@@ -174,6 +174,8 @@ pub(super) struct Snapshot {
     /// The source control, branch comparison and history reads that are
     /// current: binding the source control to other work cancels them.
     source_reads: String,
+    /// The open palette's results, which name panes as their chrome does.
+    palette: String,
 }
 
 impl Snapshot {
@@ -233,6 +235,7 @@ impl Snapshot {
                 app.branch_ui.projection_view(),
                 app.history_ui.projection_view(),
             ),
+            palette: app.palette.projection_view(),
         }
     }
 
@@ -274,6 +277,7 @@ impl Snapshot {
             terminal_directories,
             terminal_finds,
             source_reads,
+            palette,
         );
         differences
     }
@@ -415,6 +419,29 @@ impl Cagents {
                     )
                     | Message::Frame(_)
                     | Message::Viewport { .. }
+                    | Message::Lsp(_)
+                    | Message::ContextSectionsMeasured(_)
+                    | Message::ContextInspector(inspector::InspectorAction::Resize { .. })
+                    | Message::Palette(palette_ui::Action::Query(_))
+                    | Message::ResumeConversation(
+                        resume_ui::Action::Query(_)
+                            | resume_ui::Action::Reach(_)
+                            | resume_ui::Action::Point(..)
+                            | resume_ui::Action::More
+                    )
+                    | Message::Repository(
+                        RepositoryAction::EditorAction { .. }
+                            | RepositoryAction::DiffViewport { .. }
+                            | RepositoryAction::PreviewViewport { .. }
+                            | RepositoryAction::Language {
+                                action: repository_widget::EditorLspAction::Hover(_)
+                                    | repository_widget::EditorLspAction::CompleteAt { .. }
+                                    | repository_widget::EditorLspAction::Complete
+                                    | repository_widget::EditorLspAction::Next(_)
+                                    | repository_widget::EditorLspAction::Dismiss,
+                                ..
+                            }
+                    )
             )
     }
 
@@ -783,7 +810,10 @@ mod tests {
         let collapsed = app.chrome_ui.projects_collapsed;
         let before = projections();
         drop(app.update(Message::KeyEvent {
-            event: character("B", keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT),
+            event: character(
+                "B",
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
+            ),
             captured: false,
         }));
         assert_ne!(app.chrome_ui.projects_collapsed, collapsed);

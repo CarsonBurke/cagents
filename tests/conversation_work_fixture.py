@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -75,12 +76,12 @@ class ConversationWork(unittest.TestCase):
         self.assertIn("half made", half.stderr)
         self.assertFalse((self.fixture / "home" / ".claude" / "fixture-frames.jsonl").exists())
 
-    def test_the_project_gets_three_worktrees_the_forge_knows(self):
+    def test_the_project_gets_four_worktrees_the_forge_knows(self):
         self.helper()
         project = self.fixture / "project"
         listed = self.git(project, "worktree", "list", "--porcelain")
         for name, branch in (("cache-key", "fix/cache-key"), ("retry-budget", "feat/retry-budget"),
-                             ("locale-notes", "docs/locale-notes")):
+                             ("locale-notes", "docs/locale-notes"), ("cache-metrics", "feat/cache-metrics")):
             self.assertRegex(listed, f"(?m)^worktree {re.escape(str(project / '.worktrees' / name))}\n"
                                      f"HEAD [0-9a-f]+\nbranch refs/heads/{re.escape(branch)}$")
         # The main checkout stays clean; the edited worktrees hold uncommitted work.
@@ -89,25 +90,55 @@ class ConversationWork(unittest.TestCase):
         self.assertEqual(self.git(project / ".worktrees/locale-notes", "status", "--porcelain"),
                          "M docs/locales.md")
         self.assertEqual(self.git(project / ".worktrees/retry-budget", "status", "--porcelain"), "")
+        self.assertEqual(self.git(project / ".worktrees/cache-metrics", "status", "--porcelain"), "")
         self.assertEqual(self.git(project, "rev-parse", "--abbrev-ref", "fix/cache-key@{upstream}"),
                          "origin/fix/cache-key")
 
         # The forge's own validation accepts the seeds, and each lookup answers.
         self.assertEqual(self.gh("repo", "view", "--json", "nameWithOwner,url")["nameWithOwner"],
                          "octo-org/fixture-app")
-        listed = self.gh("pr", "list", "--state", "all", "--json", "number,state,headRefName,headRefOid")
+        listed = self.gh("pr", "list", "--state", "all", "--json", "number,state,headRefName,headRefOid,mergedAt")
         self.assertEqual([(row["number"], row["state"]) for row in listed],
-                         [(41, "OPEN"), (38, "OPEN"), (35, "MERGED"), (29, "CLOSED"), (12, "MERGED")])
+                         [(41, "OPEN"), (38, "OPEN"), (44, "MERGED"), (35, "MERGED"), (29, "CLOSED"),
+                          (12, "MERGED")])
         heads = {row["number"]: row["headRefOid"] for row in listed}
         self.assertEqual(heads[41], self.git(project, "rev-parse", "fix/cache-key"))
         self.assertEqual(heads[38], self.git(project, "rev-parse", "feat/retry-budget"))
+        # #44 merged after its worktree's commit, at a head GitHub moved past it.
+        metrics = self.git(project, "rev-parse", "feat/cache-metrics")
+        self.assertNotEqual(heads[44], metrics)
+        merged_at = next(row["mergedAt"] for row in listed if row["number"] == 44)
+        self.assertLess(self.git(project, "log", "-1", "--format=%cI", metrics).replace("+00:00", "Z"), merged_at)
         checks = self.gh("pr", "view", "41", "--json", "statusCheckRollup")["statusCheckRollup"]
         self.assertEqual(sorted((check["name"], check["status"], check["conclusion"]) for check in checks),
                          [("build", "COMPLETED", "SUCCESS"), ("lint", "COMPLETED", "FAILURE"),
                           ("test", "IN_PROGRESS", "")])
         # The Work board lists only the viewer's own.
         authored = self.gh("pr", "list", "--state", "all", "--author", "@me", "--json", "number")
-        self.assertEqual([row["number"] for row in authored], [41, 38, 35])
+        self.assertEqual([row["number"] for row in authored], [41, 38, 44, 35])
+
+    def test_spent_graphql_quota_preserves_rest_and_expires(self):
+        self.helper()
+        marker = self.fixture / "home" / ".config" / "fixture-forge-graphql-reset"
+        reset = int(time.time()) + 3600
+        marker.write_text(f"{reset}\n")
+        for arguments, output in (
+            (("api", "--include", "graphql", "-f", "query=query Test { viewer { login } }"), "stdout"),
+            (("pr", "view", "41", "-R", "octo-org/fixture-app", "--json", "number"), "stderr"),
+            (("repo", "view", "octo-org/fixture-app", "--json", "nameWithOwner,url"), "stderr"),
+        ):
+            with self.subTest(arguments=arguments):
+                refused = subprocess.run(["gh", *arguments], text=True, capture_output=True,
+                                         env=self.environment())
+                self.assertEqual(refused.returncode, 1)
+                self.assertIn("GraphQL: API rate limit already exceeded", refused.stderr)
+                headers = getattr(refused, output)
+                self.assertIn("X-Ratelimit-Remaining: 0", headers)
+                self.assertIn("X-Ratelimit-Resource: graphql", headers)
+                self.assertIn(f"X-Ratelimit-Reset: {reset}", headers)
+        self.assertEqual(self.gh("api", "repos/octo-org/fixture-app/releases"), [])
+        marker.write_text("1\n")
+        self.assertEqual(self.gh("pr", "view", "41", "--json", "number"), {"number": 41})
 
     def test_the_frames_name_this_fixture_s_paths_and_commits(self):
         self.helper()
@@ -116,6 +147,7 @@ class ConversationWork(unittest.TestCase):
         frames = [json.loads(line) for line in text.splitlines()]
         self.assertNotIn("@PROJECT@", text)
         self.assertNotIn("@RETRY_", text)
+        self.assertNotIn("@METRICS_", text)
         self.assertEqual(frames[-1], {"_end": True})
         self.assertEqual(frames[-2]["type"], "result")
         calls = [block for frame in frames if frame.get("type") == "assistant"
@@ -144,7 +176,7 @@ class ConversationWork(unittest.TestCase):
         self.helper()
         self.assertEqual(frames.read_text(), written)
         self.assertEqual(self.git(project, "rev-parse", "main", "fix/cache-key", "feat/retry-budget"), before)
-        self.assertEqual(len(self.gh("pr", "list", "--state", "all", "--json", "number")), 5)
+        self.assertEqual(len(self.gh("pr", "list", "--state", "all", "--json", "number")), 6)
         self.assertEqual(self.git(project, "remote", "get-url", "origin"),
                          "https://github.com/octo-org/fixture-app")
 

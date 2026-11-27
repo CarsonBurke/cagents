@@ -232,7 +232,7 @@ fn without_image_placeholders(text: &str) -> std::borrow::Cow<'_, str> {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn image_placeholder_prompt(text: &str) -> bool {
+pub fn image_placeholder_prompt(text: &str) -> bool {
     // Most prompts have no attachment marker. Bound the detection the same way
     // the title parser bounds ordinary prompt text.
     text.len() <= INPUT_BYTES

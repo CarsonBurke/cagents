@@ -251,6 +251,7 @@ fn a_window_starting_the_draft_itself_keeps_its_own_start() {
             intent: chat::Intent::Start,
             session: own.clone(),
             recovery: None,
+            disconnect: None,
             upgrade_committed: false,
             upgrade_admission: None,
             resume_committed: false,

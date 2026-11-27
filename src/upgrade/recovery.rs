@@ -5,10 +5,11 @@
 //! fences remain held. Its only startup action is adopting existing owners.
 #[cfg(any(feature = "host", test))]
 mod retention;
-pub(crate) mod verified;
+pub mod verified;
 #[cfg(feature = "host")]
-pub(crate) use retention::collect_superseded;
+pub use retention::collect_superseded;
 
+use super::handoff::Phase;
 use crate::{
     chat::Session,
     daemon::lease_handoff::LeaseHandoff,
@@ -21,35 +22,49 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, BorrowedFd, FromRawFd},
+        fd::{AsRawFd, BorrowedFd},
         unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-            process::CommandExt,
         },
     },
     path::{Path, PathBuf},
     process::Command,
     sync::{Mutex, OnceLock},
 };
+#[cfg(target_os = "linux")]
+use std::{os::fd::FromRawFd, os::unix::process::CommandExt};
 
 pub(crate) const RECOVERY_FD_ENV: &str = "CAGENTS_UPDATE_RECOVERY_FD";
 const ENV: &str = RECOVERY_FD_ENV;
+#[cfg(target_os = "linux")]
 const LEGACY_FD: i32 = 189;
+#[cfg(target_os = "linux")]
 const RECEIPT_FD: i32 = 193;
+#[cfg(target_os = "linux")]
 const WORKER_FD: i32 = 194;
+#[cfg(target_os = "linux")]
 const FENCE_FD: i32 = 195;
+#[cfg(target_os = "linux")]
 const DAEMON_FD: i32 = 196;
+#[cfg(target_os = "linux")]
+pub(crate) const RECEIPT_DESCRIPTORS: [i32; 5] =
+    [RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD];
+#[cfg(target_os = "macos")]
+pub(crate) const STANDBY_RECEIPT_DESCRIPTORS: usize = 3;
+#[cfg(target_os = "macos")]
+pub(crate) const STANDBY_RECEIPT_LIMIT: usize = LIMIT as usize;
 const ORIGINAL_WORKER_FD: i32 = 198;
 const LIMIT: u64 = 16 * 1024 * 1024;
 const SNAPSHOT_LIMIT: usize = 8 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const SEALS: i32 = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
 static INHERITED: OnceLock<io::Result<Mutex<Option<Inherited>>>> = OnceLock::new();
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub(crate) struct Census {
+pub struct Census {
     pub terminals: Vec<TerminalSession>,
     pub chats: Vec<Session>,
     pub snapshots: Vec<super::floor::StoppedSnapshot>,
@@ -67,7 +82,7 @@ pub(crate) struct Census {
 /// Transcript pages captured before preparation. [`Census::fit_pages`] fits
 /// their total to the evidence; a long conversation is never refused.
 #[derive(Default)]
-pub(crate) struct SnapshotCapture {
+pub struct SnapshotCapture {
     snapshots: Vec<super::floor::StoppedSnapshot>,
     pages: Vec<super::floor::Page>,
 }
@@ -77,7 +92,7 @@ pub(crate) struct SnapshotCapture {
 const CAPTURE_COMPACTION: usize = 2 * SNAPSHOT_LIMIT;
 
 impl SnapshotCapture {
-    pub(crate) fn push(
+    pub fn push(
         &mut self,
         source: Session,
         mut snapshot: crate::chat::Snapshot,
@@ -124,7 +139,7 @@ impl SnapshotCapture {
         }
         Ok(())
     }
-    pub(crate) fn finish(self) -> Vec<super::floor::StoppedSnapshot> {
+    pub fn finish(self) -> Vec<super::floor::StoppedSnapshot> {
         self.snapshots
     }
 }
@@ -185,7 +200,7 @@ fn same_captured_terminal(
 }
 
 impl Census {
-    pub(crate) fn terminal_ids(&self) -> BTreeSet<TerminalId> {
+    pub fn terminal_ids(&self) -> BTreeSet<TerminalId> {
         self.terminals
             .iter()
             .map(|source| source.id)
@@ -419,7 +434,7 @@ impl Census {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
-struct Authority {
+pub(crate) struct Authority {
     version: u16,
     #[serde(default)]
     origin: Origin,
@@ -524,6 +539,50 @@ struct ManualRequest {
     target_hash: String,
     census_hash: String,
     windows: Vec<String>,
+}
+
+impl ManualRequest {
+    /// The original checkpoint remains immutable across recovery attempts.
+    /// A synced request recorded before a close keeps that window in scope
+    /// even if the coordinator died before the successor claimed custody.
+    fn carried_windows(&self, state: &Path) -> Result<BTreeSet<String>, String> {
+        let mut carried = BTreeSet::new();
+        for entry in fs::read_dir(state).map_err(|error| error.to_string())? {
+            let entry = entry.map_err(|error| error.to_string())?;
+            let name = entry.file_name();
+            let Some(job) = name.to_str().and_then(|name| name.strip_suffix(".request")) else {
+                continue;
+            };
+            if uuid::Uuid::parse_str(job).is_err() {
+                continue;
+            }
+            let Ok(Some(bytes)) = read_checkpoint(&entry.path()) else {
+                continue;
+            };
+            let Ok(prior) = serde_json::from_slice::<Self>(&bytes) else {
+                continue;
+            };
+            if prior.version == self.version
+                && prior.job == job
+                && prior.checkpoint == self.checkpoint
+                && prior.source == self.source
+                && prior.target == self.target
+                && prior.target_hash == self.target_hash
+                && prior.census_hash == self.census_hash
+            {
+                if !valid_recovery_windows(&prior.windows) {
+                    return Err("An earlier recovery recorded invalid window slots".into());
+                }
+                carried.extend(
+                    prior
+                        .windows
+                        .into_iter()
+                        .filter(|slot| !self.windows.contains(slot)),
+                );
+            }
+        }
+        Ok(carried)
+    }
 }
 
 /// A restored terminal's source/relaunch lineage is bounded by the complete
@@ -685,7 +744,7 @@ impl Bound {
 /// Retain only the immutable allocation/lineage and serving ownership fields
 /// used by the proof reader. Output and attachment metadata can keep changing.
 #[cfg(feature = "host")]
-pub(crate) fn proof_terminal_descriptor(
+pub fn proof_terminal_descriptor(
     mut descriptor: crate::terminal_ipc::TerminalDescriptor,
 ) -> crate::terminal_ipc::TerminalDescriptor {
     descriptor.generation = 0;
@@ -708,8 +767,18 @@ pub(crate) struct Preparation {
 
 pub(crate) struct CapturedPreparation(Preparation);
 
+#[cfg(target_os = "macos")]
+enum StandbyCheckpoint {
+    Prepared,
+    /// Keep the original Ready inode alive until standby custody settles.
+    Ready(File),
+}
+
 pub(crate) struct Receipt {
+    #[cfg(target_os = "linux")]
     receipt: File,
+    #[cfg(target_os = "macos")]
+    checkpoint: StandbyCheckpoint,
     worker: File,
     fence: File,
     legacy: File,
@@ -723,14 +792,21 @@ pub(crate) struct RecoveryOutcome {
     pub paused_chats: Vec<TerminalId>,
 }
 
+#[cfg(any(target_os = "linux", feature = "host"))]
 #[derive(Debug)]
 struct Inherited {
+    #[cfg(target_os = "linux")]
     receipt: File,
+    #[cfg(target_os = "macos")]
+    authority: Option<Authority>,
     worker: File,
     fence: File,
     legacy: File,
     daemon: File,
 }
+
+#[cfg(all(target_os = "macos", not(feature = "host")))]
+struct Inherited;
 
 #[cfg(feature = "host")]
 #[derive(Debug)]
@@ -743,11 +819,20 @@ struct Continuity {
 struct CheckpointIndex {
     version: u16,
     proof: HostSessionProof,
-    phase: String,
+    #[serde(deserialize_with = "checkpoint_phase_from_string")]
+    phase: Phase,
     terminals: Vec<TerminalSource>,
     #[serde(default)]
     carried: Vec<TerminalSource>,
     chats: Vec<ChatSource>,
+}
+
+fn checkpoint_phase_from_string<'de, D>(deserializer: D) -> Result<Phase, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let phase = String::deserialize(deserializer)?;
+    Phase::deserialize(serde::de::value::StrDeserializer::new(&phase))
 }
 
 #[derive(Deserialize)]
@@ -792,7 +877,6 @@ fn persist_bound_capture(checkpoint: &Path, capture: &CapturedCensus) -> Result<
     if bytes.len() as u64 > LIMIT {
         return Err("Bound recovery census exceeds its private size limit".into());
     }
-    use std::os::unix::ffi::OsStrExt;
     let parent = path.parent().ok_or("Recovery capture has no parent")?;
     let temporary = parent.join(format!(".bound-recovery-capture-{}", uuid::Uuid::new_v4()));
     let result = (|| {
@@ -806,26 +890,10 @@ fn persist_bound_capture(checkpoint: &Path, capture: &CapturedCensus) -> Result<
         file.write_all(&bytes)
             .and_then(|_| file.sync_all())
             .map_err(|e| e.to_string())?;
-        let from =
-            std::ffi::CString::new(temporary.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-        let to = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
         // Publish complete bytes atomically without ever replacing a prior
         // binding. A failed write cannot strand a partial bound-census file.
-        if unsafe {
-            libc::renameat2(
-                libc::AT_FDCWD,
-                from.as_ptr(),
-                libc::AT_FDCWD,
-                to.as_ptr(),
-                libc::RENAME_NOREPLACE,
-            )
-        } != 0
-        {
-            return Err(format!(
-                "Could not publish immutable recovery census: {}",
-                io::Error::last_os_error()
-            ));
-        }
+        rename_noreplace(&temporary, &path)
+            .map_err(|error| format!("Could not publish immutable recovery census: {error}"))?;
         File::open(parent)
             .and_then(|directory| directory.sync_all())
             .map_err(|e| e.to_string())
@@ -927,17 +995,48 @@ impl PendingRecovery {
         Self::inspect_at(&store.path)
     }
 
+    /// Recover the original scope of an already archived request. This is for
+    /// verifying its serving successor, with no authority to start a daemon.
+    pub(crate) fn inspect_archived(hash: &str, target: &Path) -> Result<Option<Self>, String> {
+        let Some(store) = super::handoff::Store::existing()? else {
+            return Ok(None);
+        };
+        Self::inspect_archived_at(&store.path, hash, target)
+    }
+
+    fn inspect_archived_at(
+        canonical: &Path,
+        hash: &str,
+        target: &Path,
+    ) -> Result<Option<Self>, String> {
+        if read_checkpoint(canonical)?.is_some() {
+            return Ok(None);
+        }
+        let Some(archive) = archived_proof(canonical, target)? else {
+            return Ok(None);
+        };
+        if archive.checkpoint_sha256 != hash {
+            return Ok(None);
+        }
+        let original = Self::inspect_at(&archive.archive_path)?
+            .ok_or("The exact archived Prepared checkpoint disappeared")?;
+        if original.checkpoint_hash != hash {
+            return Err("The archived Prepared checkpoint changed during inspection".into());
+        }
+        Ok(Some(original))
+    }
+
     fn inspect_at(path: &Path) -> Result<Option<Self>, String> {
         let Some(bytes) = read_checkpoint(path)? else {
             return Ok(None);
         };
         let checkpoint: CheckpointIndex =
             serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-        if checkpoint.phase == "Ready" {
+        if checkpoint.phase == Phase::Ready {
             return Ok(None);
         }
         if !(1..=5).contains(&checkpoint.version)
-            || checkpoint.phase != "Prepared"
+            || checkpoint.phase != Phase::Prepared
             || !checkpoint.proof.is_complete()
             || checkpoint.terminals.len() + checkpoint.carried.len() > super::handoff::MAX_TERMINALS
             || checkpoint.chats.len() > super::handoff::MAX_CHATS
@@ -1029,19 +1128,14 @@ impl PendingRecovery {
                                 .any(|known| known.id == paired.id && !same_terminal(known, paired))
                     })
             })
-            || self.windows.len() > 1024
-            || self
-                .windows
-                .iter()
-                .any(|slot| crate::instance::validate_window_slot(slot).is_err())
-            || self.windows.iter().collect::<BTreeSet<_>>().len() != self.windows.len()
+            || !valid_recovery_windows(&self.windows)
         {
             return Err(
                 "Retained recovery census has duplicate, foreign or unbounded original owners"
                     .into(),
             );
         }
-        if validate_checkpoint(&self.authority(), bytes)? != "Prepared"
+        if validate_checkpoint(&self.authority(), bytes)? != Phase::Prepared
             || digest(bytes) != self.checkpoint_hash
         {
             return Err(
@@ -1215,9 +1309,15 @@ impl PendingRecovery {
         worker: &File,
         guard: &UiUpdateGuard,
         handoff: &LeaseHandoff,
+        windows: &[String],
     ) -> Result<Receipt, String> {
         if !yes || selected_hash != self.checkpoint_hash {
             return Err("Recovery requires --yes and the exact retained checkpoint SHA256; nothing was started".into());
+        }
+        if !valid_recovery_windows(windows)
+            || self.windows.iter().any(|slot| !windows.contains(slot))
+        {
+            return Err("Recovery requires the original saved window slots".into());
         }
         if !self.original_census_complete {
             return Err("Recovery needs the complete original census. Repeat this exact command with --census PATH naming the retained pre-update installer census; the checkpoint was preserved".into());
@@ -1259,8 +1359,9 @@ impl PendingRecovery {
         )?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
-        let cli = fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-            .map_err(|e| e.to_string())?;
+        let cli =
+            fs::canonicalize(crate::process::current_executable().map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
         if crate::update::locate(&cli)
             .map_err(|e| e.to_string())?
             .version_root
@@ -1285,8 +1386,8 @@ impl PendingRecovery {
         let daemon_path = descriptor_path(&daemon).map_err(|e| e.to_string())?;
         validate_lock(&daemon, &daemon_path).map_err(|e| e.to_string())?;
         let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
-        if daemon_path != paths.lock
-            || std::os::unix::net::UnixStream::connect(&paths.socket).is_ok()
+        if !same_authority_path(&daemon_path, &paths.lock)
+            || crate::descriptor::connect_settled(&paths.socket).is_ok()
         {
             return Err(
                 "Another daemon is serving or starting; explicit recovery did not replace it"
@@ -1294,7 +1395,7 @@ impl PendingRecovery {
             );
         }
         let target_hash = executable_hash(&target)?;
-        let request = ManualRequest {
+        let mut request = ManualRequest {
             version: 1,
             job: job.into(),
             checkpoint: self.checkpoint_hash.clone(),
@@ -1302,8 +1403,14 @@ impl PendingRecovery {
             target: target.clone(),
             target_hash: target_hash.clone(),
             census_hash: digest(&serde_json::to_vec(&self.census).map_err(|e| e.to_string())?),
-            windows: self.windows.clone(),
+            windows: windows.to_vec(),
         };
+        let carried = request.carried_windows(state)?;
+        request.windows.extend(carried);
+        if !valid_recovery_windows(&request.windows) {
+            return Err("The retained recovery window scope exceeds its limit".into());
+        }
+        let windows = request.windows.clone();
         let request = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
         let mut file = OpenOptions::new()
             .write(true)
@@ -1322,6 +1429,7 @@ impl PendingRecovery {
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
         let mut authority = self.authority();
+        authority.windows = windows;
         authority.job = job.into();
         authority.request_identity = digest(&request);
         authority.job_request_hash = digest(&request);
@@ -1333,9 +1441,11 @@ impl PendingRecovery {
         authority.target_hash = target_hash;
         validate_request_origin(&authority, &request)?;
         preflight_preparation_size(&authority)?;
-        let receipt = sealed_receipt(&authority).map_err(|e| e.to_string())?;
         Ok(Receipt {
-            receipt,
+            #[cfg(target_os = "linux")]
+            receipt: sealed_receipt(&authority).map_err(|e| e.to_string())?,
+            #[cfg(target_os = "macos")]
+            checkpoint: StandbyCheckpoint::Prepared,
             worker,
             fence,
             legacy,
@@ -1450,7 +1560,12 @@ impl Preparation {
                 "The original update request changed before acknowledged checkpoint binding".into(),
             );
         }
-        self.authority.checkpoint_hash = digest(&bytes);
+        self.bind_acknowledged_checkpoint(&bytes)?;
+        Ok(CapturedPreparation(self))
+    }
+
+    fn bind_acknowledged_checkpoint(&mut self, bytes: &[u8]) -> Result<(), String> {
+        self.authority.checkpoint_hash = digest(bytes);
         persist_bound_capture(
             &self.authority.checkpoint_path,
             &CapturedCensus {
@@ -1463,8 +1578,7 @@ impl Preparation {
                 census: self.authority.census.clone(),
                 windows: self.authority.windows.clone(),
             },
-        )?;
-        Ok(CapturedPreparation(self))
+        )
     }
 
     fn validate_continuity(&self) -> Result<(), String> {
@@ -1484,7 +1598,7 @@ impl CapturedPreparation {
         target_daemon: &Path,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, None, handoff);
+        let result = self.make_receipt(target_daemon, None, handoff, false);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1501,7 +1615,7 @@ impl CapturedPreparation {
         verified_daemon_sha256: &str,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff);
+        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff, false);
         if let Err(error) = &result {
             eprintln!(
                 "The acknowledged preparation could not authorize successor recovery: {error}"
@@ -1510,36 +1624,40 @@ impl CapturedPreparation {
         result
     }
 
+    #[cfg(target_os = "macos")]
+    pub(crate) fn standby_receipt(
+        self,
+        target_daemon: &Path,
+        handoff: &LeaseHandoff,
+    ) -> Result<Receipt, String> {
+        self.make_receipt(target_daemon, None, handoff, true)?
+            .ok_or_else(|| {
+                "The acknowledged checkpoint did not authorize standby activation".to_owned()
+            })
+    }
+
     fn make_receipt(
         self,
         target_daemon: &Path,
         verified_digest: Option<&str>,
         handoff: &LeaseHandoff,
+        transfer_ready: bool,
     ) -> Result<Option<Receipt>, String> {
         let mut preparation = self.0;
         preparation.validate_continuity()?;
-        let bytes = read_checkpoint(&preparation.authority.checkpoint_path)?
+        let input = open_checkpoint(&preparation.authority.checkpoint_path)?
             .ok_or("The acknowledged checkpoint disappeared before recovery")?;
+        let bytes = read_checkpoint_input(&input)?;
         let phase = validate_checkpoint(&preparation.authority, &bytes)?;
-        if phase == "Ready" {
+        if phase == Phase::Ready {
             // The same acknowledged source may finish Prepared -> Ready while
             // this worker continuously owns its fences. Retain the full
             // original scope for the exact final bytes consumed by normal
             // restoration, including panes ended before that checkpoint.
-            persist_bound_capture(
-                &preparation.authority.checkpoint_path,
-                &CapturedCensus {
-                    producer: Some(CaptureProducer::Acknowledged {
-                        job: preparation.authority.job.clone(),
-                        request_hash: preparation.authority.job_request_hash.clone(),
-                    }),
-                    source: preparation.authority.source.clone(),
-                    checkpoint_hash: Some(digest(&bytes)),
-                    census: preparation.authority.census.clone(),
-                    windows: preparation.authority.windows.clone(),
-                },
-            )?;
-            return Ok(None);
+            preparation.bind_acknowledged_checkpoint(&bytes)?;
+            if !transfer_ready {
+                return Ok(None);
+            }
         }
         if digest(&bytes) != preparation.authority.checkpoint_hash {
             return Err("The Prepared checkpoint changed after this update acknowledged it; automatic recovery was refused".into());
@@ -1569,9 +1687,15 @@ impl CapturedPreparation {
             .map_err(|e| e.to_string())?;
         preparation.authority.daemon_path = descriptor_path(&daemon).map_err(|e| e.to_string())?;
         validate_lock(&daemon, &preparation.authority.daemon_path).map_err(|e| e.to_string())?;
-        let receipt = sealed_receipt(&preparation.authority).map_err(|e| e.to_string())?;
         Ok(Some(Receipt {
-            receipt,
+            #[cfg(target_os = "linux")]
+            receipt: sealed_receipt(&preparation.authority).map_err(|e| e.to_string())?,
+            #[cfg(target_os = "macos")]
+            checkpoint: if phase == Phase::Ready {
+                StandbyCheckpoint::Ready(input)
+            } else {
+                StandbyCheckpoint::Prepared
+            },
             worker: preparation.worker,
             fence: preparation.fence,
             legacy: preparation.legacy,
@@ -1582,23 +1706,85 @@ impl CapturedPreparation {
 }
 
 impl Receipt {
+    #[cfg(target_os = "macos")]
+    pub(crate) fn is_ready(&self) -> bool {
+        matches!(self.checkpoint, StandbyCheckpoint::Ready(_))
+    }
+    pub(crate) fn saved_windows(&self) -> &[String] {
+        &self.authority.windows
+    }
+
     pub(crate) fn release_daemon_reservation(&mut self) {
         self.daemon.take();
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
-        forward(
-            command,
-            [
-                &self.receipt,
-                &self.worker,
-                &self.fence,
-                self.daemon.as_ref().ok_or_else(|| {
-                    io::Error::other("Recovery daemon reservation was already released")
-                })?,
-                &self.legacy,
-            ],
+        forward(command, self.files()?)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn inherit(&self, _command: &mut Command) -> io::Result<()> {
+        Err(io::Error::other(
+            "Darwin Prepared recovery requires the private standby channel",
+        ))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn files(&self) -> io::Result<[&File; 5]> {
+        Ok([
+            &self.receipt,
+            &self.worker,
+            &self.fence,
+            self.daemon.as_ref().ok_or_else(|| {
+                io::Error::other("Recovery daemon reservation was already released")
+            })?,
+            &self.legacy,
+        ])
+    }
+
+    /// The original, exact Ready bytes still precede any provider restore.
+    /// A changed phase or even a byte change removes the retry authority.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn ready_before_restore(&self) -> Result<bool, String> {
+        let StandbyCheckpoint::Ready(original) = &self.checkpoint else {
+            return Ok(false);
+        };
+        // The successor can open or migrate the saved store before changing
+        // Ready to Restoring. Untouched checkpoint bytes alone cannot prove
+        // that no successor started using the store.
+        match fs::symlink_metadata(ready_claim_path(&self.authority)?) {
+            Ok(_) => return Ok(false),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+            Err(error) => return Err(error.to_string()),
+        }
+        let Some(current) = open_checkpoint(&self.authority.checkpoint_path)? else {
+            return Ok(false);
+        };
+        let original = original.metadata().map_err(|error| error.to_string())?;
+        let current_metadata = current.metadata().map_err(|error| error.to_string())?;
+        // A failed restore can write byte-identical Ready contents again.
+        // It does so by atomic replacement, so those bytes are a different
+        // file and cannot authorize an automatic replay from this worker.
+        Ok(
+            (original.dev(), original.ino()) == (current_metadata.dev(), current_metadata.ino())
+                && digest(&read_checkpoint_input(&current)?) == self.authority.checkpoint_hash,
         )
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn standby_proof(
+        &self,
+        executable: &Path,
+    ) -> io::Result<(&Authority, [&File; STANDBY_RECEIPT_DESCRIPTORS])> {
+        validate_authority_target(executable, &self.authority)?;
+        let daemon = self
+            .daemon
+            .as_ref()
+            .ok_or_else(|| io::Error::other("Recovery daemon reservation was already released"))?;
+        validate_lock(daemon, &self.authority.daemon_path)?;
+        encoded_size(&self.authority, STANDBY_RECEIPT_LIMIT).map_err(io::Error::other)?;
+        Ok((&self.authority, [&self.worker, &self.fence, &self.legacy]))
     }
 
     /// Bind the target's verified serving proof to this exact Prepared job.
@@ -1723,31 +1909,52 @@ fn read_verified_record(
         target_hash,
         serving,
     )?;
-    let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
-    let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
-    if terminals.len() != live_terminals.len()
-        || chats.len() != live_chats.len()
-        || terminals != record.adopted_terminals.iter().copied().collect()
-        || chats != record.adopted_chats.iter().copied().collect()
-        || record.adopted_chat_descriptors.len() != live_chats.len()
-        || record.adopted_terminal_descriptors.len() != live_terminals.len()
-        || live_terminals.iter().any(|item| {
-            !record
-                .adopted_terminal_descriptors
-                .iter()
-                .any(|issued| same_adopted_terminal(issued, item, serving))
-                || !verified_terminal(census, item, serving, target)
-        })
-        || live_chats.iter().any(|item| {
-            !record.adopted_chat_descriptors.contains(item)
-                || !verified_chat(census, item, serving, live_terminals, target)
-        })
-    {
-        return Err(
-            "The serving recovery inventory differs from its verified original owners".into(),
-        );
-    }
+    record.verify_live_inventory(serving, live_terminals, live_chats)?;
     Ok(record)
+}
+
+impl RecoveryRecord {
+    /// A startup publisher uses the same lineage checks as an external
+    /// installer, against the live owner's inventory before opening admission.
+    pub fn verify_live_inventory(
+        &self,
+        serving: &HostSessionProof,
+        live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        live_chats: &[Session],
+    ) -> Result<(), String> {
+        if !self.settled || self.successor.as_ref() != Some(serving) || !serving.is_complete() {
+            return Err("The replacement has not settled this recovery".into());
+        }
+        let target = self
+            .target
+            .as_deref()
+            .ok_or("Recovery is missing its exact target")?;
+        let terminals: BTreeSet<_> = live_terminals.iter().map(|item| item.session.id).collect();
+        let chats: BTreeSet<_> = live_chats.iter().map(|item| item.id).collect();
+        if terminals.len() != live_terminals.len()
+            || chats.len() != live_chats.len()
+            || terminals != self.adopted_terminals.iter().copied().collect()
+            || chats != self.adopted_chats.iter().copied().collect()
+            || self.adopted_chat_descriptors.len() != live_chats.len()
+            || self.adopted_terminal_descriptors.len() != live_terminals.len()
+            || live_terminals.iter().any(|item| {
+                !self
+                    .adopted_terminal_descriptors
+                    .iter()
+                    .any(|issued| same_adopted_terminal(issued, item, serving))
+                    || !verified_terminal(&self.census, item, serving, target)
+            })
+            || live_chats.iter().any(|item| {
+                !self.adopted_chat_descriptors.contains(item)
+                    || !verified_chat(&self.census, item, serving, live_terminals, target)
+            })
+        {
+            return Err(
+                "The serving recovery inventory differs from its verified original owners".into(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn same_adopted_terminal(
@@ -1952,7 +2159,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
     let bytes = super::handoff::Store::discover()?
         .read_bytes()?
         .ok_or("The acknowledged source has no Ready checkpoint")?;
-    if validate_checkpoint(&authority, &bytes)? != "Ready" {
+    if validate_checkpoint(&authority, &bytes)? != Phase::Ready {
         return Err("The acknowledged preparation is still Prepared; previous provider shutdown is unconfirmed and ordinary startup is refused".into());
     }
     Ok(())
@@ -1961,7 +2168,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
 /// The reviewed owners the source's checkpoint must name. A conversation
 /// whose provider already ended is reviewed, so the user sees it reopen, but
 /// the source has nothing of it to checkpoint and leaves it out.
-pub(crate) fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
+pub fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, TerminalId)> {
     reviewed
         .sessions
         .iter()
@@ -1970,11 +2177,11 @@ pub(crate) fn checkpointed_owners(reviewed: &DaemonImpact) -> Vec<(SessionKind, 
         .collect()
 }
 
-fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
+fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<Phase, String> {
     let checkpoint: CheckpointIndex = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if !(1..=5).contains(&checkpoint.version)
         || checkpoint.proof != authority.source
-        || !matches!(checkpoint.phase.as_str(), "Prepared" | "Ready")
+        || !matches!(checkpoint.phase, Phase::Prepared | Phase::Ready)
     {
         return Err("The checkpoint is not this update's acknowledged source preparation".into());
     }
@@ -2069,7 +2276,7 @@ fn digest(bytes: &[u8]) -> String {
     format!("{:x}", Sha256::digest(bytes))
 }
 
-fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
+fn open_checkpoint(path: &Path) -> Result<Option<File>, String> {
     let file = match OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
@@ -2088,6 +2295,16 @@ fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
     {
         return Err("Unsafe or oversized preparation evidence; recovery was refused".into());
     }
+    Ok(Some(file))
+}
+
+fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
+    open_checkpoint(path)?
+        .map(|file| read_checkpoint_input(&file))
+        .transpose()
+}
+
+fn read_checkpoint_input(file: &File) -> Result<Vec<u8>, String> {
     let mut bytes = Vec::new();
     file.take(LIMIT + 1)
         .read_to_end(&mut bytes)
@@ -2095,7 +2312,7 @@ fn read_checkpoint(path: &Path) -> Result<Option<Vec<u8>>, String> {
     if bytes.len() as u64 > LIMIT {
         return Err("Preparation evidence exceeds its byte limit".into());
     }
-    Ok(Some(bytes))
+    Ok(bytes)
 }
 
 fn require_absent_checkpoint(path: &Path) -> Result<(), String> {
@@ -2120,6 +2337,10 @@ fn require_absent_checkpoint(path: &Path) -> Result<(), String> {
 }
 
 fn executable_hash(path: &Path) -> Result<String, String> {
+    hash_open_executable(&open_recovery_executable(path)?)
+}
+
+fn open_recovery_executable(path: &Path) -> Result<File, String> {
     let file = File::open(path).map_err(|e| e.to_string())?;
     let metadata = file.metadata().map_err(|e| e.to_string())?;
     if !metadata.is_file()
@@ -2128,6 +2349,12 @@ fn executable_hash(path: &Path) -> Result<String, String> {
     {
         return Err("The recovery daemon executable is not trusted".into());
     }
+    Ok(file)
+}
+
+fn hash_open_executable(file: &File) -> Result<String, String> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut reader = file.take(512 * 1024 * 1024 + 1);
     let mut buffer = [0u8; 64 * 1024];
@@ -2138,7 +2365,22 @@ fn executable_hash(path: &Path) -> Result<String, String> {
         }
         hash.update(&buffer[..count]);
     }
-    Ok(format!("{:x}", hash.finalize()))
+    let mut digest = String::with_capacity(64);
+    for byte in hash.finalize() {
+        use std::fmt::Write as _;
+        write!(&mut digest, "{byte:02x}").expect("formatting a SHA-256 digest into a string");
+    }
+    Ok(digest)
+}
+
+fn same_authority_path(left: &Path, right: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    return left == right;
+    #[cfg(target_os = "macos")]
+    left.canonicalize()
+        .ok()
+        .zip(right.canonicalize().ok())
+        .is_some_and(|(left, right)| left == right)
 }
 
 fn clone_descriptor(fd: i32) -> io::Result<File> {
@@ -2150,8 +2392,14 @@ fn clone_descriptor(fd: i32) -> io::Result<File> {
     ))
 }
 
+#[cfg(target_os = "linux")]
 fn descriptor_path(file: &File) -> io::Result<PathBuf> {
     fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+#[cfg(target_os = "macos")]
+fn descriptor_path(file: &File) -> io::Result<PathBuf> {
+    crate::descriptor::path_of(file)
 }
 
 fn validate_lock(file: &File, path: &Path) -> io::Result<()> {
@@ -2159,6 +2407,14 @@ fn validate_lock(file: &File, path: &Path) -> io::Result<()> {
 }
 
 fn validate_lock_mode(file: &File, path: &Path, access: &str) -> io::Result<()> {
+    validate_lock_inode(file, path)?;
+    validate_lock_description(file, access)?;
+    #[cfg(target_os = "macos")]
+    validate_lock_inode(file, path)?;
+    Ok(())
+}
+
+fn validate_lock_inode(file: &File, path: &Path) -> io::Result<()> {
     let actual = file.metadata()?;
     let expected = fs::symlink_metadata(path)?;
     if !actual.is_file()
@@ -2173,6 +2429,32 @@ fn validate_lock_mode(file: &File, path: &Path, access: &str) -> io::Result<()> 
             "Recovery lost its exact continuous update lease or fence",
         ));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn validate_lock_description(file: &File, access: &str) -> io::Result<()> {
+    if access == "READ" {
+        // The inherited exclusive publication fence already prevents modern
+        // window admission. Retain legacy-window exclusion by proving we
+        // can hold a SH lock on this inode throughout recovery. An
+        // independently held SH lock here prevents an EX owner from racing
+        // the offered descriptor's acquisition or downgrade.
+        crate::flock::require_lock_history(file)?;
+        let independent = crate::descriptor::reopen(file, 0)?;
+        for descriptor in [&independent, file] {
+            // SAFETY: the descriptors remain live; neither flock blocks.
+            if unsafe { libc::flock(descriptor.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        return Ok(());
+    }
+    crate::flock::verify_inherited_exclusive(file)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_lock_description(file: &File, access: &str) -> io::Result<()> {
     let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
     if !info
         .lines()
@@ -2191,7 +2473,9 @@ fn validate_lock_mode(file: &File, path: &Path, access: &str) -> io::Result<()> 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn sealed_receipt(authority: &Authority) -> io::Result<File> {
+    use std::io::{Seek, SeekFrom};
     let bytes = serde_json::to_vec(authority).map_err(io::Error::other)?;
     if bytes.len() as u64 > LIMIT {
         return Err(io::Error::other("Recovery receipt exceeds its byte limit"));
@@ -2216,6 +2500,7 @@ fn sealed_receipt(authority: &Authority) -> io::Result<File> {
     Ok(file)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_sealed_descriptor(fd: i32) -> io::Result<()> {
     let seals = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
     if seals < 0 {
@@ -2239,6 +2524,7 @@ fn validate_sealed_descriptor(fd: i32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn forward(command: &mut Command, files: [&File; 5]) -> io::Result<()> {
     let copies = files
         .map(|file| {
@@ -2254,10 +2540,7 @@ fn forward(command: &mut Command, files: [&File; 5]) -> io::Result<()> {
     command.env(ENV, RECEIPT_FD.to_string());
     unsafe {
         command.pre_exec(move || {
-            for (file, target) in copies
-                .iter()
-                .zip([RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD])
-            {
+            for (file, target) in copies.iter().zip(RECEIPT_DESCRIPTORS) {
                 if libc::dup2(file.as_raw_fd(), target) == -1
                     || libc::fcntl(target, libc::F_SETFD, 0) == -1
                 {
@@ -2272,43 +2555,56 @@ fn forward(command: &mut Command, files: [&File; 5]) -> io::Result<()> {
 
 fn inherited() -> io::Result<&'static Mutex<Option<Inherited>>> {
     INHERITED
-        .get_or_init(|| {
-            if std::env::var_os(ENV).is_none() {
-                return Ok(Mutex::new(None));
-            }
-            if std::env::var(ENV).ok().as_deref() != Some("193") {
-                return Err(io::Error::other(
-                    "Invalid inherited update recovery descriptor",
-                ));
-            }
-            let mut files = Vec::new();
-            for fd in [RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD, LEGACY_FD] {
-                if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
-                    return Err(io::Error::last_os_error());
-                }
-                files.push(unsafe { File::from_raw_fd(fd) });
-            }
-            let mut files = files.into_iter();
-            Ok(Mutex::new(Some(Inherited {
-                receipt: files.next().unwrap(),
-                worker: files.next().unwrap(),
-                fence: files.next().unwrap(),
-                daemon: files.next().unwrap(),
-                legacy: files.next().unwrap(),
-            })))
-        })
+        .get_or_init(load_inherited)
         .as_ref()
         .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+#[cfg(target_os = "linux")]
+fn load_inherited() -> io::Result<Mutex<Option<Inherited>>> {
+    if std::env::var_os(ENV).is_none() {
+        return Ok(Mutex::new(None));
+    }
+    if std::env::var(ENV).ok().as_deref() != Some("193") {
+        return Err(io::Error::other(
+            "Invalid inherited update recovery descriptor",
+        ));
+    }
+    let mut files = Vec::new();
+    for fd in RECEIPT_DESCRIPTORS {
+        if unsafe { libc::fcntl(fd, libc::F_GETFD) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        if unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        files.push(unsafe { File::from_raw_fd(fd) });
+    }
+    let mut files = files.into_iter();
+    Ok(Mutex::new(Some(Inherited {
+        receipt: files.next().unwrap(),
+        worker: files.next().unwrap(),
+        fence: files.next().unwrap(),
+        daemon: files.next().unwrap(),
+        legacy: files.next().unwrap(),
+    })))
+}
+
+#[cfg(target_os = "macos")]
+fn load_inherited() -> io::Result<Mutex<Option<Inherited>>> {
+    if std::env::var_os(ENV).is_some() {
+        return Err(io::Error::other(
+            "Darwin Prepared recovery requires the private standby channel",
+        ));
+    }
+    Ok(Mutex::new(None))
 }
 
 pub(crate) fn initialize_inherited() -> io::Result<()> {
     inherited().map(|_| ())
 }
 
-pub(crate) fn has_inherited_receipt() -> io::Result<bool> {
+pub fn has_inherited_receipt() -> io::Result<bool> {
     Ok(inherited()?
         .lock()
         .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
@@ -2319,13 +2615,14 @@ pub(crate) fn has_inherited_receipt() -> io::Result<bool> {
 /// intermediate executable. Bind forwarding to the selected daemon's path and
 /// verified bytes before installing its recovery descriptor remapping hook. The daemon
 /// still validates the receipt and all continuous ownership after exec.
+#[cfg(target_os = "linux")]
 pub(crate) fn forward_target_daemon(command: &mut Command) -> io::Result<()> {
     if let Some(receipt) = inherited()?
         .lock()
         .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
         .as_ref()
     {
-        validate_forward_target(command, &receipt.receipt)?;
+        validate_forward_target(Path::new(command.get_program()), &receipt.receipt)?;
         forward(
             command,
             [
@@ -2340,14 +2637,28 @@ pub(crate) fn forward_target_daemon(command: &mut Command) -> io::Result<()> {
     Ok(())
 }
 
-fn validate_forward_target(command: &Command, receipt: &File) -> io::Result<()> {
+#[cfg(target_os = "macos")]
+pub(crate) fn forward_target_daemon(_command: &mut Command) -> io::Result<()> {
+    if has_inherited_receipt()? {
+        return Err(io::Error::other(
+            "Darwin Prepared authority cannot be forwarded to another process",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn validate_forward_target(selected: &Path, receipt: &File) -> io::Result<()> {
     validate_sealed_descriptor(receipt.as_raw_fd())?;
     let mut bytes = vec![0; receipt.metadata()?.len() as usize];
     // F_DUPFD shares an open-file description with the selected CLI and daemon.
     // Read by offset so forwarding never consumes another receiver's receipt.
     std::os::unix::fs::FileExt::read_exact_at(receipt, &mut bytes, 0)?;
     let authority: Authority = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
-    let selected = Path::new(command.get_program());
+    validate_authority_target(selected, &authority)
+}
+
+fn validate_authority_target(selected: &Path, authority: &Authority) -> io::Result<()> {
     if authority.version != 1
         || !selected.is_absolute()
         || !authority.target.is_absolute()
@@ -2368,7 +2679,7 @@ fn validate_forward_target(command: &Command, receipt: &File) -> io::Result<()> 
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(crate) struct RecoveryRecord {
+pub struct RecoveryRecord {
     version: u16,
     #[serde(default)]
     origin: Origin,
@@ -2402,6 +2713,14 @@ pub(crate) struct RecoveryRecord {
     authority: Option<Continuity>,
 }
 
+fn valid_recovery_windows(windows: &[String]) -> bool {
+    windows.len() <= 1024
+        && windows
+            .iter()
+            .all(|slot| crate::instance::validate_window_slot(slot).is_ok())
+        && windows.iter().collect::<BTreeSet<_>>().len() == windows.len()
+}
+
 fn recovery_name(hash: &str) -> String {
     format!("daemon-upgrade.recovery.{hash}.json")
 }
@@ -2409,7 +2728,7 @@ fn recovery_name(hash: &str) -> String {
 /// Immutable identity of the originally settled outcome, never renewed
 /// receipt authority. A later incarnation must authenticate its own holders.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SettledWitness {
+pub struct SettledWitness {
     pub checkpoint_hash: String,
     pub record_hash: String,
     pub target: PathBuf,
@@ -2422,14 +2741,16 @@ pub(crate) struct SettledWitness {
 /// Durable evidence that these exact Prepared bytes have already been handled.
 /// This value carries no locks, receipt, or authority to replay or adopt owners.
 #[derive(Clone, Debug)]
-pub(crate) struct AlreadyRecovered {
+pub struct AlreadyRecovered {
+    pub(crate) job: String,
+    pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
     pub census: Census,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
     pub adopted_chat_descriptors: Vec<Session>,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub adopted_terminals: Vec<TerminalId>,
     checkpoint_path: PathBuf,
     daemon_binary: PathBuf,
@@ -2447,12 +2768,12 @@ fn validate_settled_record(
     let index: CheckpointIndex = serde_json::from_slice(checkpoint).map_err(|e| e.to_string())?;
     if record.checkpoint_hash != digest(checkpoint)
         || record.source != index.proof
-        || index.phase != "Prepared"
+        || index.phase != Phase::Prepared
     {
         return Err("Settled recovery does not match the exact Prepared checkpoint".into());
     }
     let authority = validate_settled_identity(record, checkpoint_path, target)?;
-    if validate_checkpoint(&authority, checkpoint)? != "Prepared" {
+    if validate_checkpoint(&authority, checkpoint)? != Phase::Prepared {
         return Err("Settled recovery no longer names a Prepared checkpoint".into());
     }
     Ok(())
@@ -2562,7 +2883,7 @@ fn validate_settled_identity(
 
 /// Classify exact settled history only. Orphan adoption still authenticates
 /// every current holder and cannot execute a recipe based on this record.
-pub(crate) fn classify_retained_prepared(
+pub fn classify_retained_prepared(
     checkpoint_path: &Path,
     daemon_binary: &Path,
 ) -> Result<Option<AlreadyRecovered>, String> {
@@ -2647,7 +2968,7 @@ struct Retirement {
 /// Read-only evidence for an independent verifier. Neither the retirement nor
 /// the archived checkpoint grants replay, lease transfer, or adoption authority.
 #[derive(Clone, Debug)]
-pub(crate) struct ArchiveProof {
+pub struct ArchiveProof {
     pub archive_path: PathBuf,
     pub checkpoint_sha256: String,
     pub outcome_path: PathBuf,
@@ -2847,7 +3168,7 @@ fn archived_discovery_strict(
 /// This never directs restoration, adoption, paused panes or provider starts.
 /// Broken, unsupported or unrelated history must never prevent normal startup.
 #[cfg(any(feature = "host", test))]
-pub(crate) fn archived_discovery(
+pub fn archived_discovery(
     checkpoint: &Path,
     daemon: &Path,
 ) -> Result<Option<AlreadyRecovered>, String> {
@@ -2902,10 +3223,7 @@ pub(crate) fn pending_retirement_for_source(
 
 /// Strict actual archive evidence. A durable routing pointer may precede the
 /// move, so its presence alone never establishes completed archival.
-pub(crate) fn archived_proof(
-    checkpoint: &Path,
-    daemon: &Path,
-) -> Result<Option<ArchiveProof>, String> {
+pub fn archived_proof(checkpoint: &Path, daemon: &Path) -> Result<Option<ArchiveProof>, String> {
     let target = fs::canonicalize(daemon).map_err(|e| e.to_string())?;
     let Some((_, proof, record)) = scoped_retirement(checkpoint, &target, None, None)? else {
         return Ok(None);
@@ -2942,12 +3260,14 @@ fn recovered_data(
     descriptors.extend(additional);
     AlreadyRecovered {
         witness,
+        job: record.job,
+        windows: record.windows,
         source: record.source,
         census: record.census,
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
         adopted_chat_descriptors: descriptors,
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         adopted_terminals: record.adopted_terminals,
         checkpoint_path: checkpoint.to_owned(),
         daemon_binary: target,
@@ -3091,8 +3411,8 @@ impl AlreadyRecovered {
     /// restoration, and Ready. The live/paused counts below are mechanical
     /// safety checks; they do not establish that the user's recovery succeeded.
     /// Unrelated owners created since the original recovery are left alone.
-    #[cfg(test)]
-    pub(crate) fn archive_completed(
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn archive_completed(
         &self,
         serving: &HostSessionProof,
         live_terminals: &[crate::terminal_ipc::TerminalDescriptor],
@@ -3447,7 +3767,9 @@ fn sweep_archive_temporaries_at(directory: &Path, proc_root: &Path) {
 fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
     let from = std::ffi::CString::new(from.as_os_str().as_bytes())?;
     let to = std::ffi::CString::new(to.as_os_str().as_bytes())?;
-    if unsafe {
+    // SAFETY: both paths are NUL-terminated and outlive the call.
+    #[cfg(target_os = "linux")]
+    let renamed = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
             from.as_ptr(),
@@ -3455,18 +3777,29 @@ fn rename_noreplace(from: &Path, to: &Path) -> io::Result<()> {
             to.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    } == 0
-    {
+    };
+    // SAFETY: as above; RENAME_EXCL is Darwin's no-replace rename.
+    #[cfg(target_os = "macos")]
+    let renamed = unsafe {
+        libc::renameatx_np(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if renamed == 0 {
         Ok(())
     } else {
         Err(io::Error::last_os_error())
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 thread_local! { static ARCHIVE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnMut(&str)>>> = const { std::cell::RefCell::new(None) }; }
-#[cfg(test)]
-fn archive_test_hook(stage: &str) {
+#[cfg(any(test, feature = "test-support"))]
+pub fn archive_test_hook(stage: &str) {
     ARCHIVE_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(stage);
@@ -3486,7 +3819,7 @@ fn archive_claimed_checkpoint(
         digest(expected),
         uuid::Uuid::new_v4()
     ));
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     archive_test_hook("before-claim");
     match rename_noreplace(checkpoint, &custody) {
         Ok(()) => {}
@@ -3506,7 +3839,7 @@ fn archive_claimed_checkpoint(
     // canonical name. It is intentionally never swept or replayed.
     let result = (|| {
         sync_directory(directory)?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-support"))]
         archive_test_hook("after-claim");
         let bytes = read_checkpoint(&custody)?.ok_or("Claimed checkpoint disappeared")?;
         if bytes != expected {
@@ -3889,7 +4222,7 @@ impl RecoveryRecord {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
+pub fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     let Some(mut inherited) = inherited()
         .map_err(|e| e.to_string())?
         .lock()
@@ -3898,56 +4231,7 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
     else {
         return Ok(None);
     };
-    validate_sealed_descriptor(inherited.receipt.as_raw_fd()).map_err(|e| e.to_string())?;
-    inherited
-        .receipt
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    (&mut inherited.receipt)
-        .take(LIMIT + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > LIMIT {
-        return Err("Update recovery receipt exceeds its byte limit".into());
-    }
-    let authority: Authority = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    validate_host_context(&authority)?;
-    if authority.version != 1
-        || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
-            != fs::canonicalize(std::env::current_exe().map_err(|e| e.to_string())?)
-                .map_err(|e| e.to_string())?
-        || executable_hash(&authority.target)? != authority.target_hash
-    {
-        return Err("Update recovery receipt names a different daemon executable".into());
-    }
-    for (file, path) in [
-        (&inherited.worker, &authority.worker_path),
-        (&inherited.fence, &authority.fence_path),
-        (&inherited.daemon, &authority.daemon_path),
-    ] {
-        validate_lock(file, path).map_err(|e| e.to_string())?;
-    }
-    validate_lock_mode(&inherited.legacy, &authority.legacy_path, "READ")
-        .map_err(|e| e.to_string())?;
-    let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
-    if authority.daemon_path != paths.lock {
-        return Err("Recovery inherited a different daemon namespace".into());
-    }
-    let checkpoint =
-        read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
-    super::handoff::validate_checkpoint_bytes(&checkpoint)?;
-    if validate_checkpoint(&authority, &checkpoint)? != "Prepared"
-        || digest(&checkpoint) != authority.checkpoint_hash
-    {
-        return Err(
-            "Recovery receipt does not identify these exact Prepared checkpoint bytes".into(),
-        );
-    }
-    let store = super::handoff::Store::discover()?;
-    if store.path != authority.checkpoint_path {
-        return Err("Recovery checkpoint belongs to another application".into());
-    }
+    let authority = inherited.take_authority()?;
     let record = RecoveryRecord {
         version: 2,
         origin: authority.origin,
@@ -3979,14 +4263,330 @@ pub(crate) fn take_for_host() -> Result<Option<RecoveryRecord>, String> {
             ],
         }),
     };
+    #[cfg(target_os = "macos")]
+    record.validate_continuity()?;
     record.claim()?;
     Ok(Some(record))
 }
 
 #[cfg(feature = "host")]
+impl Inherited {
+    #[cfg(target_os = "linux")]
+    fn take_authority(&mut self) -> Result<Authority, String> {
+        use std::io::{Seek, SeekFrom};
+        validate_sealed_descriptor(self.receipt.as_raw_fd()).map_err(|e| e.to_string())?;
+        self.receipt
+            .seek(SeekFrom::Start(0))
+            .map_err(|e| e.to_string())?;
+        let mut bytes = Vec::new();
+        (&mut self.receipt)
+            .take(LIMIT + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() as u64 > LIMIT {
+            return Err("Update recovery receipt exceeds its byte limit".into());
+        }
+        let authority = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        self.validate_received(&authority, Phase::Prepared)?;
+        Ok(authority)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn take_authority(&mut self) -> Result<Authority, String> {
+        let authority = self
+            .authority
+            .take()
+            .ok_or("Prepared authority was already consumed")?;
+        // The private transfer checked the request and exact mapped target
+        // before admission. The checkpoint must still name the same bytes.
+        validate_received_checkpoint(&authority, Phase::Prepared)?;
+        Ok(authority)
+    }
+
+    fn validate_received(&self, authority: &Authority, phase: Phase) -> Result<(), String> {
+        validate_host_context(authority)?;
+        if authority.version != 1
+            || fs::canonicalize(&authority.target).map_err(|e| e.to_string())?
+                != fs::canonicalize(
+                    crate::process::current_executable().map_err(|e| e.to_string())?,
+                )
+                .map_err(|e| e.to_string())?
+        {
+            return Err("Update recovery receipt names a different daemon executable".into());
+        }
+        #[cfg(target_os = "linux")]
+        if executable_hash(&authority.target)? != authority.target_hash {
+            return Err("Update recovery receipt names a different daemon executable".into());
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let expected = authority
+                .reviewed
+                .as_ref()
+                .map(checkpointed_owners)
+                .unwrap_or_default();
+            if authority.expected != expected {
+                return Err("Prepared authority changed its reviewed checkpoint owners".into());
+            }
+            let executable = open_recovery_executable(&authority.target)?;
+            let selected = executable.metadata().map_err(|e| e.to_string())?;
+            let mapped = crate::process::mapped_region_identity(
+                std::process::id(),
+                crate::process::own_code_address(),
+            )
+            .map_err(|e| e.to_string())?;
+            if mapped != (selected.dev(), selected.ino())
+                || hash_open_executable(&executable)? != authority.target_hash
+            {
+                return Err("Prepared authority targets a different mapped daemon image".into());
+            }
+        }
+        for (file, path) in [
+            (&self.worker, &authority.worker_path),
+            (&self.fence, &authority.fence_path),
+            (&self.daemon, &authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|e| e.to_string())?;
+        }
+        validate_lock_mode(&self.legacy, &authority.legacy_path, "READ")
+            .map_err(|e| e.to_string())?;
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
+        if !same_authority_path(&authority.daemon_path, &paths.lock) {
+            return Err("Recovery inherited a different daemon namespace".into());
+        }
+        validate_received_checkpoint(authority, phase)
+    }
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
+    if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
+        return Ok(None);
+    }
+    let path = bound_capture_path(&authority.checkpoint_path, &authority.checkpoint_hash);
+    let bytes = read_checkpoint(&path)?
+        .ok_or("Prepared authority has no acknowledged inventory capture")?;
+    let capture: CapturedCensus =
+        serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+    if !matches!(capture.producer, Some(CaptureProducer::Acknowledged { job, request_hash })
+        if job == authority.job && request_hash == authority.job_request_hash)
+        || capture.source != authority.source
+        || capture.checkpoint_hash.as_deref() != Some(authority.checkpoint_hash.as_str())
+        || capture.windows != authority.windows
+        || capture.census != authority.census
+    {
+        return Err(
+            "Prepared authority changed its acknowledged inventory or saved windows".into(),
+        );
+    }
+    Ok(Some(digest(&bytes)))
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn accept_standby_authority(
+    authority: Authority,
+    [worker, fence, legacy]: [File; STANDBY_RECEIPT_DESCRIPTORS],
+    daemon: File,
+) -> io::Result<()> {
+    if std::env::var_os(ENV).is_some() {
+        return Err(io::Error::other(
+            "Prepare receipt was already inherited from another source",
+        ));
+    }
+    let mut received = Inherited {
+        authority: None,
+        worker,
+        fence,
+        legacy,
+        daemon,
+    };
+    received
+        .validate_received(&authority, Phase::Prepared)
+        .and_then(|()| validate_acknowledged_capture(&authority))
+        .map_err(io::Error::other)?;
+    received.authority = Some(authority);
+    INHERITED
+        .set(Ok(Mutex::new(Some(received))))
+        .map_err(|_| io::Error::other("Prepared receipt was already initialized"))
+}
+
+/// The acknowledged Ready checkpoint and the exact worker, launch, legacy,
+/// and runtime descriptions that protect its one installed cutover. This
+/// authority never enters the global Prepared adoption slot.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub struct ReadyAdmission {
+    authority: Authority,
+    custody: Inherited,
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+impl ReadyAdmission {
+    pub fn checkpoint_digest(&self) -> &str {
+        &self.authority.checkpoint_hash
+    }
+
+    /// Persist the work and window scope just verified by the startup publisher.
+    pub fn remember_cutover(&self, successor: &HostSessionProof) -> Result<(), String> {
+        let authority = &self.authority;
+        crate::update::record_ready_cutover(
+            &authority.job,
+            &authority.job_request_hash,
+            &authority.checkpoint_hash,
+            &authority.target,
+            crate::update::ReadyCutoverOriginal {
+                source: &authority.source,
+                inventory: &authority.census,
+            },
+            successor,
+            &authority.windows,
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn verify_live_inventory(
+        &self,
+        serving: &HostSessionProof,
+        terminals: &[crate::terminal_ipc::TerminalDescriptor],
+        chats: &[Session],
+    ) -> Result<(), String> {
+        for (file, path) in [
+            (&self.custody.worker, &self.authority.worker_path),
+            (&self.custody.fence, &self.authority.fence_path),
+            (&self.custody.daemon, &self.authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&self.custody.legacy, &self.authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        let store = super::handoff::Store::discover()?;
+        let lineage = store.recovered_chats()?;
+        crate::update::recovery::verify_ready_inventory(
+            &self.authority.job,
+            &self.authority.source,
+            &self.authority.census,
+            serving,
+            terminals,
+            chats,
+            &lineage,
+        )
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn ready_claim_path(authority: &Authority) -> Result<PathBuf, String> {
+    let job = uuid::Uuid::parse_str(&authority.job).map_err(|error| error.to_string())?;
+    if job.to_string() != authority.job {
+        return Err("Invalid installed Ready activation job".into());
+    }
+    let state = authority
+        .worker_path
+        .parent()
+        .ok_or("Installed Ready activation has no update directory")?;
+    Ok(state.join(format!("{job}.ready-claim.json")))
+}
+
+/// Exact evidence that an installed standby obtained admission to modify the
+/// saved store. A process may never clear or replace it to replay recipes.
+#[cfg(all(target_os = "macos", feature = "host"))]
+#[derive(Serialize)]
+struct ReadyClaim<'a> {
+    version: u16,
+    job: &'a str,
+    request_digest: &'a str,
+    reviewed_digest: &'a str,
+    checkpoint_digest: &'a str,
+    capture_digest: &'a str,
+    source: &'a HostSessionProof,
+    target: &'a Path,
+    target_digest: &'a str,
+    successor: crate::daemon::holder_registry::Process,
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn claim_ready_activation(authority: &Authority, capture_digest: &str) -> io::Result<()> {
+    let path = ready_claim_path(authority).map_err(io::Error::other)?;
+    let claim = ReadyClaim {
+        version: 1,
+        job: &authority.job,
+        request_digest: &authority.job_request_hash,
+        reviewed_digest: &authority.request_identity,
+        checkpoint_digest: &authority.checkpoint_hash,
+        capture_digest,
+        source: &authority.source,
+        target: &authority.target,
+        target_digest: &authority.target_hash,
+        successor: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
+    };
+    crate::update::persist_ready_activation_claim(&path, &serde_json::to_vec(&claim)?)
+        .map_err(io::Error::other)
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn accept_ready_authority(
+    authority: Authority,
+    [worker, fence, legacy]: [File; STANDBY_RECEIPT_DESCRIPTORS],
+    daemon: File,
+) -> io::Result<ReadyAdmission> {
+    if !matches!(authority.origin, Origin::AcknowledgedPrepare) || std::env::var_os(ENV).is_some() {
+        return Err(io::Error::other(
+            "Ready activation requires this update's original acknowledgement",
+        ));
+    }
+    let custody = Inherited {
+        authority: None,
+        worker,
+        fence,
+        legacy,
+        daemon,
+    };
+    custody
+        .validate_received(&authority, Phase::Ready)
+        .map_err(io::Error::other)?;
+    let capture_digest = validate_acknowledged_capture(&authority)
+        .map_err(io::Error::other)?
+        .ok_or_else(|| io::Error::other("Installed Ready activation has no original capture"))?;
+    // This precedes runtime publication, saved-state admission and every
+    // startup path that can act on the original provider or its database.
+    claim_ready_activation(&authority, &capture_digest)?;
+    Ok(ReadyAdmission { authority, custody })
+}
+
+#[cfg(feature = "host")]
+fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    let checkpoint = {
+        let store =
+            super::handoff::Store::observe_existing()?.ok_or("Recovery checkpoint disappeared")?;
+        if store.path != authority.checkpoint_path {
+            return Err("Recovery checkpoint belongs to another application".into());
+        }
+        store
+            .read_bytes()?
+            .ok_or("Recovery checkpoint disappeared")?
+    };
+    #[cfg(not(target_os = "macos"))]
+    let checkpoint =
+        read_checkpoint(&authority.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
+    super::handoff::validate_checkpoint_bytes(&checkpoint)?;
+    if validate_checkpoint(authority, &checkpoint)? != phase
+        || digest(&checkpoint) != authority.checkpoint_hash
+    {
+        return Err(format!(
+            "Recovery receipt does not identify these exact {phase:?} checkpoint bytes"
+        ));
+    }
+    #[cfg(not(target_os = "macos"))]
+    if super::handoff::Store::discover()?.path != authority.checkpoint_path {
+        return Err("Recovery checkpoint belongs to another application".into());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "host")]
 fn validate_host_context(authority: &Authority) -> Result<(), String> {
-    let layout = crate::update::locate(&std::env::current_exe().map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?;
+    let layout =
+        crate::update::locate(&crate::process::current_executable().map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
     let metadata = fs::symlink_metadata(&state).map_err(|e| e.to_string())?;
     if !metadata.is_dir()
@@ -3996,9 +4596,9 @@ fn validate_host_context(authority: &Authority) -> Result<(), String> {
         return Err("Recovery updater state is not privately owned".into());
     }
     let (fence, legacy) = crate::instance::update_recovery_fences().map_err(|e| e.to_string())?;
-    if authority.worker_path != state.join("lock")
-        || authority.fence_path != fence
-        || authority.legacy_path != legacy
+    if !same_authority_path(&authority.worker_path, &state.join("lock"))
+        || !same_authority_path(&authority.fence_path, &fence)
+        || !same_authority_path(&authority.legacy_path, &legacy)
     {
         return Err(
             "Recovery receipt does not hold this installation's actual update leases".into(),
@@ -4066,7 +4666,7 @@ impl RecoveryRecord {
     fn name(&self) -> String {
         recovery_name(&self.checkpoint_hash)
     }
-    pub(crate) fn validate_continuity(&self) -> Result<(), String> {
+    pub fn validate_continuity(&self) -> Result<(), String> {
         let held = self
             .authority
             .as_ref()
@@ -4094,24 +4694,13 @@ impl RecoveryRecord {
         if bytes.len() as u64 > LIMIT {
             return Err("Recovery evidence exceeds its byte limit".into());
         }
-        // Claim before adoption, atomically. A crash may leave an incomplete
-        // claim requiring attention; it must never leave a reusable receipt.
-        let mut file = OpenOptions::new().write(true).create_new(true).mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(store.path.with_file_name(self.name()))
-            .map_err(|error| format!("This recovery receipt could not be claimed; existing recovery evidence was preserved: {error}"))?;
-        file.write_all(&bytes).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-        File::open(
-            store
-                .path
-                .parent()
-                .ok_or("Recovery storage has no parent directory")?,
-        )
-        .and_then(|directory| directory.sync_all())
-        .map_err(|e| e.to_string())
+        // Publish the whole claim before adopting work. An interrupted write
+        // leaves the canonical claim absent, so it cannot consume the receipt.
+        store.create_named(&self.name(), &bytes).map_err(|error| {
+            format!("This recovery receipt could not be claimed. Existing recovery evidence was preserved: {error}")
+        })
     }
-    pub(crate) fn finish(mut self, successor: &HostSessionProof) -> Result<(), String> {
+    pub fn finish(mut self, successor: &HostSessionProof) -> Result<Self, String> {
         self.validate_continuity()?;
         self.validate_census()?;
         self.adopted_terminal_descriptors = std::mem::take(&mut self.adopted_terminal_descriptors)
@@ -4123,14 +4712,14 @@ impl RecoveryRecord {
         self.settled = true;
         self.save()?;
         drop(self.authority.take());
-        Ok(())
+        Ok(self)
     }
 }
 
 /// Tests join real holder authentication to the ordinary read-only proof
 /// consumer without fabricating a live receipt or automatic source ACK.
-#[cfg(all(test, feature = "host"))]
-pub(crate) fn fixture_settled_outcome(
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+pub fn fixture_settled_outcome(
     checkpoint: &Path,
     target: &Path,
     source: &HostSessionProof,

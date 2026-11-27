@@ -88,7 +88,11 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
     if std::env::var("CAGENTS_LARGE_PATHSPEC_CONTRACT").as_deref() == Ok(name) {
         let entry = phase("child entry");
         // SAFETY: prctl takes no pointers here. Adopting orphans is
-        // confined to this dedicated single-test subprocess.
+        // confined to this dedicated single-test subprocess. Darwin has no
+        // subreaper: its orphans go to launchd, so settlement below waits for
+        // direct children only. The fixture disables Git's background
+        // maintenance, which is what could leave one.
+        #[cfg(target_os = "linux")]
         assert_eq!(
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
             0,
@@ -107,9 +111,9 @@ pub(super) fn isolated_large_pathspec_test(name: &str, contract: impl FnOnce(&Pa
         drop(running);
         eprintln!("Contract passed; settling its process family");
         let settlement = phase("settlement");
-        // The kernel reparents an orphan to this subreaper as its
-        // parent exits, so while any descendant lives this process
-        // still has a child of its own; ECHILD is settlement.
+        // Linux reparents an orphan to this subreaper as its parent exits,
+        // so while any descendant lives this process still has a child of
+        // its own; ECHILD is settlement.
         loop {
             // SAFETY: a null status pointer is valid for waitpid.
             if unsafe { libc::waitpid(-1, std::ptr::null_mut(), 0) } > 0 {

@@ -51,7 +51,7 @@ impl CloseSafetyShell {
         fs::create_dir_all(cache_home.join("fish/generated_completions")).unwrap();
         fs::create_dir_all(&data_home).unwrap();
         fs::write(home.path().join(".inputrc"), "").unwrap();
-        fs::write(home.path().join(".bashrc"), "PS1='CLOSE_READY> '\n").unwrap();
+        fs::write(home.path().join(".bashrc"), "set +H\nPS1='CLOSE_READY> '\n").unwrap();
         fs::write(
             config_home.join("fish/config.fish"),
             "function fish_prompt\nprintf 'CLOSE_READY> '\nend\n",
@@ -196,34 +196,51 @@ impl CloseSafetyShell {
         self.wait_for(text, || self.screen().contains(text));
     }
 
-    fn assert_unconfirmed_close(&self) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let outcome = self.terminal.close_checked(false);
-            if outcome == TerminalCloseResult::Closed {
-                return;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "Timed out waiting for unconfirmed shell close: {outcome:?}; screen:\n{}",
-                self.screen()
+    fn assert_idle_shell_close_policy(&self) {
+        #[cfg(target_os = "macos")]
+        {
+            // The path returned by proc_pidpath does not prove the shell's
+            // mapped executable. Closing therefore requires confirmation.
+            assert_eq!(
+                self.terminal.close_checked(false),
+                TerminalCloseResult::Active
             );
-            let _ = self.wakes.recv_timeout(Duration::from_millis(10));
+            assert_eq!(
+                self.terminal.close_checked(true),
+                TerminalCloseResult::Closed
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let outcome = self.terminal.close_checked(false);
+                if outcome == TerminalCloseResult::Closed {
+                    return;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Timed out waiting for unconfirmed shell close: {outcome:?}; screen:\n{}",
+                    self.screen()
+                );
+                let _ = self.wakes.recv_timeout(Duration::from_millis(10));
+            }
         }
     }
 
     fn assert_child_requires_confirmation(&self, command: &[u8], marker: &str) {
         self.terminal.input(command).unwrap();
         self.wait_for_text(marker);
-        let pid: u32 = fs::read_to_string(self.home.path().join("child.pid"))
+        let pid = fs::read_to_string(self.home.path().join("child.pid"))
             .unwrap()
             .parse()
             .unwrap();
         // The marker precedes exec. Wait for the actual long-running child,
         // rather than mistaking shell setup or echoed input for live work.
+        let mut child = None;
         self.wait_for("child running sleep", || {
-            fs::read_link(format!("/proc/{pid}/exe"))
-                .is_ok_and(|path| path.file_name() == Some(OsStr::new("sleep")))
+            child = matching_job(pid, "sleep");
+            child.is_some()
         });
         assert_eq!(
             self.terminal.close_checked(false),
@@ -233,15 +250,12 @@ impl CloseSafetyShell {
             self.terminal.close_checked(true),
             TerminalCloseResult::Closed
         );
-        self.wait_for(
-            "confirmed close terminating the child",
-            || match fs::read_to_string(format!("/proc/{pid}/stat")) {
-                Ok(stat) => stat.rsplit_once(") ").is_some_and(|(_, fields)| {
-                    matches!(fields.as_bytes().first(), Some(b'Z' | b'X'))
-                }),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
-                Err(error) => panic!("Cannot observe child termination: {error}"),
-            },
+        assert!(
+            child
+                .unwrap()
+                .0
+                .wait_for_exit(Duration::from_secs(10))
+                .unwrap()
         );
     }
 }
@@ -268,14 +282,14 @@ fn installed_fish() -> Option<PathBuf> {
 }
 
 #[test]
-fn an_idle_shell_closes_without_confirmation_from_its_daemon_owner() {
-    CloseSafetyShell::shell(Path::new("/bin/bash")).assert_unconfirmed_close();
+fn an_idle_shell_requires_the_platforms_executable_proof_for_unconfirmed_close() {
+    CloseSafetyShell::shell(Path::new("/bin/bash")).assert_idle_shell_close_policy();
 }
 
 #[test]
-fn an_idle_fish_closes_without_confirmation_from_its_daemon_owner() {
+fn an_idle_fish_requires_the_platforms_executable_proof_for_unconfirmed_close() {
     let Some(fish) = installed_fish() else { return };
-    CloseSafetyShell::shell(&fish).assert_unconfirmed_close();
+    CloseSafetyShell::shell(&fish).assert_idle_shell_close_policy();
 }
 
 #[test]
@@ -294,7 +308,7 @@ fn replacing_the_fish_package_does_not_make_its_idle_shell_active() {
     // active, so this waits for it to settle exactly as the test for an
     // untouched fish does. Asserting on the first inspection made the result
     // depend on how much a given fish release does after its first prompt.
-    shell.assert_unconfirmed_close();
+    shell.assert_idle_shell_close_policy();
 }
 
 #[test]
@@ -310,7 +324,7 @@ fn an_exec_replacement_cannot_inherit_the_shells_idle_close_authority() {
 fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     assert_eq!(
-        shell.terminal.close_checked(false),
+        shell.terminal.close_checked(cfg!(target_os = "macos")),
         TerminalCloseResult::Closed
     );
     // close_checked joins teardown; its Exited event is already observable
@@ -326,7 +340,7 @@ fn checked_close_delivers_its_kill_provenance_before_reporting_completion() {
 }
 
 #[test]
-fn a_shell_builtin_read_closes_without_confirmation_under_process_only_detection() {
+fn a_shell_builtin_read_uses_the_same_close_policy_as_an_idle_shell() {
     let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
     shell
         .terminal
@@ -334,7 +348,7 @@ fn a_shell_builtin_read_closes_without_confirmation_under_process_only_detection
         .unwrap();
     shell.wait_for_text("READY_BUILTIN");
     // This deliberately does not attempt to classify in-shell execution.
-    shell.assert_unconfirmed_close();
+    shell.assert_idle_shell_close_policy();
 }
 
 #[test]
@@ -370,13 +384,12 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
         .terminal
         .input(b"kill -STOP $(cat child.pid)\n")
         .unwrap();
-    let pid = fs::read_to_string(shell.home.path().join("child.pid")).unwrap();
-    shell.wait_for("the already-stopped background job", || {
-        fs::read_to_string(format!("/proc/{}/stat", pid.trim())).is_ok_and(|stat| {
-            stat.rsplit_once(") ")
-                .is_some_and(|(_, fields)| fields.starts_with('T'))
-        })
-    });
+    let pid = fs::read_to_string(shell.home.path().join("child.pid"))
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    shell.wait_for("the already-stopped background job", || job_is_stopped(pid));
     let started = Instant::now();
     let outcome = shell.terminal.shutdown();
     let elapsed = started.elapsed();
@@ -393,7 +406,7 @@ fn ordinary_shutdown_resumes_an_already_stopped_jobs_hangup_handler() {
         fs::read(shell.home.path().join("stopped-hup")).unwrap(),
         b"hup"
     );
-    assert!(holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(child.0.wait_for_exit(Duration::ZERO).unwrap());
 }
 
 #[test]
@@ -441,7 +454,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
     );
     // Watching for a product grace's worth of time: a busy host can only
     // shorten the watch relative to shutdown, never end the grace early.
-    let killed_during_grace = holder::exits_within(&root.0, CHILD_HANGUP_GRACE).unwrap();
+    let killed_during_grace = root.0.wait_for_exit(CHILD_HANGUP_GRACE).unwrap();
     fs::write(shell.home.path().join("release-hup"), b"").unwrap();
     let outcome = shutdown.join().unwrap();
     assert!(
@@ -454,7 +467,7 @@ fn ordinary_shutdown_reserves_hangup_grace_when_capture_exhausts_its_deadline() 
         started.elapsed(),
         shutdown_evidence(&shell)
     );
-    assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
+    assert!(root.0.wait_for_exit(Duration::ZERO).unwrap());
     assert_eq!(
         fs::read(shell.home.path().join("delayed-capture-hup")).unwrap(),
         b"hup",
@@ -491,7 +504,7 @@ fn ordinary_shutdown_allows_a_background_jobs_hangup_handler_to_finish() {
         b"hup",
         "ordinary shutdown must let the job run its HUP handler before escalation"
     );
-    assert!(holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(child.0.wait_for_exit(Duration::ZERO).unwrap());
 }
 
 #[test]
@@ -511,7 +524,7 @@ fn ordinary_shutdown_stops_a_hup_ignoring_background_job_after_its_shell_exits()
         "escalation must follow the hangup grace, not wait for the deadline"
     );
     assert!(
-        holder::exits_within(&child.0, Duration::ZERO).unwrap(),
+        child.0.wait_for_exit(Duration::ZERO).unwrap(),
         "ordinary shutdown reported success but left its HUP-ignoring background job running"
     );
 }
@@ -522,11 +535,28 @@ fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
     // setsid -f forks into a new session and is reparented, keeping the PTY
     // as its stdio. It is not a job of this terminal: cleanup must neither
     // signal it nor wait on it to confirm the terminal's own family.
-    let outside = shutdown_job(
-        &shell,
-        b"setsid -f sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60'\n",
-        "sleep",
-    );
+    #[cfg(target_os = "linux")]
+    let command = b"setsid -f sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60'\n";
+    #[cfg(target_os = "macos")]
+    let command = {
+        fs::write(
+            shell.home.path().join("setsid.py"),
+            r#"import os
+import signal
+
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+if os.fork():
+    os._exit(0)
+os.setsid()
+with open("child.pid", "w") as pid_file:
+    pid_file.write(str(os.getpid()))
+os.execl("/bin/sleep", "sleep", "60")
+"#,
+        )
+        .unwrap();
+        b"/usr/bin/python3 setsid.py\n"
+    };
+    let outside = shutdown_job(&shell, command, "sleep");
     let started = Instant::now();
     let outcome = shell.terminal.shutdown();
     let elapsed = started.elapsed();
@@ -536,7 +566,7 @@ fn ordinary_shutdown_leaves_a_process_that_left_the_session_holding_the_pty() {
         "a PTY held outside the family must not delay shutdown: {elapsed:?}"
     );
     assert!(
-        !holder::exits_within(&outside.0, Duration::ZERO).unwrap(),
+        !outside.0.wait_for_exit(Duration::ZERO).unwrap(),
         "ordinary shutdown must not stop a process outside the terminal's family"
     );
 }
@@ -569,6 +599,11 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     assert!(owner.holder.is_current());
     let registered_holder = pin_shutdown_process(owner.holder.pid);
     let child = shutdown_background_job(&shell);
+    let budget = ShutdownBudget {
+        join: ShutdownBudget::PATIENT.join,
+        ..ShutdownBudget::PRODUCT
+    };
+    shell.terminal.set_shutdown_budget_for_test(budget);
     shell.terminal.input(b"exit 3\n").unwrap();
     shell.wait_for("the worker's actual shell exit report", || {
         shell.terminal.events().try_iter().any(|event| {
@@ -582,34 +617,36 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
             )
         })
     });
-    assert!(!holder::exits_within(&child.0, Duration::ZERO).unwrap());
+    assert!(!child.0.wait_for_exit(Duration::ZERO).unwrap());
+    let mut events = Vec::new();
+    #[cfg(target_os = "macos")]
+    shell.wait_for("the natural PTY EOF cleanup decision", || {
+        events.extend(shell.terminal.events().try_iter());
+        events.iter().any(|event| {
+            matches!(event, TerminalEvent::Completed { .. }) || unconfirmed_child_cleanup(event)
+        })
+    });
     let unpublished = reaper.reserve().unwrap();
     let drain = reaper.begin_exit_drain();
-    // The job ignores its hangup and outlives the shell, so confirmation
-    // must run out: give it the product's deadline, and the caller enough
-    // patience to see the worker report that rather than give up first.
-    let budget = ShutdownBudget {
-        join: ShutdownBudget::PATIENT.join,
-        ..ShutdownBudget::PRODUCT
-    };
-    shell.terminal.set_shutdown_budget_for_test(budget);
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_err());
     assert!(started.elapsed() < budget.join);
     assert!(!shell.terminal.is_completed());
     assert!(shell.terminal.worker_joined_for_test());
-    let events = shell.terminal.events().try_iter().collect::<Vec<_>>();
+    events.extend(shell.terminal.events().try_iter());
     assert!(
-        events.iter().any(|event| matches!(
-            event,
-            TerminalEvent::Error {
-                operation: "wait for child",
-                message,
-            } if message == "Terminal process cleanup remains unconfirmed"
-        )),
+        events.iter().any(unconfirmed_child_cleanup),
         "shutdown took {:?}; events: {events:?}; one process census now: {}",
         started.elapsed(),
         census_cost()
+    );
+    #[cfg(target_os = "macos")]
+    assert_eq!(
+        crate::process::table::record(child.0.pid() as libc::pid_t)
+            .unwrap()
+            .session,
+        Some(owner.root.pid),
+        "the same-session job outlived Darwin's controlling tty"
     );
     assert!(
         !events
@@ -630,6 +667,14 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     // assertions; a live recoverable holder must not escape the test.
     drop(child);
     drop(registered_holder);
+}
+
+fn unconfirmed_child_cleanup(event: &TerminalEvent) -> bool {
+    matches!(
+        event,
+        TerminalEvent::Error { operation: "wait for child", message }
+            if message == "Terminal process cleanup remains unconfirmed"
+    )
 }
 
 #[test]
@@ -659,7 +704,7 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
     let started = Instant::now();
     assert!(shell.terminal.shutdown().is_ok());
     assert!(started.elapsed() < ShutdownBudget::PATIENT.join);
-    assert!(holder::exits_within(&root.0, Duration::ZERO).unwrap());
+    assert!(root.0.wait_for_exit(Duration::ZERO).unwrap());
     assert!(!shell.home.path().join("unexpected-root-exit").exists());
     assert!(shell.terminal.is_completed());
     let expected_signal = ExitStatus::from(std::process::ExitStatus::from_raw(libc::SIGKILL))
@@ -678,12 +723,12 @@ fn ordinary_shutdown_force_kills_its_pinned_root_when_the_census_fails() {
     );
 }
 
-struct ShutdownJob(File);
+struct ShutdownJob(crate::pinned_process::PinnedProcess);
 
 impl Drop for ShutdownJob {
     fn drop(&mut self) {
-        let _ = close_processes::signal(&self.0, libc::SIGKILL);
-        let _ = holder::exits_within(&self.0, Duration::from_secs(1));
+        let _ = self.0.signal(libc::SIGKILL);
+        let _ = self.0.wait_for_exit(Duration::from_secs(1));
     }
 }
 
@@ -715,9 +760,10 @@ fn shutdown_evidence(shell: &CloseSafetyShell) -> String {
 }
 
 fn pin_shutdown_process(pid: libc::pid_t) -> ShutdownJob {
-    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-    assert!(fd >= 0, "pin the fixture's exact terminal process");
-    ShutdownJob(unsafe { File::from_raw_fd(fd as libc::c_int) })
+    ShutdownJob(
+        crate::pinned_process::PinnedProcess::open_unreaped(pid as u32)
+            .expect("pin the fixture's exact terminal process"),
+    )
 }
 
 fn shutdown_job(shell: &CloseSafetyShell, command: &[u8], executable: &str) -> ShutdownJob {
@@ -730,15 +776,28 @@ fn shutdown_job(shell: &CloseSafetyShell, command: &[u8], executable: &str) -> S
         else {
             return false;
         };
-        if !fs::read_link(format!("/proc/{pid}/exe"))
-            .is_ok_and(|path| path.file_name() == Some(OsStr::new(executable)))
-        {
-            return false;
-        }
-        child = Some(pin_shutdown_process(pid));
-        true
+        child = matching_job(pid, executable);
+        child.is_some()
     });
     child.unwrap()
+}
+
+fn matching_job(pid: libc::pid_t, executable: &str) -> Option<ShutdownJob> {
+    let pin = crate::pinned_process::PinnedProcess::open(pid as u32).ok()?;
+    (pin.executable().ok()?.file_name() == Some(OsStr::new(executable))).then(|| ShutdownJob(pin))
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn job_is_stopped(pid: libc::pid_t) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+        stat.rsplit_once(") ")
+            .is_some_and(|(_, fields)| fields.starts_with('T'))
+    })
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn job_is_stopped(pid: libc::pid_t) -> bool {
+    crate::process::table::record(pid).is_ok_and(|record| record.bsd.pbsi_status == libc::SSTOP)
 }
 
 #[test]

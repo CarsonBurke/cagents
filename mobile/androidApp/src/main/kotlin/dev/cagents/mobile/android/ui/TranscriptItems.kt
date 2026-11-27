@@ -41,6 +41,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedCard
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -61,6 +62,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import dev.cagents.mobile.client.isBlankThinking
 import dev.cagents.mobile.protocol.CommandAction
+import dev.cagents.mobile.protocol.DetailKind
 import dev.cagents.mobile.protocol.Item
 import dev.cagents.mobile.protocol.ItemBody
 import dev.cagents.mobile.protocol.Role
@@ -68,7 +70,7 @@ import dev.cagents.mobile.protocol.ToolStatus
 
 /** One transcript item. Prose reads in full; tool activity is one line until opened. */
 @Composable
-fun TranscriptItem(item: Item) {
+internal fun TranscriptItem(item: Item, onDetail: ((TranscriptDetail) -> Unit)? = null) {
     if (item.isBlankThinking) return
     when (val body = item.body) {
         is ItemBody.Text -> when {
@@ -94,7 +96,12 @@ fun TranscriptItem(item: Item) {
             ).joinToString(" · "),
         ) {
             if (body.label.isNotBlank()) Code(body.command)
-            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped)
+            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped && onDetail == null)
+            if (body.clipped && onDetail != null) {
+                TextButton(onClick = { onDetail(TranscriptDetail(item.id, DetailKind.Output, "Command output")) }) {
+                    Text("Read full output")
+                }
+            }
         }
         is ItemBody.Changes -> {
             val added = body.files.sumOf { it.addedLines }
@@ -107,7 +114,15 @@ fun TranscriptItem(item: Item) {
                 trailing = "+$added −$removed",
             ) {
                 body.files.forEach { file ->
-                    Row(Modifier.fillMaxWidth().padding(vertical = 2.dp)) {
+                    Row(
+                        Modifier.fillMaxWidth()
+                            .then(
+                                if (onDetail == null) Modifier else Modifier.clickable {
+                                    onDetail(TranscriptDetail(item.id, DetailKind.Diff, file.path, file.path))
+                                },
+                            )
+                            .padding(vertical = 8.dp),
+                    ) {
                         Text(
                             buildString {
                                 file.from?.let { append(it).append(" → ") }
@@ -148,15 +163,23 @@ fun TranscriptItem(item: Item) {
             trailing = "",
         ) {
             if (body.input.isNotBlank() && body.input != "{}") Code(body.input)
-            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped)
+            if (body.output.isNotBlank()) Code(body.output, clipped = body.clipped && onDetail == null)
+            if (body.outputClipped && onDetail != null) {
+                TextButton(onClick = { onDetail(TranscriptDetail(item.id, DetailKind.Output, "Tool output")) }) {
+                    Text("Read full output")
+                }
+            }
         }
         is ItemBody.Image -> ActivityRow(
             id = item.id,
             icon = Icons.Outlined.Image,
             title = body.description.ifBlank { "Image" },
             status = null,
-            trailing = "on the computer",
+            trailing = if (body.available && onDetail != null) "View" else "on the computer",
             expandable = false,
+            onClick = if (body.available && onDetail != null) {
+                { onDetail(TranscriptDetail(item.id, DetailKind.Image, body.description.ifBlank { "Image" })) }
+            } else null,
         ) {}
         is ItemBody.Delivery -> Delivery(item.id, body)
         is ItemBody.Unknown -> SystemLine("Something this app can't show yet (${body.kind.ifBlank { "unknown" }})")
@@ -180,7 +203,8 @@ private fun UserMessage(text: String) {
 
 @Composable
 private fun AssistantText(text: String, quiet: Boolean) {
-    val blocks = remember(text) { markdownBlocks(text) }
+    val markdown = remember { IncrementalMarkdown() }
+    val blocks = remember(text) { markdown.blocks(text) }
     val color = if (quiet) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface
     val style = if (quiet) MaterialTheme.typography.bodyMedium else MaterialTheme.typography.bodyLarge
     SelectionContainer {
@@ -248,13 +272,18 @@ private fun ActivityRow(
     trailing: String,
     monospaceTitle: Boolean = false,
     expandable: Boolean = true,
+    onClick: (() -> Unit)? = null,
     detail: @Composable () -> Unit,
 ) {
     var open by rememberSaveable(id) { mutableStateOf(false) }
     Column(
         Modifier
             .fillMaxWidth()
-            .then(if (expandable) Modifier.clickable { open = !open } else Modifier)
+            .then(when {
+                onClick != null -> Modifier.clickable(onClick = onClick)
+                expandable -> Modifier.clickable { open = !open }
+                else -> Modifier
+            })
             .padding(horizontal = 16.dp, vertical = 5.dp)
             .animateContentSize(),
     ) {
@@ -313,7 +342,7 @@ private fun Delivery(id: String, body: ItemBody.Delivery) {
                 Icon(Icons.Outlined.Inbox, null, Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
                 Spacer(Modifier.width(8.dp))
                 Text(
-                    body.summary.ifBlank { body.from.ifBlank { "Delivered" } },
+                    body.heading,
                     style = MaterialTheme.typography.labelLarge,
                     maxLines = if (open) Int.MAX_VALUE else 1,
                     overflow = TextOverflow.Ellipsis,
@@ -333,7 +362,7 @@ private fun Delivery(id: String, body: ItemBody.Delivery) {
 }
 
 @Composable
-fun Code(text: String, clipped: Boolean = false) {
+fun Code(text: String, clipped: Boolean = false, preserveTrailingWhitespace: Boolean = false) {
     Surface(
         color = MaterialTheme.colorScheme.surfaceContainerHigh,
         shape = RoundedCornerShape(8.dp),
@@ -355,7 +384,7 @@ fun Code(text: String, clipped: Boolean = false) {
                     .horizontalScroll(rememberScrollState()),
             ) {
                 Text(
-                    text.trimEnd(),
+                    if (preserveTrailingWhitespace) text else text.trimEnd(),
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     softWrap = false,
@@ -387,40 +416,128 @@ sealed interface MarkdownBlock {
 }
 
 fun markdownBlocks(text: String): List<MarkdownBlock> {
-    val blocks = mutableListOf<MarkdownBlock>()
-    val paragraph = StringBuilder()
-    val code = StringBuilder()
-    var inCode = false
-    fun flushParagraph() {
-        if (paragraph.isNotBlank()) blocks += MarkdownBlock.Paragraph(paragraph.toString().trim('\n'))
-        paragraph.clear()
-    }
-    for (line in text.lines()) {
+    val lines = text.lines()
+    val reader = BlockReader()
+    for (i in 0 until lines.lastIndex) reader.line(lines[i])
+    return reader.ending(lines.last())
+}
+
+/**
+ * Markdown's blocks read a whole line at a time, so text that grows is read
+ * once: a paragraph or code block still open keeps growing until a line
+ * closes it.
+ */
+private class BlockReader {
+    /** The blocks closed so far. */
+    private val closed = mutableListOf<MarkdownBlock>()
+    private val paragraph = StringBuilder()
+    private val code = StringBuilder()
+    private var inCode = false
+
+    fun line(line: String) {
         val trimmed = line.trimStart()
         when {
-            trimmed.startsWith("```") -> {
+            isFence(trimmed) -> {
                 if (inCode) {
-                    blocks += MarkdownBlock.Code(code.toString().trimEnd('\n'))
+                    closed += codeBlock("")
                     code.clear()
                 } else {
-                    flushParagraph()
+                    paragraphBlock("")?.let(closed::add)
+                    paragraph.clear()
                 }
                 inCode = !inCode
             }
             inCode -> code.append(line).append('\n')
-            trimmed.startsWith("#") && trimmed.trimStart('#').startsWith(" ") -> {
-                flushParagraph()
-                val level = trimmed.takeWhile { it == '#' }.length
-                blocks += MarkdownBlock.Heading(level, trimmed.drop(level).trim())
+            isHeading(trimmed) -> {
+                paragraphBlock("")?.let(closed::add)
+                paragraph.clear()
+                closed += heading(trimmed)
             }
-            line.isBlank() -> flushParagraph()
+            line.isBlank() -> {
+                paragraphBlock("")?.let(closed::add)
+                paragraph.clear()
+            }
             else -> paragraph.append(line).append('\n')
         }
     }
-    // A fence still open is code still streaming.
-    if (inCode) blocks += MarkdownBlock.Code(code.toString().trimEnd('\n'))
-    flushParagraph()
-    return blocks
+
+    /**
+     * The blocks of the text read, ending with [last], a line with no line
+     * break after it. Leaves this reader as it was, for the text to go on.
+     */
+    fun ending(last: String): List<MarkdownBlock> {
+        val trimmed = last.trimStart()
+        val open = when {
+            // A fence still open is code still streaming.
+            isFence(trimmed) -> if (inCode) listOf(codeBlock("")) else listOfNotNull(paragraphBlock(""), MarkdownBlock.Code(""))
+            inCode -> listOf(codeBlock(last))
+            isHeading(trimmed) -> listOfNotNull(paragraphBlock(""), heading(trimmed))
+            last.isBlank() -> listOfNotNull(paragraphBlock(""))
+            else -> listOfNotNull(paragraphBlock(last))
+        }
+        return if (open.isEmpty()) closed.toList() else closed + open
+    }
+
+    private fun paragraphBlock(more: String): MarkdownBlock? {
+        val text = if (more.isEmpty()) paragraph.toString() else "$paragraph$more\n"
+        return if (text.isBlank()) null else MarkdownBlock.Paragraph(text.trim('\n'))
+    }
+
+    private fun codeBlock(more: String) = MarkdownBlock.Code("$code$more".trimEnd('\n'))
+
+    private fun isFence(trimmed: String) = trimmed.startsWith("```")
+
+    private fun isHeading(trimmed: String) = trimmed.startsWith("#") && trimmed.trimStart('#').startsWith(" ")
+
+    private fun heading(trimmed: String): MarkdownBlock {
+        val level = trimmed.takeWhile { it == '#' }.length
+        return MarkdownBlock.Heading(level, trimmed.drop(level).trim())
+    }
+}
+
+/**
+ * [markdownBlocks] for text that grows, as an answer streams. Each whole
+ * line is read once, so an append costs its own length and the block still
+ * open, not the whole answer. Text that doesn't extend the last is read
+ * again from the start.
+ */
+class IncrementalMarkdown {
+    private var reader = BlockReader()
+    private var text = ""
+
+    /** How much of [text] [reader] has read: whole lines, as [String.lines] has them. */
+    private var read = 0
+
+    /** Whether the last line read ended in a \r at the end of [text], which a \n may yet join. */
+    private var lastEndedInReturn = false
+
+    fun blocks(new: String): List<MarkdownBlock> {
+        if (new.length < read || !new.regionMatches(0, text, 0, read)) {
+            reader = BlockReader()
+            read = 0
+            lastEndedInReturn = false
+        }
+        text = new
+        if (lastEndedInReturn && read < new.length) {
+            if (new[read] == '\n') read++
+            lastEndedInReturn = false
+        }
+        var start = read
+        var i = read
+        while (i < new.length) {
+            val c = new[i]
+            if (c == '\n' || c == '\r') {
+                reader.line(new.substring(start, i))
+                lastEndedInReturn = c == '\r' && i + 1 == new.length
+                i += if (c == '\r' && i + 1 < new.length && new[i + 1] == '\n') 2 else 1
+                start = i
+            } else {
+                i++
+            }
+        }
+        read = start
+        return reader.ending(new.substring(read))
+    }
 }
 
 private val inlinePattern = Regex("""`([^`]+)`|\*\*([^*]+)\*\*|(?<![\w*])\*([^*\s][^*]*)\*(?![\w*])""")

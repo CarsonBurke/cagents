@@ -1,4 +1,5 @@
-//! Small immutable previews for the current composer's image attachments.
+//! Small immutable previews for the image attachments of the composer and
+//! of the reader's messages it shows ahead of the conversation.
 use super::*;
 
 const RECENT: usize = 8;
@@ -11,9 +12,15 @@ struct Entry {
 #[derive(Default)]
 pub(super) struct Cache(HashMap<PathBuf, Entry>);
 impl Cache {
-    pub(super) fn sync(&mut self, attachments: &[Attachment]) {
+    /// Keeps previews for `attachments`, the most recent last, up to
+    /// [`RECENT`] of them.
+    pub(super) fn sync<'a, I>(&mut self, attachments: I)
+    where
+        I: IntoIterator<Item = &'a Attachment>,
+        I::IntoIter: DoubleEndedIterator,
+    {
         let paths: Vec<_> = attachments
-            .iter()
+            .into_iter()
             .rev()
             .filter(|attachment| {
                 attachment.reference.is_some()
@@ -46,9 +53,6 @@ impl Cache {
                 loaded: None,
             });
         }
-    }
-    pub(super) fn clear(&mut self) {
-        self.0.clear();
     }
     pub(super) fn handle(&self, path: &Path) -> Option<&iced::widget::image::Handle> {
         match self.0.get(path)?.loaded.as_ref()? {
@@ -258,7 +262,7 @@ mod tests {
             cache.0.get(source.as_path()).unwrap().loaded,
             Some(images::Loaded::Unavailable)
         ));
-        cache.clear();
+        cache.sync(&[]);
         assert!(cache.0.is_empty());
     }
 }

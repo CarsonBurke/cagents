@@ -3,7 +3,7 @@ use std::{
     ffi::{OsStr, OsString},
     io::{self, IsTerminal, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsFd, AsRawFd},
         unix::{net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
@@ -43,6 +43,8 @@ mod completions;
 pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
 mod daemon_stop_tests;
+#[cfg(target_os = "macos")]
+mod darwin_ui;
 mod sessions;
 #[cfg(test)]
 mod startup_route;
@@ -82,10 +84,10 @@ use crate::{
     terminal::{
         self, TerminalSpawnOptions,
         ipc::{
-            ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolErrorCode,
-            SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse, ShutdownCapability,
-            ShutdownOperation, ShutdownOutcome, ShutdownPreflight, TerminalDescriptor,
-            TerminalSnapshot, TerminalVisibility,
+            ClientEnvelope, ClientRequest, FrameError, PROTOCOL_VERSION, ProtocolError,
+            ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
+            ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+            TerminalDescriptor, TerminalSnapshot, TerminalVisibility,
             client_session::{HandshakeError, validate_handshake},
             daemon_socket_path, read_frame, write_frame,
         },
@@ -138,24 +140,24 @@ const UI_PREDECESSOR_EXIT_TIMEOUT: Duration = Duration::from_secs(10);
 /// out lowers it for its own threads with [`ordinary_budget::quick`]; nothing
 /// else can change it.
 fn io_timeout() -> Duration {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     {
         ordinary_budget::current()
     }
-    #[cfg(not(test))]
+    #[cfg(not(any(test, feature = "test-support")))]
     {
         IO_TIMEOUT
     }
 }
 
-#[cfg(test)]
-pub(crate) mod ordinary_budget {
+#[cfg(any(test, feature = "test-support"))]
+pub mod ordinary_budget {
     use std::cell::Cell;
     use std::time::Duration;
 
     /// Short enough that waiting one out costs little, and still long beside
     /// an in-process exchange.
-    pub(crate) const QUICK: Duration = Duration::from_secs(1);
+    pub const QUICK: Duration = Duration::from_secs(1);
 
     thread_local! {
         static BUDGET: Cell<Duration> = const { Cell::new(super::IO_TIMEOUT) };
@@ -168,7 +170,7 @@ pub(crate) mod ordinary_budget {
     /// Lower the ordinary budget on this thread to [`QUICK`] until the guard
     /// drops. A client must be created and used on a thread holding it.
     #[must_use = "the budget is restored when the guard drops"]
-    pub(crate) fn quick() -> impl Drop {
+    pub fn quick() -> impl Drop {
         struct Restore(Duration);
         impl Drop for Restore {
             fn drop(&mut self) {
@@ -423,6 +425,9 @@ pub enum TopCommand {
         /// Publish files while preserving running windows and the daemon.
         #[arg(long)]
         stage_only: bool,
+        /// Run an offline publication script under the launch fence.
+        #[arg(long, conflicts_with = "stage_only")]
+        publish_only: bool,
         #[arg(last = true)]
         #[arg(help = "Arguments passed to the installer after --.")]
         arguments: Vec<OsString>,
@@ -433,6 +438,9 @@ pub enum TopCommand {
         #[arg(long)]
         #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
+        /// Check the launch fence for offline publication.
+        #[arg(long, conflicts_with = "stage_only")]
+        publish_only: bool,
     },
     /// Record that staged files must retain windows on the running daemon's UI.
     #[command(hide = true)]
@@ -480,8 +488,12 @@ pub enum DaemonCommand {
     #[command(hide = true)]
     Bridge {
         /// Serve the stable mobile API instead, as JSON lines (docs/mobile-api.md).
-        #[arg(long)]
+        #[arg(long, conflicts_with = "pair")]
         mobile: bool,
+        /// Take one phone's pairing request for the pairing in this directory:
+        /// the forced command of a one-time pairing key (docs/mobile-api.md).
+        #[arg(long, value_name = "DIRECTORY")]
+        pair: Option<PathBuf>,
     },
     /// Start the daemon if it is not already running.
     Start,
@@ -852,6 +864,8 @@ pub enum ControlError {
     SnapshotTimeout,
     #[error("the daemon returned a terminal list page that does not follow the previous one")]
     StalledListPage,
+    #[error("the daemon returned an invalid page for the retired input queue")]
+    InvalidExitedQueuePage,
     #[error("timed out waiting for terminal {terminal_id} to contain {text:?}")]
     WaitTimeout {
         terminal_id: TerminalId,
@@ -984,6 +998,12 @@ pub struct ModelEdge {
     pub effects: crate::workspace_model::delta::EditEffects,
 }
 
+/// The old provider's independently verified queue and the successor result.
+pub type PreparedChatResume = (
+    Option<crate::chat::ExitedQueue>,
+    Result<crate::chat::Session, ProtocolError>,
+);
+
 /// A bounded, synchronous client for the current cagents daemon protocol.
 pub struct ControlClient {
     stream: UnixStream,
@@ -1002,6 +1022,8 @@ pub struct ControlClient {
     /// buffered for the same reason `observed` buffers an inventory edge.
     observed_model: VecDeque<ModelEdge>,
     observed_notifications: VecDeque<crate::notifications::Update>,
+    mobile_watch: Option<crate::terminal::ipc::MobileWatch>,
+    mobile_changed: bool,
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
@@ -1053,7 +1075,9 @@ impl std::fmt::Debug for ControlClient {
 /// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
 /// fresh nonblocking sockets within the same establishment deadline, rather
 /// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
+/// Darwin answers that pressure with a refusal, which callers take to mean no
+/// daemon runs; see [`crate::descriptor::retry_refusal`].
+pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -1067,6 +1091,7 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
         *target = *byte as _;
     }
     let deadline = Instant::now() + timeout;
+    let refusing_since = Instant::now();
     let mut delay = Duration::from_millis(1);
     loop {
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1076,18 +1101,8 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
                 "daemon socket connection deadline elapsed",
             ));
         }
-        // SAFETY: socket returns a new descriptor transferred to this stream.
-        let fd = unsafe {
-            libc::socket(
-                libc::AF_UNIX,
-                libc::SOCK_STREAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
-                0,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let stream = unsafe { UnixStream::from_raw_fd(fd) };
+        let stream = UnixStream::from(crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?);
+        let fd = stream.as_raw_fd();
         // SAFETY: address is initialized with its valid length and the
         // descriptor belongs exclusively to this connection attempt.
         let result = unsafe {
@@ -1105,7 +1120,8 @@ pub(crate) fn connect_control_socket(path: &Path, timeout: Duration) -> io::Resu
         if !matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) {
+        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
+        {
             return Err(error);
         }
         // EAGAIN has not queued a connection. Close this attempt before
@@ -1129,6 +1145,14 @@ pub struct ResidentTerminals {
 impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
+        Self::connect_observing_socket(socket_path, |_| Ok(()))
+    }
+
+    /// Make the socket available for cancellation before the handshake.
+    pub(crate) fn connect_observing_socket(
+        socket_path: &Path,
+        connected: impl FnOnce(&UnixStream) -> io::Result<()>,
+    ) -> Result<Self, ControlError> {
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
         let deadline = Instant::now() + Self::handshake_timeout();
@@ -1138,6 +1162,7 @@ impl ControlClient {
                 io_timeout().min(deadline.saturating_duration_since(Instant::now())),
             )
             .map_err(ControlError::Connect)?;
+            connected(&stream).map_err(ControlError::Configure)?;
             Self::from_stream_inner(
                 stream,
                 deadline,
@@ -1240,6 +1265,8 @@ impl ControlClient {
         protocol: u16,
         extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<Self, ControlError> {
+        crate::descriptor::keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&stream))
+            .map_err(ControlError::Configure)?;
         stream
             .set_read_timeout(Some(Self::handshake_timeout()))
             .map_err(ControlError::Configure)?;
@@ -1268,6 +1295,8 @@ impl ControlClient {
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
+            mobile_watch: None,
+            mobile_changed: false,
             observed_work: None,
             observed_conversation: None,
             attached_chats: BTreeSet::new(),
@@ -1287,19 +1316,30 @@ impl ControlClient {
     /// Panics if anything was asked on it: a reply or notification it read
     /// would be lost to the new owner.
     pub fn into_handshaken_stream(self) -> (UnixStream, HostSessionProof) {
+        assert_eq!(
+            self.next_request_id, 2,
+            "the connection has already sent a request"
+        );
+        let (stream, proof, _) = self.into_unsubscribed_stream();
+        (stream, proof)
+    }
+
+    /// Hand over a current-protocol connection after ordinary round trips.
+    /// The new owner keeps the request sequence, and must subscribe itself.
+    pub(crate) fn into_unsubscribed_stream(self) -> (UnixStream, HostSessionProof, u64) {
         assert!(
             self.protocol == PROTOCOL_VERSION
-                && self.next_request_id == 2
                 && self.observed.is_empty()
                 && self.observed_model.is_empty()
                 && self.observed_notifications.is_empty()
+                && self.mobile_watch.is_none()
                 && self.observed_work.is_none()
                 && self.observed_conversation.is_none()
                 && self.attached_chats.is_empty()
                 && self.terminal_streams.is_empty(),
-            "only a connection that has asked nothing since its handshake can be handed over"
+            "only an unsubscribed current-protocol connection can be handed over"
         );
-        (self.stream, self.proof)
+        (self.stream, self.proof, self.next_request_id)
     }
 
     /// Whether nothing has arrived on this connection since its last reply,
@@ -1331,11 +1371,11 @@ impl ControlClient {
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.
-    #[cfg(any(feature = "ui", all(test, feature = "host")))]
-    pub(crate) fn commit_terminal_handoff(
-        &mut self,
-        terminal_id: TerminalId,
-    ) -> Result<(), ControlError> {
+    #[cfg(any(
+        feature = "ui",
+        all(any(test, feature = "test-support"), feature = "host")
+    ))]
+    pub fn commit_terminal_handoff(&mut self, terminal_id: TerminalId) -> Result<(), ControlError> {
         match self.request_strict(ClientRequest::ChatCommitTerminal { terminal_id })? {
             ServerResponse::Accepted => Ok(()),
             response => Err(unexpected_response(
@@ -1553,6 +1593,61 @@ impl ControlClient {
         }
     }
 
+    pub(crate) fn watch_mobile(
+        &mut self,
+        topic: crate::terminal::ipc::MobileWatch,
+    ) -> Result<(), ControlError> {
+        self.mobile_watch = Some(topic);
+        self.accepted(ClientRequest::WatchMobile { topic })
+    }
+
+    /// Await the next invalidation. A read can be interrupted by a newer
+    /// invalidation; keep that edge for the next pass.
+    pub(crate) fn next_mobile_change(&mut self) -> Result<(), ControlError> {
+        if std::mem::take(&mut self.mobile_changed) {
+            return Ok(());
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        let envelope = self.read_envelope()?;
+        self.validate_pinned_envelope(&envelope)?;
+        match envelope.message {
+            ServerMessage::MobileChanged { topic }
+                if envelope.request_id.is_none() && Some(topic) == self.mobile_watch =>
+            {
+                Ok(())
+            }
+            ServerMessage::HostShuttingDown => Err(ControlError::ConnectionClosed),
+            message => Err(ControlError::UnexpectedMessage {
+                expected: "a mobile watch update",
+                actual: message_name(&message),
+            }),
+        }
+    }
+
+    pub(crate) fn mobile_sessions(
+        &mut self,
+    ) -> Result<Vec<crate::agent_execution::directory::Member>, ControlError> {
+        self.stream
+            .set_read_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        let reply = self.agent(
+            Authority::default(),
+            crate::agent_execution::Operation::Context {
+                scope: crate::agent_execution::directory::Scope::All,
+                standing: false,
+            },
+        )?;
+        match reply {
+            crate::agent_execution::Reply::Context(context) => Ok(context.sessions.sessions),
+            _ => Err(ControlError::UnexpectedResponse {
+                expected: "mobile sessions",
+                actual: "agent reply",
+            }),
+        }
+    }
+
     pub fn watch_notifications(
         &mut self,
         presence: crate::notifications::Presence,
@@ -1589,6 +1684,13 @@ impl ControlClient {
         observed: crate::notifications::review::ObservedRequests,
     ) -> Result<(), ControlError> {
         self.accepted(ClientRequest::ObserveReviewRequests { observed })
+    }
+
+    pub fn observe_review_monitor(
+        &mut self,
+        update: crate::notifications::review::MonitorUpdate,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::ObserveReviewMonitor { update })
     }
 
     pub fn notification_presence(
@@ -2051,6 +2153,101 @@ impl ControlClient {
             ServerResponse::ChatResumePrepared { session } => Ok(session),
             response => Err(unexpected_response(
                 "a prepared conversation resume",
+                &response,
+            )),
+        }
+    }
+
+    /// Prepare an exact successor while preserving the old provider's
+    /// verified final queue, even when later preparation is refused.
+    pub fn prepare_chat_resume_with_queue(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<PreparedChatResume, ControlError> {
+        let expected = source.id;
+        match self.request_strict(ClientRequest::ChatPrepareResumeWithQueue { source })? {
+            ServerResponse::ChatResumePreparedWithQueue {
+                source,
+                queued,
+                prepared,
+            } if source == expected => {
+                let queued = queued
+                    .map(|first| {
+                        crate::terminal_ipc::collect_exited_queue(
+                            source,
+                            first,
+                            |request| self.request_strict(request),
+                            || ControlError::InvalidExitedQueuePage,
+                        )
+                    })
+                    .transpose()?;
+                Ok((queued, prepared))
+            }
+            response => Err(unexpected_response(
+                "a prepared conversation resume with its exact final queue",
+                &response,
+            )),
+        }
+    }
+
+    /// A completed native actor's exact held input, without preparing or
+    /// launching a successor. An unavailable receipt is distinct from empty.
+    pub fn read_exited_chat_queue(
+        &mut self,
+        source: crate::chat::Session,
+    ) -> Result<Option<crate::chat::ExitedQueue>, ControlError> {
+        let expected = source.id;
+        match self.request_strict(ClientRequest::ChatReadExitedQueue {
+            source,
+            execution: None,
+        })? {
+            ServerResponse::ChatExitedQueue { source, queued } if source == expected => queued
+                .map(|first| {
+                    crate::terminal_ipc::collect_exited_queue(
+                        source,
+                        first,
+                        |request| self.request_strict(request),
+                        || ControlError::InvalidExitedQueuePage,
+                    )
+                })
+                .transpose(),
+            response => Err(unexpected_response(
+                "a completed chat's exact queue",
+                &response,
+            )),
+        }
+    }
+
+    /// Release a completed queue after the exact input and its replay
+    /// checkpoint have been saved together.
+    pub fn commit_exited_chat_queue(
+        &mut self,
+        source: crate::chat::Session,
+        queue_ids: Vec<String>,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::ChatCommitExitedQueue { source, queue_ids })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "an exited queue acknowledgement",
+                &response,
+            )),
+        }
+    }
+
+    /// The exact recipient's captured provider account, resolved by the
+    /// daemon hosting it rather than the machine running the window.
+    pub fn chat_queue_recipient_scope(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<Option<[u8; 32]>, ControlError> {
+        let expected = session.id;
+        match self.request_strict(ClientRequest::ChatQueueRecipientScope { session })? {
+            ServerResponse::ChatQueueRecipientScope {
+                source,
+                account_scope,
+            } if source == expected => Ok(account_scope),
+            response => Err(unexpected_response(
+                "a chat's captured queue scope",
                 &response,
             )),
         }
@@ -2872,8 +3069,8 @@ impl ControlClient {
     }
 
     /// Exercises the public control wire in host integration fixtures.
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn fixture_request(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn fixture_request(
         &mut self,
         request: ClientRequest,
     ) -> Result<ServerResponse, ControlError> {
@@ -3036,6 +3233,9 @@ impl ControlClient {
     fn absorb(&mut self, message: ServerMessage) -> Option<ServerMessage> {
         match message {
             ServerMessage::TerminalWorker { .. } => {}
+            ServerMessage::MobileChanged { topic } if Some(topic) == self.mobile_watch => {
+                self.mobile_changed = true;
+            }
             ServerMessage::TerminalCreated { terminal } => self.observed.push_back(terminal),
             ServerMessage::WorkspaceModelEdited {
                 sequence,
@@ -3099,6 +3299,8 @@ impl ControlClient {
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
             | ServerMessage::ChatActiveModel { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
+            ServerMessage::ChatQueueEnded { source, .. }
+                if self.attached_chats.contains(&source.id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
             | ServerMessage::TerminalObserved { terminal_id, .. }
@@ -3372,10 +3574,12 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatChanged { .. }
         | ServerMessage::ChatObserved { .. }
         | ServerMessage::ChatActivity { .. }
+        | ServerMessage::ChatQueueEnded { .. }
         | ServerMessage::TerminalCreated { .. }
         | ServerMessage::WorkspaceModelEdited { .. }
         | ServerMessage::ChatAccountUsage { .. }
         | ServerMessage::NotificationsChanged
+        | ServerMessage::MobileChanged { .. }
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
@@ -3408,6 +3612,8 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
         ServerMessage::ChatActiveModel { .. } => "chat_active_model",
         ServerMessage::NotificationsChanged => "notifications_changed",
+        ServerMessage::MobileChanged { .. } => "mobile_changed",
+        ServerMessage::ChatQueueEnded { .. } => "chat_queue_ended",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
@@ -3458,6 +3664,10 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::WorkspaceEdit(_) => "workspace_edit",
         ServerResponse::WorkspaceMetadata(_) => "workspace_metadata",
         ServerResponse::ChatResumePrepared { .. } => "chat_resume_prepared",
+        ServerResponse::ChatResumePreparedWithQueue { .. } => "chat_resume_prepared_with_queue",
+        ServerResponse::ChatQueueRecipientScope { .. } => "chat_queue_recipient_scope",
+        ServerResponse::ChatExitedQueuePage { .. } => "chat_exited_queue_page",
+        ServerResponse::ChatExitedQueue { .. } => "chat_exited_queue",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",
@@ -4065,20 +4275,40 @@ where
     .then(ServiceRequestContext::capture);
     if !crate::device::is_remote()
         && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
-        && !service_context
-            .as_ref()
-            .is_some_and(|context| context.scoped())
     {
-        let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
-            Ok(Some(bin)) => {
+        let scoped = service_context
+            .as_ref()
+            .is_some_and(ServiceRequestContext::scoped);
+        let executable = crate::process::current_executable().unwrap_or_default();
+        let staged_cli = if !scoped {
+            let recover = !no_start && staged_command_requires_daemon(&cli.command);
+            staged_lookup(&executable, recover)
+                .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Cli.file_name())))
+        } else if matches!(
+            cli.command,
+            TopCommand::Agent {
+                command: AgentCommand::List { .. } | AgentCommand::Spawn { .. }
+            }
+        ) {
+            // Use only a live owner whose shipped CLI handles this scoped
+            // request. Resolve it before Spawn can read the original stdin.
+            let owner = crate::install_guard::staged_agent_owner_cli(&executable)
+                .inspect_err(
+                    |error| tracing::debug!(%error, "could not verify staged agent routing"),
+                )
+                .ok()
+                .flatten();
+            Ok(owner)
+        } else {
+            Ok(None)
+        };
+        match staged_cli {
+            Ok(Some(executable)) => {
                 use std::os::unix::process::CommandExt;
-                let mut command =
-                    Command::new(bin.join(crate::companion::Product::Cli.file_name()));
-                // Carry implicit stop/environment policy into the matched CLI.
-                // An older owner that lacks this flag must refuse parsing
-                // rather than recover/start services before handling the read.
-                if inherited_no_start && !cli.global.no_start {
+                let mut command = Command::new(executable);
+                // Carry implicit stop policy into the matched CLI. Scoped
+                // delegation never starts or recovers a missing service.
+                if (inherited_no_start || scoped) && !cli.global.no_start {
                     command.arg("--no-start");
                 }
                 command.args(&arguments[1..]);
@@ -4095,9 +4325,18 @@ where
         }
     }
     if let TopCommand::Daemon {
-        command: DaemonCommand::Bridge { mobile },
+        command: DaemonCommand::Bridge { mobile, pair },
     } = cli.command
     {
+        if let Some(directory) = pair {
+            return match crate::mobile::pairing::serve_pairing(&directory) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("cagents daemon bridge --pair: {error}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
         let served = if mobile {
             crate::mobile::serve_bridge()
         } else {
@@ -4221,7 +4460,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 /// Desktop launches need the same matched owner as CLI launches while a staged
 /// update is pending. Internal helpers and remote devices do not use this route.
 pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
+    crate::install_guard::staged_owner_bin(&crate::process::current_executable()?, true)
         .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
@@ -4287,15 +4526,26 @@ fn execute_with_model_context(
             prefix,
             installer,
             stage_only,
+            publish_only,
             arguments,
         } => {
-            crate::install_guard::run(&prefix, &installer, &arguments, stage_only)
+            use crate::install_guard::InstallMode;
+            let mode = if publish_only {
+                InstallMode::Publish
+            } else if stage_only {
+                InstallMode::Stage
+            } else {
+                InstallMode::Replace
+            };
+            crate::install_guard::run(&prefix, &installer, &arguments, mode)
                 .map_err(|error| AppError::new("install", error))?;
             let selected = stage_only && arguments.iter().any(|argument| argument == "--select");
             Ok(CommandOutput {
                 command: "update.coordinate_install",
-                data: json!({"reopened": !stage_only, "staged": stage_only, "selected": selected}),
-                human: if selected {
+                data: json!({"reopened": !stage_only && !publish_only, "staged": stage_only, "selected": selected}),
+                human: if publish_only {
+                    "Installation published"
+                } else if selected {
                     "Installed version selected; running windows and daemon preserved"
                 } else if stage_only {
                     "Update staged; running windows and daemon preserved"
@@ -4305,8 +4555,13 @@ fn execute_with_model_context(
                 .into(),
             })
         }
-        TopCommand::VerifyInstallGuard { stage_only } => {
-            (if stage_only {
+        TopCommand::VerifyInstallGuard {
+            stage_only,
+            publish_only,
+        } => {
+            (if publish_only {
+                crate::install_guard::verify_publication()
+            } else if stage_only {
                 instance::validate_stage_guard()
             } else {
                 instance::validate_install_guard()
@@ -4469,7 +4724,17 @@ pub(crate) fn spawn_ui_process(command: &mut Command) -> io::Result<Option<Strin
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
-        .env(UI_LAUNCH_PANE_NOTES_ENV, "1")
+        .env(UI_LAUNCH_PANE_NOTES_ENV, "1");
+    #[cfg(target_os = "macos")]
+    if let Some(bundle) = crate::update::stable_ui_bundle(
+        Path::new(command.get_program()),
+        &crate::process::current_executable()?,
+    )
+    .map_err(io::Error::other)?
+    {
+        return darwin_ui::launch(command, &bundle, timeout);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -4509,7 +4774,15 @@ fn finish_ui_launch(
                             Ok(0) => break,
                             Ok(_) => {}
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                                thread::sleep(Duration::from_millis(100))
+                                if crate::descriptor::wait_for_activity(
+                                    stdout.as_fd(),
+                                    libc::POLLIN,
+                                    None,
+                                )
+                                .is_err()
+                                {
+                                    break;
+                                }
                             }
                             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
                             Err(_) => break,
@@ -4545,17 +4818,10 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
 }
 
 fn read_ui_launch_handshake(
-    stdout: &mut ChildStdout,
+    response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
-    let descriptor = stdout.as_raw_fd();
-    // SAFETY: fcntl receives a live descriptor and integer flags only.
-    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-    if flags == -1
-        || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
+    crate::descriptor::set_nonblocking(response_stream.as_fd())?;
 
     let started = Instant::now();
     let mut deadline = started + timeout;
@@ -4563,7 +4829,7 @@ fn read_ui_launch_handshake(
     let mut response = Vec::new();
     let mut buffer = [0_u8; 256];
     loop {
-        match stdout.read(&mut buffer) {
+        match response_stream.read(&mut buffer) {
             Ok(0) => {
                 return Err(io::Error::new(
                     io::ErrorKind::UnexpectedEof,
@@ -4602,7 +4868,11 @@ fn read_ui_launch_handshake(
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                if Instant::now() >= deadline {
+                if !crate::descriptor::wait_for_activity(
+                    response_stream.as_fd(),
+                    libc::POLLIN,
+                    Some(deadline),
+                )? {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         if recovery_announced {
@@ -4616,7 +4886,6 @@ fn read_ui_launch_handshake(
                         },
                     ));
                 }
-                thread::sleep(Duration::from_millis(10));
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => {}
             Err(error) => return Err(error),
@@ -6707,7 +6976,7 @@ mod tests {
         }
         // A reaped source supplies genuine exit evidence before any descriptor
         // is opened; no unrelated fixture can inherit the reservation.
-        let mut source = Command::new("/bin/true").spawn().unwrap();
+        let mut source = Command::new("true").spawn().unwrap();
         let source_pid = source.id();
         source.wait().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -6761,6 +7030,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
+    )]
     fn inherited_daemon_lease_is_not_a_serving_daemon() {
         #[cfg(target_os = "linux")]
         if crate::retained_fixture::run_isolated() {
@@ -6803,7 +7076,7 @@ mod tests {
                 assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), 199) }, 199);
                 let reserved = unsafe { std::fs::File::from_raw_fd(199) };
                 let error = crate::daemon::lease_handoff::inherit_daemon_lease(
-                    &mut std::process::Command::new("/bin/true"),
+                    &mut std::process::Command::new("true"),
                 )
                 .unwrap_err();
                 assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
@@ -7168,6 +7441,10 @@ mod tests {
     /// as `scripts/run-development --stop-instance` does, unless that daemon
     /// hosts it. The daemon here is a process holding the instance's lock.
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "the fixture holds its lock with util-linux flock(1)"
+    )]
     fn hosted_stop_for_rebuild_ends_only_a_development_daemon_that_does_not_host_it() {
         use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
         const CHILD: &str = "CAGENTS_TEST_HOSTED_STOP_FOR_REBUILD";
@@ -7405,7 +7682,7 @@ mod tests {
         }
         let socket = daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
-        let listener = UnixListener::bind(&socket).unwrap();
+        let listener = crate::descriptor::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let before = std::fs::symlink_metadata(&socket).unwrap();
         let pinned = proof("fixture-host", "fixture-boot", "fixture-incarnation");
@@ -7433,7 +7710,7 @@ mod tests {
                 revents: 0,
             };
             assert_eq!(unsafe { libc::poll(&mut event, 1, 5000) }, 1);
-            let (mut stream, _) = listener.accept().unwrap();
+            let (mut stream, _) = crate::descriptor::accept(listener).unwrap();
             stream
                 .set_read_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
@@ -7512,7 +7789,7 @@ mod tests {
                 let peer = thread::spawn(move || {
                     let deadline = Instant::now() + Duration::from_secs(5);
                     while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                        match observed.accept() {
+                        match crate::descriptor::accept(&observed) {
                             Ok((stream, _)) => {
                                 drop(stream);
                                 return true;
@@ -7531,7 +7808,7 @@ mod tests {
                 assert_eq!(result.unwrap_err().kind(), io::ErrorKind::PermissionDenied);
             }
             assert!(
-                matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
+                matches!(crate::descriptor::accept(&listener), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
             );
             let after = std::fs::symlink_metadata(&socket).unwrap();
             assert_eq!((after.dev(), after.ino()), (before.dev(), before.ino()));
@@ -8135,11 +8412,12 @@ mod tests {
     fn saturated_control_listener(
         path: &Path,
     ) -> (std::os::unix::net::UnixListener, Vec<UnixStream>) {
-        let listener = std::os::unix::net::UnixListener::bind(path).unwrap();
-        assert_eq!(unsafe { libc::listen(listener.as_raw_fd(), 1) }, 0);
-        let pending = (0..2)
-            .map(|_| connect_control_socket(path, Duration::from_millis(100)).unwrap())
-            .collect();
+        let listener = crate::descriptor::bind(path).unwrap();
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let pending = vec![connect_control_socket(path, Duration::from_millis(100)).unwrap()];
         (listener, pending)
     }
 
@@ -8179,7 +8457,7 @@ mod tests {
                     1,
                     "owned fixture connection must arrive"
                 );
-                listener.accept().unwrap()
+                crate::descriptor::accept(&listener).unwrap()
             };
             for _ in 0..pending.len() {
                 drop(accept());
@@ -8205,6 +8483,10 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "Darwin cannot shut down a listener another descriptor still holds"
+    )]
     fn control_socket_connection_preserves_missing_and_refused_error_classification() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("daemon.sock");
@@ -8214,7 +8496,7 @@ mod tests {
                 .kind(),
             io::ErrorKind::NotFound
         );
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         // A forked child can retain this socket description until it execs.
         // Keep that interleaving present while checking the refused endpoint.
         let inherited_listener = listener.try_clone().unwrap();
@@ -8550,7 +8832,10 @@ mod tests {
         assert_eq!(error.kind, "repository");
         assert_eq!(
             error.message,
-            format!("`{}` is not a directory", file.display())
+            format!(
+                "`{}` is not a directory",
+                std::fs::canonicalize(&file).unwrap().display()
+            )
         );
 
         if Command::new("git").arg("--version").output().is_err() {
@@ -10478,6 +10763,15 @@ mod tests {
                 None,
                 activity(closed, ActivityState::Working),
             );
+            send(
+                &mut server_stream,
+                None,
+                ServerMessage::ChatQueueEnded {
+                    source: session.clone(),
+                    execution: uuid::Uuid::new_v4(),
+                    current: true,
+                },
+            );
             respond(
                 &mut server_stream,
                 attach.request_id,
@@ -10616,6 +10910,12 @@ mod tests {
             })
         ));
         assert!(client.attached_chats.is_empty());
+        let foreign_queue = ServerMessage::ChatQueueEnded {
+            source: session(elsewhere),
+            execution: uuid::Uuid::new_v4(),
+            current: true,
+        };
+        assert_eq!(client.absorb(foreign_queue.clone()), Some(foreign_queue));
         assert!(client.list_chats().unwrap().is_empty());
         assert!(matches!(
             client.list_chats(),
@@ -11856,6 +12156,19 @@ mod tests {
         assert_eq!(
             spawn_ui_process(&mut command).unwrap().as_deref(),
             Some("One pane could not reconnect. Another is still reconnecting.")
+        );
+    }
+
+    #[test]
+    fn ui_launch_handshake_keeps_buffered_readiness_after_socket_close() {
+        let (mut parent, mut window) = UnixStream::pair().unwrap();
+        window
+            .write_all(b"recovering: 1\nready-with-pane-notes: Exact pane kept.\n")
+            .unwrap();
+        drop(window);
+        assert_eq!(
+            read_ui_launch_handshake(&mut parent, Duration::from_secs(5)).unwrap(),
+            Some("Exact pane kept.".into())
         );
     }
 

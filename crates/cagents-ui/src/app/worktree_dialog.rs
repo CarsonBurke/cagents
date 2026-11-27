@@ -545,11 +545,8 @@ impl Cagents {
                 // so the folder's own name, at its end, stays in view.
                 widget::row::with_children(vec![
                     design::caption("Folder").into(),
-                    design::caption(dialog.draft.destination.trim())
-                        .wrapping(iced::widget::text::Wrapping::None)
-                        .ellipsize(iced::widget::text::Ellipsize::Start(
-                            cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                        ))
+                    crate::ui_controls::FadeText::caption(dialog.draft.destination.trim())
+                        .edge(crate::ui_controls::FadeEdge::Start)
                         .width(Length::Fill)
                         .into(),
                 ])

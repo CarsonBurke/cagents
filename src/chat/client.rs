@@ -204,7 +204,7 @@ fn trace_worker_stack(role: &'static str) {
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
-    let result = UnixStream::connect(path);
+    let result = crate::descriptor::connect_settled(path);
     #[cfg(feature = "ui")]
     crate::daemon_health::connection_io(path, &result, health_request);
     result
@@ -274,11 +274,131 @@ pub enum Wake {
     /// subagents; read them with `agent_addresses`.
     AgentAddresses,
     Disconnected(String),
+    ExitedQueue(TerminalId, Vec<super::QueuedMessage>),
+    /// The authenticated source and whole queue of an attached or archived
+    /// ended provider, independent of the current presentation descriptor.
+    CompletedQueue {
+        source: Box<Session>,
+        messages: Vec<super::QueuedMessage>,
+        current: bool,
+    },
 }
 #[derive(Clone)]
 pub struct ClientHandle {
     inner: Arc<Inner>,
 }
+struct CompletedQueueNotice {
+    source: Session,
+    execution: Option<uuid::Uuid>,
+    current: bool,
+}
+
+fn remember_queue_execution(
+    seen: &mut [Option<uuid::Uuid>; 2],
+    execution: uuid::Uuid,
+) -> Result<bool, &'static str> {
+    if seen.contains(&Some(execution)) {
+        return Ok(false);
+    }
+    let slot = seen
+        .iter_mut()
+        .find(|entry| entry.is_none())
+        .ok_or("Too many native queue receipts for one attachment")?;
+    *slot = Some(execution);
+    Ok(true)
+}
+
+struct CompletedQueueRead {
+    notice: CompletedQueueNotice,
+    request: u64,
+    collector: Option<ipc::ExitedQueueCollector>,
+}
+
+impl CompletedQueueRead {
+    fn begin(
+        wire: &Mutex<Wire>,
+        proof: &HostSessionProof,
+        next: &AtomicU64,
+        notice: CompletedQueueNotice,
+    ) -> Result<Self, String> {
+        if notice.source.proof.as_ref() != Some(proof) {
+            return Err("Completed chat queue names a different daemon".into());
+        }
+        let request = next.fetch_add(1, Ordering::Relaxed);
+        transmit(
+            wire,
+            proof,
+            request,
+            ClientRequest::ChatReadExitedQueue {
+                source: notice.source.clone(),
+                execution: notice.execution,
+            },
+        )?;
+        Ok(Self {
+            notice,
+            request,
+            collector: None,
+        })
+    }
+
+    fn accept(
+        mut self,
+        wire: &Mutex<Wire>,
+        proof: &HostSessionProof,
+        next: &AtomicU64,
+        message: ServerMessage,
+        wake: &dyn Fn(Wake),
+    ) -> Result<Option<Self>, String> {
+        match message {
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueue { source, queued },
+            } if self.collector.is_none() && source == self.notice.source.id => {
+                let Some(first) = queued else {
+                    return Ok(None);
+                };
+                self.collector = Some(
+                    ipc::ExitedQueueCollector::start(source, first)
+                        .map_err(|_| "Invalid first page of a completed chat queue")?,
+                );
+            }
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueuePage { source, page },
+            } => {
+                self.collector
+                    .as_mut()
+                    .ok_or("Unexpected continuation of a completed chat queue")?
+                    .append(source, page)
+                    .map_err(|_| "Invalid continuation of a completed chat queue")?;
+            }
+            ServerMessage::Error(error) => {
+                return Err(format!(
+                    "Could not recover held chat input ({}). Reconnect to retry.",
+                    error.message
+                ));
+            }
+            _ => return Err("Unexpected response to a completed chat queue read".into()),
+        }
+        let Some(collector) = self.collector.take() else {
+            return Ok(None);
+        };
+        if let Some(page) = collector.next_request() {
+            self.request = next.fetch_add(1, Ordering::Relaxed);
+            transmit(wire, proof, self.request, page)?;
+            self.collector = Some(collector);
+            return Ok(Some(self));
+        }
+        let queue = collector
+            .finish()
+            .map_err(|_| "Invalid completed chat queue payload")?;
+        wake(Wake::CompletedQueue {
+            source: Box::new(self.notice.source),
+            messages: queue.messages,
+            current: self.notice.current,
+        });
+        Ok(None)
+    }
+}
+
 struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
@@ -806,10 +926,24 @@ struct InnerPayload {
     file_pending: FilePending,
     text_copy_pending: TextCopyPending,
     text_copies: AtomicUsize,
+    /// Wakes the worker that tells the daemon this window's visibility and
+    /// whether it holds follow-ups, as `presence` says which changed.
     visibility_tx: crossbeam_channel::Sender<()>,
     visibility_worker: Mutex<Option<JoinHandle<()>>>,
+    presence: Arc<Presence>,
     #[cfg(any(test, feature = "test-support"))]
     retirement_complete: Option<std::sync::mpsc::Sender<std::thread::ThreadId>>,
+}
+
+/// What the visibility worker has yet to tell the daemon. Both are
+/// replaceable state, so only the latest of each is sent.
+#[derive(Default)]
+struct Presence {
+    /// Whether visibility changed since the worker last sent it.
+    visibility: AtomicBool,
+    /// Whether the window holds follow-ups the person wrote for the chat's
+    /// next turn, which the daemon's courier lets go first.
+    holds_followups: AtomicBool,
 }
 
 impl Inner {
@@ -1495,6 +1629,7 @@ fn set_chat_timeouts(stream: &UnixStream) -> Result<(), String> {
         .set_write_timeout(Some(Duration::from_secs(5)))
         .map_err(|e| e.to_string())
 }
+
 fn receive_handshake(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
@@ -1590,6 +1725,7 @@ fn restore(
     upgrade_recovery: &mut Option<(Session, Session)>,
     resumed_from: &mut Option<Session>,
     intent: Intent,
+    wake: &dyn Fn(Wake),
 ) -> Result<ClientRequest, StartFailure> {
     let retry_explicit_start = intent == Intent::RetryStart;
     let existing_only = intent == Intent::RestoreExisting;
@@ -1787,6 +1923,7 @@ fn restore(
             session,
             resumed_from,
             refusal.map(|failure| failure.message),
+            wake,
         );
     }
     if session.native_continuity.retains_provider() {
@@ -1830,6 +1967,55 @@ fn restore(
         execution_environment,
     })
 }
+fn startup_request(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    next: &mut u64,
+    proof: &HostSessionProof,
+    request: ClientRequest,
+) -> Result<ServerResponse, StartFailure> {
+    let request_id = *next;
+    *next += 1;
+    codec
+        .write(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                proof: Some(proof.clone()),
+                request,
+            },
+        )
+        .map_err(|error| StartFailure::retry(error.to_string()))?;
+    receive_start(stream, codec, request_id, Some(proof))
+}
+
+fn read_queue_before_direct_restart(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    next: &mut u64,
+    proof: &HostSessionProof,
+    session: &Session,
+    wake: &dyn Fn(Wake),
+) -> Result<(), StartFailure> {
+    let expected = session.id;
+    let mut request = |request| startup_request(stream, codec, next, proof, request);
+    let first = match request(ClientRequest::ChatReadExitedQueue {
+        source: session.clone(),
+        execution: None,
+    })? {
+        ServerResponse::ChatExitedQueue { source, queued } if source == expected => queued,
+        _ => return Err("The daemon did not answer the exact ended chat's queue".into()),
+    };
+    if let Some(first) = first {
+        let queue = ipc::collect_exited_queue(expected, first, &mut request, || {
+            StartFailure::retry("The daemon returned an invalid retired input queue")
+        })?;
+        wake(Wake::ExitedQueue(expected, queue.messages));
+    }
+    Ok(())
+}
+
 /// A retained Claude card whose helper no daemon hosts any more, typically
 /// because an application update or crash outlived it.
 ///
@@ -1851,29 +2037,34 @@ fn resume_retained_claude(
     session: Session,
     resumed_from: &mut Option<Session>,
     refusal: Option<String>,
+    wake: &dyn Fn(Wake),
 ) -> Result<ClientRequest, StartFailure> {
     // An unnamed card also goes to the daemon: only its retirement evidence
     // proves which conversation, if any, the ended actor confirmed. Claude can
     // write a transcript before it reports the conversation ID, so the card
     // never infers a draft from the missing ID itself.
-    let request_id = *attach_request;
-    *attach_request += 1;
-    codec
-        .write(
-            stream,
-            &ClientEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id,
-                proof: Some(proof.clone()),
-                request: ClientRequest::ChatPrepareResume {
-                    source: session.clone(),
-                },
-            },
-        )
-        .map_err(|error| error.to_string())?;
-    let prepared = match receive_start(stream, codec, request_id, Some(proof)) {
-        Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
+    let mut request = |request| startup_request(stream, codec, attach_request, proof, request);
+    let prepared = match request(ClientRequest::ChatPrepareResumeWithQueue {
+        source: session.clone(),
+    }) {
+        Ok(ServerResponse::ChatResumePreparedWithQueue {
+            source,
+            queued,
+            prepared,
+        }) if source == session.id => {
+            if let Some(first) = queued {
+                let queued = ipc::collect_exited_queue(source, first, &mut request, || {
+                    StartFailure::retry("The daemon returned an invalid retired input queue")
+                })?;
+                wake(Wake::ExitedQueue(source, queued.messages));
+            }
+            prepared.map_err(start_failure)
+        }
         Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
+        Err(failure) => Err(failure),
+    };
+    let prepared = match prepared {
+        Ok(prepared) => prepared,
         Err(mut failure) => {
             // "Yet" only where a later attempt can succeed.
             failure.message = format!(
@@ -1976,6 +2167,7 @@ impl ClientHandle {
                     text_copies: AtomicUsize::new(0),
                     visibility_tx,
                     visibility_worker: Mutex::new(None),
+                    presence: Arc::default(),
                     retirement_complete: None,
                 },
                 retirement,
@@ -2478,10 +2670,17 @@ impl ClientHandle {
 
     /// Exercise the real restore handshake against an in-process daemon in
     /// host tests, without discovering or launching any external daemon.
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn fixture_restore(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn fixture_restore(stream: UnixStream, session: Session) -> Result<Self, StartFailure> {
+        Self::fixture_restore_on(stream, session, |_| {})
+    }
+
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    #[doc(hidden)]
+    pub fn fixture_restore_on(
         stream: UnixStream,
         session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         Self::connect_on(
             stream,
@@ -2492,12 +2691,12 @@ impl ClientHandle {
             None,
             None,
             None,
-            |_| {},
+            wake,
         )
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn fixture_connect(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn fixture_connect(
         stream: UnixStream,
         session: Session,
         intent: Intent,
@@ -2698,6 +2897,7 @@ impl ClientHandle {
                     &mut upgrade_recovery,
                     &mut resumed_from,
                     Intent::Restore,
+                    wake.as_ref(),
                 )?
             } else {
                 resume_retained_claude(
@@ -2708,6 +2908,7 @@ impl ClientHandle {
                     session,
                     &mut resumed_from,
                     None,
+                    wake.as_ref(),
                 )?
             }
         } else if intent == Intent::Start
@@ -2747,6 +2948,24 @@ impl ClientHandle {
                 execution_environment,
             }
         } else if intent == Intent::Start {
+            // A direct actor can be replaced at the same allocation. Read
+            // its exact eligible receipt before sending the replacing Start.
+            // A foreign descriptor or a new allocation cannot authorize it.
+            if source.is_none()
+                && session.proof.as_ref() == Some(&proof)
+                && session.launch.session_id.is_some()
+                && session.terminal.is_none()
+                && !session.native_continuity.retains_provider()
+            {
+                read_queue_before_direct_restart(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    &session,
+                    wake.as_ref(),
+                )?;
+            }
             let execution_environment = native_environment(&session, source.is_none());
             match pane {
                 Some(pane) => ClientRequest::ChatStartInPane {
@@ -2771,6 +2990,7 @@ impl ClientHandle {
                 &mut upgrade_recovery,
                 &mut resumed_from,
                 intent,
+                wake.as_ref(),
             )?
         };
         if let ClientRequest::ChatStart { session, .. } = &request
@@ -2804,6 +3024,8 @@ impl ClientHandle {
         let mut early_limit = None;
         let mut early_addresses = AgentAddresses::default();
         let mut early_model = None;
+        let mut ended_queues = VecDeque::new();
+        let mut seen_queue_executions = [None; 2];
         let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
@@ -2830,6 +3052,19 @@ impl ClientHandle {
                 return Err("Daemon identity changed during native chat attachment".into());
             }
             match envelope.message {
+                ServerMessage::ChatQueueEnded {
+                    source,
+                    execution,
+                    current,
+                } if source.id == id && envelope.request_id.is_none() => {
+                    if remember_queue_execution(&mut seen_queue_executions, execution)? {
+                        ended_queues.push_back(CompletedQueueNotice {
+                            source,
+                            execution: Some(execution),
+                            current,
+                        });
+                    }
+                }
                 ServerMessage::ChatActivity {
                     chat_id,
                     state,
@@ -2923,12 +3158,23 @@ impl ClientHandle {
             initial.active_model_revision = revision;
             initial.active_model = model;
         }
+        if ended_queues.is_empty()
+            && initial.exited
+            && !initial.queued_messages.is_empty()
+            && !session.closes_without_hosted_actor()
+        {
+            ended_queues.push_back(CompletedQueueNotice {
+                source: session.clone(),
+                execution: None,
+                current: false,
+            });
+        }
         let upgrade_recovery = upgrade_recovery
             .map(|(source, resolved)| {
                 UpgradeRecovery::confirmed(source, resolved, &session, &initial)
             })
             .transpose()?;
-        stream.set_read_timeout(None).map_err(|e| e.to_string())?;
+        crate::descriptor::set_read_timeout_or_hangup(&stream, None).map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
         let body_requested = Arc::new(AtomicBool::new(true));
@@ -2971,6 +3217,7 @@ impl ClientHandle {
         let file_pending: FilePending = Arc::new(Mutex::new(BTreeMap::new()));
         let text_copy_pending: TextCopyPending = Arc::new(Mutex::new(BTreeMap::new()));
         let (visibility_tx, visibility_rx) = crossbeam_channel::bounded(1);
+        let presence = Arc::new(Presence::default());
         let inner = Arc::new(Inner::new(
             InnerPayload {
                 id,
@@ -3000,6 +3247,7 @@ impl ClientHandle {
                 text_copies: AtomicUsize::new(0),
                 visibility_tx,
                 visibility_worker: Mutex::new(None),
+                presence: presence.clone(),
                 #[cfg(any(test, feature = "test-support"))]
                 retirement_complete: None,
             },
@@ -3014,22 +3262,33 @@ impl ClientHandle {
             .name(format!("chat-visibility-{id}"))
             .spawn(move || {
                 trace_worker_stack("chat_visibility");
+                // The daemon starts out knowing of no follow-ups held here.
+                let mut holds_followups = false;
                 while visibility_rx.recv().is_ok() {
                     if !visibility_alive.load(Ordering::Acquire) {
                         break;
                     }
-                    let request = ClientRequest::ChatVisibility {
-                        chat_id: id,
-                        visible: visibility_value.load(Ordering::Acquire),
-                    };
-                    if transmit(
-                        &visibility_wire,
-                        &visibility_proof,
-                        visibility_next.fetch_add(1, Ordering::Relaxed),
-                        request,
-                    )
-                    .is_err()
-                    {
+                    let held = presence.holds_followups.load(Ordering::Acquire);
+                    let requests = [
+                        (held != holds_followups)
+                            .then_some(ClientRequest::ChatHoldsFollowups { chat_id: id, held }),
+                        presence.visibility.swap(false, Ordering::AcqRel).then(|| {
+                            ClientRequest::ChatVisibility {
+                                chat_id: id,
+                                visible: visibility_value.load(Ordering::Acquire),
+                            }
+                        }),
+                    ];
+                    holds_followups = held;
+                    let sent = requests.into_iter().flatten().try_for_each(|request| {
+                        transmit(
+                            &visibility_wire,
+                            &visibility_proof,
+                            visibility_next.fetch_add(1, Ordering::Relaxed),
+                            request,
+                        )
+                    });
+                    if sent.is_err() {
                         let _ = visibility_wire
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
@@ -3057,7 +3316,13 @@ impl ClientHandle {
             // Since when the agent's process has been missing reads, and when
             // it last missed one.
             let mut unanswered: Option<(Instant, Instant)> = None;
-            let failure = loop {
+            let first_queue_read = ended_queues
+                .pop_front()
+                .map(|notice| CompletedQueueRead::begin(&wire, &proof, &next, notice))
+                .transpose();
+            let failure = match first_queue_read {
+                Err(error) => error,
+                Ok(mut queue_read) => loop {
                 let envelope: ServerEnvelope = match codec.read(&mut reader_stream) {
                     Ok(Some(value)) => value,
                     Ok(None) => break "Chat daemon disconnected; exact session retained for reattachment".into(),
@@ -3065,6 +3330,22 @@ impl ClientHandle {
                 };
                 if !body_requested.load(Ordering::Acquire) { codec.release_spare(); }
                 if envelope.version != PROTOCOL_VERSION || envelope.proof != proof { break "Chat daemon identity/version changed; refusing replacement".into(); }
+                if queue_read.as_ref().is_some_and(|read| Some(read.request) == envelope.request_id) {
+                    let read = queue_read.take().expect("checked correlated queue reply");
+                    match read.accept(&wire, &proof, &next, envelope.message, wake.as_ref()) {
+                        Ok(read) => queue_read = read,
+                        Err(error) => break error,
+                    }
+                    if queue_read.is_none()
+                        && let Some(notice) = ended_queues.pop_front()
+                    {
+                        match CompletedQueueRead::begin(&wire, &proof, &next, notice) {
+                            Ok(read) => queue_read = Some(read),
+                            Err(error) => break error,
+                        }
+                    }
+                    continue;
+                }
                 if matches!(&envelope.message, ServerMessage::Response { response: ServerResponse::ChatClosed { .. } | ServerResponse::ChatTerminal { .. } }) {
                     let (chat_id, final_snapshot, terminal) = match envelope.message {
                         ServerMessage::Response { response: ServerResponse::ChatClosed { chat_id, snapshot } } => (chat_id, snapshot, None),
@@ -3142,6 +3423,26 @@ impl ClientHandle {
                     continue;
                 }
                 match envelope.message {
+                    ServerMessage::ChatQueueEnded { source, execution, current }
+                        if source.id == id && envelope.request_id.is_none() =>
+                    {
+                        match remember_queue_execution(&mut seen_queue_executions, execution) {
+                            Ok(false) => {},
+                            Ok(true) => {
+                                let notice = CompletedQueueNotice { source, execution: Some(execution), current };
+                                if queue_read.is_none() {
+                                    match CompletedQueueRead::begin(&wire, &proof, &next, notice) {
+                                        Ok(read) => queue_read = Some(read),
+                                        Err(error) => break error,
+                                    }
+                                } else {
+                                    // The host stores one transfer per connection.
+                                    ended_queues.push_back(notice);
+                                }
+                            }
+                            Err(error) => break error.into(),
+                        }
+                    },
                     ServerMessage::ChatChanged { chat_id } if chat_id == id && visible.load(Ordering::Acquire) => {
                         if read_pending { read_again = true; continue; }
                         read_again = true;
@@ -3311,6 +3612,7 @@ impl ClientHandle {
                         Err(error) => break error,
                     }
                 }
+            },
             };
             alive.store(false, Ordering::Release);
             {
@@ -3799,6 +4101,30 @@ impl ClientHandle {
         }
         // Visibility is replaceable state, not an ordered provider frame. Coalesce
         // transitions without socket IO or acknowledgement waits on the UI thread.
+        self.inner
+            .presence
+            .visibility
+            .store(true, Ordering::Release);
+        self.notify_presence()
+    }
+    /// Tells the daemon whether this window holds follow-ups the person
+    /// wrote for the chat's next turn, which its provider has no queue to
+    /// take, so its courier starts no turn ahead of them. Cheap to call on
+    /// every change of the window: only a change reaches the daemon, from
+    /// the worker, never from the caller's thread.
+    pub fn set_holds_followups(&self, held: bool) -> Result<(), String> {
+        if self
+            .inner
+            .presence
+            .holds_followups
+            .swap(held, Ordering::AcqRel)
+            == held
+        {
+            return Ok(());
+        }
+        self.notify_presence()
+    }
+    fn notify_presence(&self) -> Result<(), String> {
         match self.inner.visibility_tx.try_send(()) {
             Ok(()) | Err(crossbeam_channel::TrySendError::Full(())) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(())) => {

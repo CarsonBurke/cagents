@@ -421,6 +421,27 @@ impl WorktreePathIndex {
     pub(super) fn rows(&self, path: &Path) -> &[(ProjectId, WorktreeId)] {
         self.rows.get(path).map_or(&[], Vec::as_slice)
     }
+
+    /// The project folder's row holding `directory`, unless a worktree or
+    /// known root nearer to it holds it: a repository inside a folder holds
+    /// its own directories.
+    pub(super) fn folder_row(&self, directory: &Path) -> Option<(ProjectId, WorktreeId)> {
+        let root = self.resolve(directory);
+        for ancestor in directory.ancestors() {
+            // Every worktree lists rows, so a first row without them is a
+            // folder's. A folder is a known root too.
+            if !self.rows.contains_key(ancestor)
+                && let Some(row) = self.first_row(ancestor)
+            {
+                return Some(row);
+            }
+            // A root nearer than any folder holds the directory.
+            if root == Some(ancestor) {
+                return None;
+            }
+        }
+        None
+    }
 }
 
 impl<'a> ResolveRoot<'a> for &'a WorktreePathIndex {
@@ -646,6 +667,7 @@ fn scope_descriptor(
         chat_draft_models: HashMap::new(),
         chat_waiting_messages: HashMap::new(),
         kept_chat_drafts: HashMap::new(),
+        returned_chat_queues: Default::default(),
         stopping_chats: Vec::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
@@ -1815,7 +1837,10 @@ mod tests {
             app.workspace.order().collect::<Vec<_>>(),
             vec![loose.id, companion.id]
         );
-        assert_eq!(app.terminal_directory(), Some(PathBuf::from("/tmp")));
+        assert_eq!(
+            app.terminal_directory(),
+            Some(PathBuf::from("/tmp").canonicalize().unwrap())
+        );
         let _ = app.select_worktree("/home/user".into(), false);
         assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![home.id]);
         let _ = app.select_worktree("/repo".into(), false);
@@ -2777,8 +2802,9 @@ mod tests {
     #[test]
     fn known_roots_resolve_once_and_again_when_a_row_lists_one() {
         let directory = tempfile::tempdir().unwrap();
-        let real = directory.path().join("real");
-        let alias = directory.path().join("alias");
+        let root = directory.path().canonicalize().unwrap();
+        let real = root.as_path().join("real");
+        let alias = root.as_path().join("alias");
         std::fs::create_dir_all(real.join("existing")).unwrap();
         std::os::unix::fs::symlink(&real, &alias).unwrap();
         let mut known = KnownWorktreeRoots::from_iter([

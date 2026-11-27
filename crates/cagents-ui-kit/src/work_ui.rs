@@ -15,9 +15,9 @@ use cosmic::{
 
 use crate::{
     agent::ActivityState,
-    design::{self, Tone, space},
+    design::{self, space},
     model::TerminalId,
-    ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
+    ui_controls::{Icon, icon_button, placeholder, popover, popover_item},
     work::{ActivitySource, Board, Column, Forge, Item, ItemKey, PullRequestState},
 };
 
@@ -755,9 +755,12 @@ impl State {
                 .class(dot(column_tone(column)))
                 .into(),
             design::heading(column.label()).into(),
-            design::caption(items.len().to_string())
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .into(),
+            // An empty lane says so beneath; a zero badge would only repeat it.
+            if items.is_empty() {
+                widget::Space::new().into()
+            } else {
+                crate::ui_controls::count_badge(items.len().to_string(), Default::default())
+            },
         ])
         .spacing(space::S)
         .align_y(Alignment::Center)
@@ -885,10 +888,7 @@ impl State {
             .into(),
         ];
         if item.pinned {
-            top.push(crate::interaction::tooltip(
-                widget::icon(Icon::Lock.handle()).size(design::COMPACT_ICON_SIZE),
-                format!("Pinned; its state says {}", item.derived.label()),
-            ));
+            top.push(pinned_mark(item));
         }
         top.push(self.card_menu(item, &card));
         let mut lines = vec![
@@ -899,23 +899,33 @@ impl State {
         ];
         if let Some(pull_request) = &item.pull_request {
             lines.push(
-                design::body(format!("#{} {}", pull_request.number, pull_request.title))
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
-                    .ellipsize(iced::widget::text::Ellipsize::End(
-                        iced::advanced::text::EllipsizeHeightLimit::Lines(2),
-                    ))
-                    .width(Length::Fill)
-                    .into(),
+                crate::ui_controls::fade_text(format!(
+                    "#{} {}",
+                    pull_request.number, pull_request.title
+                ))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .lines(2)
+                .width(Length::Fill)
+                .into(),
             );
         }
-        let facts = self.facts(item);
-        if !facts.is_empty() {
+        // Where it is and how far it has gone from its base, then the marks
+        // for what may need the user, as a list row has them.
+        let mut context = self.context(item);
+        context.extend(comparison_counts(item));
+        let marks = self.marks(item);
+        if !context.is_empty() || !marks.is_empty() {
+            let mut parts = vec![with_tip(
+                crate::ui_controls::FadeText::caption(context.join(" · "))
+                    .width(Length::Fill)
+                    .into(),
+                details(item),
+            )];
+            parts.extend(marks);
             lines.push(
-                widget::row::with_children(facts)
+                widget::row::with_children(parts)
                     .spacing(space::XS)
                     .align_y(Alignment::Center)
-                    .wrap()
                     .into(),
             );
         }
@@ -923,7 +933,11 @@ impl State {
         let content = widget::column::with_children(lines).spacing(space::XS);
         let selected = self.menu.as_ref() == Some(&card);
         let button = widget::button::custom(content)
-            .name(format!("Open {}", item.label()))
+            .name(format!(
+                "Open {}, {}",
+                spoken_label(item),
+                status_words(item).replace(" · ", ", ")
+            ))
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
@@ -933,65 +947,59 @@ impl State {
             .into()
     }
 
-    /// A list row: the same facts as a card, on one line where they fit.
+    /// A list row: its pull request's title, or its branch when it has
+    /// none, with marks for what may need the user, then the number, branch
+    /// and project that name it. Its folder and how far it has gone from
+    /// its base are on hover; its column is said only where its glyph and
+    /// age leave it unsaid.
     fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
         let card = CardRef::of(item);
+        let branch = item.branch.as_deref().unwrap_or("Detached HEAD");
         let mut title = vec![
             status_glyph(item),
-            design::heading(item.branch.as_deref().unwrap_or("Detached HEAD"))
-                .wrapping(iced::widget::text::Wrapping::None)
-                .into(),
-        ];
-        if let Some(pull_request) = &item.pull_request {
-            title.push(
-                crate::ui_controls::fade_text(format!(
-                    "#{} {}",
-                    pull_request.number, pull_request.title
-                ))
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .width(Length::Fill)
-                .into(),
-            );
-        } else {
-            title.push(widget::Space::new().width(Length::Fill).into());
-        }
-        title.push(badge(
-            item.column.label(),
-            Tone::Themed(column_tone(item.column)),
-        ));
-        title.push(
-            widget::container(
-                design::caption(age(self.now_unix_ms, activity_at(item), false))
-                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+            crate::ui_controls::FadeText::heading(
+                item.pull_request
+                    .as_ref()
+                    .map_or(branch, |pull_request| pull_request.title.as_str()),
             )
-            .width(44)
-            .align_x(iced::alignment::Horizontal::Right)
+            .width(Length::Fill)
             .into(),
-        );
-        title.push(self.card_menu(item, &card));
-        let mut facts = self.facts(item);
-        if let Some(worktree) = &item.worktree {
-            facts.push(
-                design::caption(crate::ui_controls::display_path(&worktree.path))
+        ];
+        title.extend(self.marks(item));
+        if item.pinned {
+            title.push(pinned_mark(item));
+        } else if let Some(column) = quiet_column(item.column) {
+            title.push(
+                design::caption(column)
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             );
         }
+        title.push(self.age(item));
+        title.push(self.card_menu(item, &card));
+        let mut names = Vec::with_capacity(4);
+        if let Some(pull_request) = &item.pull_request {
+            names.push(format!("#{}", pull_request.number));
+            names.push(branch.to_owned());
+        }
+        names.extend(self.context(item));
         let mut lines = vec![
             widget::row::with_children(title)
                 .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into(),
         ];
-        if !facts.is_empty() {
+        // The second line ends before the age and menu column, so a long
+        // branch never runs under them.
+        if !names.is_empty() {
             lines.push(
-                widget::container(
-                    widget::row::with_children(facts)
-                        .spacing(space::XS)
-                        .align_y(Alignment::Center)
-                        .wrap(),
-                )
+                widget::container(with_tip(
+                    crate::ui_controls::FadeText::caption(names.join(" · "))
+                        .width(Length::Fill)
+                        .into(),
+                    details(item),
+                ))
                 .padding(Padding {
                     left: f32::from(design::ROW_ICON_SIZE) + space::S,
                     ..Padding::ZERO
@@ -1001,8 +1009,12 @@ impl State {
         }
         let selected = self.menu.as_ref() == Some(&card);
         let button =
-            widget::button::custom(widget::column::with_children(lines).spacing(space::XS))
-                .name(format!("Open {}", item.label()))
+            widget::button::custom(widget::column::with_children(lines).spacing(space::XXS))
+                .name(format!(
+                    "Open {}, {}",
+                    spoken_label(item),
+                    status_words(item).replace(" · ", ", ")
+                ))
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
@@ -1012,92 +1024,95 @@ impl State {
             .into()
     }
 
-    /// The pills that say what is true of a card now.
-    fn facts<'a>(&'a self, item: &'a Item) -> Vec<Element<'a, Action>> {
-        let mut facts = Vec::new();
-        if self.scope.is_none() {
-            facts.push(badge(
-                item.project_name.as_str(),
-                Tone::Themed(design::muted_color),
-            ));
+    /// How long ago the card's last activity was, in a column of its own so
+    /// the rows' ages line up, with what it was and when on hover.
+    fn age<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
+        let age = widget::container(
+            design::caption(age(self.now_unix_ms, activity_at(item), false))
+                .class(cosmic::theme::Text::Custom(design::muted_text)),
+        )
+        .width(44)
+        .align_x(iced::alignment::Horizontal::Right);
+        match &item.last_activity {
+            Some(activity) => crate::interaction::tooltip(
+                age,
+                format!(
+                    "{} {}, {}",
+                    activity_label(activity.source),
+                    crate::work_ui::age(self.now_unix_ms, activity.at_unix_ms, true),
+                    local_time(activity.at_unix_ms)
+                ),
+            ),
+            None => age.into(),
         }
+    }
+
+    /// What places a card among the others in words: its project while every
+    /// project is shown, and its Linear ticket.
+    fn context(&self, item: &Item) -> Vec<String> {
+        let mut context = Vec::with_capacity(2);
+        if self.scope.is_none() {
+            context.push(item.project_name.clone());
+        }
+        if let Some(identifier) = item
+            .linear
+            .as_ref()
+            .and_then(|ticket| ticket.identifier.clone())
+        {
+            context.push(identifier);
+        }
+        context
+    }
+
+    /// Glyphs for what is true of a card now and may need the user, each
+    /// saying itself on hover: its pull request's checks and review, and its
+    /// worktree's unpushed commits, uncommitted changes, conflicts and
+    /// unreadable status. A card with none of them has no marks.
+    fn marks<'a>(&'a self, item: &'a Item) -> Vec<Element<'a, Action>> {
+        let size = design::COMPACT_ICON_SIZE;
+        let mut marks = Vec::new();
         if let Some(pull_request) = &item.pull_request {
             // The leading glyph gives the state unless an agent's activity
-            // has its place; then a small glyph beside the facts says it.
+            // has its place; then a small glyph among the marks says it.
             if !status_glyph_is_pull_request(item) {
                 let state = crate::sidebar::WorktreePullRequestState::from_work(pull_request);
-                facts.push(crate::interaction::tooltip(
-                    crate::ui_controls::pull_request_state_glyph(
-                        Some(state),
-                        design::COMPACT_ICON_SIZE,
-                    ),
+                marks.push(crate::interaction::tooltip(
+                    crate::ui_controls::pull_request_state_glyph(Some(state), size),
                     format!("{} pull request", state.label()),
                 ));
             }
-            facts.extend(pull_request_badges(pull_request));
+            marks.extend(pull_request_badges(pull_request));
             if pull_request.state == PullRequestState::Open
                 && !pull_request.contains_local_head
                 && item.worktree.is_some()
             {
-                facts.push(crate::interaction::tooltip(
-                    badge("Unpushed", Tone::Themed(design::muted_icon_color)),
-                    "The worktree has commits the pull request does not",
-                ));
+                marks.push(crate::ui_controls::unpushed_glyph(size));
             }
-        }
-        if let Some(ticket) = &item.linear
-            && let Some(identifier) = &ticket.identifier
-        {
-            let pill = badge(identifier.as_str(), Tone::Themed(design::accent_color));
-            facts.push(match &ticket.title {
-                Some(title) => crate::interaction::tooltip(pill, title.clone()),
-                None => pill,
-            });
-        }
-        if let Some(comparison) = &item.comparison
-            && (comparison.ahead > 0 || comparison.behind > 0)
-        {
-            let counts = match (comparison.ahead, comparison.behind) {
-                (ahead, 0) => format!("↑{ahead}"),
-                (0, behind) => format!("↓{behind}"),
-                (ahead, behind) => format!("↑{ahead} ↓{behind}"),
-            };
-            facts.push(crate::interaction::tooltip(
-                design::caption(counts)
-                    .class(cosmic::theme::Text::Custom(design::muted_text))
-                    .wrapping(iced::widget::text::Wrapping::None),
-                format!(
-                    "{} ahead of and {} behind {}",
-                    commits(comparison.ahead),
-                    commits(comparison.behind),
-                    comparison.base
-                ),
-            ));
         }
         if let Some(dirty) = &item.dirty {
             if dirty.conflicted > 0 {
-                facts.push(badge(
-                    format!("{} conflicted", dirty.conflicted),
-                    Tone::Themed(design::destructive_color),
+                marks.push(crate::interaction::tooltip(
+                    sized_glyph(Icon::Warning, design::destructive_color, size),
+                    match dirty.conflicted {
+                        1 => "1 conflicted file".to_owned(),
+                        count => format!("{count} conflicted files"),
+                    },
                 ));
             }
             if dirty.paths > 0 {
-                facts.push(crate::interaction::tooltip(
-                    badge(
-                        format!("{} changed", dirty.paths),
-                        Tone::Themed(design::muted_icon_color),
-                    ),
-                    "Uncommitted changes in the worktree",
+                marks.push(crate::ui_controls::uncommitted_glyph(
+                    crate::ui_controls::uncommitted_label(u64::from(dirty.paths), ""),
+                    size,
                 ));
             }
         }
         if let Some(error) = &item.error {
-            facts.push(crate::interaction::tooltip(
-                badge("Unreadable", Tone::Themed(design::destructive_color)),
-                error.clone(),
+            marks.push(crate::interaction::tooltip(
+                sized_glyph(Icon::Warning, design::destructive_color, size),
+                format!("Its status could not be read: {error}"),
             ));
         }
-        facts
+        marks
     }
 
     /// Live sessions on the left, the last activity on the right.
@@ -1406,6 +1421,44 @@ impl<'a> Leading<'a> {
 }
 
 fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
+    crate::interaction::tooltip(leading_glyph(item), status_words(item))
+}
+
+/// What a card or row is called aloud: a pull request's title and number,
+/// which lead what it draws, then its branch or folder; otherwise the
+/// branch or folder alone.
+fn spoken_label(item: &Item) -> String {
+    match &item.pull_request {
+        Some(pull_request) => format!(
+            "{}, #{}, {}",
+            pull_request.title,
+            pull_request.number,
+            item.label()
+        ),
+        None => item.label(),
+    }
+}
+
+/// What a card's leading glyph says, and the column it is in: `Draft pull
+/// request · In review`. Its tooltip, and part of its accessible name.
+fn status_words(item: &Item) -> String {
+    use crate::sidebar::AttentionState;
+    let glyph = match Leading::of(item) {
+        Leading::Working => "An agent is working".to_owned(),
+        Leading::Waiting(AttentionState::Approval) => "An agent needs your permission".to_owned(),
+        Leading::Waiting(AttentionState::Question) => "An agent asked you a question".to_owned(),
+        Leading::Waiting(_) => "An agent is waiting for you".to_owned(),
+        Leading::PullRequest(pull_request) => format!(
+            "{} pull request",
+            crate::sidebar::WorktreePullRequestState::from_work(pull_request).label()
+        ),
+        Leading::Branch if item.worktree.is_some() => "Worktree".to_owned(),
+        Leading::Branch => "Branch".to_owned(),
+    };
+    format!("{glyph} · {}", item.column.label())
+}
+
+fn leading_glyph<'a>(item: &Item) -> Element<'a, Action> {
     match Leading::of(item) {
         Leading::Working => widget::container(crate::sidebar::attention_mark(
             crate::sidebar::AttentionState::Working,
@@ -1418,6 +1471,74 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
         // A checked-out branch is a worktree, drawn as the sidebar draws it.
         Leading::Branch if item.worktree.is_some() => glyph(Icon::Worktree, design::muted_color),
         Leading::Branch => glyph(Icon::Branch, design::muted_color),
+    }
+}
+
+/// A pinned card's lock, saying on hover where it is pinned and where its
+/// state alone would put it.
+fn pinned_mark<'a>(item: &Item) -> Element<'a, Action> {
+    crate::interaction::tooltip(
+        widget::icon(Icon::Lock.handle()).size(design::COMPACT_ICON_SIZE),
+        format!(
+            "Pinned to {}; its state says {}",
+            item.column.label(),
+            item.derived.label()
+        ),
+    )
+}
+
+/// The column a list row names in words. Landed asks to be cleaned up and
+/// Stale to be looked at again, so they are said, quietly; the others are
+/// the usual states of work under way, which the leading glyph's tooltip
+/// and the row's accessible name say.
+fn quiet_column(column: Column) -> Option<&'static str> {
+    matches!(column, Column::Landed | Column::Stale).then(|| column.label())
+}
+
+/// `↑6 ↓22`: commits ahead of and behind the project's base, when either.
+fn comparison_counts(item: &Item) -> Option<String> {
+    let comparison = item.comparison.as_ref()?;
+    match (comparison.ahead, comparison.behind) {
+        (0, 0) => None,
+        (ahead, 0) => Some(format!("↑{ahead}")),
+        (0, behind) => Some(format!("↓{behind}")),
+        (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
+    }
+}
+
+/// What a card's naming line says on hover, one fact a line: its worktree's
+/// folder, its Linear ticket's title, and how far it has gone from its base.
+fn details(item: &Item) -> Option<String> {
+    let mut lines = Vec::with_capacity(3);
+    if let Some(worktree) = &item.worktree {
+        lines.push(crate::ui_controls::display_path(&worktree.path).into_owned());
+    }
+    if let Some(ticket) = &item.linear
+        && let Some(title) = &ticket.title
+    {
+        lines.push(match &ticket.identifier {
+            Some(identifier) => format!("{identifier}: {title}"),
+            None => title.clone(),
+        });
+    }
+    if let Some(comparison) = &item.comparison
+        && (comparison.ahead > 0 || comparison.behind > 0)
+    {
+        lines.push(format!(
+            "{} ahead of and {} behind {}",
+            commits(comparison.ahead),
+            commits(comparison.behind),
+            comparison.base
+        ));
+    }
+    (!lines.is_empty()).then(|| lines.join("\n"))
+}
+
+/// `content` with `tip` on hover, when there is one.
+fn with_tip<'a>(content: Element<'a, Action>, tip: Option<String>) -> Element<'a, Action> {
+    match tip {
+        Some(tip) => crate::interaction::tooltip(content, tip),
+        None => content,
     }
 }
 
@@ -1457,8 +1578,12 @@ pub(crate) fn pull_request_badges<'a, Message: 'a>(
 }
 
 fn glyph<'a, Message: 'a>(icon: Icon, tone: Toned) -> Element<'a, Message> {
+    sized_glyph(icon, tone, design::ROW_ICON_SIZE)
+}
+
+fn sized_glyph<'a, Message: 'a>(icon: Icon, tone: Toned, size: u16) -> Element<'a, Message> {
     widget::icon(icon.handle())
-        .size(design::ROW_ICON_SIZE)
+        .size(size)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
             iced::widget::svg::Style {
                 color: Some(tone(theme)),
@@ -2397,6 +2522,130 @@ mod tests {
                 self.0.push(text.to_owned());
             }
         }
+    }
+
+    /// The words a list row draws and the names its controls and marks
+    /// publish, in tree order.
+    fn row_words(state: &State, item: &Item) -> (Vec<String>, Vec<String>) {
+        use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+        struct Texts<'a>(&'a mut Vec<String>);
+        impl iced::advanced::widget::Operation for Texts<'_> {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                _bounds: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut element: Element<'_, ()> = state.row(item).map(|_| ());
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 200.0)),
+        );
+        let mut texts = Vec::new();
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut Texts(&mut texts),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        let names = nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(str::to_owned))
+            .collect();
+        (texts, names)
+    }
+
+    /// A list row leads with its pull request and names its branch and
+    /// project beneath it in plain words. What needs the user is a glyph
+    /// that says itself; the folder, the counts against the base and a
+    /// column its glyph already implies are not drawn.
+    #[test]
+    fn a_list_row_leads_with_its_pull_request_and_marks_what_needs_the_user() {
+        let mut state = State::default();
+        let mut card = item("feat/android", "cagents");
+        card.worktree = Some(crate::work::Worktree {
+            path: "/repos/cagents/.worktrees/android".into(),
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        card.comparison = Some(Comparison {
+            base: "origin/main".into(),
+            ahead: 6,
+            behind: 22,
+        });
+        card.dirty = Some(Dirty {
+            paths: 3,
+            conflicted: 0,
+            newest_modified_at_unix_ms: None,
+        });
+        card.pull_request = Some(PullRequest {
+            number: 1089,
+            title: "Add the Android app".into(),
+            url: "https://github.com/o/cagents/pull/1089".into(),
+            state: PullRequestState::Open,
+            draft: false,
+            head_oid: "a".into(),
+            contains_local_head: false,
+            checks: None,
+            review: None,
+            updated_at: String::new(),
+        });
+        card.column = Column::InReview;
+        card.derived = Column::InReview;
+        let mut landed = item("fix/login", "cagents");
+        landed.column = Column::Landed;
+        landed.derived = Column::Landed;
+        connected(&mut state, 1, board(vec![card.clone(), landed.clone()]));
+
+        let (texts, names) = row_words(&state, &card);
+        assert_eq!(
+            texts,
+            ["Add the Android app", "—", "#1089 · feat/android · cagents"],
+            "{names:?}"
+        );
+        assert!(
+            names.iter().any(|name| name == "3 uncommitted changes"),
+            "{names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == crate::ui_controls::UNPUSHED_LABEL),
+            "{names:?}"
+        );
+        // Its state and column, which no word on it draws, are in its name.
+        assert!(
+            names.iter().any(|name| name
+                == "Open Add the Android app, #1089, feat/android, Open pull request, In review"),
+            "{names:?}"
+        );
+        // A branch without a pull request is named by the branch, and a
+        // column nothing else implies is said.
+        let (texts, _) = row_words(&state, &landed);
+        assert_eq!(texts, ["fix/login", "Landed", "—", "cagents"]);
+        // In one project's scope, the project goes unsaid.
+        state.update(Action::Scope(Some(landed.project.clone())));
+        let (texts, _) = row_words(&state, &landed);
+        assert_eq!(texts, ["fix/login", "Landed", "—"]);
     }
 
     /// Frames of a Work board at a long-lived installation's scale, 600 cards

@@ -61,6 +61,8 @@ pub const TEXT_TRANSCRIPT: f32 = TEXT_PROSE;
 pub const LINE_TRANSCRIPT: f32 = TEXT_TRANSCRIPT + 6.0;
 /// Secondary detail beside or beneath a body-sized label.
 pub const TEXT_CAPTION: f32 = 11.0;
+/// The line box a caption sits in: libcosmic's caption preset's.
+pub const LINE_CAPTION: f32 = 17.0;
 /// A heading is set at body size and told apart by weight, so a pane's
 /// header does not outshout the rows under it.
 pub const TEXT_HEADING: f32 = TEXT_BODY;
@@ -101,6 +103,7 @@ pub fn body<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
 pub fn caption<'a>(text: impl Into<Cow<'a, str>> + 'a) -> ShellText<'a> {
     cosmic::widget::text::caption(text)
         .size(TEXT_CAPTION)
+        .line_height(LineHeight::Absolute(LINE_CAPTION.into()))
         .class(cosmic::theme::Text::Custom(muted_text))
 }
 

@@ -943,6 +943,9 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     assert!(runtime.find_error.is_none());
 }
 
+// A Linux registration fails cleanly at FD exhaustion. CoreServices can
+// fail the process itself before FSEvents reports this error on Darwin.
+#[cfg(target_os = "linux")]
 #[test]
 fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery() {
     const CHILD: &str = "CAGENTS_DOCUMENT_WATCH_LIMIT_CHILD";

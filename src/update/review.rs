@@ -66,6 +66,7 @@ fn items(preview: &Preview) -> Vec<Item> {
         .into_iter()
         .map(|id| {
             let live = sessions.get(&id);
+            let run_warning = live.is_some_and(|session| session.warns_about_agent_run);
             let saved = preview.labels.details.panes.get(&id);
             let stopped = stopped.get(&id);
             let label = preview
@@ -113,10 +114,10 @@ fn items(preview: &Preview) -> Vec<Item> {
                 outcome = Outcome::KeepsRunning;
             }
             if !detail.is_empty()
-                && matches!(
+                && (matches!(
                     outcome,
                     Outcome::Working | Outcome::Interrupted | Outcome::Attention
-                )
+                ) || run_warning)
                 && let Some(live) = live
             {
                 detail = format!("{}; {detail}", live_fact(live));
@@ -135,7 +136,10 @@ fn items(preview: &Preview) -> Vec<Item> {
                     detail = format!("{reason}; after the update: {recovery}");
                 } else {
                     outcome = Outcome::Paused;
-                    detail = recovery;
+                    detail = match live.filter(|_| run_warning) {
+                        Some(live) => format!("{} After the update: {recovery}", live.reason),
+                        None => recovery,
+                    };
                 }
             } else if detail.is_empty()
                 && let Some(live) = live
@@ -145,7 +149,8 @@ fn items(preview: &Preview) -> Vec<Item> {
                 } else if matches!(
                     outcome,
                     Outcome::Attention | Outcome::Working | Outcome::Interrupted
-                ) {
+                ) || run_warning
+                {
                     detail = live_fact(live);
                 }
             }
@@ -156,7 +161,7 @@ fn items(preview: &Preview) -> Vec<Item> {
                 outcome = Outcome::Stops;
                 // Keep safe recovery instructions for blocked work, including
                 // the background agents that outlived their parent's turn.
-                if live.disposition != Disposition::Blocked {
+                if live.disposition != Disposition::Blocked && !run_warning {
                     detail.clear();
                 }
             }
@@ -347,7 +352,9 @@ pub(super) fn interruption_review(preview: &Preview) -> Preview {
     if let Some(daemon) = &mut selected.daemon {
         daemon.policy = super::impact::Policy::Interrupt;
         for session in &mut daemon.sessions {
-            if session.disposition == Disposition::WaitsForIdle {
+            if session.disposition == Disposition::WaitsForIdle
+                && session.reason != super::impact::SessionCause::PendingDelivery
+            {
                 session.disposition = Disposition::Interrupted;
             }
         }
@@ -530,7 +537,7 @@ fn clause(reason: &str) -> String {
     }
 }
 
-fn recovery_detail(reason: &str, recovery: &str) -> String {
+pub(super) fn recovery_detail(reason: &str, recovery: &str) -> String {
     let reason = clause(reason);
     format!("{reason}. {recovery}")
 }
@@ -697,6 +704,36 @@ mod tests {
             recovery: "Its saved file stays as it is".into(),
         });
         preview
+    }
+
+    #[test]
+    fn a_running_conversation_still_discloses_the_managed_run_risk() {
+        let mut preview = preview();
+        let mut retained = session("Running conversation", Disposition::Continues, "");
+        retained.reason = crate::update::impact::SessionCause::AgentRunUnconfirmed {
+            queued_prompts: true,
+        };
+        retained.id = saved(
+            &mut preview,
+            "Running conversation",
+            SavedOutcome::KeepsRunning,
+        );
+        preview
+            .labels
+            .details
+            .panes
+            .get_mut(&retained.id)
+            .unwrap()
+            .detail = "Its console reconnects in the same pane.".into();
+        preview.daemon.as_mut().unwrap().sessions = vec![retained];
+        let output = render_review(&preview);
+        assert!(output.contains("Keep running (1)"), "{output}");
+        assert!(
+            output.contains("Running conversation: its conversation keeps running"),
+            "{output}"
+        );
+        assert!(output.contains("without a confirmed result"), "{output}");
+        assert!(output.contains("queued prompts unsent"), "{output}");
     }
 
     #[test]

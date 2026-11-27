@@ -20,8 +20,10 @@ fn unique_destination(
         .filter(|(session, _)| seen.insert(*session));
     match (matches.next(), matches.next()) {
         (Some((_, destination)), None) => Ok(destination),
-        (None, _) => Err(format!("Session {prefix} is no longer available.")),
-        _ => Err(format!("More than one session starts with {prefix}.")),
+        // The prefix is the CLI's address for the session, not a name the
+        // person was shown, so neither notice repeats it.
+        (None, _) => Err("That session is no longer open.".into()),
+        _ => Err("More than one open session matches this link.".into()),
     }
 }
 
@@ -36,9 +38,9 @@ impl Cagents {
             .iter()
             .filter(|agent| !agent.closed && agent.id.to_string().starts_with(prefix));
         let (agent, None) = (agents.next(), agents.next()) else {
-            self.status = Some(TransientNotice::warning(format!(
-                "More than one agent starts with {prefix}."
-            )));
+            self.status = Some(TransientNotice::warning(
+                "More than one open agent matches this link.",
+            ));
             return Task::none();
         };
         let Some(agent) = agent else {
@@ -223,6 +225,13 @@ impl Cagents {
         if !wayland {
             return handoff_session_window(slot, session, None);
         }
+        self.request_activation_token(slot, session)
+    }
+
+    /// Asks the compositor for a token that lets the session's window take
+    /// focus from this one's click, then hands the session over with it.
+    #[cfg(target_os = "linux")]
+    fn request_activation_token(&self, slot: String, session: TerminalId) -> Task<Message> {
         use iced::runtime::{Action as RuntimeAction, platform_specific};
         let window = self.core.main_window_id();
         iced::runtime::task::oneshot(move |channel| {
@@ -243,6 +252,15 @@ impl Cagents {
                 token,
             )))
         })
+    }
+}
+
+/// Activation tokens are a Wayland protocol, and no other window handle
+/// asks for one.
+#[cfg(target_os = "macos")]
+impl Cagents {
+    fn request_activation_token(&self, slot: String, session: TerminalId) -> Task<Message> {
+        handoff_session_window(slot, session, None)
     }
 }
 
@@ -298,6 +316,8 @@ mod tests {
         assert!(matches!(destination, Destination::Local(id) if id == session));
     }
 
+    // Activation tokens are a Wayland protocol.
+    #[cfg(target_os = "linux")]
     #[test]
     fn cross_window_link_requests_a_token_for_its_native_origin_window() {
         use cosmic::iced::futures::StreamExt as _;
@@ -334,18 +354,14 @@ mod tests {
             (first, Destination::Local(first)),
             (second, Destination::Window("other".into(), second)),
         ];
-        assert!(
-            unique_destination("12345678", candidates.clone())
-                .unwrap_err()
-                .contains("More than one")
-        );
+        // The prefix is an address the person was never shown.
+        let ambiguous = unique_destination("12345678", candidates.clone()).unwrap_err();
+        assert!(ambiguous.contains("More than one"), "{ambiguous}");
+        assert!(!ambiguous.contains("12345678"), "{ambiguous}");
         assert!(
             matches!(unique_destination(&second.to_string(), candidates), Ok(Destination::Window(slot, id)) if slot == "other" && id == second)
         );
-        assert!(
-            unique_destination("missing", Vec::new())
-                .unwrap_err()
-                .contains("no longer available")
-        );
+        let missing = unique_destination("missing", Vec::new()).unwrap_err();
+        assert_eq!(missing, "That session is no longer open.");
     }
 }

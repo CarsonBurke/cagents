@@ -283,6 +283,22 @@ impl Operation for MoveListFocus {
 const HOVER_DURATION: Duration = Duration::from_millis(120);
 const TOOLTIP_DELAY: Duration = Duration::from_millis(300);
 
+/// The lowercase Latin letter or symbol a key press names, for matching
+/// chords such as Ctrl+S.
+///
+/// A key whose layout produces a single Latin-script character is read as
+/// that character, so a remapped layout (Dvorak, AZERTY) keeps its own
+/// letters. Any other script falls back to the physical key, so a chord
+/// stays where it is on a Cyrillic, Greek or other non-Latin layout instead
+/// of doing nothing.
+pub fn latin_key(
+    key: &cosmic::iced::keyboard::Key,
+    physical_key: cosmic::iced::keyboard::key::Physical,
+) -> Option<char> {
+    key.to_latin(physical_key)
+        .map(|key| key.to_ascii_lowercase())
+}
+
 pub fn font_zoom_chord(
     key: &cosmic::iced::keyboard::Key,
     physical: cosmic::iced::keyboard::key::Physical,
@@ -292,7 +308,7 @@ pub fn font_zoom_chord(
         Key,
         key::{Code, Physical},
     };
-    if !modifiers.control() || modifiers.alt() || modifiers.logo() {
+    if !crate::settings::primary_alone(modifiers.control(), modifiers.alt(), modifiers.logo()) {
         return None;
     }
     match (key.as_ref(), physical) {
@@ -3532,6 +3548,33 @@ fn set_color(value: &mut serde_json::Value, source: Srgba, progress: f32) {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn latin_key_reads_latin_layouts_by_character_and_others_by_position() {
+        use cosmic::iced::keyboard::{
+            Key,
+            key::{Code, Physical},
+        };
+        let read =
+            |text: &str, code| super::latin_key(&Key::Character(text.into()), Physical::Code(code));
+        // A Latin layout keeps its own letters, including a remapped one:
+        // Dvorak's "o" sits where QWERTY has "s".
+        assert_eq!(read("s", Code::KeyS), Some('s'));
+        assert_eq!(read("S", Code::KeyS), Some('s'));
+        assert_eq!(read("o", Code::KeyS), Some('o'));
+        // Cyrillic and Greek letters fall back to the physical key.
+        assert_eq!(read("ы", Code::KeyS), Some('s'));
+        assert_eq!(read("Ы", Code::KeyS), Some('s'));
+        assert_eq!(read("с", Code::KeyC), Some('c'));
+        assert_eq!(read("σ", Code::KeyS), Some('s'));
+        assert_eq!(
+            super::latin_key(
+                &Key::Named(cosmic::iced::keyboard::key::Named::Enter),
+                Physical::Code(Code::Enter)
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn native_menu_hints_use_effective_shortcut_configuration() {
         use cosmic::iced::keyboard::{Key, Modifiers};
         let chords = vec!["Ctrl+Alt+F5".to_owned(), "Ctrl+N".to_owned()];
@@ -3957,14 +4000,14 @@ mod tests {
         };
         let equal = Physical::Code(Code::Equal);
         assert_eq!(
-            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::CTRL),
+            font_zoom_chord(&Key::Character("=".into()), equal, Modifiers::COMMAND),
             Some(1)
         );
         assert_eq!(
             font_zoom_chord(
                 &Key::Character("+".into()),
                 equal,
-                Modifiers::CTRL | Modifiers::SHIFT
+                Modifiers::COMMAND | Modifiers::SHIFT
             ),
             Some(1)
         );
@@ -3972,7 +4015,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("-".into()),
                 Physical::Code(Code::Minus),
-                Modifiers::CTRL
+                Modifiers::COMMAND
             ),
             Some(-1)
         );
@@ -3980,7 +4023,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("0".into()),
                 Physical::Code(Code::Digit0),
-                Modifiers::CTRL
+                Modifiers::COMMAND
             ),
             Some(0)
         );
@@ -3992,7 +4035,7 @@ mod tests {
             font_zoom_chord(
                 &Key::Character("=".into()),
                 equal,
-                Modifiers::CTRL | Modifiers::ALT
+                Modifiers::COMMAND | Modifiers::ALT
             ),
             None
         );

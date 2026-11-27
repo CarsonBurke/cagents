@@ -3,8 +3,10 @@
 ssh-keygen keys and a stand-in GitHub that records secrets and variables in
 files. Nothing reaches GitHub."""
 
+import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import tempfile
@@ -13,11 +15,15 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 HANG_GUARD = 60
 
-# Published releases, environment secrets and repository variables are files.
+# Published releases, commit statuses, secrets and variables are files.
 GH = r"""#!/bin/bash
 echo "$*" >> "$FIXTURE/gh.log"
 case "$1 $2" in
     "release list") cat "$FIXTURE/published" 2>/dev/null ;;
+    "api repos/"*/status\?per_page=100) cat "$FIXTURE/status-response" ;;
+    "api --silent")
+        [[ $3 == --method && $4 == POST && $5 == repos/*/statuses/* ]] || exit 99
+        [[ ! -e $FIXTURE/status-write-fails ]] ;;
     "secret list") [[ ! -e $FIXTURE/list-fails ]] || exit 1; ls "$FIXTURE/secrets" 2>/dev/null ;;
     "secret set") mkdir -p "$FIXTURE/secrets"; cat > "$FIXTURE/secrets/$3" ;;
     "secret delete") rm -f "$FIXTURE/secrets/$3" ;;
@@ -37,9 +43,28 @@ echo "release-metadata $*" >> "$FIXTURE/calls.log"
 """
 
 
+class ReleaseWorkflow(unittest.TestCase):
+    def test_the_hosted_workflow_requires_the_exact_commit_status_before_signing(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        jobs = dict(re.findall(r"^  (\w+):\n((?:^    .*\n|\n)*)", workflow, re.MULTILINE))
+        admit, build, sign = (jobs[name] for name in ("admit", "build", "sign"))
+        gate = next(step for step in admit.split("      - name:") if "scripts/release-actions require-tests" in step)
+        self.assertIn("if: steps.admit.outputs.sign == 'true'", gate)
+        self.assertIn("COMMIT: ${{ steps.admit.outputs.commit }}", gate)
+        self.assertIn('run: scripts/release-actions require-tests "$COMMIT"', gate)
+        self.assertNotIn("continue-on-error:", gate)
+        self.assertIn("statuses: read", admit)
+        self.assertIn("needs: admit", build)
+        self.assertIn("needs.admit.result == 'success'", build)
+        self.assertIn("needs: [admit, build]", sign)
+        self.assertIn("needs.admit.result == 'success'", sign)
+        self.assertIn("COMMIT: ${{ needs.admit.outputs.commit }}", sign)
+
+
 class ReleaseActions(unittest.TestCase):
     def setUp(self):
-        self.directory = tempfile.TemporaryDirectory(prefix="cagents-release-actions-", dir="/var/tmp")
+        self.directory = tempfile.TemporaryDirectory(prefix="cagents-release-actions-",
+                                                     dir=os.environ.get("TMPDIR", "/var/tmp"))
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
         self.repo = self.root / "repo"
@@ -87,7 +112,7 @@ class ReleaseActions(unittest.TestCase):
     def published(self, *tags):
         (self.root / "published").write_text("".join(f"{tag}\n" for tag in tags))
 
-    def run_actions(self, *args, actions="actions", trusted=("security", "actions"), env=None):
+    def run_actions(self, *args, actions="actions", trusted=("security", "actions"), env=None, stdin=None):
         environment = {
             **os.environ, "FIXTURE": str(self.root), "PATH": f"{self.bin}:{os.environ['PATH']}",
             "GITHUB_OUTPUT": str(self.root / "output"), "CAGENTS_SIGNING_SCRATCH": str(self.root / "scratch"),
@@ -99,7 +124,7 @@ class ReleaseActions(unittest.TestCase):
         environment.update(env or {})
         (self.root / "output").unlink(missing_ok=True)
         return subprocess.run([str(self.repo / "scripts/release-actions"), *args], cwd=self.repo, env=environment,
-                              text=True, capture_output=True, timeout=HANG_GUARD)
+                              input=stdin, text=True, capture_output=True, timeout=HANG_GUARD)
 
     def outputs(self):
         path = self.root / "output"
@@ -190,6 +215,16 @@ class ReleaseActions(unittest.TestCase):
         self.assertIn("not newer than the published 0.3.0", result.stderr)
         self.assertEqual(self.outputs(), {})
 
+    def test_the_daemon_package_must_declare_the_tag_version_too(self):
+        daemon = self.repo / "crates/cagents-host/Cargo.toml"
+        daemon.parent.mkdir(parents=True)
+        daemon.write_text('[package]\nname = "cagents-host"\nversion = "0.2.3"\n')
+        self.release_commit("0.2.4", "security", "actions")
+        self.git("tag", "-a", "v0.2.4", "-m", "v0.2.4")
+        self.git("push", "-q", "origin", "main")
+        result = self.run_actions("admit", "v0.2.4")
+        self.assertIn("crates/cagents-host/Cargo.toml at v0.2.4 declares 0.2.3, not 0.2.4", result.stderr)
+
     def test_a_tag_must_be_a_commit_on_main_that_declares_its_version(self):
         self.git("checkout", "-q", "-b", "side")
         self.release_commit("0.2.4", "security", "actions")
@@ -204,6 +239,44 @@ class ReleaseActions(unittest.TestCase):
         result = self.run_actions("admit", "v0.2.6", env={"GITHUB_SHA": "0" * 40})
         self.assertIn(f"v0.2.6 resolves to {sha}", result.stderr)
         self.assertIn("not a release tag", self.run_actions("admit", "v0.2.6-rc1").stderr)
+
+    def test_require_tests_only_accepts_passing_status_for_exact_commit(self):
+        sha = self.tag("0.2.5", "security", "actions")
+        other_sha = "a" * 40
+        other_check = {"context": "another-check", "state": "success"}
+        verdict = {"context": "cagents/fw16-tests", "state": "success"}
+        status_response = self.root / "status-response"
+
+        self.assertEqual(self.run_actions("require-tests", sha).returncode, 1, "API error")
+        for resolved, statuses, code in (
+            (sha, [other_check], 3),
+            (sha, [other_check, verdict | {"state": "failure"}], 3),
+            (sha, [other_check, verdict | {"state": "pending"}], 3),
+            (other_sha, [verdict], 1),
+            (sha, [other_check, verdict], 0),
+        ):
+            with self.subTest(resolved=resolved, statuses=statuses):
+                status_response.write_text(json.dumps({"sha": resolved, "statuses": statuses}))
+                result = self.run_actions("require-tests", sha)
+                self.assertEqual(result.returncode, code, result.stderr)
+        self.assertIn(f"/commits/{sha}/status?per_page=100", (self.root / "gh.log").read_text())
+
+    def test_record_tests_only_reports_a_passing_sentinel_verdict_for_exact_commit(self):
+        sha = "a" * 40
+        good = {"sha": sha, "passed": True}
+        for verdict in (good | {"passed": False}, good | {"sha": "b" * 40}, good | {"outside_code": ["ui"]}):
+            with self.subTest(verdict=verdict):
+                result = self.run_actions("record-tests", sha, stdin=json.dumps(verdict))
+                self.assertIn("has no passing fw16 sentinel verdict", result.stderr)
+        self.assertFalse((self.root / "gh.log").exists(), "an invalid verdict reached GitHub")
+
+        result = self.run_actions("record-tests", sha, stdin=json.dumps(good))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"/statuses/{sha} -f context=cagents/fw16-tests -f state=success",
+                      (self.root / "gh.log").read_text())
+        (self.root / "status-write-fails").touch()
+        result = self.run_actions("record-tests", sha, stdin=json.dumps(good))
+        self.assertIn("cannot record the fw16 test status", result.stderr)
 
     def test_sign_signs_the_checked_metadata_with_the_actions_key(self):
         dist = self.root / "dist"

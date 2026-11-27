@@ -1159,3 +1159,47 @@ fn actual_main_187_receives_invalid_request_for_a_refusal_before_any_effect() {
         encode(ProtocolErrorCode::InvalidRequest)
     );
 }
+
+/// An older client reads only the capabilities its protocol knows, and a
+/// snapshot from an older source defaults the missing fields without
+/// consuming the next bytes of the message.
+#[test]
+fn queued_input_fields_follow_the_peers_protocol() {
+    use crate::chat::{Capabilities, SendNow, Snapshot};
+
+    let snapshot = Snapshot {
+        generation: 3,
+        capabilities: Capabilities {
+            steer: true,
+            interrupt_modes: vec!["foreground".into()],
+            send_queued_now: true,
+            queue_holds: true,
+            ..Capabilities::default()
+        },
+        send_now: Some(SendNow::Delivering),
+        ..Snapshot::default()
+    };
+    let message = (snapshot.clone(), 7u8);
+    let current = postcard::to_stdvec(&message).unwrap();
+    for (protocol, omitted) in [
+        (SEND_QUEUED_NOW - 1, 4),
+        (SEND_QUEUED_NOW, 1),
+        (QUEUE_HOLDS, 0),
+    ] {
+        let sent = encoding_for(protocol, || postcard::to_stdvec(&message)).unwrap();
+        assert_eq!(sent.len() + omitted, current.len(), "protocol {protocol}");
+        let (read, after): (Snapshot, u8) =
+            decoding_from(protocol, || postcard::from_bytes(&sent)).unwrap();
+        let mut expected = snapshot.clone();
+        expected.capabilities.queue_holds = protocol >= QUEUE_HOLDS;
+        if protocol < SEND_QUEUED_NOW {
+            expected.capabilities.send_queued_now = false;
+            expected.send_now = None;
+        }
+        assert_eq!(after, 7, "protocol {protocol}");
+        assert_eq!(read, expected, "protocol {protocol}");
+    }
+    // Saved JSON carries the current fields independently of the wire layout.
+    let saved: Snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    assert_eq!(saved, snapshot);
+}

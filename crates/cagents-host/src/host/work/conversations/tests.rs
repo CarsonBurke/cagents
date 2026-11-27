@@ -1,0 +1,1676 @@
+use crate::work::CheckState;
+
+use super::*;
+use crate::{
+    model::WorktreeId,
+    pull_request_signals::Signal,
+    work::{PullRequestState, Relation},
+};
+use std::io::Write as _;
+
+fn repo(owner: &str) -> GitHubRepoKey {
+    GitHubRepoKey::new("github.com", None, owner, "repo").unwrap()
+}
+
+fn key(owner: &str, number: u64) -> PullRequestKeyOrd {
+    PullRequestKeyOrd {
+        repository: (&repo(owner)).into(),
+        number,
+    }
+}
+
+fn listed(number: u64, branch: &str, state: &str) -> crate::github::PullRequest {
+    serde_json::from_value(serde_json::json!({
+        "number": number,
+        "title": format!("PR {number}"),
+        "state": state,
+        "isDraft": false,
+        "headRefName": branch,
+        "headRefOid": "abc",
+        "headRepository": {"name": "repo"},
+        "headRepositoryOwner": {"login": "me"},
+        "baseRefName": "main",
+        "updatedAt": "2026-11-01T00:00:00Z",
+        "url": format!("https://github.com/me/repo/pull/{number}"),
+    }))
+    .unwrap()
+}
+
+fn worktree(path: &str, branch: &str) -> super::super::scan::Worktree {
+    super::super::scan::Worktree {
+        id: WorktreeId::new(),
+        path: PathBuf::from(path),
+        primary: false,
+        locked: false,
+        created_at_unix_ms: None,
+        branch: Some(branch.to_owned()),
+        head: None,
+        comparison: None,
+        dirty: None,
+        link: None,
+        error: None,
+        status_read_at: None,
+    }
+}
+
+/// A conversation in `/w/app`, whose primary worktree has `main` checked out
+/// and whose `.worktrees/feat` worktree has `feat`; the board lists #1 for
+/// `feat` and #2, merged, for `old`.
+fn facts(directory: &str) -> Facts {
+    let mut local = super::super::scan::Local::default();
+    local.worktrees = vec![
+        worktree("/w/app", "main"),
+        worktree("/w/app/.worktrees/feat", "feat"),
+    ];
+    Facts {
+        directory: PathBuf::from(directory),
+        project: Some(ProjectFacts {
+            id: ProjectId::new(),
+            snapshot: Some(Arc::new(forge::Snapshot {
+                repository: repo("me"),
+                remotes: vec![repo("me"), repo("upstream")],
+                pull_requests: vec![listed(1, "feat", "OPEN"), listed(2, "old", "MERGED")],
+                others: BTreeMap::new(),
+            })),
+            local: Some(Arc::new(local)),
+            forge_error: None,
+            synced_at_unix_ms: Some(1_000),
+        }),
+    }
+}
+
+fn watched(signals: &[(Reference, Relation, bool)]) -> Watched {
+    let mut watched = Watched::new();
+    for (reference, relation, by_subagent) in signals {
+        watched.record(transcript::Found {
+            signal: Signal {
+                reference: reference.clone(),
+                relation: *relation,
+            },
+            by_subagent: *by_subagent,
+        });
+    }
+    watched
+}
+
+fn branch(owner: Option<&str>, name: &str) -> Reference {
+    Reference::Branch {
+        repository: owner.map(|owner| (&repo(owner)).into()),
+        name: name.into(),
+    }
+}
+
+fn resolved(reference: &Reference, facts: &Facts) -> Option<PullRequestKeyOrd> {
+    match resolve(reference, facts, &BTreeMap::new()) {
+        Resolved::Key(key) => Some(key),
+        _ => None,
+    }
+}
+
+fn rows(list: &ConversationPullRequests) -> Vec<(u64, Relation, bool, bool)> {
+    list.pull_requests
+        .iter()
+        .map(|row| {
+            (
+                row.number,
+                row.relation,
+                row.current_branch,
+                row.by_subagent,
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn references_resolve_through_the_project_s_board() {
+    let facts = facts("/w/app");
+    // A bare number belongs to the conversation's repository.
+    assert_eq!(resolved(&Reference::Number(9), &facts), Some(key("me", 9)));
+    // A branch the board lists resolves without asking GitHub.
+    assert_eq!(
+        resolved(&branch(Some("me"), "feat"), &facts),
+        Some(key("me", 1))
+    );
+    assert_eq!(resolved(&branch(None, "old"), &facts), Some(key("me", 2)));
+    // An edit in a worktree points at that worktree's branch, even from a
+    // relative path through `..`.
+    assert_eq!(
+        resolved(
+            &Reference::CurrentBranch {
+                directory: Some("src/../.worktrees/feat/src".into())
+            },
+            &facts
+        ),
+        Some(key("me", 1))
+    );
+    // A branch the board does not list is asked about, in this repository.
+    assert!(matches!(
+        resolve(&branch(Some("upstream"), "new"), &facts, &BTreeMap::new()),
+        Resolved::Branch { base, head, branch }
+            if base == repo("me") && head == repo("upstream") && branch == "new"
+    ));
+}
+
+#[test]
+fn a_branch_pushed_outside_the_project_s_remotes_is_not_its_pull_request() {
+    let facts = facts("/w/app");
+    assert!(matches!(
+        resolve(&branch(Some("stranger"), "feat"), &facts, &BTreeMap::new()),
+        Resolved::Nothing
+    ));
+    // Nor is anything without a project to resolve it in.
+    let outside = Facts {
+        directory: PathBuf::from("/elsewhere"),
+        project: None,
+    };
+    assert!(matches!(
+        resolve(&Reference::Number(1), &outside, &BTreeMap::new()),
+        Resolved::Nothing
+    ));
+    // A fork's URL names its own pull request regardless.
+    assert_eq!(
+        resolved(&Reference::PullRequest(key("stranger", 4)), &outside),
+        Some(key("stranger", 4))
+    );
+}
+
+#[test]
+fn a_branch_known_to_have_no_pull_request_is_not_asked_about_again_soon() {
+    let facts = facts("/w/app");
+    let mut branches = BTreeMap::new();
+    let checked = Instant::now();
+    branches.insert(
+        ((&repo("me")).into(), "lonely".to_owned()),
+        BranchLookup {
+            number: None,
+            checked,
+        },
+    );
+    assert!(matches!(
+        resolve(&branch(None, "lonely"), &facts, &branches),
+        Resolved::Deferred(due) if due == checked + BRANCH_MISSING_FOR
+    ));
+    branches.insert(
+        ((&repo("me")).into(), "found".to_owned()),
+        BranchLookup {
+            number: Some(30),
+            checked: Instant::now(),
+        },
+    );
+    assert!(matches!(
+        resolve(&branch(None, "found"), &facts, &branches),
+        Resolved::Key(found) if found == key("me", 30)
+    ));
+}
+
+#[test]
+fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
+    let facts = facts("/w/app/.worktrees/feat");
+    let watched = watched(&[
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Mentioned,
+            false,
+        ),
+        (
+            Reference::PullRequest(key("other", 7)),
+            Relation::Mentioned,
+            false,
+        ),
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Reviewed,
+            false,
+        ),
+        (branch(None, "feat"), Relation::Pushed, false),
+    ]);
+    let mut observed = BTreeMap::new();
+    observed.insert(key("other", 7), observed_now(&listed(7, "x", "OPEN")));
+    let list = assemble(&watched, Some(&facts), &observed, &BTreeMap::new(), None);
+    assert_eq!(list.repository, Some(repo("me")));
+    assert_eq!(
+        rows(&list),
+        vec![
+            // The branch the conversation is on, which it also pushed.
+            (1, Relation::Pushed, true, false),
+            (2, Relation::Reviewed, false, false),
+            (7, Relation::Mentioned, false, false),
+        ]
+    );
+    let first = &list.pull_requests[0];
+    assert_eq!(
+        first.pull_request.as_ref().map(|found| found.state),
+        Some(PullRequestState::Open)
+    );
+    assert_eq!(list.pull_requests[2].repository, repo("other"));
+}
+
+#[test]
+fn rows_use_the_repository_s_own_spelling_and_the_board_s_sync_time() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+    snapshot.repository = GitHubRepoKey::new("github.com", None, "Me", "Repo").unwrap();
+    project.snapshot = Some(Arc::new(snapshot));
+    let watched = watched(&[(
+        Reference::PullRequest(key("me", 1)),
+        Relation::Mentioned,
+        false,
+    )]);
+    let first = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let row = &first.pull_requests[0];
+    // The key is kept in one case, but the row names the repository as the
+    // board does, so the panel knows it is the conversation's own.
+    assert_eq!(Some(&row.repository), first.repository.as_ref());
+    // A listed row is as old as the board's sync, so a later pass with
+    // nothing new sends the same list.
+    assert_eq!(row.observed_at_unix_ms, Some(1_000));
+    let second = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(first.pull_requests, second.pull_requests);
+}
+
+#[test]
+fn the_current_branch_s_pull_request_is_listed_before_anything_touches_it() {
+    let facts = facts("/w/app/.worktrees/feat/src");
+    let list = assemble(
+        &Watched::new(),
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(rows(&list), vec![(1, Relation::CheckedOut, true, false)]);
+    // On a branch without one, there is nothing.
+    let list = assemble(
+        &Watched::new(),
+        Some(&self::facts("/w/app")),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert!(list.pull_requests.is_empty());
+}
+
+#[test]
+fn an_old_merged_pull_request_of_the_branch_is_listed_only_once_touched() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    local.worktrees[0].branch = Some("old".into());
+    project.local = Some(Arc::new(local));
+    let list = assemble(
+        &Watched::new(),
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert!(list.pull_requests.is_empty());
+    let watched = watched(&[(
+        Reference::CurrentBranch { directory: None },
+        Relation::Pushed,
+        false,
+    )]);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(rows(&list), vec![(2, Relation::Pushed, true, false)]);
+}
+
+#[test]
+fn numbers_appear_only_once_github_says_they_are_pull_requests() {
+    let facts = facts("/w/app");
+    let watched = watched(&[
+        (Reference::Number(40), Relation::Mentioned, false),
+        (Reference::Number(41), Relation::Mentioned, false),
+        (Reference::Number(42), Relation::Mentioned, false),
+        (
+            Reference::PullRequest(key("me", 43)),
+            Relation::Mentioned,
+            false,
+        ),
+    ]);
+    let mut observed = BTreeMap::new();
+    observed.insert(key("me", 40), observed_now(&listed(40, "x", "OPEN")));
+    observed.insert(
+        key("me", 41),
+        Observed {
+            missing: true,
+            checked: Some(Instant::now()),
+            ..Observed::default()
+        },
+    );
+    let list = assemble(&watched, Some(&facts), &observed, &BTreeMap::new(), None);
+    let mut numbers = rows(&list).into_iter().map(|row| row.0).collect::<Vec<_>>();
+    numbers.sort();
+    // #41 is an issue and #42 is not known yet; a URL names a pull request
+    // even before its state is.
+    assert_eq!(numbers, vec![40, 43]);
+    let unknown = list
+        .pull_requests
+        .iter()
+        .find(|row| row.number == 43)
+        .unwrap();
+    assert!(unknown.pull_request.is_none());
+    assert!(unknown.observed_at_unix_ms.is_none());
+}
+
+#[test]
+fn a_pull_request_is_by_a_subagent_only_when_every_signal_was() {
+    let facts = facts("/w/app");
+    let watched = watched(&[
+        (
+            Reference::PullRequest(key("me", 5)),
+            Relation::Created,
+            true,
+        ),
+        (
+            Reference::PullRequest(key("me", 6)),
+            Relation::Created,
+            true,
+        ),
+        (Reference::Number(6), Relation::Mentioned, false),
+        // The same pull request by URL and by its branch is one row.
+        (branch(None, "old"), Relation::Pushed, true),
+        (
+            Reference::PullRequest(key("me", 2)),
+            Relation::Mentioned,
+            false,
+        ),
+    ]);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let mut found = rows(&list);
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            (2, Relation::Pushed, false, false),
+            (5, Relation::Created, false, true),
+            (6, Relation::Created, false, false),
+        ]
+    );
+}
+
+#[test]
+fn the_list_carries_why_github_could_not_be_asked() {
+    let mut facts = facts("/w/app");
+    let watched = watched(&[(
+        Reference::PullRequest(key("me", 2)),
+        Relation::Mentioned,
+        false,
+    )]);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        Some("gh: rate limited".into()),
+    );
+    assert_eq!(list.forge_error.as_deref(), Some("gh: rate limited"));
+    // The board's own poll failing says more about the project than a lookup.
+    facts.project.as_mut().unwrap().forge_error = Some("gh is not signed in".into());
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(list.forge_error.as_deref(), Some("gh is not signed in"));
+    // What the board listed is still shown.
+    assert!(list.pull_requests[0].pull_request.is_some());
+}
+
+#[test]
+fn many_mentions_drop_the_oldest_mention_before_any_work() {
+    let mut signals = vec![(
+        Reference::PullRequest(key("me", 1)),
+        Relation::Pushed,
+        false,
+    )];
+    signals.extend((100..100 + REFERENCES as u64 + 5).map(|number| {
+        (
+            Reference::PullRequest(key("me", number)),
+            Relation::Mentioned,
+            false,
+        )
+    }));
+    let watched = watched(&signals);
+    assert_eq!(watched.references.len(), REFERENCES);
+    assert!(
+        watched
+            .references
+            .contains_key(&Reference::PullRequest(key("me", 1)))
+    );
+    assert!(
+        !watched
+            .references
+            .contains_key(&Reference::PullRequest(key("me", 100)))
+    );
+}
+
+#[test]
+fn failed_lookups_back_off() {
+    let mut state = State::default();
+    assert!(state.lookup_retry().is_none());
+    let error = GitHubError::NoActiveAccount("github.com".into());
+    state.failed(&error);
+    assert!(state.lookup_retry().is_some());
+    assert_eq!(backoff(1), Duration::from_secs(30));
+    assert_eq!(backoff(2), Duration::from_secs(60));
+    assert_eq!(backoff(40), FINISHED_FOR);
+    state.succeeded();
+    assert!(state.lookup_retry().is_none());
+    assert!(state.forge_error.is_none());
+}
+
+#[test]
+fn lookups_skip_spent_graphql_hosts_without_using_up_the_pass() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
+    };
+
+    #[derive(Default)]
+    struct Forge(Mutex<Vec<String>>);
+    impl ProcessExecutor for Forge {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            self.0.lock().unwrap().push(
+                command
+                    .arguments
+                    .iter()
+                    .map(|argument| argument.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+            );
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: b"Could not resolve to a PullRequest".to_vec(),
+            })
+        }
+    }
+
+    let scope = "conversation-lookups-quota-test";
+    let spent = GitHubRepoKey::new("spent-graphql.invalid", None, "owner", "repo").unwrap();
+    let rest_spent = GitHubRepoKey::new("spent-rest.invalid", None, "owner", "repo").unwrap();
+    let open = GitHubRepoKey::new("open-graphql.invalid", None, "owner", "repo").unwrap();
+    let forge = Arc::new(Forge::default());
+    let gh = GitHubService::new("gh", forge.clone());
+    let work = Handle::idle(Weak::new());
+    let view = |repository: &GitHubRepoKey, number| {
+        Lookup::PullRequest(PullRequestKeyOrd {
+            repository: repository.into(),
+            number,
+        })
+    };
+
+    let reset = polling::now() + 600;
+    let next = polling::with_scope(scope, || {
+        for (repository, resource) in [(&spent, "graphql"), (&rest_spent, "core")] {
+            polling::failed(
+                &repository.authority(),
+                &GitHubError::RateLimited {
+                    limit: polling::RateLimit::primary(resource, reset),
+                },
+            );
+        }
+        let lookups = std::iter::once(Lookup::Branch {
+            base: (&spent).into(),
+            head: (&spent).into(),
+            branch: "next".into(),
+        })
+        .chain((1..10).map(|number| view(&spent, number)))
+        .chain([view(&rest_spent, 1), view(&open, 1)]);
+        work.run_lookups(&gh, lookups.map(|lookup| (Relation::Edited, lookup)))
+    });
+    assert_eq!(next.reset, Some(reset + 1));
+    assert_eq!(next.wait_for(), Some(crate::host::work::PAUSED_WAKE));
+
+    let commands = forge.0.lock().unwrap();
+    assert_eq!(commands.len(), 2);
+    assert!(commands[0].contains("spent-rest.invalid"));
+    assert!(commands[1].contains("open-graphql.invalid"));
+    let state = work.conversations();
+    assert_eq!(
+        state.observed.len(),
+        2,
+        "a skipped lookup changes no observation"
+    );
+    assert!(state.branches.is_empty());
+    assert!(
+        state.lookup_retry().is_none(),
+        "rate limits do not start an outage backoff"
+    );
+    assert!(
+        state
+            .forge_error
+            .as_deref()
+            .unwrap()
+            .contains("Retrying at")
+    );
+}
+
+#[test]
+fn a_new_rate_limit_ends_an_outage_but_a_near_reset_backs_off() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
+    };
+
+    struct Rejected(u64);
+    impl ProcessExecutor for Rejected {
+        fn execute(
+            &self,
+            _: &CommandSpec,
+            _: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            Ok(ProcessOutput {
+                success: false,
+                exit_code: Some(1),
+                signal: None,
+                stdout: Vec::new(),
+                stderr: format!(
+                    "GraphQL: API rate limit already exceeded\nX-RateLimit-Remaining: 0\nX-RateLimit-Resource: graphql\nX-RateLimit-Reset: {}\n",
+                    self.0,
+                ).into_bytes(),
+            })
+        }
+    }
+
+    for (authority, seconds) in [("normal-reset.invalid", 600), ("near-reset.invalid", 1)] {
+        let reset = polling::now() + seconds;
+        let gh = GitHubService::new("gh", Arc::new(Rejected(reset)));
+        let repository = GitHubRepoKey::new(authority, None, "owner", "repo").unwrap();
+        let key = PullRequestKeyOrd {
+            repository: (&repository).into(),
+            number: 1,
+        };
+        let work = Handle::idle(Weak::new());
+        let outage = GitHubError::NoActiveAccount(authority.into());
+        work.conversations().failed(&outage);
+        work.conversations().failed(&outage);
+
+        let next = polling::with_scope("conversation-rate-limit-reply-test", || {
+            work.run_lookups(&gh, [(Relation::Edited, Lookup::PullRequest(key.clone()))])
+        });
+        let state = work.conversations();
+        if seconds == 1 {
+            assert_eq!(state.failures, 3);
+            assert_eq!(state.observed[&key].failures, 1);
+            assert_eq!(next.deadline, state.lookup_retry());
+            assert_eq!(next.reset, None);
+        } else {
+            assert_eq!(state.failures, 0);
+            assert!(!state.observed.contains_key(&key));
+            assert_eq!(next.deadline, None);
+            assert_eq!(next.reset, Some(reset + 1));
+        }
+    }
+}
+
+/// A transcript file in a directory owned by its test.
+struct Transcript {
+    path: PathBuf,
+    _directory: tempfile::TempDir,
+}
+
+impl Transcript {
+    fn new(name: &str) -> Self {
+        let directory = tempfile::Builder::new()
+            .prefix(&format!("cagents-conversations-{name}-"))
+            .tempdir()
+            .unwrap();
+        Self {
+            path: directory.path().join("transcript.jsonl"),
+            _directory: directory,
+        }
+    }
+
+    fn append(&self, text: &str) {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .unwrap()
+            .write_all(text.as_bytes())
+            .unwrap();
+    }
+}
+
+fn mention(number: u64) -> String {
+    format!(
+        "{}\n",
+        serde_json::json!({"type": "user", "message": {"content":
+            format!("See https://github.com/me/repo/pull/{number}")}})
+    )
+}
+
+fn numbers(watched: &Watched) -> Vec<u64> {
+    watched
+        .references
+        .keys()
+        .filter_map(|reference| match reference {
+            Reference::PullRequest(key) => Some(key.number),
+            _ => None,
+        })
+        .collect()
+}
+
+fn located(path: &Path) -> Source {
+    Source::Located(Located {
+        format: Format::Claude,
+        directory: PathBuf::from("/w/app"),
+        transcript: path.to_owned(),
+        subagents: Some(path.with_extension("").join("subagents")),
+    })
+}
+
+#[test]
+fn a_transcript_is_read_as_it_grows_one_whole_line_at_a_time() {
+    let file = Transcript::new("grows");
+    let mut watched = Watched::new();
+    watched.source = located(&file.path);
+    read(&mut watched);
+    assert!(matches!(
+        watched.coverage,
+        TranscriptCoverage::Unavailable { .. }
+    ));
+
+    file.append(&mention(1));
+    let second = mention(2);
+    let (head, tail) = second.split_at(20);
+    file.append(head);
+    read(&mut watched);
+    // A line still being written is not read yet.
+    assert_eq!(numbers(&watched), vec![1]);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+
+    file.append(tail);
+    read(&mut watched);
+    assert_eq!(numbers(&watched), vec![1, 2]);
+
+    // A subagent's transcript is found beside it.
+    let subagents = file.path.with_extension("").join("subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(subagents.join("agent-a.jsonl"), mention(3)).unwrap();
+    std::fs::write(subagents.join("notes.txt"), mention(4)).unwrap();
+    read(&mut watched);
+    assert_eq!(numbers(&watched), vec![1, 2, 3]);
+    assert!(watched.references[&Reference::PullRequest(key("me", 3))].by_subagent);
+}
+
+#[test]
+fn a_replaced_or_truncated_transcript_is_read_again_from_its_start() {
+    let file = Transcript::new("replaced");
+    file.append(&mention(1));
+    file.append(&mention(2));
+    let mut watched = Watched::new();
+    watched.source = located(&file.path);
+    read(&mut watched);
+    assert_eq!(numbers(&watched), vec![1, 2]);
+
+    // Rewritten shorter in place.
+    std::fs::write(&file.path, mention(5)).unwrap();
+    read(&mut watched);
+    assert_eq!(numbers(&watched), vec![1, 2, 5]);
+
+    // Replaced by a new file of the same length.
+    let replacement = file.path.with_extension("new");
+    std::fs::write(&replacement, mention(6)).unwrap();
+    std::fs::rename(&replacement, &file.path).unwrap();
+    read(&mut watched);
+    assert_eq!(numbers(&watched), vec![1, 2, 5, 6]);
+}
+
+#[test]
+fn a_long_transcript_is_read_from_its_newest_part_and_says_so() {
+    let file = Transcript::new("long");
+    // One line of padding longer than the first read, then a mention.
+    let padding = format!(
+        "{}\n",
+        serde_json::json!({"type": "user", "message": {"content":
+            format!("https://github.com/me/repo/pull/9 {}", "x".repeat(FIRST_READ as usize))}})
+    );
+    file.append(&padding);
+    file.append(&mention(7));
+    let mut watched = Watched::new();
+    watched.source = located(&file.path);
+    // The backlog is read a pass at a time.
+    for _ in 0..(FIRST_READ / READ_PER_PASS + 2) {
+        read(&mut watched);
+    }
+    // The cut-off line is skipped rather than read from its middle.
+    assert_eq!(numbers(&watched), vec![7]);
+    assert_eq!(watched.coverage, TranscriptCoverage::Partial);
+}
+
+#[test]
+fn an_over_long_line_is_skipped_without_making_the_list_partial() {
+    let file = Transcript::new("image");
+    // Longer than a line may be, such as an attached image; it spans reads
+    // and also fits in one, and either way is skipped whole.
+    for length in [MAX_LINE + 1, READ_PER_PASS as usize + 1] {
+        file.append(&format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "message": {"content":
+                format!("https://github.com/me/repo/pull/9 {}", "x".repeat(length))}})
+        ));
+    }
+    file.append(&mention(8));
+    let mut watched = Watched::new();
+    watched.source = located(&file.path);
+    for _ in 0..4 {
+        read(&mut watched);
+    }
+    assert_eq!(numbers(&watched), vec![8]);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+}
+
+#[test]
+fn a_codex_search_that_finds_nothing_waits_longer_each_time() {
+    assert_eq!(search_backoff(1), Duration::from_secs(5));
+    assert_eq!(search_backoff(2), Duration::from_secs(10));
+    assert_eq!(search_backoff(5), Duration::from_secs(80));
+    assert_eq!(search_backoff(6), Duration::from_secs(120));
+    assert_eq!(search_backoff(u32::MAX), Duration::from_secs(120));
+}
+
+#[test]
+fn work_on_the_current_branch_stays_with_that_branch_after_a_switch() {
+    let mut watched = Watched::new();
+    let push = |directory: Option<&str>| transcript::Found {
+        signal: Signal {
+            reference: Reference::CurrentBranch {
+                directory: directory.map(str::to_owned),
+            },
+            relation: Relation::Pushed,
+        },
+        by_subagent: false,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![push(None), push(Some(".worktrees/feat"))],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts("/w/app")),
+    );
+    assert_eq!(
+        watched.references.keys().cloned().collect::<Vec<_>>(),
+        vec![branch(None, "feat"), branch(None, "main")]
+    );
+}
+
+#[test]
+fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
+    let mut watched = Watched::new();
+    let edit = |directory: &str, by_subagent: bool| transcript::Found {
+        signal: Signal {
+            reference: Reference::CurrentBranch {
+                directory: Some(directory.to_owned()),
+            },
+            relation: Relation::Edited,
+        },
+        by_subagent,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![
+                edit("/w/app/src", false),
+                edit("/w/app/.worktrees/feat/src/deep", true),
+                edit("/elsewhere/project", false),
+                edit(".worktrees/feat", true),
+            ],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts("/w/app")),
+    );
+    let facts = facts("/w/app");
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (
+                worktree.path.to_str().unwrap(),
+                worktree.branch.as_deref(),
+                worktree.by_subagent
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            ("/w/app/.worktrees/feat", Some("feat"), true),
+            ("/w/app", Some("main"), false),
+        ]
+    );
+    // The feat branch heads #1, which editing it worked on, so the row shows
+    // the worktree; main heads nothing.
+    assert!(
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 1 && row.relation == Relation::Edited)
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| worktree.pull_request)
+            .collect::<Vec<_>>(),
+        vec![Some(1), None]
+    );
+    // Editing a directory again is the newest edit, by the conversation
+    // itself this time.
+    watched.apply(
+        Scanned {
+            found: vec![edit("/w/app", false), edit("/w/app/.worktrees/feat", false)],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.by_subagent))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", false), ("/w/app", false)]
+    );
+}
+
+#[test]
+fn an_edit_stays_with_the_pull_request_it_was_made_for_and_not_with_a_reused_name() {
+    // A worktree has `old` checked out at `oid`; #2 heads `old` at `abc`
+    // and is `state`.
+    let facts_at = |oid: &str, state: &str| {
+        let mut facts = facts("/w/app");
+        let project = facts.project.as_mut().unwrap();
+        let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+        snapshot.pull_requests = vec![listed(1, "feat", "OPEN"), listed(2, "old", state)];
+        project.snapshot = Some(Arc::new(snapshot));
+        let mut local = (**project.local.as_ref().unwrap()).clone();
+        let mut reused = worktree("/w/app/.worktrees/old", "old");
+        reused.head = Some(crate::work::Head {
+            oid: oid.to_owned(),
+            committed_at_unix_ms: None,
+        });
+        local.worktrees.push(reused);
+        project.local = Some(Arc::new(local));
+        facts
+    };
+    let edit = |watched: &mut Watched, facts: &Facts| {
+        watched.apply(
+            Scanned {
+                found: vec![transcript::Found {
+                    signal: Signal {
+                        reference: Reference::CurrentBranch {
+                            directory: Some(".worktrees/old/src".to_owned()),
+                        },
+                        relation: Relation::Edited,
+                    },
+                    by_subagent: false,
+                }],
+                coverage: TranscriptCoverage::Complete,
+            },
+            Some(facts),
+        );
+    };
+    let list = |watched: &mut Watched, facts: &Facts| {
+        watched.pin_edits(Some(facts), &BTreeMap::new(), &BTreeMap::new());
+        assemble(
+            watched,
+            Some(facts),
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+    };
+    let edited_two = |list: &ConversationPullRequests| {
+        list.pull_requests
+            .iter()
+            .any(|row| row.number == 2 && row.relation == Relation::Edited)
+    };
+
+    // Editing #2's branch while it is open is work on #2, and stays so once
+    // it merges and the worktree moves past it.
+    let mut watched = Watched::new();
+    let open = facts_at("abc", "OPEN");
+    edit(&mut watched, &open);
+    assert!(edited_two(&list(&mut watched, &open)));
+    let moved_on = facts_at("def", "MERGED");
+    let after = list(&mut watched, &moved_on);
+    assert!(edited_two(&after), "the merged pull request lost its edit");
+    // The worktree is no longer #2's branch, so it is listed on its own.
+    assert_eq!(after.worktrees[0].pull_request, None);
+
+    // The name reused after the merge is new work: no #2 row.
+    let mut watched = Watched::new();
+    edit(&mut watched, &moved_on);
+    let list_now = list(&mut watched, &moved_on);
+    assert!(!edited_two(&list_now));
+    assert_eq!(
+        list_now
+            .worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/old", None)]
+    );
+
+    // Still at the merged commit, it is #2's branch.
+    let mut watched = Watched::new();
+    let at_merge = facts_at("abc", "MERGED");
+    edit(&mut watched, &at_merge);
+    let list_now = list(&mut watched, &at_merge);
+    assert!(edited_two(&list_now));
+    assert_eq!(list_now.worktrees[0].pull_request, Some(2));
+}
+
+/// A checkout of `old` in its own worktree, at `oid` committed at
+/// `committed_at`, `ahead` commits past the default branch.
+struct Checkout {
+    oid: &'static str,
+    committed_at: u64,
+    ahead: u32,
+}
+
+/// #2, merged at 2026-11-24T00:00:00Z, heads `old` at `pr_head`; the
+/// conversation pushed `old` from its worktree and edited there. `contained`
+/// is the scan's answer that `pr_head` contains the checkout's commit.
+fn merged_branch_list(
+    checkout: Checkout,
+    pr_head: &str,
+    contained: bool,
+) -> ConversationPullRequests {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+    let mut old = listed(2, "old", "MERGED");
+    old.head_ref_oid = pr_head.to_owned();
+    old.merged_at = Some("2026-11-24T00:00:00Z".to_owned());
+    old.closed_at = old.merged_at.clone();
+    snapshot.pull_requests = vec![listed(1, "feat", "OPEN"), old];
+    project.snapshot = Some(Arc::new(snapshot));
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    let mut worktree = worktree("/w/app/.worktrees/old", "old");
+    worktree.head = Some(crate::work::Head {
+        oid: checkout.oid.to_owned(),
+        committed_at_unix_ms: Some(checkout.committed_at),
+    });
+    worktree.comparison = Some(crate::work::Comparison {
+        base: "main".to_owned(),
+        ahead: checkout.ahead,
+        behind: 3,
+    });
+    local.worktrees.push(worktree);
+    if contained {
+        local
+            .ancestry
+            .insert((checkout.oid.to_owned(), pr_head.to_owned()), true);
+    }
+    project.local = Some(Arc::new(local));
+    let mut watched = Watched::new();
+    let found = |reference: Reference, relation: Relation| transcript::Found {
+        signal: Signal {
+            reference,
+            relation,
+        },
+        by_subagent: true,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![
+                found(
+                    Reference::CurrentBranch {
+                        directory: Some(".worktrees/old/src".to_owned()),
+                    },
+                    Relation::Edited,
+                ),
+                found(branch(None, "old"), Relation::Pushed),
+            ],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts),
+    );
+    watched.pin_edits(Some(&facts), &BTreeMap::new(), &BTreeMap::new());
+    assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    )
+}
+
+#[test]
+fn a_worktree_shows_on_its_merged_pull_request_after_github_moved_its_head() {
+    // Its row and where its worktree is shown, which is on that row or not.
+    let shown = |list: ConversationPullRequests| {
+        (
+            list.pull_requests
+                .iter()
+                .filter(|row| row.number == 2)
+                .map(|row| row.relation)
+                .collect::<Vec<_>>(),
+            list.worktrees
+                .iter()
+                .map(|worktree| worktree.pull_request)
+                .collect::<Vec<_>>(),
+        )
+    };
+    const BEFORE: u64 = 1_763_942_400_000 + 365 * 86_400_000 - 3_600_000;
+    const AFTER: u64 = BEFORE + 2 * 3_600_000;
+    let one_row = (vec![Relation::Pushed], vec![Some(2)]);
+    let apart = (vec![Relation::Pushed], vec![None]);
+    let own = |oid, committed_at| Checkout {
+        oid,
+        committed_at,
+        ahead: 1,
+    };
+
+    // The default branch was merged into it on GitHub before it landed:
+    // its head contains the worktree's, which settles it whenever that was
+    // committed.
+    assert_eq!(
+        shown(merged_branch_list(own("local", AFTER), "merged-main", true)),
+        one_row
+    );
+    // Rebased and pushed from elsewhere, then merged: GitHub's head no
+    // longer contains the worktree's commits, all made before it merged.
+    assert_eq!(
+        shown(merged_branch_list(own("local", BEFORE), "rebased", false)),
+        one_row
+    );
+
+    // A commit made after it merged is new work on a reused name.
+    assert_eq!(
+        shown(merged_branch_list(own("new", AFTER), "rebased", false)),
+        apart
+    );
+    // So is the name made again from the default branch, which the merged
+    // head contains, with nothing committed on it yet.
+    let from_main = Checkout {
+        oid: "main",
+        committed_at: BEFORE,
+        ahead: 0,
+    };
+    assert_eq!(
+        shown(merged_branch_list(from_main, "merged-main", true)),
+        apart
+    );
+}
+
+#[test]
+fn edited_directories_are_bounded_by_recency() {
+    let mut watched = Watched::new();
+    for index in 0..EDITED_DIRECTORIES + 8 {
+        watched.edited_in(PathBuf::from(format!("/w/app/{index}")), false);
+    }
+    assert_eq!(watched.edited.len(), EDITED_DIRECTORIES);
+    assert!(!watched.edited.contains_key(Path::new("/w/app/0")));
+    assert!(
+        watched
+            .edited
+            .contains_key(&PathBuf::from(format!("/w/app/{}", EDITED_DIRECTORIES + 7)))
+    );
+}
+
+#[test]
+fn a_pull_request_row_carries_its_changes_and_every_check_as_it_ended() {
+    let mut found = listed(9, "feat", "OPEN");
+    found.additions = Some(12);
+    found.deletions = Some(3);
+    found.status_check_rollup = serde_json::from_value(serde_json::json!([
+        {"__typename": "CheckRun", "name": "test", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SUCCESS",
+         "detailsUrl": "https://github.com/me/repo/runs/1"},
+        {"__typename": "CheckRun", "name": "docs", "workflowName": "CI",
+         "status": "COMPLETED", "conclusion": "SKIPPED"},
+        {"__typename": "CheckRun", "name": "deploy", "workflowName": "Release",
+         "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"__typename": "CheckRun", "name": "lint", "workflowName": "CI",
+         "status": "IN_PROGRESS"},
+        {"__typename": "StatusContext", "context": "ci/legacy", "state": "FAILURE",
+         "targetUrl": "https://ci.invalid/1"},
+    ]))
+    .unwrap();
+    let detail = Detail::of(&found);
+    assert_eq!(
+        detail.diff,
+        Some(DiffStat {
+            additions: 12,
+            deletions: 3
+        })
+    );
+    assert_eq!(
+        detail
+            .checks
+            .iter()
+            .map(|check| (check.state, check.workflow.as_str(), check.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![
+            (CheckState::Failed, "", "ci/legacy"),
+            (CheckState::Pending, "CI", "lint"),
+            (CheckState::Cancelled, "Release", "deploy"),
+            (CheckState::Passed, "CI", "test"),
+            (CheckState::Skipped, "CI", "docs"),
+        ]
+    );
+    // A check without its own page links to the pull request.
+    assert_eq!(detail.checks[1].url, "https://github.com/me/repo/pull/9");
+}
+
+#[test]
+fn an_edited_worktree_counts_its_changed_paths_and_takes_its_measured_lines() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    local.worktrees[0].dirty = Some(crate::work::Dirty {
+        paths: 3,
+        conflicted: 0,
+        newest_modified_at_unix_ms: Some(5),
+    });
+    project.local = Some(Arc::new(local));
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    watched.edited_in(PathBuf::from("/w/app/.worktrees/feat"), false);
+    let mut list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let counted = |list: &ConversationPullRequests| {
+        list.worktrees
+            .iter()
+            .map(|worktree| {
+                (
+                    worktree.path.to_str().unwrap().to_owned(),
+                    (worktree.changed_paths, worktree.diff),
+                )
+            })
+            .collect::<BTreeMap<_, _>>()
+    };
+    // The scan has not read the linked worktree's status yet.
+    assert_eq!(
+        counted(&list),
+        BTreeMap::from([
+            ("/w/app".to_owned(), (Some(3), None)),
+            ("/w/app/.worktrees/feat".to_owned(), (None, None)),
+        ])
+    );
+    let project = facts.project.as_ref().unwrap();
+    let main = &project.local.as_ref().unwrap().worktrees[0];
+    let measured = BTreeMap::from([(
+        PathBuf::from("/w/app"),
+        Measured {
+            fingerprint: Fingerprint::of(main),
+            diff: Some(DiffStat {
+                additions: 7,
+                deletions: 2,
+            }),
+        },
+    )]);
+    with_measured(&mut list, &measured);
+    assert_eq!(
+        counted(&list)["/w/app"],
+        (
+            Some(3),
+            Some(DiffStat {
+                additions: 7,
+                deletions: 2
+            })
+        )
+    );
+    // Any change to its status, such as another edit's time, is a new
+    // fingerprint and so is measured again.
+    let mut edited = main.clone();
+    edited.dirty.as_mut().unwrap().newest_modified_at_unix_ms = Some(6);
+    assert_ne!(Fingerprint::of(&edited), Fingerprint::of(main));
+}
+
+#[test]
+fn a_conversation_with_no_transcript_yet_reads_as_complete_once_looked_for() {
+    let mut watched = Watched::new();
+    // Before any read, nothing is known.
+    assert_eq!(watched.coverage, TranscriptCoverage::Pending);
+    // A read of a conversation whose transcript is not there yet finds all
+    // of nothing, rather than staying on its way forever.
+    read(&mut watched);
+    assert_eq!(watched.source, Source::Pending);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+    assert!(watched.references.is_empty());
+}
+
+#[test]
+fn a_recorded_conversation_lists_the_worktree_it_edited_and_the_pull_request_it_opened() {
+    use crate::chat::{
+        ChangeKind, CommandAction, FileChange, Item, ItemContent, Role, ToolStatus, runtime::Unread,
+    };
+    let item = |id: &str, content| Item {
+        started_at: None,
+        id: id.into(),
+        role: Role::Assistant,
+        content,
+        at: None,
+    };
+    let unread = Unread {
+        restarted: true,
+        items: vec![
+            item(
+                "edit",
+                ItemContent::Changes {
+                    changes: vec![FileChange {
+                        path: "/w/app/.worktrees/feat/src/lib.rs".into(),
+                        kind: ChangeKind::Updated,
+                        diff: String::new(),
+                        lines: crate::chat::LineOrigin::File,
+                    }],
+                    status: ToolStatus::Succeeded,
+                },
+            ),
+            item(
+                "create",
+                ItemContent::Command {
+                    label: String::new(),
+                    command: "gh pr create --fill".into(),
+                    working_directory: "/w/app/.worktrees/feat".into(),
+                    action: CommandAction::Run,
+                    status: ToolStatus::Succeeded,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    output: "https://github.com/me/repo/pull/1\n".into(),
+                },
+            ),
+        ],
+        ..Unread::default()
+    };
+    let mut items = Items::default();
+    let mut found = Vec::new();
+    items.read(unread, false, &mut found);
+    let facts = facts("/w/app");
+    let mut watched = Watched::new();
+    watched.source = Source::Recorded;
+    watched.apply(
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        Some(&facts),
+    );
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(list.transcript, TranscriptCoverage::Complete);
+    assert_eq!(rows(&list), vec![(1, Relation::Created, false, false)]);
+    assert_eq!(
+        list.worktrees
+            .iter()
+            .map(|worktree| (worktree.path.to_str().unwrap(), worktree.pull_request))
+            .collect::<Vec<_>>(),
+        vec![("/w/app/.worktrees/feat", Some(1))]
+    );
+}
+
+/// Hosts an Antigravity chat whose record holds `items`, the way the daemon
+/// installs one, and tells the Work tracker.
+fn host_recorded_chat(host: &SharedHost, items: Vec<crate::chat::Item>) -> TerminalId {
+    let recipe = crate::model::LaunchRecipe {
+        program: "unused-history-reader".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: Default::default(),
+        unset_environment: Default::default(),
+    };
+    host_chat(host, Provider::Antigravity, recipe, None, items)
+}
+
+/// Hosts a `provider` chat launched from `recipe`, whose record holds
+/// `items`, and tells the Work tracker.
+fn host_chat(
+    host: &SharedHost,
+    provider: Provider,
+    recipe: crate::model::LaunchRecipe,
+    session_id: Option<String>,
+    items: Vec<crate::chat::Item>,
+) -> TerminalId {
+    use crate::chat::{
+        self, Command, Event, Item, ItemContent, Phase, Role,
+        protocol::{Adapter, ProcessSpec, Step, TransportSpec},
+    };
+    struct Idle;
+    impl Adapter for Idle {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            let Command::SetModel { model: text, .. } = command else {
+                return Ok(Step::default());
+            };
+            Ok(Step {
+                events: vec![Event::Item(Item {
+                    id: "extra".into(),
+                    role: Role::Assistant,
+                    content: ItemContent::Text {
+                        text,
+                        thinking: false,
+                        phase: Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        transport: TransportSpec::History,
+        followed: true,
+        ..ProcessSpec::from(&recipe)
+    };
+    let mut initial = Step {
+        events: items.into_iter().map(Event::Item).collect(),
+        ..Step::default()
+    };
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let id = TerminalId::new();
+    let execution_instance = uuid::Uuid::new_v4();
+    let owner = Arc::downgrade(host);
+    let handle =
+        chat::runtime::Handle::start(spec, Box::new(Idle), initial, store, None, move |update| {
+            crate::host::chat::changed_owned(&owner, id, execution_instance, update);
+        })
+        .unwrap();
+    let mut state = host.lock().unwrap();
+    let session = chat::Session {
+        id,
+        launch: chat::Launch {
+            provider,
+            recipe,
+            session_id,
+            draft_model: None,
+        },
+        proof: Some(state.proof().clone()),
+        terminal: None,
+        owned_codex_listener: None,
+        native_continuity: Default::default(),
+    };
+    state.chats.insert(
+        id,
+        crate::host::chat::Record {
+            execution_instance,
+            console_recipe: None,
+            paired_terminal: None,
+            session,
+            handle,
+            source_process: None,
+            subscribers: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            completion_observed: false,
+            returning_terminal: false,
+        },
+    );
+    state.chat_added(id);
+    id
+}
+
+#[test]
+fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_it() {
+    use crate::chat::{CommandAction, Item, ItemContent, Role, ToolStatus};
+    use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    host.lock().unwrap().work = Some(work.clone());
+    let signal = &work.0.conversations.signal;
+
+    let mut files = files::Watches::new(|_| {});
+    // Nothing to read: the loop would wait for input.
+    let observed = signal.observe().unwrap();
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
+
+    let id = host_recorded_chat(
+        &host,
+        vec![Item {
+            id: "create".into(),
+            role: Role::Assistant,
+            content: ItemContent::Command {
+                label: String::new(),
+                command: "gh pr create --fill".into(),
+                working_directory: "/w/app".into(),
+                action: CommandAction::Run,
+                status: ToolStatus::Succeeded,
+                exit_code: Some(0),
+                duration_ms: None,
+                output: "https://github.com/me/repo/pull/1\n".into(),
+            },
+            started_at: None,
+            at: None,
+        }],
+    );
+    // The loop's wait ends: it was told.
+    signal.wait(observed, Duration::from_secs(5));
+    assert_ne!(signal.observe(), Some(observed));
+
+    // Followed with no watcher, and read from its start.
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
+    {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        assert!(watched.watchers.is_empty());
+        assert_eq!(numbers(watched), [1]);
+        assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+        watched.input.read = Some(Instant::now() - TICK);
+    }
+
+    // A daemon-origin command writes a record without provider output or
+    // visible presentation. The next record read is triggered by that write.
+    let observed = signal.observe().unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    handle
+        .command(crate::chat::Command::SetModel {
+            model: "https://github.com/me/repo/pull/2".into(),
+            reasoning: None,
+        })
+        .unwrap();
+    assert_ne!(signal.observe(), Some(observed));
+    assert_eq!(
+        work.conversation_pass(&host, &mut files),
+        NextPass::default()
+    );
+    assert_eq!(numbers(&work.conversations().watched[&id]), [1, 2]);
+
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
+fn an_inspected_claude_chat_finds_its_first_transcript_when_a_turn_starts() {
+    use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    host.lock().unwrap().work = Some(work.clone());
+    let signal = &work.0.conversations.signal;
+    let home = tempfile::Builder::new()
+        .prefix("cagents-conversations-claude-")
+        .tempdir()
+        .unwrap();
+    let home = home.path().canonicalize().map(|path| (path, home)).unwrap();
+    let project = home.0.join("project");
+    std::fs::create_dir(&project).unwrap();
+    let session = uuid::Uuid::new_v4().to_string();
+    let recipe = crate::model::LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: project.clone(),
+        environment: [("HOME".into(), home.0.to_string_lossy().into_owned())].into(),
+        unset_environment: Default::default(),
+    };
+    let id = host_chat(
+        &host,
+        Provider::Claude,
+        recipe,
+        Some(session.clone()),
+        Vec::new(),
+    );
+    let queue = Arc::new(crate::host::delivery::DeliveryQueue::new(1, 16));
+    work.watch_conversation(&host, 1, id, Arc::downgrade(&queue))
+        .unwrap();
+    let mut files = files::Watches::new(|_| {});
+
+    // Opened before its first prompt: Claude has written no transcript.
+    // The inspector has been waiting long enough to back off far.
+    work.input_changed(id);
+    work.conversation_pass(&host, &mut files);
+    let missed = |work: &Handle| {
+        let state = work.conversations();
+        let watched = &state.watched[&id];
+        (watched.source == Source::Pending, watched.searches_missed)
+    };
+    assert_eq!(missed(&work), (true, 1));
+    let waited = |work: &Handle| {
+        let mut state = work.conversations();
+        let watched = state.watched.get_mut(&id).unwrap();
+        watched.input.read = Some(Instant::now() - TICK);
+        watched.searches_missed = 5;
+        watched.search_after = Some(Instant::now() + Duration::from_secs(120));
+    };
+    waited(&work);
+
+    // The prompt starts a turn, which is input, before Claude has written
+    // the transcript: the search misses again, but backs off from its start.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_ne!(signal.observe(), Some(observed));
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (true, 1));
+    let soon = work.conversations().watched[&id].search_after.unwrap();
+    assert!(soon <= Instant::now() + search_backoff(1));
+
+    // Claude writes it, which no watch reports; the short backoff ends.
+    let key: String = project
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let directory = home.0.join(".claude/projects").join(key);
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join(format!("{session}.jsonl")), "").unwrap();
+    work.conversations()
+        .watched
+        .get_mut(&id)
+        .unwrap()
+        .search_after = Some(Instant::now());
+    work.conversation_pass(&host, &mut files);
+    assert_eq!(missed(&work), (false, 0));
+
+    // Once found, activity is not input: its file watch is.
+    let observed = signal.observe().unwrap();
+    work.activity_changed(id);
+    assert_eq!(signal.observe(), Some(observed));
+
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
+fn checkout_facts_change_with_what_a_left_behind_branch_reads() {
+    let local = |ahead: u32| {
+        let mut local = super::super::scan::Local::default();
+        local.worktrees = vec![worktree("/w/app/.worktrees/feat", "feat")];
+        local.worktrees[0].comparison = Some(crate::work::Comparison {
+            base: "main".into(),
+            ahead,
+            behind: 0,
+        });
+        local
+    };
+    assert!(!checkout_facts_changed(Some(&local(0)), &local(0)));
+    // A fetch moved the base, so its commits are now its own.
+    assert!(checkout_facts_changed(Some(&local(0)), &local(1)));
+    // A scan measured whether a merged head contains its commit.
+    let mut measured = local(0);
+    measured
+        .ancestry
+        .insert(("local".into(), "merged".into()), true);
+    assert!(checkout_facts_changed(Some(&local(0)), &measured));
+}
+
+#[test]
+fn invalid_branch_identity_is_displayed_with_escapes_without_a_forge_query() {
+    let identity = ":6c65676163792dff";
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    Arc::make_mut(project.local.as_mut().unwrap()).worktrees[0].branch = Some(identity.into());
+    let mut watched = Watched::new();
+    watched.edited_in(PathBuf::from("/w/app/src"), false);
+    assert!(matches!(
+        resolve(&branch(None, identity), &facts, &BTreeMap::new()),
+        Resolved::Nothing
+    ));
+    let project = facts.project.as_ref().unwrap();
+    let worktrees = edited_worktrees(&watched, project, |_| None);
+    assert_eq!(worktrees.len(), 1);
+    assert_eq!(worktrees[0].branch.as_deref(), Some(r"legacy-\xFF"));
+    assert!(worktrees[0].pull_request.is_none());
+}

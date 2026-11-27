@@ -1746,6 +1746,12 @@ impl Cagents {
                 if receipt.identity != self.workspace_model.identity {
                     return Task::none();
                 }
+                // The registry holds this window's rename from here, and its
+                // row clock keeps any older model from showing the old title,
+                // even when a later edit already replaced this one's row.
+                if let ModelEdit::RetitleChannel { id, title } = &edit {
+                    self.note_channel_rename_held(*id, title);
+                }
                 let operation = match &edit {
                     ModelEdit::ChangeView { operation, .. } => Some(*operation),
                     _ => None,
@@ -2981,12 +2987,48 @@ impl Cagents {
         self.adopt_execution_agent_resolved_session(agent, display, session)
     }
 
+    /// Gives open card `card`, showing `current`, the conversation ID its
+    /// agent's `session` holds, when that is the only difference: the
+    /// provider named the thread after the card was made from a descriptor
+    /// without it. Returns whether the card learned it.
+    fn learn_agent_identity(
+        &mut self,
+        card: CardId,
+        current: &crate::agent_execution::HostedSession,
+        session: &crate::agent_execution::HostedSession,
+    ) -> bool {
+        use crate::agent_execution::HostedSession;
+        let (HostedSession::Chat(current), HostedSession::Chat(learned)) = (current, session)
+        else {
+            return false;
+        };
+        if !crate::chat::is_first_codex_identity_update(current, learned) {
+            return false;
+        }
+        let Some(state) = self.card_state_mut(card) else {
+            return false;
+        };
+        state.kind = CardKind::Chat(learned.clone());
+        true
+    }
+
     fn adopt_execution_agent_resolved_session(
         &mut self,
         agent: &crate::agent_execution::Agent,
         display: crate::workspace_model::views::ManagedDisplay,
         session: crate::agent_execution::HostedSession,
     ) -> Option<Task<Message>> {
+        // A pane written before the provider named the thread shows the
+        // agent's process without the ID the agent holds; the card takes it.
+        let session = match (&session, &agent.session) {
+            (
+                crate::agent_execution::HostedSession::Chat(shown),
+                Some(crate::agent_execution::HostedSession::Chat(saved)),
+            ) if crate::chat::is_first_codex_identity_update(shown, saved) => {
+                crate::agent_execution::HostedSession::Chat(saved.clone())
+            }
+            _ => session,
+        };
         let placement = &display.scope;
         if !session.has_complete_proof()
             || self
@@ -3050,7 +3092,10 @@ impl Cagents {
             if !session.same_process(&current) {
                 return None;
             }
-            let saved = display.pane.as_ref()?;
+            let learned = self.learn_agent_identity(card_id, &current, &session);
+            let Some(saved) = display.pane.as_ref() else {
+                return learned.then(Task::none);
+            };
             let in_place = match placement {
                 crate::agent_execution::Placement::Channel(channel) => self
                     .durable
@@ -3067,7 +3112,7 @@ impl Cagents {
                 }
             };
             if in_place {
-                return None;
+                return learned.then(Task::none);
             }
             let durable = Arc::make_mut(&mut self.durable);
             durable
@@ -3204,6 +3249,11 @@ impl Cagents {
 
     /// Takes the shared half of a channel this window already has.
     fn absorb_shared_channel(&mut self, index: usize, shared: &ModelChannel) -> bool {
+        // A model showing this window's rename, which may come before the
+        // rename's receipt. One with any other title may predate it.
+        if shared.title_source == crate::model::ChannelTitleSource::Manual {
+            self.note_channel_rename_held(shared.id, &shared.title);
+        }
         let local = &self.durable.channels[index];
         // The shared title wins even where this window's own derivation would
         // differ: one window deferring is better than two windows showing one
@@ -3224,9 +3274,11 @@ impl Cagents {
         }
         // A name cleared in another window asks for the automatic one, which
         // this window offers if it runs the channel's conversation. A model
-        // older than this window's own rename looks the same, so it does not
-        // forget that rename (see `channel_is_named`): the registry refuses
-        // the offer once it holds the new name, whose echo then restores it.
+        // older than this window's own rename looks the same, so a rename
+        // still waiting for its echo is not forgotten (see
+        // `channel_is_named`): the registry refuses the offer once it holds
+        // the new name, whose echo then restores it. A clear after the echo
+        // leaves the channel unnamed.
         let cleared = retitle && !local.title.is_empty() && shared.title.is_empty();
         let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
         if retitle {

@@ -7,6 +7,7 @@
 # slice, every build sharing one jobserver for the CPUs. Tests and programs
 # run after their build has given its share back.
 set -eu
+invoking_process=$PPID
 
 # A mise shim finds its target on PATH, passing over its own directory only if
 # that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
@@ -32,7 +33,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=43
+gate_version=46
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -100,7 +101,8 @@ script that only builds, one slot there is leased first and held until
 COMMAND exits: its Cargo commands build in that slot one at a time.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
-here through scripts/build-host. A build waits for its share of the memory
+here through scripts/build-host. Queries such as `metadata` and `tree` skip
+build admission. A build waits for its share of the memory
 set aside for builds (three quarters of the host's, in shares of 4 GiB; a
 check or CLI build takes one, a host or UI build two), then starts at once.
 While they are taken, a build that only builds first asks Cargo, in a short
@@ -144,6 +146,13 @@ Environment:
   CAGENTS_BUILD_REMOTE_LOOPBACK=1
                          On the build host itself, build in its shared
                          slots, as another host would, rather than here
+  CAGENTS_BUILD_LOCAL_SYNC_SLOTS
+                         Concurrent source and artifact phases on this
+                         client, across all worktrees (default 2)
+  CAGENTS_BUILD_TRANSPORT_TIMEOUT_SECONDS
+                         Time for one transfer attempt (default 180)
+  CAGENTS_BUILD_REMOTE_COMMAND_TIMEOUT_SECONDS
+                         Time for a remote command connection (default 7200)
   CAGENTS_BUILD_INSTALLED_GATE
                          The installed gate a checkout's older gate defers
                          to (default /var/tmp/cagents-cargo-gate); empty
@@ -157,8 +166,8 @@ Environment:
   CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS
                          Optional positive integer budget for preflight and
                          admission waits, including the wait for the build
-                         host; expiry exits 124 after cleanup. Admitted
-                         builds are not timed out; default unbounded
+                         host; expiry exits 124 after cleanup. This budget
+                         stops at admission; default unbounded
   CAGENTS_BUILD_SLOTS    Memory shares on this host; default three quarters
                          of its memory in shares of 4 GiB, at least 2
   CAGENTS_BUILD_EXTRA_SHARES
@@ -271,7 +280,7 @@ build_shares() {
         case ,$names, in
             # A feature may be named with its package, as in cagents/ui.
             *[,\ /]ui[,\ ]*|*integrated-browser*|*cagents-ui*) lane=ui ;;
-            *[,\ /]host[,\ ]*|*cagentsd*) [ "$lane" = ui ] || lane=host ;;
+            *[,\ /]host[,\ ]*|*cagentsd*|*cagents-host*) [ "$lane" = ui ] || lane=host ;;
         esac
     done
     case $1:$lane in
@@ -297,7 +306,10 @@ supervised() {
     # POSIX shells may replace async stdin with /dev/null before applying
     # redirections. Save the caller's stdin on the now-free queue descriptor.
     exec 8<&0
-    set -- "$command_state/cancelled" "$@"
+    set -- --parent "$$" "$command_state/cancelled" "$@"
+    if [ "${watch_invoking_process:-false}" = true ]; then
+        set -- --watch-parent "$invoking_process" "$@"
+    fi
     if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
         set -- --admission-until "$admission_deadline" "$@"
     fi
@@ -433,13 +445,17 @@ cargo_shim() {
 # Rust compiles on the build host when there is one, whether or not this
 # command is inside a slot here. `scripts/cargo-offload --host` exits 0 when
 # there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
-# `local`; anything else is a failure, never a reason to build here. Its wait
+# `local`. Status 76 means the local Cargo command needs no slot. Its wait
 # for that host spends the admission budget; the build there does not.
 cargo=${CAGENTS_BUILD_CARGO:-cargo}
 offload=$here/cargo-offload
 if [ -x "$offload" ]; then
     where=0
-    remote_host=$("$offload" --host) || where=$?
+    if [ "$mode" = cargo ]; then
+        remote_host=$("$offload" --host "$@") || where=$?
+    else
+        remote_host=$("$offload" --host) || where=$?
+    fi
 elif [ "${CAGENTS_BUILD_REMOTE-}" = local ]; then
     where=75
 else
@@ -447,10 +463,11 @@ else
 fi
 case $where in
     0) ;;
-    75) ;;
+    75|76) ;;
     *) fail "$offload could not tell where Rust compiles (status $where)" ;;
 esac
 if [ "$where" -eq 0 ]; then
+    watch_invoking_process=true
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
         deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
@@ -465,6 +482,7 @@ if [ "$where" -eq 0 ]; then
         shares=$(build_shares "$@") || exit "$?"
         supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
             CAGENTS_BUILD_SHARES="$shares" \
+            CAGENTS_BUILD_OFFLOAD_SUPERVISED=1 \
             CAGENTS_BUILD_OFFLOAD_HOST="$remote_host" "$offload" "$@" || status=$?
         exit "$status"
     fi
@@ -483,6 +501,7 @@ if [ "$where" -eq 0 ]; then
     status=0
     if [ "$hold" = true ]; then
         supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_OFFLOAD_SUPERVISED=1 \
             CAGENTS_BUILD_OFFLOAD_HOST="$remote_host" "$offload" --hold "$@" || status=$?
     else
         supervised '' "$@" || status=$?
@@ -499,6 +518,9 @@ fi
 # that `cargo run` started, and may be another build's.
 if [ "${CAGENTS_BUILD_METADATA_SUPPLIED-}" = 1 ]; then
     unset CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+fi
+if [ "$where" -eq 76 ]; then
+    exec "$cargo" "$@"
 fi
 
 # Whether Cargo already has a runner for the programs it starts. Two

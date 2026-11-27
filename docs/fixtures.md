@@ -19,9 +19,11 @@ person.
 | A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat, or an Antigravity or Muse chat prompted with `work` |
 | A Work board of fourteen GitHub projects, optionally with the account's GraphQL quota spent | [`tests/fixtures/work-board-projects.py`](#many-projects-on-the-work-board), run through `scripts/native-evidence env python3 ...` |
 | A pull request review read from cache while GitHub is unavailable, with a restored draft line comment | [`tests/fixtures/offline-review-cache.py`](#an-offline-cached-review), run through `scripts/native-evidence env python3 ...` once the app has started |
+| The inert draft copy older windows kept beside a pane whose conversation came back with a new proof (#4115) | [`tests/fixtures/stale-chat-copy.py`](../tests/fixtures/stale-chat-copy.py)` TITLE [DRAFT]`, run through `scripts/native-evidence env python3 ...` with the app window closed; it copies the first chat of the channel titled TITLE |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Real Codex app-server ownership, saved-history loading or socket behaviour | [An isolated real executable](#a-real-codex-in-the-fixture), selected by `native-evidence start SIDE --codex-executable /absolute/path/to/codex` |
+| The status bar's phone popover: paired phones, a connected phone, Tailscale up or down, no SSH server | [The phone host marker](#phone-connection-states), `home/.cagents-fixture-mobile-host`, and the fixture HOME's own `.ssh/authorized_keys` |
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
@@ -115,9 +117,9 @@ in a session before starting the chat; it takes no arguments:
 scripts/native-evidence env python3 "$PWD/tests/fixtures/conversation-work.py"
 ```
 
-It adds three worktrees of the fixture project under `.worktrees/`, gives the
+It adds four worktrees of the fixture project under `.worktrees/`, gives the
 project the remote `https://github.com/octo-org/fixture-app`, turns the
-[forge](#an-offline-github) on with five seeded pull requests, and writes
+[forge](#an-offline-github) on with six seeded pull requests, and writes
 [`conversation-work/frames.jsonl`](../tests/fixtures/conversation-work/frames.jsonl)
 as the provider's `fixture-frames.jsonl`, with this fixture's paths. Its turn
 replays Claude Code `Edit` and `Bash` calls and their output, in the shape
@@ -127,6 +129,7 @@ Claude Code records them:
 | --- | --- | --- |
 | #41 Key the response cache by locale, **Created**, worktree `fix/cache-key` | edited it, committed, pushed and ran `gh pr create`, then left a test uncommitted | open; checks build passed, lint failed, test running |
 | #38 Bound the retry budget, **Pushed**, worktree `feat/retry-budget` | edited it, committed and pushed its branch | open, approved, every check passed |
+| #44 Count cache misses per locale, **Pushed**, worktree `feat/cache-metrics` | edited it, committed and pushed its branch | merged after `main` was merged into it on GitHub, so its head there is not the worktree's commit; the worktree is shown on its row |
 | #35 Drop the legacy cache flag, **Updated** | `gh pr merge 35` | merged |
 | `docs/locale-notes`, a worktree with no pull request | edited `docs/locales.md`, uncommitted | |
 | #12 and #29, **Mentioned** | named by URL and by `#29` in prose | merged; closed |
@@ -253,7 +256,7 @@ again keeps the projects and rewrites their seeds, keeping any other
 repository's.
 
 `work-board-projects.py rate-limit` spends the account's GraphQL quota
-through the forge's `fixture-forge-rate-limited` switch, as many agents
+through the forge's `fixture-forge-graphql-reset` switch, as many agents
 sharing one GitHub account do, until the start of the hour after next, so a
 Before and an After session in the same hour show the same reset time.
 `rate-limit off` gives it back. The board reports it once it reads GitHub
@@ -317,13 +320,12 @@ and its `CagentsPullRequestChecks` reads the next hundred from there. This exerc
 actual query and decoder without a GitHub account.
 
 To spend the account's GraphQL quota, write the Unix time it resets to
-`home/.config/fixture-forge-rate-limited`, or leave the file empty for an hour
-after it was written. Until then every `gh api graphql` fails as GitHub's
-does: `X-Ratelimit-Remaining: 0` and the reset in its headers, a
-`RATE_LIMITED` error in its body, and gh's message on stderr. REST, a quota of
-its own, still answers, as does `gh auth status`; `gh repo view` and `gh pr`,
-which read GraphQL, fail with gh's own rate-limit message. Remove the file, or let the
-time pass, to give it back.
+`home/.config/fixture-forge-graphql-reset`. Until then every GraphQL read
+fails as GitHub's does: `gh api graphql` with `X-Ratelimit-Remaining: 0` and
+the reset in its headers and a `RATE_LIMITED` error in its body, and
+`gh repo view` and `gh pr`, which read GraphQL, with gh's rate-limit message
+and those headers on stderr. REST, a quota of its own, still answers, as does
+`gh auth status`. Remove the file, or let the time pass, to give it back.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
 appends epoch time, parent PID and operation label to
@@ -459,8 +461,10 @@ outside the app's clock, so the app's next save of the review replaces it, and
 running the script again rewrites the cache and keeps the commits. Other seeds
 in `fixture-forge-prs.json` are kept.
 
-To open the review as a person does, show the sidebar's search, choose its
-**Pull requests** filter and click the `fix/cache-key` row. The draft's
+To open the review as a person does, open the Worktrees pane
+(`Ctrl+Shift+E`), press the project heading's pull requests button (its tooltip
+reads *Pull requests in project*) and click #57, "Key the response cache by
+locale", in the list it opens. The draft's
 composer sits under line 23; its buttons are below the fold at the default
 height, so scroll the diff to reach them. Don't click a diff gutter in a
 revision without the fix for #3417: that starts a comment the cached review has
@@ -470,18 +474,18 @@ no authority for, and the app panics. A steps file:
 evidence env python3 -I "$tool/tests/fixtures/offline-review-cache.py" >/dev/null
 evidence cli project open '{fixture}/project' >/dev/null
 evidence drive wait 'Worktrees' --timeout 60 >/dev/null
-evidence drive click 206,67 >/dev/null    # the sidebar's search
-evidence drive wait 'Pull requests' --timeout 10 >/dev/null
-evidence drive click 'Pull requests' >/dev/null
-evidence drive wait 'cache-key' --timeout 60 >/dev/null
-evidence drive click 'cache-key' >/dev/null
+evidence drive key ctrl+shift+e >/dev/null
+evidence drive wait 'Pull requests in project' --timeout 60 >/dev/null
+evidence drive click 'Pull requests in project' >/dev/null
+evidence drive wait 'Key the response cache' --timeout 60 >/dev/null
+evidence drive click 'Key the response cache' >/dev/null
 evidence drive wait 'read only' --timeout 30 >/dev/null
 evidence drive wait 'empty locale' --timeout 30 >/dev/null
 evidence shot offline-review
 ```
 
-If `Worktrees` is collapsed, the filter shows no `fix/cache-key` row until it
-is expanded. `tests/offline_review_cache_fixture.py` checks the rows the
+The button appears once the app has read the project's GitHub remote.
+`tests/offline_review_cache_fixture.py` checks the rows the
 script writes against the tables `src/persistence.rs` creates, and that the
 forge lists #57 at the cached head; the native review is what shows the app
 reads them.
@@ -597,6 +601,16 @@ reports a subagent the child spawned earlier, Ada, which never runs live. Like
 Codex, the peer lists a child it hasn't loaded since it started as
 `notLoaded`, and refuses to read Ada until the child's own read has loaded it:
 the state a restarted daemon restores nested subagents from.
+
+With `home/.codex/fixture-multi-agent-v2` present, each prompt to the
+`tool-rows` peer plays a turn of Codex's second multi-agent version instead, as
+Codex 0.172 sends one. It starts two subagents, Arendt and Hume, and announces
+each only with a `subAgentActivity` item: no `thread/started` and no
+collaboration call names either. It waits for both to report, then answers.
+The thread listing names each child, with its agent path, once its turn has
+started, so a chat opened before the prompt lists none. Create the marker
+before the prompt, as with `evidence env touch
+'{fixture}/home/.codex/fixture-multi-agent-v2'` in a steps file.
 
 The `tool-rows` peer also reads an optional `model/list` result from
 `home/.codex/fixture-models.json`. Its nonempty `data` array needs a `model`
@@ -1164,6 +1178,16 @@ blocked. Both failures come back wrapped in `<tool_use_error>` tags, as
 Claude Code sends them. It captures the turn with the cards closed, then
 open.
 
+`narration` replays
+[`narration.jsonl`](../tests/fixtures/reasoning-row-scene/narration.jsonl):
+an empty thought, then two passages of progress prose, each followed by a
+command, then the answer. As some models send it, the prose arrives as
+thinking blocks whose server signature names them narration; the signatures
+are real ones and the text is invented. The first passage's frame also lists
+it in `narration_block_indexes`, and the second is known only by its
+signature. The scene captures the finished turn, where the prose should read
+as the agent's commentary rather than as thinking rows.
+
 `agents` has the lead start a background command and three background
 subagents, one of which finishes before the lead answers, so two subagents
 and the command are still working after the lead has finished. `plan` needs a session started with
@@ -1404,6 +1428,8 @@ The first of these words a prompt contains chooses what it does:
 | `edits` | edits three files in one step (a two-hunk change to `src/config.rs`, a new `src/error.rs` and a deleted `docs/legacy-config.md`), then rewrites `src/handlers.rs` with a long patch |
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
+| `background` | starts a build in the background, says it is waiting, and stays silent until the build ends after `FAKE_ACP_BACKGROUND_SECONDS` (default 20); Stop fails the build |
+| `subagent` | starts a Release Checker subagent as Antigravity 1.5.17 does, whose `make check` asks for approval under its own session ID; once allowed, it runs for two seconds and reports. Deny leaves the checks unrun; Stop fails them. A loaded conversation replays only the call that started it |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
 | `files` | asks the client to read a file and reports the error it got |
 | `mode` | moves to the next mode and reports it |
@@ -1413,8 +1439,15 @@ The first of these words a prompt contains chooses what it does:
 | `allowance` | refuses the turn as a login with no usage allowance |
 | `/compact`, at the start | compacts the conversation |
 
-Anything else gets a thought and `Fake answer to: ...`. These variables add
-failures:
+Anything else gets a thought and `Fake answer to: ...`.
+
+A prompt sent during a turn is handled the way Antigravity 1.5.17 handles
+one. The running prompt ends at once with `end_turn`. The turn then goes
+on under the new prompt, answers it with `Fake answer to: ...`, and ends
+with that prompt's reply. In Muse's shape, a prompt sent during a turn is
+refused because a prompt is already running.
+
+These variables add failures:
 
 | Variable | Effect |
 | --- | --- |
@@ -1424,6 +1457,7 @@ failures:
 | `FAKE_ACP_NOISE=1` | a banner line that is not JSON comes before the first reply |
 | `FAKE_ACP_REPLAY=N` | loading a session first replays `N` invented exchanges |
 | `FAKE_ACP_LOG=PATH` | every frame the agent receives is appended to `PATH` |
+| `FAKE_ACP_BACKGROUND_SECONDS=N` | how long the `background` turn's build runs |
 | `FAKE_ACP_WORK=PATH` | the Claude Code transcript a `work` prompt replays. The installed `agy` and `muse-upstream` read the fixture's `home/.claude/fixture-frames.jsonl`, which `conversation-work.py` writes |
 | `FAKE_ACP_AUTH_FILE=PATH` | the sign-in record Muse's `login` writes and `logout` removes; only ever a fixture's own file |
 
@@ -1434,6 +1468,7 @@ These files under `FAKE_ACP_STATE` switch states that last across processes:
 | `signed-out` | every new or loaded session and every prompt answers that sign-in is required |
 | `no-allowance` | every prompt is refused as a login with no usage allowance, and Muse's `usage --json` reports none |
 | `hang-probe` | a session opened by the account probe (`--app-data-dir`) never answers, as one that times out |
+| `background-seconds` | in the native-evidence fixture only, how long a `background` prompt's build runs, where `FAKE_ACP_BACKGROUND_SECONDS` cannot reach the app's agent |
 
 Run with `--app-data-dir DIR`, as the Antigravity account probe runs
 `agy acp`, it saves each new session's files under `~/.gemini/DIR` the way
@@ -1518,6 +1553,34 @@ If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
 
+## Phone connection states
+
+The phone popover reads this computer's network, SSH server and running
+mobile bridges. In a native-evidence task, a JSON file at
+`home/.cagents-fixture-mobile-host` stands in for all of them; paired phones
+still come from the fixture HOME's `.ssh/authorized_keys`, which pairing also
+writes:
+
+```sh
+scripts/native-evidence env sh -c 'cat >"$CAGENTS_EVIDENCE_FIXTURE/home/.cagents-fixture-mobile-host" <<EOF
+{"name":"workstation","port":22,"listening":true,
+ "host_key":"SHA256:I7uYBbsuJDf9UOOdWpjHuU7LQcImmvDuSC3TnbMc5jo",
+ "tailscale":{"name":"workstation.tail4a1c.ts.net","addresses":["100.101.102.103"]},
+ "lan":["192.168.1.20"],"connections":["100.88.1.4"]}
+EOF'
+```
+
+Every field is optional. `tailscale` set to `null` reports Tailscale as
+installed but not connected, and leaving it out reports it as not installed.
+`listening` set to `false` reports no SSH server, `blocked` lists network
+addresses the firewall blocks SSH on while it allows SSH over Tailscale, and
+`connections` lists the addresses of connected phones. Leave `connections`
+out to show the phones really connected, as when a real phone pairs with the
+fixture over an SSH server that reads the fixture HOME's `authorized_keys`. The file is read each time the popover checks
+again, every two seconds while it is open, so it can be changed while the
+session runs. Debug builds whose `HOME` is in a native-evidence task read it;
+other builds and homes ignore it.
+
 ## An update restore in progress or held
 
 After an update, the new daemon restores the conversations the old one ran.
@@ -1584,8 +1647,12 @@ Copy `tests/fixtures/update-review.json` there with mode 0600, then start the
 session (or wait for the active review's next status poll). The example includes
 running work, a blocked conversation, a daemon notice and a paused terminal.
 The file must contain a job named `fixture-update-review`: either awaiting
-confirmation with a daemon preview, or ended (`Failed` or `Cancelled`) with no
-confirmation, to show how a review ended. Decisions fail before looking up an
+confirmation with a daemon preview, waiting for idle after confirmation
+(`tests/fixtures/update-waiting.json`, which the header shows as a waiting
+update with its popover), or ended (`Failed` or `Cancelled`) with no
+confirmation, to show how a review ended. Replace the waiting job with one
+whose sessions resume instead of waiting to show the list shrinking at the
+next status poll. Decisions fail before looking up an
 installation. While the session runs, replace the blocked review with one whose
 blockers are empty and whose sessions continue to show the update becoming
 available at the next status poll, or with an ended one to show the window that
@@ -1598,6 +1665,9 @@ To show what the header offers when a newer release exists, also copy
 otherwise never runs, reports that release as available at startup and on
 "Check again". Under native evidence, `apply` refuses every release, so
 "Update to" and "Retry update to" fail without installing anything.
+To show how macOS offers that release, through its installer, also create an
+empty `home/.config/fixture-update-installer`: About then says the release is
+available and offers "Copy installer command" instead of "Review update".
 
 This loads data into the actual native dialog and supports scrolling and Copy
 details. It does not run providers, inspect a live update inventory, perform an

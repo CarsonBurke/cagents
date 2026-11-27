@@ -9,6 +9,7 @@ use crate::agent_execution::{
     },
 };
 use crate::model::ChannelId;
+use crate::workspace_model::primary_checkout;
 
 #[derive(Debug, clap::Args)]
 pub struct SessionsArgs {
@@ -778,10 +779,10 @@ pub(super) fn list_human<'a>(
     );
     let project = shared.map(|project| {
         let name = super::format::plain(first.entry.project_name.as_deref().unwrap_or_default());
-        match primary_checkout(project) {
-            Some(root) => format!("project {name} at {}", super::format::location(root, None)),
-            None => format!("project {name}"),
-        }
+        format!(
+            "project {name} at {}",
+            super::format::location(primary_checkout(project), None)
+        )
     });
     let shares: Vec<String> = project
         .into_iter()
@@ -850,7 +851,7 @@ fn context(
 ) -> String {
     use crate::agent_execution::{State, directory::Owner};
     let entry = row.entry;
-    let checkout = entry.project.as_deref().and_then(primary_checkout);
+    let checkout = entry.project.as_deref().map(primary_checkout);
     // Across projects a relative path would have no stated base.
     let root = checkout.filter(|_| !projects);
     let shown = |path: &std::path::Path| {
@@ -928,17 +929,6 @@ fn context(
 
 /// How many columns of a title a row shows; the whole title is in `--json`.
 const TITLE_WIDTH: usize = 60;
-
-/// The primary checkout of the project whose repository key is `project`:
-/// the directory holding a Git checkout's own `.git`, or an open folder
-/// itself.
-fn primary_checkout(project: &std::path::Path) -> Option<&std::path::Path> {
-    if project.file_name()? == ".git" {
-        project.parent()
-    } else {
-        Some(project)
-    }
-}
 
 /// Names for the accounts one listing shows, the same in a row and in the
 /// account table: an account's key alone, since a row's provider column

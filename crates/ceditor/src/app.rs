@@ -2625,7 +2625,11 @@ impl Editor {
             .collect::<Vec<_>>();
         let task = self
             .review_requests
-            .update(action, repositories)
+            .update_observing(
+                action,
+                repositories,
+                cagents::notifications::Application::Ceditor,
+            )
             .map(Message::ReviewRequests)
             .map(cosmic::Action::App);
         let report = self.report_review_requests();
@@ -3096,11 +3100,7 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
                                     widget::button::custom(
                                         widget::row::with_children(vec![
                                     widget::container(icon).center_y(Length::Fill).into(),
-                                    design::body(title.clone())
-                                        .wrapping(iced::widget::text::Wrapping::None)
-                                        .ellipsize(iced::widget::text::Ellipsize::End(
-                                            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                                        ))
+                                    cagents_ui_kit::ui_controls::fade_text(title.clone())
                                         .width(Length::Fill)
                                         .into(),
                                 ])

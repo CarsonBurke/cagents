@@ -1,12 +1,19 @@
 package dev.cagents.mobile.android.ssh
 
+import android.system.ErrnoException
+import android.system.OsConstants
 import com.hierynomus.sshj.key.KeyAlgorithms
+import com.hierynomus.sshj.userauth.certificate.Certificate
 import dev.cagents.mobile.android.data.ConnectionSettings
+import dev.cagents.mobile.client.AllFailed
 import dev.cagents.mobile.client.BridgeTransport
 import dev.cagents.mobile.client.ConnectFailure
 import dev.cagents.mobile.client.LineChannel
+import dev.cagents.mobile.client.firstToSucceed
+import dev.cagents.mobile.client.mostTelling
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runInterruptible
@@ -31,7 +38,33 @@ import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 import java.security.PrivateKey
 import java.security.PublicKey
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
+import kotlin.time.Duration.Companion.milliseconds
+
+/**
+ * Loads the phone's key for each connection, failing in a way that tells the
+ * person what to do. A key that can't be used stops connecting until they
+ * make a new one. Any other failure may pass, such as the Keystore before the
+ * phone is first unlocked, so connecting goes on trying; but after [patience]
+ * of them in a row it stops too, pointing to Settings, which can try again or
+ * make a new key.
+ */
+internal class KeyForConnecting<K>(private val load: () -> K, private val patience: Int = 3) {
+    private val failures = AtomicInteger()
+
+    fun get(): K = try {
+        load().also { failures.set(0) }
+    } catch (e: PhoneKeyUnusable) {
+        throw ConnectFailure.Refused(e.message.orEmpty())
+    } catch (e: Exception) {
+        if (failures.incrementAndGet() >= patience) {
+            throw ConnectFailure.Refused("This phone couldn't load its key. Try again in Settings.")
+        }
+        throw ConnectFailure.Network("This phone couldn't load its key just now.", e)
+    }
+}
 
 /**
  * Reaches the bridge by SSH: authenticates with the [PhoneKey], checks the
@@ -39,109 +72,239 @@ import kotlin.concurrent.thread
  * the remote command, its standard input and output carrying the API.
  */
 class SshBridgeTransport(
-    private val phoneKey: () -> PhoneKey,
+    phoneKey: () -> PhoneKey,
     private val settings: () -> ConnectionSettings,
     private val hostKeys: HostKeyStore,
 ) : BridgeTransport {
+    private val phoneKey = KeyForConnecting(phoneKey)
 
     override suspend fun open(): LineChannel {
         val target = settings()
         if (!target.isComplete) throw ConnectFailure.Refused("Enter your computer's address in Settings.")
-        val key = phoneKey()
-        val verifier = PinningVerifier(hostKeys, target.hostKeyId)
-        val client = SSHClient(configFor(key))
-        client.addHostKeyVerifier(verifier)
-        client.connectTimeout = 10_000
-        // Bounds every read, including waiting for the server's banner. sshj's
-        // reader carries on past a read timeout once connected, so it doesn't
-        // limit how long the connection stays idle.
-        client.timeout = 15_000
-        // Set once the channel exists, so whatever happens after, including a
-        // cancellation that discards the result, the connection is closed.
-        var made: SshLineChannel? = null
-        try {
-            return coroutineScope {
-                val work = async(Dispatchers.IO) { establish(client, verifier, key, target).also { made = it } }
-                try {
-                    work.await()
-                } catch (e: CancellationException) {
-                    // Socket I/O ignores interrupts; closing the socket ends a connect or read in progress.
-                    runCatching { client.disconnect() }
-                    throw e
-                }
-            }
-        } catch (e: Throwable) {
-            made?.close() ?: runCatching { client.disconnect() }
-            throw when (e) {
-                is CancellationException, is ConnectFailure -> e
-                is Exception -> ConnectFailure.Network(describe(e, target), e)
-                else -> e
-            }
-        }
-    }
-
-    private fun establish(
-        client: SSHClient,
-        verifier: PinningVerifier,
-        key: PhoneKey,
-        target: ConnectionSettings,
-    ): SshLineChannel {
-        try {
-            client.connect(target.host, target.port)
-        } catch (e: TransportException) {
-            verifier.failure?.let { throw it }
-            throw ConnectFailure.Network(describe(e, target), e)
-        }
-        try {
-            client.authPublickey(target.user, PhoneKeyProvider(key))
-        } catch (e: UserAuthException) {
-            throw ConnectFailure.Unauthorized(
-                "${target.user}@${target.host} didn't accept this phone's key. " +
-                    "Add it to ~/.ssh/authorized_keys there, as Settings shows.",
-            )
-        }
-        client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
-        val session = client.startSession()
-        return SshLineChannel(client, session.exec(target.command))
-    }
-
-    private fun describe(e: Throwable, target: ConnectionSettings): String {
-        val address = "${target.host}:${target.port}"
-        return when (e.rootCause()) {
-            is UnknownHostException -> "Couldn't find ${target.host}. Check the address in Settings."
-            is ConnectException, is NoRouteToHostException ->
-                "Couldn't reach $address. Is the computer awake and on the same network?"
-            is SocketTimeoutException -> "$address didn't answer in time."
-            else -> e.message ?: "The connection to $address failed."
-        }
-    }
-
-    private fun Throwable.rootCause(): Throwable = generateSequence(this) { it.cause }.last()
-
-    private fun configFor(key: PhoneKey) = DefaultConfig().apply {
-        keyAlgorithms = keyAlgorithms.map { factory ->
-            if (factory.name == KeyType.ED25519.toString()) {
-                KeyAlgorithms.Factory(factory.name, PhoneKeySignature.Factory(key), KeyType.ED25519)
-            } else {
-                factory
-            }
-        }
-    }
-
-    private companion object {
-        const val KEEPALIVE_SECONDS = 20
+        return openSsh(
+            SshTarget(
+                name = target.label,
+                hosts = target.hosts,
+                port = target.port,
+                user = target.user,
+                key = phoneKey.get(),
+                hostKeys = StoredHostKeys(hostKeys, target),
+                command = target.command,
+                // A computer named by its pairing code was paired; one set up by hand has no name.
+                paired = target.name.isNotBlank(),
+                unauthorized = { host ->
+                    ConnectFailure.Unauthorized(
+                        "${target.user}@$host didn't accept this phone's key. " +
+                            "Pair again from the computer, or add the key to ~/.ssh/authorized_keys there, as Settings shows.",
+                    )
+                },
+            ),
+        )
     }
 }
 
-/** Hands sshj the phone's key. The private half is a handle; [PhoneKeySignature] signs with the real one. */
-private class PhoneKeyProvider(private val key: PhoneKey) : KeyProvider {
-    override fun getPrivate(): PrivateKey = PhoneKeyHandle
+/** How to recognize the computer. */
+internal interface HostKeyCheck {
+    /** Null to accept the key [host] presented; otherwise why it isn't accepted. */
+    fun check(host: String, fingerprint: String, keyType: String): ConnectFailure?
+
+    /** The host key algorithms to ask [host] for first. */
+    fun preferred(host: String): List<String>
+
+    /** Whether to offer only `ssh-ed25519` host keys, so that an Ed25519 fingerprint applies. */
+    val ed25519Only: Boolean get() = false
+}
+
+/** The keys trusted in the [HostKeyStore]. */
+private class StoredHostKeys(private val store: HostKeyStore, private val target: ConnectionSettings) : HostKeyCheck {
+    override fun check(host: String, fingerprint: String, keyType: String): ConnectFailure? {
+        val pinned = store.pinned(target.hostKeyId(host))
+        return when {
+            pinned == null -> ConnectFailure.UnknownHostKey(fingerprint, keyType, host)
+            pinned != fingerprint -> ConnectFailure.HostKeyChanged(fingerprint, pinned, host)
+            else -> null
+        }
+    }
+
+    override fun preferred(host: String) = store.pinnedType(target.hostKeyId(host))?.let(::hostKeyAlgorithms).orEmpty()
+}
+
+/**
+ * The host key algorithms that present a key of [keyType]. An RSA key's
+ * type is `ssh-rsa`, but that algorithm signs with SHA-1, which OpenSSH
+ * 8.8 and later no longer offers; asked for it alone, the computer would
+ * present another of its keys instead.
+ */
+internal fun hostKeyAlgorithms(keyType: String): List<String> =
+    if (keyType == "ssh-rsa") listOf("rsa-sha2-512", "rsa-sha2-256", "ssh-rsa") else listOf(keyType)
+
+internal class SshTarget(
+    /** What to call the computer in messages. */
+    val name: String,
+    /** Tried in order, each given a head start; see [firstToSucceed]. */
+    val hosts: List<String>,
+    val port: Int,
+    val user: String,
+    val key: SigningKey,
+    val hostKeys: HostKeyCheck,
+    val command: String,
+    /** The failure when [host] refuses [key]. */
+    val unauthorized: (host: String) -> ConnectFailure,
+    /** Whether [hosts] came from a pairing code, local network addresses among them; see [mostTelling]. */
+    val paired: Boolean = false,
+)
+
+/** How long a preferred address has before the next one is tried as well. */
+private val ADDRESS_HEAD_START = 1_500.milliseconds
+private const val KEEPALIVE_SECONDS = 20
+
+/**
+ * Connects to the first of the target's hosts to answer with an acceptable
+ * host key, authenticates there, and runs its command.
+ */
+internal suspend fun openSsh(target: SshTarget): LineChannel {
+    // Set once the channel exists, outside the IO context: a cancellation as
+    // that context returns discards its result, and the channel with it, so
+    // it is closed here rather than left connected.
+    var made: SshLineChannel? = null
+    try {
+        return withContext(Dispatchers.IO) {
+            // Everything here may touch the network, disconnecting included,
+            // which Android refuses on the main thread.
+            val client = try {
+                firstToSucceed(target.hosts, ADDRESS_HEAD_START, discard = { it.disconnectQuietly() }) { host ->
+                    connect(target, host)
+                }
+            } catch (e: AllFailed) {
+                throw mostTelling(e.failures, target.name, target.hosts, target.paired)
+            }
+            try {
+                blocking(client) {
+                    val host = client.remoteHostname
+                    try {
+                        client.authPublickey(target.user, SigningKeyProvider(target.key))
+                    } catch (e: UserAuthException) {
+                        throw target.unauthorized(host)
+                    }
+                    client.connection.keepAlive.keepAliveInterval = KEEPALIVE_SECONDS
+                    val session = client.startSession()
+                    SshLineChannel(client, session.exec(target.command)).also { made = it }
+                }
+            } catch (e: Throwable) {
+                made?.close() ?: client.disconnectQuietly()
+                made = null
+                throw when (e) {
+                    is CancellationException, is ConnectFailure -> e
+                    is Exception -> ConnectFailure.Network(describeConnectFailure(e, client.remoteHostname, target.port), e)
+                    else -> e
+                }
+            }
+        }
+    } catch (e: CancellationException) {
+        made?.let { withContext(NonCancellable + Dispatchers.IO) { it.close() } }
+        throw e
+    }
+}
+
+/** A connected client whose host key [HostKeyCheck] accepted, not yet authenticated. */
+private suspend fun connect(target: SshTarget, host: String): SSHClient {
+    val verifier = CheckingVerifier(target.hostKeys)
+    val client = SSHClient(configFor(target.key, target.hostKeys.ed25519Only))
+    client.addHostKeyVerifier(verifier)
+    client.connectTimeout = 10_000
+    // Bounds every read, including waiting for the server's banner. sshj's
+    // reader carries on past a read timeout once connected, so it doesn't
+    // limit how long the connection stays idle.
+    client.timeout = 15_000
+    try {
+        blocking(client) { client.connect(host, target.port) }
+    } catch (e: CancellationException) {
+        // Cancelled even as it connected: nobody else will close it.
+        client.disconnectQuietly()
+        throw e
+    } catch (e: TransportException) {
+        client.disconnectQuietly()
+        throw verifier.failure ?: ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
+    } catch (e: Exception) {
+        client.disconnectQuietly()
+        throw ConnectFailure.Network(describeConnectFailure(e, host, target.port), e, host.takeIf { isRefusal(e) })
+    }
+    return client
+}
+
+/**
+ * Runs blocking sshj [work] off the main thread. Socket I/O ignores
+ * interrupts, so a cancellation disconnects [client] to end it.
+ */
+private suspend fun <T> blocking(client: SSHClient, work: () -> T): T = coroutineScope {
+    val running = async(Dispatchers.IO) { work() }
+    try {
+        running.await()
+    } catch (e: CancellationException) {
+        client.disconnectQuietly()
+        throw e
+    }
+}
+
+private fun SSHClient.disconnectQuietly() {
+    runCatching { disconnect() }
+}
+
+internal fun describeConnectFailure(e: Throwable, host: String, port: Int): String {
+    val address = "$host:$port"
+    // The first known kind in the chain: on Android a refused connection's
+    // root cause is the system's ErrnoException, under a ConnectException.
+    val known = generateSequence(e) { it.cause }.firstOrNull {
+        it is UnknownHostException || it is ConnectException || it is NoRouteToHostException || it is SocketTimeoutException
+    }
+    return when {
+        isRefusal(e) ->
+            "$host refused the connection on port $port. Is its SSH server running on that port? " +
+                "Check the port in Settings, or pair again."
+        else -> describeKnown(known, e, host, address)
+    }
+}
+
+/**
+ * Whether the computer answered and turned the connection down, as it does
+ * when nothing listens on the port, rather than not answering at all.
+ */
+internal fun isRefusal(e: Throwable): Boolean = generateSequence(e) { it.cause }.any { cause ->
+    (cause is ErrnoException && cause.errno == OsConstants.ECONNREFUSED) ||
+        // The JVM says so only in words.
+        (cause is ConnectException && cause.message.orEmpty().let { "ECONNREFUSED" in it || "Connection refused" in it })
+}
+
+private fun describeKnown(known: Throwable?, e: Throwable, host: String, address: String): String {
+    return when (known) {
+        is UnknownHostException -> "Couldn't find $host. Check the address."
+        is ConnectException, is NoRouteToHostException ->
+            "Couldn't reach $address. Is the computer awake and on the same network?"
+        is SocketTimeoutException -> "$address didn't answer in time."
+        else -> e.message ?: "The connection to $address failed."
+    }
+}
+
+private fun configFor(key: SigningKey, ed25519Only: Boolean) = DefaultConfig().apply {
+    keyAlgorithms = keyAlgorithms.mapNotNull { factory ->
+        when {
+            factory.name == KeyType.ED25519.toString() ->
+                KeyAlgorithms.Factory(factory.name, Ed25519Signature.Factory(key), KeyType.ED25519)
+            ed25519Only -> null
+            else -> factory
+        }
+    }
+}
+
+/** Hands sshj a [SigningKey]. The private half is a handle; [Ed25519Signature] signs with the real one. */
+private class SigningKeyProvider(private val key: SigningKey) : KeyProvider {
+    override fun getPrivate(): PrivateKey = SigningKeyHandle
     override fun getPublic(): PublicKey = Ed25519PublicKey(key.publicKey)
     override fun getType(): KeyType = KeyType.ED25519
 }
 
-private object PhoneKeyHandle : PrivateKey {
-    private fun readResolve(): Any = PhoneKeyHandle
+private object SigningKeyHandle : PrivateKey {
+    private fun readResolve(): Any = SigningKeyHandle
     override fun getAlgorithm() = "Ed25519"
     override fun getFormat(): String? = null
     override fun getEncoded(): ByteArray? = null
@@ -158,32 +321,25 @@ internal class Ed25519PublicKey(private val raw: ByteArray) : PublicKey {
     }
 }
 
-/** Checks the computer's host key against the pin, remembering why it refused one. */
-private class PinningVerifier(
-    private val store: HostKeyStore,
-    private val hostKeyId: String,
-) : HostKeyVerifier {
+/**
+ * The host key a computer presented, as `ssh-keygen -lf` fingerprints it on
+ * the computer: for a host certificate, the key it certifies. The key is
+ * what's trusted, whoever signed the certificate.
+ */
+internal fun presentedKey(key: PublicKey): PublicKey = (key as? Certificate<*>)?.key ?: key
+
+/** Asks the [HostKeyCheck] about the computer's host key, remembering why it refused one. */
+private class CheckingVerifier(private val hostKeys: HostKeyCheck) : HostKeyVerifier {
     @Volatile
     var failure: ConnectFailure? = null
 
     override fun verify(hostname: String, port: Int, key: PublicKey): Boolean {
-        val fingerprint = HostKeyStore.fingerprint(key)
-        val pinned = store.pinned(hostKeyId)
-        return when {
-            pinned == null -> {
-                failure = ConnectFailure.UnknownHostKey(fingerprint, KeyType.fromKey(key).toString())
-                false
-            }
-            pinned != fingerprint -> {
-                failure = ConnectFailure.HostKeyChanged(fingerprint, pinned)
-                false
-            }
-            else -> true
-        }
+        val plain = presentedKey(key)
+        failure = hostKeys.check(hostname, HostKeyStore.fingerprint(plain), KeyType.fromKey(plain).toString())
+        return failure == null
     }
 
-    override fun findExistingAlgorithms(hostname: String, port: Int): List<String> =
-        store.pinnedType(hostKeyId)?.let(::listOf).orEmpty()
+    override fun findExistingAlgorithms(hostname: String, port: Int): List<String> = hostKeys.preferred(hostname)
 }
 
 /**
@@ -198,6 +354,7 @@ private class SshLineChannel(
     private val reader = BufferedReader(InputStreamReader(command.inputStream, Charsets.UTF_8))
     private val output: OutputStream = command.outputStream
     private val writeLock = Mutex()
+    private val closed = AtomicBoolean()
     private val stderr = StringBuilder()
     private val stderrReader = thread(name = "cagents-bridge-stderr", isDaemon = true) {
         runCatching {
@@ -224,10 +381,11 @@ private class SshLineChannel(
         return line
     }
 
-    private fun refusal(): ConnectFailure? {
+    /** Waits up to a second for the rest of standard error, off the caller's thread, which may be the main one. */
+    private suspend fun refusal(): ConnectFailure? = withContext(Dispatchers.IO) {
         stderrReader.join(1_000)
         val text = synchronized(stderr) { stderr.toString().trim() }
-        return text.takeIf { it.isNotEmpty() }?.let { ConnectFailure.Refused(it) }
+        text.takeIf { it.isNotEmpty() }?.let { ConnectFailure.Refused(it) }
     }
 
     override suspend fun writeLine(line: String) = writeLock.withLock {
@@ -238,10 +396,12 @@ private class SshLineChannel(
     }
 
     /**
-     * Drops the whole connection without waiting for the computer: closing the
-     * session channel first would wait for its reply, which a dead network never sends.
+     * Close the socket first to release a reader or writer blocked on a dead
+     * network. SSHJ's graceful disconnect sends a packet on the same socket.
      */
     override fun close() {
-        runCatching { client.disconnect() }
+        if (!closed.compareAndSet(false, true)) return
+        runCatching { client.socket?.close() }
+        client.disconnectQuietly()
     }
 }

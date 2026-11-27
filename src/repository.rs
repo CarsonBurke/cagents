@@ -30,6 +30,8 @@ use std::{
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
+#[cfg(target_os = "macos")]
+pub(crate) use complete_inventory::resolved_git_executable;
 mod pr_checkout;
 mod pr_creation;
 #[cfg(any(test, feature = "test-support"))]
@@ -3827,6 +3829,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_ahead_behind_counts(&output.stdout);
         invalid_output(parsed, output)
+    }
+
+    /// Refuses removing `worktree` while its detached HEAD holds commits that
+    /// no branch, remote-tracking branch or tag contains. Removing the
+    /// worktree drops its HEAD, the one thing that points at them, so they
+    /// would be lost without a word. A worktree on a branch keeps its commits
+    /// on that branch and is never refused.
+    ///
+    /// The count runs from `repository` against the commit Git listed, so it
+    /// works for a worktree whose directory is already gone. A count that
+    /// fails or times out refuses too: removal is never authorized blind.
+    pub fn refuse_losing_detached_commits(
+        &self,
+        repository: &Path,
+        worktree: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        if !worktree.detached {
+            return Ok(());
+        }
+        let Some(head) = worktree.head_oid.as_deref() else {
+            return Err(
+                "Git listed this worktree's HEAD as detached without a commit, \
+                 so the worktree was kept."
+                    .into(),
+            );
+        };
+        let short = head.get(..12).unwrap_or(head);
+        let command = self
+            .git_read(
+                repository,
+                [
+                    "rev-list",
+                    "--count",
+                    head,
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                    "--tags",
+                ],
+            )
+            .timeout(Duration::from_secs(30))
+            .output_limits(64, 64 * 1024);
+        let count = self
+            .run_checked(&command, cancellation)
+            .map_err(RepositoryError::from)
+            .and_then(|output| {
+                let parsed = parse_utf8_line(&output.stdout, "rev-list count")?;
+                parsed
+                    .parse::<u64>()
+                    .map_err(|_| RepositoryError::InvalidOutput {
+                        field: "rev-list count",
+                        reason: "count is not a number".into(),
+                    })
+            })
+            .map_err(|error| {
+                format!(
+                    "Could not check whether detached HEAD {short} has commits on no branch, \
+                     tag or remote, so the worktree was kept: {error}"
+                )
+            })?;
+        match count {
+            0 => Ok(()),
+            count => Err(format!(
+                "Detached HEAD {short} has {count} commit{} on no branch, tag or remote, \
+                 which deleting the worktree would lose. Keep {} on a branch first, \
+                 for example with `git branch NAME {short}`.",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "them" },
+            )),
+        }
     }
 
     /// Line counts for one uncommitted area. The staged form compares HEAD to
@@ -7997,11 +8070,14 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         mod scale_support {
             include!("../tests/support/repository_scale.rs");
         }
+        #[cfg(target_os = "linux")]
         use scale_support::isolated_large_pathspec_test;
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         #[test]
         fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
             isolated_large_pathspec_test(
@@ -8385,7 +8461,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             git(root, &["init", "-b", "feature"]);
+            #[cfg(target_os = "linux")]
             let unusual = RepoPath::from_bytes(b":(glob)*\n\xff").unwrap();
+            #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+            let unusual = RepoPath::from_bytes(":(glob)*\n雪".as_bytes()).unwrap();
             for name in ["old.txt", "deleted.txt", "unselected.txt"] {
                 fs::write(root.join(name), b"base\n").unwrap();
             }
@@ -15893,7 +15972,7 @@ mod worktree_journal_tests {
         let mut intended_child = intended_command.spawn().unwrap();
         let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
         let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        let mut unrelated = Command::new("/bin/true");
+        let mut unrelated = Command::new("true");
         // SAFETY: only async-signal-safe read/write on live inherited fds.
         unsafe {
             unrelated.pre_exec(move || {

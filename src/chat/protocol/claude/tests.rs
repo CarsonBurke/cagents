@@ -2691,6 +2691,88 @@ fn stream(event: Value) -> Value {
 }
 
 #[test]
+fn claude_turn_confirmation_requires_correlated_lifecycle_or_a_new_root_stream() {
+    let mut adapter = Claude {
+        ready: true,
+        async_input: true,
+        ..Claude::default()
+    };
+    let sent = adapter
+        .send_prompt("start".into(), vec![], PromptMode::Send)
+        .unwrap();
+    assert!(sent.events.contains(&Event::TurnStarted));
+    assert!(!sent.events.contains(&Event::TurnStartConfirmed));
+    let lifecycle =
+        |id: &Value, state| json!({"type":"command_lifecycle","command_uuid":id,"state":state});
+    let id = &sent.writes[0]["uuid"];
+    let queued = adapter.receive(lifecycle(id, "queued")).unwrap();
+    assert!(!queued.events.contains(&Event::TurnStartConfirmed));
+    let wrong = adapter
+        .receive(lifecycle(&json!("unknown"), "started"))
+        .unwrap();
+    assert!(!wrong.events.contains(&Event::TurnStartConfirmed));
+    let first = adapter.receive(lifecycle(id, "started")).unwrap();
+    assert!(first.events.contains(&Event::TurnStartConfirmed));
+    assert!(!first.events.contains(&Event::TurnStarted));
+    let root = |id| stream(json!({"type":"message_start","message":{"id":id}}));
+    let same_turn = adapter.receive(root("first-root")).unwrap();
+    assert!(!same_turn.events.contains(&Event::TurnStartConfirmed));
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+
+    let repeated = adapter.receive(root("first-root")).unwrap();
+    assert!(!repeated.events.contains(&Event::TurnStartConfirmed));
+    let mut history = root("history");
+    history["isReplay"] = json!(true);
+    assert!(
+        !adapter
+            .receive(history)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let mut child = root("child");
+    child["parent_tool_use_id"] = json!("background");
+    assert!(
+        !adapter
+            .receive(child)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let live = adapter.receive(root("second-root")).unwrap();
+    assert!(live.events.contains(&Event::TurnStartConfirmed));
+    let another_model_call = adapter.receive(root("third-root")).unwrap();
+    assert!(
+        !another_model_call
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    adapter
+        .receive(json!({"type":"result","is_error":false}))
+        .unwrap();
+    let reply = |id, replay| {
+        json!({"type":"assistant","uuid":id,"isReplay":replay,"message":{
+            "id":id,"content":[{"type":"text","text":"Done"}],"role":"assistant"
+        }})
+    };
+    let replayed_reply = adapter.receive(reply("older-reply", true)).unwrap();
+    assert!(!replayed_reply.events.contains(&Event::TurnStartConfirmed));
+    let mut refusal = reply("refused-reply", false);
+    refusal["error"] = json!("rate_limit");
+    assert!(
+        !adapter
+            .receive(refusal)
+            .unwrap()
+            .events
+            .contains(&Event::TurnStartConfirmed)
+    );
+    let actual_reply = adapter.receive(reply("fresh-reply", false)).unwrap();
+    assert!(actual_reply.events.contains(&Event::TurnStartConfirmed));
+}
+
+#[test]
 fn autonomous_parent_turns_publish_one_start_even_with_pending_decisions() {
     for pending in [false, true] {
         let mut adapter = Claude {
@@ -3095,6 +3177,79 @@ fn idle_steer_waits_for_consumption_and_starts_a_turn() {
     );
     assert!(adapter.busy);
     assert!(adapter.queued.is_empty());
+}
+
+#[test]
+fn recovery_keeps_full_acknowledged_input_and_omits_unproved_or_consumed_input() {
+    let directory = tempfile::tempdir().unwrap();
+    let attachment = Attachment::file(directory.path().join("notes.txt"));
+    std::fs::write(&attachment.path, "attachment content").unwrap();
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        async_input: true,
+        ..Default::default()
+    };
+    let next_turn = format!("first {} tail", "雪".repeat(7 * 1024));
+    let next_step = format!("second {} tail", "水".repeat(7 * 1024));
+    let submit = |adapter: &mut Claude, text: &str, attachments, mode| {
+        let mut step = adapter.send_prompt(text.into(), attachments, mode).unwrap();
+        step.writes.remove(0)["uuid"].as_str().unwrap().to_owned()
+    };
+    let first = submit(
+        &mut adapter,
+        &next_turn,
+        vec![attachment.clone()],
+        PromptMode::Queue,
+    );
+    assert!(adapter.recovery_queue().is_none());
+    let second = submit(&mut adapter, &next_step, Vec::new(), PromptMode::Steer);
+    let lifecycle =
+        |id: &str, state| json!({"type":"command_lifecycle","command_uuid":id,"state":state});
+    adapter.receive(lifecycle(&first, "queued")).unwrap();
+
+    let partial = adapter.recovery_queue().unwrap();
+    assert_eq!(partial.len(), 1);
+    assert_eq!(partial[0].id, first);
+    assert_eq!(partial[0].text, next_turn);
+    assert_eq!(partial[0].attachments, [attachment]);
+    assert!(partial[0].editable);
+
+    let step = adapter.receive(lifecycle(&second, "queued")).unwrap();
+    assert!(
+        step.events
+            .iter()
+            .any(|event| matches!(event, Event::QueueChanged(messages)
+                if messages.iter().all(|message| !message.editable
+                    && message.text.ends_with("[Queue preview truncated]"))
+            ))
+    );
+    let proved = adapter.recovery_queue().unwrap();
+    assert_eq!(
+        proved
+            .iter()
+            .map(|message| (message.id.as_str(), message.text.as_str(), message.delivery))
+            .collect::<Vec<_>>(),
+        [
+            (
+                second.as_str(),
+                next_step.as_str(),
+                chat::QueueDelivery::NextStep
+            ),
+            (
+                first.as_str(),
+                next_turn.as_str(),
+                chat::QueueDelivery::NextTurn
+            )
+        ]
+    );
+
+    adapter.receive(lifecycle(&second, "started")).unwrap();
+    assert_eq!(adapter.recovery_queue().unwrap()[0].id, first);
+    adapter.receive(lifecycle(&first, "cancelled")).unwrap();
+    // A delayed admission for a cancelled message does not put it back.
+    adapter.receive(lifecycle(&first, "queued")).unwrap();
+    assert_eq!(adapter.recovery_queue(), Some(Vec::new()));
 }
 
 #[test]
@@ -11122,6 +11277,90 @@ fn rejected_model_change_does_not_apply_or_report_effort() {
 }
 
 #[test]
+fn elicitation_omits_blank_optional_fields_and_rejects_blank_required_ones() {
+    let mut adapter = Claude::default();
+    adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+    let answers = |query: Vec<String>, limit: Vec<String>| {
+        vec![
+            Answer {
+                field: "query".into(),
+                values: query,
+            },
+            Answer {
+                field: "limit".into(),
+                values: limit,
+            },
+        ]
+    };
+    // A blank required field is missing, and the request stays pending.
+    for blank in [vec![], vec![String::new()]] {
+        let error = adapter
+            .answer("e1".into(), "accept".into(), answers(blank, vec![]))
+            .unwrap_err();
+        assert!(error.contains("Missing required Claude field"), "{error}");
+    }
+    // Skipping a blank answer must not hide a duplicate or unknown field.
+    for field in ["limit", "unknown"] {
+        let mut duplicate = answers(vec!["search".into()], vec![]);
+        duplicate.push(Answer {
+            field: field.into(),
+            values: if field == "limit" {
+                vec!["5".into()]
+            } else {
+                vec![]
+            },
+        });
+        let error = adapter
+            .answer("e1".into(), "accept".into(), duplicate)
+            .unwrap_err();
+        assert!(error.contains("unknown or duplicate field"), "{error}");
+    }
+    // An untouched optional field arrives with no value; a cleared one may
+    // arrive as one empty string. Either way it is left out of the reply.
+    for (id, blank) in [("e2", vec![]), ("e3", vec![String::new()])] {
+        adapter.receive(json!({"type":"control_request","request_id":id,"request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"query":{"type":"string"},"limit":{"type":"integer"}},"required":["query"]}}})).unwrap();
+        let step = adapter
+            .answer(
+                id.into(),
+                "accept".into(),
+                answers(vec!["search".into()], blank),
+            )
+            .unwrap();
+        assert_eq!(
+            step.writes[0]["response"]["response"],
+            json!({"action":"accept","content":{"query":"search"}})
+        );
+    }
+    let step = adapter
+        .answer(
+            "e1".into(),
+            "accept".into(),
+            answers(vec!["search".into()], vec!["5".into()]),
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"query":"search","limit":5}})
+    );
+    // An empty multi-select is a selection of nothing, not a blank field.
+    adapter.receive(json!({"type":"control_request","request_id":"e4","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"tags":{"type":"array","items":{"type":"string","enum":["a","b"]}}},"required":["tags"]}}})).unwrap();
+    let step = adapter
+        .answer(
+            "e4".into(),
+            "accept".into(),
+            vec![Answer {
+                field: "tags".into(),
+                values: vec![],
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        step.writes[0]["response"]["response"],
+        json!({"action":"accept","content":{"tags":[]}})
+    );
+}
+
+#[test]
 fn elicitation_answers_preserve_boolean_and_numeric_types() {
     let mut adapter = Claude::default();
     adapter.receive(json!({"type":"control_request","request_id":"e1","request":{"subtype":"elicitation","mode":"form","mcp_server_name":"fixture","requested_schema":{"type":"object","properties":{"enabled":{"type":"boolean"},"count":{"type":"integer"}},"required":["enabled","count"]}}})).unwrap();
@@ -15455,6 +15694,8 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     // A refresh the reader asked for says why it got nothing.
     let refresh = adapter.command(Command::Refresh).unwrap();
     assert_eq!(refresh.writes[0]["request"].get("_cagents_automatic"), None);
+    // Losing it unread is losing the reader's input.
+    assert!(!adapter.expendable_write(&refresh.writes[0]));
     let asked = refresh.writes[0]["request_id"].as_str().unwrap().to_owned();
     let refused = adapter
         .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
@@ -15482,9 +15723,559 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         .find(|frame| frame["request"]["subtype"] == "get_context_usage")
         .unwrap();
     assert_eq!(asked["request"].get("_cagents_automatic"), None);
+    // A provider that exits before reading this one lost no input (#3888).
+    assert!(adapter.expendable_write(asked));
     let asked = asked["request_id"].as_str().unwrap().to_owned();
     let refused = adapter
         .receive(json!({"type":"control_response","response":{"subtype":"error","request_id":asked,"error":"Unsupported"}}))
         .unwrap();
     assert!(refused.events.is_empty(), "{:?}", refused.events);
+}
+
+/// Signatures the server wrote on Claude Code 2.1.325 with Opus 5.5: one on a
+/// block whose kind is narration, one on a reasoning block. Nothing checks
+/// them against the text, so the tests pair them with text of their own.
+const NARRATION_SIGNATURE: &str = "CAQSugYKEQgUGAI4AUIJbmFycmF0aW9uEgzmpqwj0KUbGt4S0h4aDGiZX39ePhkan6aiOiIwObAYlBhTbiWUWXCYRIPb9GP+9bexsVo3Q14s8cZXtX5kYijtjCzYayi1o6EFk7mpKtYF4uIXEXrghNnd16bu9d5kM6RziPxhbUpiRrVlxh39xrYgTVAaav2UDofPVvKlgNd20axPpgWkzOSbJ/1KDulmzm7sbm4KFvouy3LkIiKc0oDeJSHjkoFCZixiVRulPmtMHuDOIeMi6dvVWam8aES5I9HQMRCNsxthhbKPOpuieQ+lk1/ZMEjRJoyapLmFAxOJgbtDDM8PnQl4dPn26fVQTmGs/pxGLBlWd/keSRWaeZiGp9T69a2aAKMs2+FjmupP8oiU+GbLaUMo4NzLS75v6VRQAlsY2ZK5V0qNUQuT4drXHIC0H+TxsEhdOfshUM7j6WMybqByy1o+GkB+q0cHIwJSMdj9SP5AB/oBIsSrSpHRVbI5qJeKl+LxVkVKVLAd0QkgVTIaslTlsifPG8tfifSiok/Dg3qGmpHDER0evQfcOCfk0zHbCEl5cFi5ycqi7NN+XoRkjtn+2PSQJncq8zX5yRwG+UZUbL3U1m7O8E0jUjU7TgdBEC0ReuUIof2VUNs7+U0sdWnlUse1hTPaFT+Y3qv5CIRUlRB/buIz3rq3DK8Pr4nv7K8J5TZbGaSnMixLSKmiu7ECHHgtvh+JFTdZW1kjgjxP8ObLoBhG6erefVcpJk2QKmvxOfGaQzVCUY+dGVdFl9vGOVBRN38iuQgPZNMgaDiFP8866apxYj9QnbRXlW4AFWSqaw9TQ5Ev01rz80OpvHIyBlc8rHusaaiX0IEJmxrQXv6pfvZ2bcu76FC2X90OPTvuwvja4axbwe+Kqwltgq2bSWL8ZFXxqcI2rndEI3EfFFUbKoKax7EPcDS9fKbcAaPqgP2p1a/uitJx219BYcrYW2Plmoej8QEi3RK9tA77ixTJwtCdrqjJh7zecR2j4UdWZFsX81HS0EkLRjg9y/84QJlL5RrBfcSNvlDcwDEeh6Jh3Sq1VJf0o1IhBmjxnxM2FzOxoqlqXc4SbQSSGAE=";
+const THINKING_SIGNATURE: &str = "CAQSsgUKEAgUGAI4AUIIdGhpbmtpbmcSDHks+c19DrILYmviCxoMzICvZ/2LpvkiL4NXIjDZEkoepfzVZefKwGyfacQlDy84svlKrueAyqjiI3ysey8cdcXwcYi/ydBfZllwWCIqzwRaNGMbdguJRxQgQ0HlwKBa7M5p6VwFzVQVMJyZW95o8rC+mgmHc+uM0bu2Sr6Ow2kI18HpROaKY1NaqEWdimeDf9keghYe6t1ljIzU6J65pXm1/4yWEEd+AObNorGZbn5zHDzkyLtcBobqi1Zly0z9dNLL/kalnI1zSFO3dCeRzNYCx4GzVRyGOEG8SO4KMlp+ZSfvkmrXCW+HmhVTN0RgeGl3KNGyfghaxXMWaR8kwE3CSH7UatR0QOONRGUoKCLaxXbWACbpZRqIbf33ivkyG89Cd/xfpw40r6GaabOj4PKJoOSXqMJredmYYOBR/4Axscip4PyUfflbFJcWfrEkV1JHMf2JGb0cA2sAY7sfLwu7g291WcjxY7OZPSWpyf342iV956KHLS98ecBUhMUjAaZHPGXD7TvTIn04hoDTAbhsDdsK2OQN2HqsyltGTLURuBQQn6ROOhYCQjYPcP+dbhxnAFVvkijfJRjtxYS7IaDhG/DZ1JVJvNyr+NolgrJqz9XeUo86TmKG5lf8PgqO3bycgLLtPDGBF85aQ4mGOMjAJOJk1qdPssIAeW/W3FdMAJXWGjlHYYRqYqSBGhGZ+YPEjDDlnqH9LlEcPwVO+e0sVPupV/nOtXlqTa3m0/n2pah9GnXygNgDiZ654kD8LKpLhG6CZK7YC8zIAadW1cD2uTn+eobcEkQdGrQFve4/T+Ws/GJ77T27s5MUNmPpzN5U9dQz24l7DZJKvC7owIscS3NgA1bbWSgiMJskHEbyGvNewXJlCCz7ZMQEDusYAQ==";
+
+fn signed_thought(text: &str, signature: &str) -> Value {
+    json!({"type":"thinking","thinking":text,"signature":signature})
+}
+
+type Shown = (String, String, bool, Phase);
+
+/// A step's text items as (id, text, thinking, phase).
+fn texts(step: &Step) -> Vec<Shown> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(Item {
+                id,
+                content:
+                    ItemContent::Text {
+                        text,
+                        thinking,
+                        phase,
+                    },
+                ..
+            }) => Some((id.clone(), text.clone(), *thinking, *phase)),
+            _ => None,
+        })
+        .collect()
+}
+
+fn narrated(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), false, Phase::Commentary)
+}
+
+fn reasoned(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), true, Phase::Final)
+}
+
+fn answered(id: &str, text: &str) -> Shown {
+    (id.into(), text.into(), false, Phase::Final)
+}
+
+#[test]
+fn listed_narration_blocks_read_as_commentary_and_the_rest_as_thinking() {
+    let mut adapter = Claude::default();
+    // The frame's list decides alone: an unlisted block stays thinking
+    // whatever its signature says, and a listed one is narration even with
+    // a signature that can't be read.
+    let step = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","narration_block_indexes":[1, 2],
+            "message":{"id":"m1","content":[
+                signed_thought("Unlisted narration", NARRATION_SIGNATURE),
+                signed_thought("Checking the log next.", "unreadable"),
+                signed_thought("", NARRATION_SIGNATURE),
+                {"type":"text","text":"Done."},
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&step),
+        [
+            reasoned("m1:0", "Unlisted narration"),
+            narrated("m1:1", "Checking the log next."),
+            // Narration with nothing to say is an empty thought, as Claude
+            // Code treats it.
+            reasoned("m1:2", ""),
+            answered("m1:3", "Done."),
+        ]
+    );
+}
+
+#[test]
+fn a_narration_signature_reads_as_commentary_without_a_list() {
+    let mut adapter = Claude::default();
+    let step = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                signed_thought("", THINKING_SIGNATURE),
+                signed_thought("Checking the log next.", NARRATION_SIGNATURE),
+                signed_thought("Weighing the two readings.", THINKING_SIGNATURE),
+                signed_thought("  \n", NARRATION_SIGNATURE),
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&step),
+        [
+            reasoned("m1:0", ""),
+            narrated("m1:1", "Checking the log next."),
+            reasoned("m1:2", "Weighing the two readings."),
+            reasoned("m1:3", "  \n"),
+        ]
+    );
+}
+
+#[test]
+fn a_signature_that_does_not_read_as_narration_stays_thinking() {
+    let bytes = STANDARD.decode(NARRATION_SIGNATURE).unwrap();
+    // The kind's own field, without the envelope around it.
+    let bare = STANDARD.encode(b"B\x09narration");
+    // Cut short, so the envelope's length runs past the end.
+    let truncated = STANDARD.encode(&bytes[..bytes.len() / 2]);
+    // The envelope given twice.
+    let mut repeated = bytes.clone();
+    repeated.extend_from_slice(&bytes[2..]);
+    let repeated = STANDARD.encode(&repeated);
+    // A wire type that doesn't exist, after an intact envelope.
+    let mut invalid = bytes.clone();
+    invalid.push(0x0f);
+    let invalid = STANDARD.encode(&invalid);
+    let oversized = "A".repeat(128 * 1024);
+    for signature in [
+        "",
+        "not base64!",
+        // "narration" alone.
+        "bmFycmF0aW9u",
+        NARRATION_SIGNATURE.trim_end_matches('='),
+        &bare,
+        &truncated,
+        &repeated,
+        &invalid,
+        &oversized,
+    ] {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(
+                json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    signed_thought("Weighing it.", signature),
+                ]}}),
+            )
+            .unwrap();
+        assert_eq!(
+            texts(&step),
+            [reasoned("m1:0", "Weighing it.")],
+            "{signature:.40}"
+        );
+    }
+    for block in [
+        json!({"type":"thinking","thinking":"Weighing it."}),
+        json!({"type":"thinking","thinking":"Weighing it.","signature":7}),
+    ] {
+        let mut adapter = Claude::default();
+        let step = adapter
+            .receive(
+                json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[block]}}),
+            )
+            .unwrap();
+        assert_eq!(texts(&step), [reasoned("m1:0", "Weighing it.")]);
+    }
+}
+
+#[test]
+fn a_streamed_thought_becomes_commentary_under_its_own_id_when_it_completes() {
+    let mut adapter = Claude::default();
+    adapter
+        .receive(stream(
+            json!({"type":"message_start","message":{"id":"msg-1"}}),
+        ))
+        .unwrap();
+    let started = adapter
+        .receive(stream(json!({"type":"content_block_start","index":0,
+            "content_block":{"type":"thinking","thinking":"","signature":""}})))
+        .unwrap();
+    assert_eq!(texts(&started), [reasoned("msg-1:0", "")]);
+    for delta in [
+        json!({"type":"thinking_delta","thinking":"Checking the log next."}),
+        json!({"type":"signature_delta","signature":NARRATION_SIGNATURE}),
+    ] {
+        adapter
+            .receive(stream(
+                json!({"type":"content_block_delta","index":0,"delta":delta}),
+            ))
+            .unwrap();
+    }
+    let complete = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a1","narration_block_indexes":[0],
+            "message":{"id":"msg-1","content":[
+                signed_thought("Checking the log next.", NARRATION_SIGNATURE),
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(
+        texts(&complete),
+        [narrated("msg-1:0", "Checking the log next.")],
+        "the placeholder is replaced, not joined by a second item"
+    );
+    let stopped = adapter
+        .receive(stream(json!({"type":"content_block_stop","index":0})))
+        .unwrap();
+    assert!(texts(&stopped).is_empty(), "{:?}", stopped.events);
+    // The message's next block still takes the next place.
+    adapter
+        .receive(stream(json!({"type":"content_block_start","index":1,
+            "content_block":{"type":"text","text":""}})))
+        .unwrap();
+    let answer = adapter
+        .receive(
+            json!({"type":"assistant","uuid":"a2","message":{"id":"msg-1","content":[
+                {"type":"text","text":"Done."},
+            ]}}),
+        )
+        .unwrap();
+    assert_eq!(texts(&answer), [answered("msg-1:1", "Done.")]);
+}
+
+#[test]
+fn a_reopened_narration_reads_as_commentary_from_its_signature() {
+    let id = "00000000-0000-4000-8000-000000000001";
+    let mut file = tempfile::tempfile().unwrap();
+    for value in [
+        json!({"type":"user","uuid":"u1","parentUuid":null,"sessionId":id,"message":{"content":"Check the log"}}),
+        json!({"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":id,"message":{"id":"m1","content":[signed_thought("", THINKING_SIGNATURE)]}}),
+        json!({"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":id,"message":{"id":"m1","content":[signed_thought("Checking the log next.", NARRATION_SIGNATURE)]}}),
+        json!({"type":"assistant","uuid":"a3","parentUuid":"a2","sessionId":id,"message":{"id":"m1","content":[{"type":"text","text":"Done."}]}}),
+    ] {
+        writeln!(file, "{value}").unwrap();
+    }
+    file.rewind().unwrap();
+    let mut history = History::index(file, id).unwrap();
+    let mut step = Step::default();
+    let mut adapter = Claude::default();
+    for record in &history.page().unwrap() {
+        adapter.history_message(record, &mut step).unwrap();
+    }
+    assert_eq!(
+        texts(&step)[1..],
+        [
+            reasoned("m1:0", ""),
+            narrated("m1:1", "Checking the log next."),
+            answered("m1:2", "Done."),
+        ]
+    );
+}
+
+#[test]
+fn native_attribution_uses_the_exact_spawn_environment() {
+    let mut recipe = crate::model::LaunchRecipe {
+        program: "claude".into(),
+        arguments: Vec::new(),
+        working_directory: "/work".into(),
+        environment: [("HOME".into(), "/fixture/system".into())].into(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let captured = spawn_attribution_recipe(&spec);
+    assert!(
+        captured.unset_environment.contains("CLAUDE_CONFIG_DIR"),
+        "an absent config directory cannot be inherited from the daemon"
+    );
+    assert!(!captured.unset_environment.contains("HOME"));
+    recipe.environment.clear();
+    let captured = spawn_attribution_recipe(&ProcessSpec::from(&recipe));
+    assert!(captured.unset_environment.contains("HOME"));
+}
+
+#[test]
+fn large_managed_attribution_uses_private_settings_and_explicit_files_stay_in_place() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let inherited = json!({"commit": "a".repeat(150 * 1024), "pr": ""});
+    let fixture_directory = || Ok(directory.path().to_path_buf());
+    let argument =
+        launch_attribution_argument(None, || Some(inherited.clone()), fixture_directory).unwrap();
+    assert!(argument.len() < MAX_INLINE_ATTRIBUTION);
+    let staged = read_attribution_file(directory.path(), &argument).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&staged).unwrap()["attribution"],
+        inherited
+    );
+    assert_eq!(
+        std::fs::metadata(&argument).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        write_attribution_file(directory.path(), &staged).unwrap(),
+        argument,
+        "identical launches reuse the file"
+    );
+
+    let inline = json!({"unrelated": "x".repeat(5 * 1024)}).to_string();
+    let merged = launch_attribution_argument(
+        Some(&inline),
+        || Some(json!(false)),
+        || panic!("the additional attribution is small"),
+    )
+    .unwrap();
+    let merged = serde_json::from_str::<Value>(&merged).unwrap();
+    assert_eq!(merged["attribution"], json!(false));
+    assert_eq!(merged["unrelated"], json!("x".repeat(5 * 1024)));
+
+    let path = directory.path().join("settings.json");
+    std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+    assert!(
+        launch_attribution_argument(
+            path.to_str(),
+            || panic!("Claude owns this explicit file"),
+            || panic!("no settings may be staged for it"),
+        )
+        .is_none()
+    );
+    assert_eq!(
+        std::fs::read_to_string(path).unwrap(),
+        r#"{"theme":"dark"}"#
+    );
+}
+
+#[test]
+fn attribution_launch_scans_exact_native_option_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let launch = Launch {
+        provider: Provider::Claude,
+        session_id: None,
+        draft_model: None,
+        recipe: crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: [
+                "--system-prompt=--settings",
+                "--append-system-prompt=--setting-sources",
+                "--tools=--settings",
+                "--add-dir",
+                "/first",
+                "/second",
+                "--setting-sources=project",
+            ]
+            .map(str::to_owned)
+            .to_vec(),
+            working_directory: directory.path().to_path_buf(),
+            environment: Default::default(),
+            unset_environment: ["CLAUDE_CODE_PERMISSION_MODE".to_owned()].into(),
+        },
+    };
+    let mut argv = arguments(&launch).unwrap();
+    let mut expected = argv.clone();
+    expected.extend(["--settings".into(), r#"{"attribution":false}"#.into()]);
+    apply_spawn_attribution_with(
+        &mut argv,
+        &launch.recipe,
+        || Ok(directory.path().to_path_buf()),
+        |_, sources| {
+            assert_eq!(sources, "project");
+            Some(json!(false))
+        },
+    );
+    assert_eq!(argv, expected);
+}
+
+#[test]
+fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let homes = account::home::Homes::at(directory.path().join("accounts"));
+    let managed = homes.path(Provider::Claude, uuid::Uuid::new_v4());
+    let system = directory.path().join("system");
+    let project = directory.path().join("project");
+    for path in [&managed, &system, &project.join(".claude")] {
+        std::fs::create_dir_all(path).unwrap();
+    }
+    let system_settings = system.join("settings.json");
+    std::fs::write(
+        managed.join("settings.json"),
+        r#"{"attribution":{"commit":"stale"}}"#,
+    )
+    .unwrap();
+    let mut launch = Launch {
+        provider: Provider::Claude,
+        recipe: crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: vec![],
+            working_directory: project.clone(),
+            environment: [("CLAUDE_CONFIG_DIR".into(), managed.display().to_string())].into(),
+            unset_environment: ["HOME".into(), "CLAUDE_CODE_PERMISSION_MODE".into()].into(),
+        },
+        session_id: None,
+        draft_model: None,
+    };
+    let settings = |launch: &Launch| {
+        let mut arguments = arguments(launch).unwrap();
+        assert!(arguments.iter().all(|argument| {
+            !argument.contains("attribution")
+                || launch
+                    .recipe
+                    .arguments
+                    .iter()
+                    .any(|original| original.contains("attribution"))
+        }));
+        apply_spawn_attribution_with(
+            &mut arguments,
+            &launch.recipe,
+            || Ok(directory.path().to_path_buf()),
+            |recipe, sources| chat::managed_claude_attribution(recipe, &homes, &system, sources),
+        );
+        arguments
+            .windows(2)
+            .find(|pair| pair[0] == "--settings")
+            .map(|pair| serde_json::from_str::<Value>(&pair[1]).unwrap())
+    };
+
+    std::fs::write(&system_settings, r#"{"attribution":false,"theme":"dark"}"#).unwrap();
+    assert_eq!(settings(&launch), Some(json!({"attribution": false})));
+    let terminal_overlay = |recipe: &crate::model::LaunchRecipe| {
+        crate::model::agent_recovery::claude_attribution_overlay_with(recipe, |recipe, sources| {
+            chat::managed_claude_attribution(recipe, &homes, &system, sources)
+        })
+        .map(|overlay| overlay.argument)
+    };
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":false}"#)
+    );
+    launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    std::fs::write(
+        &system_settings,
+        r#"{"attribution":{"commit":"","pr":"custom"}}"#,
+    )
+    .unwrap();
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}}))
+    );
+    let mut recovered = launch.recipe.clone();
+    recovered.arguments = vec![
+        "--resume".into(),
+        "a1b2c3d4-1111-4111-8111-123456789abc".into(),
+    ];
+    assert_eq!(
+        terminal_overlay(&recovered).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"}}"#)
+    );
+
+    for name in ["settings.json", "settings.local.json"] {
+        let path = project.join(".claude").join(name);
+        std::fs::write(&path, r#"{"attribution":false}"#).unwrap();
+        assert_eq!(settings(&launch), None, "{name}");
+        launch.recipe.arguments = vec!["--setting-sources=user".into()];
+        assert_eq!(
+            settings(&launch),
+            Some(json!({"attribution": {"commit": "", "pr": "custom"}})),
+            "Claude ignores the excluded {name} source"
+        );
+        launch.recipe.arguments.clear();
+        for invalid in [r#"{"attribution":true}"#, r#"{"attribution":{"commit":1}}"#] {
+            std::fs::write(&path, invalid).unwrap();
+            assert_eq!(
+                settings(&launch),
+                Some(json!({"attribution": {"commit": "", "pr": "custom"}})),
+                "{name}: {invalid}"
+            );
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    let nested = project.join("src/feature");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::create_dir(project.join(".git")).unwrap();
+    std::fs::write(project.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    launch.recipe.working_directory = nested;
+    let root_shared = project.join(".claude/settings.json");
+    let root_local = project.join(".claude/settings.local.json");
+    let intermediate = project.join("src/.claude");
+    std::fs::create_dir(&intermediate).unwrap();
+    std::fs::write(
+        intermediate.join("settings.local.json"),
+        r#"{"attribution":{"pr":"intermediate"}}"#,
+    )
+    .unwrap();
+    std::fs::write(&root_shared, r#"{"attribution":{"commit":"root"}}"#).unwrap();
+    let system_overlay = Some(json!({"attribution": {"commit": "", "pr": "custom"}}));
+    assert_eq!(settings(&launch), system_overlay);
+    std::fs::write(&root_local, r#"{"attribution":{"sessionUrl":false}}"#).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::remove_file(root_local).unwrap();
+    std::fs::remove_file(root_shared).unwrap();
+    std::fs::remove_dir_all(project.join(".git")).unwrap();
+
+    launch.recipe.working_directory = project.clone();
+    let fifo = project.join(".claude/settings.json");
+    let fifo_name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"}}"#)
+    );
+    std::fs::remove_file(fifo).unwrap();
+
+    // This linked checkout has a different parent directory from its primary
+    // checkout. Its personal local settings come from the primary root.
+    let checkout = directory.path().join("primary");
+    let git = checkout.join(".git/worktrees/linked");
+    std::fs::create_dir_all(&git).unwrap();
+    std::fs::write(git.join("commondir"), "../..\n").unwrap();
+    std::fs::write(project.join(".git"), format!("gitdir: {}\n", git.display())).unwrap();
+    std::fs::create_dir(checkout.join(".claude")).unwrap();
+    let shared_local = checkout.join(".claude/settings.local.json");
+    std::fs::write(&shared_local, r#"{"attribution":{"commit":"local"}}"#).unwrap();
+    assert_eq!(settings(&launch), None);
+    launch.recipe.arguments = vec!["--setting-sources=user,project".into()];
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}}))
+    );
+    std::fs::remove_file(shared_local).unwrap();
+
+    launch.recipe.arguments = vec![r#"--settings={"attribution":true}"#.into()];
+    assert_eq!(settings(&launch), Some(json!({"attribution": true})));
+    launch.recipe.arguments = vec![r#"--settings={"theme":"dark"}"#.into()];
+    assert_eq!(
+        settings(&launch),
+        Some(json!({"attribution": {"commit": "", "pr": "custom"}, "theme": "dark"}))
+    );
+    assert_eq!(
+        terminal_overlay(&launch.recipe).as_deref(),
+        Some(r#"--settings={"attribution":{"commit":"","pr":"custom"},"theme":"dark"}"#)
+    );
+    launch.recipe.arguments = vec!["--settings".into(), r#"{"attribution":true}"#.into()];
+    assert!(terminal_overlay(&launch.recipe).is_none());
+    launch.recipe.arguments = vec!["--settings".into(), "private-settings.json".into()];
+    assert!(terminal_overlay(&launch.recipe).is_none());
+    launch.recipe.arguments = vec!["--setting-sources=project,local".into()];
+    assert_eq!(settings(&launch), None);
+    launch.recipe.arguments.clear();
+
+    for invalid in [
+        "{}",
+        "malformed",
+        "[]",
+        r#"{"attribution":true}"#,
+        r#"{"attribution":{"pr":false}}"#,
+    ] {
+        std::fs::write(&system_settings, invalid).unwrap();
+        assert_eq!(settings(&launch), None, "{invalid}");
+    }
+    std::fs::remove_file(&system_settings).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::create_dir(&system_settings).unwrap();
+    assert_eq!(settings(&launch), None);
+    std::fs::remove_dir(&system_settings).unwrap();
+    std::fs::write(&system_settings, r#"{"attribution":false}"#).unwrap();
+    launch.recipe.environment.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        directory.path().join("linked").display().to_string(),
+    );
+    assert_eq!(settings(&launch), None);
 }

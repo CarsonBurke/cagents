@@ -116,15 +116,15 @@ class WorkBoardProjects(unittest.TestCase):
         rest = self.gh(project, "api", "repos/octo-org/api-gateway/issues?creator=fixture&per_page=20")
         self.assertEqual(json.loads(rest.stdout)[0]["number"], 100)
         # A reset in the past, or the switch off, gives the quota back.
-        (self.config / "fixture-forge-rate-limited").write_text("1\n")
+        (self.config / "fixture-forge-graphql-reset").write_text("1\n")
         self.assertEqual(self.authored(project).returncode, 0)
         self.helper("rate-limit")
         self.helper("rate-limit", "off")
         self.assertEqual(self.authored(project).returncode, 0)
-        (self.config / "fixture-forge-rate-limited").write_text("soon\n")
+        (self.config / "fixture-forge-graphql-reset").write_text("soon\n")
         refused = self.authored(project)
         self.assertEqual(refused.returncode, 1)
-        self.assertIn("must hold the Unix time", refused.stderr)
+        self.assertIn("must hold a Unix reset timestamp", refused.stderr)
 
 
 if __name__ == "__main__":

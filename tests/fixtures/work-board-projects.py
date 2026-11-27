@@ -132,7 +132,7 @@ def fixture_root():
 
 
 def rate_limit(config, switch):
-    path = config / "fixture-forge-rate-limited"
+    path = config / "fixture-forge-graphql-reset"
     if switch == "off":
         path.unlink(missing_ok=True)
         return {"rate_limited": False}

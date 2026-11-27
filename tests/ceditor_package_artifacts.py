@@ -196,7 +196,7 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
                 message = ["--message-format=json-render-diagnostics"]
                 self.assertEqual(self.builds(), [
                     common + ["--no-default-features", "--bin", "cagents"] + message,
-                    common + ["--no-default-features", "--features", "host", "--bin", "cagentsd"] + message,
+                    common + ["--no-default-features", "-p", "cagents-host", "--bin", "cagentsd"] + message,
                     common + ["--package", "ceditor"] + message,
                 ])
 

@@ -306,22 +306,16 @@ mod recording {
     #[cfg(feature = "development")]
     fn write_output(output: &Output, bytes: &[u8]) -> io::Result<()> {
         use std::io::Write;
-        use std::os::fd::{AsRawFd, FromRawFd};
+        use std::os::fd::AsRawFd;
         validate_directory(&output.directory)?;
-        // SAFETY: retained directory FD and CString remain live. Creation is
-        // exclusive, cannot follow the leaf, and grants no group/other access.
-        let fd = unsafe {
-            libc::openat(
-                output.directory.as_raw_fd(),
-                output.leaf.as_ptr(),
-                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        // Creation is exclusive, cannot follow the leaf, and grants no
+        // group/other access.
+        let mut file = std::fs::File::from(crate::descriptor::openat(
+            output.directory.as_raw_fd(),
+            &output.leaf,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )?);
         // File has no user-space buffer and performs no implicit writes on Drop.
         file.write_all(bytes)?;
         file.write_all(b"\n")?;

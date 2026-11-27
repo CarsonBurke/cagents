@@ -9,6 +9,7 @@ use crate::{
         directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
+    workspace_model::primary_checkout,
 };
 use imara_diff::{Algorithm, Diff, InternedInput};
 
@@ -329,15 +330,30 @@ impl ShowArgs {
     }
 }
 
-/// The directory a project named without a path works in: the checkout
-/// around a Git repository's metadata, and a folder project itself.
-fn checkout(project: &Path) -> PathBuf {
-    match project.parent() {
-        Some(parent) if project.file_name() == Some(std::ffi::OsStr::new(".git")) => {
-            parent.to_owned()
-        }
-        _ => project.to_owned(),
+/// Refuses a working directory that the open project `containing` it, if
+/// any, shows is not in `project`. The refusal names the project by the
+/// checkout a person opened, not its Git directory.
+///
+/// A `keyed` request may retry one the daemon accepted while its directory
+/// was there; once gone, that directory is in no project, so the daemon,
+/// which knows the first acceptance, judges it.
+fn inside_project(
+    directory: &Path,
+    project: &Path,
+    containing: Option<&Path>,
+    keyed: bool,
+) -> Result<(), AppError> {
+    if containing == Some(project) || (containing.is_none() && keyed) {
+        return Ok(());
     }
+    Err(AppError::new(
+        "target",
+        format!(
+            "{} is not in the project {}; pass a directory inside it",
+            super::format::location(directory, None),
+            super::format::location(primary_checkout(project), None)
+        ),
+    ))
 }
 
 pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
@@ -421,7 +437,7 @@ fn list_human(summaries: &[Summary], projects: &[ModelProject], program: &str) -
     let handles = Handles::among(summaries, &[]);
     let project_of = |summary: &Summary| {
         let repository = &summary.agent.spec.target.repository;
-        let root = checkout(repository);
+        let root = primary_checkout(repository).to_owned();
         let name = projects
             .iter()
             .find(|project| project.repository == *repository)
@@ -1316,19 +1332,17 @@ pub(super) fn execute_with_context(
                     match given {
                         // A target given in full is sent as given, so retrying
                         // it stays exact even after its directory has moved;
-                        // only a directory known to be elsewhere is refused.
+                        // only a directory known to be elsewhere is refused,
+                        // including one no open project contains. The daemon
+                        // refuses it too; this says so before anything is sent.
                         Some(_) => {
-                            if let (Ok(named), Some(containing)) = (&named, &containing)
-                                && named != containing
-                            {
-                                return Err(AppError::new(
-                                    "target",
-                                    format!(
-                                        "{} is not in the project {}",
-                                        here.display(),
-                                        named.display()
-                                    ),
-                                ));
+                            if let Ok(named) = &named {
+                                inside_project(
+                                    &here,
+                                    named,
+                                    containing.as_deref(),
+                                    retry.idempotency_key.is_some(),
+                                )?;
                             }
                             let repository = if project.is_absolute() {
                                 project
@@ -1348,7 +1362,7 @@ pub(super) fn execute_with_context(
                                 let directory = if project.is_absolute() {
                                     project
                                 } else {
-                                    checkout(&named)
+                                    primary_checkout(&named).to_owned()
                                 };
                                 (named, directory)
                             }
@@ -1568,10 +1582,11 @@ pub(super) fn execute_with_context(
             // hint, after them all, so a wait prints one however many.
             let single = statuses.len() == 1;
             let now = super::sessions::now_ms();
+            let mut named = Vec::new();
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
-                    with_standing(
+                    with_standing_once(
                         status_lines(
                             agent,
                             run,
@@ -1582,6 +1597,7 @@ pub(super) fn execute_with_context(
                         ),
                         member_of(&members, agent.id),
                         now,
+                        &mut named,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1906,7 +1922,8 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
-    // A run that settled says what stops its provider now, and the account.
+    // A run that settled says what stops its provider now, and the account
+    // when it needs attention.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
     let now = super::sessions::now_ms();
@@ -1941,9 +1958,24 @@ fn woke(after: Option<&Value>, before: &Value) -> bool {
 }
 
 /// A status with what stops the agent's provider, the account it runs on
-/// and whether its prompt cache has likely expired, as of `now`, after its
-/// first line, which readers of the output parse.
+/// when that account could change what the caller does next, and whether
+/// its prompt cache has likely expired, as of `now`, after its first line,
+/// which readers of the output parse. Status and wait run in loops, so an
+/// account with ordinary allowance left goes unsaid; `--json` and `ls`
+/// still name it.
 fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
+    with_standing_once(lines, member, now, &mut Vec::new())
+}
+
+/// [`with_standing`] for one of several runs printed together, naming each
+/// account at most once among them: `named` holds the accounts already
+/// named.
+fn with_standing_once(
+    lines: String,
+    member: Option<&Member>,
+    now: u64,
+    named: &mut Vec<crate::account::AccountId>,
+) -> String {
     let Some(member) = member else {
         return lines;
     };
@@ -1954,7 +1986,13 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
             super::sessions::limit_phrase(limit, now)
         ));
     }
-    if let Some(account) = &member.account {
+    if let Some(account) = member
+        .account
+        .as_ref()
+        .filter(|account| member.limit.is_some() || account_needs_attention(account))
+        .filter(|account| !named.contains(&account.id))
+    {
+        named.push(account.id.clone());
         standing.push_str(&format!(
             "\nAccount {}",
             super::sessions::account_phrase(account, now)
@@ -1969,6 +2007,28 @@ fn with_standing(lines: String, member: Option<&Member>, now: u64) -> String {
     match lines.split_once('\n') {
         Some((head, rest)) => format!("{head}{standing}\n{rest}"),
         None => format!("{lines}{standing}"),
+    }
+}
+
+/// Whether an account's standing is worth a line in a run's status: its
+/// allowance is past the warning mark, used up, or needs a new sign-in.
+/// Once one of the reading's windows has reset, its Warning or Limited
+/// counts only while a window that has not reset is still past the warning
+/// mark: the old status no longer says anything about the allowance. A
+/// reading that is merely old is still believed.
+fn account_needs_attention(account: &crate::agent_execution::directory::SessionAccount) -> bool {
+    use crate::account::UsageStatus;
+    let still_spent = || {
+        !account.remaining.iter().any(|window| window.reset_elapsed)
+            || account.remaining.iter().any(|window| {
+                !window.reset_elapsed
+                    && window.remaining_fraction < 1.0 - crate::account::WARNING_FRACTION
+            })
+    };
+    match account.status {
+        Some(UsageStatus::NeedsLogin) => true,
+        Some(UsageStatus::Warning | UsageStatus::Limited) => still_spent(),
+        _ => account.ordinary_usage_allowed == Some(false) && still_spent(),
     }
 }
 
@@ -2881,6 +2941,9 @@ mod tests {
                 super::super::messages::message_lines(&messages[0])
                     .contains("Receipt not confirmed; this message may appear again.")
             );
+            // Darwin clears the receive timeout when the retired socket's
+            // read side is shut down; nothing can read it after that.
+            #[cfg(target_os = "linux")]
             assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
             assert!(
                 client
@@ -3578,8 +3641,8 @@ mod tests {
         let server_socket = socket.clone();
         let server = thread::spawn(move || {
             thread::sleep(Duration::from_millis(30));
-            let listener = std::os::unix::net::UnixListener::bind(server_socket).unwrap();
-            let (mut stream, _) = listener.accept().unwrap();
+            let listener = crate::descriptor::bind(&server_socket).unwrap();
+            let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
             let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             thread::sleep(Duration::from_millis(30));
             let proof = crate::model::HostSessionProof {
@@ -3644,7 +3707,7 @@ mod tests {
             host_incarnation: crate::model::HostIncarnation::new("slow-startup"),
         };
         let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
-        let listener = std::os::unix::net::UnixListener::bind(&paths.socket).unwrap();
+        let listener = crate::descriptor::bind(&paths.socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let peer = proof.clone();
         let server = thread::spawn(move || {
@@ -3657,7 +3720,7 @@ mod tests {
                     Instant::now() < deadline,
                     "the startup console never reconnected"
                 );
-                let (mut stream, _) = match listener.accept() {
+                let (mut stream, _) = match crate::descriptor::accept(&listener) {
                     Ok(pair) => pair,
                     Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                         thread::sleep(Duration::from_millis(2));
@@ -4393,6 +4456,96 @@ mod tests {
         assert_eq!(data["account"]["id"], "claude/system");
         assert!(data.get("cache").is_none(), "no estimate");
 
+        // Without a limit, the account is named only when its standing
+        // could change what the caller does; JSON names it either way.
+        let mut unlimited = found.unwrap().clone();
+        unlimited.limit = None;
+        for (usage, shown) in [
+            (None, false),
+            (Some(crate::account::UsageStatus::Ok), false),
+            (Some(crate::account::UsageStatus::Unavailable), false),
+            (Some(crate::account::UsageStatus::Warning), true),
+            (Some(crate::account::UsageStatus::Limited), true),
+            (Some(crate::account::UsageStatus::NeedsLogin), true),
+        ] {
+            unlimited.account.as_mut().unwrap().status = usage;
+            let human = with_standing(status.into(), Some(&unlimited), 0);
+            assert_eq!(
+                human.contains("\nAccount claude/system"),
+                shown,
+                "{usage:?}: {human}"
+            );
+            let mut data = json!({});
+            standing_json(&mut data, Some(&unlimited), 0);
+            assert_eq!(data["account"]["id"], "claude/system", "{usage:?}");
+        }
+        let account = unlimited.account.as_mut().unwrap();
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(with_standing(status.into(), Some(&unlimited), 0).contains("\nAccount "));
+
+        // A stale Limited reading counts while a window it saw spent has not
+        // reset, and not once every such window has.
+        let spent = |reset_elapsed| crate::account::info::RemainingWindow {
+            window: crate::account::UsageWindow {
+                key: "weekly".into(),
+                kind: crate::account::WindowKind::Weekly,
+                label: "Weekly".into(),
+                used: 1.0,
+                resets_at: None,
+                span_secs: None,
+                binding: false,
+            },
+            remaining_fraction: 0.0,
+            reset_elapsed,
+        };
+        let account = unlimited.account.as_mut().unwrap();
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = true;
+        account.remaining = vec![spent(false)];
+        assert!(account_needs_attention(account), "not reset yet");
+        account.remaining = vec![spent(true)];
+        assert!(!account_needs_attention(account), "reset since the reading");
+        account.remaining = vec![spent(true), spent(false)];
+        assert!(
+            account_needs_attention(account),
+            "another window still spent"
+        );
+        let mut unspent = spent(false);
+        unspent.remaining_fraction = 0.9;
+        account.remaining = vec![spent(true), unspent];
+        assert!(
+            !account_needs_attention(account),
+            "the other window has room"
+        );
+        // A reading that is only old, with no window reset, is believed:
+        // a provider's own Limited or Warning, or its refusal of ordinary
+        // use, needs no spent window behind it.
+        account.remaining = Vec::new();
+        assert!(account_needs_attention(account), "provider-limited, old");
+        account.status = Some(crate::account::UsageStatus::Warning);
+        assert!(account_needs_attention(account), "provider warning, old");
+        let mut healthy = spent(false);
+        healthy.remaining_fraction = 0.9;
+        account.remaining = vec![healthy];
+        account.status = Some(crate::account::UsageStatus::Ok);
+        account.ordinary_usage_allowed = Some(false);
+        assert!(
+            account_needs_attention(account),
+            "refused ordinary use, old"
+        );
+        account.ordinary_usage_allowed = None;
+        account.status = Some(crate::account::UsageStatus::Limited);
+        account.stale = false;
+
+        // Several runs on one account name it once among them.
+        let mut named = Vec::new();
+        let first = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        let second = with_standing_once(status.into(), Some(&unlimited), 0, &mut named);
+        assert!(first.contains("\nAccount claude/system"), "{first}");
+        assert_eq!(second, status);
+
         // A cache that likely expired gets a line among the standing, and
         // the same `now` decides the text and the JSON.
         let mut cold = found.unwrap().clone();
@@ -4803,8 +4956,31 @@ mod tests {
             here.is_absolute() && here.ends_with("src"),
             "an existing word is a path"
         );
-        assert_eq!(checkout(Path::new("/repo/.git")), Path::new("/repo"));
-        assert_eq!(checkout(Path::new("/notes")), Path::new("/notes"));
+        assert_eq!(
+            primary_checkout(Path::new("/repo/.git")),
+            Path::new("/repo")
+        );
+        assert_eq!(primary_checkout(Path::new("/notes")), Path::new("/notes"));
+    }
+
+    /// #3432: an explicit directory is refused unless the open project
+    /// containing it is the one named, including when no open project
+    /// contains it at all, such as the home directory.
+    #[test]
+    fn an_explicit_directory_must_be_in_the_named_project() {
+        let project = Path::new("/srv/app/.git");
+        assert!(inside_project(Path::new("/srv/app/src"), project, Some(project), false).is_ok());
+        let other = Some(Path::new("/srv/other/.git"));
+        for (containing, keyed) in [(None, false), (other, false), (other, true)] {
+            let error = inside_project(Path::new("/srv"), project, containing, keyed).unwrap_err();
+            assert_eq!(error.kind, "target");
+            assert_eq!(
+                error.message,
+                "/srv is not in the project /srv/app; pass a directory inside it"
+            );
+        }
+        // A keyed retry whose directory is gone is the daemon's to judge.
+        assert!(inside_project(Path::new("/srv/gone"), project, None, true).is_ok());
     }
 
     #[test]

@@ -16,7 +16,7 @@ pub struct ProjectLocation {
 
 /// Preserve an already-open folder identity before interpreting new Git
 /// metadata. Otherwise checkouts and linked worktrees resolve to one Git key.
-pub(crate) fn resolve(
+pub fn resolve(
     path: &Path,
     model: Option<&crate::workspace_model::WorkspaceModel>,
 ) -> Result<ProjectLocation, String> {
@@ -122,22 +122,19 @@ fn has_git_metadata(directory: &Path) -> Result<bool, String> {
 /// belongs to. Read from the filesystem as Git discovers a repository, without
 /// running Git, so listing many sessions stays cheap.
 #[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct Placement {
+pub struct Placement {
     pub worktree: Option<PathBuf>,
     pub project: Option<PathBuf>,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
+pub fn place(path: &Path, model: &crate::workspace_model::WorkspaceModel) -> Placement {
     place_among(path, &model.projects)
 }
 
 /// [`place`] among `projects`, for a client that read the open projects
 /// rather than the whole workspace model.
-pub(crate) fn place_among(
-    path: &Path,
-    projects: &[crate::workspace_model::ModelProject],
-) -> Placement {
+pub fn place_among(path: &Path, projects: &[crate::workspace_model::ModelProject]) -> Placement {
     let Ok(directory) = fs::canonicalize(path) else {
         return Placement::default();
     };
@@ -152,39 +149,35 @@ fn placed(directory: &Path, opened: &dyn Fn(&Path) -> bool) -> Placement {
     let checkout = checkout(directory);
     // An open folder keeps its own identity, as in `resolve`, and the nearest
     // open project wins over an enclosing one: a folder inside the checkout,
-    // then the checkout's repository, then a folder that encloses it.
-    let (inner, outer) = match &checkout {
-        Some((worktree, _)) => directory
+    // then the checkout's repository, then whatever holds the checkout.
+    let Some((worktree, common)) = checkout else {
+        let project = directory
             .ancestors()
-            .partition::<Vec<_>, _>(|ancestor| ancestor.starts_with(worktree)),
-        None => (Vec::new(), directory.ancestors().collect()),
+            .find(|ancestor| opened(ancestor))
+            .map(Path::to_path_buf);
+        return Placement {
+            worktree: None,
+            project,
+        };
     };
-    let project = inner
-        .into_iter()
+    let project = directory
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(&worktree))
         .find(|ancestor| opened(ancestor))
         .map(Path::to_path_buf)
+        .or_else(|| opened(&common).then_some(common))
+        // A submodule or a clone nested in an open repository is not opened
+        // itself; it belongs to the project of the checkout around it, which
+        // is nearer than any folder enclosing that checkout.
         .or_else(|| {
-            checkout
-                .as_ref()
-                .map(|(_, common)| common.clone())
-                .filter(|common| opened(common))
-        })
-        .or_else(|| {
-            outer
-                .into_iter()
-                .find(|ancestor| opened(ancestor))
-                .map(Path::to_path_buf)
+            worktree
+                .parent()
+                .and_then(|parent| placed(parent, opened).project)
         });
-    let worktree = checkout.map(|(worktree, _)| worktree);
-    // A submodule or a clone nested in an open repository is not opened
-    // itself; it belongs to the project of the checkout around it.
-    let project = project.or_else(|| {
-        worktree
-            .as_deref()
-            .and_then(Path::parent)
-            .and_then(|parent| placed(parent, opened).project)
-    });
-    Placement { worktree, project }
+    Placement {
+        worktree: Some(worktree),
+        project,
+    }
 }
 
 /// The working tree that contains `directory` and its Git common directory.
@@ -198,7 +191,7 @@ fn checkout(directory: &Path) -> Option<(PathBuf, PathBuf)> {
 /// its index and `HEAD`, and the common directory it shares objects and refs
 /// with every other worktree of the repository.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct GitDirectories {
+pub struct GitDirectories {
     pub private: PathBuf,
     pub common: PathBuf,
 }
@@ -208,7 +201,7 @@ pub(crate) struct GitDirectories {
 /// directory, and that directory names the shared one it borrows objects and
 /// refs from. `None` when the checkout has no marker, or one that names
 /// nothing readable; such a marker is skipped, not trusted.
-pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
+pub fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let marker = checkout.join(".git");
     if !crate::git_marker::present(&marker).ok()? {
         return None;
@@ -216,15 +209,35 @@ pub(crate) fn git_directories(checkout: &Path) -> Option<GitDirectories> {
     let private = if fs::metadata(&marker).ok()?.is_dir() {
         fs::canonicalize(&marker).ok()?
     } else {
-        let content = fs::read_to_string(&marker).ok()?;
+        let content = git_marker_text(&marker).ok()?;
         fs::canonicalize(checkout.join(line(content.strip_prefix("gitdir: ")?))).ok()?
     };
-    let common = match fs::read_to_string(private.join("commondir")) {
+    let common = match git_marker_text(&private.join("commondir")) {
         Ok(common) => fs::canonicalize(private.join(line(&common))).ok()?,
         Err(error) if error.kind() == io::ErrorKind::NotFound => private.clone(),
         Err(_) => return None,
     };
     Some(GitDirectories { private, common })
+}
+
+fn git_marker_text(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // A Git path fits well within this limit. Do not wait for an unusual
+    // filesystem entry while reading project metadata at launch.
+    const MAX_GIT_MARKER: u64 = 64 * 1024;
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Git marker is not a regular file"));
+    }
+    let bytes = crate::fs_safety::read_bounded(&mut file, MAX_GIT_MARKER)?;
+    if bytes.len() as u64 > MAX_GIT_MARKER {
+        return Err(io::Error::other("Git marker exceeds 64 KiB"));
+    }
+    String::from_utf8(bytes).map_err(io::Error::other)
 }
 
 /// One line of a Git metadata file, which Git accepts with CRLF too.
@@ -534,9 +547,21 @@ mod tests {
             place(&module, &model),
             Placement {
                 worktree: Some(module.canonicalize().unwrap()),
-                project: Some(key),
+                project: Some(key.clone()),
             }
         );
+        // #3432: an open folder enclosing the repository is farther from the
+        // submodule than the repository's own project.
+        let enclosing = root.path().canonicalize().unwrap();
+        model.projects.push(crate::workspace_model::ModelProject {
+            repository: enclosing.clone(),
+            name: "home".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 2,
+        });
+        assert_eq!(place(&module, &model).project, Some(key.clone()));
+        assert_eq!(place(&repository.join("src"), &model).project, Some(key));
+        assert_eq!(place(root.path(), &model).project, Some(enclosing));
     }
 
     #[test]

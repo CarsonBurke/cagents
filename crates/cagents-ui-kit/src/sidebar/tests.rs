@@ -1000,36 +1000,45 @@ fn compact_project_initials_paint_bright_inside_the_colored_chip() {
     }
 }
 
+/// A highlighted label fades within the slot it is given rather than being
+/// cut short to fit, and is read whole.
 #[test]
-fn highlighted_labels_truncate_to_measured_slot_with_an_ellipsis() {
-    let _renderer = headless_renderer();
-    let font = cosmic::font::default();
-    let emphasis = cosmic::iced::Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
+fn highlighted_labels_fade_within_their_slot_and_read_whole() {
     let label = "feature/authentication-long-λ-branch";
-    for width in [55.0, 105.0, 170.0] {
-        let truncated = ellipsize_search_label(label, width, |label| {
-            search_spans_width(label, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis)
-        });
-        assert!(truncated.ends_with('…'), "{truncated}");
-        assert!(
-            search_spans_width(&truncated, "feat", CHILD_ROW_TEXT_SIZE, font, emphasis) <= width
+    let natural = |query: &str| {
+        let texts = drawn_texts(
+            search_text(
+                label,
+                query,
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            )
+            .into(),
+            2000.0,
         );
-        assert!(!search_highlight_ranges(&truncated, "feat").is_empty());
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        assert_eq!(texts[0].0, label);
+        texts[0].1.width
+    };
+    // A match is set in bold, so it is a little wider, never narrower.
+    assert!(natural("feat") >= natural("") - 0.5);
+    for width in [55.0, 105.0, 170.0] {
+        let texts = drawn_texts(
+            search_label(
+                label,
+                "feat",
+                CHILD_ROW_TEXT_SIZE,
+                theme::Text::Default,
+                false,
+            ),
+            width,
+        );
+        assert_eq!(texts.len(), 1, "{texts:?}");
+        let (text, bounds) = &texts[0];
+        assert_eq!(text, label, "the whole label, not a cut one");
+        assert!(bounds.width <= width + 0.5, "{bounds:?} in {width}");
     }
-    assert_eq!(
-        ellipsize_search_label(label, 2000.0, |label| search_spans_width(
-            label,
-            "feat",
-            CHILD_ROW_TEXT_SIZE,
-            font,
-            emphasis
-        )),
-        label
-    );
-    assert!(search_highlight_ranges("fast elegant audit trail", "feat").is_empty());
 }
 
 #[test]
@@ -2092,21 +2101,8 @@ fn search_finds_pane_rows_by_title_or_checkout() {
 }
 
 #[test]
-fn hidden_checkouts_leave_pull_requests_folders_and_unowned_news_alone() {
+fn hidden_checkouts_leave_folders_and_unowned_news_alone() {
     let (mut model, mut state, [idle, unread, _]) = hidden_checkouts_scene();
-    let project = model.projects[0].id;
-    let linked = model.projects[0].worktrees[1].id;
-
-    // The pull request filter lists pull requests by their checkouts.
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-    let rows = visible_selection_rows(&model, &state, false);
-    assert!(
-        rows.contains(&SelectionRow::Worktree(project, linked)),
-        "{rows:?}"
-    );
-    assert!(!rows.iter().any(|row| matches!(row, SelectionRow::Card(_))));
-    assert_eq!(drawn_rows(&model, &state, false), rows);
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
 
     // The unread news shows once: on its pane's row, or on the header
     // while a search leaves that row out. An unread badge carries its
@@ -2280,7 +2276,7 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
                 .expect("the toggle takes keyboard focus");
             assert_eq!(
                 focusable.get(toggle.wrapping_sub(1)),
-                Some(&filter_id(SidebarFilter::Attention)),
+                Some(&attention_filter_focus_id()),
                 "it follows the bell"
             );
         }
@@ -2288,25 +2284,25 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
 }
 
 /// Only the All view lists checkouts. The setting persists, so the
-/// toggle stays live in the other views and says which view it changes.
+/// toggle stays live in the Attention view and says which view it changes.
 #[test]
-fn the_checkouts_toggle_names_the_all_view_from_the_others() {
-    let mut state = SidebarState::default();
-    for filter in [SidebarFilter::Attention, SidebarFilter::PullRequests] {
-        state.filter = filter;
-        for (mode, tooltip) in [
-            (
-                crate::settings::SidebarWorktrees::Grouped,
-                "Hide checkouts in the All view",
-            ),
-            (
-                crate::settings::SidebarWorktrees::Hidden,
-                "Show checkouts in the All view (hidden in every project)",
-            ),
-        ] {
-            state.set_sidebar_worktrees(mode);
-            assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{filter:?}");
-        }
+fn the_checkouts_toggle_names_the_all_view_from_attention() {
+    let mut state = SidebarState {
+        filter: SidebarFilter::Attention,
+        ..SidebarState::default()
+    };
+    for (mode, tooltip) in [
+        (
+            crate::settings::SidebarWorktrees::Grouped,
+            "Hide checkouts in the All view",
+        ),
+        (
+            crate::settings::SidebarWorktrees::Hidden,
+            "Show checkouts in the All view (hidden in every project)",
+        ),
+    ] {
+        state.set_sidebar_worktrees(mode);
+        assert_eq!(checkouts_toggle_tooltip(&state), tooltip, "{mode:?}");
     }
 }
 
@@ -2330,11 +2326,7 @@ fn worktree_display_operations_survive_search_filters_and_unreachable_projects()
             });
             let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
             for mode in crate::settings::SidebarWorktrees::ALL {
-                for filter in [
-                    SidebarFilter::All,
-                    SidebarFilter::Attention,
-                    SidebarFilter::PullRequests,
-                ] {
+                for filter in [SidebarFilter::All, SidebarFilter::Attention] {
                     let mut state = SidebarState::default();
                     state.set_sidebar_worktrees(mode);
                     state.apply(&SidebarAction::SetFilter(filter));
@@ -3260,7 +3252,6 @@ fn row_quick_delete_centers_its_glyph_in_the_whole_hit_area() {
             project_id(1),
             &worktree,
             false,
-            false,
             None,
             false,
             true,
@@ -3296,7 +3287,6 @@ fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
             worktree_view(
                 project_id(1),
                 &worktree,
-                false,
                 false,
                 None,
                 false,
@@ -3356,7 +3346,6 @@ fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
             project_id(1),
             &worktree,
             primary,
-            false,
             None,
             false,
             true,
@@ -3710,11 +3699,9 @@ fn project_filters_restore_native_scroll_without_viewport_messages() {
 
     for (filter, height, expected, scroll_to) in [
         (SidebarFilter::Attention, 500.0, 0.0, Some(170.0)),
-        (SidebarFilter::PullRequests, 1_000.0, 0.0, Some(330.0)),
         (SidebarFilter::All, 1_000.0, 640.0, None),
         (SidebarFilter::Attention, 500.0, 170.0, None),
         (SidebarFilter::All, 1_000.0, 640.0, None),
-        (SidebarFilter::PullRequests, 1_000.0, 330.0, None),
         (SidebarFilter::Attention, 0.0, 0.0, None),
         (SidebarFilter::All, 1_000.0, 640.0, None),
     ] {
@@ -3901,7 +3888,6 @@ fn long_worktree_labels_cannot_paint_over_status_or_badges() {
             project_id(1),
             worktree,
             true,
-            false,
             None,
             false,
             false,
@@ -3989,7 +3975,7 @@ fn navigation_rows_share_one_content_grid() {
     // the group hands it.
     let header = |compact: bool, width: f32| {
         laid_out(
-            &mut project_identity_row(&model.projects[0], false, false, compact, false, "", None),
+            &mut project_identity_row(&model.projects[0], false, false, compact, "", None),
             width,
         )
     };
@@ -4125,7 +4111,7 @@ fn project_hover_commands_preserve_disclosure_position_and_reserve_only_visible_
     let width = design::NAVIGATION_DEFAULT_WIDTH;
     let limits = layout::Limits::new(Size::ZERO, Size::new(width, PROJECT_HEADER_HEIGHT));
     let mut element = project_header_row(
-        project_identity_row(&model.projects[0], false, false, false, false, "", None),
+        project_identity_row(&model.projects[0], false, false, false, "", None),
         vec![
             icon_action(
                 Icon::ChannelAdd,
@@ -5003,7 +4989,7 @@ fn cached_sidebar_project_submenu_opens_over_expanded_rows_at_label_and_arrow() 
             false,
             navigation,
             &shortcuts,
-            false,
+            WindowCorner::default(),
         );
         let mut ui = UserInterface::build(
             widget::row::with_children(vec![
@@ -5207,7 +5193,7 @@ fn interface<'a>(
             false,
             navigation,
             &crate::settings::KeyboardShortcuts::default(),
-            false,
+            WindowCorner::default(),
         ),
         bounds,
         cache,
@@ -7266,26 +7252,20 @@ fn hiding_the_search_controls_ends_the_search_they_held() {
     let mut state = SidebarState::default();
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::SearchChanged("sidebar".into()));
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
-    assert!(state.search_filters_active());
+    assert!(state.has_search_query());
     assert_eq!(state.saved_view().query, "sidebar");
 
     state.apply(&SidebarAction::ToggleControls);
     assert!(!state.controls_expanded());
     assert_eq!(state.query(), "");
-    assert_eq!(
-        state.filter(),
-        SidebarFilter::All,
-        "a hidden pull request filter would silently change row clicks"
-    );
-    assert!(!state.search_filters_active());
+    assert!(!state.has_search_query());
 
     // Attention keeps its own always-visible header toggle.
     state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::ToggleControls);
     assert_eq!(state.filter(), SidebarFilter::Attention);
-    assert!(!state.search_filters_active());
+    assert!(!state.has_search_query());
 }
 
 #[test]
@@ -7311,17 +7291,39 @@ fn a_hidden_query_is_neither_saved_nor_restored() {
     assert_eq!(restored.saved_view().query, "");
 }
 
+/// The sidebar once had a Pull requests filter; that list now opens from
+/// each project's Worktrees pane header. A view saved with it, the search
+/// controls open or not, restores the rest of the view under All.
 #[test]
-fn the_search_toggle_is_lit_while_any_search_filter_applies() {
+fn a_saved_pull_request_filter_restores_as_all() {
+    for controls_expanded in [false, true] {
+        let saved: SidebarView = serde_json::from_value(serde_json::json!({
+            "query": "kept",
+            "controls_expanded": controls_expanded,
+            "collapsed_projects": [],
+            "selection": null,
+            "filter": "PullRequests",
+            "in_progress_collapsed": true,
+        }))
+        .unwrap();
+        let mut restored = SidebarState::default();
+        restored.restore_view(saved);
+        assert_eq!(restored.filter(), SidebarFilter::All, "{controls_expanded}");
+        assert!(restored.in_progress_collapsed, "{controls_expanded}");
+        assert_eq!(restored.controls_expanded(), controls_expanded);
+    }
+}
+
+#[test]
+fn the_search_toggle_is_lit_while_open_or_searching() {
     for (controls_expanded, query, filter, lit) in [
         (false, "", SidebarFilter::All, false),
         (false, "", SidebarFilter::Attention, false),
         (false, "  ", SidebarFilter::All, false),
         (true, "", SidebarFilter::All, true),
-        // Neither can arise through the pane any more, but a state that
-        // holds one must still show it.
+        // This cannot arise through the pane any more, but a state that
+        // holds it must still show it.
         (false, "q", SidebarFilter::All, true),
-        (false, "", SidebarFilter::PullRequests, true),
     ] {
         let state = SidebarState {
             controls_expanded,
@@ -8298,9 +8300,21 @@ fn attention_search_finds_pane_rows_by_their_checkout() {
     ignore = "its widths assume the development host's fonts, not the release sandbox's"
 )]
 fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
-    let (font, emphasis) = search_label_fonts(false);
     let title = "Review agent";
-    let natural = search_spans_width(title, "review", CHILD_ROW_TEXT_SIZE, font, emphasis).ceil();
+    let natural = drawn_texts(
+        search_text(
+            title,
+            "review",
+            CHILD_ROW_TEXT_SIZE,
+            theme::Text::Default,
+            false,
+        )
+        .into(),
+        2000.0,
+    )[0]
+    .1
+    .width
+    .ceil();
     let place = "fix-sidebar-and-a-long-checkout-name";
     let width = natural + 40.0;
     for query in ["", "review"] {
@@ -8315,7 +8329,7 @@ fn a_highlighted_title_keeps_its_width_and_its_place_gives_way() {
         );
         assert!(
             bounds.x + bounds.width <= width + 0.5,
-            "query={query:?}: the place ellipsizes within the row: {bounds:?}"
+            "query={query:?}: the place fades within the row: {bounds:?}"
         );
         assert!(bounds.width < 45.0, "query={query:?}: {bounds:?}");
     }
@@ -8426,14 +8440,12 @@ fn reading_outside_attention_retains_nothing() {
         channels: vec![channel],
         listed: &listed,
     };
-    for filter in [SidebarFilter::All, SidebarFilter::PullRequests] {
-        let mut state = SidebarState::default();
-        state.apply(&SidebarAction::SetFilter(filter));
-        state.observe_agent_update(card, project, worktree);
-        state.acknowledge_agent_update(card, &everywhere);
-        assert!(!state.has_card_update(card), "{filter:?}");
-        assert!(state.retained_attention.is_empty(), "{filter:?}");
-    }
+    let mut state = SidebarState::default();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::All));
+    state.observe_agent_update(card, project, worktree);
+    state.acknowledge_agent_update(card, &everywhere);
+    assert!(!state.has_card_update(card));
+    assert!(state.retained_attention.is_empty());
 }
 
 #[test]
@@ -8545,6 +8557,65 @@ fn project_header_actions_are_independent_and_attention_can_be_cleared() {
 }
 
 #[test]
+fn the_first_row_leaves_the_window_controls_their_corner() {
+    use cosmic::iced::advanced::widget::Operation;
+    struct Find(widget::Id, Option<Rectangle>);
+    impl Operation for Find {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            bounds: Rectangle,
+            _: &mut dyn cosmic::iced::advanced::widget::operation::Focusable,
+        ) {
+            if id == Some(&self.0) {
+                self.1 = Some(bounds);
+            }
+        }
+    }
+    let renderer = headless_renderer();
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    // The row's first control: settings in the expanded row, and the
+    // projects toggle atop the rail.
+    let first = |compact: bool, controls: Option<WindowControls>| {
+        // Padded as the pane pads it.
+        let mut element = Element::from(
+            widget::container(utilities(compact, false, &shortcuts, controls))
+                .padding([0.0, space::XS]),
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(EXPANDED_WIDTH_MIN, 400.0)),
+        );
+        let id = if compact {
+            Id::new("command.toggle-projects")
+        } else {
+            stable_id("settings")
+        };
+        let mut found = Find(id, None);
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut found);
+        found.1.expect("the row's first control is laid out")
+    };
+    let controls = WindowControls {
+        width: 76.0,
+        height: 30.0,
+        edge: WindowControlsEdge::Leading,
+    };
+    let (bare, kept) = (first(false, None), first(false, Some(controls)));
+    assert!(bare.x < controls.width, "{bare:?}");
+    assert_eq!((kept.x, kept.y), (controls.width, bare.y));
+    let (bare, kept) = (first(true, None), first(true, Some(controls)));
+    assert!(bare.y < controls.height, "{bare:?}");
+    assert_eq!((kept.x, kept.y), (bare.x, controls.height));
+}
+
+#[test]
 fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
     let renderer = headless_renderer();
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
@@ -8575,7 +8646,7 @@ fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
             assert!(child.bounds().x + child.bounds().width <= width);
         }
         assert!(
-            accessible_names(&renderer, utilities(false, false, &shortcuts))
+            accessible_names(&renderer, utilities(false, false, &shortcuts, None))
                 .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
         );
     }
@@ -9106,10 +9177,11 @@ impl cosmic::iced::advanced::widget::Operation for VisitAll {
 /// every frame.
 #[test]
 fn rows_out_of_view_let_frame_broadcasts_pass() {
+    #[cfg(target_os = "linux")]
+    use cosmic::iced::event::{PlatformSpecific, wayland};
     use cosmic::iced::{
         Event, Point, Vector,
         advanced::{Shell, clipboard, mouse},
-        event::{PlatformSpecific, wayland},
         keyboard,
         time::Instant,
         window,
@@ -9180,6 +9252,8 @@ fn rows_out_of_view_let_frame_broadcasts_pass() {
     };
 
     assert_eq!(send(list, tree, redraw(), away, &top), rows(&[0..10], &[]));
+    // Only Wayland sends a resize request to every widget.
+    #[cfg(target_os = "linux")]
     assert_eq!(
         send(
             list,
@@ -9883,6 +9957,7 @@ fn cached_project_list_preserves_actual_accessibility_press_focus_and_overlay_st
     let renderer = headless_renderer();
     let mut folder = project().with_kind(ProjectKind::Folder);
     folder.worktrees.clear();
+    // Nothing is under this folder's heading, so pressing it opens the folder.
     let expected = SidebarAction::OpenRepository {
         project_id: folder.id,
         repository: folder.repository.clone(),
@@ -10402,10 +10477,7 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
     folder.worktrees.clear();
     let key = folder.folder_key().unwrap();
     let plain = format!("Open project {}", folder.name);
-    let open = SidebarAction::OpenRepository {
-        project_id: folder.id,
-        repository: folder.repository.clone(),
-    };
+    let toggle = SidebarAction::ToggleProject(folder.id);
     let terminal = compact_attention_terminal(CardId::new());
     let card = terminal.id;
     let durable = Arc::new(crate::model::WorkspaceState {
@@ -10559,8 +10631,8 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
         ),
     );
     assert!(
-        actions.contains(&open),
-        "the unchanged actual Folder control still opens its exact destination"
+        actions.contains(&toggle),
+        "the unchanged actual Folder control folds it, as a repository's does"
     );
 }
 
@@ -10852,16 +10924,36 @@ fn folder_projects_remain_selectable_without_git_actions_in_both_sidebar_modes()
     let renderer = headless_renderer();
     let mut entry = project().with_kind(ProjectKind::Folder);
     entry.worktrees.clear();
+    entry.channels.clear();
+    entry.panes.clear();
     entry.revoke_github();
+    // A folder with nothing under its heading has nothing to fold, so its
+    // heading opens it; once it holds a channel, its heading folds it.
     let open = SidebarAction::OpenRepository {
         project_id: entry.id,
         repository: entry.repository.clone(),
     };
+    let toggle = SidebarAction::ToggleProject(entry.id);
+    let empty = SidebarModel::ready(SidebarMode::Expanded, vec![entry.clone()]);
+    entry.channels.push(SidebarChannel::new(
+        ChannelId::from_uuid(Uuid::from_u128(21)),
+        "Draft the notes".into(),
+        false,
+        None,
+        true,
+        1,
+        true,
+        1,
+    ));
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
     let state = SidebarState::default();
     for compact in [false, true] {
+        let actions = frame_enter_presses(&renderer, body(&empty, &state, compact, false));
+        assert!(actions.contains(&open), "{actions:?}");
+        assert!(!actions.contains(&toggle), "{actions:?}");
         let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
-        assert!(actions.contains(&open));
+        assert!(actions.contains(&toggle), "{actions:?}");
+        assert!(!actions.contains(&open), "{actions:?}");
         assert!(
             !actions
                 .iter()
@@ -10944,11 +11036,7 @@ fn a_filter_cannot_hide_a_project_that_cannot_be_read() {
     entry.unreachable = Some("fatal: not a git repository".into());
     let id = entry.id;
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    for filter in [
-        SidebarFilter::All,
-        SidebarFilter::Attention,
-        SidebarFilter::PullRequests,
-    ] {
+    for filter in [SidebarFilter::All, SidebarFilter::Attention] {
         let state = SidebarState {
             filter,
             ..SidebarState::default()
@@ -11194,41 +11282,18 @@ fn the_sidebar_header_keeps_its_titlebar_gestures_in_every_state() {
 }
 
 #[test]
-fn pr_browser_keeps_authenticated_projects_without_matching_worktrees() {
-    let mut entry = project();
-    entry.github_ready = true;
-    entry.pull_requests.clear();
-    entry.worktrees.clear();
-    entry.channels.clear();
-    let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
-    let state = SidebarState {
-        filter: SidebarFilter::PullRequests,
-        ..SidebarState::default()
-    };
-    for compact in [false, true] {
-        assert_eq!(filtered_projects(&model, &state, compact).len(), 1);
-    }
-}
-
-#[test]
-fn compact_search_and_pr_filter_apply_while_the_popover_is_open() {
+fn compact_search_applies_while_the_popover_is_open() {
     let model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
     let mut state = SidebarState::default();
     state.apply(&SidebarAction::ToggleControls);
     state.apply(&SidebarAction::SearchChanged("fix-sidebar".into()));
-    assert_eq!(
-        filtered_projects(&model, &state, true)[0].worktrees.len(),
-        1
-    );
-    state.apply(&SidebarAction::SearchChanged(String::new()));
-    state.apply(&SidebarAction::SetFilter(SidebarFilter::PullRequests));
     let filtered = filtered_projects(&model, &state, true);
+    assert_eq!(filtered[0].worktrees.len(), 1);
     assert_eq!(
         filtered[0].worktrees[0].branch.as_deref(),
         Some("fix-sidebar")
     );
-    assert_eq!(filtered[0].worktrees.len(), 1);
-    // Dismissing the popover ends both.
+    // Dismissing the popover ends it.
     state.apply(&SidebarAction::ToggleControls);
     assert_eq!(
         filtered_projects(&model, &state, true)[0].worktrees.len(),
@@ -11363,7 +11428,6 @@ fn terminal_pull_request_rows_hide_retained_review_and_check_badges() {
         let mut element = worktree_view(
             project_id(1),
             row,
-            false,
             false,
             None,
             false,
@@ -11501,26 +11565,18 @@ fn live_and_reopened_pull_request_rows_keep_review_and_check_status() {
     assert!(!row.chrome.accessible_name.contains("review re-requested"));
 }
 
+/// A checkout's pull request opens from the project's pull request list in
+/// the Worktrees pane; the sidebar row always opens the checkout.
 #[test]
-fn pull_request_filter_rows_open_reviews_and_other_rows_open_worktrees() {
+fn worktree_rows_open_their_worktree_with_or_without_a_pull_request() {
     let project = project();
     let mut worktree = project.worktrees[0].clone();
-    let pr = project.pull_requests[0].clone();
-    worktree.set_pull_request(pr.clone());
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, true),
-        SidebarAction::OpenPullRequest { project_id, number, url }
-        if project_id == project.id && number == pr.number && url == pr.url)
-    );
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, false),
-        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
-    );
+    worktree.set_pull_request(project.pull_requests[0].clone());
+    assert!(matches!(worktree_primary_action(project.id, &worktree),
+        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id));
     worktree.clear_pull_request();
-    assert!(
-        matches!(worktree_primary_action(project.id, &worktree, true),
-        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id)
-    );
+    assert!(matches!(worktree_primary_action(project.id, &worktree),
+        SidebarAction::OpenWorktree { worktree_id, .. } if worktree_id == worktree.id));
 }
 
 #[test]
@@ -12359,6 +12415,46 @@ fn separate_commit_fields_preserve_description_and_clear_together() {
 }
 
 #[test]
+fn source_control_selection_tracks_comparison_changes_for_the_same_file() {
+    let mut state = SidebarState::default();
+    let key = main_key();
+    assert!(state.sync_active_worktree(&panel_model(), &focus_on(&key)));
+    let path = repo_path("src/app.rs");
+    let basis = DiffBasis::MergeBaseToHead {
+        base_ref: ValidatedRefName::parse("refs/remotes/origin/main").unwrap(),
+        head: Oid::parse_object("11".repeat(20)).unwrap(),
+        merge_base: Oid::parse_object("22".repeat(20)).unwrap(),
+    };
+
+    state.select_file(&key, Some((path.as_path(), None)));
+    state.select_file(&key, Some((path.as_path(), Some(&basis))));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection {
+            path: path.clone(),
+            basis: Some(basis)
+        })
+    );
+
+    state.select_file(&key, Some((path.as_path(), Some(&DiffBasis::HeadToIndex))));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection {
+            path: path.clone(),
+            basis: Some(DiffBasis::HeadToIndex)
+        })
+    );
+    state.select_file(&key, Some((path.as_path(), None)));
+    assert_eq!(
+        state.panel_selection,
+        Some(PanelSelection { path, basis: None })
+    );
+
+    state.select_file(&key, None);
+    assert_eq!(state.panel_selection, None);
+}
+
+#[test]
 fn rebinding_scopes_panel_drafts_and_restores_the_worktrees_commit_draft() {
     let model = panel_model();
     let mut state = SidebarState::default();
@@ -12735,7 +12831,7 @@ fn sidebar_worktree_and_tab_headers_share_the_same_separator_baseline() {
             false,
             None,
             &shortcuts,
-            false,
+            WindowCorner::default(),
         ),
         file_panel(&model, &state, width, false),
         git_panel(&model, &state, width, false),
@@ -12901,8 +12997,8 @@ fn a_plain_folder_draws_no_panel_tabs() {
 }
 
 /// The tree/flat choice arranges changed files, so History, a list of
-/// commits, does not offer it; and the one control names the arrangement
-/// it switches to.
+/// commits, does not offer it, nor does a branch not yet compared with its
+/// base; and the one control names the arrangement it switches to.
 #[test]
 fn the_list_mode_toggle_follows_the_view_it_arranges() {
     let renderer = headless_renderer();
@@ -12918,10 +13014,10 @@ fn the_list_mode_toggle_follows_the_view_it_arranges() {
                     _ => None,
                 })
                 .collect();
-        let expected = if tab == ChangesTab::History {
-            Vec::new()
-        } else {
+        let expected = if tab == ChangesTab::Changes {
             vec![FileListMode::Flat]
+        } else {
+            Vec::new()
         };
         assert_eq!(modes, expected, "{tab:?}");
     }
@@ -13001,52 +13097,282 @@ fn the_changes_count_is_distinct_paths() {
     );
 }
 
+/// Pushing is the branch's, in the header beside its name, so committed
+/// work can be pushed from any view and without a commit subject.
 #[test]
 fn uploads_do_not_require_a_commit_subject_and_keep_their_guards() {
     let renderer = headless_renderer();
-    let state = SidebarState::default();
+    let model = panel_model();
+    let mut state = panel_state(&model);
+    let pushes = |actions: &[SidebarAction]| {
+        actions
+            .iter()
+            .any(|action| matches!(action, SidebarAction::Push { .. }))
+    };
+    for tab in ChangesTab::ALL {
+        state.changes_tab = tab;
+        for width in [240.0, 380.0] {
+            let actions = frame_enter_presses_at_width(
+                &renderer,
+                git_panel(&model, &state, width, false),
+                width,
+            );
+            assert!(pushes(&actions), "{tab:?} at {width} offered no push");
+            assert!(
+                !actions
+                    .iter()
+                    .any(|action| matches!(action, SidebarAction::Commit { .. }))
+            );
+        }
+    }
     for width in [240.0, 380.0] {
+        let control = |source: &SourceControlModel, modal_open| {
+            frame_enter_presses_at_width(
+                &renderer,
+                upload_control(source, modal_open).expect("a push or publish control"),
+                width,
+            )
+        };
         let mut source = source_control();
         assert!(source.can_push());
-        let actions =
-            frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width);
-        assert!(
-            actions
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
-        assert!(
-            !actions
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Commit { .. }))
-        );
-        assert!(
-            !frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, true), width)
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
+        assert!(pushes(&control(&source, false)));
+        assert!(!pushes(&control(&source, true)));
         source.set_mutation(Some(MutationKind::Stage));
-        assert!(
-            !frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width)
-                .iter()
-                .any(|action| matches!(action, SidebarAction::Push { .. }))
-        );
+        assert!(!pushes(&control(&source, false)));
         source.set_mutation(None);
         source.upstream = None;
         source.tracking = TrackingState::NoUpstream;
         assert!(source.can_publish());
-        let actions =
-            frame_enter_presses_at_width(&renderer, changes_footer(&state, &source, false), width);
+        let actions = control(&source, false);
         assert!(
             actions
                 .iter()
                 .any(|action| matches!(action, SidebarAction::OpenPublish { .. }))
         );
-        assert!(!actions.iter().any(|action| matches!(
-            action,
-            SidebarAction::Push { .. } | SidebarAction::Commit { .. }
-        )));
+        assert!(!pushes(&actions));
     }
+}
+
+/// A branch with nothing to send draws no push control at all, rather than
+/// one that can never be pressed.
+#[test]
+fn an_up_to_date_branch_offers_no_push() {
+    let mut snapshot = snapshot();
+    snapshot.status.tracking = TrackingState::Compared {
+        upstream: "refs/remotes/origin/main".into(),
+        ahead: 0,
+        behind: 3,
+    };
+    let source = SourceControlModel::ready(main_key(), &snapshot);
+    assert!(source.upstream.is_some());
+    assert!(upload_control(&source, false).is_none());
+}
+
+/// A worktree opens on Branch when it has nothing uncommitted, since an
+/// empty Changes view has nothing to show; it opens on Changes otherwise.
+/// The pick is made once, from the worktree's first read, and never over
+/// a view the user chose.
+#[test]
+fn a_clean_worktree_opens_on_its_branch_once() {
+    let model = panel_model();
+    let mut clean = snapshot();
+    clean.status.entries.clear();
+    let clean = SourceControlModel::ready(main_key(), &clean);
+    let dirty = source_control();
+    assert!(!clean.has_uncommitted_changes());
+    assert!(dirty.has_uncommitted_changes());
+
+    let mut state = panel_state(&model);
+    // Nothing is picked before the read.
+    state.settle_changes_tab(&SourceControlModel::loading(main_key()));
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+    // A change arriving later does not move the view under the reader.
+    state.settle_changes_tab(&dirty);
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+
+    // Another worktree picks again; a read of a worktree not bound picks
+    // nothing.
+    assert!(state.sync_active_worktree(&model, &focus_on(&fix_key())));
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::Changes);
+    let mut fix_clean = snapshot();
+    fix_clean.status.entries.clear();
+    state.settle_changes_tab(&SourceControlModel::ready(fix_key(), &fix_clean));
+    assert_eq!(state.changes_tab(), ChangesTab::Branch);
+
+    // The user's choice stands, and survives the window being restored.
+    let mut state = panel_state(&model);
+    state.apply(&SidebarAction::SetChangesTab {
+        key: main_key(),
+        tab: ChangesTab::History,
+    });
+    state.settle_changes_tab(&clean);
+    assert_eq!(state.changes_tab(), ChangesTab::History);
+    let mut restored = panel_state(&model);
+    restored.restore_view(state.saved_view());
+    restored.settle_changes_tab(&clean);
+    assert_eq!(restored.changes_tab(), ChangesTab::History);
+    // A view restored for another worktree keeps nothing of this one's.
+    let mut elsewhere = panel_state(&model);
+    elsewhere.restore_view(state.saved_view().without_worktree_panel());
+    elsewhere.settle_changes_tab(&clean);
+    assert_eq!(elsewhere.changes_tab(), ChangesTab::Branch);
+    // A view saved before the choice was recorded kept a tab other than
+    // Changes only because it was chosen.
+    let mut saved = state.saved_view();
+    saved.changes_tab_chosen = false;
+    let mut upgraded = panel_state(&model);
+    upgraded.restore_view(saved);
+    upgraded.settle_changes_tab(&clean);
+    assert_eq!(upgraded.changes_tab(), ChangesTab::History);
+
+    // A tab picked from a read is not kept: a worktree opened with changes
+    // and committed since opens on Branch next time.
+    let mut picked = panel_state(&model);
+    picked.settle_changes_tab(&dirty);
+    assert_eq!(picked.changes_tab(), ChangesTab::Changes);
+    let mut next = panel_state(&model);
+    next.restore_view(picked.saved_view());
+    next.settle_changes_tab(&clean);
+    assert_eq!(next.changes_tab(), ChangesTab::Branch);
+}
+
+/// With nothing to commit there is no commit box, and no tree/flat switch
+/// over an empty list. A draft under way keeps its box.
+#[test]
+fn a_clean_worktree_draws_no_commit_box() {
+    let renderer = headless_renderer();
+    let mut model = panel_model();
+    let mut clean = snapshot();
+    clean.status.entries.clear();
+    model.source_control = Some(SourceControlModel::ready(main_key(), &clean));
+    let mut state = panel_state(&model);
+    state.changes_tab = ChangesTab::Changes;
+    let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+    for absent in ["Commit subject", "Commit (Ctrl+Enter)", "Amend"] {
+        assert!(
+            !names.iter().any(|name| name == absent),
+            "{absent} drawn over a clean worktree: {names:?}"
+        );
+    }
+    assert!(
+        !names.iter().any(|name| name.starts_with("View as ")),
+        "{names:?}"
+    );
+    // Committed work is still pushed from here.
+    assert!(
+        names.iter().any(|name| name.starts_with("Push main")),
+        "{names:?}"
+    );
+
+    // The last commit can still be amended, which brings the box back.
+    let actions =
+        frame_enter_presses_at_width(&renderer, git_panel(&model, &state, 380.0, false), 380.0);
+    let amend = SidebarAction::AmendChanged {
+        key: main_key(),
+        amend: true,
+    };
+    assert!(actions.contains(&amend), "{actions:?}");
+    let mut amending = panel_state(&model);
+    amending.changes_tab = ChangesTab::Changes;
+    amending.apply(&amend);
+    let names = accessible_names(&renderer, git_panel(&model, &amending, 380.0, false));
+    assert!(
+        names.iter().any(|name| name == "Commit subject"),
+        "{names:?}"
+    );
+    assert!(
+        !names.iter().any(|name| name == "Amend last commit"),
+        "{names:?}"
+    );
+    // Once the last commit is pushed, amending it would split the branch
+    // from its upstream, so it isn't offered.
+    let mut pushed = clean.clone();
+    pushed.status.tracking = TrackingState::Compared {
+        upstream: "refs/remotes/origin/main".into(),
+        ahead: 0,
+        behind: 0,
+    };
+    let mut pushed_model = panel_model();
+    pushed_model.source_control = Some(SourceControlModel::ready(main_key(), &pushed));
+    let names = accessible_names(&renderer, git_panel(&pushed_model, &state, 380.0, false));
+    assert!(
+        !names.iter().any(|name| name == "Amend last commit"),
+        "{names:?}"
+    );
+
+    state.apply(&SidebarAction::CommitMessageChanged {
+        key: main_key(),
+        message: "a draft".into(),
+    });
+    let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
+    assert!(
+        names.iter().any(|name| name == "Commit subject"),
+        "{names:?}"
+    );
+}
+
+/// Push and publish are the Git views' header controls; Files has no place
+/// for the publish form, so its header draws neither.
+#[test]
+fn the_files_view_draws_no_push() {
+    let renderer = headless_renderer();
+    let model = panel_model();
+    let state = panel_state(&model);
+    let names = accessible_names(
+        &renderer,
+        worktree_sidebar(&model, &state, 380.0, false, WorktreePanel::Files, true),
+    );
+    assert!(
+        !names
+            .iter()
+            .any(|name| name.starts_with("Push ") || name.starts_with("Publish ")),
+        "{names:?}"
+    );
+}
+
+/// A branch that cannot be pushed for a reason the panel would not
+/// otherwise show says why, in place of a control that can't be pressed.
+#[test]
+fn an_unpushable_branch_says_why() {
+    let mut source = source_control();
+    assert_eq!(source.unpushable_reason(), None);
+    source.branch = None;
+    assert!(
+        source
+            .unpushable_reason()
+            .is_some_and(|reason| reason.contains("name"))
+    );
+    source.head_oid = None;
+    assert!(
+        source
+            .unpushable_reason()
+            .is_some_and(|reason| reason.starts_with("HEAD"))
+    );
+    source.detached = true;
+    assert_eq!(source.unpushable_reason(), None);
+    assert!(upload_control(&source, false).is_none());
+
+    let mut unnamed = source_control();
+    unnamed.upstream = None;
+    assert!(unnamed.upstream_reported());
+    assert!(
+        unnamed
+            .unpushable_reason()
+            .is_some_and(|reason| reason.contains("upstream"))
+    );
+    assert!(upload_control(&unnamed, false).is_none());
+
+    // With no remote there is nowhere to publish, and nothing to explain.
+    let mut local = source_control();
+    local.upstream = None;
+    local.tracking = TrackingState::NoUpstream;
+    local.remotes.clear();
+    assert!(upload_control(&local, false).is_none());
+    assert_eq!(local.unpushable_reason(), None);
 }
 
 /// Committing belongs to the working tree, and the working tree is one of

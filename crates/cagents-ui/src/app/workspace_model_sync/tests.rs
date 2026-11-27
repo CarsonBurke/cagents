@@ -4354,6 +4354,131 @@ fn unloaded_spawn_label_is_stable_across_opening_and_all_chrome_surfaces() {
     );
 }
 
+/// #3095: an agent's card, and the pane a window wrote for it, were made
+/// before the provider named the agent's Codex thread. The card learns the
+/// ID once the agent holds it, whether or not the pane does yet; an agent
+/// descriptor that differs in more than the ID changes nothing.
+#[test]
+fn an_existing_agent_card_learns_the_thread_its_agent_names() {
+    use crate::agent_execution::HostedSession;
+    for shown_by_pane in [false, true] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        unnamed.launch.provider = crate::agent::Provider::Codex;
+        unnamed.launch.recipe.program = "codex".into();
+        unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        let proof = unnamed.proof.clone().unwrap();
+        assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+        agent.spec.provider = crate::agent::Provider::Codex;
+        agent.session = Some(HostedSession::Chat(unnamed.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        if shown_by_pane {
+            app.workspace_model.views = vec![crate::workspace_model::views::View {
+                scope: crate::agent_execution::Placement::Channel(destination),
+                revision: 9,
+                panes: vec![pane.clone()],
+                retired: vec![],
+            }];
+        }
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        let card = pane.id;
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        // Only a different conversation's descriptor: the card keeps its own.
+        let mut other = unnamed.clone();
+        other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        other.owned_codex_listener = None;
+        agent.session = Some(HostedSession::Chat(other));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_none());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(unnamed.clone())
+        );
+
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        named.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        app.workspace_model.agents = vec![agent.clone()];
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named.clone()),
+            "the card takes the agent's thread"
+        );
+        drop(app.reconcile_workspace_model());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(named),
+            "a pane without the ID does not take it back"
+        );
+    }
+}
+
+/// #3095: a new card made from a pane that lacks the thread its agent names
+/// takes the agent's ID. A Claude pane without its agent's ID may show a
+/// cleared conversation, so its card keeps the pane's descriptor.
+#[test]
+fn a_new_agent_card_takes_only_the_codex_thread_its_pane_lacks() {
+    use crate::agent_execution::HostedSession;
+    for codex in [true, false] {
+        let (mut app, mut agent, mut pane, destination) = unloaded_chat_label_fixture();
+        let Some(HostedSession::Chat(mut unnamed)) = agent.session.clone() else {
+            unreachable!()
+        };
+        if codex {
+            unnamed.launch.provider = crate::agent::Provider::Codex;
+            unnamed.launch.recipe.program = "codex".into();
+            unnamed.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+            let proof = unnamed.proof.clone().unwrap();
+            assert!(unnamed.claim_owned_codex_listener(Path::new("/run/fixture"), &proof));
+            agent.spec.provider = crate::agent::Provider::Codex;
+        } else {
+            unnamed.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        }
+        unnamed.launch.session_id = None;
+        let mut named = unnamed.clone();
+        named.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        if codex {
+            named.native_continuity = crate::chat::NativeContinuity::Durable {
+                provider_version: "0.157.1".into(),
+            };
+        }
+        assert!(crate::chat::is_confirmed_identity_update(&unnamed, &named));
+        agent.session = Some(HostedSession::Chat(named.clone()));
+        pane.kind = CardKind::Chat(unnamed.clone());
+        app.workspace_model.views = vec![crate::workspace_model::views::View {
+            scope: crate::agent_execution::Placement::Channel(destination),
+            revision: 9,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        }];
+        app.workspace_model.agents = vec![agent.clone()];
+        app.chrome_ui
+            .agent_labels
+            .insert(agent.id, "Agent task".into());
+        assert!(app.adopt_execution_agent(&agent).is_some());
+        assert_eq!(
+            app.card_state(pane.id).unwrap().kind,
+            CardKind::Chat(if codex { named } else { unnamed }),
+            "codex: {codex}"
+        );
+    }
+}
+
 #[test]
 fn unloaded_spawn_label_reaches_the_sidebar_attention_row_without_a_model_change() {
     use crate::agent_execution::{Placement, agent_label};
@@ -5212,7 +5337,7 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
                 false,
                 navigation,
                 &shortcuts,
-                false,
+                crate::sidebar::WindowCorner::default(),
             ),
             Size::new(280.0, 900.0),
             cache,
@@ -5278,9 +5403,10 @@ fn shared_folder_reopen_loads_new_rows_and_preserves_acknowledged_terminal_membe
         let mut renderer = super::super::tests::headless_renderer();
         let navigation = crate::sidebar::NavigationCache::default();
         let directory = tempfile::tempdir().unwrap();
-        let parent = directory.path().canonicalize().unwrap().join("parent");
+        let root = directory.path().canonicalize().unwrap();
+        let parent = root.join("parent");
         let nested = parent.join("nested");
-        let control = directory.path().join("control");
+        let control = root.join("control");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::create_dir(&control).unwrap();
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -7766,4 +7892,151 @@ fn a_skipped_edge_applies_a_held_channel_name_and_projects_its_chrome() {
     drop(app.update(Message::WorkspaceModelObserved(echo)));
     assert_eq!(complete_reconciliations(), before, "the echo skips");
     assert_eq!(channel_title(&app, channel), Some("Parser cache"));
+}
+
+/// A channel named in window A, emptied by a move, and then given back its
+/// automatic name in window B retires when A leaves it (#3403). A's rename
+/// protects the name only until the registry echoes it: before the echo, a
+/// model from before the rename must not make A forget it; after it, a
+/// clear from B is the registry's word, as it would be had A cleared it.
+#[test]
+fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
+    use super::super::chrome_ui::Action as Chrome;
+    use crate::model::ChannelTitleSource;
+    use crate::workspace_model::views::View;
+
+    let (mut a, project, repository) = app_with_project();
+    let (mut b, _, _) = app_with_project();
+    let channel = ChannelId::new();
+    for window in [&mut a, &mut b] {
+        let mut source = local(channel, project, "", 1);
+        source.shared = true;
+        Arc::make_mut(&mut window.durable).channels.push(source);
+        window.channel_ui.sweep = super::super::channel_ui::Sweep::Done;
+    }
+    let mut model = registry(vec![shared(channel, &repository, "", 1)]);
+    let a_requests = intercept_publishes(&mut a);
+    let b_requests = intercept_publishes(&mut b);
+    // Hands each edit a window published to the registry, then the
+    // registry's model to `window`, with the channel's last pane moved out.
+    let deliver = |model: &WorkspaceModel, window: &mut Cagents| {
+        window.workspace_model = model.clone();
+        window.workspace_model.views.push(View::empty(channel));
+        drop(window.absorb_channel_title(channel).unwrap());
+    };
+    let publish = |model: &mut WorkspaceModel, requests: &TestModelRequests| {
+        for edit in drain(requests) {
+            model.sequence += 1;
+            let sequence = model.sequence;
+            model.fold(sequence, &edit);
+        }
+    };
+
+    // A names the channel.
+    drop(a.update_chrome(Chrome::RenameChannel(channel)));
+    drop(a.update_chrome(Chrome::RenameChanged("Named here".into())));
+    drop(a.update_chrome(Chrome::RenameSubmit));
+    assert!(a.channel_is_named(channel));
+    // A model the registry sent before the rename arrives first.
+    deliver(&model.clone(), &mut a);
+    assert!(
+        a.channel_is_named(channel),
+        "a model from before the rename does not undo it"
+    );
+    // The registry applies the rename, refusing any automatic name the
+    // stale model had A offer, and echoes it.
+    publish(&mut model, &a_requests);
+    assert_eq!(model.channels[0].title, "Named here");
+    assert_eq!(model.channels[0].title_source, ChannelTitleSource::Manual);
+    deliver(&model, &mut a);
+    deliver(&model, &mut b);
+    assert!(a.channel_is_named(channel), "the echo keeps the name");
+    assert!(b.channel_is_named(channel));
+
+    // B gives the channel back its automatic name from its sidebar.
+    drop(b.update_chrome(Chrome::RenameChannel(channel)));
+    drop(b.update_chrome(Chrome::RenameChanged(String::new())));
+    drop(b.update_chrome(Chrome::RenameSubmit));
+    publish(&mut model, &b_requests);
+    assert!(model.channels[0].title.is_empty());
+    deliver(&model, &mut a);
+    assert!(a.durable.channels[0].title.is_empty());
+    assert!(!a.channel_is_named(channel), "A takes B's clear");
+
+    drain(&a_requests);
+    a.retire_left_channel(Some(channel));
+    assert!(
+        drain(&a_requests).iter().any(|edit| matches!(
+            edit,
+            ModelEdit::RetireEmptyChannel { home, .. } if home.channel == channel
+        )),
+        "leaving the emptied, unnamed channel retires it"
+    );
+}
+
+/// When another window clears the name before this window sees its own
+/// rename in a model, the rename's receipt ends the wait instead (#3403):
+/// the channel is left unnamed, and the older receipt does not bring the
+/// name back.
+#[test]
+fn a_rename_cleared_before_its_echo_ends_its_wait_at_the_receipt() {
+    use super::super::chrome_ui::Action as Chrome;
+    use crate::workspace_model::views::View;
+
+    let (mut a, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut source = local(channel, project, "", 1);
+    source.shared = true;
+    Arc::make_mut(&mut a.durable).channels.push(source);
+    a.channel_ui.sweep = super::super::channel_ui::Sweep::Done;
+    let mut model = registry(vec![shared(channel, &repository, "", 1)]);
+    let requests = intercept_publishes(&mut a);
+
+    drop(a.update_chrome(Chrome::RenameChannel(channel)));
+    drop(a.update_chrome(Chrome::RenameChanged("Named here".into())));
+    drop(a.update_chrome(Chrome::RenameSubmit));
+    let rename = drain(&requests)
+        .into_iter()
+        .find(|edit| matches!(edit, ModelEdit::RetitleChannel { .. }))
+        .expect("the rename is published");
+    model.sequence += 1;
+    let renamed = model.sequence;
+    model.fold(renamed, &rename);
+    let held = model.clone();
+    // Another window clears the name before the registry sends a model.
+    let clear = ModelEdit::RetitleChannel {
+        id: channel,
+        title: String::new(),
+    };
+    model.sequence += 1;
+    let cleared = model.sequence;
+    model.fold(cleared, &clear);
+
+    a.workspace_model = model.clone();
+    a.workspace_model.views.push(View::empty(channel));
+    a.shared_views.snapshot_sequence = cleared;
+    drop(a.absorb_channel_title(channel).unwrap());
+    assert!(a.durable.channels[0].title.is_empty());
+    assert!(
+        a.channel_is_named(channel),
+        "a model without the rename may predate it"
+    );
+
+    drop(a.apply_workspace_model_update(ModelUpdate::Committed {
+        receipt: EditReceipt {
+            identity: held.identity,
+            sequence: renamed,
+            effects: EditEffects {
+                channels: held.channels.clone(),
+                ..Default::default()
+            },
+        },
+        edit: rename,
+        views: Default::default(),
+    }));
+    assert!(!a.channel_is_named(channel), "the receipt ends the wait");
+    assert!(
+        a.durable.channels[0].title.is_empty(),
+        "the older receipt does not restore the cleared name"
+    );
 }

@@ -20,6 +20,25 @@ pub(super) enum Format {
     Claude,
 }
 
+#[derive(Default)]
+pub(super) struct Edges {
+    pub started: bool,
+    pub claude_transcript: Option<(u64, u64)>,
+    pub claude_baseline: bool,
+    pub claude_input: bool,
+    /// Whether this read's completion follows its latest root Claude input.
+    /// The live census still decides whether a turn started.
+    pub claude_ordered_notice: bool,
+    pub notice: Option<Evidence>,
+}
+
+impl Edges {
+    #[cfg(test)]
+    fn is_none(&self) -> bool {
+        !self.started && self.notice.is_none()
+    }
+}
+
 struct Cursor {
     offset: u64,
     partial: Vec<u8>,
@@ -35,6 +54,7 @@ impl Tails {
     #[cfg(test)]
     fn read(&mut self, file: &File, format: Format) -> io::Result<Option<Evidence>> {
         self.read_for_process(file, format, (1, 1))
+            .map(|edges| edges.notice)
     }
 
     pub fn read_for_process(
@@ -42,10 +62,29 @@ impl Tails {
         file: &File,
         format: Format,
         process: (i32, u64),
-    ) -> io::Result<Option<Evidence>> {
+    ) -> io::Result<Edges> {
+        self.read_tail(file, format, process, false)
+    }
+
+    pub fn read_claude(
+        &mut self,
+        file: &File,
+        process: (i32, u64),
+        previously_absent: bool,
+    ) -> io::Result<Edges> {
+        self.read_tail(file, Format::Claude, process, previously_absent)
+    }
+
+    fn read_tail(
+        &mut self,
+        file: &File,
+        format: Format,
+        process: (i32, u64),
+        previously_absent: bool,
+    ) -> io::Result<Edges> {
         let metadata = file.metadata()?;
         if !metadata.is_file() {
-            return Ok(None);
+            return Ok(Edges::default());
         }
         let key = (process.0, process.1, metadata.dev(), metadata.ino());
         let size = metadata.len();
@@ -53,13 +92,19 @@ impl Tails {
             self.0
                 .retain(|_, cursor| cursor.seen.elapsed() < Duration::from_secs(600));
             if self.0.len() >= MAX_FILES {
-                return Ok(None);
+                return Ok(Edges::default());
             }
         }
+        let mut edges = Edges {
+            claude_transcript: matches!(format, Format::Claude).then_some((key.2, key.3)),
+            ..Edges::default()
+        };
         if self.0.get(&key).is_none_or(|cursor| cursor.offset > size) {
-            // A partial historical line must also be skipped to its newline.
+            // Prior exact absence makes the new file's beginning observable.
+            // An existing history or a truncated cursor still gets a baseline.
+            let read_from_start = previously_absent && !self.0.contains_key(&key);
             let mut last = [b'\n'];
-            if size > 0 {
+            if !read_from_start && size > 0 {
                 file.read_exact_at(&mut last, size - 1)?;
             }
             let eligible = match format {
@@ -69,14 +114,17 @@ impl Tails {
             self.0.insert(
                 key,
                 Cursor {
-                    offset: size,
+                    offset: if read_from_start { 0 } else { size },
                     partial: Vec::new(),
                     skipping: last[0] != b'\n',
                     seen: Instant::now(),
                     eligible,
                 },
             );
-            return Ok(None);
+            edges.claude_baseline = edges.claude_transcript.is_some();
+            if !read_from_start {
+                return Ok(edges);
+            }
         }
         let cursor = self.0.get_mut(&key).expect("cursor was initialized");
         cursor.seen = Instant::now();
@@ -85,11 +133,10 @@ impl Tails {
         }
         if cursor.eligible != Some(true) {
             cursor.offset = size;
-            return Ok(None);
+            return Ok(Edges::default());
         }
         let end = size.min(cursor.offset.saturating_add(MAX_READ));
         let mut buffer = [0; 64 * 1024];
-        let mut evidence = None;
         while cursor.offset < end {
             let length = (end - cursor.offset).min(buffer.len() as u64) as usize;
             file.read_exact_at(&mut buffer[..length], cursor.offset)?;
@@ -110,15 +157,29 @@ impl Tails {
                     }
                 }
                 if complete {
-                    if !cursor.skipping
-                        && let Some((kind, identity)) = boundary(&cursor.partial, format)
-                    {
-                        evidence = Some(Evidence {
-                            key: identity.unwrap_or_else(|| {
-                                format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
-                            }),
-                            kind,
-                        });
+                    if !cursor.skipping {
+                        match boundary(&cursor.partial, format) {
+                            Some(Boundary::Started) => {
+                                edges.started = true;
+                                // A completion for the preceding turn should
+                                // not come back after the next turn cleared it.
+                                edges.notice = None;
+                            }
+                            Some(Boundary::ClaudeInput) => {
+                                edges.claude_input = true;
+                                edges.claude_ordered_notice = false;
+                            }
+                            Some(Boundary::Outcome(kind, identity)) => {
+                                edges.claude_ordered_notice = edges.claude_input;
+                                edges.notice = Some(Evidence {
+                                    key: identity.unwrap_or_else(|| {
+                                        format!("log:{}:{}:{}", key.2, key.3, cursor.offset)
+                                    }),
+                                    kind,
+                                });
+                            }
+                            None => {}
+                        }
                     }
                     cursor.partial.clear();
                     cursor.skipping = false;
@@ -126,7 +187,7 @@ impl Tails {
             }
         }
         cursor.partial.shrink_to(4096);
-        Ok(evidence)
+        Ok(edges)
     }
 }
 
@@ -145,10 +206,20 @@ fn main_codex_rollout(file: &File) -> io::Result<Option<bool>> {
     ))
 }
 
-fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
+enum Boundary {
+    Started,
+    ClaudeInput,
+    Outcome(Kind, Option<String>),
+}
+
+fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
     let markers: &[&[u8]] = match format {
-        Format::Codex => &[b"\"task_complete\"", b"\"turn_aborted\""],
-        Format::Claude => &[b"\"end_turn\""],
+        Format::Codex => &[
+            b"\"task_started\"",
+            b"\"task_complete\"",
+            b"\"turn_aborted\"",
+        ],
+        Format::Claude => &[b"\"end_turn\"", b"\"user\""],
     };
     if !markers
         .iter()
@@ -160,13 +231,17 @@ fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
     match format {
         Format::Codex if value["type"] == "event_msg" => {
             let kind = match value["payload"]["type"].as_str()? {
+                "task_started" => return Some(Boundary::Started),
                 "task_complete" => Kind::Succeeded,
                 "turn_aborted" => Kind::Cancelled,
                 _ => return None,
             };
             // File identity + offset is stable across observer reconnects and
             // distinguishes repeated provider turn IDs in imported history.
-            Some((kind, None))
+            Some(Boundary::Outcome(kind, None))
+        }
+        Format::Claude if value["type"] == "user" && claude_root_input(&value) => {
+            Some(Boundary::ClaudeInput)
         }
         Format::Claude if value["type"] == "assistant" && value["isSidechain"] != true => {
             let kind = match value["message"]["stop_reason"].as_str()? {
@@ -177,10 +252,83 @@ fn boundary(line: &[u8], format: Format) -> Option<(Kind, Option<String>)> {
                 .as_str()
                 .filter(|id| id.len() <= 128)
                 .map(|id| format!("claude:{id}"));
-            Some((kind, identity))
+            Some(Boundary::Outcome(kind, identity))
         }
         _ => None,
     }
+}
+
+fn claude_root_input(value: &serde_json::Value) -> bool {
+    let origin = value.get("origin").filter(|origin| !origin.is_null());
+    if value["message"]["role"] != "user"
+        || value["uuid"].as_str().is_none_or(str::is_empty)
+        || !value["parent_tool_use_id"].is_null()
+        || !value["sourceToolUseID"].is_null()
+        || value["teamName"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+        || origin.is_some_and(|origin| origin["kind"] != "human")
+        || [
+            "isMeta",
+            "isSidechain",
+            "isSynthetic",
+            "isReplay",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|key| value[*key] == true)
+    {
+        return false;
+    }
+    let input_text = |text: &str| {
+        let text = text.trim();
+        !text.is_empty() && (origin.is_some() || !claude_context_only(text))
+    };
+    let content = &value["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return input_text(text);
+    }
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    let mut has_input = false;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                let Some(text) = block["text"].as_str() else {
+                    return false;
+                };
+                has_input |= input_text(text);
+            }
+            Some("image" | "document") if block["source"].is_object() => has_input = true,
+            _ => return false,
+        }
+    }
+    has_input
+}
+
+fn claude_context_only(mut text: &str) -> bool {
+    // Only a whole context envelope is a note. Preserve human text after
+    // the envelope, including when Claude puts both in one text block.
+    const WRAPPERS: &[(&str, &str)] = &[
+        ("<system-reminder>", "</system-reminder>"),
+        ("<task-notification>", "</task-notification>"),
+        ("<fork-boilerplate>", "</fork-boilerplate>"),
+        ("<local-command-caveat>", "</local-command-caveat>"),
+        ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
+    ];
+    while let Some((rest, close)) = WRAPPERS
+        .iter()
+        .find_map(|&(open, close)| text.strip_prefix(open).map(|rest| (rest, close)))
+    {
+        let Some((_, trailing)) = rest.split_once(close) else {
+            return false;
+        };
+        text = trailing.trim_start();
+    }
+    text.is_empty() || crate::chat::protocol::claude::model_only_note(text)
 }
 
 #[cfg(test)]
@@ -218,6 +366,44 @@ mod tests {
         assert!(
             Tails::default()
                 .read(&file, Format::Codex)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn codex_reports_just_appended_main_turn_starts_without_replaying_old_outcomes() {
+        let mut file = tempfile::tempfile().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"session_meta","payload":{{"source":"cli"}}}}"#
+        )
+        .unwrap();
+        let start = r#"{"type":"event_msg","payload":{"type":"task_started"}}"#;
+        let finish = r#"{"type":"event_msg","payload":{"type":"task_complete"}}"#;
+        writeln!(file, "{start}").unwrap();
+        let mut tails = Tails::default();
+        assert!(
+            tails
+                .read_for_process(&file, Format::Codex, (1, 1))
+                .unwrap()
+                .is_none()
+        );
+        writeln!(file, "{finish}\n{start}").unwrap();
+        let edges = tails
+            .read_for_process(&file, Format::Codex, (1, 1))
+            .unwrap();
+        assert!(edges.started);
+        assert!(edges.notice.is_none());
+        writeln!(file, "{start}\n{finish}").unwrap();
+        let edges = tails
+            .read_for_process(&file, Format::Codex, (1, 1))
+            .unwrap();
+        assert!(edges.started);
+        assert_eq!(edges.notice.unwrap().kind, Kind::Succeeded);
+        assert!(
+            tails
+                .read_for_process(&file, Format::Codex, (1, 1))
                 .unwrap()
                 .is_none()
         );
@@ -316,6 +502,7 @@ mod tests {
             tails
                 .read_for_process(&file, Format::Claude, (7, 11))
                 .unwrap()
+                .notice
                 .is_some()
         );
     }

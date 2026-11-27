@@ -197,7 +197,7 @@ exec /usr/bin/install "$@"
     let builds = fs::read_to_string(root.path().join("builds")).unwrap();
     assert!(builds.contains("build --locked --release --no-default-features --bin cagents --message-format=json-render-diagnostics\n"));
     assert!(builds.contains(
-        "build --locked --release --no-default-features --features host --bin cagentsd --message-format=json-render-diagnostics\n"
+        "build --locked --release --no-default-features -p cagents-host --bin cagentsd --message-format=json-render-diagnostics\n"
     ));
     assert!(builds.contains(
         "build --locked --release --package ceditor --message-format=json-render-diagnostics\n"

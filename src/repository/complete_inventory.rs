@@ -35,7 +35,7 @@ pub(super) fn require_complete_inventory(output: &ProcessOutput) -> Result<(), R
     Ok(())
 }
 
-pub(super) fn resolved_git_executable(program: &Path) -> Result<PathBuf, String> {
+pub(crate) fn resolved_git_executable(program: &Path) -> Result<PathBuf, String> {
     if program.is_absolute() || program.components().count() > 1 {
         return fs::canonicalize(program).map_err(|error| error.to_string());
     }
@@ -46,7 +46,7 @@ pub(super) fn resolved_git_executable(program: &Path) -> Result<PathBuf, String>
                 metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
             })
         })
-        .ok_or_else(|| "Git executable could not be resolved before reconciliation".into())
+        .ok_or_else(|| "Git executable could not be resolved".into())
         .and_then(|path| fs::canonicalize(path).map_err(|error| error.to_string()))
 }
 

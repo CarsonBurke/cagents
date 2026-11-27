@@ -464,11 +464,9 @@ impl Runtime {
                         .font(iced::Font::MONOSPACE)
                         .width(Length::Fill)
                         .into(),
-                    design::caption(detail.clone())
+                    crate::ui_controls::FadeText::caption(detail.clone())
+                        .lines(2)
                         .width(Length::Fill)
-                        .ellipsize(iced::widget::text::Ellipsize::End(
-                            iced::advanced::text::EllipsizeHeightLimit::Lines(2),
-                        ))
                         .into(),
                 ];
                 if let chat::ChangeKind::Renamed { from } = &file.kind {

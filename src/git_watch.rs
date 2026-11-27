@@ -1217,8 +1217,8 @@ impl Monitor {
         })
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn start_for_test<W: Watcher + Send + 'static>(
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn start_for_test<W: Watcher + Send + 'static>(
         wake: impl Fn() + Send + Sync + 'static,
         create: impl FnMut(Box<dyn FnMut(notify::Result<Event>) + Send>) -> notify::Result<W>
         + Send
@@ -1227,8 +1227,8 @@ impl Monitor {
         Self::with_watcher(wake, create)
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn pending_coverage_for_test(&self, id: ProjectId) -> Option<bool> {
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn pending_coverage_for_test(&self, id: ProjectId) -> Option<bool> {
         self.pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1686,6 +1686,12 @@ mod magic {
     pub const VBOXSF: u64 = 0x786f_4256;
     /// User-mode Linux's view of its host.
     pub const HOSTFS: u64 = 0x00c0_ffee;
+}
+
+/// Whether native notifications can cover external writes to this directory.
+#[cfg(feature = "host")]
+pub fn reliable_filesystem_events(path: &Path) -> bool {
+    !Filesystem::of(path).is_ok_and(Filesystem::omits_events)
 }
 
 impl Filesystem {
@@ -3823,6 +3829,7 @@ mod tests {
 
     /// Voluntary context switches, the times a thread slept and was woken,
     /// of this process's native watcher threads, by thread ID.
+    #[cfg(target_os = "linux")]
     fn watcher_thread_switches() -> BTreeMap<String, u64> {
         std::fs::read_dir("/proc/self/task")
             .unwrap()
@@ -3845,6 +3852,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")] // Measures inotify worker wakeups through procfs.
     fn reading_watched_files_does_not_wake_the_watcher() {
         let directory = tempfile::tempdir().unwrap();
         let mut project = project(directory.path());

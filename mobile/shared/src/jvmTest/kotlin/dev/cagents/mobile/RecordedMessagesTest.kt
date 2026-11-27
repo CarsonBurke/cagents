@@ -6,6 +6,8 @@ import dev.cagents.mobile.protocol.Call
 import dev.cagents.mobile.protocol.ChangeKind
 import dev.cagents.mobile.protocol.CommandAction
 import dev.cagents.mobile.protocol.DeliveryKind
+import dev.cagents.mobile.protocol.DetailKind
+import dev.cagents.mobile.protocol.ImageAttachment
 import dev.cagents.mobile.protocol.ErrorCode
 import dev.cagents.mobile.protocol.Event
 import dev.cagents.mobile.protocol.FieldAnswer
@@ -30,6 +32,7 @@ import kotlinx.serialization.json.long
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
@@ -111,10 +114,32 @@ class RecordedMessagesTest {
         assertEquals("Usage limit reached", session.failure)
         assertEquals(1700000000000, session.activeAt)
         assertTrue(session.watchable)
+        assertFalse(session.terminalWatchable)
         val agent = assertNotNull(session.agent)
         assertEquals(AgentOwner.Session, agent.owner)
         assertEquals(RunState.Running, agent.run)
         assertEquals(session.lineage, agent.ownerLineage)
+    }
+
+    @Test
+    fun terminalWatchesHaveTheirOwnCapabilityAndEvents() {
+        val terminal = event<Event.Sessions>("event terminal session").sessions.single()
+        assertEquals(Surface.Terminal, terminal.surface)
+        assertFalse(terminal.watchable)
+        assertTrue(terminal.terminalWatchable)
+
+        val screen = event<Event.TerminalScreenUpdated>("event terminal_screen").screen
+        assertEquals(terminal.id, screen.session)
+        assertEquals(Activity.Working, screen.activity)
+        assertEquals(1700000000000L, screen.lastOutputAt)
+        assertEquals(80, screen.columns)
+        assertEquals(2, screen.rows)
+        assertEquals(listOf("Running tests", "  3 passed"), screen.lines)
+        assertFalse(screen.clipped)
+
+        val ending = event<Event.TerminalWatchEnded>("event terminal_ended").ending
+        assertEquals(terminal.id, ending.session)
+        assertEquals("The terminal is no longer running this agent.", ending.message)
     }
 
     @Test
@@ -125,6 +150,12 @@ class RecordedMessagesTest {
         assertEquals("Agent needs your attention", notice.title)
         assertEquals("Run cargo test?", notice.preview)
         assertEquals("Fix the build", notice.conversation)
+    }
+
+    @Test
+    fun notificationsCarryTheDaemonsAsksClassification() {
+        val notices = event<Event.Notifications>("event notifications asks").notices
+        assertEquals(listOf(true, false), notices.map { it.asks })
     }
 
     @Test
@@ -200,6 +231,22 @@ class RecordedMessagesTest {
     }
 
     @Test
+    fun detailPagesKeepTheRequestIdAndPayload() {
+        val old = assertIs<ServerLine.WelcomeLine>(server("welcome")).welcome
+        assertEquals(false, old.conversationDetails)
+        val current = assertIs<ServerLine.WelcomeLine>(server("welcome conversation details")).welcome
+        assertTrue(current.conversationDetails)
+        val output = assertIs<ServerLine.Ok>(server("ok output page"))
+        assertEquals(20L, output.id)
+        assertEquals("Done\n", output.page?.text)
+        assertEquals("next", output.page?.next)
+        val diff = assertIs<ServerLine.Ok>(server("ok diff page"))
+        assertEquals("-old\n+new\n", diff.page?.patches?.single()?.text)
+        val image = assertIs<ServerLine.Ok>(server("ok image page"))
+        assertEquals("aW1hZ2U=", image.page?.base64)
+    }
+
+    @Test
     fun endings() {
         val ended = event<Event.ConversationEnded>("event conversation_ended")
         assertEquals("The conversation closed.", ended.message)
@@ -218,8 +265,16 @@ class RecordedMessagesTest {
             "notification.acknowledge" to Call.AcknowledgeNotification("0b0e7a52-6f6b-4f7c-8a35-5c9f3f0e2d11"),
             "conversation.watch" to Call.WatchConversation(session),
             "conversation.unwatch" to Call.UnwatchConversation(session),
+            "terminal.watch" to Call.WatchTerminal(session),
+            "terminal.unwatch" to Call.UnwatchTerminal(session),
+            "conversation.read_checkpoint" to Call.RefreshReadCheckpoint(session),
+            "conversation.read" to Call.ReadConversation(session, "1d79da8a-cd02-454c-a74e-411012875f33"),
             "conversation.load_earlier" to Call.LoadEarlier(session),
             "conversation.send" to Call.Send(session, "Run the tests", SendMode.Steer),
+            "conversation.output" to Call.ReadDetail(session, "c", DetailKind.Output),
+            "conversation.diff" to Call.ReadDetail(session, "edit", DetailKind.Diff, "src/lib.rs", "next"),
+            "conversation.image" to Call.ReadDetail(session, "image", DetailKind.Image),
+            "conversation.send_image" to Call.SendImage(session, "Look here", SendMode.Send, ImageAttachment("image.png", "aW1hZ2U=")),
             "conversation.interrupt" to Call.Interrupt(session),
             "conversation.answer" to Call.Answer(session, "r1", "allow", listOf(FieldAnswer("reason", listOf("ci")))),
         )

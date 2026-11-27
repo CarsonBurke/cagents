@@ -1,6 +1,10 @@
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
+#[cfg(target_os = "linux")]
 use crate::flock::process_owns_lock as process_owns_slot;
+use crate::pinned_process::PinnedProcess;
+#[cfg(all(target_os = "macos", feature = "host"))]
+use std::time::Instant;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -27,16 +31,20 @@ use std::{
 };
 
 mod daemon_admission;
+#[cfg(target_os = "macos")]
+pub(crate) mod ui_startup;
+#[cfg(all(target_os = "macos", feature = "ui"))]
+pub use ui_startup::connect_ui_launcher;
+pub mod state_claim;
 #[doc(hidden)]
 pub mod ui_options;
 #[cfg(any(feature = "host", test))]
 pub(crate) use daemon_admission::AdmissionFence;
+pub use daemon_admission::DAEMON_FENCE_ENV;
 #[cfg(feature = "host")]
-pub(crate) use daemon_admission::DaemonAdmissionGuard;
+pub use daemon_admission::DaemonAdmissionGuard;
 pub use daemon_admission::DaemonStillStarting;
-pub(crate) use daemon_admission::{
-    DAEMON_FENCE_ENV, LaunchFence, daemon_launch_is_updating, inherit_daemon_fence,
-};
+pub(crate) use daemon_admission::{LaunchFence, daemon_launch_is_updating, inherit_daemon_fence};
 
 use directories::ProjectDirs;
 use thiserror::Error;
@@ -54,7 +62,11 @@ const ACTIVATION_SOCKET_FILE: &str = if IS_DEVELOPMENT {
 const ACTIVATION_IO_TIMEOUT: Duration = Duration::from_secs(1);
 const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
+#[cfg(feature = "ui")]
+const PRIVATE_SOCKET_MODE: libc::mode_t = 0o600;
+#[cfg(target_os = "linux")]
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
+#[cfg(target_os = "linux")]
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
 /// The modes `cagents-ui` spawns itself with, each its first argument. None of
 /// them takes the window lease or opens the session store.
@@ -63,6 +75,7 @@ pub const STARTUP_ERROR_MODE: &str = "--startup-error";
 pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
 pub const STARTUP_WAIT_MODE: &str = "--startup-wait";
 pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+#[cfg(target_os = "linux")]
 const HELPER_MODES: [&str; 5] = [
     CONFIRM_DAEMON_STOP_MODE,
     STARTUP_ERROR_MODE,
@@ -76,7 +89,16 @@ const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` but without `integrated-browser` would claim them while running the
 // browserless code paths, so refuse the combination instead of shipping an
 // identity the binary cannot honour.
-#[cfg(all(feature = "ui", feature = "full", not(feature = "integrated-browser")))]
+//
+// macOS ships one product, `full`, whose UI has no integrated browser yet and
+// opens saved browser cards in the system browser: there is no browserless
+// peer package for it to be confused with.
+#[cfg(all(
+    target_os = "linux",
+    feature = "ui",
+    feature = "full",
+    not(feature = "integrated-browser")
+))]
 compile_error!(
     "a `full` UI must select `integrated-browser`; build the browserless UI with \
      --no-default-features --features ui"
@@ -184,14 +206,71 @@ pub fn validate_window_slot(slot: &str) -> io::Result<()> {
 }
 
 pub fn runtime_directory() -> io::Result<PathBuf> {
-    let path = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not absolute")
-        })?;
+    let path = runtime_base()?.ok_or_else(|| {
+        io::Error::new(io::ErrorKind::NotFound, "XDG_RUNTIME_DIR is not absolute")
+    })?;
     require_owned_runtime_directory(&path)?;
     Ok(path)
+}
+
+/// The per-user directory that holds sockets, leases and locks, or `None`
+/// when the session names none.
+///
+/// An absolute `XDG_RUNTIME_DIR` always wins. Linux sessions provide one.
+/// Darwin has no session runtime directory, so it uses a private `cagents`
+/// directory in the user's persistent Darwin directory, creating it on first
+/// use. The temporary directories there and `/tmp` are unsuitable: macOS
+/// cleans files from them that it has not seen used, which would unlink a lock
+/// a long-running daemon still holds.
+pub(crate) fn runtime_base() -> io::Result<Option<PathBuf>> {
+    if let Some(path) = env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|path| path.is_absolute())
+    {
+        return Ok(Some(path));
+    }
+    #[cfg(target_os = "linux")]
+    return Ok(None);
+    #[cfg(target_os = "macos")]
+    darwin_runtime_base().map(Some)
+}
+
+#[cfg(target_os = "macos")]
+pub(crate) fn darwin_runtime_base() -> io::Result<PathBuf> {
+    use std::os::unix::{ffi::OsStringExt, fs::DirBuilderExt};
+    static BASE: OnceLock<PathBuf> = OnceLock::new();
+    if let Some(base) = BASE.get() {
+        return Ok(base.clone());
+    }
+    let mut buffer = vec![0_u8; libc::PATH_MAX as usize];
+    // SAFETY: confstr writes at most `buffer.len()` bytes, NUL included.
+    let length = unsafe {
+        libc::confstr(
+            libc::_CS_DARWIN_USER_DIR,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+        )
+    };
+    if length == 0 || length > buffer.len() {
+        return Err(io::Error::other(
+            "the per-user Darwin directory is unavailable",
+        ));
+    }
+    buffer.truncate(length - 1);
+    let base = PathBuf::from(std::ffi::OsString::from_vec(buffer)).join("cagents");
+    match fs::DirBuilder::new().mode(0o700).create(&base) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(error),
+    }
+    let metadata = fs::symlink_metadata(&base)?;
+    if !metadata.is_dir() || metadata.uid() != current_uid() || metadata.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("{} must be a private directory you own", base.display()),
+        ));
+    }
+    Ok(BASE.get_or_init(|| base).clone())
 }
 
 fn slot_lock_name(slot: &str) -> String {
@@ -244,7 +323,7 @@ impl OwnedLock {
 
     /// Hand this description to a process that already inherited its own copy.
     /// Closing the returned file preserves that recipient's lock ownership.
-    pub(crate) fn into_file(mut self) -> File {
+    pub fn into_file(mut self) -> File {
         self.0.take().expect("owned lock file")
     }
 }
@@ -258,6 +337,10 @@ impl Drop for OwnedLock {
 }
 
 pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
+    owned_file_lock(open_owned_lock(path)?, operation)
+}
+
+fn open_owned_lock(path: &Path) -> io::Result<File> {
     let lock = OpenOptions::new()
         .create(true)
         .read(true)
@@ -274,12 +357,12 @@ pub(crate) fn owned_lock(path: &Path, operation: i32) -> io::Result<OwnedLock> {
         ));
     }
     lock.set_permissions(fs::Permissions::from_mode(PRIVATE_FILE_MODE))?;
-    owned_file_lock(lock, operation)
+    Ok(lock)
 }
 
 /// Acquire the existing drop-safe advisory lock on a file a confined storage
 /// caller has already opened and validated through its retained directory.
-pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
+pub fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLock> {
     // SAFETY: the descriptor remains owned by the returned file.
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
@@ -319,7 +402,6 @@ fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 's
 
 /// Observe an existing private lock without creating, repairing, or retaining
 /// it. This is a point-in-time status observation, never launch admission.
-#[cfg(feature = "ui")]
 pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
     let named = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -365,6 +447,9 @@ pub(crate) fn update_fence_held() -> io::Result<bool> {
 /// the one shared daemon. The old global lock remains held shared, so older
 /// exclusive-lease binaries cannot open any of these stores concurrently.
 pub struct WindowLease {
+    // Fields drop in order: the saved window's claim goes before the slot
+    // lock it records.
+    _state: Option<state_claim::StateClaim>,
     _legacy_fence: OwnedLock,
     _slot: OwnedLock,
 }
@@ -386,8 +471,36 @@ impl WindowLease {
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
     ) -> io::Result<Self> {
+        #[cfg(target_os = "macos")]
+        let publication = crate::install_guard::admit_darwin_state_access()?;
+        #[cfg(target_os = "macos")]
+        let require_state = publication.is_some();
+        #[cfg(not(target_os = "macos"))]
+        let require_state = false;
+        // A window here would need a daemon here, which would refuse to serve
+        // data a daemon in another runtime directory serves. Say so first:
+        // that daemon's session, not this window, is what is in the way.
+        if !crate::device::is_remote() {
+            match state_claim::daemon_served_elsewhere(&daemon_lock_in(&runtime_directory()?)) {
+                Ok(None) => {}
+                Ok(Some(refusal)) => return Err(io::Error::other(refusal)),
+                Err(error) => {
+                    tracing::warn!(%error, "could not read which daemon serves this instance's data");
+                }
+            }
+        }
+        let claims = match state_claim::claims_directory() {
+            Ok(claims) => Some(claims),
+            Err(error) if require_state => return Err(error),
+            Err(error) => {
+                tracing::warn!(%error, "window claims are unavailable");
+                None
+            }
+        };
         let (lease, slot) = Self::acquire_waiting_in(
             &runtime_directory()?,
+            claims.as_deref(),
+            require_state,
             new_window,
             requested,
             daemon_admission::admission_wait_timeout(),
@@ -414,11 +527,23 @@ impl WindowLease {
         new_window: bool,
         requested: Option<&str>,
     ) -> io::Result<(Self, String)> {
-        Self::acquire_waiting_in(runtime, new_window, requested, Duration::ZERO, &mut |_| {})
+        Self::acquire_waiting_in(
+            runtime,
+            None,
+            false,
+            new_window,
+            requested,
+            Duration::ZERO,
+            &mut |_| {},
+        )
     }
 
+    /// `claims` is where windows claim their saved state, so that a window in
+    /// another runtime directory cannot open the same saved window.
     fn acquire_waiting_in(
         runtime: &Path,
+        claims: Option<&Path>,
+        require_state: bool,
         new_window: bool,
         requested: Option<&str>,
         admission_timeout: Duration,
@@ -439,6 +564,9 @@ impl WindowLease {
         if let Some(slot) = requested {
             validate_window_slot(slot)?;
         }
+        if let Some(claims) = claims {
+            state_claim::prepare_claim_directory(claims, state_claim::Claimant::Window)?;
+        }
         for index in 1..=1024 {
             let slot = requested.map(str::to_owned).unwrap_or_else(|| {
                 if !new_window {
@@ -452,9 +580,43 @@ impl WindowLease {
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
                 Ok(mut lock) => {
+                    let state = match claims {
+                        Some(claims) => match state_claim::claim_window_state_in(
+                            claims,
+                            &slot,
+                            &runtime.join(slot_lock_name(&slot)),
+                        ) {
+                            Ok(claim) => Some(claim),
+                            // Another session has this saved window open; a
+                            // new window takes the next free one instead.
+                            Err(error)
+                                if new_window
+                                    && requested.is_none()
+                                    && state_claim::state_in_use(&error).is_some_and(
+                                        state_claim::StateInUse::can_try_another_slot,
+                                    ) =>
+                            {
+                                continue;
+                            }
+                            Err(error)
+                                if require_state || state_claim::state_in_use(&error).is_some() =>
+                            {
+                                return Err(error);
+                            }
+                            // A claim that can't be taken for another reason,
+                            // such as a read-only data directory, leaves the
+                            // window as it was before claims.
+                            Err(error) => {
+                                tracing::warn!(%error, slot, "could not claim this window's saved state");
+                                None
+                            }
+                        },
+                        None => None,
+                    };
                     daemon_admission::publish_capability(lock.file_mut())?;
                     return Ok((
                         Self {
+                            _state: state,
                             _legacy_fence: legacy,
                             _slot: lock,
                         },
@@ -551,14 +713,20 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
                 "saved conversation inventory exceeds the recovery limit",
             ));
         }
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}")?;
-        stdout.flush()?;
+        write_ui_launch_line(
+            &format!("{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}"),
+            false,
+        )?;
     }
     Ok(())
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
+#[cfg(all(target_os = "macos", any(feature = "ui", feature = "host")))]
+const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(all(target_os = "macos", feature = "ui"))]
+static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
+    (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
 /// Records that the UI's main window is on screen. A failure after this ends
 /// a running window, not its startup.
@@ -583,6 +751,14 @@ pub fn report_ui_startup_with_pane_notes(notes: &str) -> io::Result<()> {
 fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if result.is_ok() {
+        #[cfg(all(target_os = "macos", feature = "ui"))]
+        {
+            let (ready, changed) = &UI_RESTORATION_READY;
+            *ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+            changed.notify_all();
+        }
         crate::diagnostics::record(crate::diagnostics::Event::Ready);
     }
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
@@ -596,11 +772,20 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
             Ok(_) => UI_LAUNCH_READY.to_owned(),
             Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
         };
-        let mut stdout = io::stdout().lock();
-        writeln!(stdout, "{message}")?;
-        stdout.flush()?;
+        write_ui_launch_line(&message, true)?;
     }
     Ok(())
+}
+
+fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
+    #[cfg(all(target_os = "macos", feature = "ui"))]
+    if let Some(result) = ui_startup::write_reply(message, final_response) {
+        return result;
+    }
+    let _ = final_response;
+    let mut stdout = io::stdout().lock();
+    writeln!(stdout, "{message}")?;
+    stdout.flush()
 }
 
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
@@ -618,6 +803,11 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         crate::diagnostics::initialize(product, version);
     }
     crate::diagnostics::record(crate::diagnostics::Event::Startup);
+    // The default hook prints a backtrace only when RUST_BACKTRACE asks for
+    // one. A local debug capture is the record of a crash that may not
+    // happen again, so it gets one unless RUST_BACKTRACE was set either way.
+    // Read once, as the standard library reads it.
+    let force_backtrace = env::var_os("RUST_BACKTRACE").is_none();
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic| {
         let Some(recovered) = crate::runtime_state::begin_panic_report() else {
@@ -627,7 +817,22 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
         // Payloads/backtraces can contain secrets. Only a user-requested local
         // debug capture invokes the raw default hook.
         if crate::diagnostics::local_debug() {
-            previous(panic);
+            if force_backtrace {
+                // Written whole, in place of the default hook's report, so a
+                // panic on another thread cannot land between this message
+                // and its backtrace, and no "run with RUST_BACKTRACE" note
+                // contradicts it. Symbolized before stderr is locked, so
+                // tracing on other threads does not wait for it.
+                let thread = std::thread::current();
+                let report = format!(
+                    "\nthread '{}' {panic}\nstack backtrace:\n{}\n",
+                    thread.name().unwrap_or("<unnamed>"),
+                    std::backtrace::Backtrace::force_capture(),
+                );
+                let _ = io::stderr().lock().write_all(report.as_bytes());
+            } else {
+                previous(panic);
+            }
         }
         crate::runtime_state::finish_panic_report();
     }));
@@ -874,24 +1079,26 @@ pub(crate) fn verified_running_editors() -> io::Result<Vec<VerifiedWindow>> {
     verified_editors_in(&runtime_directory()?, Path::new("/proc"))
 }
 
+/// Whether an executable path names the shipped independent editor. Linux
+/// marks one whose image was replaced as ` (deleted)`.
+fn is_editor(executable: &Path) -> bool {
+    matches!(
+        executable.file_name().and_then(|name| name.to_str()),
+        Some(
+            "ceditor"
+                | "ceditor (deleted)"
+                | "ceditor-development"
+                | "ceditor-development (deleted)"
+        )
+    )
+}
+
 pub(crate) fn editor_executable(
     process: &Path,
     executable: io::Result<PathBuf>,
 ) -> io::Result<Option<PathBuf>> {
     match executable {
-        Ok(executable) => {
-            let name = executable.file_name().and_then(|name| name.to_str());
-            Ok(matches!(
-                name,
-                Some(
-                    "ceditor"
-                        | "ceditor (deleted)"
-                        | "ceditor-development"
-                        | "ceditor-development (deleted)"
-                )
-            )
-            .then_some(executable))
-        }
+        Ok(executable) => Ok(is_editor(&executable).then_some(executable)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
             // Shipped ceditor keeps its executable-derived main-thread comm;
@@ -923,9 +1130,8 @@ pub(crate) fn editor_executable(
     }
 }
 
-#[cfg(any(feature = "host", test))]
+#[cfg(all(target_os = "linux", any(feature = "host", test)))]
 fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
-    use std::os::fd::FromRawFd;
     let mut editors = Vec::new();
     for entry in fs::read_dir(proc_root)? {
         let entry = entry?;
@@ -949,36 +1155,15 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         else {
             continue;
         };
-        let lease_path = editor_ready_path(runtime, pid);
-        let lease = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lease_path)
-            .map_err(|_| {
-                io::Error::other(
-                    "close older or unready independent editors before removing worktrees",
-                )
-            })?;
-        let expected = lease.metadata()?;
-        if !expected.is_file()
-            || expected.uid() != current_uid()
-            || expected.nlink() != 1
-            || !process_owns_slot(&process, pid, &expected)?
-        {
+        let (lease_path, lease, expected) = open_editor_lease(runtime, pid)?;
+        if !process_owns_slot(&process, pid, &expected)? {
             return Err(io::Error::other(
                 "independent editor protection cannot be authenticated",
             ));
         }
-        // SAFETY: pidfd_open returns a fresh descriptor or -1.
-        let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-        if raw == -1 {
-            return Err(io::Error::last_os_error());
-        }
-        // SAFETY: ownership of the successful descriptor is transferred.
-        let pidfd = unsafe { File::from_raw_fd(raw as i32) };
         let editor = VerifiedWindow {
             executable,
-            pidfd,
+            process: PinnedProcess::open(pid)?,
             pid,
             lease,
             lease_path,
@@ -989,6 +1174,74 @@ fn verified_editors_in(runtime: &Path, proc_root: &Path) -> io::Result<Vec<Verif
         editors.push(editor);
     }
     Ok(editors)
+}
+
+/// Darwin has no `/proc` to walk. Its census is every process the user runs,
+/// each pinned before its executable and descriptors are read, so a reused pid
+/// is never taken for an editor. Ownership is the pinned process holding its
+/// exact ready lease open, as [`owns_lease`] proves on Darwin.
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn verified_editors_in(runtime: &Path, _proc_root: &Path) -> io::Result<Vec<VerifiedWindow>> {
+    let gone = |error: &io::Error| error.kind() == io::ErrorKind::NotFound;
+    let mut editors = Vec::new();
+    for pid in crate::process::table::list(current_uid())? {
+        let process = match PinnedProcess::open(pid) {
+            Ok(process) => process,
+            Err(error) if gone(&error) || error.kind() == io::ErrorKind::InvalidInput => continue,
+            Err(error) => return Err(error),
+        };
+        let executable = match process.uid().and_then(|uid| {
+            if uid == current_uid() {
+                process.executable().map(Some)
+            } else {
+                Ok(None)
+            }
+        }) {
+            Ok(Some(executable)) if is_editor(&executable) => executable,
+            Ok(_) => continue,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let (lease_path, lease, expected) = open_editor_lease(runtime, pid)?;
+        if !owns_lease(Path::new("/proc"), &process, &lease, &expected)? {
+            return Err(io::Error::other(
+                "independent editor protection cannot be authenticated",
+            ));
+        }
+        let editor = VerifiedWindow {
+            executable,
+            process,
+            pid,
+            lease,
+            lease_path,
+        };
+        if !editor.still_owns_lease()? {
+            return Err(io::Error::other("independent editor ownership changed"));
+        }
+        editors.push(editor);
+    }
+    Ok(editors)
+}
+
+/// Opens the ready lease an editor process must hold, refusing one that is
+/// missing or is not a private regular file with a single name.
+#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+fn open_editor_lease(runtime: &Path, pid: u32) -> io::Result<(PathBuf, File, fs::Metadata)> {
+    let lease_path = editor_ready_path(runtime, pid);
+    let lease = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&lease_path)
+        .map_err(|_| {
+            io::Error::other("close older or unready independent editors before removing worktrees")
+        })?;
+    let expected = lease.metadata()?;
+    if !expected.is_file() || expected.uid() != current_uid() || expected.nlink() != 1 {
+        return Err(io::Error::other(
+            "independent editor protection cannot be authenticated",
+        ));
+    }
+    Ok((lease_path, lease, expected))
 }
 
 pub(crate) fn window_is_initialized() -> bool {
@@ -1009,9 +1262,9 @@ pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
     AdmissionFence::acquire()
 }
 
-pub(crate) struct VerifiedWindow {
+pub struct VerifiedWindow {
     pub executable: PathBuf,
-    pidfd: File,
+    process: PinnedProcess,
     pid: u32,
     lease: File,
     lease_path: PathBuf,
@@ -1034,16 +1287,21 @@ impl VerifiedWindow {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
+        let marker = match OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&marker)
+        {
+            Ok(marker) => marker,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
         Ok(self.still_owns_lease()?
-            && process_owns_slot(
-                &Path::new("/proc").join(self.pid.to_string()),
-                self.pid,
-                &metadata,
-            )?)
+            && owns_lease(Path::new("/proc"), &self.process, &marker, &metadata)?)
     }
 
     #[cfg(any(feature = "host", test))]
-    pub(crate) fn pid(&self) -> u32 {
+    pub fn pid(&self) -> u32 {
         self.pid
     }
     pub fn still_owns_lease(&self) -> io::Result<bool> {
@@ -1053,76 +1311,62 @@ impl VerifiedWindow {
             && actual.dev() == expected.dev()
             && actual.ino() == expected.ino()
             && self.is_alive()
-            && process_owns_slot(
-                &Path::new("/proc").join(self.pid.to_string()),
-                self.pid,
-                &expected,
-            )?
-            && fs::read_link(Path::new("/proc").join(self.pid.to_string()).join("exe"))?
-                == self.executable)
+            && owns_lease(Path::new("/proc"), &self.process, &self.lease, &expected)?
+            && self.process.executable()? == self.executable)
     }
 
     fn is_alive(&self) -> bool {
-        let mut poll = libc::pollfd {
-            fd: self.pidfd.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll points to one initialized descriptor and does not block.
-        unsafe { libc::poll(&mut poll, 1, 0) == 0 }
+        matches!(self.process.exited(), Ok(false))
     }
 
     /// Signal exactly the pinned process; a reused PID is never addressed.
     /// False means it had already exited.
     fn signal(&self, signal: libc::c_int) -> io::Result<bool> {
-        // SAFETY: the pidfd is owned by self, the signal is valid, and a null
-        // siginfo with zero flags is the documented kill(2)-equivalent form.
-        let result = unsafe {
-            libc::syscall(
-                libc::SYS_pidfd_send_signal,
-                self.pidfd.as_raw_fd(),
-                signal,
-                std::ptr::null::<libc::siginfo_t>(),
-                0,
-            )
-        };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.raw_os_error() != Some(libc::ESRCH) {
-                return Err(error);
-            }
-            return Ok(false);
-        }
-        Ok(true)
+        self.process.signal(signal)
     }
 
     /// Whether the pinned process exited within `timeout`. The kernel closes
-    /// its descriptors, and so releases its slot flock, before the pidfd
+    /// its descriptors, and so releases its slot flock, before the pin
     /// reports the exit.
     fn wait_exit(&self, timeout: Duration) -> io::Result<bool> {
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let mut poll = libc::pollfd {
-                fd: self.pidfd.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            let milliseconds = libc::c_int::try_from(remaining.as_millis()).unwrap_or(i32::MAX);
-            // SAFETY: poll points to one initialized descriptor.
-            match unsafe { libc::poll(&mut poll, 1, milliseconds) } {
-                -1 => {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-                0 if remaining.is_zero() => return Ok(false),
-                0 => {}
-                _ => return Ok(true),
-            }
-        }
+        self.process.wait_for_exit(timeout)
     }
+}
+
+/// Whether `process` holds the exclusive flock on the lease `lease` opened,
+/// whose identity is `expected`.
+///
+/// Linux reads the exact lock from the process's descriptor fdinfo. Darwin
+/// never names a flock's holder, so it accepts the pinned same-user process
+/// holding that exact inode open while the lease is held. A window holds its
+/// lease open for its whole life, and the pin rules out a reused pid.
+#[cfg(target_os = "linux")]
+fn owns_lease(
+    proc_root: &Path,
+    process: &PinnedProcess,
+    _lease: &File,
+    expected: &fs::Metadata,
+) -> io::Result<bool> {
+    let pid = process.pid();
+    process_owns_slot(&proc_root.join(pid.to_string()), pid, expected)
+}
+
+/// Darwin's proof names less than Linux's: the process holds the lease's
+/// inode open while some open file description holds a lock on it. It cannot
+/// tell which description holds the lock, nor that the lock is exclusive
+/// rather than shared, so another process of this user holding the lease open
+/// beside its owner passes too. Any failure to list or read the process
+/// refuses the proof.
+#[cfg(target_os = "macos")]
+fn owns_lease(
+    _proc_root: &Path,
+    process: &PinnedProcess,
+    lease: &File,
+    expected: &fs::Metadata,
+) -> io::Result<bool> {
+    Ok(process.uid()? == current_uid()
+        && process.holds_open(expected)?
+        && !lease_released(lease, expected)?)
 }
 
 /// Contention alone is not ownership: require the exact exclusive flock in the
@@ -1273,7 +1517,6 @@ fn verified_window_lease_owners_in(
     runtime: &Path,
     proc_root: &Path,
 ) -> io::Result<Vec<VerifiedWindow>> {
-    use std::os::fd::FromRawFd;
     let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
     for slot in slots {
@@ -1293,29 +1536,40 @@ fn verified_window_lease_owners_in(
         // locked descriptor's stat device and inode, not a mere open descriptor.
         // The index can miss a held lock under churn, so the owner the window
         // recorded in its lease is a candidate too.
-        let recorded: Vec<u32> = daemon_admission::recorded_owner(&lock)
-            .into_iter()
+        let owner = daemon_admission::recorded_owner(&lock);
+        let recorded: Vec<u32> = owner
+            .iter()
+            .map(daemon_admission::RecordedOwner::pid)
             .collect();
         let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
-            let process = proc_root.join(pid.to_string());
             // A candidate that exits or hides its descriptors mid-proof, as a
             // stale recorded pid may, is simply not the owner.
-            if !fs::metadata(&process).is_ok_and(|metadata| metadata.uid() == current_uid())
-                || !process_owns_slot(&process, pid, &expected).unwrap_or(false)
+            let process = match PinnedProcess::open(pid) {
+                Ok(process) => process,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(error),
+            };
+            #[cfg(target_os = "linux")]
+            if !fs::metadata(proc_root.join(pid.to_string()))
+                .is_ok_and(|metadata| metadata.uid() == current_uid())
             {
                 return Ok(None);
             }
-            // SAFETY: pidfd_open returns a fresh owned descriptor or -1.
-            let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
-            if raw == -1 {
-                return Err(io::Error::last_os_error());
+            // Darwin has no lock index, so the recorded owner is the only
+            // candidate, and only the very process it names can prove it.
+            #[cfg(target_os = "macos")]
+            if !owner
+                .as_ref()
+                .is_some_and(|owner| owner.names(&process).unwrap_or(false))
+            {
+                return Ok(None);
             }
-            // SAFETY: successful pidfd_open transferred ownership to us.
-            let pidfd = unsafe { File::from_raw_fd(raw as i32) };
-            let executable = fs::read_link(process.join("exe"))?;
+            if !owns_lease(proc_root, &process, &lock, &expected).unwrap_or(false) {
+                return Ok(None);
+            }
             let verified = VerifiedWindow {
-                executable,
-                pidfd,
+                executable: process.executable()?,
+                process,
                 pid,
                 lease: lock.try_clone()?,
                 lease_path: lease_path.clone(),
@@ -1347,10 +1601,7 @@ fn verified_window_lease_owners_in(
 /// and could take a lock already held through it, and the path may since
 /// name another file.
 fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
-    let probe = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(format!("/proc/self/fd/{}", lock.as_raw_fd()))?;
+    let probe = crate::descriptor::reopen(lock, libc::O_NONBLOCK)?;
     let probed = probe.metadata()?;
     if probed.dev() != expected.dev() || probed.ino() != expected.ino() {
         return Err(io::Error::other("window lease changed during verification"));
@@ -1359,6 +1610,35 @@ fn lease_released(lock: &File, expected: &fs::Metadata) -> io::Result<bool> {
         Ok(_) => Ok(true),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
         Err(error) => Err(error),
+    }
+}
+
+/// An open observation of the exact launch fence an update already holds.
+#[cfg(feature = "host")]
+#[doc(hidden)]
+pub struct UpdateFenceRelease(File);
+
+#[cfg(feature = "host")]
+impl UpdateFenceRelease {
+    pub fn observe(runtime: &Path) -> io::Result<Option<Self>> {
+        let path = daemon_admission::fence_path_in(runtime);
+        let file = open_owned_lock(&path)?;
+        match file.try_lock_shared() {
+            Ok(()) => file.unlock().map(|()| None),
+            Err(fs::TryLockError::WouldBlock) => {
+                let opened = file.metadata()?;
+                let named = fs::symlink_metadata(&path)?;
+                if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
+                    return Err(io::Error::other("the observed update fence changed"));
+                }
+                Ok(Some(Self(file)))
+            }
+            Err(fs::TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    pub fn wait(self) -> io::Result<()> {
+        owned_file_lock(self.0, libc::LOCK_SH).map(drop)
     }
 }
 
@@ -1374,7 +1654,7 @@ pub fn update_in_progress() -> bool {
 }
 
 fn update_window(runtime: &Path, slot: &str, action: &str, timeout: Duration) -> io::Result<()> {
-    let mut stream = UnixStream::connect(runtime.join(slot_socket_name(slot)))?;
+    let mut stream = connect_activation_socket(&runtime.join(slot_socket_name(slot)))?;
     stream.set_read_timeout(Some(timeout.max(Duration::from_millis(1))))?;
     stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
     writeln!(stream, "{action}")?;
@@ -1569,8 +1849,31 @@ impl UiUpdateGuard {
         self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
+    /// An exact successor may still be restoring and holds its own copy of
+    /// the launch fence. Close this copy without unlocking that description.
+    #[cfg_attr(
+        target_os = "macos",
+        allow(dead_code, reason = "Darwin updater wiring is separate")
+    )]
+    pub(crate) fn leave_launch_fence_with_successor(&mut self) {
+        if let Some(lock) = self.lock.take() {
+            drop(lock.into_file());
+        }
+    }
+
+    /// An already committed close is recorded in the retained checkpoint.
+    /// Leave those windows there when no launch can yet reach the successor.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn defer_reopening_to_recovery(&mut self) {
+        self.closed.clear();
+    }
+
+    pub(crate) fn running_window_slots(&self) -> io::Result<Vec<String>> {
+        running_window_slots(&self.runtime)
+    }
+
     pub fn has_running_windows(&self) -> io::Result<bool> {
-        running_window_slots(&self.runtime).map(|slots| !slots.is_empty())
+        self.running_window_slots().map(|slots| !slots.is_empty())
     }
     /// Pass the held launch fence to an installer that would otherwise try to
     /// acquire it again. The child validates both this exact lock description
@@ -1606,10 +1909,37 @@ impl UiUpdateGuard {
     }
 
     pub fn acquire() -> io::Result<Self> {
+        Self::acquire_with_operation(libc::LOCK_EX | libc::LOCK_NB)
+    }
+
+    /// Let a window that is already taking its slot reach the fence naturally.
+    /// The detached flock waiter owns no update lease if this budget expires.
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn acquire_for_cutover() -> io::Result<Self> {
+        match Self::acquire() {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            result => return result,
+        }
+        let (send, receive) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("cutover-launch-fence".into())
+            .spawn(move || {
+                let _ = send.send(Self::acquire_with_operation(libc::LOCK_EX));
+            })?;
+        receive
+            .recv_timeout(CUTOVER_READY_TIMEOUT)
+            .map_err(|error| {
+                io::Error::other(format!(
+                    "The saved window launch fence was unavailable: {error}"
+                ))
+            })?
+    }
+
+    fn acquire_with_operation(operation: libc::c_int) -> io::Result<Self> {
         let runtime = runtime_directory()?;
         let lock = owned_lock(
             &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
-            libc::LOCK_EX | libc::LOCK_NB,
+            operation,
         )?;
         let legacy = owned_lock(
             &runtime.join(APPLICATION_LOCK_FILE),
@@ -1682,6 +2012,19 @@ impl UiUpdateGuard {
             ),
         }
         Ok(slots)
+    }
+
+    /// Finish draining the windows this update prepared, if any.
+    pub(crate) fn close_remaining_prepared_windows(
+        &mut self,
+        timeout: Duration,
+    ) -> io::Result<bool> {
+        if self.prepared.is_empty() {
+            return Ok(false);
+        }
+        let slots = self.prepared.clone();
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(true)
     }
 
     /// Human review has no window-RPC deadline. Closing gets its own budget.
@@ -2005,6 +2348,51 @@ impl UiUpdateGuard {
             .map(|_| ())
     }
 
+    pub(crate) fn relaunch_missing_windows(
+        self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<()> {
+        let running = running_window_slots(&self.runtime)?;
+        let missing: Vec<_> = slots
+            .iter()
+            .filter(|slot| !running.contains(slot))
+            .cloned()
+            .collect();
+        self.relaunch_windows(&missing, executable)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
+        let windows = self.verified_windows()?;
+        for slot in slots {
+            let lease = self.runtime.join(slot_lock_name(slot));
+            let owner = windows
+                .iter()
+                .find(|window| window.lease_path == lease && window.executable == image)
+                .ok_or_else(|| io::Error::other("A saved window has no matching restored owner"))?;
+            let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
+            let peer = crate::pinned_process::peer_credentials(&stream)?;
+            if peer.uid != current_uid() || peer.pid != owner.pid {
+                return Err(io::Error::other(
+                    "A saved window changed its restored owner",
+                ));
+            }
+            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            let remaining = deadline
+                .checked_duration_since(Instant::now())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
+            stream.set_read_timeout(Some(remaining))?;
+            writeln!(&mut stream, "update-ready")?;
+            if read_capped_line(&stream)? != "ready" || !owner.still_owns_lease()? {
+                return Err(io::Error::other("A saved window is still reopening"));
+            }
+        }
+        Ok(())
+    }
+
     fn relaunch_windows_with_notes(
         mut self,
         slots: &[String],
@@ -2045,6 +2433,39 @@ impl UiUpdateGuard {
     }
 }
 
+/// A naturally opened window can take its lease before binding activation.
+#[cfg(all(target_os = "macos", feature = "host"))]
+fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
+    use std::os::fd::AsFd;
+
+    let path = runtime.join(slot_socket_name(slot));
+    if let Ok(stream) = connect_activation_socket(&path) {
+        return Ok(stream);
+    }
+    let directory = File::open(runtime)?;
+    let watches = crate::fs_watch::FileWatches::shared()
+        .ok_or_else(|| io::Error::other("Cannot follow saved window startup"))?;
+    loop {
+        let watch = watches
+            .watch(&directory)
+            .ok_or_else(|| io::Error::other("Cannot follow saved window startup"))?;
+        match connect_activation_socket(&path) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                ) => {}
+            Err(error) => return Err(error),
+        }
+        if !crate::descriptor::wait_for_activity(watch.as_fd(), libc::POLLIN, Some(deadline))? {
+            return Err(io::Error::other(
+                "A saved window is still opening its activation socket",
+            ));
+        }
+    }
+}
+
 /// What the update reports when windows did not reopen cleanly. Someone reads
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
@@ -2076,7 +2497,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
         .join("; ")
 }
 
-pub(crate) const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
+pub const INSTALL_GUARD_ENV: &str = "CAGENTS_UI_UPDATE_GUARD_FD";
 #[cfg(feature = "host")]
 pub(crate) fn update_recovery_fences() -> io::Result<(PathBuf, PathBuf)> {
     let runtime = runtime_directory()?;
@@ -2094,8 +2515,18 @@ pub(crate) fn validate_install_guard() -> io::Result<()> {
 }
 
 /// Staging owns the same authenticated launch fence without closing modern windows.
-pub(crate) fn validate_stage_guard() -> io::Result<()> {
+pub fn validate_stage_guard() -> io::Result<()> {
     validate_install_fence(false)
+}
+
+/// Keep legacy-window exclusion from Parked through the daemon's readiness
+/// acknowledgement, even if the coordinator releases its own description.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) fn reserve_standby_legacy_fence() -> io::Result<OwnedLock> {
+    owned_lock(
+        &runtime_directory()?.join(APPLICATION_LOCK_FILE),
+        libc::LOCK_SH | libc::LOCK_NB,
+    )
 }
 
 fn validate_install_fence(require_closed: bool) -> io::Result<()> {
@@ -2112,28 +2543,33 @@ fn validate_install_fence(require_closed: bool) -> io::Result<()> {
     let inherited = File::from(inherited);
     let runtime = runtime_directory()?;
     let path = runtime.join(format!("{APPLICATION_LOCK_FILE}.update"));
-    let expected = fs::symlink_metadata(&path)?;
-    let actual = inherited.metadata()?;
-    if !actual.is_file()
-        || actual.uid() != current_uid()
-        || actual.mode() & 0o077 != 0
-        || actual.nlink() != 1
-        || !expected.is_file()
-        || actual.dev() != expected.dev()
-        || actual.ino() != expected.ino()
+    #[cfg(target_os = "linux")]
     {
-        return Err(io::Error::other(
-            "installer inherited a different update fence",
-        ));
+        let expected = fs::symlink_metadata(&path)?;
+        let actual = inherited.metadata()?;
+        if !actual.is_file()
+            || actual.uid() != current_uid()
+            || actual.mode() & 0o077 != 0
+            || actual.nlink() != 1
+            || !expected.is_file()
+            || actual.dev() != expected.dev()
+            || actual.ino() != expected.ino()
+        {
+            return Err(io::Error::other(
+                "installer inherited a different update fence",
+            ));
+        }
+        match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            Ok(_) => return Err(io::Error::other("installer update fence is not held")),
+            Err(error) => return Err(error),
+        }
+        if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
+            return Err(io::Error::other("installer does not own the update fence"));
+        }
     }
-    match owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB) {
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-        Ok(_) => return Err(io::Error::other("installer update fence is not held")),
-        Err(error) => return Err(error),
-    }
-    if unsafe { libc::flock(INSTALL_GUARD_FD, libc::LOCK_EX | libc::LOCK_NB) } == -1 {
-        return Err(io::Error::other("installer does not own the update fence"));
-    }
+    #[cfg(target_os = "macos")]
+    crate::flock::verify_inherited_exclusive_at(&inherited, &path)?;
     if require_closed && !running_window_slots(&runtime)?.is_empty() {
         return Err(io::Error::other(
             "application windows have not finished closing",
@@ -2312,9 +2748,8 @@ impl ApplicationLease {
             }
         }
         mark_lease_capable_process()?;
-        let runtime_directory = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
+        let runtime_directory = runtime_base()
+            .map_err(ApplicationLeaseError::Io)?
             .ok_or(ApplicationLeaseError::MissingRuntimeDirectory)?;
         let lease = Self::acquire_in(&runtime_directory)?;
         if !IS_DEVELOPMENT && legacy_ui_process_running(Path::new("/proc"))? {
@@ -2393,15 +2828,12 @@ pub struct UiActivationListener {
 #[cfg(feature = "ui")]
 impl UiActivationListener {
     pub fn bind(events: async_channel::Sender<UiActivation>) -> io::Result<Self> {
-        let runtime_directory = env::var_os("XDG_RUNTIME_DIR")
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    "XDG_RUNTIME_DIR is not set to an absolute path",
-                )
-            })?;
+        let runtime_directory = runtime_base()?.ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "XDG_RUNTIME_DIR is not set to an absolute path",
+            )
+        })?;
         Self::bind_in(&runtime_directory, events)
     }
 
@@ -2432,13 +2864,7 @@ impl UiActivationListener {
         require_owned_runtime_directory(runtime_directory)?;
         let socket_path = runtime_directory.join(socket);
         prepare_activation_socket_path(&socket_path)?;
-        let listener = UnixListener::bind(&socket_path)?;
-        // SAFETY: fchmod receives the bound listener's live descriptor.
-        if unsafe { libc::fchmod(listener.as_raw_fd(), PRIVATE_FILE_MODE) } != 0 {
-            let error = io::Error::last_os_error();
-            let _ = fs::remove_file(&socket_path);
-            return Err(error);
-        }
+        let listener = bind_activation_socket(&socket_path)?;
         let thread = match thread::Builder::new()
             .name("cagents-ui-activate".into())
             .spawn(move || serve_activation_socket(listener, events))
@@ -2459,12 +2885,15 @@ impl UiActivationListener {
 #[cfg(feature = "ui")]
 impl Drop for UiActivationListener {
     fn drop(&mut self) {
-        let woke = UnixStream::connect(&self.socket_path)
-            .and_then(|mut stream| {
-                stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-                writeln!(stream, "shutdown")
-            })
-            .is_ok();
+        // One attempt, as for any socket: the serve loop may already be gone.
+        let woke = crate::descriptor::with_socket_address(&self.socket_path, |address| {
+            crate::descriptor::connect(address)
+        })
+        .and_then(|mut stream| {
+            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+            writeln!(stream, "shutdown")
+        })
+        .is_ok();
         if let Some(thread) = self.thread.take()
             && woke
         {
@@ -2477,10 +2906,7 @@ impl Drop for UiActivationListener {
 /// Asks a running UI to focus its window. Returns `true` when that instance
 /// acknowledged the request.
 pub fn activate_running_ui() -> io::Result<bool> {
-    let Some(runtime_directory) = env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-    else {
+    let Some(runtime_directory) = runtime_base()? else {
         return Ok(false);
     };
     if activate_running_ui_in(&runtime_directory)? {
@@ -2527,7 +2953,7 @@ fn activate_window_session_in(
 ) -> io::Result<bool> {
     validate_window_slot(slot)?;
     require_owned_runtime_directory(runtime)?;
-    let mut stream = match UnixStream::connect(runtime.join(slot_socket_name(slot))) {
+    let mut stream = match connect_activation_socket(&runtime.join(slot_socket_name(slot))) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2614,7 +3040,7 @@ pub fn notification_desktop_id(application: crate::notifications::Application) -
 // installed separately, so resolve only these fixed application names, never a
 // path carried by an alert. Relative PATH entries cannot redirect activation.
 fn notification_executable(product: crate::companion::Product) -> io::Result<PathBuf> {
-    let current = env::current_exe()?;
+    let current = crate::process::current_executable()?;
     let sibling = product.beside(&current)?;
     let search = env::var_os("PATH").unwrap_or_default();
     resolve_notification_executable(
@@ -2711,7 +3137,7 @@ fn activate_socket_with_token(
 ) -> io::Result<bool> {
     require_owned_runtime_directory(runtime_directory)?;
     let socket_path = runtime_directory.join(socket);
-    let mut stream = match UnixStream::connect(&socket_path) {
+    let mut stream = match connect_activation_socket(&socket_path) {
         Ok(stream) => stream,
         Err(error)
             if matches!(
@@ -2748,6 +3174,85 @@ fn require_owned_runtime_directory(runtime_directory: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Connects to a window's activation socket. Its full path can exceed a Unix
+/// socket address: Darwin's holds 103 bytes, and its runtime directory alone
+/// takes about 56 of them, so a window or editor socket named for a UUID
+/// would not fit. It is reached as a holder endpoint is, through its directory.
+fn connect_activation_socket(path: &Path) -> io::Result<std::os::unix::net::UnixStream> {
+    crate::descriptor::with_socket_address(path, |address| {
+        crate::descriptor::connect_settled(address)
+    })
+}
+
+/// Binds a window's activation socket for its owner alone, reaching a path
+/// longer than a Unix socket address as [`connect_activation_socket`] does.
+#[cfg(feature = "ui")]
+fn bind_activation_socket(path: &Path) -> io::Result<UnixListener> {
+    crate::descriptor::with_socket_address(path, |address| {
+        let listener = crate::descriptor::bind(address)?;
+        // On failure drop the listener. A retry may remove a stale socket
+        // through prepare_activation_socket_path. Unlinking here could
+        // delete a replacement file.
+        restrict_activation_socket(address)?;
+        Ok(listener)
+    })
+}
+
+/// Leaves a bound activation socket readable and writable by its owner only.
+///
+/// `fchmod` on the listener would change only the socket's own inode, not the
+/// node bind made, whose mode `connect` checks. So the node is opened by
+/// `path` without following a symlink, required to be a socket, and changed
+/// through its `/proc/self/fd` link, which needs no glibc support for
+/// `AT_SYMLINK_NOFOLLOW`. Binding trusts the runtime directory to protect
+/// the name between bind and open, as it does for other runtime entries.
+#[cfg(all(feature = "ui", target_os = "linux"))]
+fn restrict_activation_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::FileTypeExt;
+    let node = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW)
+        .open(path)?;
+    if !node.metadata()?.file_type().is_socket() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the activation socket was replaced before it was made private",
+        ));
+    }
+    fs::set_permissions(
+        format!("/proc/self/fd/{}", node.as_raw_fd()),
+        fs::Permissions::from_mode(PRIVATE_SOCKET_MODE),
+    )
+}
+
+/// Leaves a bound activation socket readable and writable by its owner only.
+///
+/// XNU's fchmod refuses a socket with `EINVAL`, so the mode is set through the
+/// path just bound, without following a symlink. A process of this user that
+/// replaces the socket between bind and chmod could have the mode applied to
+/// its replacement instead. No one else can: the runtime directory
+/// `runtime_base` creates is verified private, and one named by
+/// `XDG_RUNTIME_DIR` is trusted as it is on Linux.
+#[cfg(all(feature = "ui", target_os = "macos"))]
+fn restrict_activation_socket(path: &Path) -> io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))?;
+    // SAFETY: the path is a NUL-terminated string that outlives the call.
+    let changed = unsafe {
+        libc::fchmodat(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            PRIVATE_SOCKET_MODE,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if changed != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 #[cfg(feature = "ui")]
 fn prepare_activation_socket_path(path: &Path) -> io::Result<()> {
     match fs::symlink_metadata(path) {
@@ -2775,13 +3280,15 @@ fn prepare_activation_socket_path(path: &Path) -> io::Result<()> {
 #[cfg(feature = "ui")]
 fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender<UiActivation>) {
     loop {
-        let Ok((stream, _)) = listener.accept() else {
+        let Ok((stream, _)) = crate::descriptor::accept(&listener) else {
             break;
         };
         let _ = stream.set_read_timeout(Some(ACTIVATION_IO_TIMEOUT));
         let _ = stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT));
         match read_activation_request(&stream) {
             Ok(ActivationRequest::Shutdown) => break,
+            #[cfg(target_os = "macos")]
+            Ok(ActivationRequest::UpdateReady) => report_cutover_ready(stream),
             Ok(ActivationRequest::Activate(token)) => {
                 // The acknowledgement is the launcher's proof that a window
                 // will be raised: `cagents ui` reports "already running" and
@@ -2839,11 +3346,49 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
     }
 }
 
+#[cfg(all(feature = "ui", target_os = "macos"))]
+fn report_cutover_ready(mut stream: UnixStream) {
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    let (ready, changed) = &UI_RESTORATION_READY;
+    if *ready
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        let _ = writeln!(stream, "ready");
+        return;
+    }
+    if WAITING.swap(true, Ordering::AcqRel) {
+        let _ = writeln!(stream, "pending");
+        return;
+    }
+    // Leave activation, close, and focus requests responsive during startup.
+    if std::thread::Builder::new()
+        .name("cutover-window-ready".into())
+        .spawn(move || {
+            let readiness = ready
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let (readiness, _) = changed
+                .wait_timeout_while(readiness, CUTOVER_READY_TIMEOUT, |ready| !*ready)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let response = if *readiness { "ready" } else { "pending" };
+            drop(readiness);
+            let _ = writeln!(stream, "{response}");
+            WAITING.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        WAITING.store(false, Ordering::Release);
+    }
+}
+
 #[cfg(feature = "ui")]
 enum ActivationRequest {
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
     Shutdown,
+    #[cfg(target_os = "macos")]
+    UpdateReady,
     Update(UiUpdateAction),
 }
 
@@ -2876,6 +3421,8 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
+        #[cfg(target_os = "macos")]
+        None if line == "update-ready" => Ok(ActivationRequest::UpdateReady),
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
         None if line == "update-commit" => Ok(ActivationRequest::Update(UiUpdateAction::Commit)),
@@ -2909,13 +3456,28 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
 /// Every mode of the current UI executable takes it, not only a window that
 /// holds the lease: the legacy scan matches any process still named
 /// `cagents-ui` that is not running a helper mode.
+#[cfg(target_os = "linux")]
 pub fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
+}
+
+/// No macOS release predates the session-store lease, so nothing scans for
+/// the name.
+#[cfg(target_os = "macos")]
+pub fn mark_lease_capable_process() -> io::Result<()> {
+    Ok(())
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {
     peer_directory.join("cagents-ui").exists() && !peer_directory.join(LEASE_MARKER_FILE).is_file()
 }
 
+/// No macOS release predates the session-store lease.
+#[cfg(target_os = "macos")]
+fn legacy_ui_process_running(_proc_root: &Path) -> io::Result<bool> {
+    Ok(false)
+}
+
+#[cfg(target_os = "linux")]
 fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
     for entry in fs::read_dir(proc_root)? {
         let Ok(entry) = entry else {
@@ -2984,11 +3546,13 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
 
 /// A process that ended after its name was read: opening one of its `/proc`
 /// entries then fails with ENOENT, and reading one already open with ESRCH.
+#[cfg(target_os = "linux")]
 fn process_exited(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
 /// Unreadable arguments are not evidence of a helper, so they keep the refusal.
+#[cfg(target_os = "linux")]
 fn runs_helper_mode(process: &Path) -> io::Result<bool> {
     let arguments = fs::read(process.join("cmdline"))?;
     Ok(arguments
@@ -3004,7 +3568,7 @@ fn current_uid() -> u32 {
 
 // Source-tree debug builds are development instances by default. The explicit
 // feature keeps the same isolation available to optimized development builds.
-pub(crate) const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
+pub const IS_DEVELOPMENT: bool = cfg!(any(debug_assertions, feature = "development"));
 
 pub const NAME: &str = if IS_DEVELOPMENT {
     "development"
@@ -3103,6 +3667,14 @@ pub fn runtime_subdirectory() -> &'static str {
     namespace()
 }
 
+/// The daemon's runtime lock under the session runtime directory `runtime`.
+/// The daemon takes it and records it in its saved-data claim; a window asking
+/// whether a daemon elsewhere serves this data must name the same file, or it
+/// mistakes this session's daemon for another session's.
+pub fn daemon_lock_in(runtime: &Path) -> PathBuf {
+    runtime.join(runtime_subdirectory()).join("cagentsd.lock")
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
     ProjectDirs::from("dev", "cagents", storage_name())
 }
@@ -3117,6 +3689,94 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    /// A process that holds a lease file's lock owns it; once it lets go of
+    /// the lock it does not, though it keeps the file open, and a process
+    /// that never opened the file never does. The processes are this test
+    /// binary, re-executed.
+    #[test]
+    fn only_the_process_holding_a_lease_lock_owns_the_lease() {
+        use std::io::{BufRead, BufReader, Write};
+        const ROLE: &str = "CAGENTS_TEST_LEASE_ROLE";
+        const LEASE: &str = "CAGENTS_TEST_LEASE_PATH";
+        if let Some(role) = env::var_os(ROLE) {
+            let lease = File::open(env::var_os(LEASE).unwrap()).unwrap();
+            let flock = |operation| {
+                // SAFETY: flock takes no pointer, on a descriptor this owns.
+                assert_eq!(unsafe { libc::flock(lease.as_raw_fd(), operation) }, 0);
+            };
+            let mut line = String::new();
+            if role == "holder" {
+                flock(libc::LOCK_EX);
+                println!("locked");
+                std::io::stdin().read_line(&mut line).unwrap();
+                flock(libc::LOCK_UN);
+                println!("unlocked");
+            } else {
+                println!("open");
+            }
+            std::io::stdin().read_line(&mut line).unwrap();
+            return;
+        }
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("lease");
+        fs::write(&path, "").unwrap();
+        let spawn = |role: &str| {
+            let mut child = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::tests::only_the_process_holding_a_lease_lock_owns_the_lease",
+                    "--nocapture",
+                ])
+                .env(ROLE, role)
+                .env(LEASE, &path)
+                .stdin(process::Stdio::piped())
+                .stdout(process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let lines = BufReader::new(child.stdout.take().unwrap()).lines();
+            (child, lines)
+        };
+        // The harness prints its own lines around the role's.
+        let expect = |lines: &mut std::io::Lines<BufReader<process::ChildStdout>>, said: &str| {
+            assert!(
+                lines.any(|line| line.unwrap() == said),
+                "the fixture never said {said}"
+            );
+        };
+        let (mut holder, mut holder_said) = spawn("holder");
+        expect(&mut holder_said, "locked");
+        let (bystander, mut bystander_said) = spawn("bystander");
+        expect(&mut bystander_said, "open");
+        let lease = File::open(&path).unwrap();
+        let expected = lease.metadata().unwrap();
+        let owns = |child: &process::Child| {
+            let process = PinnedProcess::open(child.id()).unwrap();
+            owns_lease(Path::new("/proc"), &process, &lease, &expected).unwrap()
+        };
+        let stranger = process::Command::new("sleep")
+            .arg("30")
+            .stdin(process::Stdio::null())
+            .spawn()
+            .unwrap();
+
+        assert!(owns(&holder));
+        assert!(!owns(&stranger));
+        // Linux reads which descriptor holds the lock. Darwin can only see
+        // that the file is open while some process holds its lock, so a
+        // process holding it open beside the owner passes there too.
+        assert_eq!(owns(&bystander), cfg!(target_os = "macos"));
+
+        writeln!(holder.stdin.as_mut().unwrap()).unwrap();
+        expect(&mut holder_said, "unlocked");
+        assert!(!owns(&holder));
+        assert!(!owns(&bystander));
+
+        for mut child in [holder, bystander, stranger] {
+            let _ = child.kill();
+            child.wait().unwrap();
+        }
+    }
 
     #[test]
     fn a_namespace_names_its_development_instance() {
@@ -3287,6 +3947,7 @@ mod tests {
         drop(next);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn verified_window_requires_its_exact_kernel_flock_not_an_open_descriptor() {
         let runtime = tempfile::tempdir().unwrap();
@@ -3374,6 +4035,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn window_ownership_cannot_combine_different_descriptors() {
         let root = tempfile::tempdir().unwrap();
@@ -3446,6 +4108,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn automatic_cleanup_preserves_older_and_unregistered_independent_editors() {
         use std::os::unix::fs::symlink;
@@ -3533,10 +4196,19 @@ mod tests {
             }
             let child = Self(command.spawn().unwrap());
             let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            // A window publishes its owner just after it takes the lease, and
+            // Darwin, with no kernel lock index, proves the owner from that.
+            let published = || {
+                File::open(runtime.join(slot_lock_name(slot))).is_ok_and(|lease| {
+                    daemon_admission::recorded_owner(&lease).map(|owner| owner.pid())
+                        == Some(child.0.id())
+                })
+            };
             while !running_window_slots(runtime)
                 .unwrap()
                 .iter()
                 .any(|live| live == slot)
+                || !published()
                 || (answers && !runtime.join(slot_socket_name(slot)).exists())
             {
                 assert!(
@@ -3574,13 +4246,16 @@ mod tests {
             // SAFETY: ignoring a signal installs no handler code.
             unsafe { libc::signal(libc::SIGTERM, libc::SIG_IGN) };
         }
-        let _lease = owned_lock(Path::new(&lease), libc::LOCK_EX).unwrap();
+        // Record ownership as a window's lease does: Darwin has no kernel
+        // lock index, so the recorded owner is its only candidate.
+        let mut lease = owned_lock(Path::new(&lease), libc::LOCK_EX).unwrap();
+        daemon_admission::publish_capability(lease.file_mut()).unwrap();
         if let Some(socket) = env::var_os(LINGERING_SOCKET) {
             // The path appears at bind, before listen, so a parent that saw
             // it could be refused: bind apart and move it into place.
             let mut binding = socket.clone();
             binding.push(".binding");
-            let listener = std::os::unix::net::UnixListener::bind(&binding).unwrap();
+            let listener = crate::descriptor::bind(&binding).unwrap();
             fs::rename(&binding, &socket).unwrap();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
@@ -3943,6 +4618,22 @@ mod tests {
             verified_windows_within(runtime.path(), Path::new("/proc"), Duration::ZERO).is_err()
         );
         assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_update_can_leave_the_launch_fence_with_its_exact_successor() {
+        let runtime = tempdir().unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let mut guard = guard_in(runtime.path());
+        let inherited = guard.lock.as_ref().unwrap().try_clone().unwrap();
+        guard.leave_launch_fence_with_successor();
+        drop(guard);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_err());
+        drop(inherited);
+        assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
     }
 
     #[test]
@@ -4412,13 +5103,12 @@ mod tests {
             let lease =
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             workers.push(std::thread::spawn(move || {
                 let _lease = lease;
                 let mut actions = Vec::new();
                 for _ in 0..2 {
-                    let (stream, _) = listener.accept().unwrap();
+                    let (stream, _) = crate::descriptor::accept(&listener).unwrap();
                     let action = read_capped_line(&stream).unwrap();
                     let response = if veto && action == "update-prepare" {
                         "error: unsaved editor"
@@ -4471,8 +5161,7 @@ mod tests {
             let lease =
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap();
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             listener.set_nonblocking(true).unwrap();
             let (finished, completion) = std::sync::mpsc::sync_channel(1);
             let worker = std::thread::spawn(move || {
@@ -4481,7 +5170,7 @@ mod tests {
                 for _ in 0..2 {
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     let stream = loop {
-                        match listener.accept() {
+                        match crate::descriptor::accept(&listener) {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 assert!(
@@ -4554,15 +5243,14 @@ mod tests {
                 owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
             );
             let listener =
-                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
-                    .unwrap();
+                crate::descriptor::bind(runtime.path().join(slot_socket_name(slot))).unwrap();
             listener.set_nonblocking(true).unwrap();
             workers.push(std::thread::spawn(move || {
                 let mut actions = Vec::new();
                 for _ in 0..2 {
                     let deadline = std::time::Instant::now() + Duration::from_secs(5);
                     let stream = loop {
-                        match listener.accept() {
+                        match crate::descriptor::accept(&listener) {
                             Ok((stream, _)) => break stream,
                             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                                 assert!(
@@ -4654,6 +5342,7 @@ mod tests {
         assert!(ApplicationLease::acquire_in(runtime.path()).is_err());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn legacy_ui_detection_ignores_unrelated_process_names() {
         let proc_root = tempdir().unwrap();
@@ -4809,9 +5498,12 @@ mod tests {
 
     #[test]
     fn notification_launch_resolves_private_siblings_then_safe_installed_shells() {
-        let root = tempfile::tempdir().unwrap();
-        let sibling = root.path().join("private/ceditor");
-        let installed = root.path().join("bin/ceditor");
+        let temporary = tempfile::tempdir().unwrap();
+        // Resolution answers canonical paths, which differ from the temporary
+        // one where that path crosses a link, as on Darwin.
+        let root = fs::canonicalize(temporary.path()).unwrap();
+        let sibling = root.join("private/ceditor");
+        let installed = root.join("bin/ceditor");
         fs::create_dir_all(sibling.parent().unwrap()).unwrap();
         fs::create_dir_all(installed.parent().unwrap()).unwrap();
         fs::write(&installed, "installed").unwrap();
@@ -4839,14 +5531,20 @@ mod tests {
     fn editor_activation_supports_isolated_runtime_and_full_window_name() {
         use crate::notifications::{Application, Destination};
         let root = tempfile::tempdir_in("/tmp").unwrap();
-        let padding = 37 - root.path().as_os_str().len() - 1;
-        let runtime = root.path().join("r".repeat(padding));
-        fs::create_dir(&runtime).unwrap();
         let destination = Destination {
             application: Application::Ceditor,
             window: "w".repeat(40),
         };
         destination.validate().unwrap();
+        // The longest runtime directory whose socket path, separator and
+        // terminating NUL still fit this platform's sun_path.
+        // SAFETY: sockaddr_un is plain data, valid when zeroed.
+        let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+        let sun_path = address.sun_path.len();
+        let longest = sun_path - 1 - 1 - destination_socket_name(&destination).len();
+        let padding = longest - root.path().as_os_str().len() - 1;
+        let runtime = root.path().join("r".repeat(padding));
+        fs::create_dir(&runtime).unwrap();
         let (sender, receiver) = async_channel::bounded(1);
         let listener = UiActivationListener::bind_named(
             &runtime,
@@ -4871,6 +5569,42 @@ mod tests {
             !activate_socket_with_token(&runtime, destination_socket_name(&destination), None,)
                 .unwrap()
         );
+    }
+
+    /// Darwin's runtime directory leaves too little of a Unix socket address
+    /// for a window or editor named by a UUID, so a socket past that limit is
+    /// still bound at its full path, private, and reachable.
+    #[cfg(feature = "ui")]
+    #[test]
+    fn activation_sockets_longer_than_a_unix_address_bind_and_answer() {
+        use crate::notifications::{Application, Destination};
+        use std::os::unix::fs::{FileTypeExt, PermissionsExt};
+        let root = tempdir().unwrap();
+        let runtime = root.path().join("r".repeat(120));
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let destination = Destination {
+            application: Application::Ceditor,
+            window: "w".repeat(40),
+        };
+        let socket = destination_socket_name(&destination);
+        assert!(!crate::descriptor::socket_fits(&runtime.join(&socket)));
+        let (sender, receiver) = async_channel::bounded(1);
+        let listener = UiActivationListener::bind_named(&runtime, socket.clone(), sender).unwrap();
+        let bound = fs::symlink_metadata(runtime.join(&socket)).unwrap();
+        assert!(bound.file_type().is_socket());
+        assert_eq!(bound.permissions().mode() & 0o777, 0o600);
+        assert!(activate_socket_with_token(&runtime, socket.clone(), Some("token")).unwrap());
+        assert_eq!(
+            receiver.recv_blocking().unwrap().token.as_deref(),
+            Some("token")
+        );
+        drop(listener);
+        // The serve thread holds the only sender, so a closed channel shows
+        // that dropping the listener reached it at the long path and joined it.
+        assert!(receiver.is_closed());
+        assert!(!runtime.join(&socket).exists());
+        assert!(!activate_socket_with_token(&runtime, socket, None).unwrap());
     }
 
     #[cfg(feature = "ui")]
@@ -4900,6 +5634,12 @@ mod tests {
             editor_sender,
         )
         .unwrap();
+        for destination in [&agents, &editor] {
+            let bound =
+                fs::symlink_metadata(runtime.path().join(destination_socket_name(destination)))
+                    .unwrap();
+            assert_eq!(bound.mode() & 0o777, 0o600);
+        }
         assert!(
             activate_socket_with_token(
                 runtime.path(),
@@ -4988,6 +5728,14 @@ mod tests {
         ));
         assert!(parse_activation_request("open").is_err());
         assert!(parse_activation_request("activate ").is_err());
+        #[cfg(target_os = "macos")]
+        {
+            assert!(matches!(
+                parse_activation_request("update-ready").unwrap(),
+                ActivationRequest::UpdateReady
+            ));
+            assert!(parse_activation_request("update-ready extra").is_err());
+        }
     }
 
     #[cfg(feature = "ui")]
@@ -5041,7 +5789,8 @@ mod tests {
     #[test]
     fn activation_replaces_a_stale_socket_and_rejects_a_symlink() {
         let runtime = tempdir().unwrap();
-        let leftover = UnixListener::bind(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
+        let leftover =
+            crate::descriptor::bind(runtime.path().join(ACTIVATION_SOCKET_FILE)).unwrap();
         drop(leftover);
         let (sender, receiver) = async_channel::unbounded();
         let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
@@ -5129,6 +5878,148 @@ mod startup_update_tests {
         )));
     }
     #[test]
+    fn a_window_in_another_runtime_directory_cannot_open_the_same_saved_window() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtimes = [tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap()];
+        for runtime in &runtimes {
+            fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let open = |runtime: &tempfile::TempDir, new_window| {
+            WindowLease::acquire_waiting_in(
+                runtime.path(),
+                Some(claims.path()),
+                false,
+                new_window,
+                None,
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let (_first, slot) = open(&runtimes[0], false).unwrap();
+        assert_eq!(slot, PRIMARY_WINDOW);
+        let Err(error) = open(&runtimes[1], false) else {
+            panic!("a second session opened the primary window's saved state");
+        };
+        let refusal = state_claim::state_in_use(&error).expect("a state refusal");
+        assert_eq!(refusal.pid(), Some(process::id()));
+        // A new window in the other session takes a saved window nobody has
+        // open instead.
+        let (_second, slot) = open(&runtimes[1], true).unwrap();
+        assert_eq!(slot, "window-2");
+    }
+
+    #[test]
+    fn a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere() {
+        use std::os::unix::fs::DirBuilderExt;
+
+        const DAEMON_RUNTIME: &str = "CAGENTS_TEST_WINDOW_DAEMON_RUNTIME";
+        if let Some(daemon_runtime) = env::var_os(DAEMON_RUNTIME).map(PathBuf::from) {
+            let lock = daemon_lock_in(&daemon_runtime);
+            fs::create_dir_all(lock.parent().unwrap()).unwrap();
+            let _held = owned_lock(&lock, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+            let _claim = state_claim::claim_daemon_state(&lock, "test-session").unwrap();
+
+            let lease = WindowLease::acquire(false, None);
+            if runtime_directory().unwrap().canonicalize().unwrap() == daemon_runtime {
+                lease.unwrap_or_else(|error| panic!("window refused its own daemon: {error}"));
+            } else {
+                let error = lease.err().expect("window accepted a foreign daemon");
+                assert_eq!(
+                    state_claim::state_in_use(&error).and_then(|refusal| refusal.pid()),
+                    Some(process::id()),
+                    "{error}"
+                );
+            }
+            return;
+        }
+
+        // Each child gets its own environment and window slot.
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path().canonicalize().unwrap();
+        let home = root.join("home");
+        let daemon_runtime = root.join("daemon");
+        let foreign_runtime = root.join("foreign");
+        for directory in [&home, &daemon_runtime, &foreign_runtime] {
+            fs::DirBuilder::new().mode(0o700).create(directory).unwrap();
+        }
+        let alias = root.join("alias");
+        std::os::unix::fs::symlink(&root, &alias).unwrap();
+        for runtime in [alias.join("daemon"), foreign_runtime] {
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "instance::startup_update_tests::a_window_does_not_mistake_this_sessions_daemon_for_one_elsewhere",
+                ])
+                .env(DAEMON_RUNTIME, &daemon_runtime)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", home.join("data"))
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "window launch with runtime {} failed: {}{}",
+                runtime.display(),
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
+    }
+
+    #[test]
+    fn automatic_new_window_skips_an_individually_unreadable_layout_claim() {
+        let claims = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let damaged = claims.path().join("window.window-2.lock");
+        fs::write(&damaged, b"unrecognized claim").unwrap();
+        fs::set_permissions(&damaged, fs::Permissions::from_mode(0o600)).unwrap();
+        let open = |requested| {
+            WindowLease::acquire_waiting_in(
+                runtime.path(),
+                Some(claims.path()),
+                false,
+                true,
+                requested,
+                Duration::ZERO,
+                &mut |_| {},
+            )
+        };
+        let error = open(Some("window-2"))
+            .err()
+            .expect("exact damaged slot must refuse");
+        assert!(state_claim::state_in_use(&error).is_some());
+        let (_lease, chosen) = open(None).unwrap();
+        assert_eq!(chosen, "window-3");
+        assert_eq!(fs::read(&damaged).unwrap(), b"unrecognized claim");
+    }
+
+    #[test]
+    fn new_window_reports_an_unreadable_claim_directory_before_allocating_a_slot() {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let claims = root.path().join("claims");
+        fs::write(&claims, "directory has been replaced by a file").unwrap();
+        let error = WindowLease::acquire_waiting_in(
+            &runtime,
+            Some(&claims),
+            false,
+            true,
+            None,
+            Duration::ZERO,
+            &mut |_| {},
+        )
+        .err()
+        .expect("a broken claims directory must refuse window startup");
+        let reason = state_claim::state_in_use(&error).unwrap();
+        assert!(!reason.can_try_another_slot());
+        assert!(reason.to_string().contains("unreadable"));
+        assert!(!runtime.join(slot_lock_name("window-2")).exists());
+    }
+
+    #[test]
     fn a_window_launched_during_daemon_admission_waits_and_then_takes_its_lease() {
         let runtime = tempfile::tempdir().unwrap();
         fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -5137,6 +6028,8 @@ mod startup_update_tests {
         let mut waited = Vec::new();
         let (lease, slot) = WindowLease::acquire_waiting_in(
             runtime.path(),
+            None,
+            false,
             false,
             None,
             Duration::from_secs(30),
@@ -5157,6 +6050,8 @@ mod startup_update_tests {
         let _admission = daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap();
         let error = WindowLease::acquire_waiting_in(
             runtime.path(),
+            None,
+            false,
             false,
             None,
             Duration::from_millis(60),

@@ -91,6 +91,8 @@ fn projections_of(app: &mut Cagents, message: Message) -> usize {
 
 /// Switching panes by keyboard, the reader's most frequent shortcut,
 /// projects the workspace once per key, and leaves nothing stale.
+// Spelled from the Linux table.
+#[cfg(target_os = "linux")]
 #[test]
 fn a_pane_switching_shortcut_projects_the_workspace_once() {
     let (mut app, first, second) = two_pane_app();
@@ -174,7 +176,7 @@ fn saving_by_shortcut_answers_within_its_own_update() {
     let save = press(
         keyboard::Key::Character("s".into()),
         Code::KeyS,
-        keyboard::Modifiers::CTRL,
+        keyboard::Modifiers::COMMAND,
     );
     assert_eq!(projections_of(&mut app, save), 1);
     // This fixture has no original read root, so the save is refused at
@@ -184,6 +186,24 @@ fn saving_by_shortcut_answers_within_its_own_update() {
         if runtime.save_error() == Some("The original read root is unavailable; reopen this file before saving."))
     );
     projection_oracle::assert_projected(&mut app);
+}
+
+#[test]
+fn saving_by_shortcut_works_on_a_non_latin_layout() {
+    // On a Russian layout the S key types "ы"; the chord is read through the
+    // physical key, as undo and redo are.
+    let (mut app, card) = repository_app();
+    let save = press(
+        keyboard::Key::Character("ы".into()),
+        Code::KeyS,
+        keyboard::Modifiers::COMMAND,
+    );
+    drop(app.update(save));
+    assert!(
+        matches!(app.cards.get(&card), Some(CardRuntime::Repository(runtime))
+        if runtime.save_error() == Some("The original read root is unavailable; reopen this file before saving.")),
+        "Ctrl+S on a Cyrillic layout attempts the save"
+    );
 }
 
 /// Every command that stands for another message, chosen from the palette,

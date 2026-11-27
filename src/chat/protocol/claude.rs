@@ -2,7 +2,7 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, ProcessSpec, QueuedInput, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -322,6 +322,227 @@ pub fn align_resume_identity(arguments: &mut [String], id: &str) -> Result<(), S
     Ok(())
 }
 
+pub(crate) fn managed_attribution(
+    recipe: &crate::model::LaunchRecipe,
+    sources: &str,
+) -> Option<Value> {
+    if crate::device::is_remote() {
+        return None;
+    }
+    let homes = account::home::Homes::installation()?;
+    let system = account::Account::system(Provider::Claude).resolved_home()?;
+    chat::managed_claude_attribution(recipe, &homes, &system, sources)
+}
+
+pub(crate) fn attribution_settings(
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+) -> Option<String> {
+    let mut settings: serde_json::Map<String, Value> = match explicit {
+        Some(value) => serde_json::from_str(value).ok()?,
+        None => serde_json::Map::new(),
+    };
+    if settings.contains_key("attribution") {
+        return None;
+    }
+    settings.insert("attribution".into(), attribution()?);
+    Some(Value::Object(settings).to_string())
+}
+
+/// The common inline case stays small. Larger settings travel via Claude's
+/// file option so their content cannot exceed an OS argument or environment
+/// entry limit.
+pub(crate) const MAX_INLINE_ATTRIBUTION: usize = 4 * 1024;
+const MAX_SETTINGS_FILE: u64 = 2 * 1024 * 1024;
+
+fn attribution_filename(settings: &str) -> String {
+    use sha2::{Digest, Sha256};
+    format!(".claude-attribution-{:x}.json", Sha256::digest(settings))
+}
+
+fn write_attribution_file(directory: &Path, settings: &str) -> std::io::Result<String> {
+    use std::io::Write;
+    if settings.len() as u64 > MAX_SETTINGS_FILE {
+        return Err(std::io::Error::other(
+            "Claude settings exceed the file option limit",
+        ));
+    }
+    let path = directory.join(attribution_filename(settings));
+    let argument = path
+        .to_str()
+        .filter(|value| value.len() <= MAX_INLINE_ATTRIBUTION)
+        .ok_or_else(|| {
+            std::io::Error::other("The Claude settings path cannot be passed in argv")
+        })?;
+    if !path.exists() {
+        let mut file = tempfile::NamedTempFile::new_in(directory)?;
+        file.write_all(settings.as_bytes())?;
+        match file.persist_noclobber(&path) {
+            Ok(_) => {}
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.error),
+        }
+    }
+    if read_attribution_file(directory, argument).as_deref() != Some(settings) {
+        return Err(std::io::Error::other(
+            "Cannot verify the private Claude settings override",
+        ));
+    }
+    Ok(argument.to_owned())
+}
+
+fn read_attribution_file(directory: &Path, argument: &str) -> Option<String> {
+    use std::io::Read;
+    let path = Path::new(argument);
+    if path.parent() != Some(directory)
+        || !path
+            .file_name()?
+            .to_str()?
+            .starts_with(".claude-attribution-")
+    {
+        return None;
+    }
+    let mut value = String::new();
+    crate::secure_file::open_existing_private_file_readonly(path)
+        .ok()?
+        .take(MAX_SETTINGS_FILE + 1)
+        .read_to_string(&mut value)
+        .ok()?;
+    (value.len() as u64 <= MAX_SETTINGS_FILE
+        && path.file_name()?.to_str()? == attribution_filename(&value))
+    .then_some(value)
+}
+
+/// Apply an override to an inline settings value or an otherwise bare
+/// launch. Explicit file settings stay with Claude. Only a bare launch may
+/// write a large standalone attribution value to process-owned storage.
+pub(crate) fn launch_attribution_argument(
+    explicit: Option<&str>,
+    attribution: impl FnOnce() -> Option<Value>,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Option<String> {
+    let value = attribution_settings(explicit, attribution)?;
+    let existing = explicit.map_or(0, str::len);
+    if value.len() <= existing + MAX_INLINE_ATTRIBUTION {
+        return Some(value);
+    }
+    if explicit.is_some() {
+        return None;
+    }
+    match directory().and_then(|directory| write_attribution_file(&directory, &value)) {
+        Ok(argument) => Some(argument),
+        Err(error) => {
+            tracing::warn!(%error, "cannot stage the managed Claude attribution setting");
+            None
+        }
+    }
+}
+
+pub(crate) fn terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let root = crate::instance::runtime_directory()?;
+    let boot = crate::daemon::read_boot_id()?;
+    Ok(root.join(format!(".claude-attribution-boot-{}", boot.as_str())))
+}
+
+pub(crate) fn prepare_terminal_attribution_directory() -> std::io::Result<PathBuf> {
+    let directory = terminal_attribution_directory()?;
+    crate::secure_file::prepare_private_directory(&directory)?;
+    // The runtime can be persistent on Darwin. No terminal from a past
+    // kernel boot can still use these generated attribution-only files.
+    if let Some(root) = directory.parent() {
+        for entry in std::fs::read_dir(root)?.flatten() {
+            if entry.path() != directory
+                && entry.file_type().is_ok_and(|kind| kind.is_dir())
+                && entry.file_name().to_str().is_some_and(|name| {
+                    name.strip_prefix(".claude-attribution-boot-")
+                        .is_some_and(|boot| uuid::Uuid::parse_str(boot).is_ok())
+                })
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
+            }
+        }
+    }
+    Ok(directory)
+}
+
+pub(crate) fn decode_attribution_argument(argument: &str) -> Option<String> {
+    let candidate = argument.strip_prefix("--settings=")?;
+    if candidate.starts_with('{') {
+        return Some(candidate.to_owned());
+    }
+    read_attribution_file(&terminal_attribution_directory().ok()?, candidate)
+}
+
+pub(crate) fn apply_spawn_attribution(spec: &mut ProcessSpec, store: &Path) {
+    let recipe = spawn_attribution_recipe(spec);
+    apply_spawn_attribution_with(
+        &mut spec.arguments,
+        &recipe,
+        || Ok(store.to_path_buf()),
+        managed_attribution,
+    );
+}
+
+fn spawn_attribution_recipe(spec: &ProcessSpec) -> crate::model::LaunchRecipe {
+    // The provider's spawn clears the inherited environment. A missing
+    // key belongs to this exact execution, never the helper's own account.
+    let mut unset_environment = spec.unset_environment.clone();
+    for name in ["HOME", "CLAUDE_CONFIG_DIR"] {
+        if !spec.environment.contains_key(name) {
+            unset_environment.insert(name.to_owned());
+        }
+    }
+    crate::model::LaunchRecipe {
+        program: spec.program.clone(),
+        arguments: Vec::new(),
+        working_directory: spec.working_directory.clone(),
+        environment: spec.environment.clone(),
+        unset_environment,
+    }
+}
+
+fn apply_spawn_attribution_with(
+    arguments: &mut Vec<String>,
+    recipe: &crate::model::LaunchRecipe,
+    directory: impl FnOnce() -> std::io::Result<PathBuf>,
+    attribution: impl FnOnce(&crate::model::LaunchRecipe, &str) -> Option<Value>,
+) {
+    use crate::chat::fresh::{ArgumentArity, claude_arity};
+
+    let mut settings = None;
+    let mut sources = "user,project,local";
+    let mut args = arguments.iter().enumerate().peekable();
+    while let Some((_, flag)) = args.next() {
+        match claude_arity(flag) {
+            Some(ArgumentArity::Value) => {
+                let Some((index, value)) = args.next() else {
+                    break;
+                };
+                match flag.as_str() {
+                    "--settings" => settings = Some(index),
+                    "--setting-sources" => sources = value,
+                    _ => {}
+                }
+            }
+            Some(ArgumentArity::Values) => {
+                while args.next_if(|(_, value)| !value.starts_with('-')).is_some() {}
+            }
+            _ => {}
+        }
+    }
+    if let Some(value) = launch_attribution_argument(
+        settings.map(|index| arguments[index].as_str()),
+        || attribution(recipe, sources),
+        directory,
+    ) {
+        if let Some(index) = settings {
+            arguments[index] = value;
+        } else {
+            arguments.extend(["--settings".into(), value]);
+        }
+    }
+}
+
 fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
     if launch.recipe.arguments.len() > 128
         || launch
@@ -400,10 +621,11 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         } else if crate::chat::fresh::claude_arity(flag)
             == Some(crate::chat::fresh::ArgumentArity::Values)
         {
-            result.push(flag.into());
-            if let Some(value) = inline {
-                result.push(value.into());
+            if inline.is_some() {
+                // Keep variadic inline values distinct from subsequent options.
+                result.push(arg.clone());
             } else {
+                result.push(flag.into());
                 let start = result.len();
                 while args.peek().is_some_and(|value| !value.starts_with('-')) {
                     result.push(args.next().unwrap().clone());
@@ -557,12 +779,23 @@ struct Stream {
 }
 
 struct Submission {
-    preview: chat::QueuedMessage,
+    input: QueuedInput,
     mode: PromptMode,
     /// Queued input enters the transcript only when the provider consumes it.
     deferred: Option<Vec<Item>>,
     /// Encoded input bounds retained text and image data across the queue.
     deferred_bytes: usize,
+    /// Claude Code has reported this message as queued. Until then it is
+    /// still being admitted, and a request to send it now would find nothing.
+    admitted: bool,
+}
+
+/// A written request to send what is queued now.
+struct SendNowRequest {
+    /// The control request, to tell its answer from another's.
+    id: String,
+    /// The messages it was for. One queued after it waits its own turn.
+    messages: Vec<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -646,6 +879,18 @@ struct Claude {
     busy: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
+    /// The CLI's `system/init` advertises `interrupt_send_now_v1`. Any other
+    /// CLI reads the same request as a plain interrupt, which would stop the
+    /// turn and its background agents.
+    send_now_advertised: bool,
+    send_now: Option<chat::SendNow>,
+    /// What was written for the current request. Until every queued message
+    /// has been admitted the request is held back, and this stays empty.
+    send_now_request: Option<SendNowRequest>,
+    /// The notification key of a turn that made way for a Send now, while
+    /// the messages it made way for have yet to start. Their turn carries on
+    /// its run and settles it; should none start, this one settles then.
+    hand_over: Option<String>,
     submissions: HashMap<String, Submission>,
     queued: Vec<chat::QueuedMessage>,
     interruption: Option<bool>,
@@ -667,6 +912,8 @@ struct Claude {
     /// Which result-delimited turn has already published its start. Busy may
     /// stay true between turns while background permission decisions remain.
     started_generation: Option<u64>,
+    confirmed_start_generation: Option<u64>,
+    root_message_starts: VecDeque<[u8; 32]>,
     deferred_attention: HashMap<
         u64,
         (
@@ -1039,8 +1286,155 @@ impl Claude {
             // Headless Claude Code's interrupt aborts the controller its
             // background agents run under, so it stops them with the turn.
             interrupt_stops_background: true,
+            send_queued_now: self.async_input && self.send_now_advertised,
             ..Capabilities::default()
         }
+    }
+    fn set_send_now(&mut self, state: Option<chat::SendNow>, step: &mut Step) {
+        if self.send_now != state {
+            self.send_now = state;
+            step.events.push(Event::SendNow(state));
+        }
+    }
+    /// The person's Send now: hand everything queued to the running turn.
+    fn request_send_now(&mut self) -> Result<Step, String> {
+        if !self.async_input || !self.send_now_advertised {
+            return Err("This Claude version cannot take queued messages early".into());
+        }
+        let mut step = Step::default();
+        if self.send_now.is_some_and(chat::SendNow::in_flight) {
+            return Ok(step);
+        }
+        if self.queued.is_empty() {
+            self.set_send_now(None, &mut step);
+            return Ok(step);
+        }
+        self.send_now_request = None;
+        self.set_send_now(Some(chat::SendNow::Requested), &mut step);
+        self.release_send_now(&mut step);
+        Ok(step)
+    }
+    /// Writes the requested Send now once Claude Code counts every queued
+    /// message as waiting: a request naming one it is still admitting would
+    /// find nothing to send.
+    fn release_send_now(&mut self, step: &mut Step) {
+        if self.send_now != Some(chat::SendNow::Requested) || self.send_now_request.is_some() {
+            return;
+        }
+        let admitted = self.queued.iter().all(|message| {
+            self.submissions
+                .get(&message.id)
+                .is_none_or(|submission| submission.admitted)
+        });
+        if !admitted {
+            return;
+        }
+        // A message on its way back to the composer is not sent.
+        let messages: Vec<String> = self
+            .queued
+            .iter()
+            .map(|message| message.id.clone())
+            .filter(|id| !self.taking_back(id))
+            .collect();
+        // Once the request acts, everything queued goes with the message it
+        // names, so it names the first to be delivered: messages for the
+        // next step wait ahead of those for the turn's end.
+        let Some(first) = messages.first().cloned() else {
+            self.set_send_now(None, step);
+            return;
+        };
+        match self.control(json!({"subtype":"interrupt", "send_now":true, "message_uuid":first})) {
+            Ok(request) => {
+                self.send_now_request = Some(SendNowRequest {
+                    id: string(&request.writes[0], "request_id").into(),
+                    messages,
+                });
+                step.writes.extend(request.writes);
+            }
+            Err(message) => {
+                self.set_send_now(None, step);
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+        }
+    }
+    /// Whether the queued message `id` has been asked back and not yet left.
+    fn taking_back(&self, id: &str) -> bool {
+        self.controls.values().any(|request| {
+            request["subtype"] == "cancel_async_message" && request["message_uuid"] == id
+        })
+    }
+    /// The queue has changed under the request: it is over once the messages
+    /// it was for have left, and a held request may now be written.
+    fn settle_send_now(&mut self, step: &mut Step) {
+        let done = match &self.send_now_request {
+            // A refusal answered for what was waiting then, not for what
+            // waits now.
+            Some(request) if self.send_now == Some(chat::SendNow::Declined) => !self
+                .queued
+                .iter()
+                .map(|queued| &queued.id)
+                .eq(request.messages.iter()),
+            Some(request) => !self
+                .queued
+                .iter()
+                .any(|queued| request.messages.contains(&queued.id)),
+            None => self.queued.is_empty(),
+        };
+        if done {
+            self.send_now_request = None;
+            self.set_send_now(None, step);
+            return;
+        }
+        self.release_send_now(step);
+    }
+    /// Settles a turn that made way once nothing it made way for is left to
+    /// start: its messages were taken back or dropped first.
+    fn finish_hand_over(&mut self, step: &mut Step) {
+        let Some(key) = self.hand_over.take() else {
+            return;
+        };
+        let outcome = crate::notifications::Kind::Succeeded;
+        let execution = self.execution.take();
+        if let Some(run) = execution {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Settled,
+            });
+        }
+        step.events.push(Event::TurnFinished {
+            key: Some(key),
+            outcome,
+        });
+        if let Some(run) = execution {
+            step.events.push(Event::Execution {
+                run,
+                event: crate::agent_execution::ProviderEvent::Finished { outcome },
+            });
+        }
+        let busy = !self.pending.is_empty();
+        self.status(
+            busy,
+            if busy {
+                "Claude turn ended; decisions remain"
+            } else {
+                "Claude turn complete"
+            },
+            step,
+        );
+    }
+    /// Whether a main-turn result is how the turn made way for the person's
+    /// Send now rather than an ending of its own: Claude Code stopped it, or
+    /// cut it short to start the messages as a new turn. A Stop the person
+    /// pressed meanwhile makes it their stop, and a failure with its own
+    /// account of itself is still that failure.
+    fn result_made_way(&self, frame: &Value) -> bool {
+        self.send_now_request.is_some()
+            && self.send_now.is_some_and(chat::SendNow::in_flight)
+            && self.interruption.is_none()
+            && cut_short(frame)
     }
     fn accept_user_prompt(&mut self, id: &str, step: &mut Step) {
         if self.accepted_user_prompts.iter().any(|known| known == id) {
@@ -1070,6 +1464,29 @@ impl Claude {
             self.stop_marked = false;
             step.events.push(Event::TurnStarted);
         }
+    }
+    fn confirm_turn_start(&mut self, step: &mut Step) {
+        self.start_turn(step);
+        if self.confirmed_start_generation != Some(self.attention_generation) {
+            self.confirmed_start_generation = Some(self.attention_generation);
+            step.events.push(Event::TurnStartConfirmed);
+        }
+    }
+    fn confirm_root_message(&mut self, frame: &Value, id: &str, step: &mut Step) {
+        use sha2::{Digest, Sha256};
+
+        if frame["isReplay"] == true {
+            return;
+        }
+        let id: [u8; 32] = Sha256::digest(id.as_bytes()).into();
+        if self.root_message_starts.contains(&id) {
+            return;
+        }
+        self.root_message_starts.push_back(id);
+        if self.root_message_starts.len() > 2048 {
+            self.root_message_starts.pop_front();
+        }
+        self.confirm_turn_start(step);
     }
     fn status(&mut self, busy: bool, detail: impl Into<String>, step: &mut Step) {
         self.busy = busy;
@@ -1373,11 +1790,12 @@ impl Claude {
         step.events.push(Event::PromptSuggestionCleared);
         self.message(&frame, &mut step)?;
         if self.async_input {
-            let mut preview = chat::QueuedMessage::new(id.clone(), text);
-            preview.attachments = attachments;
-            if mode == PromptMode::Steer {
-                preview.delivery = chat::QueueDelivery::NextStep;
-            }
+            let delivery = if mode == PromptMode::Steer {
+                chat::QueueDelivery::NextStep
+            } else {
+                chat::QueueDelivery::NextTurn
+            };
+            let input = QueuedInput::new(id.clone(), text, attachments, delivery);
             let deferred = if mode != PromptMode::Send {
                 let mut items = Vec::new();
                 for event in std::mem::take(&mut step.events) {
@@ -1401,7 +1819,7 @@ impl Claude {
                 } else {
                     self.queued.len()
                 };
-                self.queued.insert(position, preview.clone());
+                self.queued.insert(position, input.preview.clone());
                 step.events.push(Event::QueueChanged(self.queued.clone()));
                 Some(items)
             } else {
@@ -1410,10 +1828,11 @@ impl Claude {
             self.submissions.insert(
                 id.clone(),
                 Submission {
-                    preview,
+                    input,
                     mode,
                     deferred,
                     deferred_bytes,
+                    admitted: false,
                 },
             );
         }
@@ -1942,8 +2361,7 @@ impl Claude {
             self.refused_calls
                 .retain(|key| key.parent.as_deref() != child);
         }
-        if let Some(parent) = child
-            && fresh_live_carrier
+        let fresh_assistant_output = fresh_live_carrier
             && role == Role::Assistant
             && frame["error"].is_null()
             && frame["isMeta"].as_bool() != Some(true)
@@ -1977,7 +2395,9 @@ impl Claude {
                                 .any(|field| !string(&block["source"], field).trim().is_empty()),
                             _ => false,
                         })
-                    }))
+                    }));
+        if let Some(parent) = child
+            && fresh_assistant_output
         {
             step.events.push(Event::Subagent {
                 id: parent.into(),
@@ -1992,6 +2412,14 @@ impl Claude {
                 waiting: Some(false),
                 detail: Some(String::new()),
             });
+        }
+        if child.is_none()
+            && fresh_assistant_output
+            && frame["isSynthetic"] != true
+            && let Some(id) = frame["message"]["id"].as_str().filter(|id| !id.is_empty())
+        {
+            // A provider may deliver a complete answer without partial events.
+            self.confirm_root_message(frame, id, step);
         }
         // Another agent's delivery is shown as one, including the hand-backs
         // Claude marks as meta.
@@ -2152,6 +2580,7 @@ impl Claude {
                 let reference = references.get(&index).cloned();
                 let unavailable = unverified.get(&index);
                 let correlated_call = history_calls.get(&index);
+                let position = index;
                 let index = self
                     .blocks
                     .iter()
@@ -2200,12 +2629,18 @@ impl Claude {
                 };
                 match block_type {
                     "text" | "thinking" | "redacted_thinking" => {
-                        let thinking = string(block, "type") != "text";
-                        let text = if string(block, "type") == "redacted_thinking" {
-                            "[Redacted thinking]"
-                        } else {
-                            string(block, if thinking { "thinking" } else { "text" })
+                        let text = match block_type {
+                            "redacted_thinking" => "[Redacted thinking]",
+                            "thinking" => string(block, "thinking"),
+                            _ => string(block, "text"),
                         };
+                        // Prose between tool calls that the server sends as a
+                        // thinking block. A streamed block started out as
+                        // thinking; this item, under the same id, replaces it.
+                        let narration = role == Role::Assistant
+                            && !context
+                            && narration::is_narration(frame, position, block);
+                        let thinking = block_type != "text" && !narration;
                         // A reader's prompt from another Claude client can
                         // carry the client's notes to the model as blocks
                         // of their own, and a fork's first turn its setup.
@@ -2222,6 +2657,8 @@ impl Claude {
                             context_item(format!("{id}:{index}"), text.into())
                         } else if let Some(output) = local {
                             text_item(format!("{id}:{index}"), Role::System, output, false)
+                        } else if narration {
+                            commentary_item(format!("{id}:{index}"), text.into())
                         } else {
                             text_item(format!("{id}:{index}"), role, text.into(), thinking)
                         }));
@@ -3679,6 +4116,23 @@ impl Adapter for Claude {
     fn outcome_pending(&self) -> bool {
         !self.deferred_attention.is_empty()
     }
+
+    fn recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {
+        if !self.async_input {
+            return None;
+        }
+        let proved: Vec<_> = self
+            .queued
+            .iter()
+            .filter_map(|message| self.submissions.get(&message.id))
+            .filter(|submission| submission.admitted)
+            .map(|submission| submission.input.recovery())
+            .collect();
+        // Optimistically shown submissions have not been reported held by
+        // the provider. A later receipt must never claim they were returned.
+        (!proved.is_empty() || (self.queued.is_empty() && self.submissions.is_empty()))
+            .then_some(proved)
+    }
     fn metadata_wake(&self) -> Option<super::MetadataWake<'_>> {
         // Result frames account for ordinary writes during a turn. While
         // idle a title can change without any provider frame to wake us.
@@ -3943,6 +4397,7 @@ impl Adapter for Claude {
                 }
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
+            Command::SendQueuedNow => self.request_send_now(),
             Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
@@ -4135,6 +4590,13 @@ impl Adapter for Claude {
             }
         }
     }
+    fn expendable_write(&self, frame: &Value) -> bool {
+        frame["type"] == "control_request"
+            && frame["request_id"]
+                .as_str()
+                .and_then(|id| self.controls.get(id))
+                .is_some_and(|request| request["_cagents_automatic"] == true)
+    }
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
         for event in &mut step.events {
@@ -4301,6 +4763,8 @@ impl Claude {
             }
             "conversation_reset" => {
                 self.started_generation = None;
+                self.confirmed_start_generation = None;
+                self.root_message_starts.clear();
                 self.session_id = None;
                 self.history = None;
                 if let Some(titles) = &mut self.titles {
@@ -4344,6 +4808,9 @@ impl Claude {
                 self.handed_back.clear();
                 self.submissions.clear();
                 self.queued.clear();
+                self.send_now = None;
+                self.send_now_request = None;
+                self.hand_over = None;
                 self.stream_events.clear();
                 self.carrier_items.clear();
                 self.carrier_order.clear();
@@ -4399,7 +4866,15 @@ impl Claude {
                         self.interruption = accepted.then_some(true);
                     }
                 }
+                let send_now = self
+                    .send_now_request
+                    .as_ref()
+                    .is_some_and(|request| request.id == id);
                 if string(response, "subtype") == "error" {
+                    if send_now {
+                        self.send_now_request = None;
+                        self.set_send_now(None, &mut step);
+                    }
                     if string(&request, "subtype") == "cancel_async_message"
                         && let Some(id) = request["message_uuid"].as_str()
                     {
@@ -4424,12 +4899,13 @@ impl Claude {
                     // turns report, which is nothing the reader has to act
                     // on. A refresh the reader asked for still says why not.
                     if request["_cagents_automatic"] != true {
+                        let what = if request["send_now"] == true {
+                            "send now"
+                        } else {
+                            string(&request, "subtype")
+                        };
                         step.events.push(Event::Error {
-                            message: format!(
-                                "Claude {}: {}",
-                                string(&request, "subtype"),
-                                string(response, "error")
-                            ),
+                            message: format!("Claude {what}: {}", string(response, "error")),
                             fatal: string(&request, "subtype") == "initialize",
                         });
                     }
@@ -4567,6 +5043,29 @@ impl Claude {
                                     string(&request, "mode")
                                 ),
                             });
+                        }
+                        "interrupt" if request["send_now"] == true => {
+                            // The turn's result or the messages starting say
+                            // how it ended, and may have outrun this answer:
+                            // only the request still in hand is updated.
+                            if send_now {
+                                match response["response"]["send_now"].as_str() {
+                                    Some("delivering") => self
+                                        .set_send_now(Some(chat::SendNow::Delivering), &mut step),
+                                    Some("stopped") => {
+                                        self.set_send_now(Some(chat::SendNow::Stopped), &mut step)
+                                    }
+                                    Some("nothing_waiting") => {
+                                        self.set_send_now(Some(chat::SendNow::Declined), &mut step)
+                                    }
+                                    // A CLI that does not say what it did gives
+                                    // nothing to show; the person may ask again.
+                                    _ => {
+                                        self.send_now_request = None;
+                                        self.set_send_now(None, &mut step);
+                                    }
+                                }
+                            }
                         }
                         "interrupt" => {
                             step.events.push(Event::Status {
@@ -4736,7 +5235,23 @@ impl Claude {
                     )));
                 }
                 self.turn_visible_content = false;
-                let can_suggest = frame["parent_tool_use_id"].is_null()
+                // The turn made way for messages the person asked to send now.
+                // How it ended is that request's doing, not a failure or a
+                // stop of theirs, and the turn it made way for carries on
+                // the work, and so the run that asked for it: that turn's
+                // own result settles both.
+                let made_way = self.result_made_way(&frame);
+                // Until the messages it made way for start, the conversation
+                // is still at work on them.
+                let handing_over = made_way && !self.queued.is_empty();
+                self.send_now_request = None;
+                self.set_send_now(None, &mut step);
+                if made_way {
+                    // Its stop record has already been drawn where it was.
+                    self.stop_marked = false;
+                }
+                let can_suggest = !made_way
+                    && frame["parent_tool_use_id"].is_null()
                     && frame["is_error"] != true
                     && frame["subtype"] == "success"
                     && self.interruption.is_none()
@@ -4749,7 +5264,7 @@ impl Claude {
                 // Code's record of the stop or its acknowledgement says the
                 // stop took: a stop still unacknowledged when the turn ends
                 // may yet be refused, so the turn's own failure stands.
-                let stopped = self.stop_marked || interruption == Some(true);
+                let stopped = !made_way && (self.stop_marked || interruption == Some(true));
                 if stopped {
                     self.settle_stopped_calls(None, &mut step);
                     if !std::mem::take(&mut self.stop_marked) {
@@ -4763,6 +5278,16 @@ impl Claude {
                 }
                 if had_turn || frame["uuid"].as_str().is_some() {
                     step.events.push(Event::TurnSettled);
+                }
+                if handing_over {
+                    self.hand_over = Some(format!(
+                        "claude:{}",
+                        frame["uuid"]
+                            .as_str()
+                            .map(str::to_owned)
+                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+                    ));
+                } else if had_turn || frame["uuid"].as_str().is_some() {
                     use crate::notifications::Kind;
                     // A delayed interrupt acknowledgement can arrive during
                     // another turn. Allocate its fallback identity now instead
@@ -4777,7 +5302,7 @@ impl Claude {
                     let outcome =
                         if interruption == Some(true) || (interruption.is_none() && stopped) {
                             Kind::Cancelled
-                        } else if frame["is_error"].as_bool() == Some(true) {
+                        } else if frame["is_error"].as_bool() == Some(true) && !made_way {
                             Kind::Failed
                         } else {
                             Kind::Succeeded
@@ -4811,11 +5336,13 @@ impl Claude {
                 });
                 // Background agents have their own status. They must not
                 // prevent new input once the main turn has ended.
-                let busy = !self.pending.is_empty();
+                let busy = !self.pending.is_empty() || handing_over;
                 self.ended_interrupted = stopped;
                 self.status(
                     busy,
-                    if busy {
+                    if handing_over {
+                        "Claude is starting the queued messages"
+                    } else if busy {
                         "Claude turn ended; decisions remain"
                     } else if stopped {
                         chat::TURN_INTERRUPTED
@@ -4866,7 +5393,7 @@ impl Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) && !stopped {
+                if frame["is_error"].as_bool() == Some(true) && !stopped && !made_way {
                     let errors = content_text(&frame["errors"]);
                     let message = if !errors.is_empty() {
                         errors
@@ -4906,10 +5433,11 @@ impl Claude {
                 let state = required(&frame, "state")?;
                 if let Some(id) = frame["command_uuid"].as_str() {
                     if state == "queued" {
-                        if let Some(message) = self.submissions.get(id)
-                            && !self.queued.iter().any(|queued| queued.id == id)
-                        {
-                            self.queued.push(message.preview.clone());
+                        if let Some(message) = self.submissions.get_mut(id) {
+                            message.admitted = true;
+                            if !self.queued.iter().any(|queued| queued.id == id) {
+                                self.queued.push(message.input.preview.clone());
+                            }
                         }
                     } else if matches!(state, "started" | "completed" | "cancelled" | "discarded") {
                         if matches!(state, "started" | "completed")
@@ -4918,10 +5446,14 @@ impl Claude {
                             self.accept_user_prompt(id, &mut step);
                         }
                         if state == "started" && self.submissions.contains_key(id) {
-                            self.start_turn(&mut step);
+                            self.hand_over = None;
+                            self.confirm_turn_start(&mut step);
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
+                        if self.queued.is_empty() {
+                            self.finish_hand_over(&mut step);
+                        }
                         if let Some(submission) = self.submissions.remove(id)
                             && let Some(items) = submission.deferred
                         {
@@ -4939,6 +5471,7 @@ impl Claude {
                         }
                     }
                     step.events.push(Event::QueueChanged(self.queued.clone()));
+                    self.settle_send_now(&mut step);
                 }
                 step.events.push(Event::Status {
                     busy: self.busy,
@@ -5591,7 +6124,7 @@ fn injected(content: &Value) -> Injected<'_> {
 
 /// Whether `text` is wholly one of the notes Claude Code writes for the
 /// model alone; see [`Injected::ModelOnly`].
-fn model_only_note(text: &str) -> bool {
+pub(crate) fn model_only_note(text: &str) -> bool {
     let text = text.trim();
     let wrapped = |tag: &str| {
         let mut rest = text;
@@ -6710,16 +7243,33 @@ fn text_item(id: String, role: Role, text: String, thinking: bool) -> Item {
     Item {
         id,
         role,
-        // Claude's stream-json frames carry no turn-phase label: an assistant
-        // text block is shaped identically whether it narrates progress or
-        // answers the question, and the closing `result` frame only repeats
-        // text that was already delivered as its own block. A guessed phase
-        // would demote real answers into narration, so every text item is
-        // final until the provider itself says otherwise.
+        // A Claude text block carries no turn-phase label: it is shaped
+        // identically whether it narrates progress or answers the question,
+        // and the closing `result` frame only repeats text that was already
+        // delivered as its own block. A guessed phase would demote real
+        // answers into narration, so a text block is final. The narration
+        // Claude does label arrives as thinking blocks; see
+        // [`commentary_item`].
         content: ItemContent::Text {
             text,
             thinking,
             phase: Phase::Final,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+/// A thinking block the server labelled narration (see [`narration`]): the
+/// agent's progress prose between tool calls, not its reasoning.
+fn commentary_item(id: String, text: String) -> Item {
+    Item {
+        id,
+        role: Role::Assistant,
+        content: ItemContent::Text {
+            text,
+            thinking: false,
+            phase: Phase::Commentary,
         },
         started_at: None,
         at: None,
@@ -7096,6 +7646,43 @@ fn stop_record(message: &Value) -> bool {
     )
 }
 
+/// Whether a main-turn result says only that the turn was cut short: stopped
+/// while streaming or running tools, as Claude Code ends a turn it interrupts.
+/// Claude Code 2.1.296 words it as `error_during_execution` with nothing but
+/// its own diagnostics, or as a success that stopped for tool use, and names
+/// an abort as the terminal reason where it gives one.
+fn cut_short(frame: &Value) -> bool {
+    if frame
+        .get("terminal_reason")
+        .is_some_and(|reason| reason != "aborted_streaming" && reason != "aborted_tools")
+    {
+        return false;
+    }
+    match string(frame, "subtype") {
+        // A named abort is cut short whatever it stopped for.
+        "success" => {
+            frame["is_error"] != true
+                && (frame["stop_reason"] == "tool_use" || frame.get("terminal_reason").is_some())
+        }
+        // Without an abort named, only Claude Code's own diagnostics say
+        // nothing else went wrong.
+        "error_during_execution" => {
+            let diagnostics = frame["errors"].as_array().is_some_and(|errors| {
+                errors.iter().all(|error| {
+                    error
+                        .as_str()
+                        .is_some_and(|error| error.starts_with("[ede_diagnostic]"))
+                })
+            });
+            match frame.get("terminal_reason") {
+                Some(_) => frame["errors"].is_null() || diagnostics,
+                None => diagnostics && !frame["errors"].as_array().is_some_and(Vec::is_empty),
+            }
+        }
+        _ => false,
+    }
+}
+
 /// Whether a failed result is the call being refused or cut short rather
 /// than failing: the person declined it, or it was interrupted before it
 /// finished. Claude Code reports both as errors, in fixed wording.
@@ -7360,7 +7947,7 @@ impl Claude {
                     .is_none_or(|stream| stream.message != id)
                 {
                     let stream = Stream {
-                        message: id,
+                        message: id.clone(),
                         truncated: false,
                     };
                     // A message interrupted before its `message_stop` is
@@ -7370,7 +7957,7 @@ impl Claude {
                     }
                 }
                 if parent.is_empty() {
-                    self.start_turn(step);
+                    self.confirm_root_message(frame, &id, step);
                     self.update_usage(&event["message"]["usage"], step);
                     self.observe_request(&event["message"]["usage"], step);
                     self.status(true, "Claude is working", step);
@@ -7731,7 +8318,22 @@ impl Claude {
             "permission_denied" => {
                 self.permission_denied(frame["parent_tool_use_id"].as_str(), frame, step)?
             }
-            "init" | "commands_changed" => self.metadata(frame, step),
+            "init" | "commands_changed" => {
+                // The initialize response has a `capabilities` list of its
+                // own, which never names this; only `system/init` speaks for
+                // the input transport.
+                if subtype == "init" {
+                    self.send_now_advertised =
+                        frame["capabilities"]
+                            .as_array()
+                            .is_some_and(|capabilities| {
+                                capabilities
+                                    .iter()
+                                    .any(|capability| capability == "interrupt_send_now_v1")
+                            });
+                }
+                self.metadata(frame, step)
+            }
             "model_refusal_fallback" => {
                 self.retract(&frame["retracted_message_uuids"], step)?;
                 step.events.push(Event::Item(text_item(
@@ -9738,9 +10340,10 @@ impl Claude {
                     let schema = &request["requested_schema"];
                     let fields = elicitation_fields(schema)?;
                     let mut content = serde_json::Map::new();
+                    let mut answered = HashSet::new();
                     for answer in &answers {
                         if !fields.iter().any(|field| field.id == answer.field)
-                            || content.contains_key(&answer.field)
+                            || !answered.insert(answer.field.as_str())
                         {
                             return Err(
                                 "Claude elicitation answer has an unknown or duplicate field"
@@ -9748,6 +10351,13 @@ impl Claude {
                             );
                         }
                         let field_schema = &schema["properties"][&answer.field];
+                        // A blank scalar is an absent field: an optional one is
+                        // omitted, and a required one is reported missing below.
+                        if string(field_schema, "type") != "array"
+                            && super::blank_form_answer(&answer.values)
+                        {
+                            continue;
+                        }
                         let value = elicitation_value(field_schema, &answer.values)?;
                         content.insert(answer.field.clone(), value);
                     }
@@ -9936,10 +10546,14 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 mod history_branches;
 #[cfg(test)]
 mod history_tests;
+mod narration;
 mod streamed_input;
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod send_now_tests;
 
 #[cfg(test)]
 mod startup_history_retryability_tests {
@@ -10289,11 +10903,7 @@ mod fresh_recipe_constructor_tests {
                         .windows(2)
                         .any(|pair| pair == ["--system-prompt", system])
                 );
-                assert!(
-                    spec.arguments
-                        .windows(2)
-                        .any(|pair| pair == ["--tools", tool])
-                );
+                assert!(spec.arguments.contains(&format!("--tools={tool}")));
                 let generated: Vec<_> = spec
                     .arguments
                     .iter()

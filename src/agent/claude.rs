@@ -177,6 +177,30 @@ pub(crate) fn transcript_exists(config: &Path, cwd: &Path, id: &str) -> bool {
         })
 }
 
+/// Confirm absence only at a single exact, unsymlinked path below a
+/// canonical configuration root. A missing parent is also absence. An
+/// opaque path, directory error or dangling leaf is not an empty history.
+#[cfg(feature = "host")]
+pub(super) fn absent_transcript_path(config: &Path, cwd: &Path, id: &str) -> Option<PathBuf> {
+    let lookup = TranscriptLookup::new(cwd, id).ok()?;
+    if lookup.hashed() {
+        return None;
+    }
+    let projects = config.join("projects");
+    let project = projects.join(lookup.project);
+    let expected = project.join(lookup.filename);
+    for directory in [&projects, &project] {
+        match std::fs::symlink_metadata(directory) {
+            Ok(metadata) if metadata.is_dir() => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(expected),
+            _ => return None,
+        }
+    }
+    std::fs::symlink_metadata(&expected)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        .then_some(expected)
+}
+
 /// The transcript of conversation `id` that Claude Code keeps under `config`
 /// for a session started in `cwd`, which must already be canonical.
 ///
@@ -195,7 +219,7 @@ pub fn transcript(config: &Path, cwd: &Path, id: &str) -> Result<PathBuf, String
 /// changing the selected conversation.
 #[cfg(any(feature = "ui", feature = "host"))]
 #[derive(Debug)]
-pub(crate) enum TranscriptError {
+pub enum TranscriptError {
     Invalid(String),
     Unavailable(String),
 }
@@ -210,7 +234,7 @@ impl std::fmt::Display for TranscriptError {
 }
 
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) fn transcript_for_start(
+pub fn transcript_for_start(
     config: &Path,
     cwd: &Path,
     id: &str,
@@ -318,7 +342,7 @@ mod tests {
     #[test]
     fn supplementary_characters_count_twice_toward_the_hashed_name_limit() {
         // 101 characters, but 202 UTF-16 code units: Claude hashes this name.
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let config = root.path().join("claude");
         let cwd = PathBuf::from(format!("/x/{}a", "\u{1F600}".repeat(99)));
         let key = project_key(cwd.to_str().unwrap());
@@ -334,7 +358,7 @@ mod tests {
 
     #[test]
     fn missing_claude_history_is_unavailable_until_the_same_path_is_restored() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let config = root.path().join("claude");
         let cwd = root.path().join("project");
         std::fs::create_dir(&cwd).unwrap();
@@ -360,7 +384,7 @@ mod tests {
 
     #[test]
     fn invalid_claude_history_identity_and_symlinks_remain_invalid() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let config = root.path().join("claude");
         let cwd = root.path().join("project");
         std::fs::create_dir(&cwd).unwrap();
@@ -397,7 +421,7 @@ mod tests {
 
     #[test]
     fn hashed_claude_history_directory_io_is_unavailable_until_repaired() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let config = root.path().join("claude");
         let cwd = root.path().join("a".repeat(210));
         std::fs::create_dir(&config).unwrap();
@@ -419,7 +443,7 @@ mod tests {
 
     #[test]
     fn missing_hashed_claude_history_is_unavailable_but_ambiguity_is_invalid() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let config = root.path().join("claude");
         let cwd = root.path().join("a".repeat(210));
         std::fs::create_dir(&cwd).unwrap();
@@ -456,7 +480,7 @@ mod transcript_lookup_tests {
 
     #[test]
     fn transcript_presence_and_reader_share_exact_session_validation() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let directory = root.path().join("projects/-project");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("not-a-uuid.jsonl"), b"{}").unwrap();
@@ -471,7 +495,7 @@ mod transcript_lookup_tests {
     #[test]
     fn transcript_presence_and_reader_agree_on_unicode_and_long_path_candidates() {
         use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let unicode = root.path().join("projects/-work-na-ve-app-project");
         std::fs::create_dir_all(&unicode).unwrap();
         let exact = unicode.join(format!("{ID}.jsonl"));
@@ -524,7 +548,7 @@ mod transcript_lookup_tests {
     #[test]
     fn transcript_reader_keeps_long_path_ambiguity_and_escape_checks() {
         use std::os::unix::fs::symlink;
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let cwd = format!("/{}", "a".repeat(210));
         let prefix = format!("-{}-", "a".repeat(199));
         let projects = root.path().join("projects");

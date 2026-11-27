@@ -1347,7 +1347,11 @@ impl Cagents {
                     }
                     ProjectCommand::Reveal => {
                         self.project_ui.dialog = None;
-                        return launch_task(PathBuf::from("xdg-open"), target.path, false);
+                        return launch_task(
+                            PathBuf::from(file_manager::FOLDER_OPENER),
+                            target.path,
+                            false,
+                        );
                     }
                     ProjectCommand::NewTerminal => {
                         self.project_ui.dialog = None;
@@ -2001,18 +2005,27 @@ impl Cagents {
         None
     }
 
-    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
-        let dirty = self
-            .sidebar_model
+    fn deletion_target_row(&self, target: &Target) -> Option<&SidebarWorktree> {
+        self.sidebar_model
             .projects
             .iter()
-            .find(|project| project.id == target.project)
-            .and_then(|project| {
-                project
-                    .worktrees
-                    .iter()
-                    .find(|worktree| Some(worktree.id) == target.worktree)
-            })
+            .find(|project| project.id == target.project)?
+            .worktrees
+            .iter()
+            .find(|worktree| Some(worktree.id) == target.worktree)
+    }
+
+    /// The sentence naming the branch a deletion keeps. A detached HEAD has
+    /// none to name, and its commits are guarded when deletion runs instead.
+    fn worktree_retained_branch(&self, target: &Target) -> Option<String> {
+        let row = self.deletion_target_row(target)?;
+        let branch = row.branch.as_deref().filter(|_| !row.detached)?;
+        Some(format!("The branch {branch} is kept."))
+    }
+
+    fn worktree_deletion_warning(&self, target: &Target) -> Option<String> {
+        let dirty = self
+            .deletion_target_row(target)
             .and_then(|worktree| worktree.dirty.as_ref())
             .is_some_and(crate::repository::DirtyState::is_dirty);
         let unsaved = self.cards.values().any(|runtime| {
@@ -2114,10 +2127,12 @@ impl Cagents {
             super::notice_detail(target.path.display().to_string()),
             super::notice_detail(
                 "Git will remove this worktree directory, including uncommitted, untracked and ignored files such as .env. \
-                 The branch is retained. Terminals and chats running in it, including detached ones, \
-                 are closed first.",
+                 Terminals and chats running in it, including detached ones, are closed first.",
             ),
         ];
+        if let Some(branch) = self.worktree_retained_branch(target) {
+            rows.push(super::notice_detail(branch));
+        }
         if let Some(warning) = self.worktree_deletion_warning(target) {
             rows.push(super::notice_body(warning));
         }
@@ -2220,7 +2235,7 @@ fn merged_worktree_notice(
     notice.with_details(details)
 }
 
-fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
+pub(super) fn launch_task(executable: PathBuf, path: PathBuf, editor: bool) -> Task<Message> {
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || {
             let mut command = std::process::Command::new(executable);
@@ -2412,14 +2427,14 @@ fn close_sessions_in_scope(
         let id = session.id;
         if let Err(error) = client.close_chat(session) {
             client = crate::control::ControlClient::connect(&socket)
-                .map_err(|reconnect| format!("Could not verify chat {id}: {reconnect}"))?;
+                .map_err(|reconnect| format!("Could not check that a chat closed: {reconnect}"))?;
             if client
                 .list_chats()
-                .map_err(|list| format!("Could not verify chat {id}: {list}"))?
+                .map_err(|list| format!("Could not check that a chat closed: {list}"))?
                 .iter()
                 .any(|live| live.id == id)
             {
-                return Err(format!("Could not close chat {id}: {error}"));
+                return Err(format!("Could not close a chat: {error}"));
             }
         }
     }
@@ -2453,7 +2468,7 @@ fn close_sessions_in_scope(
                 .map_err(|error| error.to_string())
                 .and_then(|outcome| match outcome {
                     crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                    other => Err(terminal_close_refusal(other)),
                 })
         } else {
             client
@@ -2461,21 +2476,22 @@ fn close_sessions_in_scope(
                 .map_err(|error| error.to_string())
                 .and_then(|outcome| match outcome {
                     crate::terminal::ipc::TerminalCloseResult::Closed => Ok(()),
-                    other => Err(format!("terminal {id} did not confirm close: {other:?}")),
+                    other => Err(terminal_close_refusal(other)),
                 })
         };
         if let Err(error) = result {
             // Another window or a natural exit may have won the race. Query a
             // fresh connection; a failed request can desynchronize this one.
-            client = crate::control::ControlClient::connect(&socket)
-                .map_err(|reconnect| format!("Could not verify terminal {id}: {reconnect}"))?;
+            client = crate::control::ControlClient::connect(&socket).map_err(|reconnect| {
+                format!("Could not check that a terminal closed: {reconnect}")
+            })?;
             if client
                 .list()
-                .map_err(|list| format!("Could not verify terminal {id}: {list}"))?
+                .map_err(|list| format!("Could not check that a terminal closed: {list}"))?
                 .iter()
                 .any(|live| live.session.id == id)
             {
-                return Err(format!("Could not close terminal {id}: {error}"));
+                return Err(format!("Could not close a terminal: {error}"));
             }
         }
     }
@@ -2489,6 +2505,20 @@ fn close_sessions_in_scope(
 pub struct ProjectSessionClosure {
     scope: ProjectSessionScope,
     ownership: ProjectSessionOwnership,
+}
+
+/// Why the daemon did not close a terminal, in words rather than its reply.
+/// An unconfirmed close's reason describes the daemon's own bookkeeping, so
+/// it goes to the log, not the person.
+pub(super) fn terminal_close_refusal(result: crate::terminal::ipc::TerminalCloseResult) -> String {
+    match result {
+        crate::terminal::ipc::TerminalCloseResult::Active => "it is still running".into(),
+        crate::terminal::ipc::TerminalCloseResult::Closed
+        | crate::terminal::ipc::TerminalCloseResult::Unknown(_) => {
+            tracing::warn!(?result, "a terminal close was not confirmed");
+            "the app could not confirm that it stopped".into()
+        }
+    }
 }
 
 #[cfg(test)]
@@ -2694,6 +2724,9 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if record.lock.locked {
         return Err("The worktree is locked; unlock it explicitly in Git first.".into());
     }
+    // Checked before any session closes, so a refusal leaves everything
+    // running. The dialog's consent covers files, not commits it never named.
+    service.refuse_losing_detached_commits(&target.repository, record, &cancellation)?;
     let removed = service
         .common_dir(&target.repository, &cancellation)
         .and_then(|common_dir| {
@@ -2713,6 +2746,16 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
         })
         .ok();
     close_worktree_sessions(target)?;
+    // An agent in the worktree may have committed between the first check
+    // and its session closing; nothing can commit there now.
+    if let Some(record) = service
+        .list_worktrees(&target.repository, &cancellation)
+        .map_err(|error| error.to_string())?
+        .iter()
+        .find(|record| record.id == id)
+    {
+        service.refuse_losing_detached_commits(&target.repository, record, &cancellation)?;
+    }
     // Confirmation authorizes discarding this worktree's changes. Git owns
     // directory removal and still refuses locked worktrees with one --force.
     let command = worktree_removal_command(target);
@@ -5166,5 +5209,151 @@ pub(in crate::app) mod tests {
             original_head.unwrap()
         );
         assert!(repository.join("tracked.txt").exists());
+    }
+
+    /// Removing a detached worktree drops its HEAD. When nothing else holds
+    /// the commits there, deletion is refused before any session closes;
+    /// once a branch or tag holds them, or the worktree is on a branch,
+    /// nothing is refused and Git removes it.
+    #[test]
+    fn deletion_keeps_commits_only_a_detached_head_holds() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let repository = root.join("checkout");
+        git(&root, &["init", "-b", "main", "checkout"]);
+        git(&repository, &["commit", "--allow-empty", "-m", "initial"]);
+        let detached = root.join("detached");
+        let branched = root.join("branched");
+        let reachable = root.join("reachable");
+        git(
+            &repository,
+            &["worktree", "add", "--detach", detached.to_str().unwrap()],
+        );
+        git(&detached, &["commit", "--allow-empty", "-m", "first"]);
+        git(&detached, &["commit", "--allow-empty", "-m", "second"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "feature",
+                branched.to_str().unwrap(),
+            ],
+        );
+        git(&branched, &["commit", "--allow-empty", "-m", "unpushed"]);
+        git(
+            &repository,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                reachable.to_str().unwrap(),
+                "main",
+            ],
+        );
+        let service = RepositoryService::system("git");
+        let cancellation = CancellationToken::default();
+        let records = service.list_worktrees(&repository, &cancellation).unwrap();
+        let record = |path: &Path| records.iter().find(|record| record.path == path).unwrap();
+        let target = |path: &Path| Target {
+            project: ProjectId::new(),
+            worktree: Some(record(path).id),
+            repository: repository.clone(),
+            path: path.to_path_buf(),
+            label: "linked".into(),
+        };
+        let head = record(&detached).head_oid.clone().unwrap();
+        let short = &head[..12];
+
+        // A commit Git cannot read is not counted as kept.
+        let unreadable = WorktreeRecord {
+            head_oid: Some("0123456789abcdef0123456789abcdef01234567".into()),
+            ..record(&detached).clone()
+        };
+        let failure = service
+            .refuse_losing_detached_commits(&repository, &unreadable, &cancellation)
+            .unwrap_err();
+        assert!(
+            failure.starts_with(
+                "Could not check whether detached HEAD 0123456789ab has commits on no branch, \
+                 tag or remote, so the worktree was kept:"
+            ),
+            "{failure}"
+        );
+
+        let refusal = delete_worktree(&target(&detached)).unwrap_err();
+        assert_eq!(
+            refusal,
+            format!(
+                "Detached HEAD {short} has 2 commits on no branch, tag or remote, which deleting \
+                 the worktree would lose. Keep them on a branch first, for example with \
+                 `git branch NAME {short}`."
+            )
+        );
+        assert!(detached.is_dir());
+
+        // A tag holds them as well as a branch would.
+        git(&repository, &["tag", "kept", &head]);
+        let refreshed = service.list_worktrees(&repository, &cancellation).unwrap();
+        for path in [&detached, &branched, &reachable] {
+            let record = refreshed
+                .iter()
+                .find(|record| &record.path == path)
+                .unwrap();
+            assert_eq!(
+                service.refuse_losing_detached_commits(&repository, record, &cancellation),
+                Ok(()),
+                "{}",
+                path.display()
+            );
+        }
+        for path in [&detached, &branched, &reachable] {
+            let command = worktree_removal_command(&target(path));
+            SystemProcessExecutor
+                .execute(&command, &cancellation)
+                .unwrap()
+                .require_success(&command.program)
+                .unwrap();
+            assert!(!path.exists(), "{}", path.display());
+        }
+    }
+
+    #[test]
+    fn deletion_dialog_names_the_kept_branch_and_none_for_a_detached_head() {
+        let repository = PathBuf::from("/repo");
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        drop(app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(linked.id),
+            command: ProjectCommand::Delete,
+        }));
+        let target = app.project_ui.dialog.as_ref().unwrap().target.clone();
+        assert_eq!(
+            app.worktree_retained_branch(&target).as_deref(),
+            Some("The branch feature is kept.")
+        );
+        let row = app
+            .sidebar_model
+            .projects
+            .iter_mut()
+            .find(|row| row.id == project)
+            .unwrap()
+            .worktrees
+            .iter_mut()
+            .find(|row| row.id == linked.id)
+            .unwrap();
+        row.detached = true;
+        assert_eq!(app.worktree_retained_branch(&target), None);
     }
 }

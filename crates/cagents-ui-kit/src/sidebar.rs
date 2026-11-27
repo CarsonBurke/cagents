@@ -18,7 +18,7 @@ use std::{
 
 use cosmic::{
     Element,
-    iced::{Alignment, Length, Padding, advanced::text::EllipsizeHeightLimit, id::Id},
+    iced::{Alignment, Length, Padding, id::Id},
     theme,
     widget::{self, button, icon},
 };
@@ -31,10 +31,10 @@ use crate::{
     model::{CardId, ChannelId, ProjectId, ProjectKind, ProjectState, WorktreeId},
     repository::{
         BranchComparison, ChangeArea, ChangeKind, ChangedPath, CommitIdentity, CommitSummary,
-        ConflictKind, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid, PathSelection,
-        PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo, RepositorySnapshot,
-        StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName, WorktreeRecord,
-        build_file_tree, build_file_tree_with_directories,
+        ConflictKind, DiffBasis, DirtyState, DiscardRequest, HISTORY_PAGE_SIZE, HeadState, Oid,
+        PathSelection, PushTarget, RemoteRecord, RepoPath, RepositoryId, RepositoryInfo,
+        RepositorySnapshot, StatusSnapshot, TrackingState, ValidatedBranchName, ValidatedRefName,
+        WorktreeRecord, build_file_tree, build_file_tree_with_directories,
     },
     splitter::{Edge as SplitterEdge, Splitter},
     ui_controls::Icon,
@@ -87,6 +87,10 @@ const ROW_ICON_WIDTH: f32 = 20.0;
 const ROW_ICON_SIZE: u16 = design::LEADING_ICON_SIZE;
 const CHILD_ROW_ICON_SIZE: u16 = ROW_ICON_SIZE;
 const CHILD_ROW_TEXT_SIZE: f32 = design::TEXT_BODY;
+/// The line box a navigation row's label is centred in: libcosmic's body
+/// preset's, which the rows' heights were chosen around, so a label lands on
+/// whole pixels whether or not a search highlights it.
+const ROW_TEXT_LINE: f32 = 21.0;
 // Controls and status indicators retain the shared workspace chrome sizes.
 
 /// Horizontal step between one row slot and the next, and the unit the rest of
@@ -108,7 +112,7 @@ const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
 const ROW_DELETE_STATUS_WIDTH: f32 = ICON_CONTROL_SIZE - 2.0 * ROW_GUTTER;
 const _: () = assert!(ROW_DELETE_STATUS_WIDTH >= ROW_STATUS_WIDTH);
 /// The project header's hover-revealed commands: disclose, new channel, new
-/// worktree. Reserved inside the header row so a long project name ellipsizes
+/// worktree. Reserved inside the header row so a long project name fades
 /// instead of running under them, and read by `row_interaction::header_at` so
 /// the same three controls stay out of the group's drag region.
 const HEADER_ACTION_WIDTH: f32 = 3.0 * ICON_CONTROL_SIZE;
@@ -164,13 +168,14 @@ impl SidebarMode {
     }
 }
 
-/// Coarse filters which can be combined with the free-text query.
+/// Coarse filters which can be combined with the free-text query. A view
+/// saved by a build that had a pull request filter restores as `All`; its
+/// list now lives in the Worktrees pane (see `known_or_default`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SidebarFilter {
     #[default]
     All,
     Attention,
-    PullRequests,
 }
 
 /// Where a card's attention shows, as only the application knows it. The
@@ -1753,13 +1758,6 @@ impl ChangesTab {
             Self::History => "Commit history",
         }
     }
-
-    /// Whether the view is a list of changed files, which is what the
-    /// tree/flat switch arranges. History lists commits and has no such
-    /// choice to offer.
-    fn lists_files(self) -> bool {
-        matches!(self, Self::Changes | Self::Branch)
-    }
 }
 
 /// Which source-control mutation is currently running.
@@ -1937,13 +1935,13 @@ impl ChangeRow {
             .conflict
             .map(conflict_label)
             .unwrap_or_else(|| change_kind_label(entry.kind));
-        // Which end of the label the row may throw away, decided once.
+        // Which end of the label the row may let fade, decided once.
         //
-        // A repository path is elided from the front, because its tail is the
-        // file and `…/src/lib.rs` still names one; so is a rename, whose tail
+        // A repository path fades at its front, because its tail is the
+        // file and `src/lib.rs` still names one; so is a rename, whose tail
         // is the name the file now has. A file in the worktree root is nothing
         // but its name and has no head to spare.
-        let ellipsize_start = entry.old_path.is_some() || label.contains('/');
+        let fade_start = entry.old_path.is_some() || label.contains('/');
         let chrome = ChangeRowChrome {
             accessible_name: if counts.is_empty() {
                 format!("{status} {label}")
@@ -1958,7 +1956,7 @@ impl ChangeRow {
             status: status.into_boxed_str(),
             counts_split: counts.find(' '),
             counts: counts.into_boxed_str(),
-            ellipsize_start,
+            fade_start,
             stage_id: stable_id(format!("panel.change.stage.{key}")),
             unstage_id: stable_id(format!("panel.change.unstage.{key}")),
             discard_id: stable_id(format!("panel.change.discard.{key}")),
@@ -1991,7 +1989,7 @@ struct ChangeRowChrome {
     counts_split: Option<usize>,
     /// True when the label's tail is what identifies it; see
     /// [`ChangeRow::new`].
-    ellipsize_start: bool,
+    fade_start: bool,
     stage_id: Id,
     unstage_id: Id,
     discard_id: Id,
@@ -2242,8 +2240,7 @@ pub struct SourceControlModel {
     /// `None` for a detached or unborn `HEAD`, for a `HEAD` that could not be
     /// read, and for a branch whose ref name Git reported in bytes this cannot
     /// hand back to it - which is a branch that exists and still cannot be
-    /// pushed. The label the header shows is separate and may be lossy; see
-    /// [`Self::no_branch_reason`].
+    /// pushed. The label the header shows is separate and may be lossy.
     pub branch: Option<ValidatedBranchName>,
     pub detached: bool,
     /// The commit `HEAD` names, or `None` when `HEAD` is unborn or could not be
@@ -2747,6 +2744,13 @@ impl SourceControlModel {
             || matches!(&self.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
     }
 
+    /// Whether the working tree has anything uncommitted: what the Changes
+    /// view lists and a commit could take. Unlike [`Self::has_changes`], the
+    /// branch's committed changes do not count.
+    pub fn has_uncommitted_changes(&self) -> bool {
+        self.groups.iter().any(|group| !group.is_empty())
+    }
+
     /// Whether this panel is bound to a Git worktree, so Changes can load.
     pub fn offers_changes(&self) -> bool {
         self.branch.is_some() || self.unborn || self.detached || self.head_oid.is_some()
@@ -2794,6 +2798,29 @@ impl SourceControlModel {
             && !self.remotes.is_empty()
     }
 
+    /// Why a branch that has commits cannot be pushed from here, when the
+    /// reason is not already plain: a detached `HEAD` says so beside the
+    /// worktree, and an unborn branch has nothing to send. A branch whose
+    /// name Git reported in bytes this cannot represent has both and still
+    /// cannot be named back to Git; a `HEAD` that could not be read is
+    /// neither; an upstream `git status` reported but this could not name
+    /// cannot be pushed to without re-pointing the branch.
+    pub fn unpushable_reason(&self) -> Option<&'static str> {
+        if self.detached || self.unborn {
+            None
+        } else if self.branch.is_none() {
+            Some(if self.head_oid.is_some() {
+                "This branch's name can't be passed back to Git, so it can't be pushed from here."
+            } else {
+                "HEAD couldn't be read, so this branch can't be pushed from here."
+            })
+        } else if self.upstream.is_none() && self.upstream_reported() {
+            Some("This branch's upstream couldn't be read, so it can't be pushed from here.")
+        } else {
+            None
+        }
+    }
+
     /// Whether `git status` reported an upstream for the checked-out branch,
     /// whether or not it could be compared against or named.
     pub fn upstream_reported(&self) -> bool {
@@ -2801,26 +2828,6 @@ impl SourceControlModel {
             TrackingState::NoUpstream => false,
             TrackingState::Compared { .. } => true,
             TrackingState::Unknown { upstream } => upstream.is_some(),
-        }
-    }
-
-    /// Why this panel offers no branch mutation, for the caption that replaces
-    /// the button.
-    ///
-    /// The four states with no branch to push are four different facts: a
-    /// detached `HEAD` is on no branch, an unborn one has no commit to send, a
-    /// branch whose ref name Git reported in bytes this cannot represent has
-    /// both and still cannot be named back to Git, and a `HEAD` that could not
-    /// be read is not any of the three.
-    pub fn no_branch_reason(&self) -> &'static str {
-        if self.detached {
-            "Detached HEAD — nothing to push"
-        } else if self.unborn {
-            "Nothing committed yet — nothing to push"
-        } else if self.head_oid.is_some() {
-            "This branch's name is not representable — nothing to push"
-        } else {
-            "HEAD could not be read — nothing to push"
         }
     }
 }
@@ -3053,11 +3060,9 @@ enum SidebarSelection {
 
 /// What the source-control panel currently highlights.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum PanelSelection {
-    File(RepoPath),
-    Change { path: RepoPath, area: ChangeArea },
-    Branch(RepoPath),
-    Commit { oid: Oid, path: RepoPath },
+struct PanelSelection {
+    path: RepoPath,
+    basis: Option<DiffBasis>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -3125,6 +3130,12 @@ pub struct SidebarView {
     change_list_mode: FileListMode,
     #[serde(default, deserialize_with = "known_or_default")]
     changes_tab: ChangesTab,
+    /// Whether the user chose `changes_tab` for the worktree it was saved
+    /// on. A tab picked from a read is not saved, so the next start picks
+    /// again from what the worktree holds then; see
+    /// [`SidebarState::settle_changes_tab`].
+    #[serde(default)]
+    changes_tab_chosen: bool,
 }
 
 impl SidebarView {
@@ -3138,6 +3149,7 @@ impl SidebarView {
             collapsed_change_directories: Vec::new(),
             toggled_sections: BTreeSet::new(),
             changes_tab: ChangesTab::default(),
+            changes_tab_chosen: false,
             ..self
         }
     }
@@ -3285,6 +3297,13 @@ pub struct SidebarState {
     /// Which view of the Git panel is showing. Local to the surface, like
     /// every other draft here, so a worktree switch resets it.
     changes_tab: ChangesTab,
+    /// Whether `changes_tab` is settled for the bound worktree: chosen by
+    /// the user, or picked once from its first read. Until then the first
+    /// read picks it; see [`Self::settle_changes_tab`].
+    changes_tab_settled: bool,
+    /// Whether the user chose `changes_tab`, which is the only pick a saved
+    /// view keeps.
+    changes_tab_chosen: bool,
     worktree_sort: crate::settings::WorktreeSort,
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -3407,12 +3426,9 @@ impl SidebarState {
             && !self.worktree_display(project.id).shows_checkouts()
     }
 
-    /// Whether the checkout rows the filter asks for are drawn. The pull
-    /// request filter lists pull requests by their checkouts, so hiding
-    /// checkouts would empty it; it draws them whatever the display.
+    /// Whether `project`'s checkout rows are drawn.
     fn shows_checkouts(&self, project: ProjectId) -> bool {
-        self.filter == SidebarFilter::PullRequests
-            || self.worktree_display(project).shows_checkouts()
+        self.worktree_display(project).shows_checkouts()
     }
 
     /// Whether any project's pane rows may be drawn, and so which of them
@@ -3420,7 +3436,6 @@ impl SidebarState {
     fn draws_pane_rows(&self) -> bool {
         match self.filter {
             SidebarFilter::Attention => true,
-            SidebarFilter::PullRequests => false,
             SidebarFilter::All => {
                 !self.sidebar_worktrees.shows_checkouts()
                     || self
@@ -3517,21 +3532,10 @@ impl SidebarState {
     pub fn has_row_selection(&self) -> bool {
         !self.rows.is_empty()
     }
-    /// Whether the search controls narrow the list: a query, or the pull
-    /// request filter that lives beside it. Attention is not counted; its
-    /// toggle stays in the header whether or not the controls show.
-    pub fn search_filters_active(&self) -> bool {
-        !self.query.trim().is_empty() || self.filter == SidebarFilter::PullRequests
-    }
-
-    /// Hiding the search controls ends the search. A query or filter nobody
-    /// can see would keep hiding rows, and the pull request filter would keep
-    /// changing what a click on a row does, with nothing on screen to say so.
-    fn clear_search_filters(&mut self) {
-        self.query.clear();
-        if self.filter == SidebarFilter::PullRequests {
-            self.set_filter(SidebarFilter::All);
-        }
+    /// Whether a search query narrows the list. Attention is not counted;
+    /// its toggle stays in the header whether or not the search shows.
+    pub fn has_search_query(&self) -> bool {
+        !self.query.trim().is_empty()
     }
 
     /// Choosing a filter starts a fresh list, so rows kept only because they
@@ -3566,7 +3570,12 @@ impl SidebarState {
             files_query: self.files_query.clone(),
             files_filter_open: self.files_filter_open,
             change_list_mode: self.change_list_mode,
-            changes_tab: self.changes_tab,
+            changes_tab: if self.changes_tab_chosen {
+                self.changes_tab
+            } else {
+                ChangesTab::default()
+            },
+            changes_tab_chosen: self.changes_tab_chosen,
         }
     }
 
@@ -3578,19 +3587,18 @@ impl SidebarState {
             String::new()
         };
         self.controls_expanded = view.controls_expanded;
-        // Like the query, the pull request filter belongs to the search
-        // controls and ends with them; see `clear_search_filters`.
-        self.filter = if !view.controls_expanded && view.filter == SidebarFilter::PullRequests {
-            SidebarFilter::All
-        } else {
-            view.filter
-        };
+        self.filter = view.filter;
         self.toggled_sections = view.toggled_sections;
         self.panel_open = view.panel_open;
         self.files_query = view.files_query;
         self.files_filter_open = view.files_filter_open;
         self.change_list_mode = view.change_list_mode;
         self.changes_tab = view.changes_tab;
+        // A view saved before this was recorded kept any tab but Changes
+        // only because someone chose it.
+        self.changes_tab_chosen =
+            view.changes_tab_chosen || view.changes_tab != ChangesTab::default();
+        self.changes_tab_settled = self.changes_tab_chosen;
         self.collapsed_projects = view.collapsed_projects;
         self.expanded_worktree_groups = view.expanded_worktree_groups;
         self.selection = view.selection;
@@ -4505,24 +4513,26 @@ impl SidebarState {
         self.follow_projected_card();
     }
 
-    /// Synchronize when editor focus changes outside the file navigator.
-    pub fn select_file(&mut self, key: &ActiveWorktreeKey, path: Option<&Path>) {
+    /// Follow the focused repository pane's file and comparison.
+    pub fn select_file(
+        &mut self,
+        key: &ActiveWorktreeKey,
+        selected: Option<(&Path, Option<&DiffBasis>)>,
+    ) {
         if self.active_worktree.as_ref() != Some(key) {
             return;
         }
         let current = self
             .panel_selection
             .as_ref()
-            .map(|selection| match selection {
-                PanelSelection::File(path)
-                | PanelSelection::Branch(path)
-                | PanelSelection::Change { path, .. }
-                | PanelSelection::Commit { path, .. } => path.as_path(),
+            .map(|selection| (selection.path.as_path(), selection.basis.as_ref()));
+        if current != selected {
+            self.panel_selection = selected.and_then(|(path, basis)| {
+                Some(PanelSelection {
+                    path: RepoPath::parse(path).ok()?,
+                    basis: basis.cloned(),
+                })
             });
-        if current != path {
-            self.panel_selection = path
-                .and_then(|path| RepoPath::parse(path).ok())
-                .map(PanelSelection::File);
         }
     }
 
@@ -4752,6 +4762,8 @@ impl SidebarState {
         // panel, so none of their disclosures carry to the next worktree.
         self.toggled_sections.clear();
         self.changes_tab = ChangesTab::default();
+        self.changes_tab_settled = false;
+        self.changes_tab_chosen = false;
         self.publish = None;
         self.discard = None;
         self.panel_selection = None;
@@ -4765,6 +4777,26 @@ impl SidebarState {
     /// [`ChangesTab::History`], and nothing else in the panel asks for one.
     pub fn changes_tab(&self) -> ChangesTab {
         self.changes_tab
+    }
+
+    /// Picks the Git view for a worktree the panel has just bound, once its
+    /// first read is in: Changes when it has uncommitted changes, otherwise
+    /// Branch, since an empty Changes view has nothing to show. It picks
+    /// once per binding and never over the user's choice, so a view does
+    /// not switch under the reader as files change.
+    pub fn settle_changes_tab(&mut self, source: &SourceControlModel) {
+        if self.changes_tab_settled
+            || !matches!(source.data_state, SidebarDataState::Ready)
+            || self.active_worktree.as_ref() != Some(&source.key)
+        {
+            return;
+        }
+        self.changes_tab_settled = true;
+        self.changes_tab = if source.has_uncommitted_changes() {
+            ChangesTab::Changes
+        } else {
+            ChangesTab::Branch
+        };
     }
 
     /// Whether one change group is disclosed.
@@ -4793,8 +4825,10 @@ impl SidebarState {
             }
             SidebarAction::ToggleControls => {
                 self.controls_expanded = !self.controls_expanded;
+                // Hiding the search controls ends the search: a query nobody
+                // can see would keep hiding rows.
                 if !self.controls_expanded {
-                    self.clear_search_filters();
+                    self.query.clear();
                 }
             }
             SidebarAction::ToggleWorktrees(project_id) => {
@@ -4850,7 +4884,11 @@ impl SidebarState {
                 }
             }
             SidebarAction::SetChangeListMode { mode, .. } => self.change_list_mode = *mode,
-            SidebarAction::SetChangesTab { tab, .. } => self.changes_tab = *tab,
+            SidebarAction::SetChangesTab { tab, .. } => {
+                self.changes_tab = *tab;
+                self.changes_tab_settled = true;
+                self.changes_tab_chosen = true;
+            }
             SidebarAction::SetWorktreePanel { .. } => {}
             SidebarAction::ToggleDirectory { path, .. } => {
                 if !self.expanded_directories.remove(path) {
@@ -4865,21 +4903,44 @@ impl SidebarState {
                 }
             }
             SidebarAction::OpenFile { path, .. } => {
-                self.panel_selection = Some(PanelSelection::File(path.clone()));
-            }
-            SidebarAction::OpenChange { path, area, .. } => {
-                self.panel_selection = Some(PanelSelection::Change {
+                self.panel_selection = Some(PanelSelection {
                     path: path.clone(),
-                    area: *area,
+                    basis: None,
                 });
             }
-            SidebarAction::OpenBranchFile { path, .. } => {
-                self.panel_selection = Some(PanelSelection::Branch(path.clone()));
+            SidebarAction::OpenChange { path, area, .. } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: Some(if *area == ChangeArea::Staged {
+                        DiffBasis::HeadToIndex
+                    } else {
+                        DiffBasis::IndexToWorktree
+                    }),
+                });
+            }
+            SidebarAction::OpenBranchFile {
+                path,
+                base_ref,
+                head,
+                merge_base,
+                ..
+            } => {
+                self.panel_selection = Some(PanelSelection {
+                    path: path.clone(),
+                    basis: Some(DiffBasis::MergeBaseToHead {
+                        base_ref: base_ref.clone(),
+                        head: head.clone(),
+                        merge_base: merge_base.clone(),
+                    }),
+                });
             }
             SidebarAction::OpenCommitFile { oid, path, .. } => {
-                self.panel_selection = Some(PanelSelection::Commit {
-                    oid: oid.clone(),
+                self.panel_selection = Some(PanelSelection {
                     path: path.clone(),
+                    basis: Some(DiffBasis::CommitToParent {
+                        oid: oid.clone(),
+                        parent: None,
+                    }),
                 });
             }
             SidebarAction::CommitMessageChanged { message, .. } => {
@@ -5381,7 +5442,7 @@ pub fn search_toggle_focus_id() -> Id {
 /// Hiding read Attention rows removes the control that did it, so focus
 /// returns to the filter those rows were kept for, in both densities.
 pub fn attention_filter_focus_id() -> Id {
-    filter_id(SidebarFilter::Attention)
+    stable_id("filter.attention")
 }
 
 /// The focus target of the pane's resize handle.
@@ -5439,7 +5500,7 @@ pub fn view<'a>(
         modal_open,
         None,
         &crate::settings::KeyboardShortcuts::default(),
-        false,
+        WindowCorner::default(),
     )
 }
 
@@ -6017,9 +6078,8 @@ mod cached_projects {
     }
 }
 
-/// `window_rounded` says the window draws rounded corners, as a floating
-/// window does and a maximized or tiled one does not: the pane's top-left
-/// corner is the window's, and follows it.
+/// The pane's top-left corner is the window's, so the pane draws it as the
+/// window does and leaves room for anything the system draws over it.
 #[allow(clippy::too_many_arguments)]
 pub fn view_cached<'a>(
     model: &'a SidebarModel,
@@ -6029,7 +6089,7 @@ pub fn view_cached<'a>(
     modal_open: bool,
     cache: &'a NavigationCache,
     shortcuts: &crate::settings::KeyboardShortcuts,
-    window_rounded: bool,
+    corner: WindowCorner,
 ) -> Element<'a, SidebarAction> {
     view_inner(
         model,
@@ -6039,8 +6099,37 @@ pub fn view_cached<'a>(
         modal_open,
         Some(cache),
         shortcuts,
-        window_rounded,
+        corner,
     )
+}
+
+/// How the window draws the corner the pane shares with it.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct WindowCorner {
+    /// The window draws rounded corners, as a floating window does and a
+    /// maximized or tiled one does not.
+    pub rounded: bool,
+    /// The system's window controls over the corner, as macOS's traffic
+    /// lights are.
+    pub controls: Option<WindowControls>,
+}
+
+/// The region the system's window controls take in a top corner of the
+/// window, measured from that corner and including their margin to whatever
+/// follows them.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowControls {
+    pub width: f32,
+    pub height: f32,
+    pub edge: WindowControlsEdge,
+}
+
+/// The top corner holding the window controls: the leading one, beside this
+/// pane, unless a right-to-left system puts them at the trailing one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowControlsEdge {
+    Leading,
+    Trailing,
 }
 
 fn view_inner<'a>(
@@ -6051,7 +6140,7 @@ fn view_inner<'a>(
     modal_open: bool,
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
-    window_rounded: bool,
+    corner: WindowCorner,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -6059,7 +6148,15 @@ fn view_inner<'a>(
     let header_loading = loading && !model.projects.is_empty();
     let mut content = widget::column::with_capacity(7)
         .push(
-            widget::container(utilities(compact, modal_open, shortcuts)).padding([0.0, space::XS]),
+            widget::container(utilities(
+                compact,
+                modal_open,
+                shortcuts,
+                corner
+                    .controls
+                    .filter(|controls| controls.edge == WindowControlsEdge::Leading),
+            ))
+            .padding([0.0, space::XS]),
         )
         .push(design::horizontal_rule())
         .push(
@@ -6076,7 +6173,7 @@ fn view_inner<'a>(
 
     if !compact && state.controls_expanded && search_is_reachable(model, mode) {
         content = content.push(
-            widget::container(controls(state, modal_open))
+            widget::container(search(state, modal_open))
                 .class(theme::Container::Primary)
                 .padding(space::S),
         );
@@ -6123,7 +6220,7 @@ fn view_inner<'a>(
         .height(Length::Fill)
         .into(),
     ))
-    .class(design::docked_primary(window_rounded))
+    .class(design::docked_primary(corner.rounded))
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
@@ -6144,7 +6241,7 @@ fn header<'a>(
             crate::interaction::pressed(
                 centered_icon_button(Icon::Attention, ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
                     .class(sidebar_button_style(attention))
-                    .id(filter_id(SidebarFilter::Attention))
+                    .id(attention_filter_focus_id())
                     .name("Show projects needing attention")
                     .selected(attention)
                     .on_press_maybe(gated(
@@ -6176,7 +6273,7 @@ fn header<'a>(
                 selected,
             ),
             // Closing the controls also ends the search, so say so.
-            if state.controls_expanded && state.search_filters_active() {
+            if state.controls_expanded && state.has_search_query() {
                 "Close and clear search".to_owned()
             } else {
                 crate::workspace_widget::shortcut_tooltip(
@@ -6189,7 +6286,7 @@ fn header<'a>(
             actions.push(crate::ui_controls::popover(
                 search_button,
                 (state.controls_expanded && !modal_open).then(|| {
-                    widget::container(controls(state, false))
+                    widget::container(search(state, false))
                         .width(DEFAULT_EXPANDED_WIDTH)
                         .into()
                 }),
@@ -6247,15 +6344,15 @@ pub fn checkouts_toggle_focus_id() -> Id {
 /// The checkouts toggle's accessible name, whatever its state.
 const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
 
-/// Shows or hides every project's checkouts. Like the filters beside it, it
-/// is lit while it narrows the list, so a list without checkouts never
+/// Shows or hides every project's checkouts. Like the Attention bell beside
+/// it, it is lit while it narrows the list, so a list without checkouts never
 /// passes for the whole one. Its name stays fixed and its pressed state says
 /// whether checkouts are hidden, as the bell's does for its filter; the
 /// tooltip says what a press does. Hiding them by default overrides each
 /// project's own mode, which the hidden tooltip says.
 ///
-/// Only the All view lists checkouts: Attention names panes instead and Pull
-/// requests always shows them. The setting persists, so the toggle stays
+/// Only the All view lists checkouts: Attention names panes instead. The
+/// setting persists, so the toggle stays
 /// live elsewhere and its tooltip names the view it changes.
 fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
     let hidden = !state.sidebar_worktrees.shows_checkouts();
@@ -6287,7 +6384,7 @@ fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
 /// The search toggle is lit whenever the controls narrow the list, not only
 /// while they show, so an active search can never pass for the full list.
 fn search_toggle_lit(state: &SidebarState) -> bool {
-    state.controls_expanded || state.search_filters_active()
+    state.controls_expanded || state.has_search_query()
 }
 
 /// The pane's top strip is part of the titlebar.
@@ -6338,31 +6435,17 @@ pub fn files_filter_focus_id(key: &ActiveWorktreeKey) -> Id {
     entity_id("panel.files.query", key.worktree_id)
 }
 
-fn controls<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarAction> {
-    let mut actions: Vec<Element<'a, SidebarAction>> = Vec::with_capacity(3);
-    actions.push(filters(state.filter, modal_open));
-    actions.push(
-        cosmic::iced::widget::Space::new()
-            .width(Length::Fill)
-            .into(),
-    );
-    widget::column::with_children(vec![
-        search(state, modal_open),
-        widget::row::with_children(actions)
-            .align_y(Alignment::Center)
-            .spacing(space::XS)
-            .into(),
-    ])
-    .spacing(space::XS)
-    .width(Length::Fill)
-    .into()
-}
-
+/// The pane's first row, which on macOS shares the window's top-left corner
+/// with the traffic lights: the expanded row starts after them, and the
+/// rail, too narrow for them, starts below them.
 fn utilities<'a>(
     compact: bool,
     modal_open: bool,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    controls: Option<WindowControls>,
 ) -> Element<'a, SidebarAction> {
+    // The container around this row and the row itself each pad by XS.
+    let inset = |extent: f32, padding: f32| (extent - padding).max(0.0);
     let toggle = crate::ui_controls::icon_button(
         Icon::Sidebar,
         crate::workspace_widget::shortcut_tooltip(
@@ -6376,23 +6459,45 @@ fn utilities<'a>(
     let [settings, automations, work] = utility_controls(modal_open, Some(shortcuts));
     if compact {
         let children: Vec<Element<'a, SidebarAction>> = vec![toggle, settings, automations, work];
-        return widget::column::with_children(children)
+        let rail = widget::column::with_children(children)
             .align_x(Alignment::Center)
             .spacing(space::XS)
             .padding(space::XS)
-            .width(Length::Fill)
-            .into();
+            .width(Length::Fill);
+        return match controls {
+            Some(controls) => widget::column::with_children(vec![
+                window_gestures(
+                    cosmic::iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .height(inset(controls.height, space::XS)),
+                ),
+                rail.into(),
+            ])
+            .into(),
+            None => rail.into(),
+        };
     }
+    // The row's spacing also follows the space kept for the controls.
+    let leading = controls.map(|controls| {
+        cosmic::iced::widget::Space::new()
+            .width(inset(controls.width, 2.0 * space::XS + space::XXS))
+            .into()
+    });
     window_gestures(
-        widget::row::with_children(vec![
-            settings,
-            automations,
-            work,
-            cosmic::iced::widget::Space::new()
-                .width(Length::Fill)
-                .into(),
-            toggle,
-        ])
+        widget::row::with_children(
+            leading
+                .into_iter()
+                .chain([
+                    settings,
+                    automations,
+                    work,
+                    cosmic::iced::widget::Space::new()
+                        .width(Length::Fill)
+                        .into(),
+                    toggle,
+                ])
+                .collect::<Vec<_>>(),
+        )
         .align_y(Alignment::Center)
         .spacing(space::XXS)
         .padding([0.0, space::XS])
@@ -6471,34 +6576,6 @@ fn search<'a>(state: &'a SidebarState, modal_open: bool) -> Element<'a, SidebarA
         }
     }
     RowInteraction::search(input.id(search_focus_id()).into(), !modal_open)
-}
-
-/// Secondary filters live beside the search input. Attention has its own
-/// independent header toggle rather than a duplicate control here.
-const FILTER_CHOICES: [(SidebarFilter, &str, &str); 2] = [
-    (SidebarFilter::All, "All", "Show all projects"),
-    (
-        SidebarFilter::PullRequests,
-        "Pull requests",
-        "Show projects with pull requests",
-    ),
-];
-
-fn filters(filter: SidebarFilter, modal_open: bool) -> Element<'static, SidebarAction> {
-    let mut row = widget::row::with_capacity(FILTER_CHOICES.len())
-        .spacing(space::XS)
-        .align_y(Alignment::Center);
-    for (value, visible_label, accessible_label) in FILTER_CHOICES {
-        row = row.push(
-            button::custom(design::caption(visible_label))
-                .class(sidebar_button_style(filter == value))
-                .id(filter_id(value))
-                .name(accessible_label)
-                .selected(filter == value)
-                .on_press_maybe(gated(SidebarAction::SetFilter(value), modal_open)),
-        );
-    }
-    row.into()
 }
 
 fn body<'a>(
@@ -6766,13 +6843,6 @@ fn empty(state: &SidebarState, compact: bool, modal_open: bool) -> Element<'stat
                 "Show all",
                 SidebarAction::SetFilter(SidebarFilter::All),
             ),
-            SidebarFilter::PullRequests => (
-                Icon::PullRequest,
-                "No pull requests",
-                "Open a repository or change the current filter.",
-                "Show all",
-                SidebarAction::SetFilter(SidebarFilter::All),
-            ),
         }
     };
     if compact {
@@ -7017,16 +7087,13 @@ fn project_identity_row(
     selected: bool,
     modal_open: bool,
     compact: bool,
-    review_mode: bool,
     query: &str,
     activity: Option<crate::agent::ActivityState>,
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
     let label = (!compact).then(|| project_name_label(project, query));
-    let mut name = if review_mode && project.github_ready {
-        format!("Browse pull requests in {}", project.name)
-    } else if compact {
+    let mut name = if compact {
         chrome.compact_open_name.to_string()
     } else {
         chrome.open_name.to_string()
@@ -7047,19 +7114,9 @@ fn project_identity_row(
         .id(chrome.open_id.clone())
         .name(name)
         .on_press_maybe(
-            project_primary_action(
-                project,
-                if review_mode {
-                    SidebarFilter::PullRequests
-                } else {
-                    SidebarFilter::All
-                },
-            )
-            .and_then(|action| gated(action, modal_open)),
+            project_primary_action(project).and_then(|action| gated(action, modal_open)),
         );
-    let tip: Cow<'static, str> = if review_mode && project.github_ready {
-        Cow::Owned(format!("Browse pull requests in {}", project.name))
-    } else if compact {
+    let tip: Cow<'static, str> = if compact {
         Cow::Owned(chrome.compact_open_name.to_string())
     } else {
         Cow::Owned(project.repository.display().to_string())
@@ -7068,34 +7125,31 @@ fn project_identity_row(
 }
 
 /// The primary action for a project row, shared by pointer and keyboard
-/// activation. An unreadable project offers retry rather than navigation.
-pub fn project_primary_action(
-    project: &SidebarProject,
-    filter: SidebarFilter,
-) -> Option<SidebarAction> {
+/// activation: it folds the project, a folder as a repository, whose root
+/// opens from its row in the Worktrees pane. A folder with nothing under its
+/// heading has nothing to fold, so pressing it opens the folder instead of
+/// doing nothing visible. An unreadable project offers retry rather than
+/// navigation.
+pub fn project_primary_action(project: &SidebarProject) -> Option<SidebarAction> {
     if project.unreachable.is_some() {
         return (!project.reloading).then(|| SidebarAction::RefreshProject {
             project_id: project.id,
             repository: project.repository.clone(),
         });
     }
-    Some(
-        if filter == SidebarFilter::PullRequests && project.github_ready {
-            SidebarAction::BrowsePullRequests {
-                project_id: project.id,
-            }
-        } else if project.kind == ProjectKind::Folder {
-            SidebarAction::OpenRepository {
-                project_id: project.id,
-                repository: project.repository.clone(),
-            }
-        } else {
-            SidebarAction::ToggleProject(project.id)
-        },
-    )
+    let nothing_to_fold =
+        project.worktrees.is_empty() && project.channels.is_empty() && project.panes.is_empty();
+    Some(if project.kind == ProjectKind::Folder && nothing_to_fold {
+        SidebarAction::OpenRepository {
+            project_id: project.id,
+            repository: project.repository.clone(),
+        }
+    } else {
+        SidebarAction::ToggleProject(project.id)
+    })
 }
 
-/// The project's name, on one line, ellipsized rather than wrapped so a long
+/// The project's name, on one line, fading rather than wrapping so a long
 /// name cannot change a header's height.
 fn project_name_label(project: &SidebarProject, query: &str) -> Element<'static, SidebarAction> {
     search_label(
@@ -7120,12 +7174,8 @@ fn operation_rows(
 ) -> impl Iterator<Item = Element<'static, SidebarAction>> {
     let grid = RowGrid::child(false);
     project.operations.iter().map(move |operation| {
-        let label = design::body(operation.label.to_string())
+        let label = crate::ui_controls::fade_text(operation.label.to_string())
             .class(theme::Text::Custom(design::muted_text))
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
             .width(Length::Fill)
             .into();
         let content = grid.content(
@@ -7298,8 +7348,7 @@ fn unreachable_project<'a>(
 ) -> Element<'static, SidebarAction> {
     let chrome = &project.chrome;
     let grid = RowGrid::project(compact);
-    let reload =
-        project_primary_action(project, state.filter).and_then(|action| gated(action, modal_open));
+    let reload = project_primary_action(project).and_then(|action| gated(action, modal_open));
     // A colon rather than a full stop, because the reason comes from git or
     // the filesystem and those messages begin in lower case.
     let description = if project.reloading {
@@ -7419,8 +7468,9 @@ fn worktree_group_row(
         grid.rail(glyph, rail::Badges::attention(attention))
     } else {
         let label = widget::row::with_children(vec![
-            design::body("Worktrees").width(Length::Fill).into(),
-            design::caption(count.to_string()).into(),
+            design::body("Worktrees").into(),
+            crate::ui_controls::count_badge(count.to_string(), Default::default()),
+            widget::Space::new().width(Length::Fill).into(),
         ])
         .spacing(space::XS)
         .align_y(Alignment::Center)
@@ -7602,7 +7652,7 @@ fn project_view<'a>(
     // list gives every pane and channel it counts a row of its own, so an
     // expanded header there repeats none of it. Otherwise an expanded header
     // says only what none of the rows drawn under it does: a Folder root,
-    // which is its own destination with no row, whatever the checkout
+    // which has no row in the sidebar, whatever the checkout
     // display, and for hidden checkouts news of a pane a search leaves out
     // or of no pane at all.
     let header_attention = if !expanded {
@@ -7628,7 +7678,6 @@ fn project_view<'a>(
         selection == Some(SidebarSelection::Project(project_id)),
         modal_open,
         false,
-        project.state.filter == SidebarFilter::PullRequests,
         &project.state.query,
         if project.state.worktree_display(project_id) == crate::settings::SidebarWorktrees::Hidden
             || project.state.filter == SidebarFilter::Attention
@@ -7771,7 +7820,6 @@ fn project_view<'a>(
                         project_id,
                         worktree,
                         is_primary_worktree(&entity.repository, &worktree.path),
-                        project.state.filter == SidebarFilter::PullRequests,
                         selection,
                         modal_open,
                         entity.github_ready,
@@ -7960,8 +8008,7 @@ fn compact_project_identity(
         .id(project.chrome.open_id.clone())
         .name(description)
         .on_press_maybe(
-            project_primary_action(project, state.filter)
-                .and_then(|action| gated(action, modal_open)),
+            project_primary_action(project).and_then(|action| gated(action, modal_open)),
         );
     grid.mount(crate::interaction::tooltip(control, tip))
 }
@@ -8031,7 +8078,6 @@ fn compact_project<'a>(
                     entity.id,
                     worktree,
                     is_primary_worktree(&entity.repository, &worktree.path),
-                    project.state.filter == SidebarFilter::PullRequests,
                     selection,
                     modal_open,
                     entity.github_ready,
@@ -8705,7 +8751,7 @@ fn child_glyph(icon: Icon, tone: GlyphTone, compact: bool) -> Element<'static, S
 /// A row's title followed by where it is, dimmed: "Codex chat · fix-sidebar".
 /// The title keeps the width it needs and the place gives way first, since
 /// the title is what tells two rows apart. Only once the place is gone does
-/// the title itself truncate.
+/// the title itself fade.
 fn titled_label(
     title: &str,
     place: Option<&str>,
@@ -8715,64 +8761,21 @@ fn titled_label(
     let Some(place) = place else {
         return search_label(title, query, CHILD_ROW_TEXT_SIZE, ink.text_class(), false);
     };
-    let ellipsized = |text: widget::Text<'static, cosmic::Theme>| {
-        text.size(CHILD_ROW_TEXT_SIZE)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
+    // The title shrinks to its text and is laid out before the filling
+    // place, so it fades only if the row cannot hold even that.
+    widget::row::with_children(vec![
+        search_text(title, query, CHILD_ROW_TEXT_SIZE, ink.text_class(), false).into(),
+        crate::ui_controls::fade_text(format!(" · {place}"))
+            .size(CHILD_ROW_TEXT_SIZE)
+            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+                ROW_TEXT_LINE.into(),
             ))
-    };
-    let place = format!(" · {place}");
-    let place = move || -> Element<'static, SidebarAction> {
-        ellipsized(widget::text::body(place.clone()))
             .class(theme::Text::Custom(design::secondary_text))
             .width(Length::Fill)
-            .into()
-    };
-    if search_highlight_ranges(title, query).is_empty() {
-        // A shrinking text takes its natural width before the filling place
-        // is laid out, and ellipsizes only if the row cannot hold even that.
-        return widget::row::with_children(vec![
-            ellipsized(widget::text::body(title.to_owned()))
-                .class(ink.text_class())
-                .into(),
-            place(),
-        ])
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into();
-    }
-    // A highlighted title is a fitting label that fills whatever slot it is
-    // given, so it is given its natural width, measured once, or the whole
-    // row when that is narrower.
-    let title = title.to_owned();
-    let query = query.to_owned();
-    let natural = std::cell::OnceCell::new();
-    crate::ui_controls::responsive(move |slot| {
-        let natural = *natural.get_or_init(|| {
-            let (font, emphasis) = search_label_fonts(false);
-            search_spans_width(&title, &query, CHILD_ROW_TEXT_SIZE, font, emphasis).ceil()
-        });
-        widget::row::with_children(vec![
-            widget::container(search_label(
-                &title,
-                &query,
-                CHILD_ROW_TEXT_SIZE,
-                ink.text_class(),
-                false,
-            ))
-            .width(Length::Fixed(natural.min(slot.width)))
             .into(),
-            place(),
-        ])
-        .align_y(Alignment::Center)
-        .width(Length::Fill)
-        .into()
-    })
-    // As tall as the title's text, as a title on its own is, so the
-    // two share a pixel row; a height of their own would centre them
-    // between two and blur them.
-    .height(Length::Shrink)
+    ])
+    .align_y(Alignment::Center)
+    .width(Length::Fill)
     .into()
 }
 
@@ -9243,7 +9246,6 @@ fn worktree_view<'a>(
     project_id: ProjectId,
     worktree: &'a SidebarWorktree,
     primary: bool,
-    review_mode: bool,
     selection: Option<SidebarSelection>,
     modal_open: bool,
     github_ready: bool,
@@ -9377,15 +9379,7 @@ fn worktree_view<'a>(
         == Some(SidebarSelection::Worktree {
             project_id,
             worktree_id: worktree.id,
-        })
-        || (review_mode
-            && worktree.pull_request().is_some_and(|pr| {
-                selection
-                    == Some(SidebarSelection::PullRequest {
-                        project_id,
-                        number: pr.number,
-                    })
-            }));
+        });
     // A worktree on its way out is not somewhere to go: opening it would start
     // sessions in a directory Git is about to remove.
     let inert = modal_open || deleting;
@@ -9398,10 +9392,7 @@ fn worktree_view<'a>(
             &chrome.label,
             deletion,
         ))
-        .on_press_maybe(gated(
-            worktree_primary_action(project_id, worktree, review_mode),
-            inert,
-        ));
+        .on_press_maybe(gated(worktree_primary_action(project_id, worktree), inert));
     let action: Element<'static, SidebarAction> = if compact {
         action.into()
     } else {
@@ -9454,23 +9445,11 @@ fn worktree_view<'a>(
     ))
 }
 
-fn worktree_primary_action(
-    project_id: ProjectId,
-    worktree: &SidebarWorktree,
-    review_mode: bool,
-) -> SidebarAction {
-    if review_mode && let Some(pr) = worktree.pull_request() {
-        SidebarAction::OpenPullRequest {
-            project_id,
-            number: pr.number,
-            url: pr.url.clone(),
-        }
-    } else {
-        SidebarAction::OpenWorktree {
-            project_id,
-            worktree_id: worktree.id,
-            path: worktree.path.clone(),
-        }
+fn worktree_primary_action(project_id: ProjectId, worktree: &SidebarWorktree) -> SidebarAction {
+    SidebarAction::OpenWorktree {
+        project_id,
+        worktree_id: worktree.id,
+        path: worktree.path.clone(),
     }
 }
 
@@ -9643,7 +9622,11 @@ fn context_controls_with_display<'a>(
     }
     crate::interaction::context_menu_lazy(content, move || {
         let mut commands = vec![
-            ("Open folder".to_owned(), None, ProjectCommand::Reveal),
+            (
+                "Show in file manager".to_owned(),
+                None,
+                ProjectCommand::Reveal,
+            ),
             ("New terminal".to_owned(), None, ProjectCommand::NewTerminal),
             (
                 project_channel_command_label(worktree_id).to_owned(),
@@ -10395,17 +10378,25 @@ fn source_control_header<'a>(
             activity.unwrap_or("Worktree"),
         ),
         widget::container(crate::interaction::tooltip(
-            design::heading(worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label))
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill),
+            crate::ui_controls::FadeText::heading(
+                worktree.map_or(&*chrome.subheading, |row| &*row.chrome.label),
+            )
+            .width(Length::Fill),
             worktree.map_or(&*chrome.subheading, |row| &*row.chrome.tooltip),
         ))
         .width(Length::Fill)
         .into(),
     ]);
+    // Pushing belongs to the branch the header names, not to the commit box:
+    // committed work is pushed from whichever Git view is open, and the
+    // commit box is gone while there is nothing to commit. Files and Pull
+    // requests have no place for the publish form it may open.
+    if matches!(view, PanelView::Git(_))
+        && matches!(source.data_state, SidebarDataState::Ready)
+        && let Some(upload) = upload_control(source, modal_open)
+    {
+        header = header.push(upload);
+    }
     if let Some(branch) = worktree
         .and_then(|row| row.branch.as_deref())
         .filter(|_| !worktree.is_some_and(|row| row.detached))
@@ -10445,8 +10436,8 @@ fn source_control_header<'a>(
         }
         // File browsing is always a tree, so only a list of changed files
         // offers the tree/flat switch: the flat list exists for reading
-        // diffs, not for browsing.
-        PanelView::Git(tab) if tab.lists_files() => {
+        // diffs, not for browsing. An empty list has nothing to arrange.
+        PanelView::Git(tab) if lists_changed_files(source, tab) => {
             header = header.push(list_mode_toggle(
                 key,
                 chrome,
@@ -10464,6 +10455,19 @@ fn source_control_header<'a>(
         .into()
 }
 
+/// Whether `tab` shows a list of changed files right now, which the
+/// tree/flat switch arranges; an empty or unread list has nothing to
+/// arrange.
+fn lists_changed_files(source: &SourceControlModel, tab: ChangesTab) -> bool {
+    match tab {
+        ChangesTab::Changes => source.has_uncommitted_changes(),
+        ChangesTab::Branch => {
+            matches!(&source.branch_changes, BranchChanges::Ready(branch) if !branch.rows.is_empty())
+        }
+        ChangesTab::History => false,
+    }
+}
+
 /// Error notices beneath the header. Activity stays in the header's fixed
 /// icon slot so a background read or mutation cannot move the body.
 fn source_control_notices<'a>(
@@ -10476,6 +10480,16 @@ fn source_control_notices<'a>(
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into()
         })))
+        .push(slot(
+            matches!(source.data_state, SidebarDataState::Ready)
+                .then(|| source.unpushable_reason())
+                .flatten()
+                .map(|reason| {
+                    design::caption(reason)
+                        .wrapping(cosmic::iced::widget::text::Wrapping::Word)
+                        .into()
+                }),
+        ))
 }
 
 /// Shared worktree identity and loading slots around file or Git navigation.
@@ -10548,11 +10562,29 @@ fn source_control_panel<'a>(
         ChangesTab::Branch => branch_changes_section(state, source, modal_open),
         ChangesTab::History => history_section(state, source, modal_open),
     };
+    // The publish form is several rows tall and grows a wrapping refusal, so
+    // it stays in the scroll region: pinned beside the commit box it could
+    // push its own Cancel and Publish past the bottom of a short panel. The
+    // header opens it from any view, so every view shows it.
+    let body = match state
+        .publish_draft()
+        .filter(|draft| draft.key == source.key)
+    {
+        Some(publish) => widget::column::with_children(vec![
+            body,
+            crate::design::horizontal_rule(),
+            publish_picker(source, publish, modal_open),
+        ])
+        .spacing(space::XS)
+        .into(),
+        None => body,
+    };
     // Committing is the panel's terminal action, so it sits at the panel's
     // bottom edge rather than after however many change rows the scroll
     // region happens to hold. It belongs to the working tree, so only the
-    // working-tree view carries it.
-    let footer = matches!(tab, ChangesTab::Changes).then(|| {
+    // working-tree view carries it, and only while there is something to
+    // commit.
+    let footer = (matches!(tab, ChangesTab::Changes) && offers_commit(state, source)).then(|| {
         widget::container(changes_footer(state, source, modal_open))
             .padding(Padding::from([space::S, space::S]))
             .width(Length::Fill)
@@ -10589,9 +10621,8 @@ fn source_control_panel<'a>(
 ///
 /// Every tab is a word, never a bare glyph, and each keeps a stable id so
 /// focus and the accessibility tree survive a switch. A view that holds a
-/// countable list states its count beside its name, so what is behind a tab
-/// is readable before it is opened; the working tree's count takes the same
-/// warning tone the shell uses for a dirty worktree.
+/// countable list states its count in a badge beside its name, so what is
+/// behind a tab is readable before it is opened.
 fn panel_navigation<'a>(
     source: &'a SourceControlModel,
     modal_open: bool,
@@ -10605,7 +10636,7 @@ fn panel_navigation<'a>(
         source
             .change_count_label
             .as_deref()
-            .map(|count| (Cow::Borrowed(count), design::muted_text as fn(&_) -> _))
+            .map(|count| (Cow::Borrowed(count), crate::ui_controls::CountTone::Neutral))
     };
     let tabs = match navigation {
         PanelNavigation::None => return None,
@@ -10619,7 +10650,7 @@ fn panel_navigation<'a>(
                     ChangesTab::Branch => match &source.branch_changes {
                         BranchChanges::Ready(branch) if !branch.rows.is_empty() => Some((
                             Cow::Borrowed(&*branch.count_label),
-                            design::muted_text as fn(&_) -> _,
+                            crate::ui_controls::CountTone::Neutral,
                         )),
                         _ => None,
                     },
@@ -10732,7 +10763,9 @@ fn worktree_panel_chrome_with_footer<'a, M: 'a>(
 #[derive(Debug, Clone, PartialEq)]
 struct SectionHeader {
     icon: Icon,
-    title: String,
+    title: &'static str,
+    /// Drawn as a badge after the title.
+    count: Option<RowCount>,
     /// The accessible name and the tooltip. Both name the action rather than
     /// the section, because the row is a control.
     action_name: String,
@@ -10754,10 +10787,8 @@ impl SectionHeader {
             } else {
                 Icon::ChevronRight
             },
-            title: match count {
-                Some(count) => format!("{} ({count})", section.title()),
-                None => section.title().to_owned(),
-            },
+            title: section.title(),
+            count,
             action_name: format!(
                 "{} {}",
                 if expanded { "Collapse" } else { "Expand" },
@@ -10798,13 +10829,12 @@ fn panel_section<'a>(
             widget::container(parts.icon.handle().icon().size(ROW_ICON_SIZE))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::heading(parts.title)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
-                .width(Length::Fill)
-                .into(),
+            crate::ui_controls::FadeText::heading(parts.title).into(),
+            parts.count.map_or_else(
+                || widget::Space::new().into(),
+                |count| crate::ui_controls::count_badge(count.to_string(), Default::default()),
+            ),
+            widget::Space::new().width(Length::Fill).into(),
         ])
         .align_y(Alignment::Center)
         .spacing(space::XS)
@@ -10953,7 +10983,7 @@ fn files_section<'a>(
         .opacity(if row.ignored { 0.5 } else { 1.0 });
         let selected = matches!(
             state.panel_selection.as_ref(),
-            Some(PanelSelection::File(path)) if *path == row.path
+            Some(PanelSelection { path, basis: None }) if *path == row.path
         );
         let identity = panel_row(
             &*chrome.accessible_name,
@@ -10962,7 +10992,7 @@ fn files_section<'a>(
                 widget::container(file_icon)
                     .center_x(Length::Fixed(ROW_ICON_WIDTH))
                     .into(),
-                design::body(if flat || page > 0 {
+                crate::ui_controls::fade_text(if flat || page > 0 {
                     row.path.display()
                 } else {
                     Cow::Borrowed(&*chrome.label)
@@ -10972,10 +11002,6 @@ fn files_section<'a>(
                 } else {
                     theme::Text::Default
                 })
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                    EllipsizeHeightLimit::Lines(1),
-                ))
                 .width(Length::Fill)
                 .into(),
             ])
@@ -11305,6 +11331,25 @@ fn changes_section<'a>(
                 "No tracked changes."
             },
         ));
+        // With nothing to commit the commit box is gone, but the last commit
+        // can still be reworded: amending brings the box back for it. Not
+        // once it is pushed, where amending would split the branch from its
+        // upstream so that a plain push could no longer send it.
+        let pushed = source.upstream.is_some()
+            && matches!(source.tracking, TrackingState::Compared { ahead: 0, .. });
+        if source.head_oid.is_some() && !pushed && !offers_commit(state, source) {
+            column = column.push(
+                crate::ui_controls::button::secondary("Amend last commit")
+                    .icon(Icon::Commit.handle())
+                    .on_press_maybe(gated(
+                        SidebarAction::AmendChanged {
+                            key: source.key.clone(),
+                            amend: true,
+                        },
+                        modal_open || source.busy(),
+                    )),
+            );
+        }
     }
     for group in source.groups() {
         // A collapsed untracked group remains discoverable because its
@@ -11334,8 +11379,10 @@ fn changes_section<'a>(
             section,
             source.chrome.section_id(section).clone(),
             // A count matters most while the rows are not drawn: a bare
-            // "Unstaged" does not say it is folding forty files away.
-            Some(RowCount::exact(group.rows().len())),
+            // "Unstaged" does not say it is folding forty files away. A
+            // folded Untracked group was not walked, so it has no count.
+            (group.area != ChangeArea::Untracked || expanded)
+                .then(|| RowCount::exact(group.rows().len())),
             expanded,
             modal_open,
             actions,
@@ -11353,16 +11400,6 @@ fn changes_section<'a>(
                 }
             },
         ));
-    }
-    // The publish form is several rows tall and grows a wrapping refusal, so
-    // it stays in the scroll region: pinned beside the commit box it could
-    // push its own Cancel and Publish past the bottom of a short panel.
-    if let Some(publish) = state
-        .publish_draft()
-        .filter(|draft| draft.key == source.key)
-    {
-        column = column.push(crate::design::horizontal_rule());
-        column = column.push(publish_picker(source, publish, modal_open));
     }
     column.into()
 }
@@ -11472,30 +11509,44 @@ fn branch_changes_section<'a>(
             ChangeKind::Deleted => BadgeTone::Danger,
             _ => BadgeTone::Neutral,
         };
-        rows.push(crate::sticky_tree::Row { depth: file.depth, directory: false, element: panel_row(
-            &*row.label, if flat { 0 } else { file.depth },
-            widget::row::with_children(vec![
-                crate::file_icon::icon(row.entry.path.as_path()).into(),
-                design::body(if !flat && row.entry.old_path.is_none() {
-                    row.entry.path.file_name()
-                } else { Cow::Borrowed(&*row.label) })
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                    .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1)))
-                    .width(Length::Fill).into(),
-                semantic_caption(&*row.status, tone),
-                design::caption(&*row.counts).into(),
-            ]).spacing(space::XS).align_y(Alignment::Center),
-            Some(SidebarAction::OpenBranchFile {
-                key: source.key.clone(),
-                path: row.entry.path.clone(),
-                old_path: row.entry.old_path.clone(),
-                base_ref: branch.base_ref.clone(),
-                head: branch.head.clone(),
-                merge_base: branch.merge_base.clone(),
-            }),
-            matches!(&state.panel_selection, Some(PanelSelection::Branch(path)) if path == &row.entry.path),
-            modal_open,
-        ) });
+        rows.push(crate::sticky_tree::Row {
+            depth: file.depth,
+            directory: false,
+            element: panel_row(
+                &*row.label,
+                if flat { 0 } else { file.depth },
+                widget::row::with_children(vec![
+                    crate::file_icon::icon(row.entry.path.as_path()).into(),
+                    crate::ui_controls::fade_text(if !flat && row.entry.old_path.is_none() {
+                        row.entry.path.file_name()
+                    } else {
+                        Cow::Borrowed(&*row.label)
+                    })
+                    .edge(crate::ui_controls::FadeEdge::Start)
+                    .width(Length::Fill)
+                    .into(),
+                    semantic_caption(&*row.status, tone),
+                    design::caption(&*row.counts).into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+                Some(SidebarAction::OpenBranchFile {
+                    key: source.key.clone(),
+                    path: row.entry.path.clone(),
+                    old_path: row.entry.old_path.clone(),
+                    base_ref: branch.base_ref.clone(),
+                    head: branch.head.clone(),
+                    merge_base: branch.merge_base.clone(),
+                }),
+                matches!(&state.panel_selection,
+                    Some(PanelSelection {
+                        path, basis: Some(DiffBasis::MergeBaseToHead { base_ref, head, merge_base })
+                    }) if path == &row.entry.path && base_ref == &branch.base_ref
+                        && head == &branch.head && merge_base == &branch.merge_base
+                ),
+                modal_open,
+            ),
+        });
     }
     column = column.push(crate::sticky_tree::rows(rows, PANEL_ROW_HEIGHT));
     column
@@ -11583,8 +11634,12 @@ fn change_row_view<'a>(
     let chrome = &row.chrome;
     let selected = matches!(
         state.panel_selection.as_ref(),
-        Some(PanelSelection::Change { path, area: selected })
-            if *path == row.entry.path && *selected == area
+        Some(PanelSelection { path, basis: Some(basis) })
+            if *path == row.entry.path && match basis {
+                DiffBasis::HeadToIndex => area == ChangeArea::Staged,
+                DiffBasis::IndexToWorktree => area != ChangeArea::Staged,
+                _ => false,
+            }
     );
     let tone = if row.entry.conflict.is_some() {
         BadgeTone::Danger
@@ -11641,16 +11696,15 @@ fn change_row_view<'a>(
             widget::container(crate::file_icon::icon(row.entry.path.as_path()))
                 .center_x(Length::Fixed(ROW_ICON_WIDTH))
                 .into(),
-            design::body(if tree && row.entry.old_path.is_none() {
+            crate::ui_controls::fade_text(if tree && row.entry.old_path.is_none() {
                 row.entry.path.file_name()
             } else {
                 Cow::Borrowed(&*chrome.label)
             })
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(if chrome.ellipsize_start {
-                cosmic::iced::widget::text::Ellipsize::Start(EllipsizeHeightLimit::Lines(1))
+            .edge(if chrome.fade_start {
+                crate::ui_controls::FadeEdge::Start
             } else {
-                cosmic::iced::widget::text::Ellipsize::End(EllipsizeHeightLimit::Lines(1))
+                crate::ui_controls::FadeEdge::End
             })
             .width(Length::Fill)
             .into(),
@@ -11997,6 +12051,90 @@ fn commit_description_style(
     }
 }
 
+/// Whether the working tree offers a commit: it has changes, or a commit
+/// draft is under way, which stays on screen rather than vanishing with the
+/// last change it was written for.
+fn offers_commit(state: &SidebarState, source: &SourceControlModel) -> bool {
+    source.has_uncommitted_changes()
+        || state.commit_draft.amend
+        || !state.commit_message().trim().is_empty()
+}
+
+/// The branch's push or publish control for the panel header, where it is
+/// reachable from every view, or `None` when there is nothing to send: an
+/// up-to-date branch, or no branch Git could be given.
+fn upload_control<'a>(
+    source: &'a SourceControlModel,
+    modal_open: bool,
+) -> Option<Element<'a, SidebarAction>> {
+    let key = &source.key;
+    let chrome = &source.chrome;
+    let branch = source.branch.as_ref()?;
+    match &source.upstream {
+        Some(_) if source.up_to_date => None,
+        Some(target) => {
+            let counts = match &source.tracking {
+                TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
+                    Some(format!("↑{ahead} ↓{behind}"))
+                }
+                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
+                _ => None,
+            };
+            let detail = counts
+                .as_ref()
+                .map_or_else(String::new, |counts| format!(" · {counts}"));
+            let push = crate::ui_controls::icon_button(
+                Icon::Push,
+                format!(
+                    "Push {} to {}{detail}",
+                    branch.as_str(),
+                    target
+                        .remote_side_ref()
+                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
+                        .unwrap_or_else(|_| target.remote().to_owned())
+                ),
+            )
+            .on_press_maybe(
+                (source.can_push() && !modal_open).then(|| SidebarAction::Push {
+                    key: key.clone(),
+                    branch: branch.clone(),
+                    target: target.clone(),
+                }),
+            )
+            .id(chrome.push_id.clone());
+            let mut upload = widget::row::with_children(vec![push.into()])
+                .spacing(space::XXS)
+                .align_y(cosmic::iced::Alignment::Center);
+            if let Some(counts) = counts {
+                upload = upload.push(design::caption(counts));
+            }
+            Some(upload.into())
+        }
+        // A repository with no remote has nowhere to publish to.
+        None if source.remotes.is_empty() => None,
+        None if !source.upstream_reported() => Some(
+            crate::ui_controls::icon_button(
+                Icon::Push,
+                format!("Publish {}… Choose a remote and upstream", branch.as_str()),
+            )
+            .on_press_maybe((source.can_publish() && !modal_open).then(|| {
+                SidebarAction::OpenPublish {
+                    key: key.clone(),
+                    branch: branch.clone(),
+                    remotes: source.remotes.clone(),
+                }
+            }))
+            .id(chrome.push_id.clone())
+            .into(),
+        ),
+        // `git status` reported an upstream this panel could not name, so
+        // publishing would re-point the branch at whatever remote the picker
+        // offered rather than push to the upstream it has. The notices say
+        // why there is no push.
+        None => None,
+    }
+}
+
 fn changes_footer<'a>(
     state: &'a SidebarState,
     source: &'a SourceControlModel,
@@ -12038,7 +12176,7 @@ fn changes_footer<'a>(
                     press.key,
                     cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Enter)
                 ) {
-                    if press.modifiers.control() && can_commit {
+                    if press.modifiers.command() && can_commit {
                         Some(cosmic::iced::widget::text_editor::Binding::Custom(
                             subject_submit.clone(),
                         ))
@@ -12088,7 +12226,7 @@ fn changes_footer<'a>(
                 ) {
                     return None;
                 }
-                if press.modifiers.control()
+                if press.modifiers.command()
                     && matches!(
                         press.key,
                         cosmic::iced::keyboard::Key::Named(
@@ -12132,7 +12270,7 @@ fn changes_footer<'a>(
         commit_label
     };
     let commit = crate::interaction::tooltip(
-        // Ticking Amend relabels Commit; Push beside it stays put.
+        // Ticking Amend relabels Commit in place.
         crate::ui_controls::button::primary("Commit")
             .instead("Amend commit", state.commit_draft.amend)
             .icon(Icon::Commit)
@@ -12145,98 +12283,30 @@ fn changes_footer<'a>(
     if has_subject {
         column = column.push(commit_input);
     }
-    let amend = crate::ui_controls::field::checkbox(state.commit_draft.amend)
-        .label("Amend")
-        .size(14)
-        .text_size(design::TEXT_CAPTION)
-        .spacing(6)
-        .on_toggle_maybe(
-            (!modal_open && !source.busy() && source.head_oid.is_some()).then(|| {
+    // Amending needs a commit; an unborn branch has none to offer.
+    let amend = source.head_oid.is_some().then(|| {
+        crate::ui_controls::field::checkbox(state.commit_draft.amend)
+            .label("Amend")
+            .size(14)
+            .text_size(design::TEXT_CAPTION)
+            .spacing(6)
+            .on_toggle_maybe((!modal_open && !source.busy()).then(|| {
                 let key = key.clone();
                 move |amend| SidebarAction::AmendChanged {
                     key: key.clone(),
                     amend,
                 }
-            }),
-        );
-    let mut buttons = widget::row::with_capacity(4)
+            }))
+    });
+    let buttons = widget::row::with_capacity(3)
         .spacing(space::S)
-        .align_y(cosmic::iced::Alignment::Center);
-    buttons = buttons.push(commit);
-    match (&source.branch, &source.upstream) {
-        (Some(branch), Some(target)) => {
-            let counts = match &source.tracking {
-                TrackingState::Compared { ahead, behind, .. } if *behind > 0 => {
-                    Some(format!("↑{ahead} ↓{behind}"))
-                }
-                TrackingState::Compared { ahead, .. } if *ahead > 0 => Some(format!("↑{ahead}")),
-                _ => None,
-            };
-            let detail = counts
-                .as_ref()
-                .map_or_else(String::new, |counts| format!(" · {counts}"));
-            let push = crate::ui_controls::icon_button(
-                Icon::Push,
-                format!(
-                    "Push {} to {}{detail}",
-                    branch.as_str(),
-                    target
-                        .remote_side_ref()
-                        .map(|reference| format!("{}:{}", target.remote(), reference.as_str()))
-                        .unwrap_or_else(|_| target.remote().to_owned())
-                ),
-            )
-            .on_press_maybe(
-                (source.can_push() && !modal_open).then(|| SidebarAction::Push {
-                    key: key.clone(),
-                    branch: branch.clone(),
-                    target: target.clone(),
-                }),
-            )
-            .id(chrome.push_id.clone());
-            let mut upload = widget::row::with_children(vec![push.into()])
-                .spacing(space::XS)
-                .align_y(cosmic::iced::Alignment::Center);
-            if let Some(counts) = counts {
-                upload = upload.push(design::caption(counts));
-            }
-            buttons = buttons.push(upload);
-        }
-        (Some(branch), None) if !source.upstream_reported() => {
-            buttons = buttons.push(
-                crate::ui_controls::icon_button(
-                    Icon::Push,
-                    format!("Publish {}… Choose a remote and upstream", branch.as_str()),
-                )
-                .on_press_maybe((source.can_publish() && !modal_open).then(|| {
-                    SidebarAction::OpenPublish {
-                        key: key.clone(),
-                        branch: branch.clone(),
-                        remotes: source.remotes.clone(),
-                    }
-                }))
-                .id(chrome.push_id.clone()),
-            );
-        }
-        (Some(_), None) => {
-            // `git status` reported an upstream this panel could not name, so
-            // publishing would re-point the branch at whatever remote the
-            // picker offered rather than push to the upstream it has.
-            column = column.push(design::caption(
-                "Upstream could not be read — nothing to push",
-            ));
-        }
-        (None, _) => {
-            // A branch this panel cannot name is not one it may invent a
-            // mutation for, and each reason is stated as itself.
-            column = column.push(design::caption(source.no_branch_reason()));
-        }
+        .align_y(cosmic::iced::Alignment::Center)
+        .push(commit);
+    let mut buttons = buttons.push(widget::Space::new().width(Length::Fill));
+    if let Some(amend) = amend {
+        buttons = buttons.push(amend);
     }
-    column = column.push(
-        buttons
-            .push(widget::Space::new().width(Length::Fill))
-            .push(amend),
-    );
+    column = column.push(buttons);
     column.into()
 }
 
@@ -12396,12 +12466,9 @@ fn commit_changes_section<'a>(
                     0,
                     widget::row::with_children(vec![
                         crate::file_icon::icon(entry.path.as_path()).into(),
-                        design::body(label)
+                        crate::ui_controls::fade_text(label)
+                            .edge(crate::ui_controls::FadeEdge::Start)
                             .width(Length::Fill)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::Start(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
                             .into(),
                         semantic_caption(change_kind_label(entry.kind), tone),
                         design::caption(crate::repository::line_change_counts(
@@ -12417,7 +12484,7 @@ fn commit_changes_section<'a>(
                         oid: commit.oid.clone(),
                         path: entry.path.clone(),
                     }),
-                    matches!(&state.panel_selection, Some(PanelSelection::Commit { oid, path }) if oid == &commit.oid && path == &entry.path),
+                    matches!(&state.panel_selection, Some(PanelSelection { path, basis: Some(DiffBasis::CommitToParent { oid, .. }) }) if oid == &commit.oid && path == &entry.path),
                     modal_open,
                 ));
             }
@@ -12477,18 +12544,10 @@ fn history_section<'a>(
                         .center_x(Length::Fixed(ROW_ICON_WIDTH))
                         .into(),
                     widget::column::with_children(vec![
-                        design::body(&*chrome.subject)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
+                        crate::ui_controls::fade_text(&*chrome.subject)
                             .width(Length::Fill)
                             .into(),
-                        design::caption(&*chrome.metadata)
-                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                                EllipsizeHeightLimit::Lines(1),
-                            ))
+                        crate::ui_controls::FadeText::caption(&*chrome.metadata)
                             .width(Length::Fill)
                             .into(),
                     ])
@@ -13250,8 +13309,8 @@ fn filtered_projects<'a>(
         .filter_map(|project| {
             let project_matches = query.is_empty() || project.matches(query.as_ref());
             // An unreachable project draws none of its children, so it must
-            // not be matched or counted through them either: an attention or
-            // pull-request filter asks which worktrees need looking at, and
+            // not be matched or counted through them either: the attention
+            // filter asks which worktrees need looking at, and
             // rows from a read that has since failed cannot answer that. The
             // project itself survives every filter, because a project that
             // cannot be read is exactly something needing attention, and
@@ -13275,7 +13334,6 @@ fn filtered_projects<'a>(
                         && match state.filter {
                             SidebarFilter::All => true,
                             SidebarFilter::Attention => state.lists_channel(channel),
-                            SidebarFilter::PullRequests => false,
                         }
                 }));
             // The Attention list names the panes needing the user instead of
@@ -13301,15 +13359,7 @@ fn filtered_projects<'a>(
                 project
                     .worktrees
                     .iter()
-                    .filter(|_| shows_checkouts)
-                    .filter(|worktree| match state.filter {
-                        SidebarFilter::All => true,
-                        SidebarFilter::PullRequests => {
-                            state.selected_worktree(project) == Some(worktree.id)
-                                || worktree.pull_request().is_some()
-                        }
-                        SidebarFilter::Attention => false,
-                    })
+                    .filter(|_| shows_checkouts && state.filter == SidebarFilter::All)
                     .filter(|worktree| {
                         state.selected_worktree(project) == Some(worktree.id)
                             || project_matches
@@ -13330,9 +13380,6 @@ fn filtered_projects<'a>(
                         || !worktrees.is_empty()
                         || !channels.is_empty()
                         || !cards.is_empty()
-                }
-                SidebarFilter::PullRequests => {
-                    (project_matches && project.github_ready) || !worktrees.is_empty()
                 }
                 SidebarFilter::Attention => !channels.is_empty() || !cards.is_empty(),
             };
@@ -13738,6 +13785,30 @@ fn search_highlight_ranges(label: &str, query: &str) -> Vec<std::ops::Range<usiz
     merged
 }
 
+/// A row's label, fading where its row runs out of room, with the search's
+/// match in it set in bold and the accent colour. It shrinks to its text, so
+/// whatever follows it in the row takes the room that is left.
+fn search_text(
+    label: &str,
+    query: &str,
+    size: f32,
+    class: theme::Text,
+    heading: bool,
+) -> crate::ui_controls::FadeText<'static> {
+    crate::ui_controls::fade_text(label.to_owned())
+        .size(size)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+            ROW_TEXT_LINE.into(),
+        ))
+        .font(search_label_font(heading))
+        .class(class)
+        .highlight(
+            &search_highlight_ranges(label, query),
+            theme::Text::Custom(design::accent_text),
+        )
+}
+
+/// [`search_text`] filling its row.
 fn search_label(
     label: &str,
     query: &str,
@@ -13745,150 +13816,21 @@ fn search_label(
     class: theme::Text,
     heading: bool,
 ) -> Element<'static, SidebarAction> {
-    let (font, emphasis) = search_label_fonts(heading);
-    let highlights = search_highlight_ranges(label, query);
-    if highlights.is_empty() {
-        return widget::text::body(label.to_owned())
-            .size(size)
-            .font(font)
-            .class(class)
-            .wrapping(cosmic::iced::widget::text::Wrapping::None)
-            .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
-                EllipsizeHeightLimit::Lines(1),
-            ))
-            .width(Length::Fill)
-            .into();
-    }
-    let label = label.to_owned();
-    let query = query.to_owned();
-    let fitted = std::cell::RefCell::new(None::<(u32, String)>);
-    crate::ui_controls::responsive(move |slot| {
-        // Measure the exact span/font partition before truncation: the pinned
-        // renderer cannot ellipsize spans. Reuse the fit until the slot changes.
-        let label = {
-            let mut fitted = fitted.borrow_mut();
-            if fitted
-                .as_ref()
-                .is_none_or(|(width, _)| *width != slot.width.to_bits())
-            {
-                *fitted = Some((
-                    slot.width.to_bits(),
-                    ellipsize_search_label(&label, slot.width, |candidate| {
-                        search_spans_width(candidate, &query, size, font, emphasis)
-                    }),
-                ));
-            }
-            fitted.as_ref().expect("fitted label").1.clone()
-        };
-        let spans = search_label_spans(&label, &query, emphasis);
-        widget::container(
-            cosmic::iced::widget::rich_text(spans)
-                .size(size)
-                .font(font)
-                .class(class)
-                .wrapping(cosmic::iced::widget::text::Wrapping::None)
-                .width(Length::Fill),
-        )
+    search_text(label, query, size, class, heading)
         .width(Length::Fill)
-        .clip(true)
         .into()
-    })
-    .width(Length::Fill)
-    // As tall as its text, so a highlighted title sits on the same pixel
-    // row as a plain one rather than blurred between two.
-    .height(Length::Shrink)
-    .into()
 }
 
-/// A search label's font, and the one its matches are drawn in.
-fn search_label_fonts(heading: bool) -> (cosmic::iced::Font, cosmic::iced::Font) {
-    let font = cosmic::font::Font {
+/// A search label's font; its matches are set in its bold.
+fn search_label_font(heading: bool) -> cosmic::iced::Font {
+    cosmic::font::Font {
         weight: if heading {
             cosmic::iced::font::Weight::Medium
         } else {
             cosmic::iced::font::Weight::Normal
         },
         ..cosmic::font::default()
-    };
-    let emphasis = cosmic::font::Font {
-        weight: cosmic::iced::font::Weight::Bold,
-        ..font
-    };
-    (font, emphasis)
-}
-
-fn search_label_spans(
-    label: &str,
-    query: &str,
-    emphasis: cosmic::iced::Font,
-) -> Vec<cosmic::iced::widget::text::Span<'static, ()>> {
-    use cosmic::iced::widget::text::Span;
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    for range in search_highlight_ranges(label, query) {
-        if cursor < range.start {
-            spans.push(Span::new(label[cursor..range.start].to_owned()));
-        }
-        spans.push(
-            Span::new(label[range.clone()].to_owned())
-                .font(emphasis)
-                .color(design::accent_color(&cosmic::theme::active())),
-        );
-        cursor = range.end;
     }
-    if cursor < label.len() {
-        spans.push(Span::new(label[cursor..].to_owned()));
-    }
-    spans
-}
-
-fn search_spans_width(
-    label: &str,
-    query: &str,
-    size: f32,
-    font: cosmic::iced::Font,
-    emphasis: cosmic::iced::Font,
-) -> f32 {
-    use cosmic::iced::{
-        Pixels, Size,
-        advanced::text::{self, Paragraph as _},
-    };
-    let spans = search_label_spans(label, query, emphasis);
-    let paragraph = <cosmic::Renderer as text::Renderer>::Paragraph::with_spans(text::Text {
-        content: &spans,
-        bounds: Size::new(f32::INFINITY, f32::INFINITY),
-        size: Pixels(size),
-        line_height: text::LineHeight::Relative(1.5),
-        font,
-        align_x: text::Alignment::Left,
-        align_y: cosmic::iced::alignment::Vertical::Top,
-        shaping: text::Shaping::Advanced,
-        wrapping: text::Wrapping::None,
-        ellipsize: text::Ellipsize::None,
-    });
-    paragraph.min_bounds().width
-}
-
-fn ellipsize_search_label(label: &str, width: f32, measure: impl Fn(&str) -> f32) -> String {
-    if measure(label) <= width {
-        return label.to_owned();
-    }
-    if measure("…") > width {
-        return String::new();
-    }
-    let boundaries: Vec<_> = label.char_indices().map(|(index, _)| index).collect();
-    let mut low = 0;
-    let mut high = boundaries.len();
-    while low < high {
-        let middle = (low + high).div_ceil(2);
-        let candidate = format!("{}…", &label[..boundaries[middle - 1]]);
-        if measure(&candidate) <= width {
-            low = middle;
-        } else {
-            high = middle - 1;
-        }
-    }
-    format!("{}…", &label[..boundaries[low.saturating_sub(1)]])
 }
 
 pub(crate) fn is_check_failure(value: &str) -> bool {
@@ -13934,14 +13876,6 @@ fn entity_id(kind: &str, id: impl std::fmt::Display) -> Id {
     stable_id(format!("{kind}.{id}"))
 }
 
-fn filter_id(filter: SidebarFilter) -> Id {
-    stable_id(match filter {
-        SidebarFilter::All => "filter.all",
-        SidebarFilter::Attention => "filter.attention",
-        SidebarFilter::PullRequests => "filter.pull_requests",
-    })
-}
-
 /// Event decorators keep native buttons, focus operations, menus and accessible
 /// names intact instead of replacing rows with mouse-only hit targets.
 mod row_interaction {
@@ -13950,13 +13884,14 @@ mod row_interaction {
     };
     use crate::interaction::PinnedHeaders;
     use cosmic::iced::advanced::Renderer as _;
+    #[cfg(target_os = "linux")]
+    use cosmic::iced::event::{PlatformSpecific, wayland};
     use cosmic::iced::{
         Event, Length, Point, Rectangle, Size, Vector,
         advanced::{
             Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
             widget::{Id, Operation, Tree, operation, tree},
         },
-        event::{PlatformSpecific, wayland},
         keyboard, mouse, window,
     };
     use cosmic::{Element, Renderer, Theme};
@@ -13974,14 +13909,15 @@ mod row_interaction {
     /// draw. Keys, modifier changes, presses and releases still reach every
     /// row, since a focused or pressed row may be scrolled away.
     fn routine(event: &Event) -> bool {
-        matches!(
-            event,
+        match event {
             Event::Window(window::Event::RedrawRequested(_))
-                | Event::Mouse(mouse::Event::CursorMoved { .. })
-                | Event::PlatformSpecific(PlatformSpecific::Wayland(
-                    wayland::Event::RequestResize | wayland::Event::Frame(..)
-                ))
-        )
+            | Event::Mouse(mouse::Event::CursorMoved { .. }) => true,
+            #[cfg(target_os = "linux")]
+            Event::PlatformSpecific(PlatformSpecific::Wayland(
+                wayland::Event::RequestResize | wayland::Event::Frame(..),
+            )) => true,
+            _ => false,
+        }
     }
 
     /// One coordinate shared by the list and its groups, refreshed on each widget
@@ -14130,7 +14066,7 @@ mod row_interaction {
 
     struct FilterScrollState {
         active: SidebarFilter,
-        saved: [Option<tree::State>; 3],
+        saved: [Option<tree::State>; 2],
     }
 
     impl FilterScrollState {
@@ -14138,7 +14074,6 @@ mod row_interaction {
             match filter {
                 SidebarFilter::All => 0,
                 SidebarFilter::Attention => 1,
-                SidebarFilter::PullRequests => 2,
             }
         }
     }
@@ -14410,7 +14345,7 @@ mod row_interaction {
                     Kind::FilteredScroll { filter: active, .. } => {
                         Some(Box::new(FilterScrollState {
                             active,
-                            saved: [None, None, None],
+                            saved: [None, None],
                         }))
                     }
                     _ => None,

@@ -6,7 +6,7 @@
 use super::{Client, UpdateError, impact, invalid};
 use crate::{
     agent_execution::{self, directory},
-    chat::{Command, Session, Snapshot, ToolStatus},
+    chat::{Command, Session, Snapshot},
     control::ControlClient,
     model::{AgentId, RunId, TerminalId},
     terminal_ipc::{ClientRequest, ServerResponse},
@@ -30,6 +30,7 @@ struct Observation {
     publication: u64,
     permitted_children: BTreeSet<String>,
     run: Option<RunIdentity>,
+    latest_accepted: bool,
     activity: Activity,
     interrupted_generation: Option<u64>,
     stopped_children: BTreeSet<String>,
@@ -73,13 +74,13 @@ impl Observation {
         let children: BTreeSet<_> = snapshot
             .subagents
             .iter()
-            .filter(|child| child.status == ToolStatus::Running)
+            .filter(|child| child.is_running())
             .map(|child| child.id.clone())
             .collect();
         let background: BTreeSet<_> = snapshot
             .subagents
             .iter()
-            .filter(|child| child.background && child.status == ToolStatus::Running)
+            .filter(|child| child.background && child.is_running())
             .map(|child| child.id.clone())
             .collect();
         if !background.is_subset(&self.permitted_children) {
@@ -128,7 +129,7 @@ impl Observation {
     }
 
     fn observe_run(&mut self, entries: &[directory::Entry]) -> Result<bool, UpdateError> {
-        let (identity, active) = run_at(entries, &self.session)?;
+        let (identity, state) = run_at(entries, &self.session)?;
         if match (&self.run, &identity) {
             (Some(before), Some(after)) => {
                 before.agent != after.agent || before.owner != after.owner
@@ -140,18 +141,28 @@ impl Observation {
                 "The interrupted conversation's registry owner changed",
             ));
         }
+        self.latest_accepted = state == Some(agent_execution::State::Accepted);
         if identity != self.run {
-            self.late_turn = true;
+            self.late_turn |= !self.latest_accepted;
             self.run = identity;
         }
-        Ok(active)
+        // The directory names the newest acceptance, which can be a prompt
+        // still behind the interrupted turn. An Accepted row by itself proves
+        // neither a new turn nor that the original run has stopped. Require
+        // the actor's completed turn, then let the final idle impact check
+        // for an outstanding dispatch or run anywhere in this agent's queue.
+        Ok(match state {
+            Some(agent_execution::State::Accepted) => !self.activity.completion,
+            Some(state) => !state.is_terminal(),
+            None => false,
+        })
     }
 }
 
 fn run_at(
     entries: &[directory::Entry],
     session: &Session,
-) -> Result<(Option<RunIdentity>, bool), UpdateError> {
+) -> Result<(Option<RunIdentity>, Option<agent_execution::State>), UpdateError> {
     let mut matches = entries.iter().filter(|entry| entry.id == session.id);
     let entry = matches.next().ok_or_else(|| {
         invalid("The interrupted conversation disappeared from the source run registry")
@@ -166,9 +177,18 @@ fn run_at(
         ));
     }
     let Some(delegation) = &entry.delegation else {
-        return Ok((None, false));
+        return Ok((None, None));
     };
-    if delegation.run.is_some() != delegation.run_state.is_some() {
+    let owner_is_nil = match &delegation.owner {
+        directory::Owner::User => false,
+        directory::Owner::Session(lineage) => lineage.0.as_uuid().is_nil(),
+        directory::Owner::Automation(id) => id.is_nil(),
+    };
+    if delegation.run.is_some() != delegation.run_state.is_some()
+        || delegation.agent.as_uuid().is_nil()
+        || delegation.run.is_some_and(|id| id.as_uuid().is_nil())
+        || owner_is_nil
+    {
         return Err(invalid(
             "The source did not confirm the conversation's accepted run state",
         ));
@@ -184,9 +204,7 @@ fn run_at(
             owner: delegation.owner.clone(),
             run: delegation.run,
         }),
-        delegation
-            .run_state
-            .is_some_and(|state| !state.is_terminal()),
+        delegation.run_state,
     ))
 }
 
@@ -379,6 +397,7 @@ fn begin_with(
             publication: snapshot.generation,
             permitted_children: item.interrupted_subagents.iter().cloned().collect(),
             run: run_at(&entries, session)?.0,
+            latest_accepted: false,
             activity: Activity {
                 busy: false,
                 accepted: false,
@@ -498,7 +517,8 @@ fn poll_with(
         let run_active = observed.observe_run(&entries)?;
         if !observed.activity.settled
             || run_active
-            || observed.run.is_none() && !observed.activity.completion
+            || observed.run.as_ref().and_then(|run| run.run).is_none()
+                && !observed.activity.completion
         {
             pending.push(*id);
         }
@@ -526,12 +546,18 @@ fn poll_with(
         }
         check_scope(consent, &compared)?;
         for item in &idle.sessions {
-            if item.disposition == impact::Disposition::WaitsForIdle
-                && item.kind == impact::SessionKind::NativeChat
+            if item.kind == impact::SessionKind::NativeChat
                 && let Some(observed) = observations.get_mut(&item.id)
             {
-                observed.late_turn = true;
-                pending.push(item.id);
+                if item.disposition == impact::Disposition::WaitsForIdle {
+                    observed.late_turn = true;
+                    pending.push(item.id);
+                } else if item.reason.unconfirmed_agent_run()
+                    || (observed.latest_accepted
+                        && item.reason != impact::SessionCause::QueuedPromptsReady)
+                {
+                    pending.push(item.id);
+                }
             }
         }
         if !pending.is_empty() {
@@ -556,6 +582,7 @@ fn poll_with(
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+    use crate::chat::ToolStatus;
     use crate::{
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe},
         terminal_ipc::{ClientEnvelope, ServerEnvelope, ServerMessage, read_frame},
@@ -629,7 +656,7 @@ mod tests {
                 title: "Offline Codex".into(),
                 identity: "exact-owner".into(),
                 disposition: impact::Disposition::Interrupted,
-                reason: String::new(),
+                reason: "".into(),
                 interrupted_subagents: Vec::new(),
             }],
             blockers: Vec::new(),
@@ -679,6 +706,7 @@ mod tests {
             publication: 0,
             permitted_children: BTreeSet::new(),
             run: run_at(std::slice::from_ref(entry), session).unwrap().0,
+            latest_accepted: false,
             activity: Activity {
                 busy: false,
                 accepted: false,
@@ -697,15 +725,20 @@ mod tests {
 
     #[test]
     fn protocol_156_acceptance_is_not_settlement_and_registry_must_commit_the_outcome() {
-        assert_quiescence(false);
+        assert_quiescence(false, false);
+    }
+
+    #[test]
+    fn a_newer_queued_acceptance_waits_for_the_running_outcome_but_not_delivery() {
+        assert_quiescence(false, true);
     }
 
     #[test]
     fn settled_target_keeps_previously_reviewed_blocked_owners_for_floor_review() {
-        assert_quiescence(true);
+        assert_quiescence(true, false);
     }
 
-    fn assert_quiescence(known_blocked: bool) {
+    fn assert_quiescence(known_blocked: bool, queued: bool) {
         let (session, mut daemon, entry) = fixture();
         if known_blocked {
             daemon.sessions.push(impact::SessionImpact {
@@ -744,6 +777,9 @@ mod tests {
                         if phase > 0 && phase != 3 {
                             observed.sessions[0].disposition = impact::Disposition::Resumes;
                         }
+                        if queued && policy == impact::Policy::WhenIdle && phase == 2 {
+                            observed.sessions[0].reason = impact::SessionCause::QueuedPromptsReady;
+                        }
                         ServerResponse::UpgradeImpact(observed)
                     }
                     ClientRequest::ChatList => ServerResponse::ChatListed {
@@ -781,7 +817,10 @@ mod tests {
                         if phase >= 3 {
                             entry.delegation.as_mut().unwrap().run = Some(late_run);
                         }
-                        if phase > 1 && phase != 3 {
+                        if queued && phase < 3 {
+                            entry.delegation.as_mut().unwrap().run_state =
+                                Some(agent_execution::State::Accepted);
+                        } else if phase > 1 && phase != 3 {
                             entry.delegation.as_mut().unwrap().run_state =
                                 Some(agent_execution::State::Cancelled);
                         }
@@ -1106,13 +1145,13 @@ mod tests {
         let mut replacement_owner = entry.clone();
         replacement_owner.delegation.as_mut().unwrap().agent = AgentId::new();
         assert!(observed.observe_run(&[replacement_owner]).is_err());
-        for change in 0..4 {
+        for change in 0..5 {
             let mut observed = observation(&session, &entry);
             let mut publication = snapshot(&session, 1);
             match change {
                 0 => publication.turn_generation += 1,
                 1 => publication.session_id = Some("replacement-thread".into()),
-                2 => publication.subagents.push(crate::chat::Subagent {
+                2 | 4 => publication.subagents.push(crate::chat::Subagent {
                     id: "unreviewed-child".into(),
                     status: ToolStatus::Running,
                     background: true,
@@ -1120,7 +1159,11 @@ mod tests {
                     description: String::new(),
                     model: None,
                     waiting: false,
-                    detail: String::new(),
+                    detail: if change == 4 {
+                        crate::chat::UNLOADED_CHILD_RUNNING.into()
+                    } else {
+                        String::new()
+                    },
                     items: Vec::new(),
                 }),
                 _ => publication
@@ -1130,13 +1173,16 @@ mod tests {
                         "new work".into(),
                     )),
             }
-            if change == 0 || change == 3 {
+            if matches!(change, 0 | 3 | 4) {
                 observed.project(publication, false).unwrap();
                 if change == 0 {
                     assert!(observed.late_turn);
                 }
                 if change == 3 {
                     assert!(!observed.activity.settled);
+                }
+                if change == 4 {
+                    assert!(observed.activity.separate_children.is_empty());
                 }
             } else {
                 assert!(observed.project(publication, false).is_err());

@@ -787,7 +787,7 @@ mod tests {
                 focused: None,
                 checkout: None,
             }];
-            app.note_channel_named(id);
+            app.note_channel_named(id, title.into());
             drop(app.update_chrome(Action::RenameChannel(id)));
             // No conversation here names the channel, so the copy says what
             // clearing does without promising a name.
@@ -1717,13 +1717,15 @@ mod tests {
                     }),
                     Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)),
                     Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
-                    Event::Keyboard(keyboard::Event::ModifiersChanged(keyboard::Modifiers::CTRL)),
+                    Event::Keyboard(keyboard::Event::ModifiersChanged(
+                        keyboard::Modifiers::COMMAND,
+                    )),
                     Event::Keyboard(keyboard::Event::KeyPressed {
                         key: keyboard::Key::Character("a".into()),
                         modified_key: keyboard::Key::Character("a".into()),
                         physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyA),
                         location: keyboard::Location::Standard,
-                        modifiers: keyboard::Modifiers::CTRL,
+                        modifiers: keyboard::Modifiers::COMMAND,
                         text: None,
                         repeat: false,
                     }),
@@ -2014,6 +2016,19 @@ impl State {
     pub(super) fn close(&mut self) {
         self.popup = None;
     }
+
+    /// Whether something other than pane `card` is being renamed: another
+    /// pane or a channel. A click elsewhere does not end a rename.
+    pub(super) fn renaming_other_than(&self, card: CardId) -> bool {
+        self.rename
+            .as_ref()
+            .is_some_and(|(target, _)| *target != RenameTarget::Pane(card))
+    }
+
+    /// Drops a rename without applying it.
+    pub(super) fn cancel_rename(&mut self) {
+        self.rename = None;
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2021,6 +2036,8 @@ enum Popup {
     NewTab,
     Notices,
     Attention,
+    /// The waiting update's list of who it waits for.
+    Update,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2079,6 +2096,8 @@ pub enum Action {
     ToggleNewTab,
     ToggleNotices,
     ToggleAttention,
+    /// Opens or closes the waiting update's popover.
+    ToggleUpdate,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
     Close,
@@ -2086,7 +2105,7 @@ pub enum Action {
     Launch(NewTab),
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RenameTarget {
     Pane(CardId),
     Channel(crate::model::ChannelId),
@@ -2458,7 +2477,30 @@ impl Cagents {
                 }
                 ring
             }
+            Popup::Update => self.waiting_focus_ring(),
         }
+    }
+
+    /// Whether the waiting update's popover is open.
+    pub(super) fn update_popup_is_open(&self) -> bool {
+        self.chrome_ui.popup == Some(Popup::Update)
+    }
+
+    /// Closes the waiting update's popover once the wait has ended, keeping
+    /// the keyboard on the header rather than on a control that is gone.
+    pub(super) fn reconcile_update_popup(&mut self) -> Task<Message> {
+        if !self.update_popup_is_open() {
+            return Task::none();
+        }
+        if self.modal_is_open() {
+            // The dialog that opened over it takes the keyboard itself.
+            self.chrome_ui.close();
+        } else if self.idle_wait().is_none() {
+            self.chrome_ui.close();
+            return iced::widget::operation::focus(self.notice_focus_fallback())
+                .map(cosmic::Action::App);
+        }
+        Task::none()
     }
 
     /// Focuses the ring's control at `focus_index`, or its last one when the
@@ -2696,9 +2738,12 @@ impl Cagents {
                             channel.title_source = crate::model::ChannelTitleSource::Manual;
                         }
                         self.publish_model_edit(
-                            crate::workspace_model::ModelEdit::RetitleChannel { id, title },
+                            crate::workspace_model::ModelEdit::RetitleChannel {
+                                id,
+                                title: title.clone(),
+                            },
                         );
-                        self.note_channel_named(id);
+                        self.note_channel_named(id, title);
                         self.refresh_sidebar_channels();
                         self.persist();
                         return restore;
@@ -2795,11 +2840,17 @@ impl Cagents {
             Action::ToggleNewTab
             | Action::ToggleNotices
             | Action::ToggleAttention
+            | Action::ToggleUpdate
             | Action::ShowNoticesFor(_) => {
                 let popup = if matches!(action, Action::ToggleNewTab) {
                     Popup::NewTab
                 } else if matches!(action, Action::ToggleAttention) {
                     Popup::Attention
+                } else if matches!(action, Action::ToggleUpdate) {
+                    if self.idle_wait().is_none() {
+                        return Task::none();
+                    }
+                    Popup::Update
                 } else {
                     Popup::Notices
                 };
@@ -2822,6 +2873,11 @@ impl Cagents {
                         .iter()
                         .position(|id| id == NOTICES_CLOSE_ID)
                         .unwrap_or_default(),
+                    // Opens on its way forward; Enter would only review it.
+                    Popup::Update => ring
+                        .iter()
+                        .position(|id| id == super::update_ui::WAITING_NOW_ID)
+                        .unwrap_or_default(),
                 };
                 self.focus_popup_control(ring)
             }
@@ -2839,6 +2895,7 @@ impl Cagents {
                         Popup::NewTab => TOOLBAR_FOCUS_ID,
                         Popup::Notices => NOTICES_CONTROL_ID,
                         Popup::Attention => "attention.control",
+                        Popup::Update => super::update_ui::WAITING_CONTROL_ID,
                     }))
                     .map(cosmic::Action::App)
                 })
@@ -3443,7 +3500,7 @@ impl Cagents {
             .density(cosmic::cosmic_theme::Density::Compact)
             .focused(focused)
             .maximized(self.core.window.is_maximized)
-            .sharp_corners(self.core.window.sharp_corners)
+            .sharp_corners(self.window_corners_sharp())
             .start(start)
             .on_drag(Message::NativeWindowAction(cosmic::app::Action::Drag))
             .on_double_click(Message::NativeWindowAction(cosmic::app::Action::Maximize))
@@ -3473,12 +3530,19 @@ impl Cagents {
         // resize border.
         let inset = if window_controls {
             self.trailing_edge_inset()
+                .max(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing))
         } else {
             0.0
         };
+        // The header starts where the traffic lights end, should they reach
+        // past the projects pane.
         widget::container(header)
             .center_y(design::HEADER_CONTENT_HEIGHT)
-            .padding(Padding::ZERO.right(inset))
+            .padding(
+                Padding::ZERO
+                    .left(self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading))
+                    .right(inset),
+            )
             .width(Length::Fill)
             .class(cosmic::theme::Container::Background)
             .into()
@@ -3493,11 +3557,7 @@ impl Cagents {
             // desktop's density, so this gap has to follow it too.
             + count.saturating_sub(1) as f32 * f32::from(cosmic::theme::spacing().space_xxs)
             + 12.0;
-        let update = if self.has_update_control() {
-            design::PRIMARY_CONTROL_SIZE + 4.0
-        } else {
-            0.0
-        };
+        let update = self.update_control_width();
         // Same predicate `workflow_header` mounts the notice control behind.
         let notice = if self.has_chrome_notices() {
             design::PRIMARY_CONTROL_SIZE + 2.0
@@ -3517,6 +3577,8 @@ impl Cagents {
     fn tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading)
+            - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Trailing)
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);
@@ -3875,6 +3937,7 @@ impl Cagents {
         };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.close_waiting_its_turn(id) => Some(("Waiting to close", true)),
             _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.reopen_preparing(id) => Some(("Reopening conversation", true)),
@@ -3963,7 +4026,8 @@ impl Cagents {
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),
                 ),
-                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
+                (!self.terminal_close_in_progress(id) || self.close_waiting_its_turn(id))
+                    .then_some(Message::CloseCard(id)),
             ));
         }
         let tab = crate::tab_strip::middle_click_close(
