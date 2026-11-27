@@ -396,7 +396,7 @@ fn settled_bin(
 /// Use a directory/lease watcher while another coordinator still owns it.
 pub(crate) fn resume_selected(
     executable: &Path,
-    mut launch: ReadyLaunch<'_>,
+    launch: ReadyLaunch<'_>,
 ) -> Result<Option<PathBuf>, UpdateError> {
     let source = match locate(executable) {
         Ok(layout) => layout,
@@ -409,6 +409,39 @@ pub(crate) fn resume_selected(
     if source.prefix != original.prefix || source.version_root == original.plan.target {
         return Ok(None);
     }
+    resume_reserved(source, original, launch)
+}
+
+/// Resume only the job this progress command already follows. A new
+/// reservation cannot inherit that command's permission to finish it.
+pub(super) fn resume_verified_preselection(
+    state: &Path,
+    job: &UpdateJob,
+    launch: ReadyLaunch<'_>,
+) -> Result<(), UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(());
+    };
+    if reservation.job != job.id
+        || reservation.state() != state
+        || reservation.phase()? != Phase::Claimed
+        || !cutover::has_restored_checkpoint_receipt(state, &job.id)?
+    {
+        return Ok(());
+    }
+    let source = locate(&reservation.prefix.join("current/bin/cagents"))?;
+    if source.version_root == reservation.plan.target {
+        return Ok(());
+    }
+    resume_reserved(source, reservation, launch)?;
+    Ok(())
+}
+
+fn resume_reserved(
+    source: InstallLayout,
+    original: Reservation<'static>,
+    mut launch: ReadyLaunch<'_>,
+) -> Result<Option<PathBuf>, UpdateError> {
     let state = original.state();
     let deadline = Instant::now() + crate::install_guard::daemon_start_timeout()?;
     let mut last = String::new();

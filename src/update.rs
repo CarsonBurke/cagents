@@ -985,6 +985,10 @@ trait TerminalReview: Write {
     fn worker_running(&mut self) -> Result<bool, UpdateError> {
         Ok(false)
     }
+    #[cfg(target_os = "macos")]
+    fn resume_interrupted_installation(&mut self, _job: &UpdateJob) -> Result<(), UpdateError> {
+        Ok(())
+    }
     fn pause(&mut self, _deadline: Instant) {
         thread::sleep(Duration::from_millis(250));
     }
@@ -1107,6 +1111,26 @@ impl TerminalReview for NativeTerminalReview {
             Err(error) => Err(error),
         }
     }
+    #[cfg(target_os = "macos")]
+    fn resume_interrupted_installation(&mut self, job: &UpdateJob) -> Result<(), UpdateError> {
+        if !crate::install_guard::allows_darwin_update_resume()
+            || crate::daemon::lease_handoff::has_inherited_lease()?
+        {
+            return Ok(());
+        }
+        let state = running_installation()?.state_dir()?;
+        let mut report = |message: &str| {
+            let _ = writeln!(io::stderr().lock(), "{message}");
+        };
+        let launch = crate::install_guard::ReadyLaunch::Terminal(&mut report);
+        let result = ready_plan::resume_verified_preselection(&state, job, launch);
+        if result.is_err()
+            && status()?.is_some_and(|current| current.id == job.id && current.phase.is_terminal())
+        {
+            return Ok(());
+        }
+        result
+    }
     fn pause(&mut self, deadline: Instant) {
         if let Some(progress) = &self.progress {
             if progress.wait(deadline) == progress::TerminalWake::Unavailable {
@@ -1183,6 +1207,8 @@ fn drive_terminal_review_with(
     let mut confirmed: Option<impact::Preview> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     let mut finishing_message_shown = false;
+    #[cfg(target_os = "macos")]
+    let mut tried_interrupted_installation = false;
     loop {
         if Instant::now() >= deadline {
             return Err(invalid(
@@ -1213,6 +1239,15 @@ fn drive_terminal_review_with(
             } else {
                 Err(invalid(job.message))
             };
+        }
+        #[cfg(target_os = "macos")]
+        if job.phase == UpdatePhase::Installing
+            && !tried_interrupted_installation
+            && !terminal.worker_running()?
+        {
+            terminal.resume_interrupted_installation(&job)?;
+            tried_interrupted_installation = true;
+            continue;
         }
         if terminal.interrupted() {
             if terminal.cancel(&job.id)? {

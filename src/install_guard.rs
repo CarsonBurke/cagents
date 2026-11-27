@@ -940,6 +940,14 @@ pub(crate) enum ReadyLaunch<'a> {
     Window(&'a mut dyn FnMut()),
 }
 
+#[cfg(target_os = "macos")]
+pub(crate) fn allows_darwin_update_resume() -> bool {
+    std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_none()
+        && std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_none()
+        && crate::instance::window_launch_restore_policy()
+            != crate::instance::WindowRestorePolicy::ExistingOnly
+}
+
 /// A marker only selects a complete same-prefix tree while the kernel still
 /// identifies that exact daemon or matching live windows as the runtime owner.
 /// Recovery can restart only their matched daemon under the launch fence; the
@@ -957,10 +965,7 @@ pub(crate) fn staged_owner_bin(
     }
     #[cfg(target_os = "macos")]
     if recover
-        && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_none()
-        && std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_none()
-        && crate::instance::window_launch_restore_policy()
-            != crate::instance::WindowRestorePolicy::ExistingOnly
+        && allows_darwin_update_resume()
         && let Some(ready_launch) = ready_launch
         && let Some(bin) =
             crate::update::resume_darwin_update(executable, ready_launch).map_err(|error| {
