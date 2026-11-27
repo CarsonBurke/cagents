@@ -281,7 +281,11 @@ pub fn floating_control_style() -> cosmic::theme::Button {
             appearance(
                 focused,
                 theme,
-                design::mix(design::raised(theme), hover_fill(theme), hover_fill(theme).a),
+                design::mix(
+                    design::raised(theme),
+                    hover_fill(theme),
+                    hover_fill(theme).a,
+                ),
             )
         }),
         pressed: Box::new(move |focused, theme| {

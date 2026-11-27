@@ -816,10 +816,12 @@ impl Runtime {
     /// section that needs attention.
     pub(super) fn child_picker_opener(&self) -> widget::Id {
         let target = self.target;
-        let opener = match self.child_picker.as_ref().and_then(|picker| picker.opened_on) {
-            Some(Section::Finished)
-                if self.snapshot.subagents.iter().any(finished) =>
-            {
+        let opener = match self
+            .child_picker
+            .as_ref()
+            .and_then(|picker| picker.opened_on)
+        {
+            Some(Section::Finished) if self.snapshot.subagents.iter().any(finished) => {
                 Some(card_control_id(target.card, FINISHED_CONTROL))
             }
             Some(Section::Attention) => {
@@ -1174,7 +1176,10 @@ mod tests {
         assert_eq!(child_icon(&child), Icon::History);
         let children = [child.clone()];
         assert!(direct_tabs(&children, None, None, None).is_empty());
-        assert_eq!(direct_tabs(&children, Some(&child.id), None, None), [&child]);
+        assert_eq!(
+            direct_tabs(&children, Some(&child.id), None, None),
+            [&child]
+        );
         assert_eq!(
             super::super::view::AgentWork::default().caption(&child),
             chat::UNLOADED_CHILD_RUNNING

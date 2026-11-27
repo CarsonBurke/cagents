@@ -2267,8 +2267,7 @@ impl Runtime {
     /// the child goes by it and its tab already shows it whole.
     pub(super) fn selected_task(agent: &chat::Subagent) -> Option<&str> {
         Self::native_child_task(agent).filter(|task| {
-            !Self::named_by_task(agent)
-                || task.chars().nth(child_navigation::TAB_CHARS).is_some()
+            !Self::named_by_task(agent) || task.chars().nth(child_navigation::TAB_CHARS).is_some()
         })
     }
 
@@ -2710,8 +2709,7 @@ impl Runtime {
         Some(
             widget::container(
                 widget::button::custom(
-                    widget::container(design::caption("↓ New activity"))
-                        .center_y(Length::Fill),
+                    widget::container(design::caption("↓ New activity")).center_y(Length::Fill),
                 )
                 .id(card_control_id(target.card, LATEST_JUMP))
                 .name("New activity: jump to the latest")

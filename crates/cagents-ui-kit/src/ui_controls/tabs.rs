@@ -124,13 +124,15 @@ pub fn quiet_tab<'a, Message: Clone + 'a>(
     }
     // The label takes its colour from the tab, so it follows hover and
     // selection; only its drawing is cut, never its name.
-    let mut label = crate::ui_controls::FadeText::caption(label).class(cosmic::theme::Text::Default);
+    let mut label =
+        crate::ui_controls::FadeText::caption(label).class(cosmic::theme::Text::Default);
     if let Some(limit) = limit {
         label = label.limit(limit);
     }
     content = content.push(label);
     if let Some(suffix) = suffix {
-        content = content.push(design::caption(suffix).wrapping(iced::widget::text::Wrapping::None));
+        content =
+            content.push(design::caption(suffix).wrapping(iced::widget::text::Wrapping::None));
     }
     let underline = widget::container(widget::Space::new())
         .width(Length::Fill)
@@ -340,8 +342,15 @@ mod tests {
                     panic!("a custom style");
                 };
                 assert_eq!(active(false, &theme).background, None);
-                assert_eq!(active(true, &theme).background, None, "focus is not selection");
-                assert!(active(true, &theme).border_width > 0.0, "focus rings the tab");
+                assert_eq!(
+                    active(true, &theme).background,
+                    None,
+                    "focus is not selection"
+                );
+                assert!(
+                    active(true, &theme).border_width > 0.0,
+                    "focus rings the tab"
+                );
                 assert_eq!(
                     hovered(false, &theme).background.is_some(),
                     !selected,
@@ -355,8 +364,8 @@ mod tests {
     /// its room, so choosing a tab moves no label.
     #[test]
     fn selecting_a_quiet_tab_does_not_resize_it() {
-        use cosmic::iced::advanced::{layout, widget::Tree};
         use cosmic::iced::Size;
+        use cosmic::iced::advanced::{layout, widget::Tree};
         let renderer = headless_renderer();
         let sizes: Vec<_> = [false, true]
             .into_iter()

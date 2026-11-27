@@ -50,8 +50,8 @@ pub use icon::{
     passive_icon, provider_artwork, provider_icon,
 };
 pub use icon_button::{
-    IconButton, control_style, floating_control_style, focus_ring, hover_fill, icon_button, outlined_control_style,
-    segmented_controls, selected_fill, toolbar_actions,
+    IconButton, control_style, floating_control_style, focus_ring, hover_fill, icon_button,
+    outlined_control_style, segmented_controls, selected_fill, toolbar_actions,
 };
 pub use labeled_controls::labeled_controls;
 pub use labelled::labelled;

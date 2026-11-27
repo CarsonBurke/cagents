@@ -3621,7 +3621,9 @@ fn selected_native_child_renders_identity_and_bounded_selector() {
         "{labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label.starts_with("Main conversation")),
+        labels
+            .iter()
+            .any(|label| label.starts_with("Main conversation")),
         "{labels:?}"
     );
 }
@@ -14849,7 +14851,10 @@ fn the_new_activity_jump_floats_over_the_transcript_without_taking_a_row() {
     assert_eq!(control(&quiet, "New activity"), None);
     runtime.unseen_activity = true;
     let (shown, texts) = strip_scene(&runtime);
-    assert!(texts.iter().any(|text| text == "↓ New activity"), "{texts:?}");
+    assert!(
+        texts.iter().any(|text| text == "↓ New activity"),
+        "{texts:?}"
+    );
     let jump = control(&shown, "New activity").expect("the jump shows");
     let main = control(&shown, "Main conversation").expect("the Main tab");
     // Nothing below the transcript moved for it.
@@ -14899,18 +14904,28 @@ fn a_selected_subagent_says_its_state_once() {
         "{texts:?}"
     );
     assert!(
-        !texts.iter().any(|text| text.contains("Waiting for subagent activity")),
+        !texts
+            .iter()
+            .any(|text| text.contains("Waiting for subagent activity")),
         "{texts:?}"
     );
     // What the tab cannot hold: the task, and where it runs on what.
-    assert!(texts.iter().any(|text| text == "Inspect repository"), "{texts:?}");
     assert!(
-        texts.iter().any(|text| text == "Claude subagent · child-model"),
+        texts.iter().any(|text| text == "Inspect repository"),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "Claude subagent · child-model"),
         "{texts:?}"
     );
     // The tab, whose accessible name carries the state for those who
     // cannot see its mark.
-    assert!(control(&controls, "Scout · Working · ").is_some(), "{controls:?}");
+    assert!(
+        control(&controls, "Scout · Working · ").is_some(),
+        "{controls:?}"
+    );
     assert!(texts.iter().any(|text| text == "Scout"), "{texts:?}");
     assert!(texts.iter().any(|text| text == "Main"), "{texts:?}");
 }
