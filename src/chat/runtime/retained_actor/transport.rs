@@ -1163,8 +1163,8 @@ impl RemoteActor {
             .unwrap_or_else(|p| p.into_inner())
             .clone()
     }
-    pub fn recovery_environment_matches(&self, value: &BTreeMap<String, String>) -> bool {
-        &self.0.recovery_environment == value
+    pub fn recovery_environment(&self) -> BTreeMap<String, String> {
+        self.0.recovery_environment.clone()
     }
     #[cfg(any(test, feature = "test-support"))]
     pub fn resource_lifetime(&self) -> Box<dyn Fn() -> bool> {

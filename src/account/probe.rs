@@ -800,6 +800,10 @@ fn command_with_path(account: &Account, program: &Path, search_path: Option<&OsS
     for variable in account.credential_overrides() {
         command.env_remove(variable);
     }
+    // The probe reads the sign-in from where the account's agents keep it.
+    for (name, value) in super::credential_storage(account.provider) {
+        command.env(name, value);
+    }
     if let Some(home) = std::env::var_os("HOME") {
         command.current_dir(home);
     }

@@ -551,3 +551,18 @@ fn a_prepared_remote_login_uses_its_selected_path_snapshot() {
     .unwrap();
     assert!(!no_path.environment.contains_key("PATH"));
 }
+
+/// A device signs Antigravity in with the paste-code sign-in its ACP server
+/// prints, which needs no browser on the device, so a headless one reached
+/// with `--device` can be signed in from another.
+#[test]
+fn a_remote_antigravity_login_signs_in_without_a_browser_on_the_device() {
+    let recipe = login_recipe_with_path(
+        &Account::system(Provider::Antigravity),
+        "/usr/bin/agy".into(),
+        None,
+    )
+    .unwrap();
+    assert_eq!(recipe.program, "/usr/bin/agy");
+    assert_eq!(recipe.arguments, ["acp", "--login", "--disable-telemetry"]);
+}

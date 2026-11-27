@@ -96,6 +96,14 @@ pub struct Profile {
     /// Whether an error reply means the user has to sign in again. ACP
     /// reserves `-32000` for this; [`auth_required`] checks only that.
     pub sign_in_required: fn(&Value) -> bool,
+    /// What to do about a sign-in failure, given the version the agent's
+    /// `initialize` reply named, in place of signing in again and retrying:
+    /// for an agent whose sign-in cagents keeps somewhere of its own.
+    pub sign_in_advice: Option<fn(Option<&str>) -> String>,
+    /// Whether the agent reads its sign-in again for every request, so a
+    /// sign-in made since in another process is the one its next turn uses.
+    /// Antigravity 1.5.18 was seen to re-read its file sign-in each time.
+    pub rereads_sign_in: bool,
     /// Whether a `session/prompt` sent while a turn runs reaches that turn
     /// without stopping it. ACP v1 does not say what an agent does with one;
     /// Antigravity 1.5.17 answers the running prompt at once and goes on
@@ -328,6 +336,8 @@ struct Acp {
     list_titles: bool,
     title: Option<String>,
     images: bool,
+    /// The version the agent's `initialize` reply named it by.
+    agent_version: Option<String>,
     config: config::Config,
     /// Settings waiting to be sent; only one is in flight at a time, since
     /// choosing a model can change the reasoning levels it offers.
@@ -367,6 +377,7 @@ impl Acp {
             list_titles: false,
             title: None,
             images: false,
+            agent_version: None,
             config: config::Config::default(),
             settings: VecDeque::new(),
             setting_in_flight: false,
@@ -467,11 +478,11 @@ impl Acp {
     /// allowance, the agent's reason, marked as one.
     fn failure(&self, error: &Value) -> String {
         if (self.profile.sign_in_required)(error) {
-            format!(
-                "{SIGN_IN_PREFIX}: sign in to {}, then try again. ({})",
-                self.profile.label,
-                rpc::error_message(error)
-            )
+            let advice = match self.profile.sign_in_advice {
+                Some(advice) => advice(self.agent_version.as_deref()),
+                None => format!("sign in to {}, then try again.", self.profile.label),
+            };
+            format!("{SIGN_IN_PREFIX}: {advice} ({})", rpc::error_message(error))
         } else if no_allowance(error) {
             format!(
                 "{}{}",
@@ -1098,6 +1109,10 @@ impl Acp {
                 step,
             );
         }
+        self.agent_version = result["agentInfo"]["version"]
+            .as_str()
+            .filter(|version| version.len() <= 64)
+            .map(str::to_owned);
         let capabilities = &result["agentCapabilities"];
         self.images = capabilities["promptCapabilities"]["image"].as_bool() == Some(true);
         self.list_titles = capabilities["sessionCapabilities"]["list"].is_object();
@@ -2005,9 +2020,25 @@ impl Adapter for Acp {
             Command::LoadFileChanges { .. } | Command::LoadFileChangePatches { .. } => {
                 Err("File changes are served by the transcript cache".into())
             }
-            Command::ResumeAfterLogin { .. } => Err(format!(
+            // An agent that reads its sign-in again for every request uses
+            // one made since in another process for its next turn, so the
+            // failure only has to be lifted for that turn to be sent. A
+            // sign-in that still doesn't work fails that turn the same way.
+            Command::ResumeAfterLogin { .. } if !self.profile.rereads_sign_in => Err(format!(
                 "Signing in again is not yet available for {label} chats."
             )),
+            Command::ResumeAfterLogin { failure, .. } => {
+                if self.stage != Stage::Ready || self.turn.is_some() {
+                    return Err("Finish the active turn before resuming".into());
+                }
+                if !failure.starts_with(SIGN_IN_PREFIX) {
+                    return Err("This conversation has no recognized sign-in failure".into());
+                }
+                Ok(Step {
+                    events: vec![Event::LoginRecovered { failure }],
+                    ..Step::default()
+                })
+            }
             Command::StopSubagent { .. } => Err(format!("{label} cannot stop a single subagent.")),
             Command::SetFastMode { .. } => Err(format!("{label} has no fast mode.")),
             Command::SetInterruptMode { .. } => Err(format!("{label} stops a turn only one way.")),
@@ -2175,6 +2206,8 @@ pub(crate) static TEST_PROFILE: Profile = Profile {
     ],
     offers_model: |model| !model.ends_with("-contributor"),
     sign_in_required: auth_required,
+    sign_in_advice: None,
+    rereads_sign_in: true,
     steers: true,
     cancel_stops_background: true,
     backgrounds_commands: true,

@@ -1727,11 +1727,8 @@ impl LocalHandle {
     pub(crate) fn execution_environment(&self) -> crate::terminal_ipc::ChatExecutionEnvironment {
         self.0.execution_environment.clone()
     }
-    pub(crate) fn recovery_environment_matches(
-        &self,
-        environment: &BTreeMap<String, String>,
-    ) -> bool {
-        &self.0.recovery_environment == environment
+    pub(crate) fn recovery_environment(&self) -> BTreeMap<String, String> {
+        self.0.recovery_environment.clone()
     }
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
@@ -3794,8 +3791,12 @@ impl Actor {
             }
             let login_recovery = if let Command::ResumeAfterLogin { failure, .. } = &command {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                // The adapter decides whether its own provider's sign-in
+                // failed; this only refuses what is no sign-in failure at all.
                 if state.error.as_ref() != Some(failure)
-                    || !super::requires_sign_in(crate::agent::Provider::Codex, failure)
+                    || !crate::agent::Provider::ALL
+                        .into_iter()
+                        .any(|provider| super::requires_sign_in(provider, failure))
                     || state.busy
                     || state.waiting
                     || !state.requests.is_empty()

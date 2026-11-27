@@ -1915,6 +1915,49 @@ fn another_protocol_version_is_refused() {
 }
 
 #[test]
+fn being_signed_out_of_antigravity_says_where_its_agents_read_the_sign_in() {
+    let signed_out = |version: &str| {
+        let mut launch = launch(&[], None);
+        launch.provider = crate::agent::Provider::Antigravity;
+        let mut acp = prepare(&antigravity::PROFILE, &launch).unwrap().1;
+        let initialize = acp.initialize().unwrap();
+        let mut initialized = agy_initialize();
+        initialized["agentInfo"]["version"] = json!(version);
+        let opened = acp
+            .receive(reply(only_write(&initialize), initialized))
+            .unwrap();
+        let step = acp
+            .receive(refusal(
+                only_write(&opened),
+                -32000,
+                "Authentication required",
+            ))
+            .unwrap();
+        match step.events.first() {
+            Some(Event::Error { message, .. }) => message.clone(),
+            events => panic!("{events:?}"),
+        }
+    };
+    let current = signed_out("1.5.18");
+    assert!(current.starts_with(SIGN_IN_PREFIX), "{current}");
+    assert!(
+        current.contains("sign in to Antigravity from cagents, then try again."),
+        "{current}"
+    );
+    assert!(chat::requires_sign_in(
+        crate::agent::Provider::Antigravity,
+        &current
+    ));
+    // One that cannot keep its sign-in in a file is named, with the cause.
+    let outdated = signed_out("1.5.15");
+    assert!(outdated.starts_with(SIGN_IN_PREFIX), "{outdated}");
+    assert!(
+        outdated.contains("Antigravity 1.5.15 keeps its sign-in in the desktop keyring"),
+        "{outdated}"
+    );
+}
+
+#[test]
 fn being_signed_out_is_a_recognisable_sign_in_failure() {
     let signed_out = |acp: &mut Acp, request: &Value| {
         acp.receive(refusal(request, -32000, "Authentication required"))
@@ -3684,4 +3727,51 @@ fn subagents_beyond_the_bounds_forget_the_oldest() {
             .iter()
             .any(|(id, _, _, _)| *id == format!("tool:call_{MAX_INVOCATIONS}"))
     );
+}
+
+/// A turn refused for want of a sign-in leaves the conversation running.
+/// Once signed in elsewhere, resuming lifts the failure without a provider
+/// request, since the agent reads its sign-in again for the next turn; only
+/// a recognized sign-in failure, between turns, is lifted.
+#[test]
+fn a_turn_refused_for_its_sign_in_resumes_once_signed_in() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "Summarize");
+    let refused = acp
+        .receive(refusal(&request, -32000, "Authentication required"))
+        .unwrap();
+    assert_eq!(finished(&refused), Some(Kind::Failed));
+    let failure = refused
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .expect("the turn reports its sign-in failure");
+    assert!(failure.starts_with(SIGN_IN_PREFIX), "{failure}");
+    let resume = |acp: &mut Acp, failure: &str| {
+        acp.command(Command::ResumeAfterLogin {
+            failure: failure.into(),
+            expected: None,
+        })
+    };
+    assert!(resume(&mut acp, "fixture: adapter crashed").is_err());
+    let resumed = resume(&mut acp, &failure).unwrap();
+    assert!(resumed.writes.is_empty());
+    assert_eq!(
+        resumed.events,
+        vec![Event::LoginRecovered {
+            failure: failure.clone()
+        }]
+    );
+    // Not while a turn runs.
+    prompt(&mut acp, "Again");
+    assert!(resume(&mut acp, &failure).is_err());
+    // Nor for an agent that doesn't read its sign-in again on each request.
+    let mut other = adapter(&[], None);
+    ready(&mut other);
+    other.profile = &muse::PROFILE;
+    assert!(resume(&mut other, &failure).is_err());
 }

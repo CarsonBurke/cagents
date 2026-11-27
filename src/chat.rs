@@ -78,6 +78,15 @@ pub fn requires_sign_in(provider: Provider, message: &str) -> bool {
                 .any(|phrase| lower.contains(phrase)))
 }
 
+/// Whether a sign-in failure comes from an agent that keeps its sign-in where
+/// the agents cagents starts can't read it while the desktop keyring is
+/// locked: an Antigravity too old to keep it in a file. Signing in again
+/// cannot help until it is updated.
+pub fn sign_in_needs_update(provider: Provider, message: &str) -> bool {
+    provider == Provider::Antigravity
+        && message.contains(crate::agent::antigravity::KEYRING_SIGN_IN)
+}
+
 /// How an ACP conversation's sign-in failure begins.
 pub const ACP_SIGN_IN_PREFIX: &str = "Authentication required";
 

@@ -22210,6 +22210,65 @@ fn auth_recovery_rejects_stale_wrong_account_and_unknown_home_actions() {
     );
     assert!(app.chat_ui.attempt(card).is_none());
 }
+/// An Antigravity too old to keep its sign-in in a file can't be signed in
+/// for agents while the desktop keyring is locked, so its sign-in bar says to
+/// update it first. A current one is only asked to sign in.
+#[test]
+fn an_antigravity_too_old_for_a_file_sign_in_is_told_to_update_first() {
+    for (failure, update) in [
+        (
+            "sign in to Antigravity from cagents, then try again. Agents in cagents read this sign-in from a file, not the desktop keyring.",
+            false,
+        ),
+        (
+            "Antigravity 1.5.15 keeps its sign-in in the desktop keyring, which agents can't read while it's locked, as it stays until someone logs in to the desktop. Update it by running agy update, then sign in from cagents.",
+            true,
+        ),
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat_for_provider(&mut app, Provider::Antigravity);
+        let handle = fixture_handle(&app, card, None);
+        handle.replace_snapshot_for_test(Snapshot::default());
+        answer_start(&mut app, target, Ok(handle.clone()));
+        let target = chat_runtime(&app, card).target;
+        let failure = format!(
+            "{}: {failure} (Authentication required)",
+            chat::ACP_SIGN_IN_PREFIX
+        );
+        handle.replace_snapshot_for_test(Snapshot {
+            error: Some(failure),
+            exited: true,
+            ..Snapshot::default()
+        });
+        let _ = app.update(Message::ChatUi(Action::Wake(target, Wake::Changed)));
+        retired(&mut app, card);
+        assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
+        let text = visible_text(&app, card).join("\n");
+        assert_eq!(
+            text.contains("Antigravity needs an update to sign in"),
+            update,
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Run agy update in a terminal, then sign in and send your message."),
+            update,
+            "{text}"
+        );
+        assert_eq!(
+            text.contains("Antigravity sign-in required"),
+            !update,
+            "{text}"
+        );
+        // Signing in stays offered: it is the step after updating.
+        let buttons = super::blocked_recovery_tests::buttons(&app, card);
+        assert!(
+            buttons
+                .iter()
+                .any(|(label, enabled)| label == "Sign in" && *enabled),
+            "{buttons:?}"
+        );
+    }
+}
 /// An ACP provider reports a missing sign-in when its conversation starts,
 /// not during a turn, so the card goes back to its draft. That draft offers
 /// the sign-in a started conversation gets, on the system account a provider
@@ -22307,6 +22366,43 @@ fn a_signed_out_draft_with_nothing_to_send_offers_only_sign_in() {
         .environment
         .insert("HOME".into(), "/unknown/agy-recovery-home".into());
     assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_none());
+}
+
+/// A conversation that stopped for its sign-in while the daemon still holds it
+/// can't start again in its pane (#4482): reconnecting would attach to the
+/// same stopped view. Its sign-in bar offers no Resume chat and says to start
+/// a new chat; once the daemon connection is gone, resuming starts it again.
+#[test]
+fn a_stopped_conversation_the_daemon_still_holds_offers_no_resume_after_sign_in() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Antigravity);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.error = Some(format!(
+        "{}: sign in to Antigravity from cagents, then try again.",
+        chat::ACP_SIGN_IN_PREFIX
+    ));
+    snapshot.exited = true;
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    assert!(!chat_runtime(&app, card).is_draft());
+    assert!(app.chat_auth_recovery(chat_runtime(&app, card)).is_some());
+    assert!(!app.chat_auth_resume_enabled(target));
+    let text = visible_text(&app, card).join("\n");
+    assert!(text.contains("Sign in, then start a new chat."), "{text}");
+    let buttons = super::blocked_recovery_tests::buttons(&app, card);
+    assert!(
+        buttons.iter().all(|(label, _)| label != "Resume chat"),
+        "{buttons:?}"
+    );
+    assert!(
+        buttons
+            .iter()
+            .any(|(label, enabled)| label == "Sign in" && *enabled),
+        "{buttons:?}"
+    );
+    app.chat_runtime_mut(target).unwrap().disconnected = true;
+    assert!(app.chat_auth_resume_enabled(target));
 }
 
 /// A start that stops for any other reason keeps its plain report.

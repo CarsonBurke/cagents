@@ -218,6 +218,82 @@ Provider references checked against the installed CLI versions:
 - [Claude user-scoped MCP configuration](https://code.claude.com/docs/en/mcp)
 - [Codex 0.157.1 keyring storage implementation](https://github.com/openai/codex/blob/rust-v0.157.1/codex-rs/login/src/auth/storage.rs)
 
+## Antigravity's sign-in
+
+Antigravity (`agy`) keeps its OAuth sign-in in the desktop keyring by default.
+On Linux the login keyring stays locked until someone logs in graphically. A
+cagents daemon started at boot, or one on a headless machine, could reach the
+keyring over D-Bus but not unlock it. Every Antigravity conversation it started
+or resumed then failed with **Antigravity sign-in needs attention**, while
+Claude and Codex, which keep their logins in files, kept working.
+
+Cagents sets `AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` on every Antigravity process it
+starts, and Antigravity then keeps its sign-in in
+`~/.gemini/antigravity-cli/antigravity-oauth-token` instead. Every path sets it:
+
+- new conversations and agents
+- conversations resumed or restored after a daemon upgrade, including recipes
+  saved before this change or that set the variable differently
+- account checks, whose own data directory links to that file, since
+  Antigravity reads its sign-in only from the directory it runs with
+- the **Sign in** terminal, which runs `agy acp --login`
+- every cagents terminal, including a shell where you run `agy` yourself
+
+The variable takes precedence over the daemon's environment, the saved recipe
+and the terminal's starting environment. A shell startup file that unsets it
+again affects only that shell.
+
+### Signing in
+
+The file starts out empty. A sign-in held only in the keyring, such as one made
+in a terminal outside cagents, is not copied: cagents does not read or move
+credential values. Copying would mean reading Antigravity's private keyring
+entry while the keyring is unlocked and writing it in Antigravity's
+undocumented file format. Instead, sign in once from cagents: choose **Sign
+in** on the Antigravity row in the Accounts pane. The sign-in prints a Google
+link and asks for the code, or the address of the page Google shows next. It
+needs no browser on the machine itself, so it also works on a device reached
+over `ssh` or `--device`.
+
+Until you do, Antigravity conversations ask you to sign in, even on a desktop
+whose keyring is unlocked. The prompt says that agents in cagents read the
+sign-in from a file, not the keyring. Once signed in, choose **Resume chat** on
+the prompt of a conversation that is still running, and your next message uses
+the new sign-in.
+
+Antigravity 1.5.18 is the first version known to support the variable. Version
+1.5.15 does not; 1.5.16 and 1.5.17 were not checked. An older Antigravity still
+uses the keyring. A conversation's sign-in prompt then says **Antigravity
+needs an update to sign in**, and the account status names the version: run
+`agy update`, then sign in from cagents and start a new chat. A conversation
+whose older Antigravity is still running can't read the new sign-in, so it
+offers no **Resume chat**.
+
+This applies on macOS too, where a headless or SSH-only Mac leaves the login
+Keychain locked in the same way. A conversation or terminal whose Antigravity
+was already running when the daemon was upgraded keeps the environment it
+started with until its Antigravity starts again.
+
+### Security
+
+The file is readable and writable only by your user (mode 0600), the same
+protection Claude Code's `.credentials.json` and Codex's `auth.json` have. The
+account check that follows every sign-in, and later checks, reset a wider mode
+to 0600. They change only the mode: cagents never reads the file. Unlike a
+keyring entry, the file is protected by file permissions, not by your login
+password. Any process running as your user can read it, and so can anyone who
+can read your home directory, such as from an unencrypted disk or a backup.
+Keep `~/.gemini` out of shared backups and synced dotfiles.
+
+An `agy` you run outside cagents without the variable uses the keyring. If the
+keyring is unlocked when it starts, Antigravity moves the file's sign-in into
+the keyring and deletes the file. Agents in cagents are then signed out until
+you sign in from cagents again. To keep them from interfering, set
+`AGY_CLI_FORCE_FILE_TOKEN_STORAGE=1` in the environment where you run `agy`
+yourself, such as `~/.config/environment.d/` or your shell's startup file. Your
+own `agy` then uses the same sign-in as cagents. Terminals in cagents need no
+such setting.
+
 ## When the account list is lost
 
 Each added account keeps its login and conversation history in its own home

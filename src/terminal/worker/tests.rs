@@ -4749,6 +4749,34 @@ fn explicit_recipe_environment_overrides_terminal_defaults() {
 }
 
 #[test]
+fn every_terminal_keeps_antigravity_s_sign_in_where_its_agents_read_it() {
+    let name = crate::agent::antigravity::FILE_TOKEN_STORAGE;
+    let on = OsStr::new(crate::agent::antigravity::FILE_TOKEN_STORAGE_ON);
+    // A shell the reader starts, and a recipe saved with another value or
+    // asking for it to be removed, all start with it set.
+    let shell = command_from_recipe(&env_recipe(BTreeMap::new()));
+    assert_eq!(shell.get_env(name), Some(on));
+    let saved = command_from_recipe(&env_recipe(BTreeMap::from([(
+        name.to_owned(),
+        "0".to_owned(),
+    )])));
+    assert_eq!(saved.get_env(name), Some(on));
+    let mut removing = env_recipe(BTreeMap::new());
+    removing.unset_environment.insert(name.to_owned());
+    assert_eq!(command_from_recipe(&removing).get_env(name), Some(on));
+    // So does a conversation returned to its terminal with the exact
+    // environment it ran with, even one from before cagents set it.
+    let returned = command_from_execution(
+        &removing,
+        &crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([(
+            name.to_owned(),
+            "0".to_owned(),
+        )])),
+    );
+    assert_eq!(returned.get_env(name), Some(on));
+}
+
+#[test]
 fn removed_managed_home_cannot_relaunch_from_final_pty_environment() {
     const CHILD: &str = "CAGENTS_REMOVED_ACCOUNT_PTY_TEST";
     if std::env::var_os(CHILD).is_none() {
