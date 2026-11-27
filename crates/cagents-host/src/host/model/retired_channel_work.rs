@@ -307,11 +307,19 @@ mod tests {
 
     /// The rows of `db` as a schema before 30 holds them. Schema 30 adds
     /// each channel's checkout, which a channel made before it lacks: it
-    /// works in the main checkout.
+    /// works in the main checkout. Schema 32 adds automation attention
+    /// resolution and schema 33 lineage predecessors; neither backfills a
+    /// record for this fixture.
     fn rows_without_checkouts(db: &Connection) -> BTreeMap<String, Vec<Vec<Value>>> {
         let mut rows = rows(db);
         for channel in rows.get_mut("channels").unwrap() {
             assert_eq!(channel.pop(), Some(Value::Null));
+        }
+        for table in [
+            "automation_attention_resolution",
+            "session_lineage_predecessors",
+        ] {
+            assert_eq!(rows.remove(table), Some(Vec::new()), "{table}");
         }
         rows
     }
