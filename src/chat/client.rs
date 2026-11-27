@@ -147,6 +147,13 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         {
             super::Recovery::UpdateStopped
         }
+        // Retryable for older windows, which keep asking; attaching again
+        // only meets it again, and an explicit restore reopens it.
+        ipc::ProtocolErrorCode::TerminalUnavailable
+            if error.message.starts_with(super::DAEMON_LOST_STOPPED) =>
+        {
+            super::Recovery::DaemonLost
+        }
         _ if error.retryable => super::Recovery::Retry,
         ipc::ProtocolErrorCode::TerminalUnavailable
             if error.message.starts_with(super::STARTUP_RECOVERY_REFUSAL) =>
@@ -1927,13 +1934,13 @@ fn restore(
         );
     }
     if session.native_continuity.retains_provider() {
-        let mut failure = refusal.unwrap_or_else(|| {
-            StartFailure::retry("No authenticated native holder was available.")
-        });
-        failure.message = format!(
-            "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
-            failure.message
-        );
+        let mut failure = refusal.unwrap_or_else(|| StartFailure::retry(super::NOTHING_RUNS_IT));
+        if failure.message != super::NOTHING_RUNS_IT {
+            failure.message = format!(
+                "This conversation couldn't be reconnected, and nothing was restarted or resent. {}",
+                failure.message
+            );
+        }
         return Err(failure);
     }
     if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {

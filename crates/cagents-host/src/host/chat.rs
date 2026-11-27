@@ -1210,6 +1210,37 @@ pub(super) fn from_earlier_boot(host: &SharedHost, session: &Session) -> bool {
         .is_some_and(|saved| saved.is_complete() && saved.boot_id != boot)
 }
 
+/// Whether `session` is a conversation whose provider an earlier daemon ran
+/// itself, so that it ended attached to nothing when that daemon was lost:
+/// named, from another daemon's complete proof, and kept by nothing that
+/// outlives a daemon (a native holder or retained actor, a paired terminal,
+/// or an owned Codex listener). Claude chats are excluded: their own
+/// recovery reopens them through their retained owner or saved history.
+///
+/// This grants nothing. It only says that attaching cannot bring the
+/// conversation back, so the reader may be offered an explicit restart, which
+/// runs every check an ordinary start of the saved conversation runs.
+pub(super) fn ended_with_lost_daemon(host: &SharedHost, session: &Session) -> bool {
+    if session.launch.provider == Provider::Claude
+        || session.native_continuity.retains_provider()
+        || session.terminal.is_some()
+        || session.owns_codex_listener()
+        || session
+            .launch
+            .session_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return false;
+    }
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    !state.chats.contains_key(&session.id)
+        && session
+            .proof
+            .as_ref()
+            .is_some_and(|saved| saved.is_complete() && saved != state.proof())
+}
+
 /// Holds a lost agent's allocation while its close commits, once nothing could
 /// be running under it: no owner, no start, handoff or close in flight, no
 /// live paired terminal or console, and no capability issued in this boot.

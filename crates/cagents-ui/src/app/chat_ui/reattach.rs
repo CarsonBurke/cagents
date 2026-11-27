@@ -1231,6 +1231,63 @@ mod tests {
         assert!(runtime.disconnected && !runtime.reattaching);
     }
 
+    /// Regression for #4570. The daemon that ran an agent's provider itself
+    /// was lost, so nothing is left to attach the pane to. The daemon says
+    /// so, and the window stops asking: the pane says what happened, keeps
+    /// the conversation and draft, and offers Reopen conversation, whose
+    /// explicit restore starts the provider again for the agent to follow.
+    #[test]
+    fn a_managed_agents_pane_its_lost_daemon_ran_offers_a_reopen() {
+        let mut app = test_app();
+        let card = live_chat(&mut app, Some("thread"));
+        let source = chat_runtime(&app, card).session.clone();
+        app.workspace_model
+            .agents
+            .push(crate::app::channel_ui::close_tests::agent(&source));
+        lose(&mut app, card, Instant::now());
+        make_attempt(&mut app, card);
+        assert_eq!(
+            app.chat_ui.attempt(card).map(|attempt| attempt.intent),
+            Some(chat::Intent::RestoreExisting)
+        );
+        let target = attempt(&app, card).unwrap();
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: chat::daemon_lost_stopped(source.launch.provider),
+                recovery: chat::Recovery::DaemonLost,
+            }),
+        );
+        assert!(app.chat_ui.reattach.gave_up(card), "no attempt can help");
+        assert!(attempt(&app, card).is_none());
+        let runtime = chat_runtime(&app, card);
+        assert!(!runtime.is_draft());
+        assert_eq!(
+            runtime.start_blocked,
+            Some(super::blocked_recovery::Reopen::DaemonLost)
+        );
+        let stopped = runtime.stopped(false, false);
+        assert_eq!(
+            stopped.primary,
+            Some((
+                super::blocked_recovery::REOPEN_LABEL,
+                stopped::Press::Reopen,
+                true
+            ))
+        );
+        assert_eq!(
+            stopped.guidance,
+            super::blocked_recovery::DAEMON_LOST_GUIDANCE
+        );
+        drop(app.update(Message::ChatUi(Action::ReopenStopped(card))));
+        assert_eq!(
+            app.chat_ui.attempt(card).map(|attempt| attempt.intent),
+            Some(chat::Intent::Restore),
+            "the reader's reopen restores the conversation explicitly"
+        );
+    }
+
     /// Reconnect now on an agent's pane makes the attempt the window was
     /// waiting to make, not the reader's own kind, which starts a provider.
     #[test]

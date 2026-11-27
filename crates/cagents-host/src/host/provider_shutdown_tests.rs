@@ -1594,6 +1594,143 @@ fn a_chat_reopened_in_place_after_its_daemon_was_lost_keeps_its_agent() {
     assert!(pane_opens(&registry, agent.id));
 }
 
+/// The next daemon of the same boot after the one that ran `provider`'s
+/// agent chat was lost uncleanly, with window 17 connected, and that chat as
+/// the agent and the window saved it.
+fn after_a_lost_daemon(
+    directory: &Path,
+    provider: crate::agent::Provider,
+    continuity: chat::NativeContinuity,
+) -> (SharedHost, crate::agent_execution::Agent, chat::Session) {
+    let (registry, agent, session, _) = reopenable_agent(directory, provider, continuity);
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        host_incarnation: HostIncarnation::new("first-incarnation-again"),
+        ..boot_proof("first")
+    });
+    state.install_model(registry);
+    state.register_client(17);
+    (Arc::new(state::HostLock::new(state)), agent, session)
+}
+
+/// What a window's reconnect asks first of a conversation whose saved proof
+/// names an earlier daemon: where that conversation runs now.
+fn reconnect_from_window(
+    host: &SharedHost,
+    session: &chat::Session,
+) -> Result<crate::terminal_ipc::ServerResponse, crate::terminal_ipc::ProtocolError> {
+    super::client::process_request(
+        host,
+        17,
+        crate::terminal_ipc::ClientRequest::ResolveUpgradeChat {
+            source: session.clone(),
+        },
+    )
+    .map(|(response, _, _)| response)
+}
+
+/// Regression for #4570. The daemon that ran an agent's Antigravity, Muse
+/// or OMP chat was killed, and nothing kept that provider: no holder exists
+/// for one. A window reconnecting to it used to be told that "the durable
+/// native holder is unavailable", a retryable refusal, so it asked again
+/// forever and the pane stayed stuck. It is now told, in words its pane
+/// classifies, that the conversation stopped with its daemon, so the pane
+/// offers to reopen it. Reconnecting itself starts nothing, sends nothing,
+/// and leaves the agent bound where it was.
+#[test]
+fn reconnecting_to_a_chat_its_lost_daemon_ran_is_told_it_stopped() {
+    use crate::agent_execution::HostedSession;
+    for provider in [
+        crate::agent::Provider::Antigravity,
+        crate::agent::Provider::Muse,
+        crate::agent::Provider::Omp,
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let (host, agent, session) = after_a_lost_daemon(
+            directory.path(),
+            provider,
+            chat::NativeContinuity::ReconnectOnly,
+        );
+        for _ in 0..2 {
+            let refusal = reconnect_from_window(&host, &session).unwrap_err();
+            assert_eq!(
+                refusal.code,
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable
+            );
+            assert_eq!(refusal.message, chat::daemon_lost_stopped(provider));
+            assert!(!refusal.message.contains("holder"), "{}", refusal.message);
+        }
+        assert!(host.lock().unwrap().chats.is_empty(), "nothing was started");
+        let registry = agent_execution::registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        assert_eq!(
+            registry.agent(agent.id).unwrap().session,
+            Some(HostedSession::Chat(session))
+        );
+        assert!(
+            !registry.agent_process_ended(agent.id).unwrap(),
+            "a reconnect proves nothing about the earlier process"
+        );
+    }
+}
+
+/// Only a chat its lost daemon ran with nothing else keeping it is offered a
+/// reopen. A retained provider, a conversation never named, a chat of this
+/// very daemon or one without its proof, and a Claude chat keep their own
+/// recovery, and a holder that is gone is described without naming it.
+#[test]
+fn only_a_chat_its_lost_daemon_ran_alone_is_offered_a_reopen() {
+    let directory = tempfile::tempdir().unwrap();
+    let (host, _, session) = after_a_lost_daemon(
+        directory.path(),
+        crate::agent::Provider::Antigravity,
+        chat::NativeContinuity::ReconnectOnly,
+    );
+    assert!(super::chat::ended_with_lost_daemon(&host, &session));
+    let current = host.lock().unwrap().proof().clone();
+    let variants: [(&str, Box<dyn Fn(&mut chat::Session)>); 5] = [
+        (
+            "retained",
+            Box::new(|session| {
+                session.native_continuity = chat::NativeContinuity::Durable {
+                    provider_version: "test".into(),
+                }
+            }),
+        ),
+        (
+            "unnamed",
+            Box::new(|session| session.launch.session_id = None),
+        ),
+        (
+            "this daemon's",
+            Box::new(move |session| session.proof = Some(current.clone())),
+        ),
+        ("proofless", Box::new(|session| session.proof = None)),
+        (
+            "claude",
+            Box::new(|session| session.launch.provider = crate::agent::Provider::Claude),
+        ),
+    ];
+    for (name, change) in variants {
+        let mut other = session.clone();
+        change(&mut other);
+        assert!(
+            !super::chat::ended_with_lost_daemon(&host, &other),
+            "{name} must keep its own recovery"
+        );
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let (host, _, retained) = after_a_lost_daemon(
+        directory.path(),
+        crate::agent::Provider::Claude,
+        chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+    );
+    let refusal = reconnect_from_window(&host, &retained).unwrap_err();
+    assert_eq!(refusal.message, chat::NOTHING_RUNS_IT);
+    assert!(refusal.retryable);
+}
+
 /// A retained provider outlives the daemon that started it, so a chat
 /// reopened beside it in the same boot does not take its agent over, and
 /// nothing records that it stopped.
