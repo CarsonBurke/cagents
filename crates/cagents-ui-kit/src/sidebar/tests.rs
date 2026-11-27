@@ -11439,7 +11439,27 @@ fn a_row_being_deleted_is_inert_and_a_failed_one_offers_a_retry() {
         }),
         "{actions:?}"
     );
+    // A failure the user decides to live with can be put away from the row.
+    assert!(
+        actions.contains(&SidebarAction::DismissWorktreeDeletion {
+            project_id,
+            worktree_id: doomed,
+        }),
+        "{actions:?}"
+    );
+    assert!(
+        actions.contains(&SidebarAction::DismissChannelDeletion {
+            channel_id: channel
+        }),
+        "{actions:?}"
+    );
     let names = accessible_names(&renderer, body(&model, &state, false, false));
+    assert!(
+        names
+            .iter()
+            .any(|name| name == "Keep fix-sidebar and dismiss the failed deletion"),
+        "{names:?}"
+    );
     assert!(
         names
             .iter()

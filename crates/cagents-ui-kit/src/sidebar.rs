@@ -5371,6 +5371,8 @@ impl SidebarState {
             | SidebarAction::RetryWorktreeOperation(_)
             | SidebarAction::RetryWorktreeDeletion { .. }
             | SidebarAction::RetryChannelDeletion { .. }
+            | SidebarAction::DismissWorktreeDeletion { .. }
+            | SidebarAction::DismissChannelDeletion { .. }
             | SidebarAction::ProjectCommand { .. }
             | SidebarAction::OpenFileInEditor { .. }
             | SidebarAction::FileCommand { .. }
@@ -5502,6 +5504,17 @@ pub enum SidebarAction {
     },
     /// Runs a confirmed channel deletion again after it failed.
     RetryChannelDeletion {
+        channel_id: ChannelId,
+    },
+    /// Keeps a worktree whose deletion failed and clears the failure from its
+    /// row.
+    DismissWorktreeDeletion {
+        project_id: ProjectId,
+        worktree_id: WorktreeId,
+    },
+    /// Keeps a channel whose deletion failed and clears the failure from its
+    /// row.
+    DismissChannelDeletion {
         channel_id: ChannelId,
     },
     SearchChanged(String),
@@ -8992,26 +9005,40 @@ fn deletion_ink(ink: RowInk, deletion: Option<&RowDeletion>) -> RowInk {
     }
 }
 
-/// Mounts a row with the trailing retry a failed deletion offers.
-fn with_deletion_retry(
+/// The answers a row's failed deletion offers: run it again, or keep the row
+/// and stop asking.
+struct FailedDeletionAnswers {
+    retry: Option<SidebarAction>,
+    retry_id: Id,
+    dismiss: Option<SidebarAction>,
+    dismiss_id: Id,
+}
+
+/// Mounts a row with the trailing answers a failed deletion offers.
+fn with_failed_deletion_answers(
     row: Element<'static, SidebarAction>,
     deletion: Option<&RowDeletion>,
     compact: bool,
     label: &str,
-    retry: Option<SidebarAction>,
-    id: Id,
+    answers: FailedDeletionAnswers,
 ) -> Element<'static, SidebarAction> {
     if compact || !matches!(deletion, Some(RowDeletion::Failed(_))) {
         return row;
     }
-    widget::row::with_capacity(2)
+    widget::row::with_capacity(3)
         .align_y(Alignment::Center)
         .push(row)
         .push(icon_action(
             Icon::Refresh,
             format!("Retry deleting {label}"),
-            retry,
-            id,
+            answers.retry,
+            answers.retry_id,
+        ))
+        .push(icon_action(
+            Icon::Close,
+            format!("Keep {label} and dismiss the failed deletion"),
+            answers.dismiss,
+            answers.dismiss_id,
         ))
         .into()
 }
@@ -9141,18 +9168,27 @@ fn channel_view(
         indicator_width,
     );
     crate::reorder::channel_target(
-        grid.mount(with_deletion_retry(
+        grid.mount(with_failed_deletion_answers(
             channel_context_controls(action, channel.id, inert, selection_count),
             deletion,
             compact,
             &channel.title,
-            gated(
-                SidebarAction::RetryChannelDeletion {
-                    channel_id: channel.id,
-                },
-                modal_open,
-            ),
-            entity_id("channel.retry-delete", channel.id),
+            FailedDeletionAnswers {
+                retry: gated(
+                    SidebarAction::RetryChannelDeletion {
+                        channel_id: channel.id,
+                    },
+                    modal_open,
+                ),
+                retry_id: entity_id("channel.retry-delete", channel.id),
+                dismiss: gated(
+                    SidebarAction::DismissChannelDeletion {
+                        channel_id: channel.id,
+                    },
+                    modal_open,
+                ),
+                dismiss_id: entity_id("channel.dismiss-delete", channel.id),
+            },
         )),
         channel.id,
         !inert,
@@ -9872,7 +9908,7 @@ fn worktree_view(
     } else {
         action
     };
-    grid.mount(with_deletion_retry(
+    grid.mount(with_failed_deletion_answers(
         context_controls(
             action,
             project_id,
@@ -9887,14 +9923,24 @@ fn worktree_view(
         deletion,
         compact,
         &chrome.label,
-        gated(
-            SidebarAction::RetryWorktreeDeletion {
-                project_id,
-                worktree_id: worktree.id,
-            },
-            modal_open,
-        ),
-        entity_id("worktree.retry-delete", worktree.id),
+        FailedDeletionAnswers {
+            retry: gated(
+                SidebarAction::RetryWorktreeDeletion {
+                    project_id,
+                    worktree_id: worktree.id,
+                },
+                modal_open,
+            ),
+            retry_id: entity_id("worktree.retry-delete", worktree.id),
+            dismiss: gated(
+                SidebarAction::DismissWorktreeDeletion {
+                    project_id,
+                    worktree_id: worktree.id,
+                },
+                modal_open,
+            ),
+            dismiss_id: entity_id("worktree.dismiss-delete", worktree.id),
+        },
     ))
 }
 

@@ -264,6 +264,8 @@ pub enum Action {
     ProjectSessionsClosed(ProjectId, u64, Result<ProjectSessionClosure, String>),
     /// Runs a failed deletion again. The user confirmed it once already.
     RetryDelete(WorktreeId),
+    /// Keeps a worktree whose deletion failed; its row stops asking.
+    DismissFailedDelete(WorktreeId),
     AwaitSessions(Target, WorktreeRemovalCapture),
     /// A merged worktree was inspected for its notice; it is always kept.
     /// `contents` is `None` when the inspection could not finish.
@@ -1461,17 +1463,14 @@ impl Cagents {
                 let dismissed = self.project_ui.dialog.take();
                 // Declining to run a failed deletion again is the answer to
                 // it, so its row stops asking.
-                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree)
-                    && self
-                        .project_ui
-                        .deletions
-                        .get(&id)
-                        .is_some_and(|deletion| deletion.failure.is_some())
-                {
-                    self.project_ui.deletions.remove(&id);
-                    self.sync_worktree_operation_rows();
+                if let Some(id) = dismissed.and_then(|dialog| dialog.target.worktree) {
+                    self.dismiss_failed_worktree_deletion(id);
                 }
                 return self.project_dialog_closed();
+            }
+            Action::DismissFailedDelete(id) => {
+                self.dismiss_failed_worktree_deletion(id);
+                return Task::none();
             }
             Action::ConfirmRemove => {
                 let Some(mut removal) = self.project_ui.remove_dialog.take() else {
@@ -1865,6 +1864,20 @@ impl Cagents {
             }
         }
         Task::none()
+    }
+
+    /// Forgets the failed deletion of `id`, keeping the worktree. A deletion
+    /// still under way is not the user's to dismiss.
+    fn dismiss_failed_worktree_deletion(&mut self, id: WorktreeId) {
+        if self
+            .project_ui
+            .deletions
+            .get(&id)
+            .is_some_and(|deletion| deletion.failure.is_some())
+        {
+            self.project_ui.deletions.remove(&id);
+            self.sync_worktree_operation_rows();
+        }
     }
 
     /// Registers a confirmed deletion on its row and starts it.
@@ -2755,6 +2768,7 @@ pub(super) fn runs_in_device_window(action: &Action) -> bool {
         | Action::ProjectSessionsClosed(..)
         | Action::ConfirmDelete
         | Action::RetryDelete(_)
+        | Action::DismissFailedDelete(_)
         | Action::AwaitSessions(..)
         | Action::Deleted { .. }
         | Action::DeviceRemovalChecked { .. }
@@ -4854,6 +4868,50 @@ pub(in crate::app) mod tests {
         let _ = app.handle_project_action(Action::Dismiss);
         assert_eq!(row(&app, id).unwrap().deletion, None);
         assert!(app.project_ui.deletions.is_empty());
+    }
+
+    /// A failed deletion the user decides to live with is put away from its
+    /// row: the worktree stays, and its row stops asking. One still under
+    /// way is not the row's to dismiss.
+    #[test]
+    fn a_failed_worktree_deletion_is_dismissed_from_its_row() {
+        let repository = PathBuf::from("/repo");
+        let linked = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.join("worktrees/feature"),
+            Some("feature".into()),
+        );
+        let primary = SidebarWorktree::from_durable(
+            WorktreeId::new(),
+            repository.clone(),
+            Some("main".into()),
+        );
+        let id = linked.id;
+        let (mut app, _directory, project) = deletable_app(&repository, &linked, &primary);
+        let _ = app.handle_project_action(Action::Command {
+            project_id: project,
+            worktree_id: Some(id),
+            command: ProjectCommand::Delete,
+        });
+        let _ = app.handle_project_action(Action::ConfirmDelete);
+        let _ = app.handle_project_action(Action::DismissFailedDelete(id));
+        assert_eq!(row(&app, id).unwrap().deletion, Some(RowDeletion::Deleting));
+
+        let target = app.project_ui.deletions[&id].target.clone();
+        let _ = app.handle_project_action(Action::Deleted {
+            capture: app.capture_worktree_removal(&target),
+            target,
+            result: Err("fatal: cannot remove".into()),
+        });
+        assert!(matches!(
+            row(&app, id).unwrap().deletion,
+            Some(RowDeletion::Failed(_))
+        ));
+
+        let _ = app.handle_project_action(Action::DismissFailedDelete(id));
+        assert_eq!(row(&app, id).unwrap().deletion, None);
+        assert!(app.project_ui.deletions.is_empty());
+        assert!(!app.modal_is_open());
     }
 
     /// The window moves off a worktree whose deletion it confirms and cannot

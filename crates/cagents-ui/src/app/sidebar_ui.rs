@@ -184,6 +184,22 @@ impl Cagents {
             SidebarAction::RetryChannelDeletion { channel_id } => {
                 self.handle_channel_ui(channel_ui::Action::RetryFailed(channel_id))
             }
+            // The dismiss control leaves with the failure; its row keeps the
+            // focus it had.
+            SidebarAction::DismissWorktreeDeletion { project_id, worktree_id } => Task::batch([
+                self.handle_project_action(project_ui::Action::DismissFailedDelete(worktree_id)),
+                sidebar::focus_and_reveal(sidebar::selection_row_focus_id(
+                    sidebar::SelectionRow::Worktree(project_id, worktree_id),
+                ))
+                .map(cosmic::Action::App),
+            ]),
+            SidebarAction::DismissChannelDeletion { channel_id } => Task::batch([
+                self.handle_channel_ui(channel_ui::Action::DismissFailed(channel_id)),
+                sidebar::focus_and_reveal(sidebar::selection_row_focus_id(
+                    sidebar::SelectionRow::Channel(channel_id),
+                ))
+                .map(cosmic::Action::App),
+            ]),
             SidebarAction::OpenRepositoryPicker => {
                 cosmic::task::message(Message::OpenRepository)
             }

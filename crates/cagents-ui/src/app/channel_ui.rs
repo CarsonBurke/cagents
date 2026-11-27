@@ -386,6 +386,8 @@ pub enum Action {
     RetryDelete(ChannelId),
     /// Runs a deletion that failed again, from the channel's row.
     RetryFailed(ChannelId),
+    /// Keeps a channel whose deletion failed; its row stops asking.
+    DismissFailed(ChannelId),
     ReopenTimedOut(ChannelId, std::time::Instant),
     /// Retires the emptied channels whose views have already settled, once
     /// the closes that emptied them have landed. A pane that never reached
@@ -983,6 +985,12 @@ impl Cagents {
                     return Task::none();
                 }
                 self.delete_channel(id)
+            }
+            Action::DismissFailed(id) => {
+                if self.channel_ui.failed.remove(&id).is_some() {
+                    self.refresh_sidebar_channels();
+                }
+                Task::none()
             }
             Action::Create(project_id) => {
                 let Some(id) =
@@ -4897,6 +4905,40 @@ pub(in crate::app) mod tests {
             Ok(()),
         ));
         assert!(!app.durable.channels.iter().any(|row| row.id == doomed));
+    }
+
+    /// A failed deletion the user decides to live with is put away from its
+    /// row: the channel stays, and its row stops asking. One still under way
+    /// is not the row's to dismiss.
+    #[test]
+    fn a_failed_channel_deletion_is_dismissed_from_its_row() {
+        let (mut app, doomed, _, _) = channel_with_a_conversation();
+        let deletion = |app: &Cagents| {
+            app.sidebar_model.projects[0]
+                .channels
+                .iter()
+                .find(|row| row.id == doomed)
+                .unwrap()
+                .deletion
+                .clone()
+        };
+
+        let _ = app.handle_channel_ui(Action::Delete(doomed));
+        let _ = app.handle_channel_ui(Action::ConfirmDelete);
+        let _ = app.handle_channel_ui(Action::DismissFailed(doomed));
+        assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+
+        let _ = app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            app.channel_ui.close_operation(doomed),
+            Err("the daemon is unreachable".into()),
+        ));
+        assert!(matches!(deletion(&app), Some(RowDeletion::Failed(_))));
+
+        let _ = app.handle_channel_ui(Action::DismissFailed(doomed));
+        assert_eq!(deletion(&app), None);
+        assert!(app.channel_ui.failed.is_empty());
+        assert!(app.durable.channels.iter().any(|row| row.id == doomed));
     }
 
     #[test]
