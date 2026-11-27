@@ -2071,7 +2071,7 @@ impl TerminalHandle {
         if key.action == KeyAction::Release {
             key.text = None;
         }
-        if key.action != KeyAction::Release && is_interrupt_key(&key) {
+        if matches!(key.action, KeyAction::Press | KeyAction::Repeat) && is_interrupt_key(&key) {
             return self.try_command(Command::Interrupt(Some(key)));
         }
         self.try_command(Command::Key(key))
@@ -2914,6 +2914,9 @@ fn command_storage_bound(command: &Command) -> Option<Option<usize>> {
         Command::OrderedInput { input, .. } => command_storage_bound(input),
         Command::Input(bytes) => Some(Some(bytes.len())),
         Command::Paste(text, _) => Some(text.len().checked_add(BRACKETED_PASTE_FRAME_BYTES)),
+        Command::Key(input) if input.action == KeyAction::Tap => {
+            Some(key_storage_bound(input).and_then(|bound| bound.checked_add(128)))
+        }
         Command::Key(input) => Some(key_storage_bound(input)),
         Command::Mouse(_) | Command::Focus(_) | Command::SetTheme(_) => Some(Some(128)),
         _ => None,
@@ -2934,7 +2937,9 @@ fn command_pair(command: &Command) -> Option<(admission::Identity, KeyAction)> {
             command_pair(command)
         }
         Command::OrderedInput { input, .. } => command_pair(input),
-        Command::Key(input) => Some((admission::Identity::key(input), input.action)),
+        Command::Key(input) if input.action != KeyAction::Tap => {
+            Some((admission::Identity::key(input), input.action))
+        }
         Command::Mouse(input) if input.action != MouseAction::Motion => {
             let button = input.button?;
             if matches!(button, MouseButton::WheelUp | MouseButton::WheelDown) {
@@ -4633,10 +4638,21 @@ impl Worker {
     }
 
     fn encode_key(&mut self, mut input: KeyInput) {
-        if input.action == KeyAction::Repeat && !self.pending_input.has_key_owner(&input) {
-            // Its earlier unsent down may have been canceled at a priority
-            // boundary. A later accepted repeat establishes a fresh down.
-            input.action = KeyAction::Press;
+        match input.action {
+            KeyAction::Tap if self.pending_input.has_key_owner(&input) => {
+                // Keep the wheel repeat with the physical key's release obligation.
+                input.action = KeyAction::Repeat;
+            }
+            KeyAction::Tap => {
+                self.encode_key_tap(input);
+                return;
+            }
+            KeyAction::Repeat if !self.pending_input.has_key_owner(&input) => {
+                // Its earlier unsent down may have been canceled at a priority
+                // boundary. A later accepted repeat establishes a fresh down.
+                input.action = KeyAction::Press;
+            }
+            _ => {}
         }
         let mut release = input.clone();
         release.action = KeyAction::Release;
@@ -4675,6 +4691,42 @@ impl Worker {
             }
             Err(error) => self.error("encode key", error.to_string()),
         }
+    }
+
+    fn encode_key_tap(&mut self, mut input: KeyInput) {
+        // Queue the entire tap in one packet so interruption cannot leave
+        // an escaped press behind.
+        let mut release = input.clone();
+        release.action = KeyAction::Release;
+        release.text = None;
+        input.action = KeyAction::Press;
+        let encoded = (|| -> Result<_, libghostty_vt::Error> {
+            let mut bytes = encode_key_input(&self.terminal, &mut self.key_encoder, input)?;
+            if !bytes.is_empty() {
+                bytes.extend(encode_key_input(
+                    &self.terminal,
+                    &mut self.key_encoder,
+                    release,
+                )?);
+            }
+            Ok(bytes)
+        })();
+        let bytes = match encoded {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.error("encode key tap", error.to_string());
+                return;
+            }
+        };
+        self.flush_pty_input();
+        if !self
+            .pending_input
+            .admit_packet(&bytes, self.current_admission.clone())
+        {
+            self.input_backpressure("write encoded key tap");
+            return;
+        }
+        self.flush_pty_input();
     }
 
     /// Pastes the way Ghostty does: the view returns to the prompt the text is
@@ -7205,7 +7257,7 @@ fn encode_paste(
 
 fn map_key_action(action: KeyAction, report_events: bool) -> key::Action {
     match action {
-        KeyAction::Press => key::Action::Press,
+        KeyAction::Press | KeyAction::Tap => key::Action::Press,
         KeyAction::Release => key::Action::Release,
         KeyAction::Repeat if report_events => key::Action::Repeat,
         KeyAction::Repeat => key::Action::Press,

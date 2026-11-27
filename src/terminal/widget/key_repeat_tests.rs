@@ -1,4 +1,4 @@
-//! Which key repeats the real widget sends the hosted terminal, as its peer
+//! Which key events the real widget sends the hosted terminal, as its peer
 //! receives them.
 use super::accessibility_tests::{Peer, renderer};
 use super::*;
@@ -99,6 +99,22 @@ impl Mounted {
     fn state(&mut self) -> &mut WidgetState {
         self.tree.state.downcast_mut::<WidgetState>()
     }
+}
+
+#[test]
+fn alternate_screen_wheel_sends_one_key_tap_per_row() {
+    let mut terminal = Mounted::new();
+    Arc::make_mut(&mut terminal.widget.snapshot)
+        .scroll
+        .alternate_screen = true;
+    terminal.widget.scroll_size = 2;
+    terminal.send(Event::Mouse(mouse::Event::WheelScrolled {
+        delta: ScrollDelta::Lines { x: 0.0, y: -1.0 },
+    }));
+    assert_eq!(
+        keys(&terminal.peer),
+        [(KeyAction::Tap, TerminalKey::ArrowDown); 2]
+    );
 }
 
 /// Escape closes the terminal's context menu on its key-down, which the menu

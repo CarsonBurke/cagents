@@ -4047,6 +4047,89 @@ fn legacy_repeats_encode_once_as_ordinary_key_presses() {
 }
 
 #[test]
+fn wheel_key_taps_leave_no_held_input_after_draining() {
+    let (mut worker, _) = capture_worker();
+    worker.test_write_budget = Some(0);
+    worker.terminal.vt_write(b"\x1b[?1049h");
+
+    for (mode, expected) in [
+        (&b""[..], &b"\x1b[B"[..]),
+        (&b"\x1b[>2u"[..], &b"\x1b[1;1:1B\x1b[1;1:3B"[..]),
+    ] {
+        worker.terminal.vt_write(mode);
+        let tap = Command::Key(key_input(
+            KeyAction::Tap,
+            TerminalKey::ArrowDown,
+            None,
+            None,
+        ));
+        assert!(command_pair(&tap).is_none());
+        worker.handle_command(tap);
+        assert_eq!(worker.pending_input.front(), expected);
+        assert!(!worker.pending_input.has_held_input());
+        assert!(worker.input_drained_for_handoff().is_err());
+
+        worker.pending_input.consume(expected.len());
+        assert!(worker.input_drained_for_handoff().is_ok());
+    }
+    worker.run();
+}
+
+#[test]
+fn wheel_key_tap_does_not_release_a_physical_arrow_key() {
+    let (mut worker, _) = capture_worker();
+    worker.test_write_budget = Some(0);
+    worker.terminal.vt_write(b"\x1b[?1049h\x1b[>2u");
+
+    let arrow = |action| Command::Key(key_input(action, TerminalKey::ArrowDown, None, None));
+    for (action, expected) in [
+        (KeyAction::Press, &b"\x1b[1;1:1B"[..]),
+        (KeyAction::Tap, &b"\x1b[1;1:2B"[..]),
+        (KeyAction::Release, &b"\x1b[1;1:3B"[..]),
+    ] {
+        worker.handle_command(arrow(action));
+        assert_eq!(worker.pending_input.front(), expected);
+        worker.pending_input.consume(expected.len());
+        assert_eq!(
+            worker.pending_input.has_held_input(),
+            action != KeyAction::Release
+        );
+    }
+    assert!(worker.input_drained_for_handoff().is_ok());
+    worker.run();
+}
+
+#[test]
+fn wheel_key_repeat_keeps_the_physical_release_obligation_after_a_mode_change() {
+    let (mut worker, _) = capture_worker();
+    worker.test_write_budget = Some(0);
+    worker.terminal.vt_write(b"\x1b[?1049h");
+
+    let arrow = |action| Command::Key(key_input(action, TerminalKey::ArrowDown, None, None));
+    worker.handle_command(arrow(KeyAction::Press));
+    assert_eq!(worker.pending_input.front(), b"\x1b[B");
+    worker.pending_input.consume(b"\x1b[B".len());
+
+    worker.terminal.vt_write(b"\x1b[>2u");
+    worker.handle_command(arrow(KeyAction::Tap));
+    assert_eq!(worker.pending_input.front(), b"\x1b[1;1:2B");
+    worker.pending_input.consume(b"\x1b[1;1:2B".len());
+
+    // Legacy encoding can no longer express the release owed by the repeat.
+    worker.terminal.vt_write(b"\x1b[<u");
+    worker.handle_command(arrow(KeyAction::Release));
+    assert!(worker.pending_input.has_held_input());
+    assert!(worker.input_drained_for_handoff().is_err());
+
+    worker.terminal.vt_write(b"\x1b[>2u");
+    worker.handle_command(arrow(KeyAction::Release));
+    assert_eq!(worker.pending_input.front(), b"\x1b[1;1:3B");
+    worker.pending_input.consume(b"\x1b[1;1:3B".len());
+    assert!(worker.input_drained_for_handoff().is_ok());
+    worker.run();
+}
+
+#[test]
 fn event_reporting_protocol_preserves_repeat_semantics() {
     let mut terminal = Terminal::new(TerminalOptions {
         cols: 80,
