@@ -1215,3 +1215,121 @@ fn a_reopened_codex_thread_with_uninspectable_writer_evidence_refuses_retryably(
     );
     assert!(host.lock().unwrap().chat_spawning.is_empty());
 }
+
+#[test]
+fn reconnect_restarts_only_the_exact_managed_codex_chat() {
+    use crate::agent_execution::{Destination, HostedSession, Origin};
+
+    const NAME: &str =
+        "host::chat::unserved_resume_tests::reconnect_restarts_only_the_exact_managed_codex_chat";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    install_codex(root);
+    let _lease = daemon_lease(&host);
+    let (proof, listeners) = {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        (state.proof().clone(), state.codex_listeners.clone())
+    };
+    let mut source = reopened(root);
+    source.launch.session_id = None;
+    source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+    let mut former = proof.clone();
+    former.host_incarnation = crate::model::HostIncarnation::new("former-daemon");
+    source.proof = Some(former.clone());
+    assert!(listeners.claim(&mut source, &former));
+    source.launch.session_id = Some(thread_id().into());
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Codex;
+    let registry = super::super::agent_execution::registry(&host).unwrap();
+    let agent = {
+        let mut store = registry.lock().unwrap();
+        let accepted = store.submit_agent(&Origin::User, &request, 1).unwrap();
+        let binding = HostedSession::Chat(source.clone());
+        store
+            .reserve_agent_launch(accepted.agent.id, &binding)
+            .unwrap();
+        store.bind_agent(accepted.agent.id, None, binding).unwrap();
+        accepted.agent.id
+    };
+    let resolve = |source: &Session| upgrade_resolution::resolve(&host, 1, source);
+    let mut other = source.clone();
+    other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    assert!(resolve(&other).is_err());
+    let direct_start = || {
+        let mut direct = source.clone();
+        direct.proof = Some(proof.clone());
+        process(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: direct,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap_err()
+    };
+    let refusal = direct_start();
+    assert!(
+        refusal.message.contains("agent's saved conversation"),
+        "{refusal:?}"
+    );
+    let project = root.join("project");
+    let temporarily_unavailable = root.join("project-unavailable");
+    std::fs::rename(&project, &temporarily_unavailable).unwrap();
+    let directory_refusal = resolve(&source).unwrap_err();
+    assert!(
+        directory_refusal.message.contains("project"),
+        "{directory_refusal:?}"
+    );
+    assert_eq!(direct_start(), directory_refusal);
+    std::fs::rename(temporarily_unavailable, project).unwrap();
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(!root.join("codex-arguments").exists());
+
+    let (methods, received) = mpsc::channel();
+    let server = {
+        let root = root.to_owned();
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !root.join("codex-arguments").exists() {
+                assert!(Instant::now() < deadline, "no Codex server was launched");
+                thread::sleep(Duration::from_millis(10));
+            }
+            serve(
+                crate::descriptor::bind(&socket).unwrap(),
+                root.join("home/.codex"),
+                methods,
+            );
+        })
+    };
+    let recovered = resolve(&source).unwrap();
+    resumed(&received);
+    assert_eq!(recovered.id, source.id);
+    assert_eq!(recovered.launch, source.launch);
+    assert_eq!(recovered.proof.as_ref(), Some(&proof));
+    assert_eq!(
+        registry.lock().unwrap().agent(agent).unwrap().session,
+        Some(HostedSession::Chat(recovered.clone()))
+    );
+    assert_eq!(resolve(&source).unwrap(), recovered);
+    let attached = process(
+        &host,
+        1,
+        ClientRequest::ChatAttach {
+            session: recovered.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(started(attached), recovered);
+    process(&host, 1, ClientRequest::ChatClose { chat_id: source.id }).unwrap();
+    server.join().unwrap();
+}

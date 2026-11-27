@@ -45,6 +45,7 @@ pub(super) fn expire_for_test(host: &SharedHost, client: ClientId) {
 pub(in crate::host) enum Attempt {
     Ready(Box<Grant>),
     Spent(uuid::Uuid),
+    RestartRefused(Box<RestartRefusal>),
 }
 
 impl Attempt {
@@ -52,8 +53,30 @@ impl Attempt {
         match self {
             Self::Ready(grant) => grant.attempt,
             Self::Spent(id) => *id,
+            Self::RestartRefused(refusal) => refusal.attempt,
         }
     }
+}
+
+pub(in crate::host) struct RestartRefusal {
+    attempt: uuid::Uuid,
+    source: Session,
+    error: ProtocolError,
+}
+
+/// Older windows can follow a failed Resolve with Start on the same stream.
+/// Only the exact attempted conversation gets that failure back.
+pub(super) fn restart_refusal(
+    state: &HostState,
+    client: ClientId,
+    session: &Session,
+) -> Option<ProtocolError> {
+    let Attempt::RestartRefused(refusal) = state.chat_resolutions.get(&client)? else {
+        return None;
+    };
+    let mut source = refusal.source.clone();
+    source.proof = Some(state.proof().clone());
+    (source == *session).then(|| refusal.error.clone())
 }
 
 pub(in crate::host) struct Grant {
@@ -128,8 +151,8 @@ pub(in crate::host) fn resolve(
     }
     // Startup discovery can miss an unvisited retained owner. Resolve its
     // exact issued source through ordinary authenticated adoption before
-    // asking for lineage. This route never executes a saved launch recipe,
-    // even if the holder disappears between discovery and authentication.
+    // asking for lineage. A missing holder only permits a new writer through
+    // the separately authenticated managed Codex recovery below.
     let (missing, cleanup) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -152,13 +175,29 @@ pub(in crate::host) fn resolve(
         // Client zero is the existing unattached startup-adoption mode.
         // Resolve must not subscribe this connection before its Attach.
         if let Err(native_error) = super::native_recovery::restore_for_start(host, 0, source) {
-            // A missing holder is not permission to execute its old recipe.
-            // The separate history constructor can only page saved data and
-            // repeats owner/managed-work fences under its admission guard.
-            if !source.is_saved_claude_history() {
-                return Err(native_error);
+            if source.is_saved_claude_history() {
+                super::capacity::recover_saved_history(host, source)?;
+            } else {
+                match super::codex_reconnect::restore(host, source) {
+                    Ok(true) => {}
+                    Ok(false) => return Err(native_error),
+                    Err(error) => {
+                        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                        if matches!(state.chat_resolutions.get(&client), Some(Attempt::Spent(id)) if *id == attempt)
+                        {
+                            state.chat_resolutions.insert(
+                                client,
+                                Attempt::RestartRefused(Box::new(RestartRefusal {
+                                    attempt,
+                                    source: source.clone(),
+                                    error: error.clone(),
+                                })),
+                            );
+                        }
+                        return Err(error);
+                    }
+                }
             }
-            super::capacity::recover_saved_history(host, source)?;
         }
     }
     if source.is_saved_claude_history() {

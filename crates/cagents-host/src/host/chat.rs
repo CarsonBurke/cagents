@@ -5,6 +5,7 @@ mod account_isolation_tests;
 mod account_recovery_target_tests;
 pub(super) mod capacity;
 mod codex_owners;
+pub(super) mod codex_reconnect;
 mod console_relaunch;
 pub(super) use console_relaunch::matched_cli;
 #[cfg(test)]
@@ -2305,6 +2306,7 @@ fn start_with_execution(
         execution,
         restart_launch,
         pane,
+        None,
     )?;
     // An update that stopped this conversation's failed restart reported it
     // as needing a reopen. Starting it again is that reopen.
@@ -2325,6 +2327,7 @@ fn start_publishing(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
+    reconnect: Option<&codex_reconnect::Managed>,
 ) -> Result<ServerResponse, ProtocolError> {
     // Reading the floor can fail transiently. The client routes an ordinary
     // start of a fenced conversation through its update resume, so a start
@@ -2465,6 +2468,9 @@ fn start_publishing(
         return native_recovery::restore_with_admission_for_start(
             host, client, &session, admission,
         );
+    }
+    if reconnect.is_none() && source.is_none() && restart_launch.is_none() {
+        codex_reconnect::require_current_binding(host, client, &session)?;
     }
     let mut source_process = None;
     let mut resolved_restart_recipe = None;
@@ -2723,6 +2729,11 @@ fn start_publishing(
         }
         _ => None,
     };
+    if reconnect.is_some() && owned_socket.is_none() {
+        return Err(retryable_unavailable(
+            "The agent's Codex listener is still serving or cannot be restarted",
+        ));
+    }
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
@@ -3068,6 +3079,11 @@ fn start_publishing(
         }
         spec.withhold_environment();
         let recovery_environment = spec.environment.clone();
+        if let Some(reconnect) = reconnect {
+            // The owned-listener admission above proved the old execution
+            // ended while this start held its reservation. Never replay its work.
+            reconnect.stop_previous()?;
+        }
         let delegated_source = session.clone();
         // Capability is transient process context, never a public launch
         // recipe. A fresh provider may delegate only as its real session.
@@ -3224,6 +3240,20 @@ fn start_publishing(
                 .err()
                 .unwrap_or_else(|| retryable_unavailable(message))
         })?;
+        if let Some(reconnect) = reconnect
+            && let Err(failure) = confirm_saved_conversation(
+                &handle,
+                reconnect.thread(),
+                true,
+                Instant::now() + Duration::from_secs(15),
+                || {
+                    crate::daemon::termination_requested()
+                        || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                },
+            )
+        {
+            return Err(retryable_unavailable(failure));
+        }
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -3342,6 +3372,10 @@ fn start_publishing(
             Some(session_snapshot(&record.session, &record.handle).map_err(retryable_unavailable)?)
         };
 
+        // Agent and pane must follow the new provider before it becomes
+        // attachable. The registry lock precedes the host lock.
+        let mut reconnect_store =
+            reconnect.map(|reconnect| reconnect.registry.lock().unwrap_or_else(|p| p.into_inner()));
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(refusal) = publication_refusal(
             &state,
@@ -3351,6 +3385,7 @@ fn start_publishing(
             &reservation,
         ) {
             drop(state);
+            drop(reconnect_store);
             let _ = record.handle.close();
             return Err(refusal);
         }
@@ -3361,10 +3396,23 @@ fn start_publishing(
                 .is_none_or(|record| !previous.matches(record))
         {
             drop(state);
+            drop(reconnect_store);
             let _ = record.handle.close();
             return Err(retryable_unavailable(
                 "The completed chat changed before its exact replacement was installed",
             ));
+        }
+        if let Some((reconnect, store)) = reconnect.zip(reconnect_store.as_mut()) {
+            let ServerResponse::ChatAttached { session, .. } =
+                response.as_ref().expect("confirmed Codex snapshot")
+            else {
+                unreachable!("session_snapshot returns ChatAttached");
+            };
+            if let Err(failure) = reconnect.bind(store, &mut state, session) {
+                drop(state);
+                drop(reconnect_store);
+                return Err(retryable_unavailable(failure));
+            }
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);
@@ -3380,6 +3428,10 @@ fn start_publishing(
         state.inventory_changed();
         drop(state);
         drop(retired);
+        drop(reconnect_store);
+        if let Some(reconnect) = reconnect {
+            super::agent_execution::announce(host, &reconnect.registry);
+        }
         // The agent's provider now runs in the directory judged for it.
         if let Some((registry, opened)) = &agent_directory
             && let Err(error) = opened.started(registry)

@@ -1820,7 +1820,7 @@ pub(super) fn preflight_retirement(
 /// Serializes an agent's operations. The value is the run whose dispatcher
 /// released the gate to await provider readiness: until that dispatcher
 /// takes it back, the provider has not received the run's prompt.
-fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>> {
+pub(super) fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>> {
     shared_gate(
         &mut host
             .lock()
@@ -1894,6 +1894,9 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
             store.agent_process_ended(id)?,
         )
     };
+    if ended {
+        super::chat::codex_reconnect::reconcile_startup(host, &registry, id)?;
+    }
     // A daemon stop already proved this agent's process ended and revoked its
     // authority; only its saved conversation remains to retire.
     let mut lost_holder_fence = None;
