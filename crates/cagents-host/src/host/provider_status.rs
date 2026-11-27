@@ -17,7 +17,11 @@ pub(super) fn snapshot() -> Result<Vec<ProviderStatus>, ProtocolError> {
             ProtocolError::new(ProtocolErrorCode::Internal, error.to_string(), false)
         })?;
     runtime.block_on(async {
-        let search_path = probe::search_path().await;
+        let search_path = if cfg!(target_os = "linux") {
+            probe::refresh_search_path().await
+        } else {
+            probe::search_path().await
+        };
         let mut tasks = tokio::task::JoinSet::new();
         for provider in Provider::ALL {
             let search_path = search_path.clone();

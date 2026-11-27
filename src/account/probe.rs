@@ -600,12 +600,7 @@ static REFRESHED_SHELL_PATH: ShellPathRefresh = ShellPathRefresh::new();
 /// explicit Accounts discovery can refresh it after installation. Where the
 /// shell cannot say, this process's own `PATH` stands in.
 pub async fn search_path() -> Option<OsString> {
-    SHELL_PATH
-        .get_or_init(|| async {
-            let shell = crate::model::login_shell().ok()?;
-            shell_path(Path::new(&shell), SHELL_TIMEOUT).await
-        })
-        .await;
+    SHELL_PATH.get_or_init(read_search_path).await;
     current_search_path()
 }
 
@@ -630,9 +625,8 @@ pub fn shell_search_path() -> Option<OsString> {
         .or_else(|| SHELL_PATH.get().cloned().flatten())
 }
 
-/// Re-read interactive shell startup after an explicit setup refresh or return
-/// from installing a CLI. The existing bounded shell reader never runs a
-/// provider; concurrent requests share one result and failures keep the old path.
+/// Re-read shell startup for setup discovery and fresh native launches.
+/// Concurrent requests share one result and failures keep the last usable path.
 pub async fn refresh_search_path() -> Option<OsString> {
     REFRESHED_SHELL_PATH
         .refresh(|| async {
@@ -640,12 +634,47 @@ pub async fn refresh_search_path() -> Option<OsString> {
                 search_path().await;
                 SHELL_PATH.get().cloned().flatten()
             } else {
-                let shell = crate::model::login_shell().ok()?;
-                shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+                read_search_path().await
             }
         })
         .await;
     current_search_path()
+}
+
+async fn read_search_path() -> Option<OsString> {
+    #[cfg(target_os = "linux")]
+    return read_linux_search_path(login_path::launcher_path()).await;
+    #[cfg(not(target_os = "linux"))]
+    {
+        let shell = crate::model::login_shell().ok()?;
+        shell_path(Path::new(&shell), SHELL_TIMEOUT).await
+    }
+}
+
+#[cfg(target_os = "linux")]
+async fn read_linux_search_path(inherited: Option<OsString>) -> Option<OsString> {
+    tokio::task::spawn_blocking(move || login_path::discovery_path(inherited.as_deref()))
+        .await
+        .ok()
+        .flatten()
+}
+
+/// A local client can have a different launcher PATH from the daemon. Use it
+/// as the input to the same shell read Accounts makes in that client. Keep the
+/// daemon's shared discovery cache scoped to its own launcher environment.
+#[cfg(all(feature = "host", target_os = "linux"))]
+pub async fn launch_shell_search_path(caller: Option<&str>, refresh: bool) -> Option<OsString> {
+    if let Some(path) = caller.map(OsStr::new)
+        && Some(path) != login_path::launcher_path().as_deref()
+    {
+        return read_linux_search_path(Some(path.to_owned())).await;
+    }
+    if refresh {
+        refresh_search_path().await;
+    } else {
+        search_path().await;
+    }
+    shell_search_path()
 }
 
 /// The `PATH` `shell` sets up when started interactively, as a terminal
@@ -660,6 +689,7 @@ pub async fn refresh_search_path() -> Option<OsString> {
 /// prints, in its own process group, which goes with it. Nothing it starts
 /// can ask the reader for anything: no terminal, no input, no display, no
 /// askpass.
+#[cfg(not(target_os = "linux"))]
 async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     // Some shells (including tcsh) do not accept a combined login and
     // command invocation. Fall back within the original probe budget.
@@ -681,6 +711,7 @@ async fn shell_path(shell: &Path, timeout: Duration) -> Option<OsString> {
     None
 }
 
+#[cfg(not(target_os = "linux"))]
 async fn shell_path_in_mode(shell: &Path, mode: &str, timeout: Duration) -> Option<OsString> {
     let mut command = Command::new(shell);
     command.args([mode, "-c", SHELL_PATH_COMMAND]);
@@ -3129,6 +3160,7 @@ exec /bin/cat >/dev/null
     /// may greet the reader first or leave a job running that holds the
     /// output open; a shell that never answers leaves the search to this
     /// process's own `PATH`, without holding anything up.
+    #[cfg(not(target_os = "linux"))]
     #[tokio::test]
     async fn the_cli_is_looked_for_where_the_readers_shell_would_look() {
         let directory = tempfile::tempdir().unwrap();

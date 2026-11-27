@@ -4000,3 +4000,41 @@ fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories()
     recipe.unset_environment.insert("PATH".into());
     assert!(combined_login_search_path(&recipe, std::ffi::OsStr::new("/login")).is_none());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn linux_provider_path_uses_current_shell_order_and_keeps_caller_tools() {
+    let mut recipe = crate::model::LaunchRecipe {
+        program: "codex".into(),
+        arguments: Vec::new(),
+        working_directory: "/project".into(),
+        environment: BTreeMap::from([("PATH".into(), "/startup-only:/usr/bin".into())]),
+        unset_environment: Default::default(),
+    };
+    let shell_path = std::ffi::OsStr::new("/node:/usr/bin:./relative");
+    assert_eq!(
+        resolve_provider_path(
+            &mut recipe,
+            Some("./tools:/ui-only:/usr/bin:/node"),
+            None,
+            shell_path
+        ),
+        Some(Some("/startup-only:/usr/bin".into())),
+    );
+    assert_eq!(
+        recipe.environment["PATH"],
+        "./tools:/ui-only:/node:/usr/bin"
+    );
+
+    let old = Some("./tools:/old-node:/usr/bin");
+    resolve_provider_path(&mut recipe, old, old, shell_path).unwrap();
+    assert_eq!(recipe.environment["PATH"], "./tools:/node:/usr/bin");
+
+    recipe.environment.remove("PATH");
+    recipe.unset_environment.insert("PATH".into());
+    assert_eq!(
+        resolve_provider_path(&mut recipe, None, None, shell_path),
+        None
+    );
+    assert!(!recipe.environment.contains_key("PATH"));
+}

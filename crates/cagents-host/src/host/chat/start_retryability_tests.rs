@@ -196,22 +196,9 @@ fn wait_for_ready(host: &SharedHost, source: &Session, client: &ClientHandle) {
     }
 }
 
-#[test]
-fn executable_permission_repair_retries_the_same_saved_conversation() {
-    #[cfg(target_os = "linux")]
-    if crate::retained_fixture::run_isolated() {
-        return;
-    }
-    let Some(root) = isolated("executable_permission_repair_retries_the_same_saved_conversation")
-    else {
-        return;
-    };
-    let provider = root.join("bin/omp");
-    fs::write(
-        &provider,
-        r#"#!/usr/bin/python3
-import json, pathlib, sys
-root = pathlib.Path(__file__).resolve().parent.parent
+fn write_omp_fixture(path: &Path, interpreter: &str) {
+    let program = r#"import json, os, pathlib, sys
+root = pathlib.Path(os.environ["HOME"]).parent
 args = sys.argv[1:]
 session = args[args.index('--resume') + 1]
 with (root / 'launches').open('a') as log:
@@ -228,9 +215,109 @@ for line in sys.stdin:
         data = {'messages': [], 'nextCursor': None}
     print(json.dumps({'type': 'response', 'id': request['id'], 'command': kind,
                      'success': True, 'data': data}), flush=True)
+"#;
+    fs::write(path, format!("#!{interpreter}\n{program}")).unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn start_finds_a_provider_and_its_interpreter_installed_after_accounts_discovers_path() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated(
+        "start_finds_a_provider_and_its_interpreter_installed_after_accounts_discovers_path",
+    ) else {
+        return;
+    };
+    let project = root.join("project");
+    let shell = LaunchRecipe::shell(project).unwrap().program;
+    let home = root.join("home");
+    match Path::new(&shell).file_name().and_then(|name| name.to_str()) {
+        Some("fish") => {
+            fs::create_dir(root.join("config/fish")).unwrap();
+            fs::write(
+                root.join("config/fish/config.fish"),
+                "if test -d $HOME/.local/bin
+    set -gx PATH $HOME/.local/bin $HOME/runtime/bin $PATH
+end
+",
+            )
+            .unwrap();
+        }
+        Some("bash" | "zsh" | "sh" | "dash" | "ksh") => {
+            // A separate login file deliberately does not source interactive startup.
+            let profile = match Path::new(&shell).file_name().unwrap().to_str().unwrap() {
+                "bash" => ".bash_profile",
+                "zsh" => ".zprofile",
+                _ => ".profile",
+            };
+            fs::write(
+                home.join(profile),
+                r#"[ ! -d "$HOME/.local/bin" ] || export PATH="$HOME/.local/bin:$HOME/runtime/bin:$PATH"
 "#,
+            )
+            .unwrap();
+        }
+        _ => {
+            eprintln!("private startup fixture does not provide a profile for {shell}");
+            return;
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let mut source = session(&root, Provider::Omp, vec![]);
+    let program = "cagents-path-fixture-omp";
+    source.launch.recipe.program = program.into();
+    source.launch.recipe.environment.remove("PATH");
+    let (host, proof) = setup(&root, "provider-path-refresh");
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let before = runtime.block_on(crate::account::probe::search_path());
+    assert!(crate::account::probe::find_executable(program, before.as_deref()).is_none());
+
+    fs::create_dir_all(home.join(".local/bin")).unwrap();
+    fs::create_dir_all(home.join("runtime/bin")).unwrap();
+    let provider = home.join(".local/bin").join(program);
+    std::os::unix::fs::symlink(
+        "/usr/bin/python3",
+        home.join("runtime/bin/cagents-path-fixture-python"),
     )
     .unwrap();
+    write_omp_fixture(&provider, "/usr/bin/env cagents-path-fixture-python");
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let client = connect(&source, chat::Intent::Start).unwrap();
+    wait_for_ready(&host, &source, &client);
+    assert_eq!(
+        crate::account::probe::find_executable(
+            program,
+            crate::account::probe::current_search_path().as_deref()
+        ),
+        Some(provider),
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("launches")).unwrap(),
+        format!("{THREAD}\n")
+    );
+    client.close().unwrap();
+}
+
+#[test]
+fn executable_permission_repair_retries_the_same_saved_conversation() {
+    #[cfg(target_os = "linux")]
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated("executable_permission_repair_retries_the_same_saved_conversation")
+    else {
+        return;
+    };
+    let provider = root.join("bin/omp");
+    write_omp_fixture(&provider, "/usr/bin/python3");
     fs::set_permissions(&provider, fs::Permissions::from_mode(0o600)).unwrap();
     let source = session(&root, Provider::Omp, vec![]);
     let (host, proof) = setup(&root, "permission-retry");

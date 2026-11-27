@@ -5145,6 +5145,11 @@ pub fn fresh_session(
         working_directory,
         environment: crate::model::agent_recovery::fresh_native_environment(provider, true),
     };
+    // A device reports its daemon's startup environment. Its provider PATH
+    // is resolved on the device when this draft starts.
+    if crate::device::is_remote() {
+        recipe.environment.remove("PATH");
+    }
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))

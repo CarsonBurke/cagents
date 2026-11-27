@@ -22,11 +22,15 @@ daemon's state, or an action's result for a few seconds, and how many hosted
 agents are working or waiting for you. Stopping a daemon that still hosts
 terminals or agent work asks for a counted confirmation first.
 
-On Linux the daemon reads your login shell's `PATH` once when it starts,
-whatever started it, so the terminals, provider CLIs and agents it launches
-find what your login startup files add, such as `~/.local/bin`, even when the
-window or autostart entry that started it carries a much shorter `PATH`; see
-[Devices](devices.md) for how the two are combined.
+On Linux the daemon starts with the `PATH` from your login shell, so
+terminals can find tools such as those in `~/.local/bin` even after a desktop
+or SSH launch with a shorter `PATH`. [Devices](devices.md) describes how
+startup combines the two paths.
+
+Accounts and new native provider processes read login and interactive shell
+startup. A new chat can find a provider installed while the daemon was
+running. A chat handed off from a running terminal uses that terminal's
+captured environment.
 
 ### Starting at boot
 
