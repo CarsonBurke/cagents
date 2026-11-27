@@ -386,6 +386,9 @@ pub enum TopCommand {
         /// Copy initial navigation from this same-device client window.
         #[arg(long, value_parser = parse_window_slot, requires = "new_window")]
         source: Option<String>,
+        /// The calling window shows a startup failure itself.
+        #[arg(long, hide = true)]
+        caller_reports_startup_failure: bool,
     },
     /// Manage the persistent cagents daemon.
     Daemon {
@@ -4660,7 +4663,13 @@ fn execute_with_model_context(
             new_window,
             window,
             source,
-        } => launch_ui(new_window, window.as_deref(), source.as_deref()),
+            caller_reports_startup_failure,
+        } => launch_ui(
+            new_window,
+            window.as_deref(),
+            source.as_deref(),
+            caller_reports_startup_failure,
+        ),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => match project_channel_context {
             Some(context) => execute_terminal_as(command, &context),
@@ -4698,6 +4707,7 @@ fn launch_ui(
     new_window: bool,
     slot: Option<&str>,
     source: Option<&str>,
+    caller_reports_startup_failure: bool,
 ) -> Result<CommandOutput, AppError> {
     let unique_slot = uuid::Uuid::new_v4().to_string();
     let remote_new_window = new_window && crate::device::is_remote();
@@ -4731,6 +4741,9 @@ fn launch_ui(
         }
         if let Some(source) = source {
             command.args(["--from-window", source]);
+        }
+        if caller_reports_startup_failure {
+            command.arg(instance::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT);
         }
 
         if let Some(slot) = slot {

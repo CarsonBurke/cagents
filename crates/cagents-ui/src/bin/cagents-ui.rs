@@ -129,6 +129,7 @@ pub(crate) fn main_with_before_start(
 
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents_ui::browser::ProcessShutdown;
+    let caller_reports_startup_failure = options.caller_reports_startup_failure;
     let result = run(options);
     // Whatever ended startup explains itself from here; the wait is over.
     cagents::instance::dismiss_startup_wait_notice();
@@ -166,6 +167,7 @@ pub(crate) fn main_with_before_start(
         Err(error) => report_startup_failure(
             &error.to_string(),
             cagents::instance::is_daemon_still_starting(error.as_ref()),
+            caller_reports_startup_failure,
         ),
         // The window reports readiness from its first frame, so reaching here
         // with the handshake unclaimed means no window ever opened.
@@ -197,7 +199,7 @@ fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitC
 /// Makes a startup failure observable. Panics were already durable; an
 /// ordinary `Err` was reported only down a pipe whose reader prints it into a
 /// stderr the desktop session discards.
-fn report_startup_failure(message: &str, still_starting: bool) {
+fn report_startup_failure(message: &str, still_starting: bool, reported_by_caller: bool) {
     let message = truncated(message);
     tracing::error!(error = message, "cagents-ui startup failed");
     cagents::instance::report_startup_failure();
@@ -208,6 +210,7 @@ fn report_startup_failure(message: &str, still_starting: bool) {
     // A terminal run already prints the error. A desktop launch has none, so
     // without this the user double-clicks the icon and nothing happens.
     if !already_running
+        && !reported_by_caller
         && !std::io::stderr().is_terminal()
         && cagents::instance::window_restore_policy()
             != cagents::instance::WindowRestorePolicy::ExistingOnly
@@ -464,6 +467,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
         restore_policy,
+        caller_reports_startup_failure: _,
     } = options;
     cagents::instance::initialize_window_restore_policy(restore_policy)?;
     let _device_cleanup = cagents::device::Cleanup;

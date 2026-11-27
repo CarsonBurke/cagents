@@ -192,3 +192,19 @@ fn a_finished_update_clears_its_offer_and_says_so() {
     assert!(app.status.is_some());
     assert!(app.device_update_banner().is_none());
 }
+
+#[test]
+fn a_failed_commands_message_is_what_a_failed_open_reports() {
+    assert_eq!(
+        error_message(
+            r#"{"ok":false,"error":{"kind":"launch","message":"could not connect to device rr"}}"#
+        )
+        .as_deref(),
+        Some("could not connect to device rr")
+    );
+    assert_eq!(
+        error_message(r#"{"ok":false,"error":{"kind":"launch","message":""}}"#),
+        None
+    );
+    assert_eq!(error_message("not json"), None);
+}

@@ -413,10 +413,7 @@ fn outcome(success: bool, output: &str, report: Vec<String>) -> Result<(), Failu
     if success && value.as_ref().and_then(|value| value["ok"].as_bool()) == Some(true) {
         return Ok(());
     }
-    let error = value
-        .as_ref()
-        .and_then(|value| value["error"]["message"].as_str())
-        .map(str::to_owned)
+    let error = error_message(output)
         .unwrap_or_else(|| "The update stopped without saying why.".to_owned());
     let report: Vec<_> = report
         .into_iter()
@@ -442,6 +439,15 @@ pub(super) fn checked(output: &str) -> Option<device_ui::OpenFailure> {
         "update" | "newer" => protocol.map(device_ui::OpenFailure::Incompatible),
         _ => None,
     }
+}
+
+/// The error message in `output`, the JSON a failed command printed.
+pub(super) fn error_message(output: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(output).ok()?;
+    value["error"]["message"]
+        .as_str()
+        .filter(|message| !message.is_empty())
+        .map(str::to_owned)
 }
 
 /// Whether `output`, the JSON a device command printed, is a protocol

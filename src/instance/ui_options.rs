@@ -29,6 +29,8 @@ pub struct Options<'a> {
     pub device: Option<&'a str>,
     pub device_window_scoped: bool,
     pub restore_policy: WindowRestorePolicy,
+    /// See [`super::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT`].
+    pub caller_reports_startup_failure: bool,
 }
 
 /// `Ok(None)` means the request was answered without opening a window, which
@@ -44,6 +46,7 @@ pub fn parse<'a>(
         device: None,
         device_window_scoped: false,
         restore_policy: WindowRestorePolicy::Ordinary,
+        caller_reports_startup_failure: false,
     };
     while let Some(argument) = arguments.next() {
         match argument {
@@ -53,6 +56,9 @@ pub fn parse<'a>(
             }
             "--device" => options.device = Some(arguments.next().ok_or("missing device name")?),
             "--device-window-scoped" => options.device_window_scoped = true,
+            super::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT => {
+                options.caller_reports_startup_failure = true;
+            }
             "--window" => options.slot = Some(arguments.next().ok_or("missing window name")?),
             "--from-window" => {
                 options.source = Some(arguments.next().ok_or("missing source window name")?);
@@ -100,5 +106,21 @@ mod restore_policy_tests {
         assert_eq!(options.source, Some("primary"));
         let ordinary = super::parse(&[]).unwrap().unwrap();
         assert_eq!(ordinary.restore_policy, WindowRestorePolicy::Ordinary);
+        assert!(!ordinary.caller_reports_startup_failure);
+    }
+
+    #[test]
+    fn a_calling_window_can_take_over_reporting_a_startup_failure() {
+        let arguments = [
+            "--device",
+            "rr",
+            "--device-window-scoped",
+            "--new-window",
+            super::super::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
+        ]
+        .map(str::to_owned);
+        let options = super::parse(&arguments).unwrap().unwrap();
+        assert!(options.caller_reports_startup_failure);
+        assert_eq!(options.device, Some("rr"));
     }
 }

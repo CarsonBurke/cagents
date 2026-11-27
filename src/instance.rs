@@ -134,6 +134,11 @@ pub enum WindowRestorePolicy {
 }
 
 pub const RESTORE_EXISTING_ONLY_ARGUMENT: &str = "--restore-existing-only";
+/// Passed by a window that opens another window and shows, itself, why that
+/// failed, such as a device running another cagents version with the update
+/// that fixes it. The new window then leaves its startup failure to the
+/// caller rather than opening a startup error dialog beside it.
+pub const CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT: &str = "--caller-reports-startup-failure";
 struct WindowRestore {
     launch: WindowRestorePolicy,
     finished: AtomicBool,

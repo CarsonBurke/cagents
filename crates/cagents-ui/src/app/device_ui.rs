@@ -1815,26 +1815,14 @@ impl State {
     }
 }
 
-/// Opens a window on `name` through the CLI. When that fails, asks whether
-/// the reason is one the person can fix from here: another cagents version
-/// on the device, or none.
+/// Opens a window on `name` through the CLI. The new window leaves a startup
+/// failure to this one, which says what went wrong: when the reason is one the
+/// person can fix from here, another cagents version on the device or none,
+/// the offer to fix it, and otherwise what the new window reported.
 fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailure> {
     let executable = crate::companion::Product::Cli
         .beside_current()
         .map_err(|error| OpenFailure::Other(error.to_string()))?;
-    let status = std::process::Command::new(&executable)
-        .args(["--device", name, "ui", "--new-window"])
-        .args(
-            source
-                .map(|source| ["--source", source])
-                .into_iter()
-                .flatten(),
-        )
-        .status()
-        .map_err(|error| OpenFailure::Other(error.to_string()))?;
-    if status.success() {
-        return Ok(());
-    }
     let json = |arguments: &[&str]| {
         std::process::Command::new(&executable)
             .arg("--json")
@@ -1842,20 +1830,49 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .output()
-            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
-            .unwrap_or_default()
+            .map(|output| {
+                (
+                    output.status.success(),
+                    String::from_utf8_lossy(&output.stdout).into_owned(),
+                )
+            })
     };
+    let mut open = vec![
+        "--device",
+        name,
+        "ui",
+        "--new-window",
+        crate::instance::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
+    ];
+    if let Some(source) = source {
+        open.extend(["--source", source]);
+    }
+    let (opened, output) = json(&open).map_err(|error| OpenFailure::Other(error.to_string()))?;
+    if opened {
+        return Ok(());
+    }
     // The update's own inspection knows a missing install too. A development
     // build has no installed tree to inspect from, so it refuses at once, and
     // the device's daemon status still tells a protocol mismatch.
-    let reason =
-        device_update_ui::checked(&json(&["device", "update", name, "--check"])).or_else(|| {
-            device_update_ui::mismatch(&json(&["--device", name, "daemon", "status"]))
+    let output_of = |arguments: &[&str]| {
+        json(arguments)
+            .map(|(_, output)| output)
+            .unwrap_or_default()
+    };
+    let reason = device_update_ui::checked(&output_of(&["device", "update", name, "--check"]))
+        .or_else(|| {
+            device_update_ui::mismatch(&output_of(&["--device", name, "daemon", "status"]))
                 .map(OpenFailure::Incompatible)
         });
     Err(reason.unwrap_or_else(|| {
-        OpenFailure::Other(format!(
-            "Could not connect to {name}. Check its SSH connection and cagents daemon."
+        OpenFailure::Other(device_update_ui::error_message(&output).map_or_else(
+            || format!("Could not connect to {name}. Check its SSH connection and cagents daemon."),
+            |reason| {
+                let mut characters = reason.chars();
+                characters.next().map_or_else(String::new, |first| {
+                    first.to_uppercase().chain(characters).collect()
+                })
+            },
         ))
     }))
 }
