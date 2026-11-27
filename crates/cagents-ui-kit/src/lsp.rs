@@ -29,9 +29,9 @@
 //! inside a repository nobody has vouched for, and on Unix the `chdir`
 //! precedes the `execvp` `PATH` search, so a `PATH` carrying an empty or
 //! relative component would otherwise let repository content supply the
-//! binary. An absent binary is reported by that resolution and degrades to
-//! [`LspStatus::Unavailable`] while editing, saving and syntax highlighting
-//! keep working.
+//! binary. An absent binary is reported by that resolution as
+//! [`LspStatus::Missing`] while editing, saving and syntax highlighting keep
+//! working.
 
 use crate::repository_widget::text_editor::{Position as NativePosition, TextSnapshot};
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -2174,13 +2174,17 @@ fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, LaunchError> 
     #[cfg(unix)]
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
-        if error.kind() == io::ErrorKind::NotFound {
-            LaunchError::Missing {
-                program: program.clone(),
-            }
+        // The search above found the program, so only a configured path
+        // that names nothing, or a script whose interpreter is absent (such
+        // as `#!/usr/bin/env node`), is not found now. Neither is the server
+        // missing from PATH.
+        LaunchError::Other(if error.kind() != io::ErrorKind::NotFound {
+            format!("`{program}` could not be started: {error}")
+        } else if resolved.exists() {
+            format!("`{program}` could not be started: its interpreter was not found")
         } else {
-            LaunchError::Other(format!("`{program}` could not be started: {error}"))
-        }
+            format!("`{program}` doesn't exist")
+        })
     })?;
     let mut child = ChildProcess::new(child)
         .map_err(|error| format!("`{program}` process identity could not be retained: {error}"))?;

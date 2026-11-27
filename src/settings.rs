@@ -1866,8 +1866,22 @@ pub struct LanguageServerSettings {
     pub initialization_options: Option<serde_json::Value>,
 }
 
+/// The plain name of a built-in server, for a sentence such as "TypeScript
+/// language server isn't installed". rust-analyzer, gopls and clangd are
+/// those programs' own names; a server the settings add is called by its id.
+pub fn language_server_name(id: &str) -> &str {
+    match id {
+        "pyright" => "Pyright",
+        "typescript-language-server" => "TypeScript language server",
+        "lua-language-server" => "Lua language server",
+        "bash-language-server" => "Bash language server",
+        other => other,
+    }
+}
+
 /// The built-in language-server list. A `language_servers` key in the settings
-/// file replaces this list wholesale rather than merging with it.
+/// file replaces this list wholesale rather than merging with it. Give a new
+/// entry a plain name in [`language_server_name`] when its id isn't one.
 pub fn default_language_servers() -> Vec<LanguageServerSettings> {
     fn server(
         id: &str,

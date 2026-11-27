@@ -410,6 +410,19 @@ pub struct LspInspectorContext {
     /// Whether the user unfolded the Problems section's status lines to read
     /// their whole reason and the server's last output.
     pub details_open: bool,
+    /// Whether the user restarted or retried the server and it has not yet
+    /// settled, so its Starting is worth a line.
+    pub restarting: bool,
+}
+
+impl LspInspectorContext {
+    /// Records the server's state; a settled one ends a restart.
+    pub fn set_status(&mut self, status: LspStatus) {
+        if !matches!(status, LspStatus::Starting) {
+            self.restarting = false;
+        }
+        self.status = Some(status);
+    }
 }
 
 /// The one transient message the Problems section carries besides the
@@ -498,13 +511,15 @@ pub fn withheld_diagnostics_label(withheld: usize) -> String {
 pub fn has_problems(lsp: &LspInspectorContext) -> bool {
     !lsp.diagnostics.is_empty()
         || lsp.notice.is_some()
-        || lsp.status.as_ref().is_some_and(|status| {
-            matches!(
-                status,
-                LspStatus::Missing { .. }
-                    | LspStatus::Unavailable { .. }
-                    | LspStatus::Failed { .. }
-            )
+        || lsp.status.as_ref().is_some_and(|status| match status {
+            LspStatus::Missing { .. }
+            | LspStatus::Unavailable { .. }
+            | LspStatus::Failed { .. } => true,
+            // A retry the user asked for shows as a spinner where its
+            // failure was, rather than the section vanishing until the
+            // outcome is known.
+            LspStatus::Starting => lsp.restarting,
+            LspStatus::Ready | LspStatus::Disabled => false,
         })
 }
 
@@ -579,7 +594,7 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
     };
     match &lsp.status {
         Some(LspStatus::Missing { server, program }) => {
-            let name = server_name(server);
+            let name = crate::settings::language_server_name(server);
             let detail = vec![
                 Run::code(program),
                 Run::words(" wasn't found on PATH. Install it, then choose Retry."),
@@ -590,10 +605,10 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
                 reason: plain(&detail),
                 detail,
                 output: None,
-                action: Some(StatusAction {
+                action: restart_action(card, lsp).map(|message| StatusAction {
                     label: "Retry",
                     name: format!("Retry starting {name}"),
-                    message: InspectorAction::RestartLanguageServer(card),
+                    message,
                 }),
             });
         }
@@ -602,14 +617,16 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
             let reason = sentence(&plain(&detail));
             lines.push(StatusLine {
                 tone: StatusTone::Warning,
-                summary: reason.clone(),
+                // What to do about it follows in the detail, rather than
+                // fading out of a narrow line.
+                summary: first_sentence(&reason).to_owned(),
                 reason,
                 detail,
                 output: None,
-                action: Some(StatusAction {
+                action: restart_action(card, lsp).map(|message| StatusAction {
                     label: "Retry",
                     name: "Retry starting the language server".into(),
-                    message: InspectorAction::RestartLanguageServer(card),
+                    message,
                 }),
             });
         }
@@ -627,10 +644,10 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
                 // The tail is the only evidence of why the session died, so
                 // it stays a click away rather than being swallowed.
                 output: Some(stderr_tail.clone()),
-                action: Some(StatusAction {
+                action: restart_action(card, lsp).map(|message| StatusAction {
                     label: "Restart",
                     name: "Restart language server".into(),
-                    message: InspectorAction::RestartLanguageServer(card),
+                    message,
                 }),
             });
         }
@@ -711,7 +728,8 @@ pub fn problems_view(card: CardId, lsp: &LspInspectorContext) -> Element<'static
                 design::caption("No problems reported in this file.")
                     .class(cosmic::theme::Text::Custom(design::muted_text)),
             )
-            .padding([0.0, space::XS])
+            // In line with the status lines' text, past their glyphs.
+            .padding(cosmic::iced::Padding::ZERO.left(SUMMARY_INSET))
             .center_y(design::DENSE_ROW_HEIGHT)
             .into(),
         );
@@ -780,6 +798,11 @@ fn plain(runs: &[Run]) -> String {
     runs.iter().map(|run| run.text.as_str()).collect()
 }
 
+/// `text` up to the end of its first sentence, without the full stop.
+fn first_sentence(text: &str) -> &str {
+    text.split_once(". ").map_or(text, |(first, _)| first)
+}
+
 /// A reason fragment, such as "the server exited", as a line of its own.
 fn sentence(fragment: &str) -> String {
     let mut chars = fragment.chars();
@@ -789,17 +812,9 @@ fn sentence(fragment: &str) -> String {
     }
 }
 
-/// The plain name of a built-in server, the configured identifier otherwise.
-fn server_name(server: &str) -> Cow<'_, str> {
-    Cow::Borrowed(match server {
-        "pyright" => "Pyright",
-        "typescript-language-server" => "TypeScript language server",
-        "lua-language-server" => "Lua language server",
-        "bash-language-server" => "Bash language server",
-        // rust-analyzer, gopls and clangd are those programs' own names.
-        other => other,
-    })
-}
+/// Where a status line's summary starts: past the line's padding, its glyph
+/// and the gap after it.
+const SUMMARY_INSET: f32 = space::XS + design::COMPACT_ICON_SIZE as f32 + space::XS;
 
 fn status_line_view(
     card: CardId,
@@ -892,7 +907,7 @@ fn status_line_view(
         // Under the summary, past its glyph.
         .padding(
             cosmic::iced::Padding::ZERO
-                .left(space::XS + f32::from(design::COMPACT_ICON_SIZE) + space::XS)
+                .left(SUMMARY_INSET)
                 .bottom(space::XS),
         )
         .width(Length::Fill)
@@ -1744,6 +1759,49 @@ mod tests {
             assert_eq!(lines[0].summary, "Indexing (40%)");
             assert!(!says_no_problems(&lsp));
         }
+    }
+
+    #[test]
+    fn a_retry_keeps_the_section_with_a_spinner_until_the_server_settles() {
+        let card = CardId::new();
+        let mut lsp = typescript_missing();
+        // What the application does when the user presses Retry.
+        lsp.restarting = true;
+        lsp.set_status(LspStatus::Starting);
+        assert!(has_problems(&lsp), "the section vanished while retrying");
+        let lines = status_lines(card, &lsp);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tone, StatusTone::Busy);
+        // Still missing: the line comes back where it was.
+        lsp.set_status(typescript_missing().status.unwrap());
+        assert!(!lsp.restarting);
+        assert!(has_problems(&lsp));
+        // Running: an ordinary later start draws no section.
+        lsp.set_status(LspStatus::Ready);
+        lsp.set_status(LspStatus::Starting);
+        assert!(!has_problems(&lsp));
+    }
+
+    #[test]
+    fn an_unusable_server_line_leads_with_its_first_sentence() {
+        let card = CardId::new();
+        let lsp = with_status(LspStatus::Unavailable {
+            reason: "This file is already open for language tools in another pane. Close it there, then choose Retry here.".into(),
+        });
+        let line = &status_lines(card, &lsp)[0];
+        assert_eq!(
+            line.summary,
+            "This file is already open for language tools in another pane"
+        );
+        assert!(
+            line.reason.ends_with("choose Retry here."),
+            "{}",
+            line.reason
+        );
+        assert_eq!(
+            line.action.as_ref().map(|action| action.label),
+            Some("Retry")
+        );
     }
 
     #[test]

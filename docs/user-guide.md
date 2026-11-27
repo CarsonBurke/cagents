@@ -199,7 +199,10 @@ still reads at a glance, and the inspector remembers which are expanded.
   A folder that is not a Git worktree has only **Files**.
 - With an editor focused, **Problems** lists its language server's
   diagnostics, and a references or definitions request lists its results.
-  Neither appears while there is nothing to show.
+  Neither appears while there is nothing to show. When the server isn't
+  installed, stopped, or is still starting, Problems says so in one line:
+  **Retry** after installing a missing server, **Restart** one that stopped,
+  and press the line itself for the full reason and the server's last output.
 
 The Source control and Files views:
 

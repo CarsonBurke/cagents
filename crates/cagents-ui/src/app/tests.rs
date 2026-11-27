@@ -10705,6 +10705,37 @@ fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
     }
 }
 
+/// The Problems section's details fold and unfold on request, and a restart
+/// or dismissal folds them, so the next failure doesn't arrive unfolded.
+#[test]
+fn language_server_details_unfold_until_restart_or_dismissal() {
+    let mut app = lsp_test_app();
+    let card = repository_card(&mut app, "/repo");
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
+    app.lsp_documents.insert(LspDocumentId(1), card);
+    lsp_state(&mut app, card)
+        .attachment
+        .context
+        .set_status(LspStatus::Missing {
+            server: "typescript-language-server".into(),
+            program: "typescript-language-server".into(),
+        });
+    let details = |app: &Cagents| app.lsp_contexts[&card].attachment.context.details_open;
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    assert!(details(&app));
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    assert!(!details(&app));
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    let _ = app.update_lsp(InspectorAction::RestartLanguageServer(card));
+    assert!(!details(&app), "a restart left the old reason unfolded");
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
+    assert!(!details(&app), "a dismissal left the details unfolded");
+}
+
 /// A superseded request is the ordinary result of typing while one is in
 /// flight. Reporting it would put a notice on screen for every keystroke.
 #[test]

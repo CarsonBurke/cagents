@@ -14107,7 +14107,7 @@ impl Cagents {
             // configuration, not a failure, so the surface says the file has
             // no server rather than reporting one that is broken.
             let state = self.lsp_contexts.entry(card).or_default();
-            state.attachment.context.status = Some(LspStatus::Disabled);
+            state.attachment.context.set_status(LspStatus::Disabled);
             return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         };
         if self.lsp_contexts.iter().any(|(other, state)| {
@@ -14117,7 +14117,7 @@ impl Cagents {
         }) {
             let state = self.lsp_contexts.entry(card).or_default();
             state.blocked_by_other_buffer = true;
-            state.attachment.context.status = Some(LspStatus::Unavailable {
+            state.attachment.context.set_status(LspStatus::Unavailable {
                 reason: "This file is already open for language tools in another pane. Close it there, then choose Retry here.".into(),
             });
             return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
@@ -14139,7 +14139,7 @@ impl Cagents {
         self.lsp_documents.insert(doc, card);
         let state = self.lsp_contexts.entry(card).or_default();
         state.attachment.document = Some(doc);
-        state.attachment.context.status = Some(status);
+        state.attachment.context.set_status(status);
         self.flush_pending_lsp_jump(card, path)
     }
 
@@ -14322,7 +14322,7 @@ impl Cagents {
                 && let Some(card) = self.lsp_documents.get(&doc)
                 && let Some(state) = self.lsp_contexts.get_mut(card)
             {
-                state.attachment.context.status = Some(status);
+                state.attachment.context.set_status(status);
             }
             return;
         }
@@ -14344,7 +14344,7 @@ impl Cagents {
                         )
                         && self.lsp.document_version(doc).is_some();
                     if !retained_refusal {
-                        state.attachment.context.status = Some(status);
+                        state.attachment.context.set_status(status);
                     }
                 }
             }
@@ -14410,7 +14410,7 @@ impl Cagents {
             LspEvent::Locations { kind, items, .. } => {
                 state.attachment.context.locations = Some((kind, items));
             }
-            LspEvent::Status { status, .. } => state.attachment.context.status = Some(status),
+            LspEvent::Status { status, .. } => state.attachment.context.set_status(status),
             LspEvent::Progress { progress, .. } => {
                 // Progress is transient by definition, so it is shown in the
                 // notice slot the surface already has and cleared on `done`
@@ -14512,7 +14512,8 @@ impl Cagents {
                     state.progress = None;
                     state.refresh_notice();
                     state.attachment.context.details_open = false;
-                    state.attachment.context.status = Some(self.lsp.status(doc));
+                    state.attachment.context.restarting = true;
+                    state.attachment.context.set_status(self.lsp.status(doc));
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.dismiss_editor_results();
@@ -14522,13 +14523,14 @@ impl Cagents {
             }
             InspectorAction::ToggleLanguageServerDetails(card) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card) {
-                    state.attachment.context.details_open ^= true;
+                    state.attachment.context.details_open = !state.attachment.context.details_open;
                 }
                 Task::none()
             }
             InspectorAction::DismissLspResults(card) => {
                 if let Some(state) = self.lsp_contexts.get_mut(&card) {
                     state.attachment.invalidate_answers();
+                    state.attachment.context.details_open = false;
                     state.failure = None;
                     state.refresh_notice();
                 }
