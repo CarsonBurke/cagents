@@ -1033,15 +1033,15 @@ mod tests {
             Err("This PDF declares no pages.".to_owned())
         );
 
-        // A helper that dies carries no sentence of its own, so the status is
-        // what the reader gets, with whatever the runtime printed.
-        let aborting = helper(
+        // The reader gets both the signal and the helper's last words. Use a
+        // signal that skips core dumping so pipe closure takes no host service.
+        let killed = helper(
             root.path(),
-            "abort",
-            "echo 'fatal runtime error: stack overflow, aborting' >&2\nkill -ABRT $$",
+            "killed",
+            "echo 'fatal renderer error' >&2\nkill -KILL $$",
         );
         let message = render_with_helper(
-            &aborting,
+            &killed,
             &document,
             0,
             PdfTone::Original,
@@ -1049,9 +1049,12 @@ mod tests {
             patience,
         )
         .unwrap_err();
-        assert!(
-            message.contains("killed by signal 6") && message.contains("stack overflow"),
-            "a crashed helper must report its signal and its last words: {message}"
+        assert_eq!(
+            message,
+            format!(
+                "This document could not be rendered (killed by signal {}): fatal renderer error",
+                libc::SIGKILL
+            )
         );
 
         // Success with nothing usable on stdout is still a failure, and the
