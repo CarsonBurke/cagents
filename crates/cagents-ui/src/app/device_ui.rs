@@ -9,31 +9,39 @@ pub(super) fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
 
-/// What a device window does with a sidebar action.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a device window does instead of a sidebar action's local handling.
+/// Actions with no route here need nothing from this computer's files or Git
+/// and run as they do locally: channels, panes and projects live in the
+/// device's registry, and terminals and chats start on the device.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum SidebarRoute {
-    /// The action needs nothing from this computer's files or Git, so it
-    /// runs as it does locally. Channels, panes and projects live in the
-    /// device's registry, and terminals and chats start on the device.
-    Run,
     /// The device's file browser stands in for this computer's file manager.
     BrowseOnDevice {
         project_id: ProjectId,
         worktree_id: Option<crate::model::WorktreeId>,
     },
     /// The device's worktree tools stand in for the worktree dialogs, which
-    /// run Git on this computer (#688).
-    DeviceWorktrees { project_id: ProjectId },
+    /// run Git on this computer (#688). `remove` names a worktree to delete.
+    DeviceWorktrees {
+        project_id: ProjectId,
+        remove: Option<crate::model::WorktreeId>,
+    },
+    /// Deleting the selected rows depends on what they are.
+    DeleteSelectedRows,
+    /// A pull request opens on its forge rather than in the local review.
+    OpenLink(Url),
     /// Not available on a device yet. The reason is shown as it is.
     Unavailable(&'static str),
 }
 
-/// Routes a sidebar action in a device window. Nothing here opens the device
-/// tools for an action that has nothing to do with them: a command either
-/// runs, uses its device equivalent, or says why it can't.
-pub(super) fn sidebar_route(action: &SidebarAction) -> SidebarRoute {
+/// Routes a sidebar action in a device window, or `None` to run it as
+/// locally. Nothing here opens the device tools for an action that has
+/// nothing to do with them: a command either runs, uses its device
+/// equivalent, or says why it can't.
+pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
     use crate::sidebar::ProjectCommand;
-    match action {
+    use sidebar::SelectionRow;
+    Some(match action {
         SidebarAction::ReorderMember { .. }
         | SidebarAction::ReorderProject { .. }
         | SidebarAction::SearchChanged(_)
@@ -72,9 +80,9 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> SidebarRoute {
         | SidebarAction::MarkChannelRead(_)
         | SidebarAction::DeleteChannel { .. }
         | SidebarAction::RetryChannelDeletion { .. }
-        | SidebarAction::DeleteRow(
-            sidebar::SelectionRow::Channel(_) | sidebar::SelectionRow::Card(_),
-        ) => SidebarRoute::Run,
+        | SidebarAction::DeleteRow(SelectionRow::Channel(_) | SelectionRow::Card(_)) => {
+            return None;
+        }
         SidebarAction::ProjectCommand {
             project_id,
             worktree_id,
@@ -86,50 +94,61 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> SidebarRoute {
             | ProjectCommand::CopyBranch
             | ProjectCommand::MoveUp
             | ProjectCommand::MoveDown
-            | ProjectCommand::ResetSidebarOrder => SidebarRoute::Run,
+            | ProjectCommand::ResetSidebarOrder => return None,
             ProjectCommand::Reveal => SidebarRoute::BrowseOnDevice {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
             },
-            ProjectCommand::NewWorktree
-            | ProjectCommand::NewWorktreeFromBranch
-            | ProjectCommand::Delete => SidebarRoute::DeviceWorktrees {
+            ProjectCommand::NewWorktree => SidebarRoute::DeviceWorktrees {
                 project_id: *project_id,
+                remove: None,
             },
+            ProjectCommand::Delete => SidebarRoute::DeviceWorktrees {
+                project_id: *project_id,
+                remove: *worktree_id,
+            },
+            ProjectCommand::NewWorktreeFromBranch => SidebarRoute::Unavailable(
+                "Starting a worktree from an existing branch isn't available in a device window \
+                 yet. Use New worktree, or git worktree in a terminal on the device.",
+            ),
             ProjectCommand::Remove => SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE),
             ProjectCommand::PullRequest | ProjectCommand::RepositoryUrl => {
                 SidebarRoute::Unavailable(PULL_REQUESTS_UNAVAILABLE)
             }
             ProjectCommand::OpenEditor(_) => SidebarRoute::Unavailable(
-                "External editors open files on this computer. Use Browse device files to edit files on the device.",
+                "External editors open files on this computer. To edit a file on the device, \
+                 use Browse device files in the device menu.",
             ),
         },
         SidebarAction::NewWorktree { project_id, .. } => SidebarRoute::DeviceWorktrees {
             project_id: *project_id,
+            remove: None,
         },
-        SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, _)) => {
+        SidebarAction::DeleteRow(SelectionRow::Worktree(project_id, worktree_id)) => {
             SidebarRoute::DeviceWorktrees {
                 project_id: *project_id,
+                remove: Some(*worktree_id),
             }
         }
-        SidebarAction::DeleteRow(sidebar::SelectionRow::Project(_)) => {
+        SidebarAction::DeleteRow(SelectionRow::Project(_)) => {
             SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE)
         }
-        SidebarAction::BrowsePullRequests { .. }
-        | SidebarAction::OpenPullRequest { .. }
-        | SidebarAction::CreatePullRequest { .. } => {
+        SidebarAction::DeleteSelectedRows => SidebarRoute::DeleteSelectedRows,
+        SidebarAction::OpenPullRequest { url, .. } => SidebarRoute::OpenLink(url.clone()),
+        SidebarAction::BrowsePullRequests { .. } | SidebarAction::CreatePullRequest { .. } => {
             SidebarRoute::Unavailable(PULL_REQUESTS_UNAVAILABLE)
         }
         _ => SidebarRoute::Unavailable(
-            "That isn't available on a device yet. Use Browse device files for the device's files and Git.",
+            "That isn't available in a device window yet. For the device's files and Git, \
+             use Browse device files in the device menu.",
         ),
-    }
+    })
 }
 
 const REMOVE_PROJECT_UNAVAILABLE: &str =
-    "Removing a project isn't available on a device yet. It stays on the device.";
+    "Removing a project from a device window isn't available yet.";
 const PULL_REQUESTS_UNAVAILABLE: &str =
-    "Pull requests aren't available on a device yet. Use a terminal on the device for gh.";
+    "Pull requests aren't available in a device window yet. Run gh in a terminal on the device.";
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -398,44 +417,95 @@ impl Cagents {
         self.reconcile_shared_views()
     }
 
-    /// Carries out a device window's [`SidebarRoute`] for a sidebar action
-    /// that doesn't run as it does locally.
+    /// Carries out a device window's [`SidebarRoute`] for a sidebar action.
     pub(super) fn route_device_sidebar_action(&mut self, route: SidebarRoute) -> Task<Message> {
-        let project = |id: ProjectId| self.sidebar_model.project(id);
         match route {
-            SidebarRoute::Run => Task::none(),
             SidebarRoute::BrowseOnDevice {
                 project_id,
                 worktree_id,
             } => {
-                let Some(project) = project(project_id) else {
+                let Some(project) = self.sidebar_model.project(project_id) else {
                     return Task::none();
                 };
-                let path = worktree_id
-                    .and_then(|id| project.worktrees.iter().find(|worktree| worktree.id == id))
-                    .map_or_else(
-                        || project.repository.clone(),
-                        |worktree| worktree.path.clone(),
-                    );
+                let path = match worktree_id {
+                    Some(id) => match project.worktrees.iter().find(|worktree| worktree.id == id) {
+                        Some(worktree) => worktree.path.clone(),
+                        None => return Task::none(),
+                    },
+                    None => worktree_ui::project_main_checkout(project),
+                };
                 self.update_device(Action::OpenIn {
                     path: Some(path),
                     panel: Panel::Files,
                 })
             }
-            SidebarRoute::DeviceWorktrees { project_id } => {
-                let Some(project) = project(project_id) else {
+            SidebarRoute::DeviceWorktrees { project_id, remove } => {
+                let Some(project) = self.sidebar_model.project(project_id) else {
                     return Task::none();
                 };
-                // The main checkout, where `.worktrees/` is created.
-                let path = project.worktrees.first().map_or_else(
-                    || project.repository.clone(),
-                    |worktree| worktree.path.clone(),
-                );
+                // The main checkout, where the device creates `.worktrees/`.
+                let main = worktree_ui::project_main_checkout(project);
+                if let Some(id) = remove {
+                    let Some(worktree) =
+                        project.worktrees.iter().find(|worktree| worktree.id == id)
+                    else {
+                        return Task::none();
+                    };
+                    // The device removes only `.worktrees/<name>` checkouts.
+                    let Some(name) = worktree
+                        .path
+                        .strip_prefix(main.join(".worktrees"))
+                        .ok()
+                        .filter(|name| name.components().count() == 1)
+                        .map(|name| name.display().to_string())
+                    else {
+                        self.status = Some(TransientNotice::warning(
+                            "A device window can only remove worktrees in the project's \
+                             .worktrees folder. Use git worktree remove in a terminal on the \
+                             device.",
+                        ));
+                        return Task::none();
+                    };
+                    self.device_ui.worktree_name = name;
+                }
                 self.update_device(Action::OpenIn {
-                    path: Some(path),
+                    path: Some(main),
                     panel: Panel::Worktrees,
                 })
             }
+            SidebarRoute::DeleteSelectedRows => {
+                let visible = self.visible_sidebar_rows();
+                let selected = self.sidebar_state.selected_rows(&visible);
+                match selected.as_slice() {
+                    [] => Task::none(),
+                    [sidebar::SelectionRow::Worktree(project_id, worktree_id)] => self
+                        .route_device_sidebar_action(SidebarRoute::DeviceWorktrees {
+                            project_id: *project_id,
+                            remove: Some(*worktree_id),
+                        }),
+                    rows if rows
+                        .iter()
+                        .all(|row| matches!(row, sidebar::SelectionRow::Channel(_))) =>
+                    {
+                        self.begin_sidebar_group_delete()
+                    }
+                    rows if rows
+                        .iter()
+                        .any(|row| matches!(row, sidebar::SelectionRow::Project(_))) =>
+                    {
+                        self.status = Some(TransientNotice::warning(REMOVE_PROJECT_UNAVAILABLE));
+                        Task::none()
+                    }
+                    _ => {
+                        self.status = Some(TransientNotice::warning(
+                            "A device window deletes worktrees one at a time. Select one \
+                             worktree, or only channels.",
+                        ));
+                        Task::none()
+                    }
+                }
+            }
+            SidebarRoute::OpenLink(url) => self.open_clicked_link(url),
             SidebarRoute::Unavailable(reason) => {
                 self.status = Some(TransientNotice::warning(reason));
                 Task::none()
@@ -2038,12 +2108,14 @@ mod tests {
     fn remote_sidebar_actions_run_use_their_device_equivalent_or_say_why() {
         let project_id = ProjectId::new();
         let worktree_id = crate::model::WorktreeId::new();
-        let command = |command| SidebarAction::ProjectCommand {
+        let on = |worktree_id, command| SidebarAction::ProjectCommand {
             project_id,
-            worktree_id: Some(worktree_id),
+            worktree_id,
             command,
         };
+        let command = |command| on(Some(worktree_id), command);
         let channel = crate::model::ChannelId::new();
+        let url = Url::parse("https://github.com/example/demo/pull/7").unwrap();
         for action in [
             SidebarAction::SearchChanged("project".into()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
@@ -2059,6 +2131,8 @@ mod tests {
                 before: None,
             },
             SidebarAction::OpenRepositoryPicker,
+            SidebarAction::OpenAutomations,
+            SidebarAction::OpenWork,
             SidebarAction::NewChannel { project_id },
             SidebarAction::RenameChannel(channel),
             SidebarAction::MarkChannelRead(channel),
@@ -2072,40 +2146,60 @@ mod tests {
             command(sidebar::ProjectCommand::CopyBranch),
             command(sidebar::ProjectCommand::ResetSidebarOrder),
         ] {
-            assert_eq!(sidebar_route(&action), SidebarRoute::Run, "{action:?}");
+            assert_eq!(sidebar_route(&action), None, "{action:?}");
         }
-        assert_eq!(
-            sidebar_route(&command(sidebar::ProjectCommand::Reveal)),
-            SidebarRoute::BrowseOnDevice {
-                project_id,
-                worktree_id: Some(worktree_id),
-            }
-        );
-        for action in [
-            command(sidebar::ProjectCommand::NewWorktree),
-            command(sidebar::ProjectCommand::NewWorktreeFromBranch),
-            command(sidebar::ProjectCommand::Delete),
-            SidebarAction::NewWorktree {
-                project_id,
-                repository: "/srv/demo/.git".into(),
-            },
-            SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
+        for worktree_id in [Some(worktree_id), None] {
+            assert_eq!(
+                sidebar_route(&on(worktree_id, sidebar::ProjectCommand::Reveal)),
+                Some(SidebarRoute::BrowseOnDevice {
+                    project_id,
+                    worktree_id,
+                })
+            );
+        }
+        for (action, remove) in [
+            (command(sidebar::ProjectCommand::NewWorktree), None),
+            (
+                SidebarAction::NewWorktree {
+                    project_id,
+                    repository: "/srv/demo/.git".into(),
+                },
+                None,
+            ),
+            (command(sidebar::ProjectCommand::Delete), Some(worktree_id)),
+            (
+                SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
+                Some(worktree_id),
+            ),
         ] {
             assert_eq!(
                 sidebar_route(&action),
-                SidebarRoute::DeviceWorktrees { project_id },
+                Some(SidebarRoute::DeviceWorktrees { project_id, remove }),
                 "{action:?}"
             );
         }
+        assert_eq!(
+            sidebar_route(&SidebarAction::DeleteSelectedRows),
+            Some(SidebarRoute::DeleteSelectedRows)
+        );
+        assert_eq!(
+            sidebar_route(&SidebarAction::OpenPullRequest {
+                project_id,
+                number: 7,
+                url: url.clone(),
+            }),
+            Some(SidebarRoute::OpenLink(url))
+        );
         for action in [
             command(sidebar::ProjectCommand::Remove),
             command(sidebar::ProjectCommand::PullRequest),
+            command(sidebar::ProjectCommand::NewWorktreeFromBranch),
             command(sidebar::ProjectCommand::OpenEditor("code".into())),
             SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
             SidebarAction::BrowsePullRequests { project_id },
         ] {
             assert!(
-                matches!(sidebar_route(&action), SidebarRoute::Unavailable(reason) if !reason.is_empty()),
+                matches!(sidebar_route(&action), Some(SidebarRoute::Unavailable(reason)) if !reason.is_empty()),
                 "{action:?}"
             );
         }
@@ -2208,16 +2302,69 @@ mod tests {
         assert_eq!(channel.project_id, project_id);
         assert_eq!(app.durable.active_channel, Some(channel.id));
 
-        // Show in file manager browses that checkout on the device.
+        // New terminal starts a terminal pane in the checkout.
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
             worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::NewTerminal,
+        })));
+        assert!(!app.device_ui.open);
+        assert_eq!(app.active_workspace.as_deref(), Some(linked.as_path()));
+        let focused = app.durable.focused.expect("new terminal is focused");
+        let card = app
+            .durable
+            .cards
+            .iter()
+            .find(|card| card.id == focused)
+            .unwrap();
+        assert!(
+            matches!(&card.kind, CardKind::Terminal(session) if session.launch.working_directory == linked),
+            "{:?}",
+            card.kind
+        );
+
+        // Rename and delete the created channel through their own controls.
+        let created = app.durable.channels.last().unwrap().id;
+        drop(app.update(Message::Sidebar(SidebarAction::RenameChannel(created))));
+        drop(
+            app.update(Message::ChromeUi(chrome_ui::Action::RenameChanged(
+                "Remote work".into(),
+            ))),
+        );
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::RenameSubmit)));
+        assert!(!app.device_ui.open);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == created)
+                .unwrap()
+                .title,
+            "Remote work"
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
+            sidebar::SelectionRow::Channel(created),
+        ))));
+        drop(app.update(Message::ChannelUi(channel_ui::Action::ConfirmDelete)));
+        assert!(!app.device_ui.open);
+        assert!(
+            app.channel_ui.is_deleting(created)
+                || !app
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == created)
+        );
+
+        // Show in file manager browses the project's main checkout, not its
+        // Git directory, and a worktree row's own checkout.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
             command: sidebar::ProjectCommand::Reveal,
         })));
         assert!(app.device_ui.open);
-        assert_eq!(app.device_ui.panel, Panel::Files);
-        assert_eq!(app.device_ui.path, linked.display().to_string());
-        // The listing is answered before the dialog closes.
+        assert_eq!(app.device_ui.path, main.display().to_string());
         let settle = |app: &mut Cagents| {
             let generation = app.device_ui.generation;
             drop(app.update_device(Action::Loaded {
@@ -2227,6 +2374,16 @@ mod tests {
             drop(app.update_device(Action::Close));
             assert!(!app.device_ui.open);
         };
+        settle(&mut app);
+
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::Reveal,
+        })));
+        assert!(app.device_ui.open);
+        assert_eq!(app.device_ui.panel, Panel::Files);
+        assert_eq!(app.device_ui.path, linked.display().to_string());
         settle(&mut app);
 
         // New worktree uses the device's worktree tools at the main checkout.
@@ -2239,6 +2396,33 @@ mod tests {
         assert_eq!(app.device_ui.path, main.display().to_string());
         settle(&mut app);
 
+        // Deleting a linked worktree names it for the device's remove action.
+        drop(app.update(Message::Sidebar(SidebarAction::DeleteRow(
+            sidebar::SelectionRow::Worktree(project_id, linked_id),
+        ))));
+        assert!(app.device_ui.open);
+        assert_eq!(app.device_ui.panel, Panel::Worktrees);
+        assert_eq!(app.device_ui.worktree_name, "feature");
+        settle(&mut app);
+
+        // Before its checkouts load, a project's worktree tools still open in
+        // its main checkout, never its Git directory.
+        let unloaded = ProjectId::new();
+        app.sidebar_model.projects.push(SidebarProject::new(
+            unloaded,
+            RepositoryId(unloaded.as_uuid()),
+            "other".into(),
+            PathBuf::from("/srv/device-only/other/.git"),
+            Vec::new(),
+            Vec::new(),
+        ));
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id: unloaded,
+            repository: "/srv/device-only/other/.git".into(),
+        })));
+        assert_eq!(app.device_ui.path, "/srv/device-only/other");
+        settle(&mut app);
+
         // What a device can't do yet says so instead of opening the tools.
         drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
             project_id,
@@ -2249,7 +2433,7 @@ mod tests {
         assert!(
             app.status
                 .as_ref()
-                .is_some_and(|notice| notice.message.contains("isn't available on a device"))
+                .is_some_and(|notice| notice.message == REMOVE_PROJECT_UNAVAILABLE)
         );
     }
 
