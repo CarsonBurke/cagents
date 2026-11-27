@@ -721,7 +721,7 @@ pub enum ProjectCommand {
         /// A folder or path inside a Git repository (defaults to the current directory).
         path: Option<PathBuf>,
     },
-    /// List shared projects, newest first.
+    /// List shared projects in the order the sidebar shows them.
     List,
     /// Close a project and every channel in it.
     Close {
@@ -6302,10 +6302,8 @@ fn project_output(
         }
         ResolvedProject::List => {
             let model = client.read_workspace_model().map_err(protocol_error)?;
-            // Newest first, the order `channel list` answers in and the order
-            // the sidebar renders.
-            let mut projects = model.projects.iter().collect::<Vec<_>>();
-            projects.sort_by(|left, right| right.ordinal.cmp(&left.ordinal));
+            // The order every window's sidebar lists them in.
+            let projects = model.projects_in_order();
             let human = projects
                 .iter()
                 .map(|project| project_line(project))
@@ -8744,6 +8742,7 @@ mod tests {
             assert_eq!(asked, server_repository);
             assert_eq!(title, "probe");
             let model = WorkspaceModel {
+                project_order: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 2,
@@ -9006,6 +9005,7 @@ mod tests {
                 "the CLI opens a project exactly as a window publishes one"
             );
             let model = WorkspaceModel {
+                project_order: Vec::new(),
                 navigation_orders: Vec::new(),
                 identity: uuid::Uuid::new_v4(),
                 sequence: 4,
@@ -9045,25 +9045,23 @@ mod tests {
     }
 
     /// A listing is of the registry, which records no source: a project a
-    /// window opened and one a shell opened are the same row, listed by the
-    /// same rule, newest first.
+    /// window opened and one a shell opened are the same row, listed in the
+    /// order every sidebar shows: the arranged projects first, then the rest
+    /// by path.
     #[test]
-    fn project_list_answers_newest_first_and_tells_no_source_apart() {
+    fn project_list_answers_in_sidebar_order_and_tells_no_source_apart() {
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let peer_proof = proof("session", "boot", "incarnation");
-        let window_opened = ModelProject {
+        let project = |repository: &str, name: &str, ordinal| ModelProject {
             kind: Default::default(),
-            repository: PathBuf::from("/window/.git"),
-            name: "window".into(),
-            ordinal: 1,
+            repository: PathBuf::from(repository),
+            name: name.into(),
+            ordinal,
         };
-        let cli_opened = ModelProject {
-            kind: Default::default(),
-            repository: PathBuf::from("/shell/.git"),
-            name: "shell".into(),
-            ordinal: 2,
-        };
-        let served = vec![window_opened.clone(), cli_opened.clone()];
+        let window_opened = project("/window/.git", "window", 1);
+        let cli_opened = project("/shell/.git", "shell", 2);
+        let newest = project("/alpha/.git", "alpha", 3);
+        let served = vec![window_opened.clone(), cli_opened.clone(), newest.clone()];
         let server = thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(
@@ -9082,6 +9080,7 @@ mod tests {
                 closed_projects: Vec::new(),
                 views: Vec::new(),
                 agents: Vec::new(),
+                project_order: vec![PathBuf::from("/window/.git")],
             };
             write_frame(
                 &mut server_stream,
@@ -9094,10 +9093,14 @@ mod tests {
         server.join().unwrap();
         assert_eq!(output.command, "project.list");
         assert_eq!(
-            output.human, "/shell/.git\tshell\n/window/.git\twindow",
-            "newest first, one tab-separated line each, whoever opened them"
+            output.human, "/window/.git\twindow\n/alpha/.git\talpha\n/shell/.git\tshell",
+            "the arranged project, then the rest by path, one tab-separated line each, whoever \
+             opened them"
         );
-        assert_eq!(output.data["projects"], json!([cli_opened, window_opened]));
+        assert_eq!(
+            output.data["projects"],
+            json!([window_opened, newest, cli_opened])
+        );
     }
 
     /// Closing a project deletes every channel in it, in every window, and the
@@ -9200,6 +9203,7 @@ mod tests {
                     edit.request_id,
                     peer_proof,
                     WorkspaceModel {
+                        project_order: Vec::new(),
                         navigation_orders: Vec::new(),
                         identity: uuid::Uuid::new_v4(),
                         sequence: 9,
@@ -9525,6 +9529,7 @@ mod tests {
         channels: &[(ChannelId, &str, u32)],
     ) -> WorkspaceModel {
         WorkspaceModel {
+            project_order: Vec::new(),
             navigation_orders: Vec::new(),
             identity: uuid::Uuid::new_v4(),
             sequence: 8,

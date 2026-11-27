@@ -12,6 +12,7 @@ use crate::workspace_model::{
     ModelChannel, ModelEdit, ModelProject, NO_REGISTRY, PENDING_ORDINAL, WorkspaceModel,
     canonical_repository,
     delta::{EditEffects, EditReceipt, Mirror, ViewChanges},
+    project_order_after,
 };
 
 /// How long a thread waits before reconnecting.
@@ -240,6 +241,7 @@ fn channel_title_only(
         && effects.removed_projects.is_empty()
         && effects.removed_channels.is_empty()
         && effects.navigation_orders.is_empty()
+        && effects.project_order.is_none()
         && effects.agents.is_empty()
         && effects.removed_agents.is_empty()
         && effects.channels.iter().all(|channel| channel.id == *id)
@@ -286,6 +288,8 @@ fn edit_kind(edit: &ModelEdit) -> &'static str {
         ModelEdit::RetiredChannelWorkChanged => "RetiredChannelWorkChanged",
         ModelEdit::RetireEmptyChannel { .. } => "RetireEmptyChannel",
         ModelEdit::CloseConfirmedProject { .. } => "CloseConfirmedProject",
+        ModelEdit::ReorderProjects { .. } => "ReorderProjects",
+        ModelEdit::SeedProjectOrder { .. } => "SeedProjectOrder",
     }
 }
 
@@ -326,6 +330,8 @@ pub(super) enum MetadataKey {
     Channel(ChannelId),
     Navigation(PathBuf),
     Agent(crate::model::AgentId),
+    /// The one shared order of projects.
+    ProjectOrder,
 }
 
 /// What a run of shared model updates owes the window at its end, or before
@@ -624,10 +630,20 @@ fn publish_with_mirror(
                     *pending = None;
                     if matches!(
                         &request,
-                        ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+                        ModelEdit::ReorderNavigation { .. }
+                            | ModelEdit::ResetNavigation { .. }
+                            | ModelEdit::ReorderProjects { .. }
                     ) {
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
+                    }
+                    if matches!(&request, ModelEdit::ReorderProjects { .. }) {
+                        // The window moved the project before asking, and no
+                        // receipt will settle it: show the registry's order.
+                        let model = client
+                            .read_workspace_model()
+                            .map_err(|error| error.to_string())?;
+                        let _ = updates.send_blocking(ModelUpdate::Read(model));
                     }
                     if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
                         // A refused suggestion is not replayed against a newer
@@ -1031,6 +1047,8 @@ impl Cagents {
             self.shared_views.view_sequences.clear();
             self.shared_views.scope_absences.clear();
             self.shared_views.closed.clear();
+            // A different registry has not heard this window's order.
+            self.shared_views.project_order_offered = false;
         } else if model.sequence < self.shared_views.snapshot_sequence {
             return false;
         } else if model.sequence < self.workspace_model.sequence
@@ -1121,6 +1139,9 @@ impl Cagents {
                         .retain(|held| held.repository != order.repository);
                     model.navigation_orders.push(order.clone());
                 }
+            }
+            if newer(&MetadataKey::ProjectOrder) {
+                model.project_order = self.workspace_model.project_order.clone();
             }
             model.navigation_orders.retain(|order| {
                 !newer(&MetadataKey::Navigation(order.repository.clone()))
@@ -1462,6 +1483,7 @@ impl Cagents {
             && effects.removed_projects.is_empty()
             && effects.removed_channels.is_empty()
             && effects.navigation_orders.is_empty()
+            && effects.project_order.is_none()
             && effects.agents.is_empty()
             && effects.removed_agents.is_empty()
             && &project.repository == repository
@@ -1555,6 +1577,7 @@ impl Cagents {
             || !effects.removed_channels.is_empty()
             || !effects.removed_projects.is_empty()
             || !effects.navigation_orders.is_empty()
+            || effects.project_order.is_some()
             || !effects.agents.is_empty()
             || !effects.removed_agents.is_empty()
             || effects.views.len() > 1
@@ -2167,6 +2190,9 @@ impl Cagents {
             | ModelEdit::ReorderNavigation { repository, .. } => {
                 vec![MetadataKey::Navigation(repository.clone())]
             }
+            ModelEdit::ReorderProjects { .. } | ModelEdit::SeedProjectOrder { .. } => {
+                vec![MetadataKey::ProjectOrder]
+            }
             _ => Vec::new(),
         };
         for key in keys {
@@ -2414,6 +2440,11 @@ impl Cagents {
                     .retain(|held| held.repository != repository);
                 changed |= model.navigation_orders.len() != held;
             }
+            // Closing a project also drops it from the project order.
+            if model.project_order.contains(&repository) && accepts(MetadataKey::ProjectOrder) {
+                model.project_order.retain(|held| *held != repository);
+                changed = true;
+            }
             if protected_projects.contains(&repository)
                 || !accepts(MetadataKey::Project(repository.clone()))
             {
@@ -2467,6 +2498,13 @@ impl Cagents {
             if !order.items.is_empty() {
                 model.navigation_orders.push(order);
             }
+            changed = true;
+        }
+        if let Some(order) = effects.project_order
+            && accepts(MetadataKey::ProjectOrder)
+            && model.project_order != order
+        {
+            model.project_order = order;
             changed = true;
         }
         for agent in effects.agents {
@@ -2918,6 +2956,11 @@ impl Cagents {
             }
         }
         self.workspace_model = model;
+        // An unarranged sidebar is already in this window's own order.
+        if !self.workspace_model.project_order.is_empty() {
+            changed |= self.order_sidebar_projects();
+        }
+        self.seed_project_order();
         // First adoption has no authoritative pane to project yet. Publish only
         // these exact new descriptors and overlay their pending Inserts before
         // passive projection; existing panes still project before persistence.
@@ -3425,8 +3468,7 @@ impl Cagents {
             )
             .with_kind(project.kind),
         );
-        self.sidebar_model
-            .apply_project_order(&self.durable.project_order);
+        self.order_sidebar_projects();
         self.sidebar_model.data_state = SidebarDataState::Ready;
         Adoption::Opening(self.project_load_task(
             shared.repository.clone(),
@@ -3434,6 +3476,117 @@ impl Cagents {
             false,
             Some(shared.kind),
         ))
+    }
+
+    /// Lists the sidebar's projects in the order every window shares, once
+    /// anyone arranged them, or else in the order this window arranged before
+    /// the order was shared. A device window has only the shared order: until
+    /// someone arranges the device's projects, it lists them by path as the
+    /// device's own windows do. The window keeps the shared order as its own too,
+    /// so it opens in that order before the daemon answers. Whether the
+    /// sidebar changed.
+    pub(super) fn order_sidebar_projects(&mut self) -> bool {
+        if self.workspace_model.project_order.is_empty() && !crate::device::is_remote() {
+            self.sidebar_model
+                .apply_project_order(&self.durable.project_order);
+            return false;
+        }
+        let moved = self
+            .sidebar_model
+            .apply_shared_project_order(&self.workspace_model.project_order);
+        let shown = self.sidebar_model.projects.iter().map(|project| project.id);
+        if !self.durable.project_order.iter().copied().eq(shown.clone()) {
+            Arc::make_mut(&mut self.durable).project_order = shown.collect();
+        }
+        moved
+    }
+
+    /// Offers the registry the order this window arranged before the order of
+    /// projects was shared, once per registry. The registry takes it only
+    /// while nobody has arranged the projects, so the first window to carry
+    /// one over sets it and every later one adopts it.
+    ///
+    /// A device window leaves this to the device's own windows: the order it
+    /// saved is one it arranged while it could not see theirs.
+    fn seed_project_order(&mut self) {
+        if self.shared_views.project_order_offered
+            || self.workspace_model.identity == NO_REGISTRY
+            || !self.workspace_model.project_order.is_empty()
+            || crate::device::is_remote()
+        {
+            return;
+        }
+        self.shared_views.project_order_offered = true;
+        let order: Vec<PathBuf> = self
+            .durable
+            .project_order
+            .iter()
+            .filter_map(|id| self.sidebar_model.project(*id))
+            .map(|project| project.repository.clone())
+            .collect();
+        // Projects this reconciliation is only now opening in the registry are
+        // queued ahead of the seed; the registry leaves out any it didn't open.
+        if !order.is_empty() {
+            self.publish_model_edit(ModelEdit::SeedProjectOrder { order });
+        }
+    }
+
+    /// Moves a project in every window's sidebar. This window moves it at once;
+    /// the registry's answer then settles the order every window shows, which
+    /// is the same one unless another window moved a project meanwhile.
+    pub(super) fn reorder_sidebar_project(
+        &mut self,
+        project: crate::model::ProjectId,
+        before: Option<crate::model::ProjectId>,
+    ) -> Task<Message> {
+        let repository = |id| {
+            self.sidebar_model
+                .project(id)
+                .map(|project| project.repository.clone())
+        };
+        let Some(source) = repository(project) else {
+            return Task::none();
+        };
+        let before_repository = match before {
+            Some(id) => match repository(id) {
+                Some(repository) => Some(repository),
+                None => return Task::none(),
+            },
+            None => None,
+        };
+        let fallback: Vec<PathBuf> = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| project.repository.clone())
+            .collect();
+        if !self.sidebar_model.reorder_project(project, before) {
+            return Task::none();
+        }
+        Arc::make_mut(&mut self.durable).project_order = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| project.id)
+            .collect();
+        self.persist();
+        if self.workspace_model.identity != NO_REGISTRY {
+            let edit = ModelEdit::ReorderProjects {
+                source,
+                before: before_repository,
+                fallback,
+            };
+            // The shared order moves with it, so a reconciliation before the
+            // registry answers keeps the project where the user put it.
+            let model = &self.workspace_model;
+            if let Some(order) = project_order_after(&model.project_order, &edit, |repository| {
+                model.project(repository).is_some()
+            }) {
+                self.workspace_model.project_order = order;
+            }
+            self.publish_model_edit(edit);
+        }
+        Task::none()
     }
 
     /// Reads a repository the shared model names and this window has not opened.
@@ -3781,7 +3934,9 @@ impl Cagents {
         self.capture_view_update_source(&edit);
         let navigation = matches!(
             &edit,
-            ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+            ModelEdit::ReorderNavigation { .. }
+                | ModelEdit::ResetNavigation { .. }
+                | ModelEdit::ReorderProjects { .. }
         );
         let retitle = match &edit {
             ModelEdit::RetitleChannel { id, title } => Some((*id, !title.is_empty())),

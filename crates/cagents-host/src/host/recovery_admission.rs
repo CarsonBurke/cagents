@@ -208,6 +208,8 @@ fn model_access(edit: &ModelEdit) -> Access<'static> {
         | ModelEdit::CreateChannel { .. }
         | ModelEdit::ResetNavigation { .. }
         | ModelEdit::ReorderNavigation { .. }
+        | ModelEdit::ReorderProjects { .. }
+        | ModelEdit::SeedProjectOrder { .. }
         | ModelEdit::RetitleChannel { .. }
         | ModelEdit::SuggestChannelTitle { .. }
         | ModelEdit::SeedView { .. }

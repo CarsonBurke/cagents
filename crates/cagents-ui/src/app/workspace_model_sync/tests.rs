@@ -5005,6 +5005,7 @@ fn local(id: ChannelId, project: ProjectId, title: &str, ordinal: u32) -> Projec
 /// has reconciled against it would have recorded.
 fn registry(channels: Vec<ModelChannel>) -> WorkspaceModel {
     WorkspaceModel {
+        project_order: Vec::new(),
         navigation_orders: Vec::new(),
         identity: uuid::Uuid::new_v4(),
         sequence: channels.len() as u64,
@@ -8301,4 +8302,218 @@ fn a_rename_that_was_never_queued_leaves_the_registrys_title_deciding() {
         assert_eq!(channel_title(&app, channel), Some(""));
         assert!(!app.channel_is_named(channel), "{earlier}");
     }
+}
+
+/// A window with these projects in its sidebar, in this order, and a registry
+/// that holds them, nobody having arranged them.
+fn app_with_projects(names: &[&str]) -> (Cagents, Vec<ProjectId>, WorkspaceModel) {
+    let mut app = super::super::tests::context_inspector_test_app(true);
+    let mut model = registry(Vec::new());
+    model.sequence = 10;
+    let mut ids = Vec::new();
+    for (ordinal, name) in names.iter().enumerate() {
+        let id = ProjectId::new();
+        let repository = PathBuf::from(format!("/repositories/{name}/.git"));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            id,
+            RepositoryId::new(),
+            (*name).into(),
+            repository.clone(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        model.projects.push(ModelProject {
+            repository,
+            name: (*name).into(),
+            kind: ProjectKind::Git,
+            ordinal: ordinal as u32,
+        });
+        ids.push(id);
+    }
+    (app, ids, model)
+}
+
+fn sidebar_names(app: &Cagents) -> Vec<String> {
+    app.sidebar_model
+        .projects
+        .iter()
+        .map(|project| project.name.clone())
+        .collect()
+}
+
+fn order_of(names: &[&str]) -> Vec<PathBuf> {
+    names
+        .iter()
+        .map(|name| PathBuf::from(format!("/repositories/{name}/.git")))
+        .collect()
+}
+
+/// #4450: a device window, or a second window, showed the device's projects
+/// sorted by path (uppercase first) instead of in the order the device's own
+/// window arranged, because that order lived only in that window.
+#[test]
+fn every_window_lists_projects_in_the_order_the_registry_shares() {
+    let (mut app, ids, mut model) = app_with_projects(&[
+        "repositories",
+        "AIEvalSuite",
+        "bitlearn",
+        "redact",
+        "cleanrl",
+    ]);
+    // Arranged elsewhere: this window never saw the arrangement.
+    model.project_order = order_of(&["redact", "cleanrl", "bitlearn"]);
+    assert!(app.install_workspace_model_snapshot(model));
+    drop(app.reconcile_workspace_model());
+    assert_eq!(
+        sidebar_names(&app),
+        [
+            "redact",
+            "cleanrl",
+            "bitlearn",
+            "AIEvalSuite",
+            "repositories"
+        ],
+        "the arranged projects first, then the rest by path"
+    );
+    let shown: Vec<_> = app.sidebar_model.projects.iter().map(|p| p.id).collect();
+    assert_eq!(
+        app.durable.project_order, shown,
+        "the window opens in the shared order before the daemon answers"
+    );
+    assert_eq!(shown.len(), ids.len());
+}
+
+#[test]
+fn moving_a_project_shows_at_once_and_publishes_against_the_shared_order() {
+    let (mut app, ids, model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    assert!(app.install_workspace_model_snapshot(model));
+    drop(app.reconcile_workspace_model());
+    let published = intercept_publishes(&mut app);
+    drop(app.update(Message::Sidebar(SidebarAction::ReorderProject {
+        project: ids[2],
+        before: Some(ids[0]),
+    })));
+    assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
+    assert_eq!(
+        drain(&published),
+        [ModelEdit::ReorderProjects {
+            source: order_of(&["gamma"]).remove(0),
+            before: Some(order_of(&["alpha"]).remove(0)),
+            fallback: order_of(&["alpha", "beta", "gamma"]),
+        }]
+    );
+    // Another window moved beta to the top meanwhile; the registry's answer
+    // is the order every window settles on.
+    drop(app.apply_changed_edge(
+        11,
+        &ModelEdit::ReorderProjects {
+            source: order_of(&["beta"]).remove(0),
+            before: Some(order_of(&["gamma"]).remove(0)),
+            fallback: Vec::new(),
+        },
+        EdgeChanges {
+            identity: Some(app.workspace_model.identity),
+            effects: EditEffects {
+                project_order: Some(order_of(&["beta", "gamma", "alpha"])),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
+    assert_eq!(sidebar_names(&app), ["beta", "gamma", "alpha"]);
+    // A close drops the project from the order without an order effect.
+    drop(app.apply_changed_edge(
+        12,
+        &ModelEdit::CloseProject {
+            repository: order_of(&["gamma"]).remove(0),
+        },
+        EdgeChanges {
+            identity: Some(app.workspace_model.identity),
+            effects: EditEffects {
+                removed_projects: order_of(&["gamma"]),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ));
+    assert_eq!(
+        app.workspace_model.project_order,
+        order_of(&["beta", "alpha"])
+    );
+}
+
+#[test]
+fn a_window_offers_the_order_it_arranged_once_and_only_while_none_is_shared() {
+    let (mut app, ids, model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    Arc::make_mut(&mut app.durable).project_order = vec![ids[1], ids[2]];
+    let published = intercept_publishes(&mut app);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    let edits = drain(&published);
+    assert!(
+        edits.contains(&ModelEdit::SeedProjectOrder {
+            order: order_of(&["beta", "gamma"]),
+        }),
+        "{edits:?}"
+    );
+    drop(app.reconcile_workspace_model());
+    assert!(
+        !drain(&published)
+            .iter()
+            .any(|edit| matches!(edit, ModelEdit::SeedProjectOrder { .. })),
+        "offered once per registry"
+    );
+    // A different registry, such as one started over, has not heard it.
+    let mut replaced = model.clone();
+    replaced.identity = uuid::Uuid::new_v4();
+    assert!(app.install_workspace_model_snapshot(replaced));
+    drop(app.reconcile_workspace_model());
+    assert!(
+        drain(&published).contains(&ModelEdit::SeedProjectOrder {
+            order: order_of(&["beta", "gamma"]),
+        }),
+        "offered again to a new registry"
+    );
+
+    // A window joining an arranged registry adopts its order instead.
+    let (mut app, ids, mut model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    Arc::make_mut(&mut app.durable).project_order = vec![ids[1], ids[2]];
+    model.project_order = order_of(&["gamma", "alpha"]);
+    let published = intercept_publishes(&mut app);
+    assert!(app.install_workspace_model_snapshot(model));
+    drop(app.reconcile_workspace_model());
+    assert!(
+        !drain(&published)
+            .iter()
+            .any(|edit| matches!(edit, ModelEdit::SeedProjectOrder { .. }))
+    );
+    assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
+}
+
+/// Review of #4450: a move made over an arranged order must survive any
+/// reconciliation before the registry answers, rather than bounce back to the
+/// order the registry held before it.
+#[test]
+fn a_moved_project_stays_put_until_the_registry_answers_and_a_refusal_restores_it() {
+    let (mut app, ids, mut model) = app_with_projects(&["alpha", "beta", "gamma"]);
+    model.project_order = order_of(&["alpha", "beta", "gamma"]);
+    assert!(app.install_workspace_model_snapshot(model.clone()));
+    drop(app.reconcile_workspace_model());
+    let published = intercept_publishes(&mut app);
+    drop(app.update(Message::Sidebar(SidebarAction::ReorderProject {
+        project: ids[2],
+        before: Some(ids[0]),
+    })));
+    assert_eq!(drain(&published).len(), 1);
+    // An unrelated update reconciles the window before the answer arrives.
+    drop(app.reconcile_workspace_model());
+    assert_eq!(sidebar_names(&app), ["gamma", "alpha", "beta"]);
+
+    // The registry refused the move: the window reports it and returns to the
+    // registry's order instead of keeping a move nobody else has.
+    drop(app.apply_workspace_model_update(ModelUpdate::NavigationFailed("refused".into())));
+    drop(app.apply_workspace_model_update(ModelUpdate::Read(model)));
+    assert_eq!(sidebar_names(&app), ["alpha", "beta", "gamma"]);
+    let shown: Vec<_> = app.sidebar_model.projects.iter().map(|p| p.id).collect();
+    assert_eq!(app.durable.project_order, shown);
 }

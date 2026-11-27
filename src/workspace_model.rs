@@ -227,10 +227,12 @@ pub fn merge_navigation_fallback(items: &mut Vec<NavigationItem>, fallback: &[Na
     items.extend(worktrees);
 }
 
-pub fn reorder_navigation(
-    items: &mut Vec<NavigationItem>,
-    source: &NavigationItem,
-    before: Option<&NavigationItem>,
+/// Moves `source` to just before `before`, or to the end. Whether anything
+/// moved: an unknown `source` or `before` moves nothing.
+pub fn reorder_navigation<T: PartialEq>(
+    items: &mut Vec<T>,
+    source: &T,
+    before: Option<&T>,
 ) -> bool {
     let Some(from) = items.iter().position(|item| item == source) else {
         return false;
@@ -249,6 +251,85 @@ pub fn reorder_navigation(
     let item = items.remove(from);
     items.insert(to, item);
     true
+}
+
+/// Moves a project in the shared project order, as
+/// [`ModelEdit::ReorderProjects`] does: an empty order starts from the order
+/// the window showed, and a project the order does not hold yet joins it where
+/// the window showed it, after every ordered one. Whether the project moved;
+/// when it didn't, the order is left exactly as it was.
+pub fn reorder_projects(
+    order: &mut Vec<PathBuf>,
+    source: &Path,
+    before: Option<&Path>,
+    fallback: &[PathBuf],
+) -> bool {
+    let held = order.clone();
+    let mut known = std::collections::HashSet::new();
+    order.retain(|repository| known.insert(repository.clone()));
+    for repository in fallback {
+        if known.insert(repository.clone()) {
+            order.push(repository.clone());
+        }
+    }
+    let source = source.to_path_buf();
+    let before = before.map(Path::to_path_buf);
+    if !reorder_navigation(order, &source, before.as_ref()) {
+        // A move that moves nothing arranges nothing either, so an order
+        // nobody arranged stays automatic.
+        *order = held;
+        return false;
+    }
+    true
+}
+
+/// The project order after a project order edit, given which projects are
+/// open, or `None` when the edit leaves the order as it is. The registry and
+/// every window fold an edit through this one rule.
+///
+/// A project a stale window names that is no longer open is left out rather
+/// than refusing the edit: the window showed it a moment ago, and the projects
+/// it did order still move. A move of a project that isn't open, or before
+/// one, moves nothing.
+pub fn project_order_after(
+    held: &[PathBuf],
+    edit: &ModelEdit,
+    is_open: impl Fn(&Path) -> bool,
+) -> Option<Vec<PathBuf>> {
+    let open_only = |paths: &[PathBuf]| {
+        paths
+            .iter()
+            .filter(|path| is_open(path))
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    let order = match edit {
+        ModelEdit::ReorderProjects {
+            source,
+            before,
+            fallback,
+        } => {
+            if !is_open(source) || before.as_deref().is_some_and(|before| !is_open(before)) {
+                return None;
+            }
+            let mut order = open_only(held);
+            if !reorder_projects(&mut order, source, before.as_deref(), &open_only(fallback)) {
+                return None;
+            }
+            order
+        }
+        ModelEdit::SeedProjectOrder { order: seed } => {
+            if !held.is_empty() {
+                return None;
+            }
+            let mut known = std::collections::HashSet::new();
+            let mut order = open_only(seed);
+            order.retain(|repository| known.insert(repository.clone()));
+            order
+        }
+        _ => return None,
+    };
+    (order != held).then_some(order)
 }
 
 /// The shared sidebar model as the registry currently holds it.
@@ -280,6 +361,31 @@ pub struct WorkspaceModel {
     /// Durable execution sessions, adopted into their explicitly owned channel.
     #[serde(default)]
     pub agents: Vec<crate::agent_execution::Agent>,
+    /// The order every window lists its projects in, by repository key, once
+    /// someone arranged them; empty until then. A project it does not hold is
+    /// listed after every one it does: see [`Self::projects_in_order`].
+    ///
+    /// A client from before [`PROJECT_ORDER`] is sent the model without it.
+    ///
+    /// [`PROJECT_ORDER`]: crate::terminal_ipc::PROJECT_ORDER
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_project_order"
+    )]
+    pub project_order: Vec<PathBuf>,
+}
+
+/// Where a project is listed: its place in the shared order, then, for one the
+/// order does not hold, its repository path. Every window and the CLI list
+/// projects by this key, so they agree.
+pub fn project_rank<'a>(order: &[PathBuf], repository: &'a Path) -> (usize, &'a Path) {
+    (
+        order
+            .iter()
+            .position(|held| held == repository)
+            .unwrap_or(usize::MAX),
+        repository,
+    )
 }
 
 impl WorkspaceModel {
@@ -287,6 +393,16 @@ impl WorkspaceModel {
         self.projects
             .iter()
             .find(|project| project.repository == repository)
+    }
+
+    /// The projects in the order every window lists them.
+    pub fn projects_in_order(&self) -> Vec<&ModelProject> {
+        let mut projects = self.projects.iter().collect::<Vec<_>>();
+        projects.sort_by(|left, right| {
+            project_rank(&self.project_order, &left.repository)
+                .cmp(&project_rank(&self.project_order, &right.repository))
+        });
+        projects
     }
 
     pub fn channel(&self, id: ChannelId) -> Option<&ModelChannel> {
@@ -349,6 +465,7 @@ impl WorkspaceModel {
             | ModelEdit::CloseConfirmedProject { repository, .. } => {
                 self.navigation_orders
                     .retain(|order| order.repository != *repository);
+                self.project_order.retain(|held| held != repository);
                 if !self.closed_projects.contains(repository) {
                     self.closed_projects.push(repository.clone());
                 }
@@ -399,6 +516,13 @@ impl WorkspaceModel {
                 let items = &mut self.navigation_orders[index].items;
                 merge_navigation_fallback(items, fallback);
                 reorder_navigation(items, source, before.as_ref());
+            }
+            ModelEdit::ReorderProjects { .. } | ModelEdit::SeedProjectOrder { .. } => {
+                if let Some(order) = project_order_after(&self.project_order, edit, |repository| {
+                    self.project(repository).is_some()
+                }) {
+                    self.project_order = order;
+                }
             }
             ModelEdit::RetitleChannel { id, title } => {
                 if let Some(channel) = self.channels.iter_mut().find(|channel| channel.id == *id) {
@@ -552,6 +676,19 @@ pub enum ModelEdit {
         repository: PathBuf,
         channels: std::collections::BTreeSet<ChannelId>,
     },
+    /// Moves `source` to just before `before`, or to the end, in
+    /// [`WorkspaceModel::project_order`], against the order the registry holds
+    /// rather than the one the window last saw: see [`reorder_projects`].
+    /// `fallback` is every project in the order the window showed them.
+    ReorderProjects {
+        source: PathBuf,
+        before: Option<PathBuf>,
+        fallback: Vec<PathBuf>,
+    },
+    /// Sets [`WorkspaceModel::project_order`] only while nothing is arranged:
+    /// how a window carries over an order it arranged before the order was
+    /// shared, without overwriting one another window has arranged since.
+    SeedProjectOrder { order: Vec<PathBuf> },
 }
 
 impl ModelEdit {
@@ -603,6 +740,20 @@ impl ModelEdit {
             } => Self::CloseConfirmedProject {
                 repository: canonical_repository(&repository)?,
                 channels,
+            },
+            Self::ReorderProjects {
+                source,
+                before,
+                fallback,
+            } => Self::ReorderProjects {
+                source: canonical_repository(&source)?,
+                before: before
+                    .map(|before| canonical_repository(&before))
+                    .transpose()?,
+                fallback: canonical_repositories(fallback)?,
+            },
+            Self::SeedProjectOrder { order } => Self::SeedProjectOrder {
+                order: canonical_repositories(order)?,
             },
             Self::CreateChannel {
                 id,
@@ -673,6 +824,22 @@ impl ModelEdit {
             edit => std::borrow::Cow::Borrowed(edit),
         }
     }
+}
+
+/// The most projects an order edit names. The registry refuses a longer one
+/// before resolving any of its paths.
+pub const MAX_ORDERED_PROJECTS: usize = 4096;
+
+fn canonical_repositories(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    if paths.len() > MAX_ORDERED_PROJECTS {
+        return Err(format!(
+            "a project order names at most {MAX_ORDERED_PROJECTS} projects"
+        ));
+    }
+    paths
+        .iter()
+        .map(|path| canonical_repository(path))
+        .collect()
 }
 
 /// Resolves `path` into the shared project key.
@@ -1052,6 +1219,149 @@ mod tests {
             postcard::from_bytes::<ModelChannel>(&bytes).unwrap(),
             channel
         );
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names
+            .iter()
+            .map(|name| PathBuf::from(format!("/{name}")))
+            .collect()
+    }
+
+    #[test]
+    fn project_moves_start_from_the_shown_order_and_never_arrange_by_accident() {
+        let shown = paths(&["a", "b", "c"]);
+        let mut order = Vec::new();
+        assert!(
+            !reorder_projects(&mut order, Path::new("/c"), None, &shown),
+            "moving the last project to the end moves nothing"
+        );
+        assert!(order.is_empty(), "so nothing becomes arranged");
+        assert!(reorder_projects(
+            &mut order,
+            Path::new("/c"),
+            Some(Path::new("/a")),
+            &shown
+        ));
+        assert_eq!(order, paths(&["c", "a", "b"]));
+        // A window that missed that move, and a project opened since, which
+        // joins after the arranged ones.
+        let stale = paths(&["a", "b", "c", "d"]);
+        assert!(reorder_projects(
+            &mut order,
+            Path::new("/b"),
+            Some(Path::new("/c")),
+            &stale
+        ));
+        assert_eq!(order, paths(&["b", "c", "a", "d"]));
+        let held = order.clone();
+        assert!(!reorder_projects(&mut order, Path::new("/x"), None, &stale));
+        assert!(!reorder_projects(
+            &mut order,
+            Path::new("/a"),
+            Some(Path::new("/x")),
+            &stale
+        ));
+        assert_eq!(order, held, "an unknown project moves nothing");
+    }
+
+    #[test]
+    fn projects_list_in_the_shared_order_then_by_path() {
+        let mut model = WorkspaceModel::default();
+        for (ordinal, name) in ["repositories", "AIEvalSuite", "bitlearn", "redact"]
+            .into_iter()
+            .enumerate()
+        {
+            // The folder holding the others is a project too, as on #4450's
+            // device.
+            let repository = match name {
+                "repositories" => PathBuf::from("/home/u/repositories"),
+                name => PathBuf::from(format!("/home/u/repositories/{name}")),
+            };
+            model.projects.push(ModelProject {
+                repository,
+                name: name.into(),
+                kind: ProjectKind::Git,
+                ordinal: ordinal as u32,
+            });
+        }
+        let names = |model: &WorkspaceModel| {
+            model
+                .projects_in_order()
+                .into_iter()
+                .map(|project| project.name.clone())
+                .collect::<Vec<_>>()
+        };
+        // Unarranged, by path: the folder first, then uppercase before lowercase.
+        assert_eq!(
+            names(&model),
+            ["repositories", "AIEvalSuite", "bitlearn", "redact"]
+        );
+        model.fold(
+            1,
+            &ModelEdit::SeedProjectOrder {
+                order: vec![
+                    "/home/u/repositories/redact".into(),
+                    "/home/u/repositories".into(),
+                ],
+            },
+        );
+        assert_eq!(
+            names(&model),
+            ["redact", "repositories", "AIEvalSuite", "bitlearn"]
+        );
+        // A seed never replaces an arrangement.
+        model.fold(
+            2,
+            &ModelEdit::SeedProjectOrder {
+                order: vec!["/home/u/repositories/bitlearn".into()],
+            },
+        );
+        assert_eq!(names(&model)[0], "redact");
+        model.fold(
+            3,
+            &ModelEdit::CloseProject {
+                repository: "/home/u/repositories/redact".into(),
+            },
+        );
+        assert_eq!(model.project_order, [PathBuf::from("/home/u/repositories")]);
+    }
+
+    #[test]
+    fn an_older_client_is_sent_the_model_without_the_project_order() {
+        use crate::terminal_ipc::{PROJECT_ORDER, encoding_for};
+        let mut model = WorkspaceModel {
+            identity: Uuid::new_v4(),
+            sequence: 4,
+            ..WorkspaceModel::default()
+        };
+        let unarranged = postcard::to_allocvec(&model).unwrap();
+        model.project_order = paths(&["a"]);
+        let sent = encoding_for(PROJECT_ORDER - 1, || postcard::to_allocvec(&model)).unwrap();
+        assert_eq!(
+            sent.as_slice(),
+            &unarranged[..unarranged.len() - 1],
+            "the older layout ends where the project order would begin"
+        );
+        let bytes = postcard::to_allocvec(&model).unwrap();
+        assert_eq!(
+            postcard::from_bytes::<WorkspaceModel>(&bytes).unwrap(),
+            model
+        );
+        for edit in [
+            ModelEdit::ReorderProjects {
+                source: "/a".into(),
+                before: None,
+                fallback: paths(&["a"]),
+            },
+            ModelEdit::SeedProjectOrder {
+                order: paths(&["a"]),
+            },
+        ] {
+            let bytes = postcard::to_allocvec(&edit).unwrap();
+            assert!(bytes[0] >= 16, "appended after every earlier edit");
+            assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
+        }
     }
 
     #[test]

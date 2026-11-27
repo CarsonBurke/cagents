@@ -826,6 +826,7 @@ mod tests {
                 "deleted_channels",
                 "automation_attention_resolution",
                 "session_lineage_predecessors",
+                "project_order",
             ] {
                 assert_eq!(after.remove(table).unwrap(), Vec::<Vec<_>>::new());
             }

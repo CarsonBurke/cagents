@@ -238,6 +238,11 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            // An older daemon lists projects in each window's own order.
+            34 => {
+                tx.execute_batch("DROP TABLE project_order;")
+                    .map_err(|error| error.to_string())?;
+            }
             33 => {
                 tx.execute_batch("DROP TABLE session_lineage_predecessors;")
                     .map_err(|error| error.to_string())?;
@@ -419,6 +424,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static THIRTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static THIRTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static THIRTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -442,6 +448,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         31 => &THIRTY_ONE,
         32 => &THIRTY_TWO,
         33 => &THIRTY_THREE,
+        34 => &THIRTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1408,6 +1415,7 @@ mod tests {
                 "agent_runs_unfinished_by_agent",
                 "automation_attention_resolution",
                 "session_lineage_predecessors",
+                "project_order",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1798,7 +1806,7 @@ mod tests {
         let _clear = Clear;
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
-            26, 27, 28, 29, 30, 31, 32,
+            26, 27, 28, 29, 30, 31, 32, 33, 34,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
