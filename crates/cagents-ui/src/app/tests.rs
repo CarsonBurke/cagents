@@ -10705,6 +10705,44 @@ fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
     }
 }
 
+/// The Problems section's details fold and unfold on request, and a restart
+/// or dismissal folds them, so the next failure doesn't arrive unfolded.
+#[test]
+fn language_server_details_unfold_until_restart_dismissal_or_another_file() {
+    let mut app = lsp_test_app();
+    let card = repository_card(&mut app, "/repo");
+    lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
+    app.lsp_documents.insert(LspDocumentId(1), card);
+    lsp_state(&mut app, card)
+        .attachment
+        .context
+        .set_status(LspStatus::Missing {
+            server: "typescript-language-server".into(),
+            program: "typescript-language-server".into(),
+        });
+    let details = |app: &Cagents| app.lsp_contexts[&card].attachment.context.details_open;
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    assert!(details(&app));
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    assert!(!details(&app));
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    let _ = app.update_lsp(InspectorAction::RestartLanguageServer(card));
+    assert!(!details(&app), "a restart left the old reason unfolded");
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
+    assert!(!details(&app), "a dismissal left the details unfolded");
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    app.close_lsp_document(card);
+    assert!(
+        !details(&app),
+        "the next file opened with the last one's details"
+    );
+}
+
 /// A superseded request is the ordinary result of typing while one is in
 /// flight. Reporting it would put a notice on screen for every keystroke.
 #[test]
@@ -10826,8 +10864,8 @@ async fn progress_occupies_the_notice_slot_until_it_is_done() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-        Some("Indexing (40%)")
+        app.lsp_contexts[&card].attachment.context.notice,
+        Some(inspector::LspNotice::Progress("Indexing (40%)".into()))
     );
 
     app.apply_lsp_event(
@@ -11943,6 +11981,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
         .notice
         .clone()
         .expect("the desync is reported");
+    assert!(failure.is_failure(), "a desync is a failure, not progress");
 
     for done in [false, true] {
         app.apply_lsp_event(
@@ -11957,8 +11996,8 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
                 .await,
         );
         assert_eq!(
-            app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-            Some(failure.as_str()),
+            app.lsp_contexts[&card].attachment.context.notice.as_ref(),
+            Some(&failure),
             "progress with done={done} replaced the failure"
         );
     }
@@ -11978,8 +12017,8 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-        Some("Indexing (10%)")
+        app.lsp_contexts[&card].attachment.context.notice,
+        Some(inspector::LspNotice::Progress("Indexing (10%)".into()))
     );
     app.lsp.begin_shutdown().await;
 }

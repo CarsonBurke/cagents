@@ -916,10 +916,12 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 
 fn language_server_failure(status: LspStatus) -> Option<String> {
     match status {
+        LspStatus::Missing { program, .. } => Some(format!("`{program}` was not found on PATH")),
         LspStatus::Unavailable { reason } => Some(reason),
         LspStatus::Failed {
             reason,
             stderr_tail,
+            ..
         } => {
             if stderr_tail.is_empty() {
                 Some(reason)
@@ -9140,6 +9142,7 @@ mod tests {
     #[test]
     fn language_server_failure_preserves_the_full_stderr_evidence() {
         let failure = language_server_failure(LspStatus::Failed {
+            server: "rust-analyzer".into(),
             reason: "initialize failed".into(),
             stderr_tail: vec![
                 "toolchain unavailable".into(),

@@ -344,7 +344,11 @@ pub enum InspectorAction {
         at: LspPosition,
         coordinates: LspCoordinates,
     },
+    /// Start `card`'s language server again: Restart for one that stopped,
+    /// Retry for one that could not start, such as after installing it.
     RestartLanguageServer(CardId),
+    /// Fold or unfold the Problems section's status details.
+    ToggleLanguageServerDetails(CardId),
     DismissLspResults(CardId),
 }
 
@@ -393,23 +397,6 @@ impl Section {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Action {
-    pub label: Cow<'static, str>,
-    pub icon: Icon,
-    pub message: InspectorAction,
-}
-
-impl Action {
-    fn new(label: impl Into<Cow<'static, str>>, icon: Icon, message: InspectorAction) -> Self {
-        Self {
-            label: label.into(),
-            icon,
-            message,
-        }
-    }
-}
-
 /// The LSP half of a repository card's inspector, owned by the application
 /// because results arrive on the manager's event channel rather than from
 /// widget state.
@@ -419,7 +406,56 @@ pub struct LspInspectorContext {
     pub diagnostics: Vec<LspDiagnostic>,
     pub locations: Option<(LocationKind, Vec<LspLocation>)>,
     pub completions: Vec<CompletionTarget>,
-    pub notice: Option<String>,
+    pub notice: Option<LspNotice>,
+    /// Whether the user unfolded the Problems section's status lines to read
+    /// their whole reason and the server's last output.
+    pub details_open: bool,
+    /// Whether the user restarted or retried the server and it has not yet
+    /// settled, so its Starting is worth a line.
+    pub restarting: bool,
+}
+
+impl LspInspectorContext {
+    /// Records the server's state; a settled one ends a restart, and a
+    /// different kind of state folds the details read about the last one.
+    pub fn set_status(&mut self, status: LspStatus) {
+        if !matches!(status, LspStatus::Starting) {
+            self.restarting = false;
+        }
+        if self
+            .status
+            .as_ref()
+            .is_none_or(|old| std::mem::discriminant(old) != std::mem::discriminant(&status))
+        {
+            self.details_open = false;
+        }
+        self.status = Some(status);
+    }
+}
+
+/// The one transient message the Problems section carries besides the
+/// server's own state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LspNotice {
+    /// A request failed or the document had to be resent. It stays until the
+    /// user dismisses it.
+    Failure(String),
+    /// The server's current progress report, gone when the work is done.
+    Progress(String),
+}
+
+impl LspNotice {
+    #[must_use]
+    pub fn text(&self) -> &str {
+        match self {
+            Self::Failure(text) | Self::Progress(text) => text,
+        }
+    }
+
+    #[must_use]
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failure(_))
+    }
 }
 
 /// A language server may report thousands of diagnostics or references for one
@@ -477,17 +513,21 @@ pub fn withheld_diagnostics_label(withheld: usize) -> String {
 }
 
 /// Whether the focused editor has anything for the Problems section: a
-/// diagnostic, a notice, or a language server that could not start or died.
-/// A healthy server with nothing to report, like a file type with none
-/// configured, draws no section saying so.
+/// diagnostic, a notice, or a language server that is missing, could not
+/// start or died. A healthy server with nothing to report, like a file type
+/// with none configured, draws no section saying so.
 pub fn has_problems(lsp: &LspInspectorContext) -> bool {
     !lsp.diagnostics.is_empty()
         || lsp.notice.is_some()
-        || lsp.status.as_ref().is_some_and(|status| {
-            matches!(
-                status,
-                LspStatus::Unavailable { .. } | LspStatus::Failed { .. }
-            )
+        || lsp.status.as_ref().is_some_and(|status| match status {
+            LspStatus::Missing { .. }
+            | LspStatus::Unavailable { .. }
+            | LspStatus::Failed { .. } => true,
+            // A retry the user asked for shows as a spinner where its
+            // failure was, rather than the section vanishing until the
+            // outcome is known.
+            LspStatus::Starting => lsp.restarting,
+            LspStatus::Ready | LspStatus::Disabled => false,
         })
 }
 
@@ -504,44 +544,484 @@ pub fn worst_severity(lsp: &LspInspectorContext) -> Option<LspSeverity> {
         })
 }
 
-/// The focused editor's diagnostics in file order, after why its language
-/// server is not serving it, when it is not, and how to restart it.
-pub fn problems_view(card: CardId, lsp: &LspInspectorContext) -> Element<'static, InspectorAction> {
-    let mut rows: Vec<Element<'static, InspectorAction>> = Vec::new();
-    let healthy = lsp
-        .status
-        .as_ref()
-        .is_none_or(|status| matches!(status, LspStatus::Starting | LspStatus::Ready));
-    if !healthy || lsp.notice.is_some() {
-        rows.extend(
-            language_server_section(lsp.status.as_ref(), lsp.notice.as_deref())
-                .into_iter()
-                .flat_map(|section| section.facts)
-                .map(fact_element),
-        );
+/// What a status line's glyph says about it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusTone {
+    /// Work under way, drawn as a spinner.
+    Busy,
+    /// Something to know or to fix, such as a server that isn't installed.
+    Warning,
+    /// The server stopped.
+    Error,
+}
+
+/// A stretch of inline text: words, or code set in monospace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Run {
+    pub text: String,
+    pub code: bool,
+}
+
+/// The inline action a status line offers: only one that can fix what it
+/// reports.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusAction {
+    pub label: &'static str,
+    /// The accessible name, which says what the action acts on.
+    pub name: String,
+    pub message: InspectorAction,
+}
+
+/// One compact line of the Problems section about the language server or a
+/// request, rather than a column of label and value pairs.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StatusLine {
+    pub tone: StatusTone,
+    /// What happened, in plain words. It fades rather than wraps where the
+    /// inspector is narrow.
+    pub summary: String,
+    /// The whole account as plain text: the line's tooltip and accessible
+    /// description.
+    pub reason: String,
+    /// The same account with its program names marked as code, shown once
+    /// the user unfolds the line. Empty for a line with nothing more to say.
+    pub detail: Vec<Run>,
+    /// The server's last standard-error lines, shown unfolded beneath the
+    /// detail, for a server that stopped.
+    pub output: Option<Vec<String>>,
+    pub action: Option<StatusAction>,
+}
+
+/// What the Problems section says before its diagnostics: the language
+/// server's state when that is worth a line, then the notice.
+pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> {
+    let mut lines = Vec::with_capacity(2);
+    let progress = match &lsp.notice {
+        Some(LspNotice::Progress(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    match &lsp.status {
+        Some(LspStatus::Missing { server, program }) => {
+            let name = crate::settings::language_server_name(server);
+            // Not "isn't installed": a server installed where only a login
+            // shell's PATH reaches is not found either, and a full path in
+            // its command, which the launcher takes as written, fixes that.
+            let detail = vec![
+                Run::code(program),
+                Run::words(" wasn't found on PATH. Install it, or set its full path in "),
+                Run::code("settings.toml"),
+                Run::words(", then choose Retry."),
+            ];
+            lines.push(StatusLine {
+                tone: StatusTone::Warning,
+                summary: format!("{name} not found"),
+                reason: plain(&detail),
+                detail,
+                output: None,
+                action: restart_action(card, lsp).map(|message| StatusAction {
+                    label: "Retry",
+                    name: format!("Retry starting {name}"),
+                    message,
+                }),
+            });
+        }
+        Some(LspStatus::Unavailable { reason }) => {
+            let detail = code_runs(reason);
+            let reason = sentence(&plain(&detail));
+            lines.push(StatusLine {
+                tone: StatusTone::Warning,
+                // What to do about it follows in the detail, rather than
+                // fading out of a narrow line.
+                summary: first_sentence(&reason).to_owned(),
+                reason,
+                detail,
+                output: None,
+                action: restart_action(card, lsp).map(|message| StatusAction {
+                    label: "Retry",
+                    name: "Retry starting the language server".into(),
+                    message,
+                }),
+            });
+        }
+        Some(LspStatus::Failed {
+            server,
+            reason,
+            stderr_tail,
+        }) => {
+            let name = crate::settings::language_server_name(server);
+            let detail = code_runs(reason);
+            lines.push(StatusLine {
+                tone: StatusTone::Error,
+                // Which server stopped fits a narrow line; why is the
+                // tooltip and the detail, rather than a fading tail.
+                summary: format!("{name} stopped"),
+                reason: sentence(&plain(&detail)),
+                detail,
+                // The tail is the only evidence of why the session died, so
+                // it stays a click away rather than being swallowed.
+                output: Some(stderr_tail.clone()),
+                action: restart_action(card, lsp).map(|message| StatusAction {
+                    label: "Restart",
+                    name: format!("Restart {name}"),
+                    message,
+                }),
+            });
+        }
+        // Progress, when the server reports any, says more than "starting".
+        Some(LspStatus::Starting) if progress.is_none() => lines.push(StatusLine {
+            tone: StatusTone::Busy,
+            summary: "Starting language server".into(),
+            reason: "Starting language server".into(),
+            detail: Vec::new(),
+            output: None,
+            action: None,
+        }),
+        Some(LspStatus::Starting | LspStatus::Ready | LspStatus::Disabled) | None => {}
     }
-    if let Some(restart) = restart_action(card, lsp) {
-        rows.push(
-            SegmentedActions::new(vec![Action::new(
-                "Restart language server",
-                Icon::Refresh,
-                restart,
-            )])
-            .view(),
-        );
-    }
-    match diagnostics_section(card, &lsp.diagnostics) {
-        Some(section) => rows.extend(section.facts.into_iter().map(fact_element)),
-        None if healthy => rows.push(
-            design::caption(match lsp.status {
-                Some(LspStatus::Starting) => "The language server is starting.",
-                _ => "No problems reported in this file.",
-            })
-            .into(),
-        ),
+    match &lsp.notice {
+        Some(LspNotice::Progress(text)) => lines.push(StatusLine {
+            tone: StatusTone::Busy,
+            summary: text.clone(),
+            reason: text.clone(),
+            detail: Vec::new(),
+            output: None,
+            action: None,
+        }),
+        Some(LspNotice::Failure(text)) => {
+            let detail = code_runs(text);
+            let reason = sentence(&plain(&detail));
+            lines.push(StatusLine {
+                tone: StatusTone::Warning,
+                summary: reason.clone(),
+                reason,
+                detail,
+                output: None,
+                // Dismissing it is the section header's control.
+                action: None,
+            });
+        }
         None => {}
     }
+    lines
+}
+
+/// Whether the Problems section ends with its empty state: a running server
+/// that reports nothing for this file and is not busy.
+fn says_no_problems(lsp: &LspInspectorContext) -> bool {
+    lsp.diagnostics.is_empty()
+        && matches!(lsp.status, Some(LspStatus::Ready))
+        && !matches!(lsp.notice, Some(LspNotice::Progress(_)))
+}
+
+/// The height the Problems body takes when it holds only status lines, in an
+/// inspector `width` wide; `None` when it lists diagnostics and takes a
+/// share of the panel to scroll in.
+///
+/// Unfolded details are estimated rather than measured, so unfolding a line
+/// grows the section by about what it reveals instead of flipping it to a
+/// share of the panel; the shell caps the result and the body scrolls past
+/// it.
+pub fn problems_status_height(card: CardId, lsp: &LspInspectorContext, width: f32) -> Option<f32> {
+    if !lsp.diagnostics.is_empty() {
+        return None;
+    }
+    let lines = status_lines(card, lsp);
+    let rows = lines.len() + usize::from(says_no_problems(lsp));
+    let details: f32 = if lsp.details_open {
+        lines
+            .iter()
+            .filter(|line| line.unfolds())
+            .map(|line| details_height(line, width))
+            .sum()
+    } else {
+        0.0
+    };
+    Some(rows as f32 * design::DENSE_ROW_HEIGHT + details + 2.0 * space::XS)
+}
+
+/// About how tall `line`'s unfolded details stand in an inspector `width`
+/// wide: each paragraph's caption lines at an average glyph width, the gaps
+/// between them, and the space beneath.
+fn details_height(line: &StatusLine, width: f32) -> f32 {
+    /// A caption glyph's average advance, proportional or monospace.
+    const GLYPH_WIDTH: f32 = 0.55 * design::TEXT_CAPTION;
+    let columns = ((width - 2.0 * space::M - SUMMARY_INSET) / GLYPH_WIDTH)
+        .floor()
+        .max(1.0) as usize;
+    let wrapped = |text: &str| text.chars().count().div_ceil(columns).max(1);
+    let mut paragraphs = Vec::with_capacity(2);
+    if !line.detail.is_empty() {
+        paragraphs.push(wrapped(&plain(&line.detail)));
+    }
+    if let Some(output) = &line.output {
+        paragraphs.push(
+            output
+                .iter()
+                .map(|text| wrapped(text))
+                .sum::<usize>()
+                .max(1),
+        );
+    }
+    let lines: usize = paragraphs.iter().sum();
+    lines as f32 * design::LINE_CAPTION
+        + paragraphs.len().saturating_sub(1) as f32 * space::XS
+        + space::XS
+}
+
+/// The focused editor's diagnostics in file order, after a line for each
+/// thing standing between the user and them: a server that is missing,
+/// stopped or starting, and a failed request.
+pub fn problems_view(card: CardId, lsp: &LspInspectorContext) -> Element<'static, InspectorAction> {
+    // The status lines sit flush, one row each, so a section holding only
+    // them is exactly as tall as `problems_status_height` says.
+    let mut status: Vec<Element<'static, InspectorAction>> = status_lines(card, lsp)
+        .into_iter()
+        .map(|line| status_line_view(card, line, lsp.details_open))
+        .collect();
+    if says_no_problems(lsp) {
+        status.push(
+            widget::container(
+                design::caption("No problems reported in this file.")
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+            )
+            // In line with the status lines' text, past their glyphs.
+            .padding(cosmic::iced::Padding::ZERO.left(SUMMARY_INSET))
+            .center_y(design::DENSE_ROW_HEIGHT)
+            .into(),
+        );
+    }
+    let mut rows = Vec::with_capacity(1 + lsp.diagnostics.len().min(LSP_ROW_LIMIT + 1));
+    if !status.is_empty() {
+        rows.push(
+            widget::column::with_children(status)
+                .width(Length::Fill)
+                .into(),
+        );
+    }
+    if let Some(section) = diagnostics_section(card, &lsp.diagnostics) {
+        rows.extend(section.facts.into_iter().map(fact_element));
+    }
     section_scroll(rows)
+}
+
+impl Run {
+    fn words(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            code: false,
+        }
+    }
+
+    fn code(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            code: true,
+        }
+    }
+}
+
+impl StatusLine {
+    /// Whether pressing the line unfolds anything: a detail or the server's
+    /// output.
+    pub fn unfolds(&self) -> bool {
+        !self.detail.is_empty() || self.output.is_some()
+    }
+}
+
+/// `text` split at its backticks, which language-server reasons use to quote
+/// a program or path. An unpaired backtick is kept as written.
+fn code_runs(text: &str) -> Vec<Run> {
+    let mut runs = Vec::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('`') {
+        let Some(close) = rest[open + 1..].find('`') else {
+            break;
+        };
+        if open > 0 {
+            runs.push(Run::words(&rest[..open]));
+        }
+        runs.push(Run::code(&rest[open + 1..open + 1 + close]));
+        rest = &rest[open + 1 + close + 1..];
+    }
+    if !rest.is_empty() {
+        runs.push(Run::words(rest));
+    }
+    runs
+}
+
+/// The runs' text without their marking.
+fn plain(runs: &[Run]) -> String {
+    runs.iter().map(|run| run.text.as_str()).collect()
+}
+
+/// `text` up to the end of its first sentence, without the full stop.
+fn first_sentence(text: &str) -> &str {
+    text.split_once(". ").map_or(text, |(first, _)| first)
+}
+
+/// A reason fragment, such as "the server exited", as a line of its own.
+fn sentence(fragment: &str) -> String {
+    let mut chars = fragment.chars();
+    match chars.next() {
+        Some(first) if first.is_lowercase() => first.to_uppercase().chain(chars).collect(),
+        _ => fragment.to_owned(),
+    }
+}
+
+/// Where a status line's summary starts: past the line's padding, its glyph
+/// and the gap after it.
+const SUMMARY_INSET: f32 = space::XS + design::COMPACT_ICON_SIZE as f32 + space::XS;
+
+fn status_line_view(
+    card: CardId,
+    line: StatusLine,
+    open: bool,
+) -> Element<'static, InspectorAction> {
+    let glyph: Element<'static, InspectorAction> = match line.tone {
+        StatusTone::Busy => crate::ui_controls::activity_spinner(
+            f32::from(design::COMPACT_ICON_SIZE),
+            design::muted_icon_color,
+        ),
+        StatusTone::Warning => toned_glyph(Icon::Warning, design::warning_color),
+        StatusTone::Error => toned_glyph(Icon::Error, design::destructive_color),
+    };
+    let unfolds = line.unfolds();
+    let mut lead = vec![
+        glyph,
+        crate::ui_controls::FadeText::caption(line.summary.clone())
+            .width(Length::Fill)
+            .into(),
+    ];
+    if unfolds {
+        // Says the line opens, rather than leaving it to a hover.
+        lead.push(toned_glyph(
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            design::muted_icon_color,
+        ));
+    }
+    let lead = widget::row::with_children(lead)
+        .spacing(space::XS)
+        .align_y(cosmic::iced::Alignment::Center)
+        .width(Length::Fill);
+    let lead: Element<'static, InspectorAction> = if unfolds {
+        let mut button = widget::button::custom(widget::container(lead).center_y(Length::Fill))
+            .name(format!(
+                "{}, {}",
+                line.summary,
+                if open { "hide details" } else { "show details" }
+            ))
+            .class(crate::ui_controls::button::quiet_class())
+            .padding([0.0, space::XS])
+            .width(Length::Fill)
+            .height(design::DENSE_ROW_HEIGHT)
+            .on_press(InspectorAction::ToggleLanguageServerDetails(card));
+        if line.reason != line.summary {
+            button = button.description(line.reason.clone());
+        }
+        crate::interaction::hover(button)
+    } else {
+        widget::container(lead)
+            .padding([0.0, space::XS])
+            .center_y(design::DENSE_ROW_HEIGHT)
+            .width(Length::Fill)
+            .into()
+    };
+    let mut row = vec![crate::interaction::tooltip(lead, line.reason.clone())];
+    if let Some(action) = line.action {
+        row.push(
+            crate::ui_controls::button::quiet(action.label)
+                .name(action.name)
+                .on_press(action.message)
+                .into(),
+        );
+    }
+    let row: Element<'static, InspectorAction> = widget::row::with_children(row)
+        .spacing(space::XXS)
+        .align_y(cosmic::iced::Alignment::Center)
+        .width(Length::Fill)
+        .into();
+    if !(open && unfolds) {
+        return row;
+    }
+    let mut details = Vec::with_capacity(2);
+    if !line.detail.is_empty() {
+        details.push(runs_view(&line.detail));
+    }
+    if let Some(output) = line.output {
+        details.push(if output.is_empty() {
+            design::caption("The server wrote nothing to standard error.")
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .into()
+        } else {
+            widget::selectable_text(output.join("\n"))
+                .size(design::TEXT_CAPTION)
+                .font(cosmic::iced::Font::MONOSPACE)
+                .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+                .width(Length::Fill)
+                .into()
+        });
+    }
+    widget::column::with_children(vec![
+        row,
+        widget::container(
+            widget::column::with_children(details)
+                .spacing(space::XS)
+                .width(Length::Fill),
+        )
+        // Under the summary, past its glyph.
+        .padding(
+            cosmic::iced::Padding::ZERO
+                .left(SUMMARY_INSET)
+                .bottom(space::XS),
+        )
+        .width(Length::Fill)
+        .into(),
+    ])
+    .width(Length::Fill)
+    .into()
+}
+
+fn toned_glyph(
+    icon: Icon,
+    tone: fn(&Theme) -> cosmic::iced::Color,
+) -> Element<'static, InspectorAction> {
+    widget::icon(icon.handle())
+        .size(design::COMPACT_ICON_SIZE)
+        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {
+            cosmic::iced::widget::svg::Style {
+                color: Some(tone(theme)),
+            }
+        })))
+        .into()
+}
+
+/// `runs` as one wrapping paragraph, its code in monospace.
+fn runs_view(runs: &[Run]) -> Element<'static, InspectorAction> {
+    let size = design::TEXT_CAPTION;
+    let spans: Vec<cosmic::iced::widget::text::Span<'static, ()>> = runs
+        .iter()
+        .map(|run| {
+            let span = cosmic::iced::widget::text::Span::new(run.text.clone());
+            if run.code {
+                span.font(cosmic::iced::Font::MONOSPACE)
+                    .size(size * design::INLINE_CODE_RELATIVE_SIZE)
+            } else {
+                span
+            }
+        })
+        .collect();
+    cosmic::iced::widget::rich_text(spans)
+        .size(size)
+        .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+            design::LINE_CAPTION.into(),
+        ))
+        .wrapping(cosmic::iced::widget::text::Wrapping::WordOrGlyph)
+        .width(Length::Fill)
+        .into()
 }
 
 /// The recovery the Problems section offers when the focused editor's
@@ -602,46 +1082,6 @@ fn section_scroll(
     crate::interaction::overflow_fade_y(scroll, crate::design::base)
 }
 
-fn language_server_section(status: Option<&LspStatus>, notice: Option<&str>) -> Option<Section> {
-    if status.is_none() && notice.is_none() {
-        return None;
-    }
-    let mut facts = Vec::new();
-    if let Some(status) = status {
-        facts.push(Fact::new("Status", lsp_status_label(status)));
-        match status {
-            // Not configuring a server for a file type is a statement about the
-            // settings, not a failure of anything.
-            LspStatus::Disabled => facts.push(Fact::new(
-                "Detail",
-                "No language server is configured for this file type.",
-            )),
-            LspStatus::Unavailable { reason } => facts.push(Fact::new("Reason", reason)),
-            LspStatus::Failed {
-                reason,
-                stderr_tail,
-            } => {
-                facts.push(Fact::new("Reason", reason));
-                // The tail is the only evidence of why the session died, so it
-                // is presented rather than swallowed.
-                facts.push(Fact::new(
-                    "Server output",
-                    if stderr_tail.is_empty() {
-                        "The server wrote nothing to standard error.".to_owned()
-                    } else {
-                        stderr_tail.join("\n")
-                    },
-                ));
-            }
-            LspStatus::Starting | LspStatus::Ready => {}
-        }
-    }
-    if let Some(notice) = notice {
-        facts.push(Fact::new("Notice", notice));
-    }
-    Some(Section::new("Language server", facts))
-}
-
 fn diagnostics_section(card: CardId, diagnostics: &[LspDiagnostic]) -> Option<Section> {
     if diagnostics.is_empty() {
         return None;
@@ -683,16 +1123,6 @@ fn locations_section(card: CardId, kind: LocationKind, locations: &[LspLocation]
         facts.push(withheld_fact(withheld, "location", "locations"));
     }
     Section::new(locations_title(kind), facts)
-}
-
-fn lsp_status_label(status: &LspStatus) -> &'static str {
-    match status {
-        LspStatus::Disabled => "Not configured",
-        LspStatus::Unavailable { .. } => "Unavailable",
-        LspStatus::Starting => "Starting",
-        LspStatus::Ready => "Ready",
-        LspStatus::Failed { .. } => "Failed",
-    }
 }
 
 fn severity_label(severity: LspSeverity) -> &'static str {
@@ -795,48 +1225,6 @@ impl<'a, Message: 'a> InspectorSection<'a, Message> {
         children.extend(self.content);
         widget::column::with_children(children)
             .spacing(space::S)
-            .width(Length::Fill)
-            .into()
-    }
-}
-
-/// Compact full-width action group for an inspector footer.
-pub struct SegmentedActions {
-    actions: Vec<Action>,
-}
-
-impl SegmentedActions {
-    pub fn new(actions: Vec<Action>) -> Self {
-        Self { actions }
-    }
-
-    pub fn view(self) -> Element<'static, InspectorAction> {
-        let buttons: Vec<Element<'static, InspectorAction>> = self
-            .actions
-            .into_iter()
-            .map(|action| -> Element<'static, InspectorAction> {
-                // Deliberately unidentified. A `widget::Id::new(string)` makes
-                // the node *named*, and `UserInterface::build` empties every
-                // named node's state into a thread-local map, restoring it
-                // only for the names the next frame still asks for. Children
-                // are then claimed by name in place and never repositioned, so
-                // an action that goes away leaves its emptied node behind at
-                // its old index for whichever button now occupies that slot to
-                // draw against - and drawing a button against stateless state
-                // aborts the process. This list's membership changes with
-                // every editor and diff transition, nothing focuses these
-                // buttons by id, and their accessible names come from their
-                // labels, so the identity buys nothing and costs a crash.
-                widget::button::standard(action.label)
-                    .leading_icon(action.icon)
-                    .class(crate::sidebar::sidebar_button_style(false))
-                    .width(Length::Fill)
-                    .on_press(action.message)
-                    .into()
-            })
-            .collect();
-        widget::column::with_children(buttons)
-            .spacing(space::XS)
             .width(Length::Fill)
             .into()
     }
@@ -1191,9 +1579,8 @@ mod tests {
 
     /// The section a Problems or Locations pane draws `title` from.
     fn lsp_section(card: CardId, lsp: &LspInspectorContext, title: &str) -> Section {
-        language_server_section(lsp.status.as_ref(), lsp.notice.as_deref())
+        diagnostics_section(card, &lsp.diagnostics)
             .into_iter()
-            .chain(diagnostics_section(card, &lsp.diagnostics))
             .chain(
                 lsp.locations
                     .as_ref()
@@ -1218,6 +1605,7 @@ mod tests {
         }
         assert!(has_problems(&LspInspectorContext {
             status: Some(LspStatus::Failed {
+                server: "rust-analyzer".into(),
                 reason: "exited".into(),
                 stderr_tail: Vec::new(),
             }),
@@ -1301,64 +1689,258 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_disabled_server_offers_no_restart_while_a_failed_one_does() {
-        let card = CardId::new();
-        let disabled = LspInspectorContext {
-            status: Some(LspStatus::Disabled),
+    fn with_status(status: LspStatus) -> LspInspectorContext {
+        LspInspectorContext {
+            status: Some(status),
             ..LspInspectorContext::default()
-        };
-        assert_eq!(
-            restart_action(card, &disabled),
-            None,
-            "a file type with no configured server offered Restart"
-        );
-        let section = lsp_section(card, &disabled, "Language server");
-        let facts = &section.facts;
-        assert_eq!(facts[0].value, "Not configured");
-        assert!(
-            facts
-                .iter()
-                .any(|fact| fact.value.contains("No language server is configured")),
-            "Disabled must read as a plain statement: {facts:?}"
-        );
+        }
+    }
 
-        let failed = LspInspectorContext {
-            status: Some(LspStatus::Failed {
-                reason: "exited".into(),
-                stderr_tail: Vec::new(),
-            }),
-            ..LspInspectorContext::default()
+    fn typescript_missing() -> LspInspectorContext {
+        with_status(LspStatus::Missing {
+            server: "typescript-language-server".into(),
+            program: "typescript-language-server".into(),
+        })
+    }
+
+    #[test]
+    fn a_missing_server_is_one_line_naming_it_with_only_retry() {
+        let card = CardId::new();
+        let lsp = typescript_missing();
+        assert!(has_problems(&lsp));
+        let lines = status_lines(card, &lsp);
+        let [line] = lines.as_slice() else {
+            panic!("one fact deserves one line: {lines:?}");
         };
+        assert_eq!(line.tone, StatusTone::Warning);
+        // Not "isn't installed": it may be, just not on the app's PATH.
+        assert_eq!(line.summary, "TypeScript language server not found");
+        // The executable is code, never a pair of raw backticks.
         assert_eq!(
-            restart_action(card, &failed),
-            Some(InspectorAction::RestartLanguageServer(card)),
-            "a failed server hid Restart"
+            line.detail,
+            vec![
+                Run::code("typescript-language-server"),
+                Run::words(" wasn't found on PATH. Install it, or set its full path in "),
+                Run::code("settings.toml"),
+                Run::words(", then choose Retry."),
+            ]
+        );
+        assert!(!line.reason.contains('`'), "{}", line.reason);
+        assert!(
+            line.reason
+                .starts_with("typescript-language-server wasn't found")
+        );
+        // Restarting can't install anything; retrying after installing can.
+        let action = line.action.as_ref().expect("Retry");
+        assert_eq!(action.label, "Retry");
+        assert_eq!(action.message, InspectorAction::RestartLanguageServer(card));
+        assert!(action.name.contains("TypeScript language server"));
+        // A server this app doesn't know by name is called by its identifier.
+        let custom = with_status(LspStatus::Missing {
+            server: "zls".into(),
+            program: "zls".into(),
+        });
+        assert_eq!(status_lines(card, &custom)[0].summary, "zls not found");
+    }
+
+    #[test]
+    fn a_status_only_section_is_as_tall_as_its_lines_and_what_they_unfold() {
+        const WIDTH: f32 = 360.0;
+        let card = CardId::new();
+        let mut lsp = typescript_missing();
+        let one_line = design::DENSE_ROW_HEIGHT + 2.0 * space::XS;
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), Some(one_line));
+        // A failed request under it is a second line, not a second section.
+        lsp.notice = Some(LspNotice::Failure("hover request failed".into()));
+        let two_lines = one_line + design::DENSE_ROW_HEIGHT;
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), Some(two_lines));
+        // Unfolding grows the section by about what it reveals, rather than
+        // flipping it to a share of the panel that moves everything above.
+        lsp.details_open = true;
+        let open = problems_status_height(card, &lsp, WIDTH).expect("still fitted");
+        assert!(
+            open > two_lines + 2.0 * design::LINE_CAPTION
+                && open < two_lines + 8.0 * design::LINE_CAPTION,
+            "{open}"
+        );
+        // A narrower inspector wraps the same words onto more lines.
+        assert!(problems_status_height(card, &lsp, 240.0).unwrap() > open);
+        // Diagnostics scroll in a share of the panel.
+        lsp.details_open = false;
+        lsp.diagnostics = vec![diagnostic(0, LspSeverity::Error, "e")];
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), None);
+        let _view = problems_view(card, &lsp);
+    }
+
+    #[test]
+    fn unfolded_details_fold_when_the_server_changes_state() {
+        let mut lsp = typescript_missing();
+        lsp.details_open = true;
+        // The same kind of state, such as a fresh stderr tail, keeps them.
+        lsp.set_status(LspStatus::Missing {
+            server: "typescript-language-server".into(),
+            program: "typescript-language-server".into(),
+        });
+        assert!(lsp.details_open);
+        lsp.set_status(LspStatus::Ready);
+        assert!(!lsp.details_open);
+        lsp.details_open = true;
+        lsp.set_status(LspStatus::Failed {
+            server: "typescript-language-server".into(),
+            reason: "exited".into(),
+            stderr_tail: Vec::new(),
+        });
+        assert!(!lsp.details_open);
+    }
+
+    #[test]
+    fn a_failed_server_is_one_line_with_restart_and_keeps_its_output() {
+        let card = CardId::new();
+        let lsp = with_status(LspStatus::Failed {
+            server: "typescript-language-server".into(),
+            reason: "`tsserver` exited: initialize failed".into(),
+            stderr_tail: vec!["thread panicked".into(), "at src/main.rs:1".into()],
+        });
+        let lines = status_lines(card, &lsp);
+        let [line] = lines.as_slice() else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(line.tone, StatusTone::Error);
+        // Which server stopped fits a narrow line; why is the tooltip and
+        // the detail, not a tail fading after a second colon.
+        assert_eq!(line.summary, "TypeScript language server stopped");
+        assert_eq!(line.reason, "Tsserver exited: initialize failed");
+        assert_eq!(
+            line.detail,
+            vec![
+                Run::code("tsserver"),
+                Run::words(" exited: initialize failed")
+            ]
+        );
+        // The tail is the only evidence of why the session died.
+        assert_eq!(
+            line.output.as_deref(),
+            Some(["thread panicked".to_owned(), "at src/main.rs:1".to_owned()].as_slice())
+        );
+        assert!(line.unfolds());
+        assert_eq!(
+            line.action.as_ref().map(|action| action.label),
+            Some("Restart")
+        );
+        assert_eq!(
+            restart_action(card, &lsp),
+            Some(InspectorAction::RestartLanguageServer(card))
+        );
+        for open in [false, true] {
+            let _view = problems_view(
+                card,
+                &LspInspectorContext {
+                    details_open: open,
+                    ..lsp.clone()
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn starting_and_progress_are_one_busy_line_without_an_empty_state() {
+        let card = CardId::new();
+        let starting = with_status(LspStatus::Starting);
+        let lines = status_lines(card, &starting);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tone, StatusTone::Busy);
+        assert_eq!(lines[0].action, None);
+        assert!(!lines[0].unfolds());
+
+        // Progress says more than "starting", so it replaces that line, and
+        // "no problems" would be premature while the server is working.
+        for status in [LspStatus::Starting, LspStatus::Ready] {
+            let lsp = LspInspectorContext {
+                notice: Some(LspNotice::Progress("Indexing (40%)".into())),
+                ..with_status(status)
+            };
+            let lines = status_lines(card, &lsp);
+            assert_eq!(lines.len(), 1, "{lines:?}");
+            assert_eq!(lines[0].summary, "Indexing (40%)");
+            assert!(!says_no_problems(&lsp));
+        }
+    }
+
+    #[test]
+    fn a_retry_keeps_the_section_with_a_spinner_until_the_server_settles() {
+        let card = CardId::new();
+        let mut lsp = typescript_missing();
+        // What the application does when the user presses Retry.
+        lsp.restarting = true;
+        lsp.set_status(LspStatus::Starting);
+        assert!(has_problems(&lsp), "the section vanished while retrying");
+        let lines = status_lines(card, &lsp);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tone, StatusTone::Busy);
+        // Still missing: the line comes back where it was.
+        lsp.set_status(typescript_missing().status.unwrap());
+        assert!(!lsp.restarting);
+        assert!(has_problems(&lsp));
+        // Running: an ordinary later start draws no section.
+        lsp.set_status(LspStatus::Ready);
+        lsp.set_status(LspStatus::Starting);
+        assert!(!has_problems(&lsp));
+    }
+
+    #[test]
+    fn an_unusable_server_line_leads_with_its_first_sentence() {
+        let card = CardId::new();
+        let lsp = with_status(LspStatus::Unavailable {
+            reason: "This file is already open for language tools in another pane. Close it there, then choose Retry here.".into(),
+        });
+        let line = &status_lines(card, &lsp)[0];
+        assert_eq!(
+            line.summary,
+            "This file is already open for language tools in another pane"
+        );
+        assert!(
+            line.reason.ends_with("choose Retry here."),
+            "{}",
+            line.reason
+        );
+        assert_eq!(
+            line.action.as_ref().map(|action| action.label),
+            Some("Retry")
         );
     }
 
     #[test]
-    fn a_failed_server_presents_its_stderr_tail_as_evidence() {
-        let lsp = LspInspectorContext {
-            status: Some(LspStatus::Failed {
-                reason: "initialize failed".into(),
-                stderr_tail: vec!["thread panicked".into(), "at src/main.rs:1".into()],
-            }),
-            ..LspInspectorContext::default()
-        };
-        let section = lsp_section(CardId::new(), &lsp, "Language server");
-        let facts = &section.facts;
+    fn a_running_server_draws_nothing_but_its_empty_state() {
+        let card = CardId::new();
+        let ready = with_status(LspStatus::Ready);
+        assert!(status_lines(card, &ready).is_empty());
+        assert!(says_no_problems(&ready));
+        assert!(!says_no_problems(&LspInspectorContext {
+            diagnostics: vec![diagnostic(0, LspSeverity::Hint, "h")],
+            ..ready.clone()
+        }));
+        // An unconfigured file type has no restart, line or empty state.
+        let disabled = with_status(LspStatus::Disabled);
+        assert_eq!(restart_action(card, &disabled), None);
+        assert!(status_lines(card, &disabled).is_empty());
+        assert!(!says_no_problems(&disabled));
+    }
 
-        assert!(
-            facts.iter().any(|fact| fact.value == "initialize failed"),
-            "the failure reason was swallowed: {facts:?}"
+    #[test]
+    fn reasons_lose_their_backticks_to_code_runs() {
+        assert_eq!(
+            code_runs("`a` and `b c`"),
+            vec![Run::code("a"), Run::words(" and "), Run::code("b c")]
         );
-        let tail = facts
-            .iter()
-            .find(|fact| fact.label == "Server output")
-            .unwrap_or_else(|| panic!("no server output in {facts:?}"));
-        assert!(tail.value.contains("thread panicked"), "{}", tail.value);
-        assert!(tail.value.contains("at src/main.rs:1"), "{}", tail.value);
+        assert_eq!(code_runs("plain"), vec![Run::words("plain")]);
+        // An unpaired backtick is the server's text, kept as written.
+        assert_eq!(
+            code_runs("`a` and ` stray"),
+            vec![Run::code("a"), Run::words(" and ` stray")]
+        );
+        assert_eq!(code_runs(""), Vec::<Run>::new());
+        assert_eq!(sentence("the server exited"), "The server exited");
+        assert_eq!(sentence("éclair"), "Éclair");
     }
 
     #[test]
@@ -1560,20 +2142,19 @@ mod tests {
     }
 
     #[test]
-    fn a_notice_reads_as_a_plain_statement() {
+    fn a_failed_request_is_a_warning_line_the_header_dismisses() {
         let lsp = LspInspectorContext {
-            notice: Some("hover request cancelled".into()),
+            notice: Some(LspNotice::Failure("hover request failed".into())),
             ..LspInspectorContext::default()
         };
         assert!(
             has_problems(&lsp),
             "a notice must reach the Problems section"
         );
-        let section = lsp_section(CardId::new(), &lsp, "Language server");
-        let facts = &section.facts;
-
-        assert_eq!(facts[0].label, "Notice");
-        assert_eq!(facts[0].value, "hover request cancelled");
-        assert_eq!(facts[0].action, None);
+        let lines = status_lines(CardId::new(), &lsp);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0].tone, StatusTone::Warning);
+        assert_eq!(lines[0].summary, "Hover request failed");
+        assert_eq!(lines[0].action, None);
     }
 }

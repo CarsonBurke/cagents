@@ -4065,7 +4065,7 @@ fn initialization_options_reach_the_server_before_document_open() {
 }
 
 #[test]
-fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
+fn a_missing_executable_reports_missing_and_leaves_editing_working() {
     block_on(async {
         let (_guard, worktree, file) = workspace();
         // The real launcher runs here: nothing with this name can exist.
@@ -4090,18 +4090,20 @@ fn a_missing_executable_reports_unavailable_and_leaves_editing_working() {
             LspEvent::Status {
                 doc: at, status, ..
             } if *at == doc => match status {
-                LspStatus::Unavailable { .. } => Some(status.clone()),
+                LspStatus::Missing { .. } | LspStatus::Unavailable { .. } => Some(status.clone()),
                 _ => None,
             },
             _ => None,
         })
         .await;
-        let LspStatus::Unavailable { reason } = &status else {
-            panic!("expected Unavailable, got {status:?}");
-        };
-        assert!(
-            reason.contains("cagents-no-such-language-server"),
-            "the reason must name the executable: {reason}"
+        // Structured, so the editor can say the server isn't installed and
+        // offer Retry rather than presenting a failure to restart.
+        assert_eq!(
+            status,
+            LspStatus::Missing {
+                server: "rust-analyzer".to_owned(),
+                program: "cagents-no-such-language-server".to_owned(),
+            }
         );
         assert!(status.can_restart());
         manager.change(doc, 2, &[], "abcd\n");
@@ -4149,7 +4151,9 @@ fn a_bare_program_never_resolves_against_the_directory_the_child_will_run_in() {
     let path = OsString::from(format!("{}:", decoy.path().display()));
     assert_eq!(
         resolve_program_in("cagents-server", Some(path.as_os_str()), home.path()),
-        Err("`cagents-server` was not found on PATH".to_owned()),
+        Err(LaunchError::Missing {
+            program: "cagents-server".to_owned()
+        }),
         "neither a non-executable match nor the worktree may satisfy the lookup"
     );
 
