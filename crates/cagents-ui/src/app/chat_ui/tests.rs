@@ -25989,28 +25989,39 @@ fn an_untouched_draft_moves_off_a_provider_found_missing() {
         &app.card_state(card).unwrap().kind,
         CardKind::Chat(session) if session.launch.provider == Provider::Claude
     ));
+}
 
-    // Another window showing the same draft adopts the move the same way,
-    // and finds nothing more to move.
+#[test]
+fn shared_draft_keeps_its_provider_when_the_blank_window_discovers_it_missing() {
+    let mut host = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut host, Provider::Codex);
+    host.shared_views.attached.insert(card);
+    let session = chat_runtime(&host, card).session.clone();
+
     let mut peer = crate::app::tests::context_inspector_test_app(false);
     let peer_card = draft_chat_for_provider(&mut peer, Provider::Codex);
-    let original = {
-        let Some(CardRuntime::Chat(runtime)) = peer.cards.get_mut(&peer_card) else {
-            unreachable!()
-        };
-        runtime.session.id = id;
-        runtime.session.clone()
-    };
-    assert_eq!(original.launch.provider, Provider::Codex);
-    peer.account_ui.set_cli_for_test(Provider::Codex, false);
-    peer.account_ui.set_cli_for_test(Provider::Claude, true);
-    let moved = chat_runtime(&app, card).session.clone();
-    drop(peer.adopt_shared_draft_session(peer_card, &moved));
-    drop(peer.move_drafts_off_missing_providers());
-    let runtime = chat_runtime(&peer, peer_card);
-    assert_eq!(runtime.session, moved);
-    assert!(!runtime.draft_model_chosen);
-    assert!(peer.draft_provider_note(peer_card).is_none());
+    peer.shared_views.attached.insert(peer_card);
+    drop(peer.open_chat_draft(peer_card, session.clone()));
+    let target = chat_runtime(&peer, peer_card).target;
+    drop(peer.handle_chat_ui(Action::Composer(
+        target,
+        text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+    )));
+
+    // The window receiving discovery has no way to read the peer's composer.
+    assert!(host.chat_is_unused(card));
+    assert!(!peer.chat_is_unused(peer_card));
+    host.account_ui.set_cli_for_test(Provider::Codex, false);
+    host.account_ui.set_cli_for_test(Provider::Claude, true);
+    host.settle_discovery_for_test();
+    assert_eq!(chat_runtime(&host, card).session, session);
+    assert_eq!(chat_runtime(&peer, peer_card).session, session);
+    assert_eq!(
+        host.draft_provider_note(card).as_deref(),
+        Some(
+            "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there."
+        )
+    );
 }
 
 /// A draft with something in it, or a model picked, keeps its provider when
@@ -26071,8 +26082,8 @@ fn a_touched_draft_on_a_missing_provider_says_so_and_stays() {
 }
 
 /// A draft opened on a provider Accounts already found missing, as one
-/// restored from a saved session or opened from another window's view,
-/// moves once it is open if untouched; one with a model chosen stays
+/// restored from a private saved session, moves once it is open if
+/// untouched. One with a model chosen stays
 /// (#4413).
 #[test]
 fn a_draft_opened_on_a_missing_provider_moves_once_open() {

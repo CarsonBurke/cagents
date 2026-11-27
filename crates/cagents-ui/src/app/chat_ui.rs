@@ -10012,13 +10012,9 @@ impl Cagents {
             .find(|provider| provider.has_native_chat() && self.chat_provider_available(*provider))
     }
 
-    /// Moves every untouched draft whose provider Accounts now finds missing
-    /// where this window's conversations run to the provider a new
-    /// conversation would start on, as if it had been opened there (#4413).
-    /// The provider is chosen alike in every window, so a shared draft moves
-    /// the same way in each, whichever moves it first; the others adopt that
-    /// move from the shared view. A draft kept on its provider says, at its
-    /// composer, that it isn't installed: see `draft_provider_note`.
+    /// Moves untouched private drafts off providers Accounts now finds missing.
+    /// Shared drafts keep their provider because another window may have
+    /// unsent work. Their composers offer a model change instead (#4507).
     pub(super) fn move_drafts_off_missing_providers(&mut self) -> Task<Message> {
         let drafts = self
             .cards
@@ -10035,10 +10031,8 @@ impl Cagents {
         )
     }
 
-    /// Moves draft `card` off its provider when Accounts finds that
-    /// provider's CLI missing and the draft is untouched: nothing typed or
-    /// attached, no model picked in this window or another, and no start
-    /// under way.
+    /// Moves a private draft whose CLI is missing if the window can establish
+    /// that it has no text, attachments, explicit model choice, or pending start.
     fn move_draft_off_missing_provider(&mut self, card: CardId) -> Task<Message> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
@@ -10048,6 +10042,7 @@ impl Cagents {
             || draft_choice::get(&runtime.session).is_some()
             || !self.account_ui.cli_missing(provider)
             || !self.chat_is_unused(card)
+            || self.pane_is_shared(card)
         {
             return Task::none();
         }
@@ -10953,8 +10948,8 @@ impl Cagents {
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
-        // A draft restored or adopted on a provider Accounts already found
-        // missing moves once whatever opened it has finished (#4413).
+        // An untouched private draft restored on a provider Accounts
+        // already found missing can move once it has opened (#4413).
         let moved = if self.account_ui.cli_missing(provider) {
             Task::done(cosmic::Action::App(Message::ChatUi(
                 Action::MoveDraftOffMissingProvider(target),
