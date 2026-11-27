@@ -2158,13 +2158,27 @@ fn open_device_window(name: &str, target: Target) -> Result<(), OpenFailure> {
 /// what it needs from this computer, when that is the cause. Opening a
 /// device window, a switch and a window reopening on its device all ask this.
 pub(super) fn diagnose(name: &str, reason: Option<&str>) -> OpenFailure {
-    let json = |arguments: &[&str]| cli_json(arguments);
+    diagnose_with(name, reason, cli_json)
+}
+
+/// [`diagnose`], asking the CLI through `json`.
+fn diagnose_with(
+    name: &str,
+    reason: Option<&str>,
+    json: impl Fn(&[&str]) -> std::io::Result<(bool, String)>,
+) -> OpenFailure {
     let failed = || {
         reason.map_or_else(
             || format!("Could not connect to {name}. Check its SSH connection and cagents daemon."),
             sentence,
         )
     };
+    // SSH could not connect at all: the checks below would each wait out
+    // the same connection, only to say nothing more.
+    // It starts with the device's name, kept as the person wrote it.
+    if let Some(reason) = reason.filter(|reason| crate::device::reads_as_unreachable(reason)) {
+        return OpenFailure::Other(reason.to_owned());
+    }
     // The update's own inspection tells what the device lacks, a missing
     // install included, and what it would refuse.
     let check = json(&["device", "update", name, "--check"]);
@@ -2243,6 +2257,23 @@ fn sentence(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::Provider;
+
+    #[test]
+    fn a_device_ssh_cannot_reach_is_reported_without_asking_it_more() {
+        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh build-host` connects without asking for a password, then try again.";
+        // Each question would wait out another SSH connection timeout.
+        let failure = diagnose_with("build-host", Some(reason), |arguments| {
+            panic!("asked the device again: {arguments:?}")
+        });
+        assert!(matches!(failure, OpenFailure::Other(message) if message == reason));
+        // Any other failure is still looked into.
+        let asked = std::cell::Cell::new(0);
+        let _ = diagnose_with("build-host", Some("the daemon stopped"), |_| {
+            asked.set(asked.get() + 1);
+            Ok((false, String::new()))
+        });
+        assert_eq!(asked.get(), 2);
+    }
 
     #[test]
     fn a_failed_command_is_read_from_the_json_it_wrote_to_stderr() {
