@@ -2512,6 +2512,18 @@ impl Cagents {
 
     /// Whether an open chat has work but no shared descriptor yet, which the
     /// next complete reconciliation publishes.
+    /// Whether a new terminal waits for its Insert to be sent, which only a
+    /// reconciliation does. A refused one waits for its Retry instead.
+    pub(super) fn holds_unsent_creation(&self) -> bool {
+        self.durable.pending_terminal_creations.iter().any(|&id| {
+            self.unsent_creation(id)
+                && !self.shared_views.refused_creations.contains_key(&id)
+                && self
+                    .card_state(id)
+                    .is_some_and(|card| card.existence.is_open())
+        })
+    }
+
     pub(super) fn holds_unpublished_local_chat(&self) -> bool {
         self.durable.cards.iter().any(|card| {
             card.existence.is_open()
@@ -2917,6 +2929,7 @@ impl Cagents {
                     views::changes(&unfenced(previous), &unfenced(&panes))
                 }
             };
+            let mut unqueued = Vec::new();
             for change in changes {
                 // A Remove is every window's instruction to close the pane. A
                 // pane still open here has only lost its local placement.
@@ -2970,26 +2983,44 @@ impl Cagents {
                 {
                     self.shared_views.attached.insert(pane.id);
                 }
-                let operation = match &change {
+                let creation = match &change {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
                     {
-                        self.shared_views.sent_creations.insert(pane.id);
-                        pane.id.as_uuid()
+                        Some(pane.id)
                     }
-                    _ => uuid::Uuid::new_v4(),
+                    _ => None,
                 };
+                let operation = creation.map_or_else(uuid::Uuid::new_v4, |card| card.as_uuid());
                 self.shared_views
                     .pending
                     .push((operation, scope.clone(), change.clone()));
-                self.publish_model_edit(ModelEdit::ChangeView {
+                let queued = self.publish_model_edit(ModelEdit::ChangeView {
                     scope: scope.clone(),
                     expected_revision: revision,
                     operation,
                     change,
                 });
+                // A new terminal counts as sent only once its Insert is
+                // queued: until then no view has been asked to hold it, so
+                // none that lacks it closes it, and the next reconciliation
+                // derives its Insert again (#4490).
+                match creation {
+                    Some(card) if queued => {
+                        self.shared_views.sent_creations.insert(card);
+                    }
+                    Some(card) => {
+                        self.shared_views
+                            .pending
+                            .retain(|(id, _, _)| *id != operation);
+                        unqueued.push(card);
+                    }
+                    None => {}
+                }
             }
             if !settled {
+                let mut panes = panes;
+                panes.retain(|pane| !unqueued.contains(&pane.id));
                 self.shared_views.baseline.insert(scope.clone(), panes);
             }
             let defaults = cards[&scope]
@@ -4457,6 +4488,15 @@ impl Cagents {
         current.extend(retained_upgrades);
         for shared in &view.panes {
             if self.shared_views.quarantined.contains(&shared.id) {
+                // A new terminal its view accepted and fences is admitted
+                // all the same: it waits for no Insert, and shows as a
+                // fenced pane, whose Close is the way out (#4490).
+                if self.durable.pending_terminal_creations.contains(&shared.id) {
+                    Arc::make_mut(&mut self.durable)
+                        .pending_terminal_creations
+                        .remove(&shared.id);
+                    self.shared_views.sent_creations.remove(&shared.id);
+                }
                 continue;
             }
             self.shared_views.closed_chats.remove(&shared.id);

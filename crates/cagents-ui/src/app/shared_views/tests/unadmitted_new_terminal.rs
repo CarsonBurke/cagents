@@ -358,6 +358,15 @@ fn a_restored_terminal_that_fails_still_reads_as_one_to_restore() {
 
 /// The registry accepts the window's Insert of `card`, holding its start.
 fn admit_insert(window: &mut Window, card: CardId) {
+    admit_insert_with(window, card, |_, _| {});
+}
+
+/// [`admit_insert`], with `also` changing the accepting model.
+fn admit_insert_with(
+    window: &mut Window,
+    card: CardId,
+    also: impl FnOnce(&mut crate::workspace_model::WorkspaceModel, &Pane),
+) {
     let scope = window.scope.clone();
     let (operation, pane) = std::iter::from_fn(|| window.rx.try_recv().ok())
         .find_map(|edit| match edit {
@@ -378,7 +387,8 @@ fn admit_insert(window: &mut Window, card: CardId) {
         .find(|view| view.scope == scope)
         .unwrap();
     view.revision += 1;
-    view.panes.push(pane);
+    view.panes.push(pane.clone());
+    also(&mut model, &pane);
     drop(
         window
             .app
@@ -490,5 +500,131 @@ fn a_failed_new_terminal_a_peer_started_is_not_removed_by_identity() {
             edit,
             ModelEdit::ChangeView { change: Change::Remove { id }, .. } if id == card
         ))
+    );
+}
+
+/// An Insert that never reached the publisher's queue was never sent: a view
+/// without the terminal doesn't close it, and the next reconciliation sends
+/// the Insert again (#4490).
+#[test]
+fn a_new_terminal_whose_insert_was_not_queued_is_sent_again() {
+    let mut window = window();
+    drain(&window.rx);
+    // The publisher has stopped: nothing can be queued.
+    let (closed, receiver) = crate::app::workspace_model_sync::test_model_channel();
+    drop(receiver);
+    let open = std::mem::replace(&mut window.app.workspace_model_tx, closed);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    assert!(window.app.holds_unsent_creation());
+
+    // Another edit to the view, which doesn't list it.
+    let scope = window.scope.clone();
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap()
+        .revision += 1;
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model,
+            }),
+    );
+    assert_open(&window, card);
+
+    window.app.workspace_model_tx = open;
+    drop(window.app.reconcile_shared_views());
+    assert_eq!(inserts(&window.rx, card), 1);
+    assert!(!window.app.holds_unsent_creation());
+    assert_open(&window, card);
+}
+
+/// Until its Insert is sent, a new terminal is owed a reconciliation by
+/// every edge, as an unpublished conversation is; a refused one waits for
+/// its Retry instead (#4490).
+#[test]
+fn an_unsent_new_terminal_is_owed_reconciliation() {
+    let mut window = window();
+    drain(&window.rx);
+    let (closed, receiver) = crate::app::workspace_model_sync::test_model_channel();
+    drop(receiver);
+    let open = std::mem::replace(&mut window.app.workspace_model_tx, closed);
+    let card = new_terminal(&mut window);
+    assert!(window.app.holds_unsent_creation());
+    window.app.workspace_model_tx = open;
+    drop(window.app.reconcile_shared_views());
+    assert!(!window.app.holds_unsent_creation());
+    refuse(&mut window, card, "refused");
+    assert!(!window.app.holds_unsent_creation());
+}
+
+/// A new terminal its view accepts while fencing its agent is admitted all
+/// the same: it shows as a fenced pane, waits for no Insert, and closes
+/// (#4490).
+#[test]
+fn a_new_terminal_its_view_fences_is_admitted_and_closes() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    let scope = window.scope.clone();
+    admit_insert_with(&mut window, card, |model, pane| {
+        let CardKind::Terminal(saved) = &pane.kind else {
+            unreachable!()
+        };
+        // The registry's agent runs another session than the pane saved.
+        let running = fresh_terminal_session(saved.launch.clone());
+        model.agents.push(crate::agent_execution::Agent {
+            id: crate::model::AgentId::from_uuid(card.as_uuid()),
+            name: None,
+            origin: crate::agent_execution::Origin::User,
+            spec: crate::agent_execution::Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: crate::agent_execution::Target {
+                    repository: saved.launch.working_directory.clone(),
+                    directory: saved.launch.working_directory.clone(),
+                    placement: Some(scope.clone()),
+                },
+                surface: crate::agent_execution::Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: scope.clone(),
+            session: Some(crate::agent_execution::HostedSession::Terminal(
+                running.clone(),
+            )),
+            console: Some(running),
+            created_ms: 0,
+            closed: false,
+        });
+    });
+    assert!(window.app.shared_views.quarantined.contains(&card));
+    assert_open(&window, card);
+    assert!(
+        !window
+            .app
+            .durable
+            .pending_terminal_creations
+            .contains(&card)
+    );
+    assert!(!window.app.holds_unsent_creation());
+
+    drop(window.app.update(Message::CloseCard(card)));
+    drop(window.app.update(Message::CommitClose(card)));
+    drop(window.app.reconcile_shared_views());
+    assert!(
+        !window
+            .app
+            .card_state(card)
+            .is_some_and(|card| card.existence.is_open())
     );
 }

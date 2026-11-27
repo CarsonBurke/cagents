@@ -5766,6 +5766,9 @@ fn a_refused_terminal_creation_fails_instead_of_loading_forever() {
         .baseline
         .insert(Scope::Channel(a), vec![first.clone()]);
     app.shared_views.pending.clear();
+    // A publisher that queues the Insert, so the registry can refuse it.
+    let (publisher, _requests) = test_model_channel();
+    app.workspace_model_tx = publisher;
     let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
     drop(app.insert_terminal_card(session, Some((0, 0))));
     let id = app.workspace.focused().unwrap();
