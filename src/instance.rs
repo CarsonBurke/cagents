@@ -2436,6 +2436,10 @@ impl UiUpdateGuard {
             window_device_identity(&self.runtime, slot, &devices())
                 .ok()
                 .flatten()
+                // A window that failed for its device's sake shows why on a
+                // screen of this build: proof the build opens windows. One
+                // that shows nothing may be this build's fault.
+                .filter(|_| device_reconnect_shown(slot))
         });
         notes.extend(device_notes);
         let errors: Vec<_> = errors
@@ -2502,11 +2506,26 @@ fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::
     }
 }
 
+/// Whether device window `slot`, which just failed to start, put up the
+/// screen that explains it. The window starts that screen as it exits.
+fn device_reconnect_shown(slot: &str) -> bool {
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if device_reconnect_showing(slot) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 /// Splits the windows that did not reopen into errors, which say this build
 /// cannot open a window, and notes. A device window that cannot reach its
 /// device, or must wait for the device's update, says so on its own screen;
 /// that is no reason to take the update back. `device_of` names the device a
-/// window shows.
+/// window shows, when it explained its failure itself.
 fn split_relaunch_failures(
     failures: Vec<(String, String)>,
     device_of: impl Fn(&str) -> Option<String>,
@@ -2690,14 +2709,21 @@ fn device_reconnect_lock_path(slot: &str) -> io::Result<PathBuf> {
 /// Claims the screen that explains why device window `slot` did not open,
 /// or `None` when one already does.
 pub fn hold_device_reconnect(slot: &str) -> io::Result<Option<OwnedLock>> {
-    match owned_lock(
-        &device_reconnect_lock_path(slot)?,
-        libc::LOCK_EX | libc::LOCK_NB,
-    ) {
-        Ok(lock) => Ok(Some(lock)),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
-        Err(error) => Err(error),
+    let path = device_reconnect_lock_path(slot)?;
+    // `device_reconnect_showing` holds the lock for an instant to look; a
+    // screen holds it for as long as it shows.
+    for attempt in 0..5 {
+        match owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(lock) => return Ok(Some(lock)),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if attempt < 4 {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
+    Ok(None)
 }
 
 /// Whether a screen explains why device window `slot` did not open, so that
