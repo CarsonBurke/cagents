@@ -125,6 +125,10 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
+    // SAFETY: entry is still single-threaded. A replacement normally inherits
+    // the adopted PATH and skips this; one replacing an older daemon reads the
+    // shell here, within the time its predecessor waits for it to park.
+    unsafe { cagents::account::probe::login_path::adopt() };
     let standby = if matches.get_flag("await-update-handoff") {
         // SAFETY: the daemon has not initialized admission or started threads.
         match unsafe { cagents::daemon::standby::await_activation() } {

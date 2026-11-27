@@ -40,6 +40,7 @@ use crate::{agent::Provider, chat::Model};
 mod acp;
 pub mod conversations;
 mod inputs;
+pub mod login_path;
 mod muse;
 mod reset_consume;
 #[cfg(test)]
