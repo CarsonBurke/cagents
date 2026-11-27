@@ -251,6 +251,12 @@ impl State {
         }
     }
 
+    /// Marks what discovery found as waiting for the shell's `PATH`.
+    #[cfg(test)]
+    pub(in crate::app) fn set_provisional_for_test(&mut self) {
+        self.installed_provisional = true;
+    }
+
     #[cfg(test)]
     pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
         self.account(id)?.pending_probe.clone()
@@ -4052,7 +4058,6 @@ impl Cagents {
                 }
                 self.account_ui.installed = installed;
                 self.account_ui.installed_provisional = false;
-                let drafts = self.move_drafts_off_missing_providers();
                 // Fresh detection owns current presence, independently of an
                 // older usage snapshot which remains useful history.
                 let installed = self.account_ui.installed.clone();
@@ -4078,6 +4083,9 @@ impl Cagents {
                     }
                 }
                 self.account_ui.restore(restored);
+                // With presence settled, so a moved draft picks its account
+                // as a new one would.
+                let drafts = self.move_drafts_off_missing_providers();
                 let manual = std::mem::take(&mut self.account_ui.discovery_manual);
                 let probes = if manual.is_empty() {
                     self.probe_accounts(Trigger::Focus)

@@ -25982,7 +25982,7 @@ fn an_untouched_draft_moves_off_a_provider_found_missing() {
     assert_eq!(runtime.session.launch.provider, Provider::Claude);
     assert!(!runtime.draft_model_chosen);
     assert!(super::draft_choice::get(&runtime.session).is_none());
-    assert!(runtime.composer_note.is_none());
+    assert!(app.draft_provider_note(card).is_none());
     assert!(matches!(
         &app.card_state(card).unwrap().kind,
         CardKind::Chat(session) if session.launch.provider == Provider::Claude
@@ -26008,18 +26008,19 @@ fn an_untouched_draft_moves_off_a_provider_found_missing() {
     let runtime = chat_runtime(&peer, peer_card);
     assert_eq!(runtime.session, moved);
     assert!(!runtime.draft_model_chosen);
-    assert!(runtime.composer_note.is_none());
+    assert!(peer.draft_provider_note(peer_card).is_none());
 }
 
 /// A draft with something in it, or a model picked, keeps its provider when
 /// that provider turns out to be missing; its composer says so before the
-/// first send, until the provider is found (#4413).
+/// first send, while it is typed in, until the provider is found (#4413).
 #[test]
 fn a_touched_draft_on_a_missing_provider_says_so_and_stays() {
     let note = "Codex isn't installed on this computer. Choose a model under Claude in the model menu, or install Codex there.";
     for typed in [true, false] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = draft_chat_for_provider(&mut app, Provider::Codex);
+        let target = chat_runtime(&app, card).target;
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             unreachable!()
         };
@@ -26028,17 +26029,95 @@ fn a_touched_draft_on_a_missing_provider_says_so_and_stays() {
         } else {
             runtime.draft_model_chosen = true;
         }
+        assert!(app.draft_provider_note(card).is_none());
         app.account_ui.set_cli_for_test(Provider::Codex, false);
         app.account_ui.set_cli_for_test(Provider::Claude, true);
-        drop(app.move_drafts_off_missing_providers());
-        let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.session.launch.provider, Provider::Codex);
-        assert_eq!(runtime.composer_note.as_deref(), Some(note));
+        app.settle_discovery_for_test();
+        assert_eq!(
+            chat_runtime(&app, card).session.launch.provider,
+            Provider::Codex
+        );
+        assert_eq!(app.draft_provider_note(card).as_deref(), Some(note));
+        // Typing doesn't put it away.
+        drop(app.handle_chat_ui(Action::Composer(
+            target,
+            text_editor::Action::Edit(text_editor::Edit::Insert('y')),
+        )));
+        assert_eq!(app.draft_provider_note(card).as_deref(), Some(note));
 
         app.account_ui.set_cli_for_test(Provider::Codex, true);
-        drop(app.move_drafts_off_missing_providers());
-        assert!(chat_runtime(&app, card).composer_note.is_none());
+        assert!(app.draft_provider_note(card).is_none());
     }
+
+    // With nothing to move to, it says how to start the conversation.
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Codex);
+    for provider in Provider::ALL {
+        app.account_ui.set_cli_for_test(provider, false);
+    }
+    app.settle_discovery_for_test();
+    assert_eq!(
+        chat_runtime(&app, card).session.launch.provider,
+        Provider::Codex
+    );
+    assert_eq!(
+        app.draft_provider_note(card).as_deref(),
+        Some(
+            "Codex isn't installed on this computer. Install it there to start this conversation."
+        )
+    );
+}
+
+/// A draft opened on a provider Accounts already found missing, as one
+/// restored from a saved session or opened from another window's view,
+/// moves once it is open if untouched; one with a model chosen stays
+/// (#4413).
+#[test]
+fn a_draft_opened_on_a_missing_provider_moves_once_open() {
+    for chosen in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat_for_provider(&mut app, Provider::Codex);
+        let mut session = chat_runtime(&app, card).session.clone();
+        if chosen {
+            super::draft_choice::set(&mut session, &(Some("gpt-fixture".into()), None));
+        }
+        app.account_ui.set_cli_for_test(Provider::Codex, false);
+        app.account_ui.set_cli_for_test(Provider::Claude, true);
+        let opened = app.open_chat_draft(card, session);
+        let target = chat_runtime(&app, card).target;
+        // Opening leaves it where it was; the move follows.
+        assert_eq!(
+            chat_runtime(&app, card).session.launch.provider,
+            Provider::Codex
+        );
+        drop(opened);
+        drop(app.handle_chat_ui(Action::MoveDraftOffMissingProvider(target)));
+        let runtime = chat_runtime(&app, card);
+        let expected = if chosen {
+            Provider::Codex
+        } else {
+            Provider::Claude
+        };
+        assert_eq!(runtime.session.launch.provider, expected);
+        assert_eq!(runtime.draft_model_chosen, chosen);
+    }
+}
+
+/// A discovery still provisional, before the shell's `PATH` answers, moves
+/// nothing (#4413).
+#[test]
+fn a_provisional_discovery_moves_no_draft() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_for_provider(&mut app, Provider::Codex);
+    app.account_ui.set_cli_for_test(Provider::Codex, false);
+    app.account_ui.set_cli_for_test(Provider::Claude, true);
+    app.account_ui.set_provisional_for_test();
+    drop(app.move_drafts_off_missing_providers());
+    assert_eq!(
+        chat_runtime(&app, card).session.launch.provider,
+        Provider::Codex
+    );
+    assert!(app.draft_provider_note(card).is_none());
 }
 
 /// An ACP conversation's current sign-in or no-allowance failure has the
