@@ -289,6 +289,7 @@ impl State {
         &'a self,
         projects: &'a [SidebarProject],
         editors: &'a [SidebarEditor],
+        device: Option<&'a str>,
         current: Option<(ProjectId, WorktreeId)>,
         modal_open: bool,
     ) -> Element<'a, Action> {
@@ -296,6 +297,7 @@ impl State {
             state: self,
             projects,
             editors,
+            device,
             current,
             modal_open,
         };
@@ -452,6 +454,9 @@ struct View<'a> {
     state: &'a State,
     projects: &'a [SidebarProject],
     editors: &'a [SidebarEditor],
+    /// The device whose projects these are, or `None` for this computer.
+    /// Its menus offer only what runs there, as the sidebar's do.
+    device: Option<&'a str>,
     /// The checkout of the pane the user was last in.
     current: Option<(ProjectId, WorktreeId)>,
     modal_open: bool,
@@ -751,13 +756,7 @@ impl<'a> View<'a> {
                 })
             };
             let mut items: Vec<Element<'a, Action>> = vec![
-                popover_item(
-                    Icon::OpenFolder.handle(),
-                    "Show in file manager",
-                    "Outside cagents",
-                    command(ProjectCommand::Reveal),
-                )
-                .into(),
+                self.reveal_item(command(ProjectCommand::Reveal)),
                 popover_item(
                     Icon::CopyPath.handle(),
                     "Copy path",
@@ -767,7 +766,7 @@ impl<'a> View<'a> {
                 .into(),
             ];
             items.extend(self.editor_items(command));
-            if project.kind == ProjectKind::Git && project.github_ready {
+            if project.kind == ProjectKind::Git && project.github_ready && self.device.is_none() {
                 items.push(
                     popover_item(
                         Icon::Browser.handle(),
@@ -783,7 +782,10 @@ impl<'a> View<'a> {
                 popover_item(
                     Icon::Delete.handle(),
                     "Remove project…",
-                    "Asks first; its files stay on disk",
+                    match self.device {
+                        Some(device) => format!("Asks first; its files stay on {device}"),
+                        None => "Asks first; its files stay on disk".to_owned(),
+                    },
                     command(ProjectCommand::Remove),
                 )
                 .into(),
@@ -800,11 +802,37 @@ impl<'a> View<'a> {
         )
     }
 
+    /// Shows a checkout's folder: this computer's file manager, or a
+    /// device's files in cagents.
+    fn reveal_item(&self, action: Action) -> Element<'a, Action> {
+        match self.device {
+            Some(device) => popover_item(
+                Icon::OpenFolder.handle(),
+                format!("Browse files on {device}"),
+                "In cagents",
+                action,
+            ),
+            None => popover_item(
+                Icon::OpenFolder.handle(),
+                "Show in file manager",
+                "Outside cagents",
+                action,
+            ),
+        }
+        .into()
+    }
+
+    /// Editors run on this computer, so a device's checkouts offer none.
     fn editor_items(
         &self,
         command: impl Fn(ProjectCommand) -> Action,
     ) -> impl Iterator<Item = Element<'a, Action>> {
-        self.editors.iter().map(move |editor| {
+        let editors = if self.device.is_some() {
+            &[][..]
+        } else {
+            self.editors
+        };
+        editors.iter().map(move |editor| {
             popover_item(
                 editor_icon(editor),
                 editor.name.as_str(),
@@ -1318,7 +1346,9 @@ impl<'a> View<'a> {
                 )
                 .into(),
             );
-            if git {
+            // A device window can't start a worktree from a branch or reach
+            // GitHub yet, so it offers neither.
+            if git && self.device.is_none() {
                 items.push(
                     popover_item(
                         Icon::WorktreeAdd.handle(),
@@ -1352,15 +1382,7 @@ impl<'a> View<'a> {
                     );
                 }
             }
-            items.push(
-                popover_item(
-                    Icon::OpenFolder.handle(),
-                    "Show in file manager",
-                    "Outside cagents",
-                    command(ProjectCommand::Reveal),
-                )
-                .into(),
-            );
+            items.push(self.reveal_item(command(ProjectCommand::Reveal)));
             items.extend(self.editor_items(command));
             if git {
                 items.push(design::horizontal_rule());
@@ -1633,6 +1655,7 @@ mod tests {
             state: &state,
             projects: std::slice::from_ref(project),
             editors: &[],
+            device: None,
             current: None,
             modal_open: false,
         };
@@ -1708,6 +1731,7 @@ mod tests {
             state: &state,
             projects: &projects,
             editors: &[],
+            device: None,
             current: Some((key.project_id, key.worktree_id)),
             modal_open: false,
         };

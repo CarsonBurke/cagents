@@ -2888,6 +2888,24 @@ mod tests {
     }
 
     #[test]
+    fn a_device_window_menu_offers_nothing_its_routing_refuses() {
+        let project_id = ProjectId::new();
+        for worktree_id in [None, Some(crate::model::WorktreeId::new())] {
+            for command in sidebar::device_menu_commands(project_id, worktree_id, "amd") {
+                let action = SidebarAction::ProjectCommand {
+                    project_id,
+                    worktree_id,
+                    command,
+                };
+                assert!(
+                    !matches!(sidebar_route(&action), Some(SidebarRoute::Unavailable(_))),
+                    "{action:?} is offered but refused"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn remote_sidebar_commands_create_channels_and_open_the_matching_device_tool() {
         const CHILD: &str = "CAGENTS_TEST_REMOTE_SIDEBAR_COMMANDS";
         const TEST: &str = "app::device_ui::tests::remote_sidebar_commands_create_channels_and_open_the_matching_device_tool";

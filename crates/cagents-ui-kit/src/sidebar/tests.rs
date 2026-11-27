@@ -3270,7 +3270,7 @@ fn row_quick_delete_centers_its_glyph_in_the_whole_hit_area() {
             None,
             false,
             true,
-            &[],
+            ProjectMenus::default(),
             WorktreeRowState::default(),
             false,
             Some(1),
@@ -3306,7 +3306,7 @@ fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
                 None,
                 false,
                 false,
-                &[],
+                ProjectMenus::default(),
                 WorktreeRowState::default(),
                 compact,
                 None,
@@ -3367,7 +3367,7 @@ fn only_merged_nonprimary_worktree_rows_expose_delete_quick_action() {
             None,
             false,
             true,
-            &[],
+            ProjectMenus::default(),
             WorktreeRowState::default(),
             false,
             Some(1),
@@ -3909,7 +3909,7 @@ fn long_worktree_labels_cannot_paint_over_status_or_badges() {
             None,
             false,
             false,
-            &[],
+            ProjectMenus::default(),
             WorktreeRowState {
                 has_panes: true,
                 ..WorktreeRowState::default()
@@ -4528,7 +4528,7 @@ fn a_merged_worktrees_wide_status_hides_under_its_delete() {
             None,
             false,
             true,
-            &[],
+            ProjectMenus::default(),
             row_state,
             false,
             Some(1),
@@ -4971,6 +4971,66 @@ fn copying_a_path_needs_neither_file_management_nor_a_file() {
 }
 
 #[test]
+fn device_window_menus_offer_only_what_runs_on_the_device() {
+    let editors = [SidebarEditor {
+        id: "code".into(),
+        name: "Open in Code".into(),
+        icon: "code".into(),
+    }];
+    let worktree = Some(WorktreeId::from_uuid(Uuid::from_u128(2)));
+    let labels = |worktree_id, device| {
+        project_menu_commands(
+            project_id(1),
+            worktree_id,
+            true,
+            true,
+            ProjectMenus {
+                editors: &editors,
+                device,
+            },
+            Some(1),
+        )
+        .into_iter()
+        .map(|(label, _, command)| (label, command))
+        .collect::<Vec<_>>()
+    };
+    let local = labels(worktree, None);
+    for command in [
+        ProjectCommand::NewWorktreeFromBranch,
+        ProjectCommand::PullRequest,
+        ProjectCommand::RepositoryUrl,
+        ProjectCommand::OpenEditor("code".into()),
+    ] {
+        assert!(
+            local.iter().any(|(_, listed)| *listed == command),
+            "{command:?}"
+        );
+    }
+    assert!(local.contains(&("Show in file manager".into(), ProjectCommand::Reveal)));
+    for row in [worktree, None] {
+        let device = labels(row, Some("amd"));
+        assert!(
+            device.contains(&("Browse files on amd".into(), ProjectCommand::Reveal)),
+            "{device:?}"
+        );
+        // What needs this computer's Git, GitHub or applications is left
+        // out. The app's `device_ui` tests check the rest is routed.
+        for (_, command) in &device {
+            assert!(
+                !matches!(
+                    command,
+                    ProjectCommand::NewWorktreeFromBranch
+                        | ProjectCommand::PullRequest
+                        | ProjectCommand::RepositoryUrl
+                        | ProjectCommand::OpenEditor(_)
+                ),
+                "{command:?} is offered in a device window"
+            );
+        }
+    }
+}
+
+#[test]
 fn project_menu_renders_copy_path_and_dispatches_its_original_project() {
     use cosmic::iced::{
         Event, Point, Rectangle, Vector,
@@ -4987,7 +5047,7 @@ fn project_menu_renders_copy_path_and_dispatches_its_original_project() {
         true,
         true,
         false,
-        &[],
+        ProjectMenus::default(),
         Some(1),
     );
     let mut tree = Tree::new(&element);
@@ -5105,7 +5165,7 @@ fn context_menu_preserves_child_cursors_and_primary_clicks() {
         true,
         true,
         false,
-        &[],
+        ProjectMenus::default(),
         Some(1),
     );
     let mut tree = Tree::new(&element);
@@ -7298,7 +7358,7 @@ fn context_rows_survive_opening_and_closing_a_modal() {
             true,
             true,
             true,
-            &[],
+            ProjectMenus::default(),
             Some(1),
         )
     };
@@ -7417,6 +7477,7 @@ fn no_two_controls_in_one_frame_share_an_identity() {
                     source_control: None,
                     external_editors: Vec::new(),
                     file_management: false,
+                    device: None,
                 };
                 for selection in &selections {
                     for controls_expanded in [false, true] {
@@ -11655,7 +11716,7 @@ fn terminal_pull_request_rows_hide_retained_review_and_check_badges() {
             None,
             false,
             true,
-            &[],
+            ProjectMenus::default(),
             WorktreeRowState {
                 has_panes: true,
                 ..WorktreeRowState::default()
