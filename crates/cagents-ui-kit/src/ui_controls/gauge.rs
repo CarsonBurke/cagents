@@ -106,40 +106,73 @@ fn spinner_arc(elapsed: std::time::Duration) -> (f32, f32) {
 /// subscription and no view rebuild behind its motion.
 ///
 /// `tone` names the arc's color and is resolved from the drawing theme, so a
-/// per-row indicator never locks the process-global theme to learn it.
+/// per-row indicator never locks the process-global theme to learn it. The
+/// arc turns over a faint full ring in the gauges' track colour, so the
+/// indicator reads as one whole glyph of the same family as the budget rings
+/// rather than a loose fragment, whatever the tone.
 pub fn activity_spinner<'a, Message: Clone + 'a>(
     size: f32,
     tone: fn(&cosmic::Theme) -> iced::Color,
 ) -> Element<'a, Message> {
+    let (arc, track) = spinner_handles(size);
     Element::new(ActivitySpinner {
         size,
         tone,
-        handle: spinner_handle(size),
+        arc,
+        track,
     })
 }
 
-fn spinner_handle(size: f32) -> cosmic::iced::advanced::svg::Handle {
+/// The arc and track drawings for a spinner `size` pixels across.
+fn spinner_handles(
+    size: f32,
+) -> (
+    cosmic::iced::advanced::svg::Handle,
+    cosmic::iced::advanced::svg::Handle,
+) {
     use cosmic::iced::advanced::svg::Handle;
     use std::sync::LazyLock;
 
     // These are the shell's indicator sizes. Stable handles keep rasterized
-    // SVGs shared between rows and frames without a growing geometry cache.
-    const SIZES: [f32; 5] = [12.0, 14.0, 16.0, 20.0, 24.0];
-    static HANDLES: LazyLock<[Handle; 5]> = LazyLock::new(|| SIZES.map(spinner_svg));
+    // SVGs shared between rows and frames without a growing geometry cache,
+    // and spare a view rebuild from formatting a fresh document per spinner.
+    const SIZES: [f32; 6] = [10.0, 12.0, 14.0, 16.0, 20.0, 24.0];
+    static HANDLES: LazyLock<[(Handle, Handle); 6]> =
+        LazyLock::new(|| SIZES.map(|size| (spinner_svg(size), spinner_track_svg(size))));
     SIZES
         .iter()
         .position(|candidate| *candidate == size)
-        .map_or_else(|| spinner_svg(size), |index| HANDLES[index].clone())
+        .map_or_else(
+            || (spinner_svg(size), spinner_track_svg(size)),
+            |index| HANDLES[index].clone(),
+        )
+}
+
+/// The width of a spinner's stroke, shared by its arc and its track so the
+/// arc covers the ring exactly.
+fn spinner_stroke(size: f32) -> f32 {
+    (size / 12.0).max(2.0)
 }
 
 fn spinner_svg(size: f32) -> cosmic::iced::advanced::svg::Handle {
-    let stroke = (size / 12.0).max(2.0);
+    let stroke = spinner_stroke(size);
     let radius = (size - stroke) / 2.0;
     let center = size / 2.0;
     let right = center + radius;
     let top = center - radius;
     cosmic::iced::advanced::svg::Handle::from_memory(format!(
         r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}"><path d="M{right} {center}A{radius} {radius} 0 1 1 {center} {top}" fill="none" stroke="black" stroke-width="{stroke}" stroke-linecap="round"/></svg>"#
+    ).into_bytes())
+}
+
+/// The full ring under the arc. It never turns, so it is drawn on its own
+/// rather than into the arc's document, which the renderer rotates.
+fn spinner_track_svg(size: f32) -> cosmic::iced::advanced::svg::Handle {
+    let stroke = spinner_stroke(size);
+    let radius = (size - stroke) / 2.0;
+    let center = size / 2.0;
+    cosmic::iced::advanced::svg::Handle::from_memory(format!(
+        r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {size} {size}"><circle cx="{center}" cy="{center}" r="{radius}" fill="none" stroke="black" stroke-width="{stroke}"/></svg>"#
     ).into_bytes())
 }
 
@@ -152,7 +185,8 @@ fn spinner_svg(size: f32) -> cosmic::iced::advanced::svg::Handle {
 struct ActivitySpinner {
     size: f32,
     tone: fn(&cosmic::Theme) -> iced::Color,
-    handle: cosmic::iced::advanced::svg::Handle,
+    arc: cosmic::iced::advanced::svg::Handle,
+    track: cosmic::iced::advanced::svg::Handle,
 }
 
 #[derive(Default)]
@@ -278,15 +312,24 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
         let turn = tree.state.downcast_ref::<SpinnerState>().turn;
         let (start, _) = spinner_arc(turn.map_or(std::time::Duration::ZERO, |turn| turn.elapsed));
         let color = (self.tone)(theme);
+        let track = crate::design::track_ink(theme);
         // Rotate a stable SVG through the image pipeline, and let the
         // renderer keep turning it from the clock between the frames that
         // draw the window's widgets. Dynamic canvas meshes in the pinned WGPU
         // renderer retained arcs after their panes unmounted; sharing one
         // icon per size also avoids retessellation on every animation frame.
-        // Keep the original phase, sweep and stroke.
+        // Keep the original phase, sweep and stroke. The track is a second
+        // shared icon that never turns, drawn first so the arc covers it.
         renderer.with_layer(clip, |renderer| {
             renderer.draw_svg(
-                Svg::new(self.handle.clone())
+                Svg::new(self.track.clone())
+                    .color(cosmic::iced::Color { a: 1.0, ..track })
+                    .opacity(track.a),
+                bounds,
+                clip,
+            );
+            renderer.draw_svg(
+                Svg::new(self.arc.clone())
                     .color(cosmic::iced::Color { a: 1.0, ..color })
                     .opacity(color.a)
                     .rotation(cosmic::iced::Radians(start))
@@ -903,6 +946,82 @@ mod tests {
                     "arc escaped its pane at ({x}, {y})"
                 );
             }
+        }
+    }
+
+    /// The arc turns over a faint whole ring, as in the approved design: the
+    /// quarter the arc leaves open shows the gauges' track, a light lean from
+    /// the surface toward the ink, in either theme, and the arc keeps its
+    /// tone over it.
+    #[test]
+    fn the_arc_turns_over_a_faint_track_in_either_theme() {
+        use cosmic::iced::advanced::renderer::Headless as _;
+        use cosmic::iced::advanced::{
+            Layout, Renderer as _, layout, mouse, renderer, widget::Tree,
+        };
+        use cosmic::iced::{Color, Rectangle, Size};
+
+        const SIZE: f32 = 48.0;
+        let tone = |_: &cosmic::Theme| Color::from_rgb(1.0, 0.0, 0.0);
+        for (name, theme) in [
+            ("dark", cosmic::Theme::dark()),
+            ("light", cosmic::Theme::light()),
+        ] {
+            let mut renderer = headless_renderer();
+            let extent = Rectangle::with_size(Size::new(SIZE, SIZE));
+            let element: Element<'_, ()> = activity_spinner(SIZE, tone);
+            let tree = Tree::new(element.as_widget());
+            let node = layout::Node::new(Size::new(SIZE, SIZE));
+            renderer.reset(extent);
+            element.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &theme,
+                &renderer::Style::default(),
+                Layout::new(&node),
+                mouse::Cursor::Unavailable,
+                &extent,
+            );
+            let surface = crate::design::base(&theme);
+            let ink: Color = theme.current_container().on.into();
+            let pixels = renderer.screenshot(Size::new(48, 48), 1.0, surface);
+
+            // The middle of the stroke at each diagonal.
+            let reach = (SIZE - spinner_stroke(SIZE)) / 2.0 / std::f32::consts::SQRT_2;
+            let near = SIZE / 2.0 - reach;
+            let far = SIZE / 2.0 + reach;
+            let samples = [(far, near), (far, far), (near, far), (near, near)].map(|(x, y)| {
+                let index = (y as usize * SIZE as usize + x as usize) * 4;
+                let [r, g, b] = [0, 1, 2].map(|channel| f32::from(pixels[index + channel]) / 255.0);
+                (r, g, b)
+            });
+            let arc = samples
+                .iter()
+                .filter(|(r, g, b)| *r > 0.9 && *g < 0.1 && *b < 0.1)
+                .count();
+            assert_eq!(
+                arc, 3,
+                "{name}: the arc should cover three quarters in its tone: {samples:?}"
+            );
+
+            let (r, g, b) = *samples
+                .iter()
+                .find(|(r, g, b)| !(*r > 0.9 && *g < 0.1 && *b < 0.1))
+                .expect("the arc leaves a quarter open");
+            // How far the open quarter leans from the surface toward the ink.
+            let lean = [
+                (r, surface.r, ink.r),
+                (g, surface.g, ink.g),
+                (b, surface.b, ink.b),
+            ]
+            .iter()
+            .map(|(seen, under, over)| (seen - under) / (over - under))
+            .sum::<f32>()
+                / 3.0;
+            assert!(
+                (0.08..0.35).contains(&lean),
+                "{name}: the open quarter should show a faint track, but leans {lean} toward the ink"
+            );
         }
     }
 
