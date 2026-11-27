@@ -1,11 +1,11 @@
 //! The `PATH` a daemon started by an SSH command adopts.
 //!
 //! sshd runs a command, such as a device window's `cagents daemon bridge`,
-//! without the login startup that an interactive SSH session gets, so the
-//! daemon it starts would inherit a `PATH` of system directories only.
-//! Installers commonly add `~/.local/bin` and similar directories in login
-//! files such as `~/.profile`, and terminals, provider CLIs and conversations
-//! on the device would all miss them. Like the server VS Code starts over SSH,
+//! without the login startup files an interactive SSH session reads, so the
+//! `PATH` the daemon it starts inherits can lack what they add. Installers
+//! commonly add `~/.local/bin` and similar directories in login files such as
+//! `~/.profile`, and terminals, provider CLIs and conversations on the device
+//! would all miss them. Like the server VS Code starts over SSH,
 //! the daemon reads its user's login shell once at startup instead.
 
 use std::{
@@ -42,10 +42,7 @@ const ADOPTED_ENV: &str = "CAGENTS_LOGIN_PATH_ADOPTED";
 /// Must be called before the process starts a second thread: it changes the
 /// process environment, which another thread may be reading.
 pub unsafe fn adopt() {
-    if cfg!(target_os = "macos")
-        || std::env::var_os("SSH_CONNECTION").is_none()
-        || std::env::var_os(ADOPTED_ENV).is_some()
-    {
+    if !wanted(|name| std::env::var_os(name).is_some()) {
         return;
     }
     // Asked once, answered or not: a shell that failed to answer is not given
@@ -62,6 +59,12 @@ pub unsafe fn adopt() {
         // SAFETY: the caller guarantees the process is still single-threaded.
         unsafe { std::env::set_var("PATH", path) };
     }
+}
+
+/// Whether a process whose environment holds the variables `set` names should
+/// read the login shell: one started by SSH, on Linux, not already answered.
+fn wanted(set: impl Fn(&str) -> bool) -> bool {
+    !cfg!(target_os = "macos") && set("SSH_CONNECTION") && !set(ADOPTED_ENV)
 }
 
 /// `login`'s directories, then those of `current` it lacks, each once. As in
@@ -194,6 +197,14 @@ mod tests {
             merged(OsStr::new("/opt/x/bin"), None),
             Some("/opt/x/bin".into())
         );
+    }
+
+    #[test]
+    fn only_a_process_started_over_ssh_reads_the_login_shell_once() {
+        let with = |names: &'static [&'static str]| wanted(move |name| names.contains(&name));
+        assert_eq!(with(&["SSH_CONNECTION"]), !cfg!(target_os = "macos"));
+        assert!(!with(&[]));
+        assert!(!with(&["SSH_CONNECTION", ADOPTED_ENV]));
     }
 
     #[test]
