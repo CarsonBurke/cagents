@@ -18242,9 +18242,10 @@ impl Cagents {
                     ));
                     return ControlFlow::Break(Task::none());
                 }
-                Message::Sidebar(action) if !device_ui::supports_sidebar_action(action) => {
-                    return ControlFlow::Break(self.update_device(device_ui::Action::Open));
-                }
+                Message::Sidebar(action) => match device_ui::sidebar_route(action) {
+                    device_ui::SidebarRoute::Run => {}
+                    route => return ControlFlow::Break(self.route_device_sidebar_action(route)),
+                },
                 _ => {}
             }
         }

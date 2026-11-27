@@ -9,48 +9,127 @@ pub(super) fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
 
-/// Navigation presentation and device-owned row opening never need desktop Git or files.
-pub(super) fn supports_sidebar_action(action: &SidebarAction) -> bool {
-    matches!(
-        action,
-        SidebarAction::ReorderMember { .. }
-            | SidebarAction::ReorderProject { .. }
-            | SidebarAction::ProjectCommand {
-                command: crate::sidebar::ProjectCommand::ResetSidebarOrder
-                    | crate::sidebar::ProjectCommand::MoveUp
-                    | crate::sidebar::ProjectCommand::MoveDown,
-                ..
-            }
-            | SidebarAction::SearchChanged(_)
-            | SidebarAction::SetFilter(_)
-            | SidebarAction::HideReadAttention
-            | SidebarAction::ToggleInProgress
-            | SidebarAction::ToggleControls
-            | SidebarAction::OpenFirstSearchResult
-            | SidebarAction::FocusFirstSearchResult
-            | SidebarAction::Resize { .. }
-            | SidebarAction::ResizeFinished
-            | SidebarAction::ScrollProjects(_)
-            | SidebarAction::NavigateRow { .. }
-            | SidebarAction::OpenChannel { .. }
-            | SidebarAction::OpenCard { .. }
-            | SidebarAction::SelectRows { .. }
-            | SidebarAction::ClearRowSelection
-            | SidebarAction::OpenRepository { .. }
-            | SidebarAction::OpenWorktree { .. }
-            | SidebarAction::Refresh
-            | SidebarAction::RefreshProject { .. }
-            | SidebarAction::ToggleProjects
-            | SidebarAction::ToggleProject(_)
-            | SidebarAction::ToggleWorktrees(_)
-            | SidebarAction::SetWorktreeDisplay { .. }
-            | SidebarAction::ToggleCheckouts
-            | SidebarAction::DragWindow
-            | SidebarAction::MaximizeWindow
-            | SidebarAction::WindowMenu
-            | SidebarAction::OpenSettings
-    )
+/// What a device window does with a sidebar action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SidebarRoute {
+    /// The action needs nothing from this computer's files or Git, so it
+    /// runs as it does locally. Channels, panes and projects live in the
+    /// device's registry, and terminals and chats start on the device.
+    Run,
+    /// The device's file browser stands in for this computer's file manager.
+    BrowseOnDevice {
+        project_id: ProjectId,
+        worktree_id: Option<crate::model::WorktreeId>,
+    },
+    /// The device's worktree tools stand in for the worktree dialogs, which
+    /// run Git on this computer (#688).
+    DeviceWorktrees { project_id: ProjectId },
+    /// Not available on a device yet. The reason is shown as it is.
+    Unavailable(&'static str),
 }
+
+/// Routes a sidebar action in a device window. Nothing here opens the device
+/// tools for an action that has nothing to do with them: a command either
+/// runs, uses its device equivalent, or says why it can't.
+pub(super) fn sidebar_route(action: &SidebarAction) -> SidebarRoute {
+    use crate::sidebar::ProjectCommand;
+    match action {
+        SidebarAction::ReorderMember { .. }
+        | SidebarAction::ReorderProject { .. }
+        | SidebarAction::SearchChanged(_)
+        | SidebarAction::SetFilter(_)
+        | SidebarAction::HideReadAttention
+        | SidebarAction::ToggleInProgress
+        | SidebarAction::ToggleControls
+        | SidebarAction::OpenFirstSearchResult
+        | SidebarAction::FocusFirstSearchResult
+        | SidebarAction::Resize { .. }
+        | SidebarAction::ResizeFinished
+        | SidebarAction::ScrollProjects(_)
+        | SidebarAction::NavigateRow { .. }
+        | SidebarAction::OpenChannel { .. }
+        | SidebarAction::OpenCard { .. }
+        | SidebarAction::SelectRows { .. }
+        | SidebarAction::ClearRowSelection
+        | SidebarAction::OpenRepository { .. }
+        | SidebarAction::OpenWorktree { .. }
+        | SidebarAction::Refresh
+        | SidebarAction::RefreshProject { .. }
+        | SidebarAction::ToggleProjects
+        | SidebarAction::ToggleProject(_)
+        | SidebarAction::ToggleWorktrees(_)
+        | SidebarAction::SetWorktreeDisplay { .. }
+        | SidebarAction::ToggleCheckouts
+        | SidebarAction::DragWindow
+        | SidebarAction::MaximizeWindow
+        | SidebarAction::WindowMenu
+        | SidebarAction::OpenSettings
+        | SidebarAction::OpenAutomations
+        | SidebarAction::OpenWork
+        | SidebarAction::OpenRepositoryPicker
+        | SidebarAction::NewChannel { .. }
+        | SidebarAction::RenameChannel(_)
+        | SidebarAction::MarkChannelRead(_)
+        | SidebarAction::DeleteChannel { .. }
+        | SidebarAction::RetryChannelDeletion { .. }
+        | SidebarAction::DeleteRow(
+            sidebar::SelectionRow::Channel(_) | sidebar::SelectionRow::Card(_),
+        ) => SidebarRoute::Run,
+        SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id,
+            command,
+        } => match command {
+            ProjectCommand::NewTerminal
+            | ProjectCommand::NewChannel
+            | ProjectCommand::CopyPath
+            | ProjectCommand::CopyBranch
+            | ProjectCommand::MoveUp
+            | ProjectCommand::MoveDown
+            | ProjectCommand::ResetSidebarOrder => SidebarRoute::Run,
+            ProjectCommand::Reveal => SidebarRoute::BrowseOnDevice {
+                project_id: *project_id,
+                worktree_id: *worktree_id,
+            },
+            ProjectCommand::NewWorktree
+            | ProjectCommand::NewWorktreeFromBranch
+            | ProjectCommand::Delete => SidebarRoute::DeviceWorktrees {
+                project_id: *project_id,
+            },
+            ProjectCommand::Remove => SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE),
+            ProjectCommand::PullRequest | ProjectCommand::RepositoryUrl => {
+                SidebarRoute::Unavailable(PULL_REQUESTS_UNAVAILABLE)
+            }
+            ProjectCommand::OpenEditor(_) => SidebarRoute::Unavailable(
+                "External editors open files on this computer. Use Browse device files to edit files on the device.",
+            ),
+        },
+        SidebarAction::NewWorktree { project_id, .. } => SidebarRoute::DeviceWorktrees {
+            project_id: *project_id,
+        },
+        SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, _)) => {
+            SidebarRoute::DeviceWorktrees {
+                project_id: *project_id,
+            }
+        }
+        SidebarAction::DeleteRow(sidebar::SelectionRow::Project(_)) => {
+            SidebarRoute::Unavailable(REMOVE_PROJECT_UNAVAILABLE)
+        }
+        SidebarAction::BrowsePullRequests { .. }
+        | SidebarAction::OpenPullRequest { .. }
+        | SidebarAction::CreatePullRequest { .. } => {
+            SidebarRoute::Unavailable(PULL_REQUESTS_UNAVAILABLE)
+        }
+        _ => SidebarRoute::Unavailable(
+            "That isn't available on a device yet. Use Browse device files for the device's files and Git.",
+        ),
+    }
+}
+
+const REMOVE_PROJECT_UNAVAILABLE: &str =
+    "Removing a project isn't available on a device yet. It stays on the device.";
+const PULL_REQUESTS_UNAVAILABLE: &str =
+    "Pull requests aren't available on a device yet. Use a terminal on the device for gh.";
 
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -317,6 +396,51 @@ impl Cagents {
         self.refresh_ui.finished(project_id, true);
         self.refresh_sidebar_channels();
         self.reconcile_shared_views()
+    }
+
+    /// Carries out a device window's [`SidebarRoute`] for a sidebar action
+    /// that doesn't run as it does locally.
+    pub(super) fn route_device_sidebar_action(&mut self, route: SidebarRoute) -> Task<Message> {
+        let project = |id: ProjectId| self.sidebar_model.project(id);
+        match route {
+            SidebarRoute::Run => Task::none(),
+            SidebarRoute::BrowseOnDevice {
+                project_id,
+                worktree_id,
+            } => {
+                let Some(project) = project(project_id) else {
+                    return Task::none();
+                };
+                let path = worktree_id
+                    .and_then(|id| project.worktrees.iter().find(|worktree| worktree.id == id))
+                    .map_or_else(
+                        || project.repository.clone(),
+                        |worktree| worktree.path.clone(),
+                    );
+                self.update_device(Action::OpenIn {
+                    path: Some(path),
+                    panel: Panel::Files,
+                })
+            }
+            SidebarRoute::DeviceWorktrees { project_id } => {
+                let Some(project) = project(project_id) else {
+                    return Task::none();
+                };
+                // The main checkout, where `.worktrees/` is created.
+                let path = project.worktrees.first().map_or_else(
+                    || project.repository.clone(),
+                    |worktree| worktree.path.clone(),
+                );
+                self.update_device(Action::OpenIn {
+                    path: Some(path),
+                    panel: Panel::Worktrees,
+                })
+            }
+            SidebarRoute::Unavailable(reason) => {
+                self.status = Some(TransientNotice::warning(reason));
+                Task::none()
+            }
+        }
     }
 
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
@@ -1911,38 +2035,222 @@ mod tests {
     }
 
     #[test]
-    fn remote_sidebar_presentation_stays_in_the_sidebar() {
+    fn remote_sidebar_actions_run_use_their_device_equivalent_or_say_why() {
+        let project_id = ProjectId::new();
+        let worktree_id = crate::model::WorktreeId::new();
+        let command = |command| SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(worktree_id),
+            command,
+        };
+        let channel = crate::model::ChannelId::new();
         for action in [
             SidebarAction::SearchChanged("project".into()),
-            SidebarAction::SearchChanged(String::new()),
             SidebarAction::SetFilter(sidebar::SidebarFilter::Attention),
             SidebarAction::HideReadAttention,
-            SidebarAction::ToggleInProgress,
-            SidebarAction::ToggleControls,
-            SidebarAction::FocusFirstSearchResult,
-            SidebarAction::OpenFirstSearchResult,
             SidebarAction::Resize { width: 300.0 },
-            SidebarAction::ResizeFinished,
             SidebarAction::ReorderMember {
-                project: ProjectId::new(),
-                source: sidebar::SelectionRow::Channel(crate::model::ChannelId::new()),
+                project: project_id,
+                source: sidebar::SelectionRow::Channel(channel),
                 before: None,
             },
             SidebarAction::ReorderProject {
-                project: ProjectId::new(),
+                project: project_id,
                 before: None,
             },
-            SidebarAction::ProjectCommand {
-                project_id: ProjectId::new(),
-                worktree_id: None,
-                command: sidebar::ProjectCommand::ResetSidebarOrder,
+            SidebarAction::OpenRepositoryPicker,
+            SidebarAction::NewChannel { project_id },
+            SidebarAction::RenameChannel(channel),
+            SidebarAction::MarkChannelRead(channel),
+            SidebarAction::DeleteChannel {
+                channel_id: channel,
             },
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Channel(channel)),
+            command(sidebar::ProjectCommand::NewChannel),
+            command(sidebar::ProjectCommand::NewTerminal),
+            command(sidebar::ProjectCommand::CopyPath),
+            command(sidebar::ProjectCommand::CopyBranch),
+            command(sidebar::ProjectCommand::ResetSidebarOrder),
         ] {
-            assert!(supports_sidebar_action(&action));
+            assert_eq!(sidebar_route(&action), SidebarRoute::Run, "{action:?}");
         }
-        assert!(!supports_sidebar_action(
-            &SidebarAction::OpenRepositoryPicker
+        assert_eq!(
+            sidebar_route(&command(sidebar::ProjectCommand::Reveal)),
+            SidebarRoute::BrowseOnDevice {
+                project_id,
+                worktree_id: Some(worktree_id),
+            }
+        );
+        for action in [
+            command(sidebar::ProjectCommand::NewWorktree),
+            command(sidebar::ProjectCommand::NewWorktreeFromBranch),
+            command(sidebar::ProjectCommand::Delete),
+            SidebarAction::NewWorktree {
+                project_id,
+                repository: "/srv/demo/.git".into(),
+            },
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
+        ] {
+            assert_eq!(
+                sidebar_route(&action),
+                SidebarRoute::DeviceWorktrees { project_id },
+                "{action:?}"
+            );
+        }
+        for action in [
+            command(sidebar::ProjectCommand::Remove),
+            command(sidebar::ProjectCommand::PullRequest),
+            command(sidebar::ProjectCommand::OpenEditor("code".into())),
+            SidebarAction::DeleteRow(sidebar::SelectionRow::Project(project_id)),
+            SidebarAction::BrowsePullRequests { project_id },
+        ] {
+            assert!(
+                matches!(sidebar_route(&action), SidebarRoute::Unavailable(reason) if !reason.is_empty()),
+                "{action:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn remote_sidebar_commands_create_channels_and_open_the_matching_device_tool() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_SIDEBAR_COMMANDS";
+        const TEST: &str = "app::device_ui::tests::remote_sidebar_commands_create_channels_and_open_the_matching_device_tool";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "sidebar-test".into(),
+            host: "build-host".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("sidebar-test")).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        // Paths that exist only on the device.
+        let main = PathBuf::from("/srv/device-only/demo");
+        let linked = main.join(".worktrees/feature");
+        let project_id = ProjectId::new();
+        *app.sidebar_model.projects = vec![SidebarProject::new(
+            project_id,
+            RepositoryId(project_id.as_uuid()),
+            "demo".into(),
+            main.join(".git"),
+            Vec::new(),
+            Vec::new(),
+        )];
+        app.repository_generations.insert(project_id, 1);
+        drop(app.device_project_loaded(
+            project_id,
+            1,
+            Ok(crate::device_service::Navigation {
+                repository: main.join(".git"),
+                worktrees: vec![
+                    crate::device_service::NavigationWorktree {
+                        path: main.clone(),
+                        branch: Some("refs/heads/main".into()),
+                        ..Default::default()
+                    },
+                    crate::device_service::NavigationWorktree {
+                        path: linked.clone(),
+                        branch: Some("refs/heads/feature".into()),
+                        ..Default::default()
+                    },
+                ],
+            }),
         ));
+        let worktrees = app
+            .sidebar_model
+            .project(project_id)
+            .unwrap()
+            .worktrees
+            .clone();
+        let linked_id = worktrees
+            .iter()
+            .find(|worktree| worktree.path == linked)
+            .unwrap()
+            .id;
+
+        // The project menu's New channel asks for `NewChannel`, which the
+        // test delivers itself, since it doesn't run the returned task.
+        let channels = app.durable.channels.len();
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
+            command: sidebar::ProjectCommand::NewChannel,
+        })));
+        assert!(
+            !app.device_ui.open,
+            "New channel must not open the device tools"
+        );
+        assert!(app.status.is_none());
+        drop(app.update(Message::Sidebar(SidebarAction::NewChannel { project_id })));
+        assert!(
+            !app.device_ui.open,
+            "New channel must not open the device tools"
+        );
+        assert_eq!(app.durable.channels.len(), channels + 1);
+        let channel = app.durable.channels.last().unwrap();
+        assert_eq!(channel.project_id, project_id);
+        assert_eq!(app.durable.active_channel, Some(channel.id));
+
+        // Show in file manager browses that checkout on the device.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::Reveal,
+        })));
+        assert!(app.device_ui.open);
+        assert_eq!(app.device_ui.panel, Panel::Files);
+        assert_eq!(app.device_ui.path, linked.display().to_string());
+        // The listing is answered before the dialog closes.
+        let settle = |app: &mut Cagents| {
+            let generation = app.device_ui.generation;
+            drop(app.update_device(Action::Loaded {
+                generation,
+                result: Err("offline".into()),
+            }));
+            drop(app.update_device(Action::Close));
+            assert!(!app.device_ui.open);
+        };
+        settle(&mut app);
+
+        // New worktree uses the device's worktree tools at the main checkout.
+        drop(app.update(Message::Sidebar(SidebarAction::NewWorktree {
+            project_id,
+            repository: main.join(".git"),
+        })));
+        assert!(app.device_ui.open);
+        assert_eq!(app.device_ui.panel, Panel::Worktrees);
+        assert_eq!(app.device_ui.path, main.display().to_string());
+        settle(&mut app);
+
+        // What a device can't do yet says so instead of opening the tools.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
+            command: sidebar::ProjectCommand::Remove,
+        })));
+        assert!(!app.device_ui.open);
+        assert!(
+            app.status
+                .as_ref()
+                .is_some_and(|notice| notice.message.contains("isn't available on a device"))
+        );
     }
 
     #[test]
