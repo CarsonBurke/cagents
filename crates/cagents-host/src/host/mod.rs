@@ -1141,6 +1141,20 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         })
     };
     #[cfg(target_os = "macos")]
+    if let Some(crate::update::CutoverStartupCheckpoint::ParkedReady { digest, .. }) =
+        &cutover_checkpoint
+    {
+        let parked = update_recovery::park_carried_ready(&host, digest)
+            .map_err(io::Error::other)?
+            .ok_or_else(|| {
+                io::Error::other("The selected checkpoint lost its exact terminal roster")
+            })?;
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .publishing_startup = true;
+        parked_installed = Some(parked);
+    }
+    #[cfg(target_os = "macos")]
     let require_durable_workspace = match &ready_admission {
         Some(ready) => {
             ready.begin_workspace_effects()?;
@@ -1159,20 +1173,6 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(target_os = "macos")]
     if _durable_workspace && let Some(ready) = &ready_admission {
         ready.finish_workspace_initialization()?;
-    }
-    #[cfg(target_os = "macos")]
-    if let Some(crate::update::CutoverStartupCheckpoint::ParkedReady { digest, .. }) =
-        &cutover_checkpoint
-    {
-        let parked = update_recovery::park_carried_ready(&host, digest)
-            .map_err(io::Error::other)?
-            .ok_or_else(|| {
-                io::Error::other("The selected checkpoint lost its exact terminal roster")
-            })?;
-        host.lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .publishing_startup = true;
-        parked_installed = Some(parked);
     }
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
