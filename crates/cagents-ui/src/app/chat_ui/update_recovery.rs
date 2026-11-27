@@ -250,7 +250,14 @@ impl Cagents {
                     runtime.error = None;
                 } else {
                     let target = runtime.target;
-                    releases.push(self.handle_chat_ui_inner(Action::Reconnect(target)));
+                    let session = runtime.session.clone();
+                    // An agent's pane rejoins the agent the daemon restored,
+                    // and starts nothing beside it (see `reattach`).
+                    releases.push(if self.chat_runs_as_open_agent(card, &session) {
+                        self.chat_connection_lost(card, Instant::now())
+                    } else {
+                        self.handle_chat_ui_inner(Action::Reconnect(target))
+                    });
                 }
             } else if self
                 .chat_ui

@@ -2956,6 +2956,12 @@ impl Runtime {
             )
         } else if self.queued.is_some() {
             (Some(Icon::AgentWorking), "Starting")
+        } else if self.disconnected && self.reattaching && self.attachment_chooser_pending.is_none()
+        {
+            // Waiting for its next attempt or making one: either way the
+            // window is on it, and nothing here is being switched. An open
+            // file chooser holds the attempt back, and says so below.
+            (Some(Icon::AgentWorking), "Reconnecting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
         } else if self.attachment_chooser_pending.is_some() {

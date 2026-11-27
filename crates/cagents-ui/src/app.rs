@@ -353,6 +353,8 @@ enum NoticeKey {
     CardRestore(CardId),
     /// Closing this pane, which waits for another pane's close to finish.
     CloseWaiting(CardId),
+    /// Putting the conversations that lost their connection back on it.
+    ChatReattach,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20780,6 +20782,9 @@ impl Cagents {
                     self.update_update_ui(update_ui::Action::InspectInstallation)
                 };
                 self.daemon_health_ui.health = health;
+                // A daemon that answers again is asked for the conversations
+                // that could not reach it while it was away.
+                let reattach = self.chat_daemon_health_changed(Instant::now());
                 let confirmation = if !self.daemon_health_ui.health.unavailable()
                     && self.daemon_health_ui.confirmation
                 {
@@ -20787,7 +20792,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([inspection, confirmation])
+                Task::batch([inspection, confirmation, reattach])
             }
             Message::AcknowledgeSessionRecovery => {
                 if let Some(health) = &mut self.save_health {

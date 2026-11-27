@@ -1333,12 +1333,23 @@ and path so the producer can supply a concrete supported image.
 
 Chat work keeps running in the background when you switch worktrees or close
 the window. **Stop and close chat** interrupts active work and waits for the
-daemon before removing the pane. Disconnects keep the draft and offer
-**Reconnect to this session**. Transcripts use a private disk-backed cache and
-pageable display windows; use **Load earlier history** and **Jump to latest**
-to navigate. The cache is not a permanent archive or a fixed disk quota:
-explicitly closing the chat releases it, and provider session storage remains
-the source for resumed history.
+daemon before removing the pane. A chat that loses its connection, as when the
+daemon restarts, keeps its draft and reconnects by itself: the chats on screen
+first, a few at a time, waiting longer after each failed attempt. Its pane
+shows **Reconnecting** meanwhile, and **Reconnect now** skips the wait. A chat
+that still cannot reconnect keeps **Reconnect** and the reason, and one notice
+says how many chats came back and how many did not. Reconnecting does what
+**Reconnect** does: a provider that went down with the daemon starts again on
+the same conversation. No message is sent again; one you had queued behind the
+interrupted turn is sent once the chat is ready. A chat whose provider had
+already stopped is not started again unasked, and neither is the chat of an
+agent started with `cagents agent spawn`: its pane rejoins the agent when the
+daemon still runs it, and keeps **Reconnect** otherwise. A window opened on
+another device does not reconnect its chats by itself; use **Reconnect** there.
+Transcripts use a private disk-backed cache and pageable display windows; use
+**Load earlier history** and **Jump to latest** to navigate. The cache is not a
+permanent archive or a fixed disk quota: explicitly closing the chat releases
+it, and provider session storage remains the source for resumed history.
 
 ## Terminals and agent status
 

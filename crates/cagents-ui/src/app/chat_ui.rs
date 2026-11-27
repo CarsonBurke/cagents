@@ -132,6 +132,7 @@ mod pull_request_links;
 mod reasoning;
 pub(super) use pull_request_links::Board as PullRequestBoard;
 mod reader_source;
+mod reattach;
 mod retained;
 mod revised;
 pub(super) use closed_draft::closed_draft_source_matches;
@@ -330,6 +331,9 @@ pub enum Action {
     UpdateRecoveryAnswered(Result<crate::terminal::ipc::StartupState, String>),
     /// Time to ask the daemon about its update restore again.
     UpdateRecoveryDue,
+    /// Time for a disconnected conversation to try its connection again (see
+    /// `reattach`).
+    ReattachDue(Instant),
     /// The daemon finished its update restore: release what it refused.
     UpdateRecoveryReady,
     /// Sends a first message the update restore refused, once the daemon no
@@ -945,6 +949,7 @@ impl Action {
             Self::DictationOverdue(..) => "DictationOverdue",
             Self::UpdateRecoveryAnswered(..) => "UpdateRecoveryAnswered",
             Self::UpdateRecoveryDue => "UpdateRecoveryDue",
+            Self::ReattachDue(_) => "ReattachDue",
             Self::UpdateRecoveryReady => "UpdateRecoveryReady",
             Self::SendAgain(..) => "SendAgain",
             Self::ReopenStopped(..) => "ReopenStopped",
@@ -1166,6 +1171,9 @@ impl Action {
                 | Self::ResumeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
+                // A timer fires once: one dropped under a dialog would leave
+                // its conversations waiting for an attempt nothing makes.
+                | Self::ReattachDue(..)
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::CommandsDue(..)
@@ -1631,6 +1639,9 @@ pub(super) struct State {
     /// What the daemon last said about its update restore, for the panes
     /// that wait on it.
     update_recovery: update_recovery::Watch,
+    /// The conversations that lost their connection and are being put back
+    /// without being asked.
+    reattach: reattach::Reattach,
     /// Expanded diagnostics belong to the exact failed source, never a replacement.
     blocked_details: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
@@ -1692,6 +1703,7 @@ impl Default for State {
             held_for_start: HashMap::new(),
             resuming_on_attach: HashMap::new(),
             update_recovery: update_recovery::Watch::default(),
+            reattach: reattach::Reattach::default(),
             blocked_details: HashMap::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
@@ -3834,6 +3846,9 @@ pub(super) struct Runtime {
     commands: commands::Commands,
     next_command: u64,
     disconnected: bool,
+    /// The window is putting this disconnected conversation back by itself
+    /// (see `reattach`), so its pane says so rather than asking for a click.
+    reattaching: bool,
     /// A fingerprint of the models this conversation last listed to the
     /// catalog, which takes each list once rather than on every change.
     listed_models: u64,
@@ -5548,6 +5563,7 @@ impl Runtime {
             commands: commands::Commands::default(),
             next_command: 0,
             disconnected: false,
+            reattaching: false,
             listed_models: 0,
             visible: AtomicBool::new(visible),
             warm: None,
@@ -11239,6 +11255,7 @@ impl Cagents {
         self.release_draft_start_capture(card);
         self.stash_unsent_chat(card);
         self.chat_ui.phases.remove(&card);
+        self.reattach_forget(card);
         self.observe_agent_activity_for_card(card, None);
     }
 
@@ -14058,7 +14075,31 @@ impl Cagents {
             }
             _ => Task::none(),
         };
+        // How a start on a conversation that is reconnecting by itself
+        // failed, read before the handler takes the answer.
+        let reattach_answer = match &action {
+            Action::Ready(target, ready) if self.chat_ui.reattach.tracks(target.card) => Some((
+                *target,
+                ready.0.lock().ok().and_then(|result| {
+                    result
+                        .as_ref()
+                        .and_then(|result| result.as_ref().err())
+                        .map(|failure| failure.recovery)
+                }),
+                self.chat_ui
+                    .attempt(target.card)
+                    .is_some_and(|attempt| attempt.target == *target),
+            )),
+            _ => None,
+        };
         let task = Task::batch([failed_start_cleanup, self.handle_chat_ui_inner(action)]);
+        let task = match reattach_answer {
+            Some((target, refused, current)) => Task::batch([
+                task,
+                self.reattach_answered(target, refused, current, Instant::now()),
+            ]),
+            None => task,
+        };
         let task = match insert_ended {
             Some(target)
                 if self
@@ -14215,6 +14256,7 @@ impl Cagents {
                 return self.update_recovery_answered(answer);
             }
             Action::UpdateRecoveryDue => return self.update_recovery_due(),
+            Action::ReattachDue(due) => return self.reattach_due(due, Instant::now()),
             Action::UpdateRecoveryReady => return self.release_update_recovery(),
             Action::SendAgain(target) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -15335,7 +15377,10 @@ impl Cagents {
                             )
                             // An agent ran there, and giving up its card
                             // would end the agent and its conversation.
-                            && !self.chat_runs_as_open_agent(target.card, &attempt.session) =>
+                            && !self.chat_runs_as_open_agent(target.card, &attempt.session)
+                            // Nobody asked for this attempt, so it may not
+                            // take the pane's transcript away either.
+                            && !self.chat_ui.reattach.attaching(target) =>
                     {
                         // A conversation its provider never named, and that
                         // no CLI terminal of the reader's holds, has nothing
@@ -15726,6 +15771,7 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.refresh_session();
+                let lost = matches!(wake, Wake::Disconnected(_));
                 match wake {
                     Wake::ExitedQueue(..) | Wake::CompletedQueue { .. } => return Task::none(),
                     Wake::Changed => {
@@ -15900,6 +15946,11 @@ impl Cagents {
                 let session = runtime.session.clone();
                 self.commit_chat_session(target.card, session);
                 self.observe_agent_activity_for_card(target.card, None);
+                if lost {
+                    // Nobody has to find this pane's Reconnect: the window
+                    // tries the connection again by itself.
+                    return self.chat_connection_lost(target.card, Instant::now());
+                }
             }
             Action::SignIn(target, account) => return self.sign_in_chat(target, account),
             Action::ResumeAfterSignIn(target) => {
