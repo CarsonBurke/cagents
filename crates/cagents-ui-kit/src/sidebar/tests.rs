@@ -2215,18 +2215,18 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
         for (mode, pressed, tooltip) in [
             (
                 crate::settings::SidebarWorktrees::Grouped,
-                Toggled::False,
+                Toggled::True,
                 "Hide checkouts",
             ),
             (
                 crate::settings::SidebarWorktrees::Expanded,
-                Toggled::False,
+                Toggled::True,
                 "Hide checkouts",
             ),
             (
                 crate::settings::SidebarWorktrees::Hidden,
-                Toggled::True,
-                "Show checkouts (hidden in every project)",
+                Toggled::False,
+                "Show checkouts in every project",
             ),
         ] {
             state.set_sidebar_worktrees(mode);
@@ -2258,8 +2258,8 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
             let toggle = buttons.get(bell + 1).expect("beside the bell");
             assert_eq!(
                 (toggle.label(), toggle.toggled()),
-                (Some(CHECKOUTS_TOGGLE_NAME), Some(pressed)),
-                "{mode:?}, compact {compact}: the name stays and the pressed state says it"
+                (Some("Show checkouts"), Some(pressed)),
+                "{mode:?}, compact {compact}: the name stays and it is pressed while they show"
             );
             assert!(
                 !buttons.iter().any(|node| node
@@ -2299,7 +2299,7 @@ fn the_checkouts_toggle_names_the_all_view_from_attention() {
         ),
         (
             crate::settings::SidebarWorktrees::Hidden,
-            "Show checkouts in the All view (hidden in every project)",
+            "Show checkouts in the All view",
         ),
     ] {
         state.set_sidebar_worktrees(mode);
@@ -5145,6 +5145,20 @@ fn cached_sidebar_project_submenu_opens_over_expanded_rows_at_label_and_arrow() 
                 })
                 .1
                 .center();
+            // While the default hides them, the submenu leads with showing
+            // them, as well as the menu beside New worktree: a mode chosen
+            // there applies only once they show.
+            let show_entries = probe
+                .texts
+                .iter()
+                .filter(|(text, _)| text == "Show checkouts in every project")
+                .count();
+            assert_eq!(
+                show_entries,
+                if mode.shows_checkouts() { 0 } else { 2 },
+                "{case}: {:?}",
+                probe.texts
+            );
             assert!(
                 messages.is_empty(),
                 "{case}: hover must not activate rows: {messages:?}"

@@ -6676,29 +6676,28 @@ pub fn checkouts_toggle_focus_id() -> Id {
 }
 
 /// The checkouts toggle's accessible name, whatever its state.
-const CHECKOUTS_TOGGLE_NAME: &str = "Hide checkouts";
+const CHECKOUTS_TOGGLE_NAME: &str = "Show checkouts";
 
-/// Shows or hides every project's checkouts. Like the Attention bell beside
-/// it, it is lit while it narrows the list, so a list without checkouts never
-/// passes for the whole one. Its name stays fixed and its pressed state says
-/// whether checkouts are hidden, as the bell's does for its filter; the
-/// tooltip says what a press does. Hiding them by default overrides each
-/// project's own mode, which the hidden tooltip says.
+/// Shows or hides every project's checkouts, which start hidden. It is lit
+/// and pressed while they show, like any toggle that turns something on;
+/// its name stays fixed and the tooltip says what a press does. Hiding them
+/// by default overrides each project's own mode, so showing them is said to
+/// apply in every project, as the project menu says it.
 ///
 /// Only the All view lists checkouts: Attention names panes instead. The
-/// setting persists, so the toggle stays
-/// live elsewhere and its tooltip names the view it changes.
+/// setting persists, so the toggle stays live elsewhere and its tooltip
+/// names the view it changes.
 fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, SidebarAction> {
-    let hidden = !state.sidebar_worktrees.shows_checkouts();
+    let shown = state.sidebar_worktrees.shows_checkouts();
     crate::interaction::tooltip(
         crate::interaction::pressed(
             centered_icon_handle_button(worktree_icon(), ICON_CONTROL_SIZE, ICON_CONTROL_SIZE)
-                .class(sidebar_button_style(hidden))
+                .class(sidebar_button_style(shown))
                 .id(checkouts_toggle_focus_id())
                 .name(CHECKOUTS_TOGGLE_NAME)
-                .selected(hidden)
+                .selected(shown)
                 .on_press_maybe(gated(SidebarAction::ToggleCheckouts, modal_open)),
-            hidden,
+            shown,
         ),
         checkouts_toggle_tooltip(state),
     )
@@ -6706,12 +6705,12 @@ fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, 
 
 /// What pressing the checkouts toggle does, in the view it changes.
 fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
-    let hidden = !state.sidebar_worktrees.shows_checkouts();
-    match (hidden, state.filter == SidebarFilter::All) {
-        (false, true) => "Hide checkouts",
-        (true, true) => "Show checkouts (hidden in every project)",
-        (false, false) => "Hide checkouts in the All view",
-        (true, false) => "Show checkouts in the All view (hidden in every project)",
+    let shown = state.sidebar_worktrees.shows_checkouts();
+    match (shown, state.filter == SidebarFilter::All) {
+        (false, true) => "Show checkouts in every project",
+        (true, true) => "Hide checkouts",
+        (false, false) => "Show checkouts in the All view",
+        (true, false) => "Hide checkouts in the All view",
     }
 }
 
@@ -10096,8 +10095,18 @@ fn context_controls_with_display<'a>(
         if let Some((global, override_mode)) = display.filter(|_| selection_count == Some(1) && git)
         {
             // A hidden default hides every project's checkouts, whatever
-            // mode the project has; that mode applies once they show.
-            let mut choices = vec![Item::CheckBox(
+            // mode the project has; that mode applies once they show, so
+            // the choices lead with showing them.
+            let mut choices = Vec::new();
+            if !global.shows_checkouts() {
+                choices.push(Item::Button(
+                    "Show checkouts in every project".into(),
+                    Some(worktree_icon()),
+                    ContextCommand::ShowCheckouts(project_id, global),
+                ));
+                choices.push(Item::Divider);
+            }
+            choices.push(Item::CheckBox(
                 if global.shows_checkouts() {
                     format!("Use default ({})", global.label())
                 } else {
@@ -10106,7 +10115,7 @@ fn context_controls_with_display<'a>(
                 None,
                 override_mode.is_none(),
                 ContextCommand::Display(project_id, None),
-            )];
+            ));
             choices.extend(
                 crate::settings::SidebarWorktrees::ALL
                     .into_iter()
