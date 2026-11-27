@@ -101,9 +101,19 @@ impl Cagents {
                 // comparison are kept current exactly as a rebuild would.
                 self.apply_worktree_status(&key, &snapshot.status);
                 let branch = self.refresh_branch_changes(&snapshot);
-                return ControlFlow::Continue(Task::batch([branch, self.load_deferred_files()]));
+                let diff = if repository_changed {
+                    self.refresh_device_working_diff(&key)
+                } else {
+                    Task::none()
+                };
+                return ControlFlow::Continue(Task::batch([
+                    branch,
+                    diff,
+                    self.load_deferred_files(),
+                ]));
             }
             Err(error) => {
+                self.device_working_diff_unavailable(&key, &error);
                 self.replace_source_control(SourceControlModel::failed(key, error));
                 self.cancel_branch_changes();
                 // A device's Changes are only read on a timer, so a device
@@ -125,7 +135,8 @@ impl Cagents {
             self.sidebar_state.adopt_operation_message(source);
         }
         let branch = self.refresh_branch_changes(&snapshot);
-        ControlFlow::Continue(Task::batch([branch, self.load_deferred_files()]))
+        let diff = self.refresh_device_working_diff(&key);
+        ControlFlow::Continue(Task::batch([branch, diff, self.load_deferred_files()]))
     }
 
     /// Reads the bound worktree again when Files is shown over rows whose

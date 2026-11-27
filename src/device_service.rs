@@ -616,7 +616,20 @@ const MAX_REMOTE_DIFF_SIDE_BYTES: u64 = 2 * 1024 * 1024;
 #[cfg(feature = "host")]
 fn repository(request: crate::repository::RepositoryRequest) -> Result<String, String> {
     use crate::repository::{CancellationToken, RepositoryService};
-    let worktree = std::fs::canonicalize(request.worktree()).map_err(|error| error.to_string())?;
+    let requested = request.worktree();
+    let worktree = std::fs::canonicalize(requested).map_err(|error| {
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ) {
+            format!(
+                "The device checkout could not be found at {}. Open an existing checkout to see its changes.",
+                requested.display()
+            )
+        } else {
+            format!("Couldn't read the device checkout at {}: {error}", requested.display())
+        }
+    })?;
     // A change waits for any other change to the same worktree, from this
     // window or another, as Device files' Git operations do.
     let too_large = match &request {
@@ -1611,6 +1624,23 @@ mod tests {
             std::fs::read(root.join("selected.txt")).unwrap(),
             b"working bytes\n"
         );
+    }
+
+    #[test]
+    fn a_missing_device_checkout_names_its_path() {
+        use crate::repository::{RepositoryRequest, SnapshotOptions};
+
+        let directory = tempfile::tempdir().unwrap();
+        let checkout = directory.path().join("removed-worktree");
+        let error = repository(RepositoryRequest::Snapshot {
+            worktree: checkout.clone(),
+            options: SnapshotOptions::default(),
+            previous: None,
+            files: false,
+        })
+        .unwrap_err();
+        assert!(error.contains("The device checkout could not be found"));
+        assert!(error.contains(checkout.to_string_lossy().as_ref()));
     }
 
     #[test]
