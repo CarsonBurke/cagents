@@ -9733,6 +9733,10 @@ fn worktree_view<'a>(
             .is_some_and(SidebarPullRequest::review_requested)
         {
             status_width = 0.0;
+        } else {
+            // The review slot follows the status even when empty, so the
+            // status ends a gutter further in from the row's end.
+            status_width += ROW_GUTTER;
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
             pr.review_requested().then(|| {

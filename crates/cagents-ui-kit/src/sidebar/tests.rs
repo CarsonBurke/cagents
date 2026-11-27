@@ -4500,6 +4500,90 @@ fn a_wide_channel_status_gives_way_to_its_title_and_hides_under_delete() {
     }
 }
 
+#[test]
+fn a_merged_worktrees_wide_status_hides_under_its_delete() {
+    fn nodes(layout: Layout<'_>, out: &mut Vec<Rectangle>) {
+        out.push(layout.bounds());
+        for child in layout.children() {
+            nodes(child, out);
+        }
+    }
+    let renderer = headless_renderer();
+    let mut worktree = worktree(3, "feature", false);
+    let mut pr = project().pull_requests.remove(0);
+    pr.state = Some(WorktreePullRequestState::Merged);
+    worktree.set_pull_request(pr);
+    let mut row_state = WorktreeRowState::default();
+    row_state.attention.unread = 120;
+    row_state.attention.waiting = 1;
+    let bound = attention_status::<SidebarAction>(row_state.attention)
+        .expect("the worktree has news")
+        .width_bound;
+    for width in (200..=360).step_by(40) {
+        let width = width as f32;
+        let mut element = worktree_view(
+            project_id(1),
+            &worktree,
+            false,
+            None,
+            false,
+            true,
+            &[],
+            row_state,
+            false,
+            Some(1),
+            "",
+            false,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, WORKTREE_ROW_HEIGHT)),
+        );
+        let mut collect = TextsAndControls::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
+        let badge = collect
+            .texts
+            .iter()
+            .find(|(text, _)| text == "99+")
+            .expect("the row draws its unread count")
+            .1;
+        let delete = collect
+            .controls
+            .iter()
+            .find(|(id, _)| *id == worktree.chrome.delete_id)
+            .expect("the row mounts its delete button")
+            .1;
+        // The fill behind the button: the narrowest box that ends with the
+        // button and spans the row's height, short of the whole row.
+        let mut boxes = Vec::new();
+        nodes(Layout::new(&node), &mut boxes);
+        let fill = boxes
+            .into_iter()
+            .filter(|bounds| {
+                (bounds.x + bounds.width - (delete.x + delete.width)).abs() < 0.5
+                    && bounds.x < delete.x
+                    && bounds.height >= WORKTREE_ROW_HEIGHT - 0.5
+                    && bounds.width < width - 0.5
+            })
+            .min_by(|a, b| a.width.total_cmp(&b.width))
+            .expect("the delete button has a fill wider than itself");
+        // The status ends with the waiting mark's column after the pill,
+        // whose figures sit inside its 5 px inset. A font drawing the status
+        // as wide as its bound must still be covered, so the fill reaches
+        // the bound back from that end, not just the figures drawn here.
+        let status_end = badge.x + badge.width + 5.0 + ATTENTION_COUNT_GAP + ROW_STATUS_WIDTH;
+        assert!(
+            status_end - bound >= fill.x - 0.5,
+            "at {width}px a status {bound}px wide ending at {status_end} peeks past the \
+             delete fill {fill:?}"
+        );
+    }
+}
+
 /// How far right anything inside the scroll viewport's padded content
 /// reaches. The `filtered_scroll` decorator, the scrollable and its content
 /// container all span the pane deliberately; the first node inside that
