@@ -703,7 +703,9 @@ impl ControlClient {
                 command: crate::agent_execution::ConsoleCommand::Submit { .. },
                 ..
             } => Some(AGENT_SUBMIT_TIMEOUT),
-            Operation::Prompt { .. } | Operation::Deliver(_) => Some(AGENT_RESUME_TIMEOUT),
+            Operation::Prompt { .. } | Operation::Deliver(_) | Operation::Resume(_) => {
+                Some(AGENT_RESUME_TIMEOUT)
+            }
             _ => None,
         }
         .map(|budget| Instant::now() + budget);

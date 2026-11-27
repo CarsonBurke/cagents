@@ -2,6 +2,7 @@ mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
 mod pane_move;
+mod resume;
 mod retained_automation;
 mod transcript;
 mod working_directory;
@@ -2488,7 +2489,8 @@ fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_proce
         1
     );
     // Work for the stopped agent is never sent to a process that is gone. A
-    // conversation that cannot reopen by itself fails with a way forward.
+    // conversation whose earlier process this daemon cannot prove ended fails
+    // with a way forward.
     let refused = submit(
         &restarted,
         &Authority::default(),
@@ -2507,7 +2509,7 @@ fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_proce
             .result
             .diagnostic
             .as_deref()
-            .is_some_and(|text| text.contains("Resume it from its pane")),
+            .is_some_and(|text| text.contains("Cannot reopen the agent's conversation")),
         "{refused:?}"
     );
     // Closing needs no teardown proof from the gone actor: the stop recorded
@@ -7747,7 +7749,10 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
         panic!("{handed:?}");
     };
     assert_eq!(*agent, accepted.agent.id);
-    assert!(reason.contains("Resume it from its pane"), "{reason}");
+    assert!(
+        reason.contains("Cannot reopen the agent's conversation"),
+        "{reason}"
+    );
     let (message, latest) = {
         let registry = registry(&host).unwrap();
         let registry = registry.lock().unwrap();
@@ -7794,7 +7799,9 @@ fn a_message_to_a_stopped_agent_that_cannot_reopen_waits_and_says_why() {
             "{attempt}: {error}"
         );
         assert!(
-            error.to_string().contains("Resume it from its pane"),
+            error
+                .to_string()
+                .contains("Cannot reopen the agent's conversation"),
             "{attempt}: {error}"
         );
     }

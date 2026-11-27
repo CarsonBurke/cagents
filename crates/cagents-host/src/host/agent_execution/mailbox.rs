@@ -63,7 +63,7 @@ const PERSON_FIRST: Duration = Duration::from_secs(20);
 const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The shortest handle a session can be named by, so a typo does not reach
 /// a stranger that happens to share one character.
-const MIN_HANDLE: usize = 4;
+pub(super) const MIN_HANDLE: usize = 4;
 
 /// Sends as an older CLI asks to, without reporting the recipient.
 pub(in crate::host) fn send(
@@ -472,8 +472,10 @@ fn leave(
         let (to, reply_to) = match &outgoing.to {
             To::Session(handle) => (
                 Some(
-                    resolve(&model.agents, &live, &lineage_of, handle)
-                        .map_err(|error| stopped(&listing, handle).unwrap_or(error))?,
+                    resolve(&model.agents, &live, &lineage_of, handle).map_err(|error| {
+                        stopped(&listing, &registry, &origin, &model.agents, handle)
+                            .unwrap_or(error)
+                    })?,
                 ),
                 None,
             ),
@@ -560,17 +562,29 @@ fn recipient(listing: &directory::Listing, lineage: Lineage) -> Option<Member> {
 }
 
 /// Why `handle` names no live session when it names one whose provider
-/// exited: such a session cannot take a message until it is resumed.
-fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
-    let handle = handle.to_ascii_lowercase();
-    if handle.len() < MIN_HANDLE {
+/// exited: such a session cannot take a message until it is resumed. It
+/// names the session `cagents resume` would reopen for the same handle, and
+/// offers the command only to a sender `origin` that may resume it.
+fn stopped(
+    listing: &directory::Listing,
+    registry: &crate::host::model::Registry,
+    origin: &Origin,
+    agents: &[crate::agent_execution::Agent],
+    handle: &str,
+) -> Option<String> {
+    let mine = |id| super::resume::may_resume(origin, super::resume::open_agent(agents, id));
+    let super::resume::Resolved::Stopped(id, _) = super::resume::resolve(
+        listing.members(),
+        agents,
+        handle,
+        |lineage| registry.lineage_succession(lineage),
+        mine,
+    )
+    .ok()?
+    else {
         return None;
-    }
-    let member = listing.members().find(|member| {
-        member.exited
-            && (member.session.id.to_string().starts_with(&handle)
-                || member.session.lineage.to_string().starts_with(&handle))
-    })?;
+    };
+    let member = listing.members().find(|member| member.session.id == id)?;
     let mut reason = format!(
         "Session {} has stopped: its provider exited, so it cannot receive messages",
         member.session.id
@@ -578,9 +592,15 @@ fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
     if let Some(failure) = &member.failure {
         reason.push_str(&format!(" ({failure})"));
     }
-    reason.push_str(
-        ". Resume its conversation first, or message another session from `cagents sessions --all`",
-    );
+    if mine(id) {
+        reason.push_str(&format!(
+            ". Resume its conversation first with `cagents resume {id}`, or message another session from `cagents sessions --all`"
+        ));
+    } else {
+        reason.push_str(&format!(
+            ". The person can resume its conversation with `cagents resume {id}`; message another session from `cagents sessions --all` meanwhile"
+        ));
+    }
     Some(reason)
 }
 
@@ -864,7 +884,7 @@ impl Handle {
 
     /// Keep unclaimed inputs durable during approved interruption. Follow the
     /// fence without holding daemon control or joining its waiter at shutdown.
-    fn defers_for_update(&self) -> bool {
+    pub(super) fn defers_for_update(&self) -> bool {
         let Some(runtime) = &self.0.update_runtime else {
             return false;
         };

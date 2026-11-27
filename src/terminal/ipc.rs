@@ -351,7 +351,9 @@ use crate::{
 /// and `EditEffects::project_order`, and the `ReorderProjects` and
 /// `SeedProjectOrder` edits that change it. An older client is sent the model
 /// and effects without it, and cannot send either edit.
-pub const PROTOCOL_VERSION: u16 = 211;
+///
+/// Version 212 adds listing and resuming stopped sessions without a window.
+pub const PROTOCOL_VERSION: u16 = 212;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

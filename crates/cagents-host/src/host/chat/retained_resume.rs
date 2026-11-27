@@ -484,12 +484,7 @@ pub(super) fn unstarted_for_start(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Option<Unstarted>, SetupError> {
-    if source.launch.provider != Provider::Claude
-        || source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly
-        || source.proof.is_some()
-        || source.terminal.is_some()
-        || source.launch.session_id.is_none()
-    {
+    if !crate::chat::is_unstarted_resume_successor(source) {
         return Ok(None);
     }
     let proof = {

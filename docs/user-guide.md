@@ -1014,6 +1014,40 @@ After a confirmed close, or a kernel boot change, the picker resumes the exact
 conversation from disk. Missing ownership evidence within the same boot keeps
 the conversation available and explains the refusal without starting a writer.
 
+Without a window, as on a headless machine after a reboot, resume them from the
+CLI. `cagents resume` on its own lists the stopped sessions that can be
+resumed, with the reason each one stopped, such as a provider whose sign-in
+needs attention, and how many more only their panes in the app can reopen. It
+resumes nothing. Then resume sessions by session, lineage or agent ID, or a
+prefix of at least four characters, as `cagents send` takes them, or every
+stopped session in a scope:
+
+```sh
+cagents resume                      # list what can be resumed
+cagents resume 7c0fba49 4518d661
+cagents resume --project cagents
+cagents resume --all
+cagents --device desktop resume     # list another machine's
+cagents --device desktop resume --all
+```
+
+`--list` lists a given scope instead of resuming it, as in
+`cagents resume --list --project cagents`. Inside an agent session's terminal,
+`--channel` names that session's channel, or `--channel CHANNEL` another.
+
+Each one reopens through the same checks as its pane's Resume: the exact
+conversation, original account and working directory, and proof that no
+earlier process still writes it. A conversation an earlier process still holds
+is reattached to that process rather than started a second time. The pane then
+shows the running conversation, so a window opened later does not start it
+again. A conversation that is already running is reported and left alone. Each
+waits idle for its next message; nothing the stopped provider held is resent.
+Unlike the pane's Resume, it does not put messages still queued when the
+provider stopped back into a draft, so send any that still matter again. A
+session that cannot resume says why, and the command exits with status 4 once
+the others have been tried. A chat paired with its provider's terminal still
+resumes from its pane in the app.
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline
