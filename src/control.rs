@@ -3893,6 +3893,13 @@ where
         .as_deref()
         .is_none_or(|name| name == "local")
         && !crate::device::is_remote();
+    if hosted
+        && let TopCommand::Account { command } = &cli.command
+        && let Some(error) = accounts::hosted_refusal(command)
+    {
+        emit_error(cli.global.json, &error);
+        return ExitCode::FAILURE;
+    }
     let user_only_message: Option<std::borrow::Cow<'static, str>> = match &cli.command {
         // A development daemon with a runtime of its own, such as a runner
         // instance, is the caller's to stop unless it hosts the caller or a
@@ -3924,13 +3931,6 @@ where
         | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
-        TopCommand::Account {
-            command:
-                AccountCommand::Link { .. }
-                | AccountCommand::Default { .. }
-                | AccountCommand::Remove { .. }
-                | AccountCommand::Reset { .. },
-        } => Some("Account changes require your own terminal".into()),
         // An agent must never link a device or grant itself access to one.
         TopCommand::Device { command } if command.changes_access() => {
             Some("Device links and grants require your own terminal".into())

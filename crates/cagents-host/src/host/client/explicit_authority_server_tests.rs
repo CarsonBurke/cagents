@@ -402,6 +402,67 @@ fn wait_error(handle: &HostedTerminalHandle) -> String {
 }
 
 #[test]
+fn live_hosted_reset_has_an_exact_submitter_and_cannot_change_account_lifecycle() {
+    use crate::{
+        account::resets::ConsumeRequest, agent_execution::Lineage, device_service::Operation,
+    };
+
+    let name = thread::current().name().unwrap().to_owned();
+    let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
+        return;
+    };
+    let server = PrivateServer::new(&root, true);
+    let mut bootstrap = server.fixture_user();
+    let caller = terminal(&root, "reset-caller");
+    bootstrap.spawn(caller.clone(), Default::default()).unwrap();
+
+    let mut client = ControlClient::connect(&server.socket).unwrap();
+    client
+        .authenticate(server.issued_authority(caller.id))
+        .unwrap();
+    let host = &server.host;
+    let id = {
+        let state = host.lock().unwrap();
+        *state.agent_clients.keys().next().unwrap()
+    };
+    let actor = crate::host::agent_execution::terminals::reset_actor(host, id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(actor.lineage, Lineage(caller.id));
+    assert_eq!(actor.session, Some(caller.id));
+
+    // Use a nonexistent account so the admitted handler never contacts a provider.
+    let account = format!("claude/{}", uuid::Uuid::new_v4()).parse().unwrap();
+    let reset = client.device_operation(Operation::AccountReset {
+        request: ConsumeRequest {
+            account,
+            reset_id: "fixture-grant".into(),
+            idempotency_key: "fixture-key".into(),
+            expected_identity: None,
+        },
+    });
+    assert!(matches!(
+        reset,
+        Err(crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            ..
+        })
+    ));
+    let remove = client.device_operation(Operation::AccountLifecycle {
+        operation: crate::account::remote::Operation::Remove {
+            id: "claude/system".parse().unwrap(),
+        },
+    });
+    assert!(matches!(
+        remove,
+        Err(crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
+            ..
+        })
+    ));
+}
+
+#[test]
 fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pty_input() {
     let name = thread::current().name().unwrap().to_owned();
     let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {

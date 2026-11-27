@@ -239,6 +239,7 @@ pub(super) fn read(
 pub(in crate::host) fn consume(
     host: &SharedHost,
     request: crate::account::resets::ConsumeRequest,
+    actor: Option<crate::account::resets::ResetActor>,
 ) -> Result<crate::account::resets::ConsumeOutcome, String> {
     let registry = Store::installation()
         .ok_or("Account registry is unavailable")?
@@ -281,6 +282,7 @@ pub(in crate::host) fn consume(
             request.idempotency_key,
             request.expected_identity,
             Cache::installation(),
+            actor,
         ))
     })
 }

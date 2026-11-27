@@ -1,5 +1,5 @@
 //! Explicit, account-bound reset attempts. No path here retries a consume.
-use super::super::resets::{ConsumeOutcome, ConsumeStatus, may_act_for};
+use super::super::resets::{ConsumeOutcome, ConsumeStatus, ResetActor, may_act_for};
 use super::*;
 use sha2::{Digest, Sha256};
 
@@ -9,6 +9,7 @@ pub async fn consume(
     idempotency_key: String,
     expected_identity: Option<Identity>,
     cache: Option<Cache>,
+    actor: Option<ResetActor>,
 ) -> ConsumeOutcome {
     if idempotency_key.is_empty()
         || idempotency_key.len() > 64
@@ -25,7 +26,7 @@ pub async fn consume(
     else {
         return ConsumeOutcome::unavailable("Refresh this account before confirming a reset");
     };
-    let binding = binding(&account, &reset_id, &idempotency_key, &expected);
+    let binding = binding(&account, &reset_id, &idempotency_key, &expected, actor);
     let prior = match read_attempt(&binding) {
         Ok(prior) => prior,
         Err(message) => return ConsumeOutcome::unavailable(message),
@@ -152,6 +153,16 @@ pub async fn consume(
         Ok(Ok(status)) => status,
         _ => ConsumeStatus::Unconfirmed,
     };
+    if let Some(actor) = actor {
+        tracing::info!(
+            account = %account.id(),
+            reset = %reset_id,
+            lineage = %actor.lineage,
+            session = ?actor.session,
+            ?status,
+            "Hosted usage reset request settled"
+        );
+    }
     // Always observe the provider after submission, even after a disconnect.
     // Percentages are never optimistically cleared from the consume reply.
     let refreshed = run(account.clone(), cache, true).await;
@@ -253,17 +264,25 @@ pub(super) async fn codex_consume(
     after_close(result, session.close()).await
 }
 
-#[derive(serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(serde::Serialize, serde::Deserialize)]
 struct Attempt {
     account: String,
     reset_id: String,
     identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    actor: Option<ResetActor>,
 }
 struct Binding {
     path: PathBuf,
     attempt: Attempt,
 }
-fn binding(account: &Account, reset_id: &str, key: &str, expected: &Identity) -> Binding {
+fn binding(
+    account: &Account,
+    reset_id: &str,
+    key: &str,
+    expected: &Identity,
+    actor: Option<ResetActor>,
+) -> Binding {
     let identity = format!(
         "{:x}",
         Sha256::digest(
@@ -294,6 +313,7 @@ fn binding(account: &Account, reset_id: &str, key: &str, expected: &Identity) ->
             account: account.id().to_string(),
             reset_id: reset_id.into(),
             identity,
+            actor,
         },
     }
 }
@@ -308,7 +328,12 @@ fn read_attempt(binding: &Binding) -> Result<bool, String> {
             }
             let previous: Attempt = serde_json::from_slice(&bytes)
                 .map_err(|_| "The previous reset attempt cannot be verified")?;
-            if previous != binding.attempt {
+            // A person can resolve an agent's unconfirmed attempt using its
+            // exact key. Keep the original submitter on disk across recovery.
+            if previous.account != binding.attempt.account
+                || previous.reset_id != binding.attempt.reset_id
+                || previous.identity != binding.attempt.identity
+            {
                 return Err("This idempotency key belongs to another reset or login".into());
             }
             Ok(true)
@@ -368,6 +393,40 @@ mod tests {
         );
     }
     #[test]
+    fn reset_attempt_preserves_the_original_authenticated_actor_during_recovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().canonicalize().unwrap().join("attempt.json");
+        let session = crate::model::TerminalId::new();
+        let actor = ResetActor {
+            lineage: crate::agent_execution::Lineage(session),
+            session: Some(session),
+        };
+        let mut binding = Binding {
+            path,
+            attempt: Attempt {
+                account: "claude/system".into(),
+                reset_id: "cedar_ember/grant".into(),
+                identity: "identity-digest".into(),
+                actor: Some(actor),
+            },
+        };
+        assert!(write_attempt(&binding).unwrap());
+        binding.attempt.actor = None;
+        assert!(read_attempt(&binding).unwrap());
+        assert!(!write_attempt(&binding).unwrap());
+        let recorded: Attempt =
+            serde_json::from_slice(&std::fs::read(&binding.path).unwrap()).unwrap();
+        assert_eq!(recorded.actor, Some(actor));
+        let legacy: Attempt = serde_json::from_value(json!({
+            "account": "claude/system",
+            "reset_id": "cedar_ember/grant",
+            "identity": "identity-digest",
+        }))
+        .unwrap();
+        assert_eq!(legacy.actor, None);
+    }
+
+    #[test]
     fn same_key_record_is_created_once_and_cannot_change_account_or_grant() {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().canonicalize().unwrap().join("attempt.json");
@@ -377,6 +436,7 @@ mod tests {
                 account: "claude/system".into(),
                 reset_id: "cedar_ember/grant".into(),
                 identity: "identity-digest".into(),
+                actor: None,
             },
         };
         assert!(write_attempt(&binding).unwrap());
@@ -391,6 +451,7 @@ mod tests {
                     account: account.into(),
                     reset_id: reset_id.into(),
                     identity: "identity-digest".into(),
+                    actor: None,
                 },
             };
             assert!(write_attempt(&wrong).is_err());

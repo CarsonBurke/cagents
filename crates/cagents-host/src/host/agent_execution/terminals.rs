@@ -31,6 +31,7 @@ enum Access<'a> {
     /// Moves a pane to another channel. The handler authorizes the pane it
     /// reads, at the view revision it moves it at, with [`authorize_move`].
     Place,
+    AccountReset,
     /// Belongs to the user alone, or carries an authority of its own.
     Refused,
 }
@@ -99,6 +100,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         }
         R::Spawn { session, .. } => Access::Spawn(session),
         R::MovePane { .. } => Access::Place,
+        R::DeviceOperation {
+            operation: crate::device_service::Operation::AccountReset { .. },
+        } => Access::AccountReset,
         R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
@@ -232,7 +236,7 @@ pub(in crate::host) fn admit(
             "An agent session's connection may only read terminals and change its own",
         )),
         Access::Spawn(session) => fresh(host, session),
-        Access::Place => Ok(()),
+        Access::Place | Access::AccountReset => Ok(()),
         Access::Control(terminal) | Access::Input(terminal) => {
             let control = controls(host, lineage, terminal).map_err(internal)?;
             let Some(control) = control else {
@@ -246,6 +250,31 @@ pub(in crate::host) fn admit(
             }
         }
     }
+}
+
+/// Recheck the bound capability just before the account reset is dispatched.
+pub(in crate::host) fn reset_actor(
+    host: &SharedHost,
+    client_id: ClientId,
+) -> Result<Option<crate::account::resets::ResetActor>, ProtocolError> {
+    let Some(lineage) = acting_for(host, client_id) else {
+        return Ok(None);
+    };
+    let authority = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_client_authorities
+        .get(&client_id)
+        .cloned()
+        .ok_or_else(|| denied("This connection's agent authority is no longer recorded"))?;
+    let (origin, session) = super::caller(host, &authority).map_err(denied)?;
+    if origin != (Origin::Child { parent: lineage }) {
+        return Err(denied("This connection's agent authority changed"));
+    }
+    Ok(Some(crate::account::resets::ResetActor {
+        lineage,
+        session,
+    }))
 }
 
 /// Refuses input from an agent whose own approvals are limited into a
