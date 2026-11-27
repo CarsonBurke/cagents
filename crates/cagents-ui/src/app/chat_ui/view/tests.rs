@@ -14320,6 +14320,8 @@ fn a_new_accent_builds_the_transcript_rows_again() {
 /// bounds, and the accessible name and description of everything named.
 struct PickerLayout {
     controls: Vec<(widget::Id, iced::Rectangle)>,
+    /// The controls Tab stops at.
+    stops: Vec<widget::Id>,
     names: Vec<(String, Option<String>)>,
 }
 
@@ -14338,7 +14340,8 @@ impl PickerLayout {
             Layout, Shell, clipboard, layout,
             widget::{Operation, Tree, operation::Focusable},
         };
-        struct Controls(Vec<(widget::Id, iced::Rectangle)>);
+        #[derive(Default)]
+        struct Controls(Vec<(widget::Id, iced::Rectangle)>, Vec<widget::Id>);
         impl Operation for Controls {
             fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
                 visit(self);
@@ -14347,10 +14350,13 @@ impl PickerLayout {
                 &mut self,
                 id: Option<&widget::Id>,
                 bounds: iced::Rectangle,
-                _: &mut dyn Focusable,
+                state: &mut dyn Focusable,
             ) {
                 if let Some(id) = id {
                     self.0.push((id.clone(), bounds));
+                    if state.is_focus_stop() {
+                        self.1.push(id.clone());
+                    }
                 }
             }
         }
@@ -14362,7 +14368,7 @@ impl PickerLayout {
             &renderer,
             &layout::Limits::new(iced::Size::ZERO, viewport.size()),
         );
-        let mut controls = Controls(Vec::new());
+        let mut controls = Controls::default();
         element
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut controls);
@@ -14411,6 +14417,7 @@ impl PickerLayout {
         (
             Self {
                 controls: controls.0,
+                stops: controls.1,
                 names,
             },
             messages,
@@ -14504,7 +14511,10 @@ fn the_model_rail_lists_only_the_provider_it_shows() {
 
         let mut rail = model_rail(target, &offers, browsing, None);
         let rail = PickerLayout::of(&mut rail);
-        assert_eq!(rail.description(family_label(browsing)), Some("Selected"));
+        assert_eq!(
+            rail.description(family_label(browsing)),
+            Some("Showing its models")
+        );
         for offer in &offers {
             assert!(rail.mounts(&card_control_id(
                 target.card,
@@ -14619,9 +14629,13 @@ fn a_started_conversations_rail_holds_only_its_provider() {
         .model_search(picker_offers(&codex, &claude).into())
         .expect("open model picker");
     let laid = PickerLayout::of(&mut menu);
-    assert!(laid.mounts(&card_control_id(card, "chat-model-rail-Claude")));
-    assert!(!laid.mounts(&card_control_id(card, "chat-model-rail-Codex")));
-    assert_eq!(laid.description("Claude"), Some("Selected"));
+    // It has nothing to switch to, so it names whose models these are
+    // without being a control to press.
+    assert_eq!(laid.description("Claude"), Some("Showing its models"));
+    assert!(!laid.names.iter().any(|(name, _)| name == "ChatGPT"));
+    let tile = card_control_id(card, "chat-model-rail-Claude");
+    assert!(laid.mounts(&tile));
+    assert!(!laid.stops.contains(&tile));
     assert!(laid.mounts(&card_control_id(
         card,
         "chat-model-choice-Claude-named-claude-sonnet-4-5"
@@ -14674,4 +14688,83 @@ fn the_effort_control_selects_a_level() {
     assert!(rows.windows(2).all(|pair| pair[0] == pair[1]), "{rows:?}");
     assert_eq!(effort_segment_label("xhigh"), "XHigh");
     assert_eq!(effort_segment_label("medium"), "Med");
+}
+
+/// The rail keeps the providers' own order whichever one the conversation
+/// is on, so an icon stays where the reader last found it.
+#[test]
+fn the_model_rail_keeps_provider_order() {
+    let codex = [model("gpt-5.5", "GPT-5.5")];
+    let claude = [model("opus", "Opus 5.5")];
+    let [codex_offer, claude_offer] = picker_offers(&codex, &claude);
+    let target = Target {
+        card: CardId::new(),
+        generation: 1,
+    };
+    // A Claude draft lists its own provider first.
+    let offers = [claude_offer, codex_offer];
+    let mut rail = model_rail(target, &offers, Provider::Claude, None);
+    let laid = PickerLayout::of(&mut rail);
+    let order: Vec<_> = laid.controls.iter().map(|(id, _)| id.clone()).collect();
+    assert_eq!(
+        order,
+        [
+            card_control_id(target.card, "chat-model-rail-Codex"),
+            card_control_id(target.card, "chat-model-rail-Claude"),
+        ]
+    );
+}
+
+/// The effort and fast mode belong to the conversation's model, so they
+/// are not offered under another provider's models.
+#[test]
+fn browsing_another_provider_hides_the_conversations_settings() {
+    let (mut runtime, _handle) = furnished_runtime();
+    runtime.connection = Connection::Draft;
+    let provider = runtime.session.launch.provider;
+    let other = if provider == Provider::Codex {
+        Provider::Claude
+    } else {
+        Provider::Codex
+    };
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.ready = true;
+    snapshot.capabilities.fast_mode = true;
+    snapshot.fast_mode = Some(chat::FastMode {
+        state: chat::FastModeState::Off,
+        disabled_reason: None,
+    });
+    let own = snapshot.models.clone();
+    let theirs = [model("gpt-5.5", "GPT-5.5")];
+    let card = runtime.target.card;
+    let effort = card_control_id(card, "chat-reasoning-choice-default");
+    let fast = card_control_id(card, "chat-fast-mode");
+    for (browsing, query, shown) in [
+        (None, "", true),
+        (Some(provider), "", true),
+        (Some(other), "", false),
+        // A search spans every provider, the conversation's included.
+        (Some(other), "gpt", true),
+    ] {
+        runtime.model_picker = Some(ModelPicker {
+            query: query.into(),
+            provider: browsing,
+        });
+        let offers = vec![
+            Offer {
+                provider,
+                models: &own,
+                catalog: None,
+            },
+            Offer {
+                provider: other,
+                models: &theirs,
+                catalog: None,
+            },
+        ];
+        let mut menu = runtime.model_search(offers).unwrap();
+        let laid = PickerLayout::of(&mut menu);
+        assert_eq!(laid.mounts(&effort), shown, "{browsing:?} {query:?}");
+        assert_eq!(laid.mounts(&fast), shown, "{browsing:?} {query:?}");
+    }
 }

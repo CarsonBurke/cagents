@@ -18541,6 +18541,14 @@ impl Cagents {
                 }
                 let model = model.id.clone();
                 let provider = runtime.session.launch.provider;
+                // A pressed segment took the keyboard; it goes back to the
+                // search, which is where the open picker keeps it.
+                let refocus = if runtime.model_picker.is_some() {
+                    widget::text_input::focus(card_control_id(target.card, "chat-model-search"))
+                        .map(cosmic::Action::App)
+                } else {
+                    Task::none()
+                };
                 if runtime.is_draft() {
                     if !runtime.choosing() {
                         return Task::none();
@@ -18556,10 +18564,10 @@ impl Cagents {
                     let session = runtime.session.clone();
                     self.remember_chat_model(provider, Some(model), reasoning);
                     self.replace_chat_conversation(target.card, session);
-                    return self.save_snapshot_soon();
+                    return Task::batch([self.save_snapshot_soon(), refocus]);
                 }
                 let command = Command::SetModel { model, reasoning };
-                return self.chat_send(target, command, false);
+                return Task::batch([self.chat_send(target, command, false), refocus]);
             }
             Action::PermissionMode(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -19028,6 +19036,8 @@ impl Cagents {
                     && let Some(picker) = runtime.model_picker.as_mut()
                 {
                     picker.query = query;
+                    // A new search's best match is at the top of the list.
+                    return model_list_to_top(target);
                 }
             }
             Action::ModelRail(target, provider) => {
@@ -19042,16 +19052,26 @@ impl Cagents {
                 picker.query.clear();
                 picker.provider = Some(provider);
                 // The keyboard stays with the search, so naming a model
-                // still follows picking whose models to list.
-                return widget::text_input::focus(card_control_id(
-                    target.card,
-                    "chat-model-search",
-                ))
-                .map(cosmic::Action::App);
+                // still follows picking whose models to list, and the list
+                // starts at the top of that provider's models.
+                return Task::batch([
+                    widget::text_input::focus(card_control_id(target.card, "chat-model-search"))
+                        .map(cosmic::Action::App),
+                    model_list_to_top(target),
+                ]);
             }
         }
         Task::none()
     }
+}
+
+/// Scrolls the open model picker's list back to its first row.
+fn model_list_to_top(target: Target) -> Task<Message> {
+    iced::widget::operation::snap_to(
+        card_control_id(target.card, view::MODEL_LIST),
+        iced::widget::scrollable::RelativeOffset::START,
+    )
+    .map(cosmic::Action::App)
 }
 
 /// The permission mode draft `card` shows in its footer, and the launch its

@@ -6082,7 +6082,12 @@ impl Runtime {
             searching.then_some(matches.as_slice()),
         );
         let mut settings: Vec<Element<'a, Message>> = Vec::new();
-        if self.snapshot.capabilities.reasoning_selection
+        // The effort and fast mode belong to the conversation's model. Under
+        // another provider's models they would read as that provider's, and a
+        // level chosen there could be one its models don't offer.
+        let own = searching || browsing == provider;
+        if own
+            && self.snapshot.capabilities.reasoning_selection
             && let Some(model) = self.chosen_model().model(&self.snapshot)
             && !model.reasoning.is_empty()
         {
@@ -6102,7 +6107,7 @@ impl Runtime {
                 self.chosen_model().reasoning,
             ));
         }
-        if let Some(mode) = &self.snapshot.fast_mode {
+        if own && let Some(mode) = &self.snapshot.fast_mode {
             let available = !self.disconnected
                 && !self.snapshot.exited
                 && self.queued.is_none()
@@ -8898,6 +8903,8 @@ fn effort_label(effort: &str) -> Cow<'_, str> {
         "high" => "High".into(),
         "xhigh" => "Extra high".into(),
         "max" => "Max".into(),
+        "minimal" => "Minimal".into(),
+        "none" => "None".into(),
         _ => effort.into(),
     }
 }
@@ -9172,6 +9179,9 @@ fn picker_choice_row<'a>(
     }
 }
 
+/// The model picker's scrolling list, which starts at its top whenever what
+/// it lists changes.
+pub(super) const MODEL_LIST: &str = "chat-model-list";
 /// How wide a provider's tile on the model picker's rail is, and tall.
 const MODEL_RAIL_TILE: f32 = design::ROW_HEIGHT;
 /// The mark beside the provider the rail shows.
@@ -9193,8 +9203,14 @@ fn model_rail<'a>(
     browsing: Provider,
     matches: Option<&[Provider]>,
 ) -> Element<'a, Message> {
-    let tiles = offers.iter().map(|offer| {
-        let provider = offer.provider;
+    // The rail keeps one order whichever provider the conversation is on,
+    // so an icon is found where it was last time.
+    let mut providers: Vec<Provider> = offers.iter().map(|offer| offer.provider).collect();
+    providers.sort_by_key(|provider| MODEL_FAMILIES.iter().position(|family| family == provider));
+    // A single provider has nothing to switch to; its tile only says whose
+    // models these are.
+    let switchable = providers.len() > 1;
+    let tiles = providers.into_iter().map(|provider| {
         let selected = matches.is_none() && provider == browsing;
         let found = matches.map(|matches| matches.contains(&provider));
         let label = family_label(provider);
@@ -9252,11 +9268,11 @@ fn model_rail<'a>(
             .padding(0)
             .width(MODEL_RAIL_TILE)
             .height(MODEL_RAIL_TILE)
-            .on_press(action(Action::ModelRail(target, provider)));
+            .on_press_maybe(switchable.then(|| action(Action::ModelRail(target, provider))));
         let tile = match found {
             Some(true) => tile.description("Has matching models"),
             Some(false) => tile.description("No matching models"),
-            None if selected => tile.description("Selected"),
+            None if selected => tile.description("Showing its models"),
             None => tile,
         };
         let bar = widget::container(
@@ -9297,7 +9313,7 @@ fn effort_segment_label(effort: &str) -> Cow<'_, str> {
         "high" => "High".into(),
         "xhigh" => "XHigh".into(),
         "max" => "Max".into(),
-        _ => effort.into(),
+        _ => effort_label(effort),
     }
 }
 
@@ -9425,6 +9441,7 @@ fn model_list<'a>(
         .filter(|_| searching)
         .map(|row| row.choose(target, draft));
     let headed = draft && offers.len() > 1;
+    let mut enter = top.is_some();
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
     if groups.is_empty() {
         rows.push(
@@ -9492,6 +9509,14 @@ fn model_list<'a>(
                 None if listed => Some(Cow::Borrowed("Whichever its settings choose")),
                 None => Some(Cow::Borrowed("Its models are listed once it has run")),
             };
+            // The row Enter takes says so, as the search's answer.
+            let detail = if std::mem::take(&mut enter) {
+                Some(detail.map_or(Cow::Borrowed("Enter"), |detail| {
+                    Cow::Owned(format!("{detail} · Enter"))
+                }))
+            } else {
+                detail
+            };
             rows.push(picker_choice_row(
                 title,
                 detail,
@@ -9533,6 +9558,7 @@ fn model_list<'a>(
                 widget::column::with_children(rows)
                     .padding(design::with_vertical_rail(iced::Padding::ZERO)),
             )
+            .id(card_control_id(target.card, MODEL_LIST))
             .direction(iced::widget::scrollable::Direction::Vertical(
                 design::scrollbar(),
             ))

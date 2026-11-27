@@ -16647,6 +16647,31 @@ fn reasoning_action_draft(app: &mut Cagents, provider: Provider) -> CardId {
     card
 }
 
+/// Picking an effort keeps the model picker open where the reader was, so
+/// fast mode and the model can still be set in the same visit.
+#[test]
+fn choosing_an_effort_keeps_the_model_picker_open() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    drop(app.update(Message::ChatUi(Action::ModelPicker(target, true))));
+    drop(app.update(Message::ChatUi(Action::ModelRail(target, Provider::Codex))));
+    drop(app.update(Message::ChatUi(Action::Reasoning(
+        target,
+        "fixture-model".into(),
+        Some("low".into()),
+    ))));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("low"));
+    assert_eq!(
+        runtime
+            .model_picker
+            .as_ref()
+            .and_then(|picker| picker.provider),
+        Some(Provider::Codex)
+    );
+}
+
 #[test]
 fn saved_draft_model_is_restored_through_shared_startup() {
     use crate::model::BootId;
