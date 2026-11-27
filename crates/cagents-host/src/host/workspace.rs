@@ -149,6 +149,16 @@ fn edit_then<T>(
     edit: ModelEdit,
     then: impl FnOnce(&Registry) -> Result<T, ProtocolError>,
 ) -> Result<(crate::workspace_model::delta::EditReceipt, T), ProtocolError> {
+    edit_then_guarded(host, origin, edit, |_, _| Ok(()), then)
+}
+
+fn edit_then_guarded<T>(
+    host: &SharedHost,
+    origin: ClientId,
+    edit: ModelEdit,
+    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(), String>,
+    then: impl FnOnce(&Registry) -> Result<T, ProtocolError>,
+) -> Result<(crate::workspace_model::delta::EditReceipt, T), ProtocolError> {
     let edit = edit
         .canonicalized()
         .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
@@ -204,7 +214,7 @@ fn edit_then<T>(
             Ok(Some(state))
         })?
     } else {
-        apply_delta_guarded(&mut registry, &edit, Some(&serving), |_, _| Ok(()))?
+        apply_delta_guarded(&mut registry, &edit, Some(&serving), guard)?
     };
     if applied.changed {
         let waiting = Instant::now();
@@ -338,6 +348,7 @@ fn apply_delta_guarded<G>(
         .map_err(|error| {
             if error == Registry::VIEW_REMOVAL_CONFLICT
                 || error == Registry::VIEW_FOREIGN_CHAT_PROOF
+                || error == Registry::CHAT_PANE_ALREADY_SAVED
             {
                 return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
             }
