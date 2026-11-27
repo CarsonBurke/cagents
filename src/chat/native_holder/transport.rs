@@ -3627,6 +3627,10 @@ exec /bin/sleep 60
                         Ok(())
                     })
                 };
+                #[expect(
+                    clippy::zombie_processes,
+                    reason = "the detached child must outlive this stage; the parent test stops it through its pinned identity"
+                )]
                 let detached = detached.spawn().unwrap();
                 let working = PathBuf::from(std::env::var_os(dir_key).unwrap());
                 std::fs::write(
