@@ -1084,6 +1084,17 @@ impl<'a> View<'a> {
                         }))
                         .into(),
                 );
+                second.push(
+                    icon_button(
+                        Icon::Close,
+                        "Keep the worktree and dismiss the failed deletion",
+                    )
+                    .on_press_maybe(self.sidebar(SidebarAction::DismissWorktreeDeletion {
+                        project_id: project.id,
+                        worktree_id: worktree.id,
+                    }))
+                    .into(),
+                );
             }
             None => {}
         }

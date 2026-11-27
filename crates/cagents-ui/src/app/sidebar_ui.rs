@@ -184,6 +184,12 @@ impl Cagents {
             SidebarAction::RetryChannelDeletion { channel_id } => {
                 self.handle_channel_ui(channel_ui::Action::RetryFailed(channel_id))
             }
+            SidebarAction::DismissWorktreeDeletion { worktree_id, .. } => {
+                self.handle_project_action(project_ui::Action::DismissFailedDelete(worktree_id))
+            }
+            SidebarAction::DismissChannelDeletion { channel_id } => {
+                self.handle_channel_ui(channel_ui::Action::DismissFailed(channel_id))
+            }
             SidebarAction::OpenRepositoryPicker => {
                 cosmic::task::message(Message::OpenRepository)
             }

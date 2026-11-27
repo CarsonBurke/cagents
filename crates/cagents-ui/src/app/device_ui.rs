@@ -83,6 +83,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::MarkChannelRead(_)
         | SidebarAction::DeleteChannel { .. }
         | SidebarAction::RetryChannelDeletion { .. }
+        | SidebarAction::DismissChannelDeletion { .. }
         // A project leaves the device daemon's registry as it leaves this
         // computer's: its sessions close and its files stay on the device.
         // A worktree is deleted through the same confirmation and cleanup as
@@ -90,6 +91,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::DeleteRow(_)
         | SidebarAction::DeleteSelectedRows
         | SidebarAction::RetryWorktreeDeletion { .. }
+        | SidebarAction::DismissWorktreeDeletion { .. }
         // Only a local worktree operation can be dismissed, and dismissing or
         // cancelling a confirmation changes nothing outside this window.
         | SidebarAction::DismissWorktreeOperation(_)
@@ -2789,6 +2791,10 @@ mod tests {
             SidebarAction::DeleteRow(sidebar::SelectionRow::Worktree(project_id, worktree_id)),
             SidebarAction::DeleteSelectedRows,
             SidebarAction::RetryWorktreeDeletion {
+                project_id,
+                worktree_id,
+            },
+            SidebarAction::DismissWorktreeDeletion {
                 project_id,
                 worktree_id,
             },
