@@ -33,16 +33,18 @@
 #
 # With the argument `strip`, the scene stops halfway through settling, while
 # Trace and Rollback have finished and the rest still work, for the strip of
-# agent tabs above the composer (use --height 800, so the lead's transcript
-# scrolls): strip-main with the lead's tab shown, strip-selected with Migrate
+# agent tabs above the composer (use --height 680, so the lead's transcript
+# scrolls): strip-main with the lead's tab shown, strip-selected with Audit
 # open, and strip-jump, scrolled up as the rest of the turn arrives, with the
-# jump to the new activity. A narrow window (--width 760) shows how the strip
-# gives way.
+# jump to the new activity. A second argument names the layout, such as
+# `narrow` for a window of --width 1080, whose pane the inspector narrows to
+# about 420 pixels, and is added to each shot's name.
 set -u
 . "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
 require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
 require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 mode=${1:-}
+layout=${2:+-$2}
 
 here=$(cd "$(dirname "$0")" && pwd)
 frames=$here/nested-agents-scene
@@ -52,6 +54,15 @@ fixture=$CAGENTS_EVIDENCE_TASK/fixture
 config=$fixture/home/.claude
 
 log() { printf '== %s %s\n' "$(date +%T)" "$*"; }
+# The centre of the lowest place the screen shows a match of the extended
+# regular expression PATTERN, such as a tab in the strip above the composer
+# rather than a transcript row of the same name. The screen is read by OCR,
+# which can run words together.
+lowest() {
+    "$ne" drive observe 2>/dev/null | grep -E -- "$1" |
+        sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
+        sort -k2 -n | tail -1 | awk 'NF == 4 {printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
+}
 shot() {
     "$ne" drive hover 1,1 >/dev/null 2>&1
     sleep 1
@@ -111,11 +122,15 @@ if [ "$mode" = strip ]; then
     "$ne" drive type 'How are the reviews going?' >/dev/null 2>&1
     "$ne" drive key Return >/dev/null 2>&1
     sleep 4
-    shot strip-main
-    "$ne" drive click Migrate >/dev/null 2>&1 || log "no Migrate tab to open"
+    shot strip-main"$layout"
+    tab=$(lowest 'Audit ?retry')
+    if [ -n "$tab" ]; then "$ne" drive click "$tab" >/dev/null 2>&1; else log "no Audit tab to open"; fi
     sleep 2
-    shot strip-selected
-    "$ne" drive click Main >/dev/null 2>&1 || log "no Main tab to return to"
+    shot strip-selected"$layout"
+    # The lead's tab, named Conversation before it was Main.
+    tab=$(lowest Main)
+    [ -n "$tab" ] || tab=$(lowest Conversation)
+    if [ -n "$tab" ]; then "$ne" drive click "$tab" >/dev/null 2>&1; else log "no lead tab to return to"; fi
     sleep 2
     # Scroll up over the transcript, then let the turn go on below.
     transcript=$(printf '%s' "$composer" | awk -F, '{printf "%d,%d", $1, $2 / 3}')
@@ -123,7 +138,7 @@ if [ "$mode" = strip ]; then
     sleep 1
     : >"$config/fixture-release.rest"
     sleep 4
-    shot strip-jump
+    shot strip-jump"$layout"
     log done
     exit 0
 fi
