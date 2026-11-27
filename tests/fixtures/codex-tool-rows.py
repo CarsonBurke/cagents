@@ -31,7 +31,10 @@ reports, so two linked homes read as two accounts. With
 CODEX_HOME/fixture-rollouts present, starting the thread writes a minimal
 rollout for it under CODEX_HOME/sessions, as Codex keeps one; a peer asked to
 resume a thread it doesn't know adopts it when its own home has that rollout,
-as after an account switch copied it there.
+as after an account switch copied it there. The home that played the thread
+also keeps its last finished turn beside the rollout, which the peer that next
+resumes the thread there replays, as Codex replays a rollout: a conversation
+whose server died with its daemon comes back with what it had said.
 With CODEX_HOME/fixture-plan present, the ordinary turn also publishes a plan
 with one step done, one in progress and one pending, and finishes it before
 completing. The file may hold whole seconds for the turn to stay working,
@@ -219,6 +222,43 @@ def write_rollout(codex_home, thread, cwd):
     path.chmod(0o600)
 
 
+def saved_state_path(codex_home, thread):
+    path = rollout(codex_home, thread)
+    return path and path.with_name(f"turn-{thread}.json")
+
+
+def save_state(codex_home, state):
+    """What the thread had finished saying, beside its rollout, for the peer
+    that next resumes it in this home."""
+    path = saved_state_path(codex_home, state["thread"])
+    if path is None:
+        return
+    pending = path.with_name(f".{path.name}.{os.getpid()}")
+    try:
+        pending.write_text(json.dumps(state, separators=(",", ":")))
+        pending.chmod(0o600)
+        pending.replace(path)
+    finally:
+        pending.unlink(missing_ok=True)
+
+
+def saved_state(codex_home, thread):
+    """The state `save_state` kept for `thread`, settled: the server that
+    played it is gone, and so is whatever it was still running."""
+    path = saved_state_path(codex_home, thread)
+    try:
+        state = json.loads(path.read_text()) if path else None
+    except (OSError, ValueError):
+        return None
+    if not isinstance(state, dict) or state.get("thread") != thread:
+        return None
+    for turn in ("latest", "child_latest", "second_latest"):
+        if state.get(turn) and state[turn]["status"] == "inProgress":
+            state[turn]["status"] = "interrupted"
+    state["interrupting"] = []
+    return state
+
+
 class Scenario:
     def __init__(self):
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
@@ -236,6 +276,8 @@ class Scenario:
         self.loaded = set()
         self.latest = None
         self.child_latest = None
+        # The home of the last request, where a finished turn is kept.
+        self.home = None
         self.model = "fixture-mini"
         self.reasoning = None
         self.name = "Offline tool rows"
@@ -304,6 +346,9 @@ class Scenario:
             self.second_latest = copy.deepcopy(turn)
         else:
             self.child_latest = copy.deepcopy(turn)
+        if self.home and self.latest and self.latest["status"] != "inProgress" \
+                and (Path(self.home) / "fixture-rollouts").is_file():
+            save_state(self.home, self.state())
 
     def _child_state(self, item):
         """A parent tool's history cannot overwrite its child's actual outcome."""
@@ -591,6 +636,7 @@ class Scenario:
             return self._request(frame, codex_home)
 
     def _request(self, frame, codex_home):
+        self.home = codex_home
         identifier, method = frame.get("id"), frame.get("method")
         params = frame.get("params", {})
         if identifier is None:
@@ -628,8 +674,13 @@ class Scenario:
             if method == "thread/resume" and thread not in self._threads() \
                     and rollout(codex_home, thread) is not None:
                 # An account switch copied this thread's rollout into this
-                # account's home before resuming it here.
-                self.thread, self.latest = thread, None
+                # account's home before resuming it here, or the server that
+                # played it here is gone and left its last finished turn.
+                saved = saved_state(codex_home, thread)
+                if saved:
+                    self._restore(saved)
+                else:
+                    self.thread, self.latest = thread, None
             nested = thread == self.grandchild and (Path(codex_home) / "fixture-nested-child").is_file()
             if thread not in self._threads() and not nested:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]

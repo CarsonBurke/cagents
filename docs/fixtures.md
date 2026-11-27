@@ -672,8 +672,13 @@ second linked home is a different account rather than a login conflict. With
 `fixture-rollouts` in a home, a new thread writes a minimal rollout under
 `sessions/`, as Codex keeps one; a peer asked to resume a thread it doesn't
 know takes it over when its own home has that rollout, as it does once an
-account switch has copied it there. It does not replay the earlier turns, so
-after a switch the conversation shows only what follows. Give each home its own
+account switch has copied it there. The switch copies only the rollout, so the
+conversation shows only what follows it. In the home that played the thread,
+the peer also keeps its last finished turn beside the rollout, as
+`turn-THREAD.json`, and the peer that next resumes the thread there replays it,
+as Codex replays a rollout: after the daemon is killed and its Codex servers
+with it, a reconnected conversation shows what it had said. A turn still under
+way then is not kept. Give each home its own
 `fixture-rate-limits.json`, with `{"ordinaryUsageAllowed": false}` on the
 account that should send its conversations elsewhere, and choose automatic
 routing with `cli account default codex automatic`.

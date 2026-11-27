@@ -223,13 +223,30 @@ impl Runtime {
             };
         }
         if self.disconnected || !self.connected() {
+            // The window is trying the connection again by itself (see
+            // `reattach`); the button only saves the wait.
+            let reattaching = self.disconnected && self.reattaching;
             return Stopped {
-                guidance: format!(
-                    "Lost the connection to this chat. {provider} may still be working; your draft is kept."
-                ),
-                primary: Some(("Reconnect", Press::Reconnect, enabled)),
+                guidance: if reattaching {
+                    format!(
+                        "Lost the connection to this chat. Reconnecting; {provider} may still be working, and your draft is kept."
+                    )
+                } else {
+                    format!(
+                        "Lost the connection to this chat. {provider} may still be working; your draft is kept."
+                    )
+                },
+                primary: Some((
+                    if reattaching {
+                        "Reconnect now"
+                    } else {
+                        "Reconnect"
+                    },
+                    Press::Reconnect,
+                    enabled,
+                )),
                 secondary: None,
-                primary_labels: &[],
+                primary_labels: &["Reconnect", "Reconnect now"],
             };
         }
         if self.session.owns_codex_listener() {
