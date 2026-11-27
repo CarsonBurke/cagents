@@ -1337,24 +1337,44 @@ const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
 
-/// The `resume_sessions_after_reboot` preference from the settings file at
-/// `path`. Only that key is read, so the daemon needs none of the UI's
-/// settings model. A missing file or key is off; a file that exists but
-/// cannot be read is an error.
-pub fn resume_sessions_after_reboot(path: &std::path::Path) -> Result<bool, String> {
-    #[derive(Deserialize)]
-    struct Preference {
-        #[serde(default)]
-        resume_sessions_after_reboot: bool,
-    }
+/// One boolean preference, `key`, from the settings file at `path`, or
+/// `default` when the file or the key is missing. Only that key is read, so
+/// the CLI and the daemon need none of the UI's settings model. A file that
+/// exists but cannot be read, or a value that is not a boolean, is an error
+/// rather than the default, because it may be the one saying otherwise.
+pub fn boolean_preference(path: &Path, key: &str, default: bool) -> Result<bool, String> {
+    let failed = |error: &dyn std::fmt::Display| format!("cannot read {}: {error}", path.display());
     let document = match std::fs::read_to_string(path) {
         Ok(document) => document,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
-        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(default),
+        Err(error) => return Err(failed(&error)),
     };
-    toml::from_str::<Preference>(&document)
-        .map(|preference| preference.resume_sessions_after_reboot)
-        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+    let table = toml::from_str::<toml::Table>(&document).map_err(|error| failed(&error))?;
+    match table.get(key) {
+        None => Ok(default),
+        Some(toml::Value::Boolean(value)) => Ok(*value),
+        Some(_) => Err(failed(&format_args!("`{key}` is not true or false"))),
+    }
+}
+
+/// The `resume_sessions_after_reboot` preference from the settings file at
+/// `path`, which is off unless the file says otherwise.
+pub fn resume_sessions_after_reboot(path: &Path) -> Result<bool, String> {
+    boolean_preference(path, "resume_sessions_after_reboot", false)
+}
+
+/// Sets `resume_sessions_after_reboot` in the settings file at `path` and
+/// leaves every other setting as the file has it, including ones a newer
+/// build wrote that this one does not know.
+pub fn save_resume_sessions_after_reboot(
+    path: impl AsRef<Path>,
+    enabled: bool,
+) -> Result<(), SettingsError> {
+    let path = path.as_ref();
+    let _lock = settings_lock(path)?;
+    let mut settings = load_unlocked(path)?.settings;
+    settings.resume_sessions_after_reboot = enabled;
+    save_unlocked(path, &settings)
 }
 
 const fn default_work_stale_after_days() -> u16 {
@@ -1711,8 +1731,9 @@ pub struct AppSettings {
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,
     /// Whether the first daemon after this computer starts resumes every
-    /// stopped conversation the earlier boot ran, without waiting for a
-    /// window. Off by default. The daemon reads it from this file too; see
+    /// stopped conversation an earlier boot ran, without waiting for a
+    /// window. Off by default. The daemon reads it from this file too, and
+    /// `cagents daemon boot enable --resume-sessions` sets it; see
     /// [`resume_sessions_after_reboot`].
     #[serde(default)]
     pub resume_sessions_after_reboot: bool,
@@ -4924,6 +4945,62 @@ mod tests {
         assert_eq!(resume_sessions_after_reboot(&path), Ok(true));
         fs::write(&path, "resume_sessions_after_reboot = \"yes\"\n").unwrap();
         assert!(resume_sessions_after_reboot(&path).is_err());
+        fs::write(&path, "resume_sessions_after_reboot = true\n[").unwrap();
+        assert!(resume_sessions_after_reboot(&path).is_err());
+        assert!(resume_sessions_after_reboot(directory.path()).is_err());
+    }
+
+    /// `cagents daemon boot enable --resume-sessions` changes that one
+    /// setting: the others, and ones a newer build wrote, stay as they were.
+    #[test]
+    fn saving_whether_to_resume_after_a_reboot_keeps_every_other_setting() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let mut chosen = AppSettings {
+            show_status_bar: false,
+            terminal_font_size: 15.0,
+            ..AppSettings::default()
+        };
+        chosen.providers.insert("future_agent".into(), false);
+        save(&path, &chosen).unwrap();
+        let mut document: toml::Table =
+            toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        document.insert("future_preference".into(), "kept".into());
+        fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+
+        save_resume_sessions_after_reboot(&path, true).unwrap();
+        assert_eq!(resume_sessions_after_reboot(&path), Ok(true));
+        let saved = load(&path).unwrap();
+        assert_eq!(
+            saved,
+            AppSettings {
+                resume_sessions_after_reboot: true,
+                ..chosen.clone()
+            }
+        );
+        let written: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.get("future_preference"), Some(&"kept".into()));
+
+        save_resume_sessions_after_reboot(&path, false).unwrap();
+        assert_eq!(resume_sessions_after_reboot(&path), Ok(false));
+        assert_eq!(load(&path).unwrap(), chosen);
+        let written: toml::Table = toml::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(written.get("future_preference"), Some(&"kept".into()));
+
+        // Without a file, it starts one this build reads whole.
+        let fresh = directory.path().join("fresh").join("settings.toml");
+        save_resume_sessions_after_reboot(&fresh, true).unwrap();
+        assert_eq!(
+            load(&fresh).unwrap(),
+            AppSettings {
+                resume_sessions_after_reboot: true,
+                ..AppSettings::default()
+            }
+        );
+        // A file it cannot read is left alone rather than replaced.
+        fs::write(&path, "schema_version = 3\n[").unwrap();
+        assert!(save_resume_sessions_after_reboot(&path, true).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), "schema_version = 3\n[");
     }
 
     #[test]
