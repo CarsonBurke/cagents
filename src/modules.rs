@@ -102,6 +102,7 @@ pub mod persistence;
 pub(crate) mod pinned_process;
 pub mod process;
 pub mod project_location;
+pub mod project_sessions;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod pull_request_signals;
 pub mod recovery_authority;

@@ -25,6 +25,8 @@ use super::{
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
 
+mod project_sessions;
+
 #[cfg(test)]
 mod automation_authority_tests;
 #[cfg(test)]
@@ -388,6 +390,9 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
+                | ClientRequest::DeviceOperation {
+                    operation: crate::device_service::Operation::CloseSessions(_),
+                }
                 | ClientRequest::Agent {
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
@@ -1385,7 +1390,8 @@ fn process_wire_request(
         return super::chat::read_presentation(host, client_id, chat_id, after_generation)
             .map(|response| (response, Vec::new(), false));
     }
-    let (response, extras, shutdown) = process_admitted_request(host, client_id, request, _shared)?;
+    let (response, extras, shutdown) =
+        process_admitted_request(host, client_id, request, _shared, false)?;
     Ok((response.into(), extras, shutdown))
 }
 
@@ -1438,6 +1444,7 @@ fn process_admitted_request(
     client_id: ClientId,
     request: ClientRequest,
     _shared: Option<Shared<'_>>,
+    inventory_close: bool,
 ) -> Result<RequestOutcome, ProtocolError> {
     // Adapt the additive request to the established close paths. Its original
     // source is checked under the same lock that selects the resident handle;
@@ -1469,6 +1476,18 @@ fn process_admitted_request(
     };
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
+        ClientRequest::DeviceOperation {
+            operation: crate::device_service::Operation::CloseSessions(scope),
+        } => {
+            drop(_shared);
+            let reply = project_sessions::close(
+                host,
+                client_id,
+                scope,
+                crate::instance::local_window_database_paths,
+            )?;
+            Ok((ServerResponse::DeviceOperation { reply }, Vec::new(), false))
+        }
         ClientRequest::DeviceOperation { operation } => {
             if let crate::device_service::Operation::AccountReset { request } = operation {
                 let actor = super::agent_execution::terminals::reset_actor(host, client_id)?;
@@ -2717,7 +2736,13 @@ fn process_admitted_request(
                 validate_cleanup_source(&state, cleanup_source.as_ref())?;
                 state.ensure_retention_available(&[terminal_id])?;
                 (
-                    state.history_handle(client_id, terminal_id)?,
+                    if inventory_close && cleanup_source.is_some() {
+                        // The exact source was verified under this lock. A
+                        // bulk close has no presentation subscription.
+                        state.terminals[&terminal_id].handle.clone()
+                    } else {
+                        state.history_handle(client_id, terminal_id)?
+                    },
                     state.terminals[&terminal_id].session.clone(),
                 )
             };

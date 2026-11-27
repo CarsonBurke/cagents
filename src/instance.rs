@@ -972,10 +972,16 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?, true)
 }
 
-fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+/// The databases whose terminals and chats belong to this computer's daemon.
+#[cfg(feature = "host")]
+pub fn local_window_database_paths() -> io::Result<Vec<PathBuf>> {
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?, false)
+}
+
+fn window_database_paths_at(primary: PathBuf, include_devices: bool) -> io::Result<Vec<PathBuf>> {
     // Old inactive snapshots are retained for ordinary reopening/migration.
     // Bound enumeration before allocating paths or opening SQLite stores.
     const MAX_STORES: usize = 1024;
@@ -994,6 +1000,7 @@ fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
+                    && (include_devices || !slot.starts_with("device-"))
                 {
                     let path = entry.path().join("sessions.sqlite3");
                     match fs::symlink_metadata(&path) {
@@ -5290,7 +5297,10 @@ mod tests {
         fs::write(&old, "original legacy store bytes").unwrap();
         let mut expected = vec![primary.clone(), old.clone()];
         expected.sort();
-        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(
+            window_database_paths_at(primary.clone(), true).unwrap(),
+            expected
+        );
         assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
         for index in 0..1023 {
             let path = root
@@ -5300,7 +5310,7 @@ mod tests {
             fs::write(path, []).unwrap();
         }
         assert!(
-            window_database_paths_at(primary)
+            window_database_paths_at(primary, true)
                 .unwrap_err()
                 .to_string()
                 .contains("bounded store limit")

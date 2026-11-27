@@ -1,4 +1,7 @@
 use super::*;
+use crate::project_sessions::{
+    ProjectSessionOwnership, ProjectSessionScope, add_saved_owners, shared_project_session_scope,
+};
 use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
@@ -725,8 +728,7 @@ impl Cagents {
                 .insert(project, cancellation.clone());
             cosmic::task::future(async move {
                 let result = tokio::task::spawn_blocking(move || {
-                    let roots = project_session_roots(&repository, kind, roots);
-                    close_sessions_in_scope(&roots, Some(&repository), &project_sessions, Some(&cancellation))
+                    close_project_sessions(&repository, kind, roots, &project_sessions, Some(&cancellation))
                 })
                 .await
                 .map_err(|error| error.to_string())
@@ -2523,30 +2525,13 @@ fn close_sessions_in_scope(
         let (_, projects) = client.read_workspace_projects().map_err(|error| {
             format!("Could not verify project ownership before closing sessions: {error}")
         })?;
-        let scope = shared_project_session_scope(worktrees, project, &projects)?;
-        let paths = crate::instance::window_database_paths().map_err(|error| {
-            format!("Could not locate other windows before closing sessions: {error}")
-        })?;
-        for path in paths {
-            if project_sessions.local_database.as_ref() == Some(&path) {
-                continue;
-            }
-            match std::fs::symlink_metadata(&path) {
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => {
-                    return Err(format!(
-                        "Could not inspect ownership in {}: {error}",
-                        path.display()
-                    ));
-                }
-                Ok(_) => {}
-            }
-            let owners =
-                crate::persistence::read_project_session_owners(&path).map_err(|error| {
-                    format!("Could not verify ownership in {}: {error}", path.display())
-                })?;
-            project_sessions.extend_saved(owners, project);
-        }
+        let scope =
+            shared_project_session_scope(worktrees, project, &projects, list_worktree_paths)?;
+        add_saved_owners(
+            &mut project_sessions,
+            project,
+            crate::instance::window_database_paths(),
+        )?;
         scope
     } else {
         ProjectSessionScope::new(worktrees.to_vec(), Vec::new())
@@ -2639,11 +2624,7 @@ fn close_sessions_in_scope(
     })
 }
 
-#[derive(Debug, Clone)]
-pub struct ProjectSessionClosure {
-    scope: ProjectSessionScope,
-    ownership: ProjectSessionOwnership,
-}
+pub use crate::project_sessions::ProjectSessionClosure;
 
 /// Why the daemon did not close a terminal, in words rather than its reply.
 /// An unconfirmed close's reason describes the daemon's own bookkeeping, so
@@ -2660,91 +2641,11 @@ pub(super) fn terminal_close_refusal(result: crate::terminal::ipc::TerminalClose
 }
 
 #[cfg(test)]
-impl ProjectSessionClosure {
-    pub(super) fn for_roots(roots: Vec<PathBuf>) -> Self {
-        Self {
-            scope: ProjectSessionScope::new(roots, Vec::new()),
-            ownership: ProjectSessionOwnership::default(),
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ProjectSessionScope {
-    roots: Vec<PathBuf>,
-    protected: Vec<PathBuf>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct ProjectSessionOwnership {
-    owned: HashSet<TerminalId>,
-    protected: HashSet<TerminalId>,
-    directories: std::collections::HashMap<TerminalId, Vec<PathBuf>>,
-    local_database: Option<PathBuf>,
-}
-
-impl ProjectSessionOwnership {
-    fn extend_saved(
-        &mut self,
-        owners: Vec<(TerminalId, crate::persistence::SavedSessionOwner)>,
-        project: &Path,
-    ) {
-        for (id, owner) in owners {
-            match owner {
-                crate::persistence::SavedSessionOwner::Project(path) if path == project => {
-                    self.owned.insert(id);
-                }
-                crate::persistence::SavedSessionOwner::Project(_) => {
-                    self.protected.insert(id);
-                }
-                crate::persistence::SavedSessionOwner::Directory(path) => {
-                    self.directories.entry(id).or_default().push(path);
-                }
-            }
-        }
-    }
-
-    fn contains(&self, id: TerminalId, directory: &Path, scope: &ProjectSessionScope) -> bool {
-        if self.protected.contains(&id) {
-            return false;
-        }
-        if let Some(directories) = self.directories.get(&id) {
-            // A retained view wins when windows disagree about ownership.
-            if directories.iter().any(|path| !scope.contains(path)) {
-                return false;
-            }
-            return true;
-        }
-        self.owned.contains(&id) || scope.contains(directory)
-    }
-}
-
-#[cfg(test)]
-thread_local! {
-    static SCOPE_RESOLUTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// How many paths this thread has resolved on disk for a project scope.
-#[cfg(test)]
-pub(super) fn scope_resolutions() -> usize {
-    SCOPE_RESOLUTIONS.get()
-}
+pub(super) use crate::project_sessions::scope_resolutions;
 
 #[cfg(test)]
 pub(super) fn device_aware_scope_contains(roots: &[PathBuf], directory: &Path) -> bool {
     ProjectSessionScope::new(roots.to_vec(), Vec::new()).contains(directory)
-}
-
-/// Resolves `path` on disk, as every root and directory a scope compares is.
-/// A device window's paths are the device's, as its daemon reported them,
-/// and resolving them here would read this computer's files instead.
-fn resolve_scope_path(path: &Path) -> Option<PathBuf> {
-    if crate::device::is_remote() {
-        return None;
-    }
-    #[cfg(test)]
-    SCOPE_RESOLUTIONS.set(SCOPE_RESOLUTIONS.get() + 1);
-    path.canonicalize().ok()
 }
 
 /// Where a removed project's files stay: on this computer's disk, or on the
@@ -2783,78 +2684,7 @@ pub(super) fn runs_in_device_window(action: &Action) -> bool {
     }
 }
 
-impl ProjectSessionScope {
-    fn new(roots: Vec<PathBuf>, protected: Vec<PathBuf>) -> Self {
-        let canonical = |paths: Vec<PathBuf>| {
-            paths
-                .into_iter()
-                .map(|path| resolve_scope_path(&path).unwrap_or(path))
-                .collect()
-        };
-        Self {
-            roots: canonical(roots),
-            protected: canonical(protected),
-        }
-    }
-
-    fn contains(&self, directory: &Path) -> bool {
-        let directory = resolve_scope_path(directory).unwrap_or_else(|| directory.to_path_buf());
-        let depth = |roots: &[PathBuf]| {
-            roots
-                .iter()
-                .filter(|root| directory.starts_with(root))
-                .map(|root| root.components().count())
-                .max()
-        };
-        match (depth(&self.roots), depth(&self.protected)) {
-            (Some(owned), Some(protected)) => owned > protected,
-            (Some(_), None) => true,
-            _ => false,
-        }
-    }
-}
-
-fn shared_project_session_scope(
-    roots: &[PathBuf],
-    repository: &Path,
-    projects: &[crate::workspace_model::ModelProject],
-) -> Result<ProjectSessionScope, String> {
-    let mut protected = Vec::new();
-    for project in projects {
-        if project.repository == repository {
-            continue;
-        }
-        match project.kind {
-            ProjectKind::Folder => protected.push(project.repository.clone()),
-            ProjectKind::Git => {
-                let worktrees = list_worktree_paths(&project.repository)
-                    .map_err(|error| format!("Could not verify worktrees owned by {} before removing this project: {error}", project.name))?;
-                protected.extend(worktrees);
-            }
-        }
-    }
-    Ok(ProjectSessionScope::new(roots.to_vec(), protected))
-}
-
-/// The checkouts Git lists for `repository`, read where the repository is:
-/// on this computer, or through the device service in a device window,
-/// whose paths name nothing here.
 fn list_worktree_paths(repository: &Path) -> Result<Vec<PathBuf>, String> {
-    if crate::device::is_remote() {
-        return match crate::device_service::request(
-            crate::device_service::Operation::ProjectNavigation {
-                repository: repository.to_path_buf(),
-                kind: ProjectKind::Git,
-            },
-        )? {
-            crate::device_service::Reply::ProjectNavigation(navigation) => Ok(navigation
-                .worktrees
-                .into_iter()
-                .map(|worktree| worktree.path)
-                .collect()),
-            _ => Err("Unexpected project navigation reply".into()),
-        };
-    }
     RepositoryService::system("git")
         .list_worktrees(repository, &CancellationToken::default())
         .map(|records| records.into_iter().map(|record| record.path).collect())
@@ -2880,16 +2710,43 @@ fn project_session_roots(
     roots
 }
 
+fn close_project_sessions(
+    repository: &Path,
+    kind: ProjectKind,
+    roots: Vec<PathBuf>,
+    ownership: &ProjectSessionOwnership,
+    cancellation: Option<&CancellationToken>,
+) -> Result<ProjectSessionClosure, String> {
+    if crate::device::is_remote() {
+        use crate::device_service::{Operation, Reply, SessionCloseScope, request_for_reader};
+        if cancellation.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Project removal was cancelled.".into());
+        }
+        return match request_for_reader(Operation::CloseSessions(SessionCloseScope::Project {
+            repository: repository.to_path_buf(),
+            kind,
+            roots,
+            ownership: ownership.clone(),
+            only_if_closed: cancellation.is_some(),
+        }))? {
+            Reply::SessionsClosed(Some(closure)) => Ok(closure),
+            _ => Err("Unexpected project session close reply".into()),
+        };
+    }
+    let roots = project_session_roots(repository, kind, roots);
+    close_sessions_in_scope(&roots, Some(repository), ownership, cancellation)
+}
+
 /// The confirmation covers live and detached sessions in every listed
 /// worktree. Close those first; the shared project edit is the final step and
 /// leaves all Git files and worktree directories untouched.
 fn remove_project_from_cagents(
     removal: &ProjectRemoval,
 ) -> Result<crate::workspace_model::delta::EditReceipt, String> {
-    let roots = project_session_roots(&removal.repository, removal.kind, removal.worktrees.clone());
-    close_sessions_in_scope(
-        &roots,
-        Some(&removal.repository),
+    close_project_sessions(
+        &removal.repository,
+        removal.kind,
+        removal.worktrees.clone(),
         &removal.project_sessions,
         None,
     )?;
@@ -3028,24 +2885,34 @@ pub(super) fn device_worktree_name(main: &Path, path: &Path) -> Option<String> {
 /// would remove the worktree, so a refusal leaves its sessions running; it
 /// checks again as it removes it.
 fn delete_device_worktree(target: &Target, main: &Path) -> Result<(), String> {
-    use crate::device_service::{GitOperation, Operation, request};
+    use crate::device_service::{
+        GitOperation, Operation, Reply, SessionCloseScope, request, request_for_reader,
+    };
     let name = device_worktree_name(main, &target.path).ok_or(DEVICE_WORKTREE_OUTSIDE)?;
-    let listed = |worktrees: &[PathBuf]| worktrees.contains(&target.path);
-    if !listed(&list_worktree_paths(&target.repository)?) {
-        return Err("Worktree changed or disappeared; refresh before deleting.".into());
-    }
     match device_worktree_removable(main, &name) {
         DeviceRemoval::Removable => {}
         DeviceRemoval::Refused(reason) | DeviceRemoval::Unasked(reason) => return Err(reason),
     }
-    close_worktree_sessions(target)?;
+    match request_for_reader(Operation::CloseSessions(SessionCloseScope::Worktree {
+        path: target.path.clone(),
+    }))? {
+        Reply::SessionsClosed(None) => {}
+        _ => return Err("Unexpected worktree session close reply".into()),
+    }
     if let Err(error) = request(Operation::Git {
         root: main.to_path_buf(),
         operation: GitOperation::RemoveWorktree { name },
     }) {
         // A lost reply may follow a removal. Reconcile before saying it
         // failed, as a local deletion does.
-        if list_worktree_paths(&target.repository).is_ok_and(|worktrees| !listed(&worktrees)) {
+        if matches!(
+            request(Operation::ProjectNavigation {
+                repository: target.repository.clone(),
+                kind: ProjectKind::Git,
+            }),
+            Ok(Reply::ProjectNavigation(navigation))
+                if !navigation.worktrees.iter().any(|worktree| worktree.path == target.path)
+        ) {
             return Ok(());
         }
         return Err(error);
@@ -5181,9 +5048,13 @@ pub(in crate::app) mod tests {
             ],
             ..WorkspaceModel::default()
         };
-        let scope =
-            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &model.projects)
-                .unwrap();
+        let scope = shared_project_session_scope(
+            std::slice::from_ref(&folder),
+            &folder,
+            &model.projects,
+            list_worktree_paths,
+        )
+        .unwrap();
         assert!(scope.contains(&folder.join("owned")));
         assert!(!scope.contains(&child.join("work")));
         assert!(!scope.contains(&linked));
@@ -5195,8 +5066,13 @@ pub(in crate::app) mod tests {
         let mut missing = model;
         missing.projects[1].repository = root.join("missing.git");
         assert!(
-            shared_project_session_scope(std::slice::from_ref(&folder), &folder, &missing.projects)
-                .is_err()
+            shared_project_session_scope(
+                std::slice::from_ref(&folder),
+                &folder,
+                &missing.projects,
+                list_worktree_paths
+            )
+            .is_err()
         );
     }
 

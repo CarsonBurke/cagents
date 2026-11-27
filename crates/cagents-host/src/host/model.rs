@@ -235,6 +235,14 @@ impl Registry {
         project_rows(&self.db)
     }
 
+    pub(super) fn project_is_open(&self, repository: &Path) -> Result<bool, String> {
+        let key = repository_key(repository)?;
+        self.db
+            .prepare_cached("SELECT 1 FROM projects WHERE repository = ?1")
+            .and_then(|mut statement| statement.exists(params![key]))
+            .map_err(|error| error.to_string())
+    }
+
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
         // Independent execution and workspace writers can commit between SQL

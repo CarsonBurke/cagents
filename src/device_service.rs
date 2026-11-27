@@ -96,7 +96,25 @@ pub enum Operation {
     /// so that every build, the CLI's too, has this variant and numbers any
     /// appended after it alike. Appended wire tag.
     Repository(String),
+    CloseSessions(SessionCloseScope),
 }
+/// Removing a project preserves independently owned sessions. Deleting a
+/// checkout closes all sessions inside the directory that is going away.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum SessionCloseScope {
+    Project {
+        repository: PathBuf,
+        kind: crate::model::ProjectKind,
+        roots: Vec<PathBuf>,
+        ownership: crate::project_sessions::ProjectSessionOwnership,
+        /// A sweep after the shared close must stop if the project reopens.
+        only_if_closed: bool,
+    },
+    Worktree {
+        path: PathBuf,
+    },
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
     Status,
@@ -175,6 +193,7 @@ pub enum Reply {
     /// A [`crate::repository::RepositoryReply`] as JSON text, encoded where
     /// it was answered so its size is known before it is sent.
     Repository(String),
+    SessionsClosed(Option<crate::project_sessions::ProjectSessionClosure>),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -232,6 +251,7 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
+        Operation::CloseSessions(_) => Err("Session closure requires daemon admission".into()),
         Operation::AccountReset { .. } => Err("Account resets require daemon admission".into()),
         Operation::RemoveMergedWorktree { .. } => {
             Err("Automatic cleanup requires the daemon lifecycle fence".into())
