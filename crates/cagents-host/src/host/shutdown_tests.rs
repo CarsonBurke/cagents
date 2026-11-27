@@ -1,7 +1,10 @@
 //! Real OS-worker custody must not serialize healthy terminal shutdown.
 use super::*;
 use crate::{
-    model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+    model::{
+        HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, TerminalContinuity,
+        TerminalId, TerminalSession,
+    },
     terminal::{TerminalConfig, TerminalHandle, TerminalSendError},
 };
 use std::{
@@ -10,6 +13,7 @@ use std::{
     path::{Path, PathBuf},
     sync::mpsc,
 };
+use uuid::Uuid;
 
 const ROOT: &str = "CAGENTS_SHUTDOWN_BATCH_ROOT";
 const SCOPE: &str = "CAGENTS_SHUTDOWN_BATCH_AUTHORITY_PRESENCE";
