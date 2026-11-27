@@ -131,11 +131,12 @@ class PrScreenshots(unittest.TestCase):
 
     def test_addresses_ocr_misreads_are_still_found(self):
         for text in ("someone©example.com", "someone@®example.com", "someone ® example.com",
-                     "someone @ example . com", "someone(a)example.com", "someone@example.c0m"):
+                     "someone @ example . com", "someone(a)example.com", "someone@example.c0m",
+                     "someone@ example.com", "someone @example.com", "SOMEONE@EXAMPLE . COM"):
             with self.subTest(text=text):
                 result = self.run_tool("scan", self.image("after-misread.webp", f"Claude · {text}  Opus"))
                 self.assertEqual(result.returncode, 1, result.stderr)
-                self.assertIn("shows an email address (s…e@e…e.", result.stderr)
+                self.assertIn("shows an email address (s…e@e…e.c", result.stderr)
 
     def test_mentions_sentences_assets_and_forge_remotes_are_not_addresses(self):
         shown = self.image("after-chat.webp", "Thanks @reviewer. Next step\nMeet @ 3pm. Room 4\n"

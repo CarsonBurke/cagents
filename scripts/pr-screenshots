@@ -58,10 +58,11 @@ UNDELIVERABLE = frozenset({"test", "invalid", "example", "localhost"})
 EMAIL = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+")
 # What OCR reads @ as, between two characters of an address. A plain @ is
 # closed up only with space on both sides, so "Thanks @name" stays a mention.
-AT = re.compile(r"(?<=[A-Za-z0-9._%+-])(?:\s*@?\s*[®©]\s*|\(a\)|\s+@\s+)(?=[A-Za-z0-9])")
-# A dot is closed up only before what could end a domain, so a sentence's
-# capitalized next word stays apart.
-DOT = re.compile(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[a-z0-9-]{2,24}\b)")
+AT = re.compile(r"(?<=[A-Za-z0-9._%+-])(?:\s*@?\s*[®©]\s*|\(a\)|\s+@\s+|\s*@\s*(?=[A-Za-z0-9-]+\.[A-Za-z]{2,}\b))"
+                r"(?=[A-Za-z0-9])")
+# A dot is closed up only before what could end a domain, all lower or all
+# upper case, so a sentence's capitalized next word stays apart.
+DOT = re.compile(r"(?<=[A-Za-z0-9])\s*\.\s*(?=[a-z0-9-]{2,24}\b|[A-Z0-9-]{2,24}\b)")
 # Not addresses: a scaled asset (logo@2x.png) and a forge's SSH user.
 NOT_ADDRESS = re.compile(r"[^@]+@\d+(?:\.\d+)?x\..+|git@(?:github\.com|gitlab\.com|bitbucket\.org|codeberg\.org)")
 NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*\.webp$")
