@@ -229,22 +229,30 @@ fn changes(store: &StateStore) -> u64 {
     store.lock_inner().unwrap().connection.total_changes()
 }
 
-/// A flush that changes nothing in the window writes only the workspace row
-/// whose generation records the flush, however much history the window holds.
 #[test]
-fn an_unchanged_flush_writes_only_the_workspace_generation() {
+fn an_unchanged_flush_writes_no_rows_or_wal_frames() {
     let directory = tempfile::tempdir().unwrap();
-    let store = StateStore::open(
-        directory.path().join("history.sqlite3"),
-        BootId::new("scale"),
-    )
-    .unwrap();
+    let path = directory.path().join("history.sqlite3");
+    let store = StateStore::open(&path, BootId::new("scale")).unwrap();
+    let wal = sqlite_sidecar_path(&path, "-wal");
     let mut state = long_lived_workspace();
     let mut lane = Lane::default();
-    lane.save(&store, &state);
-    let before = changes(&store);
-    lane.save(&store, &state);
-    assert_eq!(changes(&store) - before, 1);
+    let first = lane.save(&store, &state);
+    let assert_no_writes = |lane: &mut Lane, state: &WorkspaceState| {
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+            .unwrap();
+        let generation = lane.workspace;
+        let before = changes(&store);
+        let commit = lane.save(&store, state);
+        assert_eq!(commit.generation, generation);
+        assert_eq!(changes(&store) - before, 0);
+        assert_eq!(std::fs::metadata(&wal).unwrap().len(), 0);
+    };
+    assert_no_writes(&mut lane, &state);
 
     // The same navigation rebuilt in maps and sets that iterate in another
     // order, as a restored window holds it, is still the stored navigation.
@@ -253,11 +261,11 @@ fn an_unchanged_flush_writes_only_the_workspace_generation() {
     state.pending_chat_admissions = state.pending_chat_admissions.into_iter().collect();
     state.worktree_focus = state.worktree_focus.into_iter().collect();
     state.local_only_cards = state.cards.iter().take(40).map(|card| card.id).collect();
-    lane.save(&store, &state);
+    let changed = lane.save(&store, &state);
+    assert_eq!(changed.generation, first.generation + 1);
+    assert_eq!(changed.card_generations, first.card_generations);
     state.local_only_cards = state.local_only_cards.into_iter().collect();
-    let before = changes(&store);
-    lane.save(&store, &state);
-    assert_eq!(changes(&store) - before, 1);
+    assert_no_writes(&mut lane, &state);
 }
 
 /// #2629: a flush serializes only the cards that changed since the last one,
@@ -457,13 +465,14 @@ fn time_store_paths_at_long_lived_size() {
         .pragma_update(None, "wal_checkpoint", "TRUNCATE")
         .unwrap();
     let flushes = 25;
+    let before = changes(&store);
     for _ in 0..flushes {
         lane.save(&store, &state);
     }
-    let wal_per_flush = std::fs::metadata(sqlite_sidecar_path(&path, "-wal"))
+    let unchanged_rows = changes(&store) - before;
+    let unchanged_wal = std::fs::metadata(sqlite_sidecar_path(&path, "-wal"))
         .map(|metadata| metadata.len())
-        .unwrap_or(0)
-        / flushes;
+        .unwrap_or(0);
     let loads = (0..7)
         .map(|_| {
             let started = Instant::now();
@@ -489,11 +498,10 @@ fn time_store_paths_at_long_lived_size() {
         })
         .collect();
     eprintln!(
-        "cards={} unchanged_flush_ms={:.2} one_title_flush_ms={:.2} wal_bytes_per_unchanged_flush={} (wal before checkpoint {}) load_ms={:.2} saved_conversations_ms={:.2} navigable_sessions_ms={:.2}",
+        "cards={} unchanged_flush_ms={:.2} one_title_flush_ms={:.2} unchanged_flushes={flushes} unchanged_rows={unchanged_rows} unchanged_wal_bytes={unchanged_wal} (wal before checkpoint {}) load_ms={:.2} saved_conversations_ms={:.2} navigable_sessions_ms={:.2}",
         state.cards.len(),
         median(unchanged),
         median(retitled),
-        wal_per_flush,
         wal_before,
         median(loads),
         median(conversations),

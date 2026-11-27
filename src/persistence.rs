@@ -979,9 +979,8 @@ impl StateStore {
     ///
     /// `base` supplies the generations the snapshot was derived from; the
     /// `generation` fields inside `state` are ignored. Cards whose persisted
-    /// content fingerprint is unchanged are left untouched, so a quiet
-    /// workspace updates only its workspace row and navigation metadata per
-    /// flush instead of rewriting every card and payload row.
+    /// content fingerprint is unchanged are left untouched. The workspace
+    /// generation advances only when the snapshot changes saved state.
     pub fn save_workspace(
         &self,
         state: &WorkspaceState,
@@ -995,7 +994,8 @@ impl StateStore {
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base, offered_cards, true)?;
+        let commit =
+            save_workspace_transaction(&transaction, state, base, offered_cards, true, false)?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
@@ -1296,6 +1296,7 @@ impl StateStore {
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let changes_before = transaction.total_changes();
         transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
         let mut prepared = state.clone();
         let mut generations = base.cards.clone();
@@ -1411,6 +1412,7 @@ impl StateStore {
             },
             offered_cards,
             false,
+            transaction.total_changes() != changes_before,
         )?;
         transaction.commit()?;
         Ok(commit)
@@ -1874,7 +1876,7 @@ impl StateStore {
             || invalid_state!("tombstoned project {} cannot be resurrected", project.id),
         )?;
         let next = next_generation(project.generation, "project", project.id)?;
-        transaction
+        let written = transaction
             .prepare_cached(
                 "INSERT INTO projects (
                     project_id, generation, name, repository_json, existence_json,
@@ -1886,7 +1888,11 @@ impl StateStore {
                     repository_json = excluded.repository_json,
                     kind_json = excluded.kind_json,
                     existence_json = excluded.existence_json,
-                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+                 WHERE name IS NOT excluded.name
+                    OR repository_json IS NOT excluded.repository_json
+                    OR kind_json IS NOT excluded.kind_json
+                    OR existence_json IS NOT excluded.existence_json",
             )?
             .execute(params![
                 project_id,
@@ -1898,7 +1904,11 @@ impl StateStore {
                 to_json(&project.kind)?,
             ])?;
         transaction.commit()?;
-        Ok(next)
+        Ok(if written == 0 {
+            project.generation
+        } else {
+            next
+        })
     }
 
     pub fn load_project(&self, id: ProjectId) -> Result<Option<ProjectState>> {
@@ -1982,7 +1992,7 @@ impl StateStore {
         // every retry, and once retries ran out the writer would stop
         // scheduling later changes.
         let next = next_generation(worktree.generation, "worktree", worktree.id)?;
-        transaction
+        let written = transaction
             .prepare_cached(
                 "INSERT INTO worktrees (
                     worktree_id, project_id, generation, path_json, branch, existence_json,
@@ -1994,7 +2004,11 @@ impl StateStore {
                     path_json = excluded.path_json,
                     branch = excluded.branch,
                     existence_json = excluded.existence_json,
-                    updated_at_unix_ms = excluded.updated_at_unix_ms",
+                    updated_at_unix_ms = excluded.updated_at_unix_ms
+                 WHERE project_id IS NOT excluded.project_id
+                    OR path_json IS NOT excluded.path_json
+                    OR branch IS NOT excluded.branch
+                    OR existence_json IS NOT excluded.existence_json",
             )?
             .execute(params![
                 worktree_id,
@@ -2006,7 +2020,11 @@ impl StateStore {
                 now_unix_ms(),
             ])?;
         transaction.commit()?;
-        Ok(next)
+        Ok(if written == 0 {
+            worktree.generation
+        } else {
+            next
+        })
     }
 
     pub fn load_worktree(&self, id: WorktreeId) -> Result<Option<WorktreeState>> {
@@ -4584,30 +4602,62 @@ fn save_workspace_transaction(
     base: SnapshotBase<'_>,
     offered_cards: &mut OfferedCards,
     isolate_refused_cards: bool,
+    prior_changes: bool,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
     let workspace_id = state.id.to_string();
-    let actual = select_generation(transaction, SELECT_WORKSPACE_GENERATION, &workspace_id)?;
+    let stored = transaction
+        .prepare_cached(
+            "SELECT generation, schema_version, existence_json, focused_card_id
+             FROM workspaces WHERE workspace_id = ?1",
+        )?
+        .query_row([&workspace_id], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+            ))
+        })
+        .optional()?;
+    let actual = stored
+        .as_ref()
+        .map(|(generation, ..)| i64_to_u64(*generation, "stored generation"))
+        .transpose()?;
     check_generation("workspace", state.id, base.workspace, actual)?;
-    reject_tombstone_resurrection(
-        select_existence(transaction, SELECT_WORKSPACE_EXISTENCE, &workspace_id)?,
-        &state.existence,
-        || invalid_state!("tombstoned workspace {} cannot be resurrected", state.id),
-    )?;
-    let next = next_generation(base.workspace, "workspace", state.id)?;
+    let stored_existence = stored
+        .as_ref()
+        .map(|(_, _, existence, _)| from_json("entity existence", existence))
+        .transpose()?;
+    let existence_changed = stored_existence.as_ref() != Some(&state.existence);
+    reject_tombstone_resurrection(stored_existence, &state.existence, || {
+        invalid_state!("tombstoned workspace {} cannot be resurrected", state.id)
+    })?;
     let timestamp = now_unix_ms();
-    let focused = state.focused.map(|id| id.to_string());
-
-    transaction
-        .prepare_cached(UPSERT_WORKSPACE)?
-        .execute(params![
-            workspace_id,
-            u64_to_i64(next, "workspace generation")?,
-            i64::from(state.schema_version),
-            to_json(&state.existence)?,
-            focused,
-            timestamp,
-        ])?;
+    let schema_version = i64::from(state.schema_version);
+    let mut focused = state.focused.map(|id| id.to_string());
+    let write_workspace = |focused: Option<&str>| -> Result<u64> {
+        let generation = next_generation(base.workspace, "workspace", state.id)?;
+        transaction
+            .prepare_cached(UPSERT_WORKSPACE)?
+            .execute(params![
+                workspace_id,
+                u64_to_i64(generation, "workspace generation")?,
+                schema_version,
+                to_json(&state.existence)?,
+                focused,
+                timestamp,
+            ])?;
+        Ok(generation)
+    };
+    // Cards need a parent row on their first save. Existing workspaces can
+    // wait until the snapshot has settled to know whether anything changed.
+    let inserted = if stored.is_none() {
+        Some(write_workspace(focused.as_deref())?)
+    } else {
+        None
+    };
+    let before_navigation = transaction.total_changes();
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:active_worktree"),
@@ -4703,7 +4753,7 @@ fn save_workspace_transaction(
         .filter(|(id, draft)| !open_chats.contains_key(id) || draft.keeps_queue_at_origin())
         .map(|(id, draft)| (*id, draft.clone()))
         .collect::<HashMap<_, _>>();
-    crate::model::KeptChatDraft::retain_recent(&mut kept_drafts, now_unix_ms());
+    crate::model::KeptChatDraft::retain_recent(&mut kept_drafts, timestamp);
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:kept_chat_drafts"),
@@ -4725,7 +4775,6 @@ fn save_workspace_transaction(
         &to_json(&state.workspace_model_identity)?,
     )?;
 
-    let open_chats = open_chat_sessions(&state.cards);
     let pending = state
         .pending_chat_admissions
         .iter()
@@ -4747,6 +4796,7 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:pending_terminal_creations"),
         &ordered_set_json(&state.pending_terminal_creations)?,
     )?;
+    let mut changed = prior_changes || before_navigation != transaction.total_changes();
 
     let existing = existing_cards(transaction, &workspace_id)?;
     let incoming_ids = state
@@ -4798,22 +4848,22 @@ fn save_workspace_transaction(
             )
         }
         .map_err(|error| error.in_card(card.id))?;
+        // SQLite's total_changes includes writes rolled back to a savepoint.
+        // The settled generation describes what the snapshot will commit.
+        changed |= generation != stored.map_or(0, |row| row.generation);
         card_generations.insert(card.id, generation);
     }
     // A refused card keeps what storage holds for it, which may be its
     // tombstone, and the window cannot be stored focusing a closed card.
-    if let Some(focused) = state.focused
+    if let Some(id) = state.focused
         && refused
             .iter()
-            .any(|error| matches!(error, StoreError::Card { card, .. } if *card == focused))
+            .any(|error| matches!(error, StoreError::Card { card, .. } if *card == id))
         && existing
-            .get(&focused)
+            .get(&id)
             .is_some_and(|stored| !stored.existence.is_open())
     {
-        transaction.execute(
-            "UPDATE workspaces SET focused_card_id = NULL WHERE workspace_id = ?1",
-            [&workspace_id],
-        )?;
+        focused = None;
     }
 
     for (card_id, stored) in &existing {
@@ -4839,6 +4889,7 @@ fn save_workspace_transaction(
             },
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
+        changed |= generation != stored.generation;
         card_generations.insert(*card_id, generation);
     }
     // A final receipt can be suppressed only after its destination can be
@@ -4868,11 +4919,11 @@ fn save_workspace_transaction(
                             .get(recipient)
                             .is_some_and(|queue| !queue.messages.is_empty()))
                 {
-                    checkpoint.execute(params![
+                    changed |= checkpoint.execute(params![
                         origin.to_string(),
                         source.to_string(),
                         fingerprint.as_slice()
-                    ])?;
+                    ])? != 0;
                 }
             }
         }
@@ -4901,8 +4952,20 @@ fn save_workspace_transaction(
                 .is_some_and(|stored| unrestored.holds(state.id, stored))
     });
 
+    let generation = if let Some(inserted) = inserted {
+        inserted
+    } else if changed
+        || existence_changed
+        || stored.is_some_and(|(_, schema, _, saved_focus)| {
+            schema != schema_version || saved_focus != focused
+        })
+    {
+        write_workspace(focused.as_deref())?
+    } else {
+        base.workspace
+    };
     Ok(WorkspaceCommit {
-        generation: next,
+        generation,
         card_generations,
         refused,
     })
@@ -10213,7 +10276,16 @@ mod tests {
         workspace
             .chat_drafts
             .insert(recipient, "recovered queue".into());
-        lane.save(&store, &workspace).unwrap();
+        let receipts = std::mem::take(&mut workspace.returned_chat_queues);
+        let composer = lane.save(&store, &workspace).unwrap();
+        assert!(read().returned_chat_queues.is_empty());
+
+        workspace.returned_chat_queues = receipts;
+        let checkpoint = lane.save(&store, &workspace).unwrap();
+        assert_eq!(checkpoint.generation, composer.generation + 1);
+        assert_eq!(checkpoint.card_generations, composer.card_generations);
+        let replay = lane.save(&store, &workspace).unwrap();
+        assert_eq!(replay.generation, checkpoint.generation);
         assert_eq!(
             read().returned_chat_queues,
             BTreeMap::from([(origin, BTreeMap::from([(key, None)]))])
@@ -11721,6 +11793,9 @@ mod tests {
         assert_eq!(store.load_card(sibling, None).unwrap().unwrap(), kept);
         let saved = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(saved.chat_drafts[&card], "later text");
+        let repeated = lane.save(&store, &repointed).unwrap();
+        assert_eq!(repeated.refused.len(), 2);
+        assert_eq!(repeated.generation, commit.generation);
 
         // A card storage never held has nothing to keep, so refusing it still
         // refuses the window.
@@ -12397,6 +12472,7 @@ mod tests {
             },
             &mut OfferedCards::default(),
             false,
+            false,
         )
         .unwrap();
         transaction.pragma_update(None, "user_version", 3).unwrap();
@@ -12482,6 +12558,7 @@ mod tests {
                 cards: &BTreeMap::new(),
             },
             &mut OfferedCards::default(),
+            false,
             false,
         )
         .unwrap();
@@ -12613,6 +12690,45 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap()
+    }
+
+    #[test]
+    fn unchanged_catalog_records_write_no_rows() {
+        let directory = tempdir().unwrap();
+        let store =
+            StateStore::open(directory.path().join("catalog.sqlite3"), boot("catalog")).unwrap();
+        let mut project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "Repository".into(),
+            repository: directory.path().join("repository/.git"),
+            kind: crate::model::ProjectKind::Git,
+            existence: Existence::Open,
+        };
+        let mut worktree = WorktreeState {
+            id: WorktreeId::new(),
+            project_id: project.id,
+            generation: 0,
+            path: directory.path().join("repository"),
+            branch: None,
+            existence: Existence::Open,
+        };
+        project.generation = store.save_project(&project).unwrap();
+        worktree.generation = store.save_worktree(&worktree).unwrap();
+        let before = store.lock_inner().unwrap().connection.total_changes();
+        assert_eq!(store.save_project(&project).unwrap(), project.generation);
+        assert_eq!(store.save_worktree(&worktree).unwrap(), worktree.generation);
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes(),
+            before
+        );
+
+        project.name = "Renamed".into();
+        worktree.branch = Some("main".into());
+        project.generation = store.save_project(&project).unwrap();
+        worktree.generation = store.save_worktree(&worktree).unwrap();
+        assert_eq!(store.load_project(project.id).unwrap(), Some(project));
+        assert_eq!(store.load_worktree(worktree.id).unwrap(), Some(worktree));
     }
 
     #[test]
@@ -13912,10 +14028,9 @@ mod tests {
         assert_eq!(quiet_after_first.0, 1);
         assert!(quiet_after_first.2.is_some());
 
-        // A snapshot that changes nothing must not rewrite a single card row,
-        // even though the workspace generation advances.
+        // A snapshot that changes nothing leaves all generations in place.
         let commit = lane.save(&store, &workspace).unwrap();
-        assert_eq!(commit.generation, 2);
+        assert_eq!(commit.generation, 1);
         assert_eq!(commit.card_generations[&quiet_id], 1);
         assert_eq!(commit.card_generations[&busy_id], 1);
         assert_eq!(stored_card_row(&store, quiet_id), quiet_after_first);
@@ -13925,9 +14040,24 @@ mod tests {
         let mut changed = workspace.clone();
         changed.cards[0].title = "renamed".into();
         let commit = lane.save(&store, &changed).unwrap();
+        assert_eq!(commit.generation, 2);
         assert_eq!(commit.card_generations[&busy_id], 2);
         assert_eq!(commit.card_generations[&quiet_id], 1);
         assert_eq!(stored_card_row(&store, quiet_id), quiet_after_first);
+
+        changed.focused = Some(quiet_id);
+        let focused = lane.save(&store, &changed).unwrap();
+        assert_eq!(focused.generation, commit.generation + 1);
+        assert_eq!(focused.card_generations, commit.card_generations);
+        let manifest = store
+            .load_workspace_manifest(workspace.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(manifest.focused, changed.focused);
+        assert_eq!(
+            lane.save(&store, &changed).unwrap().generation,
+            focused.generation
+        );
         assert_eq!(stored_card_row(&store, busy_id).0, 2);
 
         // And a change confined to a side-table payload is still detected.
@@ -14023,8 +14153,8 @@ mod tests {
         assert_eq!(built, 0, "#2629: no unchanged card is serialized again");
         assert_eq!(
             store.lock_inner().unwrap().connection.total_changes() - changes,
-            3,
-            "each flush writes its workspace row and nothing else"
+            0,
+            "repeated flushes write no rows"
         );
         for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
@@ -14073,8 +14203,8 @@ mod tests {
         );
         assert_eq!(
             store.lock_inner().unwrap().connection.total_changes() - changes,
-            1,
-            "only the workspace row records the flush"
+            0,
+            "an unchanged flush writes no rows"
         );
         assert_eq!(stored_card_row(&store, card), settled);
 

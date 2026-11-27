@@ -2041,16 +2041,19 @@ fn a_checkpoint_is_honoured_after_the_base_went_stale() {
     // behind, and the close path cannot tell: it only asks for a barrier.
     let mut cards = BTreeMap::new();
     cards.insert(state.cards[0].id, 1);
-    runtime
+    let mut intervening = state.clone();
+    intervening.cards[0].title = "intervening edit".into();
+    let commit = runtime
         .operation_store()
         .save_workspace(
-            &state,
+            &intervening,
             SnapshotBase {
                 workspace: 1,
                 cards: &cards,
             },
         )
         .unwrap();
+    assert_eq!(commit.generation, 2);
 
     state.cards[0].width_fraction = 0.25;
     runtime.snapshot(Arc::new(state.clone()));

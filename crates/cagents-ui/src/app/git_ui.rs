@@ -3987,7 +3987,7 @@ mod tests {
     }
 
     #[test]
-    fn a_full_scan_read_reasserts_unchanged_catalog_rows() {
+    fn a_full_scan_repairs_the_catalog_without_rewriting_matching_rows() {
         let directory = tempfile::tempdir().unwrap();
         let snapshot = fixture(&directory.path().join("repo"));
         let (mut app, project) = catalog_app(&snapshot);
@@ -4012,21 +4012,40 @@ mod tests {
             .unwrap();
         let baseline = store.load_worktree(id).unwrap().unwrap();
 
-        let entry = app.refresh_ui.git.entries.get_mut(&project.id).unwrap();
-        entry.read_full_scan = true;
-        entry.cancellation = Some(CancellationToken::default());
-        let plan = catalog_plan(project.id, &snapshot);
-        drop(app.update_git(Action::Read {
-            project: project.id,
-            generation: 1,
-            result: Ok((snapshot, Some(plan)).into()),
-        }));
-        app.session
-            .as_ref()
-            .unwrap()
-            .flush(Duration::from_secs(5))
+        let rescan = |app: &mut Cagents| {
+            let entry = app.refresh_ui.git.entries.get_mut(&project.id).unwrap();
+            entry.read_full_scan = true;
+            entry.cancellation = Some(CancellationToken::default());
+            let plan = catalog_plan(project.id, &snapshot);
+            drop(app.update_git(Action::Read {
+                project: project.id,
+                generation: 1,
+                result: Ok((snapshot.clone(), Some(plan)).into()),
+            }));
+            app.session
+                .as_ref()
+                .unwrap()
+                .flush(Duration::from_secs(5))
+                .unwrap();
+        };
+        rescan(&mut app);
+        assert_eq!(store.load_worktree(id).unwrap().unwrap(), baseline);
+
+        let closed = store
+            .save_worktree(&WorktreeState {
+                existence: worktree_ui::removed_outside(),
+                ..baseline.clone()
+            })
             .unwrap();
-        assert!(store.load_worktree(id).unwrap().unwrap().generation > baseline.generation);
+        rescan(&mut app);
+        let reopened = store.load_worktree(id).unwrap().unwrap();
+        assert_eq!(
+            reopened,
+            WorktreeState {
+                generation: closed + 1,
+                ..baseline
+            }
+        );
     }
 
     #[test]
