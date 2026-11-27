@@ -369,8 +369,8 @@ exit 83
 
     def assert_built(self, *arguments, **changes):
         result, calls = self.launch(*arguments, **changes)
-        # The command line, the daemon, the app and dictation's helper.
-        self.assertEqual(len(calls), 4, result.stderr)
+        # The CLI, daemon and UI are always required.
+        self.assertEqual(len(calls), 3 + ("--dictation" in arguments), result.stderr)
         self.assertNotIn("skipping the build", result.stderr)
 
     def assert_skipped(self, *arguments, **changes):
@@ -405,7 +405,7 @@ exit 83
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("may only confirm that nothing needs compiling", result.stderr)
         lines = guard_calls.read_text().splitlines()
-        self.assertEqual(len(lines), 4)
+        self.assertEqual(len(lines), 3)
         for line in lines:
             self.assertIn(f"wrapper={self.runner.with_name('refuse-compile')} ", line)
             self.assertNotIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", line)
@@ -587,7 +587,7 @@ exit 83
     def test_a_guarded_build_records_the_same_identity_as_any_other(self):
         result = self.under_native_lock("flock", "--close")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(len(self.cargo_calls.read_text().splitlines()), 4)
+        self.assertEqual(len(self.cargo_calls.read_text().splitlines()), 3)
         self.cargo_calls.unlink()
         result = self.under_native_lock("flock", "--close")
         self.assertIn("skipping the build", result.stderr)
@@ -781,16 +781,18 @@ exit 83
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.
         offload = self.runner.with_name("cargo-offload")
-        # One slot there serves all four builds: the hold runs the script.
+        # The hold runs the whole script, including the helper when requested.
         offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
                            '[ "$1" != --hold ] || { shift; printf "hold\\n" >>"$CARGO_CALLS"; exec "$@"; }\n'
                            'exec cargo "$@"\n')
         offload.chmod(0o755)
-        for _ in range(2):
-            result, calls = self.launch("--browserless")
-            self.assertEqual(calls[0], "hold", result.stderr)
-            self.assertEqual(len(calls), 5, calls)
-            self.assertNotIn("skipping the build", result.stderr)
+        for options, call_count in (((), 4), (("--dictation",), 5)):
+            with self.subTest(options=options):
+                for _ in range(2):
+                    result, calls = self.launch("--browserless", *options)
+                    self.assertEqual(calls[0], "hold", result.stderr)
+                    self.assertEqual(len(calls), call_count, calls)
+                    self.assertNotIn("skipping the build", result.stderr)
 
     def test_identity_records_hide_environment_values_and_stay_private(self):
         # Build tools are inert; these are synthetic values, including an
@@ -1230,12 +1232,51 @@ exit 1
             f"{common} --no-default-features -p cagents-host --features development --bin cagentsd",
         ])
         self.assertEqual(integrated[:2], browserless[:2])
-        helper = f"{common} -p cagents-dictate --features engine --bin cagents-dictate"
         self.assertEqual(browserless[2:], [
-            f"{common} -p cagents-ui --features development --bin cagents-ui", helper])
+            f"{common} -p cagents-ui --features development --bin cagents-ui",
+        ])
         self.assertEqual(integrated[2:], [
             f"{common} -p cagents-ui --features development,integrated-browser --bin cagents-ui",
-            helper])
+        ])
+
+    def test_both_lanes_build_the_dictation_engine_only_on_request(self):
+        for lane in (("--browserless",), ()):
+            with self.subTest(lane=lane):
+                _, calls = self.launch(*lane, "--dictation")
+                self.assertEqual(len(calls), 4)
+                self.assertEqual(
+                    calls[-1],
+                    "build --message-format=json --locked --profile dev-runtime "
+                    "-p cagents-dictate --features engine --bin cagents-dictate",
+                )
+                self.assert_skipped(*lane, "--dictation")
+
+    def test_dictation_build_record_requires_the_helper_only_when_requested(self):
+        self.assert_built("--browserless")
+        self.assert_skipped("--browserless")
+        self.assert_built("--browserless", "--dictation")
+        self.assert_skipped("--browserless", "--dictation")
+        helper = self.target / "dev-runtime/cagents-dictate"
+        Path(f"{helper}.d").unlink()
+        self.assert_built("--browserless", "--dictation")
+
+        self.assert_built("--browserless")
+        self.assertTrue(helper.is_file())
+        helper.unlink()
+        Path(f"{helper}.d").unlink()
+        self.assert_skipped("--browserless")
+        self.assert_built("--browserless", "--dictation")
+
+    def test_hot_reload_rejects_dictation_before_building(self):
+        for mode in ("--hot", "--hot-integrated"):
+            with self.subTest(mode=mode):
+                result = subprocess.run(
+                    [str(self.runner), mode, "--dictation"], cwd=self.root,
+                    env=self.env, capture_output=True, text=True, timeout=HANG_GUARD,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("--dictation is unavailable with hot reload", result.stderr)
+                self.assertFalse(self.cargo_calls.exists())
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")

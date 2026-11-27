@@ -370,11 +370,11 @@ class Behavior(unittest.TestCase):
         self.assertEqual(self.calls(), [["check-lane-isolation"]])
 
     def test_runner_arguments_are_forwarded_after_the_lane(self):
-        self.assertEqual(self.mise_run("dev", "--", "--debug", "--", "--ui-arg").returncode, 0)
-        self.assertEqual(self.mise_run("dev:browser", "--", "--instance", "a b").returncode, 0)
+        self.assertEqual(self.mise_run("dev", "--", "--dictation", "--debug", "--", "--ui-arg").returncode, 0)
+        self.assertEqual(self.mise_run("dev:browser", "--", "--dictation", "--instance", "a b").returncode, 0)
         self.assertEqual(self.calls(), [
-            ["run-development", "--browserless", "--debug", "--", "--ui-arg"],
-            ["run-development", "--instance", "a b"],
+            ["run-development", "--browserless", "--dictation", "--debug", "--", "--ui-arg"],
+            ["run-development", "--dictation", "--instance", "a b"],
         ])
 
     def test_script_contracts_run_every_job_or_the_one_named(self):
