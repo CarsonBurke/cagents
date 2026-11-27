@@ -301,6 +301,8 @@ fn a_new_terminal_that_fails_to_start_says_it_did_not_open_and_why() {
         unreachable!()
     };
     let terminal = session.id;
+    drop(window.app.sync_chrome());
+    let pane = window.app.notice_pane_name(card).unwrap();
     let reason = "terminal worker failed to start: pin terminal launch directory /repo: No such file or directory (os error 2)";
     drop(window.app.update(Message::TerminalStarted {
         card,
@@ -314,18 +316,31 @@ fn a_new_terminal_that_fails_to_start_says_it_did_not_open_and_why() {
     assert!(window.app.terminal_creation_failed(card));
     assert_eq!(
         failure(&window, card),
+        Some("The terminal’s folder is missing: /repo.")
+    );
+    let Some(CardRuntime::Failed(failure)) = window.app.cards.get(&card) else {
+        panic!("expected the failed terminal pane");
+    };
+    assert_eq!(
+        failure.creation_guidance(),
         Some(
-            "Terminal worker failed to start: pin terminal launch directory /repo: No such file or directory (os error 2)."
+            "Restore the folder and choose Retry, or close this pane and open a terminal in another folder."
         )
     );
     assert_eq!(
-        terminal_failure::creation_title(),
+        terminal_failure::creation_title(None),
         "Couldn't open this terminal"
     );
-    assert!(window.app.notices.entries.iter().any(|entry| {
-        entry.notice.message == "Couldn't open this terminal"
-            && entry.notice.details.as_deref() == Some(reason)
-    }));
+    let notice = &window
+        .app
+        .notices
+        .entries
+        .iter()
+        .find(|entry| entry.notice.key == Some(NoticeKey::TerminalStart(card)))
+        .expect("notice about this terminal")
+        .notice;
+    assert_eq!(notice.message, format!("Couldn't open {pane}"));
+    assert_eq!(notice.details.as_deref(), Some(reason));
 }
 
 /// A saved terminal restored without its process, which never recorded an

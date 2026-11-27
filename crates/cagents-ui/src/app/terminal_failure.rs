@@ -7,6 +7,10 @@ use std::ops::Deref;
 #[derive(Debug, Clone)]
 pub(super) enum Failure {
     Generic(String),
+    Creation {
+        message: String,
+        guidance: Option<&'static str>,
+    },
     Terminal(Box<Details>),
 }
 impl Failure {
@@ -23,9 +27,15 @@ impl Failure {
             (details.code, details.message) = known_failure(&typed_error.code);
         }
     }
+    pub(super) fn creation_guidance(&self) -> Option<&'static str> {
+        match self {
+            Self::Creation { guidance, .. } => *guidance,
+            _ => None,
+        }
+    }
     pub(super) fn message(&self) -> &str {
         match self {
-            Self::Generic(message) => message,
+            Self::Generic(message) | Self::Creation { message, .. } => message,
             Self::Terminal(details) => details.message,
         }
     }
@@ -165,15 +175,38 @@ const RETRY_SHELL: &str = "Retry starts a new shell in this pane.";
 pub(super) const RETRY_UNAVAILABLE: &str = "cagents can't restart this agent. Its saved command may reopen a conversation the agent has since left, and cagents can't open the agent's conversation picker instead. Open a new terminal to keep working.";
 /// The title of a new terminal's pane when the terminal didn't open, naming
 /// the device it was to run on.
-pub(super) fn creation_title() -> Cow<'static, str> {
-    match crate::device::selected() {
-        Some(device) => format!("Couldn't open a terminal on {}", device.name).into(),
-        None => "Couldn't open this terminal".into(),
+pub(super) fn creation_title(pane: Option<&str>) -> Cow<'static, str> {
+    match (pane, crate::device::selected()) {
+        (Some(pane), Some(device)) => format!("Couldn't open {pane} on {}", device.name).into(),
+        (Some(pane), None) => format!("Couldn't open {pane}").into(),
+        (None, Some(device)) => format!("Couldn't open a terminal on {}", device.name).into(),
+        (None, None) => "Couldn't open this terminal".into(),
     }
 }
-/// Why a new terminal didn't open, as a sentence for its pane.
-pub(super) fn creation_reason(reason: &str) -> String {
+
+/// Why a new terminal didn't open and what the user can do next.
+pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
+    if login_busy {
+        return Failure::Creation {
+            message: account::login::PORT_BUSY.into(),
+            guidance: None,
+        };
+    }
     let reason = reason.trim();
+    if let Some(path) = reason
+        .strip_prefix("terminal worker failed to start: pin terminal launch directory ")
+        .and_then(|tail| tail.strip_suffix(": No such file or directory (os error 2)"))
+    {
+        return Failure::Creation {
+            message: format!(
+                "The terminal’s folder is missing: {}.",
+                bounded_path_text(path)
+            ),
+            guidance: Some(
+                "Restore the folder and choose Retry, or close this pane and open a terminal in another folder.",
+            ),
+        };
+    }
     let mut chars = reason.chars();
     let mut sentence = chars
         .next()
@@ -182,7 +215,10 @@ pub(super) fn creation_reason(reason: &str) -> String {
     if !sentence.ends_with(['.', '!', '?']) {
         sentence.push('.');
     }
-    sentence
+    Failure::Creation {
+        message: sentence,
+        guidance: Some("Fix the problem above, then choose Retry."),
+    }
 }
 /// What Retry launches in place of a terminal.
 enum NewTerminal {
@@ -386,6 +422,12 @@ fn bounded_path(path: &Path) -> String {
                 .map(|suffix| format!("~/{}", suffix.display()))
         })
         .unwrap_or_else(|| text.into_owned());
+    bounded_path_text(&text)
+}
+
+/// An absolute launch path belongs to the device. An abbreviation using the
+/// window's home would make Retry's target ambiguous.
+fn bounded_path_text(text: &str) -> String {
     text.chars().filter(|c| !c.is_control() && !matches!(*c, '\u{200b}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')).take(240).collect()
 }
 impl Details {
