@@ -1210,6 +1210,20 @@ impl Cagents {
                         self.device_ui.linked_file = None;
                         self.device_ui.linked_fragment = None;
                         self.device_ui.notice = Some(error);
+                        if self.device_ui.open
+                            && self.device_ui.worktree_source.is_some()
+                            && matches!(
+                                pending,
+                                Some(Operation::Git {
+                                    operation: GitOperation::CreateWorktreeFromBranch { .. },
+                                    ..
+                                })
+                            )
+                        {
+                            return iced::widget::operation::focus(widget::Id::new(
+                                WORKTREE_BRANCH_ID,
+                            ));
+                        }
                     }
                     Ok(Reply::Directory { path, entries }) => {
                         self.device_ui.path = path.display().to_string();
@@ -2498,6 +2512,51 @@ fn sentence(reason: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::Provider;
+
+    #[test]
+    fn refused_branch_worktree_creation_refocuses_the_preserved_draft() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let main = PathBuf::from("/device/demo");
+        let source = WorktreeSource {
+            project_id: ProjectId::new(),
+            repository: main.join(".git"),
+            main: main.clone(),
+            base: "feature".into(),
+            branch: "topic/derived".into(),
+            folder: "custom-folder".into(),
+        };
+        let request = Operation::Git {
+            root: main,
+            operation: GitOperation::CreateWorktreeFromBranch {
+                repository: source.repository.clone(),
+                name: source.folder.clone(),
+                branch: source.branch.clone(),
+                base: source.base.clone(),
+            },
+        };
+        app.device_ui.open = true;
+        app.device_ui.busy = true;
+        app.device_ui.generation = 1;
+        app.device_ui.pending = Some(request);
+        app.device_ui.worktree_source = Some(source);
+
+        let refusal = "The starting branch no longer exists.";
+        let focus = app.update_device(Action::Loaded {
+            generation: 1,
+            result: Err(refusal.into()),
+        });
+
+        let draft = app.device_ui.worktree_source.as_ref().unwrap();
+        assert!(app.device_ui.open);
+        assert!(!app.device_ui.busy);
+        assert_eq!(app.device_ui.notice.as_deref(), Some(refusal));
+        assert_eq!(draft.branch, "topic/derived");
+        assert_eq!(draft.folder, "custom-folder");
+        assert_eq!(
+            super::super::tests::focused_element(app.device_dialog(), focus),
+            Some(widget::Id::new(WORKTREE_BRANCH_ID)),
+        );
+    }
 
     #[test]
     fn a_device_ssh_cannot_reach_is_reported_without_asking_it_more() {
