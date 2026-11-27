@@ -2000,19 +2000,23 @@ fn original_policy_is_chained_with_its_hook_configuration_and_aborted_effects_ar
 }
 
 #[test]
-fn native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory() {
+fn native_addition_guard_preserves_ignored_data_and_refuses_file_to_directory() {
     if isolated_fixture_case(concat!(
         module_path!(),
         "::",
-        stringify!(
-            native_addition_guard_preserves_non_utf8_ignored_data_and_refuses_file_to_directory
-        )
+        stringify!(native_addition_guard_preserves_ignored_data_and_refuses_file_to_directory)
     )) {
         return;
     }
+    #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt;
     let fixture = Fixture::new(true);
+    #[cfg(target_os = "linux")]
     let odd = OsString::from_vec(b"odd\xff\n[] -entry".to_vec());
+    // APFS rejects invalid UTF-8 filenames. Keep literal matching of
+    // whitespace, glob metacharacters and non-ASCII text on macOS.
+    #[cfg(target_os = "macos")]
+    let odd = OsString::from("odd-雪\n[] -entry");
     let incoming = odd.clone();
     let new = fixture.advance(|root| {
         fs::create_dir(root.join("secret")).unwrap();
@@ -2159,7 +2163,7 @@ fn detached_policy_descendant_is_retained_through_settlement(cancelled: bool) {
         &["config", "core.hooksPath", policy.to_str().unwrap()],
     );
     let hook = policy.join("reference-transaction");
-    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
+    fs::write(&hook, "#!/bin/sh\nset -eu\ninput=$(/bin/cat)\nif [ \"$1\" = committed ] && printf '%s' \"$input\" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then\n /usr/bin/python3 -c 'import os,signal,sys; os.setsid(); signal.alarm(120); os.execv(sys.argv[1],sys.argv[1:])' /bin/sh -c 'touch \"$CAGENTS_PR_PRIVATE/descendant-started\"; while [ ! -e \"$CAGENTS_PR_PRIVATE/release-descendant\" ]; do /bin/sleep 0.02; done; touch \"$CAGENTS_PR_PRIVATE/descendant-retired\"' </dev/null >/dev/null 2>&1 &\nfi\n").unwrap();
     fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
     let plan = fixture.prepare(&fixture.request(new.clone()));
     let cancel = CancellationToken::default();
@@ -2272,7 +2276,7 @@ fn policy_child_finishing_before_first_lease_probe_cannot_authorize_a_stale_rece
 set -eu
 input=$(/bin/cat)
 if [ "$1" = committed ] && printf '%s' "$input" | /usr/bin/grep -F ' refs/heads/feature' >/dev/null; then
- /usr/bin/setsid /usr/bin/timeout 120 /bin/sh -c '
+ /usr/bin/python3 -c 'import os,signal,sys; os.setsid(); signal.alarm(120); os.execv(sys.argv[1],sys.argv[1:])' /bin/sh -c '
   touch "$CAGENTS_PR_PRIVATE/late-child-started"
   while [ ! -e "$CAGENTS_PR_PRIVATE/release-late-child" ]; do /bin/sleep 0.02; done
   printf "\n[branch \"feature\"]\n merge = refs/heads/changed-by-child\n" >> "$CAGENTS_PR_COMMON_FD/config"

@@ -446,6 +446,46 @@ fn manually_expanded_details_survive_find_query_changes_and_close_without_new_pu
     assert!(Arc::ptr_eq(&original, &runtime.snapshot.items[0]));
 }
 
+/// While a subagent's transcript is open, a usage limit on the main
+/// conversation still marks its tab, with the limit's own glyph.
+#[test]
+fn a_usage_limited_main_conversation_marks_its_tab() {
+    let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.subagents = vec![child("only-worker", ToolStatus::Succeeded, false)];
+    snapshot.error = Some(quota("1:30pm", "parent-tab"));
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(
+        runtime.parent_tab_state(),
+        Some((Icon::UsageLimit, "Account limit reached".to_owned()))
+    );
+}
+
+/// A usage limit the transcript records but the conversation no longer
+/// reports has lapsed: its notice stays, but is no longer current, so its
+/// mark is not drawn in the attention tone.
+#[test]
+fn a_recorded_usage_limit_is_current_only_while_reported() {
+    let text = quota("1:30pm", "lapsed");
+    let (mut runtime, handle) =
+        frame_cost::live_runtime(&[provider_error("limit", Provider::Claude, &text)]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.error = Some(text);
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot.clone());
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert!(runtime.failure_ui.incidents[0].current());
+    snapshot.error = None;
+    snapshot.generation += 1;
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    assert_eq!(runtime.failure_ui.incidents.len(), 1);
+    assert!(!runtime.failure_ui.incidents[0].current());
+}
+
 #[test]
 fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked() {
     let (mut runtime, handle) = frame_cost::live_runtime(&[]);
@@ -1160,6 +1200,15 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
         for open in [false, true] {
             runtime.child_picker =
                 open.then(|| child_navigation::Picker::new(&runtime.snapshot.subagents));
+            // What a chooser row for each child is named.
+            let choice_names: std::collections::HashSet<String> = runtime
+                .snapshot
+                .subagents
+                .iter()
+                .map(|child| runtime.child_choice_name(child, &runtime.child_label(child, 80)))
+                .collect();
+            // Without the child's ID, each name is still its own.
+            assert_eq!(choice_names.len(), runtime.snapshot.subagents.len());
             for height in [180.0, 600.0] {
                 // The navbar contains only the trigger. Exercise the actual
                 // in-pane chooser, including its bounded window of choices.
@@ -1196,11 +1245,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         node.node().role() == iced_accessibility::accesskit::Role::Button
                     })
                     .filter_map(|node| node.node().label())
-                    .filter(|label| {
-                        label
-                            .rsplit_once(" · ")
-                            .is_some_and(|(_, id)| id.starts_with("worker-"))
-                    })
+                    .filter(|label| choice_names.contains(*label))
                     .collect();
                 // The chooser builds only the rows in and near its view.
                 if open {
@@ -1232,10 +1277,7 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         .collect::<Vec<_>>();
                     actual.sort();
                     expected.sort();
-                    assert_eq!(
-                        actual, expected,
-                        "AX choices keep complete names and exact child identities"
-                    );
+                    assert_eq!(actual, expected, "AX choices keep complete names");
                 }
             }
         }
@@ -1373,9 +1415,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 .collect();
             let actual: Vec<_> = current
                 .iter()
-                .filter(|label| {
-                    label.ends_with(" · chosen-worker") || label.ends_with(" · other-worker")
-                })
+                .filter(|label| expected.contains(label))
                 .cloned()
                 .collect();
             assert_eq!(actual, expected);
@@ -1908,9 +1948,15 @@ fn an_agent_notice_reads_as_its_report() {
     let (runtime, _handle) = frame_cost::live_runtime(std::slice::from_ref(&notice));
     let surface = report_surface(&runtime, "quiet-notice");
     assert!(
-        surface.text.contains(&"Quiet".to_owned()) && surface.text.contains(&"finished".to_owned()),
+        surface.text.contains(&"Quiet".to_owned()),
         "{:?}",
         surface.text
+    );
+    // Its outcome is the mark beside its time, which names it in words.
+    assert!(
+        surface.accessible.contains(&"finished".to_owned()),
+        "{:?}",
+        surface.accessible
     );
     assert!(
         !surface.text.iter().any(|text| text.contains("Agent \"")),
@@ -1997,13 +2043,16 @@ fn report_details_and_late_find_prepare_original_markdown_and_restore_disclosure
                 1,
                 "expansion retains one title rather than repeating the full heading"
             );
-            assert_eq!(
+            // The outcome is marked beside the time, and named in words to
+            // assistive technology, never repeated as text.
+            assert!(!surface.text.iter().any(|text| text == "finished"));
+            assert!(
                 surface
-                    .text
+                    .accessible
                     .iter()
-                    .filter(|text| text.as_str() == "finished")
-                    .count(),
-                1
+                    .any(|label| label.contains("finished")),
+                "{:?}",
+                surface.accessible
             );
             // Open, the report carries the message's actions, whose Copy is
             // the only one: no button of its own repeats it in the body, and
@@ -2643,4 +2692,23 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_ui.expanded.contains(&key));
     assert_eq!(runtime.failure_details(&key).as_deref(), Some(raw.as_str()));
     assert!(runtime.failure_preview(&key).is_some());
+}
+
+/// A subagent chooser row is named by the child's label, status and task;
+/// the provider's ID for the child is an address, never part of its name.
+#[test]
+fn a_chooser_row_is_not_named_by_its_childs_id() {
+    const ID: &str = "a404930e4df62e728";
+    let (mut runtime, handle) = frame_cost::live_runtime(&[]);
+    let mut snapshot = runtime.snapshot.as_ref().clone();
+    snapshot.generation += 1;
+    let mut agent = child(ID, ToolStatus::Running, false);
+    agent.description = "Build and install the app".into();
+    snapshot.subagents = vec![agent];
+    handle.publish_snapshot_for_test(snapshot);
+    runtime.refresh();
+    let child = &runtime.snapshot.subagents[0];
+    let name = runtime.child_choice_name(child, &runtime.child_label(child, 80));
+    assert!(!name.contains(&ID[..8]), "{name}");
+    assert!(name.contains("Build and install the app"), "{name}");
 }

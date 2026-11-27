@@ -6,19 +6,19 @@
     <meta name="color-scheme" content="dark light" />
     <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#161a24" />
     <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f6f4f0" />
-    <title>cagents: every coding agent and account in one native Linux app</title>
+    <title>cagents · A native Linux workspace for coding agents</title>
     <meta
       name="description"
-      content="Run several Claude Code and Codex accounts side by side, and keep all your coding agents in one native Linux app, with their terminals, diffs and pull requests."
+      content="Run several Claude Code and Codex accounts side by side. Follow your agents by Git worktree and review their changes in the same app."
     />
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="cagents: every coding agent and account in one native Linux app" />
+    <meta property="og:title" content="cagents · A native Linux workspace for coding agents" />
     <meta
       property="og:description"
-      content="Run several Claude Code and Codex accounts side by side, and keep all your coding agents in one native Linux app, with their terminals, diffs and pull requests."
+      content="Run several Claude Code and Codex accounts side by side. Follow your agents by Git worktree and review their changes in the same app."
     />
-    <meta property="og:url" content="https://carsonburke.github.io/cagents/" />
-    <meta property="og:image" content="https://carsonburke.github.io/cagents/og-image.png" />
+    <meta property="og:url" content="https://cagents.carsonburke.com/" />
+    <meta property="og:image" content="https://cagents.carsonburke.com/og-image.png" />
     <meta property="og:image:width" content="1200" />
     <meta property="og:image:height" content="630" />
     <meta name="twitter:card" content="summary_large_image" />
@@ -38,7 +38,6 @@
       <nav aria-label="Primary">
         <ul>
           <li><a href="#features">Features</a></li>
-          <li><a href="#install">Install</a></li>
           <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/user-guide.md">Docs</a></li>
           <li>
             <a class="nav-github" href="https://github.com/CarsonBurke/cagents">
@@ -55,15 +54,14 @@
     <main id="main">
       <section class="hero" id="top" aria-labelledby="hero-title">
         <div class="hero-copy">
-          <h1 id="hero-title">Every coding agent and every account, in one native Linux app</h1>
+          <h1 id="hero-title">A native Linux workspace for coding agents</h1>
           <p class="lede">
-            Run several Claude Code and Codex accounts side by side, next to
-            Antigravity, Muse and Oh My Pi, each agent with its own terminals,
-            diffs and pull requests.
+            Run Claude Code and Codex from multiple accounts alongside
+            Antigravity, Muse and Oh My Pi. Give each task its own Git worktree
+            and review the changes beside the conversation.
           </p>
           <div class="actions">
-            <a class="button primary" href="#install">Install for Linux</a>
-            <a class="button" href="https://github.com/CarsonBurke/cagents">Source on GitHub</a>
+            <a class="button primary" href="https://github.com/CarsonBurke/cagents/blob/main/docs/user-guide.md">Read the user guide</a>
           </div>
           <p class="fine">Linux x86_64 on Wayland · MIT licensed · In beta</p>
         </div>
@@ -77,16 +75,14 @@
 
         <article class="feature" id="accounts">
           <div class="feature-copy">
-            <h3>Every account, side by side</h3>
+            <h3>Use work and personal accounts side by side</h3>
             <p>
-              Add each Claude Code and Codex login you have. Every account keeps
-              its own sign-in and shows how much of its allowance is left, and
-              you choose one per conversation, so a personal and a work account
-              can run at the same time.
+              See the remaining allowance for each Claude Code and Codex
+              account and pick one when you start a conversation.
             </p>
             <p>
-              Set a provider to Automatic and new conversations start on a
-              signed-in plan, moving to another when its allowance runs out.
+              Choose Automatic to let cagents pick an account and switch to
+              another signed-in plan when the current one runs out.
             </p>
           </div>
           <figure class="shot pane pane-teal">
@@ -96,16 +92,11 @@
 
         <article class="feature" id="agents">
           <div class="feature-copy">
-            <h3>All your agents in one window</h3>
+            <h3>Chat and terminal for the same session</h3>
             <p>
-              Conversations from every provider sit together, grouped by project
-              and worktree, in one native interface rather than a separate terminal
-              or app for each.
-            </p>
-            <p>
-              Switch a Claude Code or Codex session between a real terminal and a
-              native chat of the same conversation. Commands, edits and tool
-              calls stay one line each until you open them.
+              Switch between a terminal and native chat in a Claude Code or
+              Codex session. In chat, expand a command, edit or tool call to
+              see its details.
             </p>
           </div>
           <figure class="shot pane pane-slate">
@@ -114,7 +105,7 @@
         </article>
 
         <div class="around" aria-labelledby="around-title">
-          <h2 id="around-title">Around the agents</h2>
+          <h2 id="around-title">From worktree to pull request</h2>
           <ul class="cards">
             <li>
               <figure class="shot pane pane-slate">
@@ -122,19 +113,18 @@
               </figure>
               <h3>A worktree per task</h3>
               <p>
-                Create a worktree from a branch name or a Linear issue. The
-                sidebar shows which agents are working, waiting for you, or have
-                output you haven't read.
+                Start from a branch name or Linear issue. Check the sidebar
+                for agents at work, waiting for input, or with unread output.
               </p>
             </li>
             <li>
               <figure class="shot pane pane-coral">
                 <!--screenshot:review-->
               </figure>
-              <h3>Review in place</h3>
+              <h3>Review changes beside the conversation</h3>
               <p>
-                Read the diff, stage and commit, browse history and review pull
-                requests, with GitHub's viewed marks kept in sync.
+                Read diffs, stage files and commit. When you review a pull
+                request, files you mark as viewed stay in sync with GitHub.
               </p>
             </li>
             <li>
@@ -143,8 +133,8 @@
               </figure>
               <h3>An editor beside the chat</h3>
               <p>
-                Syntax highlighting, autosave and optional language servers. It
-                also ships on its own as <code>ceditor</code>.
+                Open and edit the files your agent is working on. The editor
+                has syntax highlighting, autosave and optional language servers.
               </p>
             </li>
           </ul>
@@ -154,33 +144,31 @@
           <li>
             <h3>Sessions outlive the window</h3>
             <p>
-              A per-user daemon owns every terminal and conversation. Restart
-              the app and your agents keep going; compatible updates keep the
-              daemon and your sessions running.
+              Close the window or restart the interface while your agents
+              and terminals keep running in the background.
             </p>
           </li>
           <li>
-            <h3>Other machines, same workspace</h3>
+            <h3>Work on another machine over SSH</h3>
             <p>
-              Connect to another computer's daemon over SSH for its terminals,
-              chats, files, Git and worktrees.
+              Open a remote machine's chats, terminals, files and Git
+              worktrees from your local window.
               <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/devices.md">Device windows</a>
             </p>
           </li>
           <li>
-            <h3>Keyboard first</h3>
+            <h3>Move between panes by keyboard</h3>
             <p>
-              Chats, terminals, editors and browsers sit in one horizontal
-              strip. Move with <kbd>Ctrl</kbd>+<kbd>PgUp</kbd> and
-              <kbd>Ctrl</kbd>+<kbd>PgDn</kbd>, and resize the focused pane with
-              <kbd>Alt</kbd>+<kbd>R</kbd>.
+              Press <kbd>Ctrl</kbd>+<kbd>PgUp</kbd> or
+              <kbd>Ctrl</kbd>+<kbd>PgDn</kbd> to move between panes.
+              Press <kbd>Alt</kbd>+<kbd>R</kbd> to resize the focused pane.
             </p>
           </li>
           <li class="fact-cli">
-            <h3>Scriptable from the shell</h3>
+            <h3>Run agents from a script</h3>
             <p>
-              Start agents, send prompts and read structured results without a
-              window, or let sessions message each other.
+              Send prompts and read structured results from the CLI, with
+              the app window closed.
               <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/agent-execution.md">Agent execution</a>
             </p>
             <pre><code><span class="prompt">$</span> cagents agent spawn --provider claude --wait \
@@ -188,43 +176,6 @@
 <span class="prompt">$</span> cagents --json sessions</code></pre>
           </li>
         </ul>
-      </section>
-
-      <section class="install" id="install" aria-labelledby="install-title">
-        <div class="install-copy">
-          <h2 id="install-title">Install</h2>
-          <p>
-            Run this in a system terminal. It looks up the latest release, checks
-            the installer and the archive against the release's SHA-256
-            manifest, and installs cagents for your user without root or a
-            GitHub account.
-          </p>
-          <p>
-            A copy installed this way updates itself: cagents checks for signed
-            releases and offers each one in the app. Compatible updates keep the daemon and
-            your sessions running.
-          </p>
-          <p>
-            Prefer a package? Download the Debian package, with or without the
-            embedded browser, or a portable archive from the
-            <a href="https://github.com/CarsonBurke/cagents/releases/latest">latest release</a>.
-          </p>
-          <p class="fine">
-            Needs Linux x86_64 with Wayland, glibc 2.35 and Git 2.36 or newer.
-            Bring the agent CLIs you use, signed in with your own accounts.
-            <a href="https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md">Installation guide</a>
-          </p>
-        </div>
-        <div class="command pane pane-slate">
-          <div class="command-bar">
-            <span id="command-label">Verified installer</span>
-            <button type="button" class="copy" data-copy-target="install-command" aria-describedby="command-label">
-              Copy
-            </button>
-          </div>
-          <pre tabindex="0"><code id="install-command"><!--install-command--></code></pre>
-          <p class="copy-status" role="status" aria-live="polite"></p>
-        </div>
       </section>
     </main>
 
@@ -236,7 +187,6 @@
       <nav aria-label="Documentation">
         <ul>
           <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/user-guide.md">User guide</a></li>
-          <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md">Installation</a></li>
           <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/configuration.md">Configuration</a></li>
           <li><a href="https://github.com/CarsonBurke/cagents/blob/main/docs/development.md">Development</a></li>
           <li><a href="https://github.com/CarsonBurke/cagents/releases">Releases</a></li>
@@ -244,11 +194,25 @@
         </ul>
       </nav>
       <p class="fine">
-        MIT licensed. Screenshots show the real app with invented projects.
-        Fonts: Open Sans and Noto Sans Mono, under the
-        <a href="fonts/OpenSans-OFL.txt">SIL Open Font License</a>.
+        <a href="./fonts/OpenSans-OFL.txt">Open Sans</a> and
+        <a href="./fonts/NotoSansMono-OFL.txt">Noto Sans Mono</a> are licensed
+        under the SIL Open Font License.
       </p>
     </footer>
+
+    <dialog class="screenshot-viewer" aria-label="Expanded screenshot">
+      <div class="viewer-content">
+        <div class="viewer-controls">
+          <a class="viewer-full-size" target="_blank" rel="noopener">Open full size in a new tab</a>
+          <form method="dialog">
+            <button type="submit" autofocus>Close</button>
+          </form>
+        </div>
+        <div class="viewer-image" role="region" aria-label="Screenshot" tabindex="0">
+          <img alt="" />
+        </div>
+      </div>
+    </dialog>
 
     <script type="module" src="/src/main.js"></script>
   </body>

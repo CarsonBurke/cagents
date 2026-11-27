@@ -35,7 +35,6 @@ unicode-casefold = "0.2"
 unicode-linebreak = "0.1"
 unicode-segmentation = "1.13.3"
 async-channel = "2.5"
-ashpd = { version = "0.12.3", default-features = false, features = ["tokio"] }
 async-lsp = { version = "0.2.4", default-features = false, features = ["omni-trait", "tracing"] }
 blake3 = "1.8"
 directories = "6.0"
@@ -62,6 +61,9 @@ libc = "0.2.189"
 lsp-types = "0.95"
 notify = "=9.0.0-rc.8"
 pulldown-cmark = { version = "0.12.2", default-features = false }
+# Draws the code a phone scans to pair. Without default features it has no
+# dependencies; only the UI resolves it.
+qrcode = { version = "0.15", default-features = false, features = ["std"] }
 mermaid-rs-renderer = { version = "0.3.1", default-features = false }
 resvg = { version = "0.45.1", default-features = false, features = ["text"] }
 roxmltree = "0.20"
@@ -71,7 +73,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
 thiserror = "2.0"
 tempfile = "3.21"
-tokio = { version = "1.47", features = ["fs", "process", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["compat"] }
 tracing = "0.1"
 toml = { version = "1.1.4", features = ["preserve_order"] }
@@ -84,7 +86,7 @@ uuid = { version = "1.18", features = ["serde", "v4"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["wayland", "x11"] }
 # Only Linux enables the portal's Wayland handle integration.
-ashpd = { version = "0.12.3", default-features = false, features = ["wayland"] }
+ashpd = { version = "0.12.3", default-features = false, features = ["tokio", "wayland"] }
 
 [dev-dependencies]
 # The shared library's test fixtures, which these tests also use.

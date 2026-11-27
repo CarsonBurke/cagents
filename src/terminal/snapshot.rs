@@ -271,7 +271,7 @@ impl RenderSnapshot {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn share_unchanged_rows(&mut self, base: &RenderSnapshot) {
+    pub fn share_unchanged_rows(&mut self, base: &RenderSnapshot) {
         if self.columns != base.columns
             || self.rows != base.rows
             || self.lines.len() != base.lines.len()

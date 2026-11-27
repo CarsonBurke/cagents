@@ -18,7 +18,8 @@ pub fn version() -> &'static str {
 pub mod build_version;
 #[doc(hidden)]
 pub mod names;
-pub(crate) mod native_chat_capacity;
+#[doc(hidden)]
+pub mod native_chat_capacity;
 pub mod search_match;
 // The repository fixtures the UI crate's tests share allocate through this;
 // that build uses only part of it.
@@ -38,8 +39,12 @@ pub mod daemon;
 #[cfg(feature = "ui")]
 #[doc(hidden)]
 pub mod daemon_health;
-#[cfg(any(feature = "host", all(test, target_os = "linux")))]
+#[doc(hidden)]
+pub mod descriptor;
 pub(crate) mod descriptor_frame;
+/// The daemon's open-descriptor limit, which the processes it starts never inherit.
+#[cfg(feature = "host")]
+pub mod descriptor_limit;
 #[cfg(feature = "ui")]
 pub mod design;
 pub mod device;
@@ -53,10 +58,21 @@ pub mod document_link;
 pub mod file_url;
 #[doc(hidden)]
 pub mod filesystem_recovery_context;
+#[cfg(all(
+    any(test, feature = "test-support"),
+    feature = "host",
+    target_os = "linux"
+))]
+#[doc(hidden)]
+pub mod fixture_startup;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod fixture_workspace;
-mod flock;
+#[doc(hidden)]
+pub mod flock;
 pub mod fs_safety;
+/// Watches on open files that wake only the subscribers of the changed inode.
+#[cfg(feature = "host")]
+pub(crate) mod fs_watch;
 pub mod git_marker;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod git_watch;
@@ -65,15 +81,15 @@ pub mod github;
 pub mod github_identity;
 pub(crate) mod github_rate_limit;
 pub mod github_status;
-#[cfg(feature = "host")]
-pub mod host;
 #[cfg(feature = "ui")]
 pub mod input_trace;
-mod install_guard;
+#[doc(hidden)]
+pub mod install_guard;
 pub mod instance;
 pub mod layout_metrics;
 #[cfg(any(feature = "ui", feature = "host"))]
-pub(crate) mod lineage_birth;
+#[doc(hidden)]
+pub mod lineage_birth;
 pub mod linear;
 pub mod location;
 pub mod mobile;
@@ -82,7 +98,7 @@ pub mod notifications;
 pub mod performance;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod persistence;
-#[cfg(any(feature = "ui", feature = "host", target_os = "linux"))]
+pub(crate) mod pinned_process;
 pub mod process;
 pub mod project_location;
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -110,7 +126,8 @@ pub mod test_timing;
 ))]
 #[doc(hidden)]
 pub mod test_tracing;
-pub(crate) mod transcript_cache;
+#[doc(hidden)]
+pub mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]

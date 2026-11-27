@@ -19,7 +19,6 @@ use std::{
     fs::{File, OpenOptions},
     io,
     os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt},
-    path::Path,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
@@ -92,49 +91,25 @@ impl Rollouts {
         pid: i32,
         process_start: u64,
         started: Option<u64>,
-    ) -> Option<(ActivityState, Option<crate::notifications::Evidence>)> {
-        let process = Path::new("/proc").join(pid.to_string());
+    ) -> Option<(ActivityState, super::attention::Edges)> {
         let mut state = None;
-        let mut evidence = None;
-        for entry in std::fs::read_dir(process.join("fd")).ok()?.take(MAX_FDS) {
-            let Ok(entry) = entry else { continue };
-            let Ok(target) = std::fs::read_link(entry.path()) else {
-                continue;
-            };
-            let Some(name) = target.file_name().filter(|name| is_rollout(name)) else {
-                continue;
-            };
-            // Something that only reads a rollout - a picker listing past
-            // sessions - says nothing about that thread's turns.
-            if !opened_for_writing(&process, &entry.file_name()) {
-                continue;
-            }
-            // Only a regular file is opened, and never so that the open can
-            // wait or take a terminal, as a pipe or device of that name could.
-            if !std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()) {
-                continue;
-            }
-            // The descriptor, not the path: the exact file this process
-            // writes, wherever its account keeps it.
-            let Ok(file) = OpenOptions::new()
-                .read(true)
-                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-                .open(entry.path())
-            else {
-                continue;
-            };
-            let turn = self.turn(&file, name.to_owned());
+        let mut edges = super::attention::Edges::default();
+        for (file, name) in written_rollouts(pid)? {
+            let turn = self.turn(&file, name);
             state = Some(merge(state, activity(turn, started)));
-            if let Ok(Some(observed)) = self
+            if let Ok(observed) = self
                 .attention
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .read_for_process(&file, super::attention::Format::Codex, (pid, process_start))
             {
-                evidence = Some(observed);
+                edges.started |= observed.started;
+                if observed.notice.is_some() {
+                    edges.notice = observed.notice;
+                }
             }
         }
-        state.map(|state| (state, evidence))
+        state.map(|state| (state, edges))
     }
 
     fn turn(&self, file: &File, name: OsString) -> Option<Turn> {
@@ -191,9 +166,89 @@ fn is_rollout(name: &OsStr) -> bool {
     name.starts_with(b"rollout-") && name.ends_with(b".jsonl")
 }
 
+/// The rollouts process `pid` holds open for writing, each opened here with
+/// its file name, or `None` when its descriptors cannot be listed.
+///
+/// Something that only reads a rollout - a picker listing past sessions -
+/// says nothing about that thread's turns. Only a regular file is opened, and
+/// never so that the open can wait or take a terminal, as a pipe or device of
+/// that name could.
+#[cfg(target_os = "linux")]
+fn written_rollouts(pid: i32) -> Option<Vec<(File, OsString)>> {
+    let process = std::path::Path::new("/proc").join(pid.to_string());
+    let mut rollouts = Vec::new();
+    for entry in std::fs::read_dir(process.join("fd")).ok()?.take(MAX_FDS) {
+        let Ok(entry) = entry else { continue };
+        let Ok(target) = std::fs::read_link(entry.path()) else {
+            continue;
+        };
+        let Some(name) = target.file_name().filter(|name| is_rollout(name)) else {
+            continue;
+        };
+        if !opened_for_writing(&process, &entry.file_name()) {
+            continue;
+        }
+        if !std::fs::metadata(entry.path()).is_ok_and(|metadata| metadata.is_file()) {
+            continue;
+        }
+        // The descriptor, not the path: the exact file this process
+        // writes, wherever its account keeps it.
+        let Ok(file) = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(entry.path())
+        else {
+            continue;
+        };
+        rollouts.push((file, name.to_owned()));
+    }
+    Some(rollouts)
+}
+
+/// The rollouts process `pid` holds open for writing, each opened here with
+/// its file name, or `None` when its descriptors cannot be listed.
+///
+/// Darwin cannot open another process's descriptor, only the path the kernel
+/// last knew it by, so each is opened there and kept only when it is still
+/// the very file the process holds; a rollout renamed or replaced since is
+/// skipped until it is next observed. Something that only reads a rollout -
+/// a picker listing past sessions - says nothing about that thread's turns,
+/// and only a regular file is opened, never so that the open can wait, take a
+/// terminal or follow a link.
+#[cfg(target_os = "macos")]
+fn written_rollouts(pid: i32) -> Option<Vec<(File, OsString)>> {
+    let pid = u32::try_from(pid).ok()?;
+    let held = crate::process::inspect::open_files(pid, MAX_FDS).ok()?;
+    Some(
+        held.into_iter()
+            .filter(|held| held.writable && held.regular)
+            .filter_map(|held| {
+                let name = held
+                    .path
+                    .file_name()
+                    .filter(|name| is_rollout(name))?
+                    .to_owned();
+                let file = OpenOptions::new()
+                    .read(true)
+                    .custom_flags(
+                        libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+                    )
+                    .open(&held.path)
+                    .ok()?;
+                let metadata = file.metadata().ok()?;
+                (metadata.is_file()
+                    && metadata.dev() == held.device
+                    && metadata.ino() == held.inode)
+                    .then_some((file, name))
+            })
+            .collect(),
+    )
+}
+
 /// Whether descriptor `fd` of `process` was opened for writing, as its
 /// `fdinfo` states in octal.
-fn opened_for_writing(process: &Path, fd: &OsStr) -> bool {
+#[cfg(target_os = "linux")]
+fn opened_for_writing(process: &std::path::Path, fd: &OsStr) -> bool {
     let Ok(info) = std::fs::read_to_string(process.join("fdinfo").join(fd)) else {
         return false;
     };

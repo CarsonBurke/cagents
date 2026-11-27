@@ -16,7 +16,9 @@
 # nested-agents-scene/, frame shapes recorded from Claude Code 2.1.325:
 #
 #   launch  the lead starts a background soak test and eight background
-#           agents, one with a long name. Review starts a second opinion,
+#           agents, one with a long name, all of Claude Code's default
+#           general-purpose type but Trace, an Explore agent, whose row
+#           names its type. Review starts a second opinion,
 #           which starts a spot check; Audit forks a review skill; Trace
 #           starts a log reader, which starts a grep. Claude Code forwards
 #           each helper's conversation under the call that started it.
@@ -70,8 +72,14 @@ for _ in $(seq 15); do
     composer=$(printf '%s\n' "$observed" | grep -E 'Message' | tail -1 |
         sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
         awk '{printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
+    # Where the hint cannot be read, the composer's input sits at a fixed place
+    # in the window, whose size observe reports on its "window" line (an
+    # older driver reported it as "output="). The point left of centre and
+    # above the footer is inside the input, clear of the Stop control.
     [ -n "$composer" ] || composer=$(printf '%s\n' "$observed" |
-        sed -nE 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' | awk '{printf "%d,%d", $1 * 0.65, $2 - 67}')
+        sed -nE -e 's/.*output=([0-9]+)x([0-9]+).*/\1 \2/p' \
+            -e "s/^ *window .* ([0-9]+)x([0-9]+)$/\1 \2/p" | head -1 |
+        awk '{printf "%d,%d", $1 * 0.45, $2 - 86}')
     # A read of the screen can come back empty; look again.
     [ -z "$composer" ] || break
 done

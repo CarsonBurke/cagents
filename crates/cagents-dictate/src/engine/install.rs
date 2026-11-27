@@ -171,7 +171,10 @@ fn download(
         .write(true)
         .open(&partial)
         .map_err(|error| storage(&partial, &error))?;
-    let mut have = part.metadata().map_err(|error| storage(&partial, &error))?.len();
+    let mut have = part
+        .metadata()
+        .map_err(|error| storage(&partial, &error))?
+        .len();
     if have > file.size {
         have = 0;
     }
@@ -352,8 +355,8 @@ mod tests {
         let mut fetch = table(model, contents);
         fetch.cut = Some(30_000);
         let mut events = Vec::new();
-        let error = install(root.path(), model, &fetch, &mut |event| events.push(event))
-            .unwrap_err();
+        let error =
+            install(root.path(), model, &fetch, &mut |event| events.push(event)).unwrap_err();
         assert_eq!(error.0, InstallError::Network);
         assert!(matches!(
             store::status(root.path(), model),
@@ -456,8 +459,7 @@ mod tests {
         let model = model(contents);
         let root = tempfile::tempdir().unwrap();
         let _held = store::lease(root.path(), model).unwrap();
-        let error = install(root.path(), model, &table(model, contents), &mut |_| {})
-            .unwrap_err();
+        let error = install(root.path(), model, &table(model, contents), &mut |_| {}).unwrap_err();
         assert_eq!(error.0, InstallError::Busy);
     }
 }

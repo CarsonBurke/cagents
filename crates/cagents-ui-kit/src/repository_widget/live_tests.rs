@@ -943,6 +943,9 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
     assert!(runtime.find_error.is_none());
 }
 
+// A Linux registration fails cleanly at FD exhaustion. CoreServices can
+// fail the process itself before FSEvents reports this error on Darwin.
+#[cfg(target_os = "linux")]
 #[test]
 fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery() {
     const CHILD: &str = "CAGENTS_DOCUMENT_WATCH_LIMIT_CHILD";
@@ -1028,4 +1031,456 @@ fn native_watch_count(path: &Path) -> usize {
                 })
         })
         .count()
+}
+
+async fn type_text(card: CardId, runtime: &mut RepositoryRuntime, text: &str) {
+    for action in [
+        text_editor::Action::SelectAll,
+        text_editor::Action::Edit(text_editor::Edit::Paste(Arc::new(text.into()))),
+    ] {
+        let task = runtime.update(RepositoryAction::EditorAction { card, action });
+        settle(runtime, task).await;
+    }
+}
+
+async fn changed_underneath(card: CardId, runtime: &mut RepositoryRuntime) {
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(&runtime.document, DocumentState::Editable(document) if document.disk_version.is_some())
+        {
+            change(card, runtime).await;
+        }
+    })
+    .await
+    .expect("the newer file was never offered");
+}
+
+/// Writes the file the way editors and agents do, so a watcher never reads
+/// it half written.
+fn write_atomically(path: &Path, text: &str) {
+    let staged = path.with_extension("staged");
+    std::fs::write(&staged, text).unwrap();
+    std::fs::rename(&staged, path).unwrap();
+}
+
+fn caret(runtime: &RepositoryRuntime) -> text_editor::Cursor {
+    let DocumentState::Editable(document) = &runtime.document else {
+        panic!("text document lost");
+    };
+    document.content.cursor()
+}
+
+#[tokio::test]
+async fn clean_reload_is_one_undo_step_of_the_same_document() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.rs");
+    std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.rs").await;
+    if let DocumentState::Editable(document) = &mut runtime.document {
+        document.content.set_cursor(text_editor::Cursor {
+            position: text_editor::Position { line: 2, column: 2 },
+            selection: Some(text_editor::Position { line: 2, column: 0 }),
+        });
+    }
+    runtime.set_auto_save(true);
+    runtime.set_lsp_document(Some(LspDocumentId(0)));
+    let identity = runtime.current_identity(card, "live.rs".into());
+    let _ = runtime.take_lsp_intents();
+
+    write_atomically(&path, "zero\none\ntwo\nthree\n");
+    text(card, &mut runtime, "zero\none\ntwo\nthree\n").await;
+    assert!(!runtime.is_dirty());
+    assert!(!runtime.has_save_conflict());
+    // The same document took the new text as an edit: no close and reopen
+    // for the language server, and a caret still on the line it was on.
+    assert_eq!(runtime.current_identity(card, "live.rs".into()), identity);
+    let intents = runtime.take_lsp_intents();
+    assert!(
+        !intents.is_empty()
+            && intents
+                .iter()
+                .all(|intent| matches!(intent, LspIntent::Change { .. })),
+        "{intents:?}"
+    );
+    assert_eq!(
+        caret(&runtime),
+        text_editor::Cursor {
+            position: text_editor::Position { line: 3, column: 2 },
+            selection: Some(text_editor::Position { line: 3, column: 0 }),
+        }
+    );
+
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("one\ntwo\nthree\n"));
+    assert!(runtime.is_dirty(), "the undone reload differs from disk");
+    // Undoing a change made outside the editor is not a reason to write the
+    // old text back over it unasked.
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
+    let task = runtime.update(RepositoryAction::Redo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.editor_text().as_deref(),
+        Some("zero\none\ntwo\nthree\n")
+    );
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+}
+
+#[tokio::test]
+async fn changed_dirty_buffer_reloads_as_an_undoable_choice() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
+    assert_eq!(
+        runtime.auto_save_revision(),
+        None,
+        "autosave waits for a choice"
+    );
+
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
+    assert!(runtime.current_disk_comparison().is_some());
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+    assert!(runtime.disk_comparison.is_none(), "nothing left to compare");
+    assert!(runtime.auto_save_revision().is_none(), "nothing to save");
+
+    // Undo brings the edits back, and the choice with them.
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
+    assert!(runtime.is_dirty() && runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
+    let task = runtime.update(RepositoryAction::KeepBufferVersion { card });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.has_save_conflict());
+    assert!(runtime.auto_save_revision().is_some(), "autosave resumes");
+}
+
+#[tokio::test]
+async fn keep_mine_saves_the_buffer_over_the_newer_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    assert!(runtime.configure_save_recovery(
+        Default::default(),
+        vec![root.path().canonicalize().unwrap()]
+    ));
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
+
+    let task = runtime.update(RepositoryAction::KeepBufferVersion { card });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.has_save_conflict());
+    assert!(runtime.disk_comparison.is_none(), "the choice is made");
+    assert!(runtime.is_dirty());
+    assert_eq!(runtime.editor_text().as_deref(), Some("my edits"));
+    assert!(runtime.auto_save_revision().is_some(), "autosave resumes");
+    // The version on disk is the baseline now: typing it back is clean.
+    type_text(card, &mut runtime, "agent edits").await;
+    assert!(!runtime.is_dirty());
+    type_text(card, &mut runtime, "my edits").await;
+    let task = runtime.update(RepositoryAction::Save {
+        card,
+        overwrite: false,
+    });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.has_save_conflict(), "{:?}", runtime.save_error());
+    assert!(!runtime.is_dirty());
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), "my edits");
+}
+
+#[tokio::test]
+async fn compare_shows_the_buffer_against_the_newer_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "shared\ndisk\n").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    type_text(card, &mut runtime, "shared\nmine\n").await;
+    write_atomically(&path, "shared\nagent\n");
+    changed_underneath(card, &mut runtime).await;
+
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
+    let comparison = runtime.current_disk_comparison().expect("comparison shown");
+    let DiffState::Ready(RenderedDiff::Text { model, .. }, _) = &comparison.state else {
+        panic!("comparison did not finish");
+    };
+    assert_eq!((model.additions, model.deletions), (1, 1));
+    assert_eq!(&*model.before, "shared\nagent\n");
+
+    // Another write to the file is what the reader now compares against.
+    write_atomically(&path, "shared\nagent again\n");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !matches!(&runtime.document, DocumentState::Editable(document)
+            if document.disk_version.as_ref().is_some_and(|version| version.text.contains("again")))
+        {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    let comparison = runtime
+        .current_disk_comparison()
+        .expect("comparison follows");
+    assert!(matches!(&comparison.state,
+        DiffState::Ready(RenderedDiff::Text { model, .. }, _) if model.before.contains("again")));
+
+    let task = runtime.update(RepositoryAction::CompareWithDisk { card });
+    settle(&mut runtime, task).await;
+    assert!(runtime.current_disk_comparison().is_none());
+    assert!(runtime.has_save_conflict(), "hiding it decides nothing");
+}
+
+#[tokio::test]
+async fn a_buffer_already_holding_the_new_file_needs_no_choice() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    type_text(card, &mut runtime, "same edit").await;
+    write_atomically(&path, "same edit");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime.is_dirty() {
+            change(card, &mut runtime).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!runtime.has_save_conflict());
+    assert_eq!(runtime.editor_text().as_deref(), Some("same edit"));
+}
+
+#[tokio::test]
+async fn an_undone_reload_stays_a_choice_when_the_file_is_read_again() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert!(runtime.has_save_conflict());
+
+    // The same bytes again: nothing changed on disk, and nothing was chosen.
+    write_atomically(&path, "agent edits");
+    tokio::time::timeout(Duration::from_secs(2), change(card, &mut runtime))
+        .await
+        .ok();
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
+    assert!(
+        matches!(&runtime.document, DocumentState::Editable(document)
+        if document.disk_version.as_ref().is_some_and(|version| version.undone))
+    );
+}
+
+#[tokio::test]
+async fn discarding_edits_under_a_newer_file_takes_that_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+
+    let task = runtime.update(RepositoryAction::DiscardEdits { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+}
+
+#[tokio::test]
+async fn a_reload_that_changes_nothing_leaves_undo_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    // Typed to the newer text by hand: Reload has nothing left to replace.
+    type_text(card, &mut runtime, "agent edits").await;
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+
+    type_text(card, &mut runtime, "more").await;
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
+    assert!(!runtime.has_save_conflict(), "no reload was undone");
+}
+
+#[test]
+fn a_place_keeps_pointing_at_its_text_through_a_replacement() {
+    let at = |line, column| text_editor::Position { line, column };
+    // "a\nb\nc\nd": line 1 ("b") replaced by "x\ny\nz", ending at (3, 1).
+    let (start, removed_end, inserted_end) = (at(1, 0), at(1, 1), at(3, 1));
+    let map = |position| map_through_replacement(position, start, removed_end, inserted_end);
+    assert_eq!(map(at(0, 1)), at(0, 1), "before it");
+    assert_eq!(map(at(2, 1)), at(4, 1), "lines after it move down");
+    assert_eq!(map(at(1, 1)), at(3, 1), "its end follows the new end");
+    assert_eq!(map(at(1, 0)), at(1, 0), "inside it keeps its place");
+    // Three lines become one: what follows moves up.
+    let map = |position| map_through_replacement(position, at(1, 0), at(4, 0), at(2, 0));
+    assert_eq!(map(at(6, 3)), at(4, 3));
+    assert_eq!(
+        map(at(3, 5)),
+        at(2, 0),
+        "inside past the new end clamps to it"
+    );
+}
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn commit(root: &Path, text: &str) -> crate::repository::Oid {
+    std::fs::write(root.join("notes.md"), text).unwrap();
+    git(root, &["commit", "-qam", text.trim()]);
+    crate::repository::Oid::parse(git(root, &["rev-parse", "HEAD"])).unwrap()
+}
+
+/// Last commit and Branch name the commits `HEAD` was at when chosen; each
+/// commit made since moves them along, including one made while they could
+/// not be named again, while a commit opened by name from History stays put.
+#[tokio::test]
+async fn a_commit_moves_the_chosen_committed_comparison_along() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.name", "Fixture"]);
+    git(root, &["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(root.join("notes.md"), "one\n").unwrap();
+    git(root, &["add", "notes.md"]);
+    git(root, &["commit", "-qm", "one"]);
+    git(root, &["branch", "base"]);
+    let base = crate::repository::Oid::parse(git(root, &["rev-parse", "HEAD"])).unwrap();
+    let two = commit(root, "two\n");
+
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: root.join(".git"),
+        worktree: root.into(),
+        selected_file: None,
+    });
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    let task = runtime.open_file(card, "notes.md".into());
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::SelectCommittedBasis {
+        card,
+        choice: CommittedChoice::LastCommit,
+    });
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::CommitToParent {
+            oid: two.clone(),
+            parent: Some(base.clone()),
+        }
+    );
+
+    let three = commit(root, "three\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    let moved = DiffBasis::CommitToParent {
+        oid: three.clone(),
+        parent: Some(two),
+    };
+    assert_eq!(runtime.diff_basis, moved, "Last commit follows HEAD");
+    assert!(
+        matches!(runtime.diff_state(&moved), Some(DiffState::Ready(..))),
+        "and is read again"
+    );
+
+    // A move seen while another choice was in progress is caught on a later
+    // read, even one that finds nothing else changed.
+    let four = commit(root, "four\n");
+    runtime.basis_resolution = Some(BasisResolution::Resolving(CommittedChoice::Branch));
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.diff_basis, moved, "not replaced mid-choice");
+    runtime.basis_resolution = None;
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::CommitToParent {
+            oid: four.clone(),
+            parent: Some(three),
+        },
+        "the skipped move is caught"
+    );
+
+    // Branch keeps the base the reader chose.
+    let base_ref = ValidatedRefName::parse("refs/heads/base").unwrap();
+    let task = runtime.update(RepositoryAction::ApplyDiffBasis {
+        card,
+        basis: DiffBasis::MergeBaseToHead {
+            base_ref: base_ref.clone(),
+            head: four,
+            merge_base: base.clone(),
+        },
+    });
+    settle(&mut runtime, task).await;
+    let five = commit(root, "five\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::MergeBaseToHead {
+            base_ref,
+            head: five.clone(),
+            merge_base: base.clone(),
+        },
+        "Branch follows HEAD from the same base"
+    );
+
+    // A commit opened from History is the one meant.
+    let opened = DiffBasis::CommitToParent {
+        oid: five,
+        parent: Some(base),
+    };
+    let task = runtime.update(RepositoryAction::OpenCommittedFile {
+        card,
+        path: crate::repository::RepoPath::parse("notes.md").unwrap(),
+        old_path: None,
+        basis: opened.clone(),
+    });
+    settle(&mut runtime, task).await;
+    commit(root, "six\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.diff_basis, opened, "an opened commit stays put");
 }

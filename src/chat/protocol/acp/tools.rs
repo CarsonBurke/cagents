@@ -29,6 +29,13 @@ struct Call {
     locations: Vec<String>,
     input: Value,
     raw_output: Value,
+    /// The agent has reported it running, not only waiting to run.
+    started: bool,
+    /// The agent went on while it ran: it runs in the background.
+    background: bool,
+    /// The reader refused it, so it will not run, whatever the agent
+    /// later reports of it.
+    declined: bool,
 }
 
 #[derive(Default)]
@@ -38,12 +45,16 @@ pub(super) struct Calls {
 }
 
 impl Calls {
+    pub fn contains(&self, id: &str) -> bool {
+        self.calls.contains_key(id)
+    }
+
     /// Merges a `tool_call`, a `tool_call_update` or a permission request's
     /// `toolCall` into what is known of the call, and returns the step to
     /// show for it.
     pub fn merge(&mut self, update: &Value) -> Option<(String, ItemContent)> {
         let id = update["toolCallId"].as_str().filter(|id| !id.is_empty())?;
-        if !self.calls.contains_key(id) {
+        if !self.contains(id) {
             if self.order.len() == MAX_CALLS
                 && let Some(oldest) = self.order.pop_front()
             {
@@ -58,10 +69,13 @@ impl Calls {
         if let Some(kind) = update["kind"].as_str() {
             call.kind = kind.to_owned();
         }
-        if let Some(status) = update["status"].as_str().and_then(status) {
+        if let Some(reported) = update["status"].as_str() {
+            call.started |= reported == "in_progress";
             // A finished call stays finished: a revision delivered out of
             // order, or a late copy of the original call, says less.
-            if call.status.is_none_or(ToolStatus::is_live) {
+            if let Some(status) = status(reported)
+                && call.status.is_none_or(ToolStatus::is_live)
+            {
                 call.status = Some(status);
             }
         }
@@ -85,6 +99,46 @@ impl Calls {
             call.raw_output = update["rawOutput"].clone();
         }
         Some((format!("tool:{id}"), call.content()))
+    }
+
+    /// Marks every command still running as running in the background, as
+    /// it is once the agent goes on without waiting for it: it writes, or
+    /// reports the usage of a model response that ended after the command
+    /// started. Agents report a step's calls together after its usage, so
+    /// calls made side by side are not taken for background ones. Such a
+    /// command is still shown running, with its time: it is.
+    pub fn background_running(&mut self) {
+        for id in &self.order {
+            let Some(call) = self.calls.get_mut(id) else {
+                continue;
+            };
+            if call.kind == "execute"
+                && call.started
+                && !call.background
+                && call.status == Some(ToolStatus::Running)
+            {
+                call.background = true;
+            }
+        }
+    }
+
+    /// Notes that the reader refused `id`.
+    pub fn declined(&mut self, id: &str) {
+        if let Some(call) = self.calls.get_mut(id) {
+            call.declined = true;
+        }
+    }
+
+    /// Whether something is still running and all of it runs in the
+    /// background. A call the reader refused is not running, though an
+    /// agent may never say that it ended.
+    pub fn only_background_live(&self) -> bool {
+        let mut live = self
+            .calls
+            .values()
+            .filter(|call| !call.declined && call.status.is_none_or(ToolStatus::is_live))
+            .peekable();
+        live.peek().is_some() && live.all(|call| call.background)
     }
 
     /// Ends every call still running, as a turn's end does: whatever it was
@@ -272,6 +326,44 @@ fn diff(block: &Value) -> Option<FileChange> {
         kind,
         diff: super::super::claude_edits::unified(before.unwrap_or_default(), after, ""),
     })
+}
+
+/// What a call names that a prompt asking for it may name too: its command,
+/// as Antigravity's `CommandLine` or another agent's `command`, and the files
+/// it reads or changes, by path and by name.
+pub(super) fn evidence(update: &Value) -> Vec<String> {
+    let input = &update["rawInput"];
+    let mut named: Vec<String> = [
+        input["CommandLine"].as_str().map(str::to_owned),
+        command_line(input),
+        (update["kind"] == "execute")
+            .then(|| update["title"].as_str().map(str::to_owned))
+            .flatten(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    let locations = update["locations"].as_array().into_iter().flatten();
+    let diffs = update["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|block| block["type"] == "diff");
+    for path in locations
+        .chain(diffs)
+        .filter_map(|entry| entry["path"].as_str())
+    {
+        named.push(path.to_owned());
+        if let Some(name) = std::path::Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+        {
+            named.push(name.to_owned());
+        }
+    }
+    named.retain(|text| !text.trim().is_empty());
+    named.dedup();
+    named
 }
 
 fn command_line(input: &Value) -> Option<String> {

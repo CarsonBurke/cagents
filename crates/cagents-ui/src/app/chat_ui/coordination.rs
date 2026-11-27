@@ -284,7 +284,7 @@ impl Coordinated {
     /// conversation lists, by its listed ID or its provider's address for it.
     pub(super) fn line(&self, listed: &dyn Fn(&str) -> Option<String>) -> (String, String) {
         let reading = &self.reading;
-        let names = |agents: &[String]| agents_phrase(reading, agents, listed);
+        let names = |agents: &[String]| agents_phrase(agents, listed);
         let name = |agent: &String| names(std::slice::from_ref(agent));
         let (verb, label): (&str, String) = match &reading.kind {
             Kind::Message(message) => (
@@ -313,11 +313,11 @@ impl Coordinated {
                 Act::Requests { agent } => ("Read what", format!("{} is asking", name(agent))),
                 Act::Answer {
                     agent,
-                    request,
+                    request: _,
                     action,
                 } => (
                     "Answered",
-                    format!("{}'s request {request} with {action}", name(agent)),
+                    format!("{}'s request with {action}", name(agent)),
                 ),
                 Act::Interrupt { agent } => ("Interrupted", name(agent)),
                 Act::Close { agents } => ("Closed", names(agents)),
@@ -367,15 +367,6 @@ fn message_verb(kind: OutboundKind) -> &'static str {
     }
 }
 
-/// An ID's first eight characters, which is how the CLI prints one. A name,
-/// such as `reviewer-2`, is kept whole.
-fn short_id(id: &str) -> &str {
-    if !is_identifier(id) {
-        return id;
-    }
-    id.char_indices().nth(8).map_or(id, |(end, _)| &id[..end])
-}
-
 /// Whom started agents are, as one phrase. One agent goes by its name, else
 /// its task's first line, else its type, as its tab will name it.
 fn started(spawn: &Spawn) -> String {
@@ -389,20 +380,16 @@ fn started(spawn: &Spawn) -> String {
 }
 
 /// A phrase for `agents`, as a step names them: by the names their tabs show
-/// where this conversation lists them. A `cagents` agent it does not list goes
-/// by the short ID the CLI prints; a provider's own agent, whose IDs the app
-/// shows nowhere, is only counted.
-fn agents_phrase(
-    reading: &Coordination,
-    agents: &[String],
-    listed: &dyn Fn(&str) -> Option<String>,
-) -> String {
+/// where this conversation lists them, or a name the agent was addressed by.
+/// An agent known only by an ID, which is an address rather than a name, is
+/// only counted.
+fn agents_phrase(agents: &[String], listed: &dyn Fn(&str) -> Option<String>) -> String {
     let mut names = Vec::new();
     let mut unknown = 0;
     for agent in agents {
         match listed(agent) {
             Some(name) => names.push(name),
-            None if reading.cli || !is_identifier(agent) => names.push(short_id(agent).to_owned()),
+            None if !is_identifier(agent) => names.push(agent.clone()),
             None => unknown += 1,
         }
     }
@@ -427,26 +414,19 @@ struct Recipient {
 }
 
 impl Recipient {
+    /// The recipient by name. A session's ID is the CLI's address for it,
+    /// not a name the reader knows, so a session without a title is only
+    /// another session.
     fn plain(&self) -> String {
         match (&self.session, self.name.is_empty()) {
-            (Some(session), true) => format!("session {}", short_id(session)),
-            (Some(session), false) => format!("{} ({})", self.name, short_id(session)),
-            (None, _) => self.name.clone(),
+            (Some(_), true) => "another session".into(),
+            _ => self.name.clone(),
         }
     }
 
-    /// As a row draws it: the name cut to fit beside the session ID that
-    /// tells it apart, and that ID, which the row keeps whole after it.
-    fn shown(&self) -> (String, String) {
-        let cut = |name: &str, room: usize| Runtime::short_description(name, room);
-        match (&self.session, self.name.is_empty()) {
-            (Some(session), false) => {
-                let id = short_id(session);
-                let room = LABEL_CHARS.saturating_sub(id.chars().count() + 3).max(8);
-                (cut(&self.name, room), format!(" ({id})"))
-            }
-            _ => (cut(&self.plain(), LABEL_CHARS), String::new()),
-        }
+    /// As a row draws it: the name, cut to fit.
+    fn shown(&self) -> String {
+        Runtime::short_description(&self.plain(), LABEL_CHARS)
     }
 }
 
@@ -480,10 +460,10 @@ fn recipient(
         session: None,
         live: false,
     };
-    let phrase = |agents: &[String]| named(agents_phrase(reading, agents, listed));
+    let phrase = |agents: &[String]| named(agents_phrase(agents, listed));
     match message.kind {
         OutboundKind::Report => named("the conversation that started it".into()),
-        OutboundKind::Reply => named(format!("message {}", short_id(&message.to))),
+        OutboundKind::Reply => named("a message".into()),
         _ if message.to == "parent" => named("the session that started it".into()),
         // A `cagents` recipient is a session ID, or a prefix of one.
         _ if reading.cli && is_identifier(&message.to) => Recipient {
@@ -650,7 +630,7 @@ impl MessageRun {
                         names: std::iter::once(agent.clone())
                             .chain(listed(agent))
                             .collect(),
-                        shown: agents_phrase(reading, std::slice::from_ref(agent), listed),
+                        shown: agents_phrase(std::slice::from_ref(agent), listed),
                     })
                     .collect(),
                 _ => vec![Agent::sent(message, reading, listed)],
@@ -766,7 +746,10 @@ fn rollup(states: Vec<RowStatus>) -> RowStatus {
     let tone = counted.first().map_or(Tone::Plain, |(state, _)| state.tone);
     let live = counted.iter().any(|(state, _)| state.live);
     if let [(only, _)] = counted.as_slice() {
-        return RowStatus::with(only.text.clone(), tone, live);
+        return RowStatus {
+            detail: None,
+            ..only.clone()
+        };
     }
     let text = counted
         .iter()
@@ -812,22 +795,26 @@ fn message_state(
             detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
             ..RowStatus::error("Not sent")
         },
-        _ if answered => RowStatus::plain("Answered"),
+        _ if answered => RowStatus::plain("Answered").marked(disclosure::Mark::Finished),
         (_, Some(receipt)) => received(receipt.arrival),
         _ => match (reading.outcome.delivery, reading.outcome.run.as_ref()) {
             (Some(delivery), _) => RowStatus {
                 // "Delivered" says all "Sent" would.
                 detail: (!matches!(delivery, Delivery::Sent))
                     .then(|| delivered(delivery).to_owned()),
-                ..RowStatus::plain(match delivery {
-                    Delivery::Queued => "Queued",
-                    Delivery::Resumed => "Resumed",
-                    Delivery::Inbox | Delivery::Sent => "Delivered",
-                })
+                ..match delivery {
+                    Delivery::Queued => RowStatus::plain("Queued"),
+                    Delivery::Resumed => {
+                        RowStatus::plain("Resumed").marked(disclosure::Mark::Finished)
+                    }
+                    Delivery::Inbox | Delivery::Sent => {
+                        RowStatus::plain("Delivered").marked(disclosure::Mark::Finished)
+                    }
+                }
             },
             // A prompt to an agent starts a run of it.
             (None, Some(run)) => run_status(run),
-            (None, None) => RowStatus::plain("Delivered"),
+            (None, None) => RowStatus::plain("Delivered").marked(disclosure::Mark::Finished),
         },
     }
 }
@@ -860,7 +847,7 @@ fn received(arrival_of: Arrival) -> RowStatus {
             | Arrival::NoSlot => RowStatus::plain("Queued"),
             // A run that ended had the message all the same.
             Arrival::Inbox | Arrival::User | Arrival::Started | Arrival::Ended => {
-                RowStatus::plain("Delivered")
+                RowStatus::plain("Delivered").marked(disclosure::Mark::Finished)
             }
             Arrival::Unknown => RowStatus::warning("Not confirmed"),
         }
@@ -937,8 +924,9 @@ fn spawn_details(reading: &Coordination, spawn: &Spawn, observed_model: Option<&
     }
     if reading.cli {
         match (&spawn.placement, &spawn.channel) {
-            (Some(crate::agent_execution::Placement::Channel(channel)), _)
-            | (None, Some(channel)) => parts.push(format!("Channel {channel}")),
+            // A channel is known here only by its ID, which is no name to
+            // show.
+            (Some(crate::agent_execution::Placement::Channel(_)), _) | (None, Some(_)) => {}
             (Some(crate::agent_execution::Placement::Worktree { path, .. }), _) => {
                 parts.push(format!("Worktree view {}", path.display()))
             }
@@ -966,10 +954,6 @@ const LABEL_CHARS: usize = 32;
 /// where it runs short; this bounds only the text shaped for it.
 const ROW_NAME_CHARS: usize = 80;
 
-/// How much of its status a row shows, a caption naming what an agent waits
-/// on included, so that the status leaves room for the agent's name. An
-/// agent's caption is already held to it, so the row and tab say the same.
-const STATUS_CHARS: usize = super::view::AGENT_CAPTION_CHARS;
 /// The room a row keeps at its trailing edge for the open arrow: the glyph
 /// and the gap before it, as a step row keeps for its chevron, so statuses
 /// end in line with step durations.
@@ -1169,20 +1153,53 @@ struct Row {
     /// What follows the name and tells it apart, the number two agents of
     /// one name go by or a session's ID, which the row keeps whole.
     tag: String,
-    /// The start of what was said, or the started agent's type.
+    /// The start of what was said or the task a CLI agent was given, after
+    /// any destination, or the agents a step started.
     preview: String,
-    /// The preview is one term, the agent's type, which the row shows whole
-    /// or leaves out: the agent's name and how it stands come first.
-    term: bool,
+    /// A single started agent's type, where its name is not already it.
+    agent_type: Option<AgentType>,
     /// The whole of it, for the tooltip.
     full: String,
     state: RowStatus,
+    /// How long the work it started took, where that is not the step's own
+    /// time: an agent's, which runs on after the step that started it, and
+    /// is none where its transcript carries no times. `None` for the step's.
+    elapsed: Option<Option<u64>>,
     /// What opening the row does, where this conversation can open the agent.
     open: Option<Action>,
     /// Where it cannot, why: there is none, or there are several.
     several: bool,
     /// The menu's name for copying what the step said.
     copy: &'static str,
+}
+
+/// The type of agent a row started. Drawn, it follows the name as
+/// `name · Type`, whole or not at all: the agent's name and how it stands
+/// come first. The tooltip and the accessible name give it either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentType {
+    name: String,
+    /// Whether the row draws it: a type someone chose does, and the
+    /// provider's default, which tells the reader nothing, does not.
+    shown: bool,
+}
+
+impl AgentType {
+    /// The type Claude Code starts an agent as when the call names none
+    /// that someone chose.
+    const CLAUDE_DEFAULT: &'static str = "general-purpose";
+
+    fn of(provider: Provider, name: &str) -> Self {
+        Self {
+            shown: !(provider == Provider::Claude && name == Self::CLAUDE_DEFAULT),
+            name: name.to_owned(),
+        }
+    }
+
+    /// What the row draws of it.
+    fn drawn(&self) -> Option<String> {
+        self.shown.then(|| format!("· {}", self.name))
+    }
 }
 
 /// What a row that opens no agent does when pressed, said where the
@@ -1237,6 +1254,10 @@ impl Row {
                 pressing.to_owned()
             },
             self.preview.clone(),
+            self.agent_type
+                .as_ref()
+                .map(|kind| kind.name.clone())
+                .unwrap_or_default(),
         ]
         .into_iter()
         .filter(|part| !part.trim().is_empty())
@@ -1255,6 +1276,12 @@ struct RowStatus {
     /// Still under way, which a still dot beside its caption marks.
     live: bool,
     detail: Option<String>,
+    /// The state's mark beside the row's time, where its tone and liveness
+    /// do not say it.
+    mark: Option<disclosure::Mark>,
+    /// Whether the mark says all the words would, so the row draws only
+    /// the mark; the words stay in the row's accessible name and tooltip.
+    quiet: bool,
 }
 
 impl RowStatus {
@@ -1264,6 +1291,44 @@ impl RowStatus {
             tone,
             live,
             detail: None,
+            mark: None,
+            quiet: false,
+        }
+    }
+    /// Marked beside the time, with its words still drawn.
+    fn marked(self, mark: disclosure::Mark) -> Self {
+        Self {
+            mark: Some(mark),
+            ..self
+        }
+    }
+    /// Told by its mark alone, or for a failure by the row's leading glyph.
+    fn quiet(self) -> Self {
+        Self {
+            quiet: true,
+            ..self
+        }
+    }
+    /// What the row's trailing column draws of this state, beside `elapsed`.
+    fn trailing(&self, elapsed: Option<String>) -> disclosure::Trailing {
+        use disclosure::Mark;
+        let mark = self.mark.or(match (self.tone, self.live) {
+            (Tone::Plain, true) => Some(Mark::Working),
+            (Tone::Warning, _) => Some(Mark::Attention),
+            _ => None,
+        });
+        // After the row's name, the words read on from it.
+        let detail = (!self.quiet && !self.text.is_empty()).then(|| {
+            let mut words = self.text.chars();
+            words
+                .next()
+                .map(|initial| initial.to_lowercase().chain(words).collect())
+                .unwrap_or_default()
+        });
+        disclosure::Trailing {
+            detail,
+            mark,
+            elapsed,
         }
     }
     fn plain(text: impl Into<Cow<'static, str>>) -> Self {
@@ -1293,29 +1358,23 @@ impl RowStatus {
     }
 }
 
-/// How a run stands, as a row's status, naming the agent that runs it in
-/// the tooltip.
+/// How a run stands, as a row's status. The agent that runs it is known
+/// here only by its ID, an address rather than a name, so it is not said.
 fn run_status(run: &Run) -> RowStatus {
     let Some(state) = run.state else {
-        return RowStatus {
-            detail: (!run.agent.is_empty()).then(|| format!("As agent {}", run.agent)),
-            ..RowStatus::plain("Launch accepted")
-        };
+        return RowStatus::plain("Launch accepted");
     };
     let mut status = match state {
-        State::Failed | State::Interrupted => RowStatus::error(state_phrase(state)),
+        State::Failed => RowStatus::error(state_phrase(state)).quiet(),
+        State::Interrupted => RowStatus::error(state_phrase(state)),
         State::Cancelled => RowStatus::warning(state_phrase(state)),
-        State::Accepted | State::Running | State::Waiting => RowStatus::live(state_phrase(state)),
-        State::Succeeded => RowStatus::plain(state_phrase(state)),
+        State::Running => RowStatus::live(state_phrase(state)).quiet(),
+        State::Accepted | State::Waiting => RowStatus::live(state_phrase(state)),
+        State::Succeeded => RowStatus::plain(state_phrase(state))
+            .marked(disclosure::Mark::Finished)
+            .quiet(),
     };
-    let mut detail = Vec::new();
-    if run.timed_out {
-        detail.push("The wait timed out".to_owned());
-    }
-    if !run.agent.is_empty() {
-        detail.push(format!("As agent {}", run.agent));
-    }
-    status.detail = (!detail.is_empty()).then(|| detail.join(". "));
+    status.detail = run.timed_out.then(|| "The wait timed out".to_owned());
     status
 }
 
@@ -1391,6 +1450,7 @@ enum Tone {
 /// whole after it, and the preview. The name takes its room before the
 /// preview has any, and a preview that is one term, an agent's type, is left
 /// out whole rather than cut, so the name fades only once nothing follows it.
+/// `term` is that type as drawn, in place of the preview.
 /// What must not be cut for the state's sake, the second element, is the
 /// verb, as much of the name as [`LABEL_CHARS`] allows and the tag, measured
 /// and never drawn: past that, a long name fades rather than hide the state.
@@ -1399,7 +1459,7 @@ fn row_words(
     name: String,
     tag: String,
     preview: String,
-    term: bool,
+    term: Option<String>,
 ) -> (Element<'static, Message>, Element<'static, Message>) {
     let measured = Runtime::short_description(&name, LABEL_CHARS);
     let title = crate::ui_controls::FadeText::transcript(name).font(design::transcript_name_font());
@@ -1410,7 +1470,8 @@ fn row_words(
     } else {
         crate::ui_controls::trailing(title, tagged(tag.clone()), 0.0)
     };
-    let preview = crate::ui_controls::FadeText::transcript(preview)
+    let whole = term.is_some();
+    let preview = crate::ui_controls::FadeText::transcript(term.unwrap_or(preview))
         .class(cosmic::theme::Text::Custom(design::muted_text))
         .width(Length::Fill);
     let words = widget::row::with_children(vec![
@@ -1419,7 +1480,7 @@ fn row_words(
             .wrapping(iced::widget::text::Wrapping::None)
             .into(),
         title,
-        if term { preview.whole() } else { preview }.into(),
+        if whole { preview.whole() } else { preview }.into(),
     ])
     .spacing(step::GAP_S)
     .align_y(Alignment::Center)
@@ -1441,12 +1502,16 @@ fn row_words(
 }
 
 /// A row's glyph, its words and its status, on the step list's grid: the
-/// glyph in the error colour where it failed, and the status kept whole
-/// while the words fade, down to what of them must stay.
+/// glyph in the error colour where it failed, and after the words, as every
+/// transcript row has, the state's mark and the time, with any words the
+/// state still needs before them, muted, so they never outweigh the row's.
+/// The trailing column stays whole while the words fade, down to what of
+/// them must stay, and then keeps only its mark.
 fn row_content(
     glyph: Icon,
     (words, kept): (Element<'static, Message>, Element<'static, Message>),
     state: &RowStatus,
+    elapsed: Option<String>,
 ) -> Element<'static, Message> {
     let lead: Element<'static, Message> = if state.tone == Tone::Error {
         widget::icon(Icon::Error.handle())
@@ -1460,44 +1525,8 @@ fn row_content(
     } else {
         muted_glyph(glyph, design::LEADING_ICON_SIZE)
     };
-    // Work under way is marked by a still dot beside its caption; the
-    // transcript's one activity indicator says that something moves.
-    let live = state.live && matches!(state.tone, Tone::Plain);
-    let mut status_cells = Vec::new();
-    if live {
-        status_cells.push(disclosure::state_dot(design::accent_color));
-    }
-    // A caption naming what an agent waits on is held to the bound its
-    // tab's caption is, so the row says what the tab says.
-    let status = crate::ui_controls::FadeText::transcript(state.text.clone()).limit(STATUS_CHARS);
-    let status = match state.tone {
-        Tone::Plain => status.class(cosmic::theme::Text::Custom(design::muted_text)),
-        Tone::Warning => status.class(cosmic::theme::Text::Custom(design::warning_text)),
-        Tone::Error => status.class(cosmic::theme::Text::Custom(design::destructive_text)),
-    };
-    if !state.text.is_empty() {
-        status_cells.push(status.into());
-    }
-    // Where the agent's name and its state no longer both fit, the state
-    // keeps only its mark: the dot of work under way, or one in the
-    // warning colour. A failure keeps the row's leading glyph in the
-    // error colour, and a settled state is told by the absence of either.
-    // A warning's words stay in the row's tooltip, and every state's in
-    // its accessible name.
-    let compact = match state.tone {
-        Tone::Plain if live => Some(disclosure::state_dot(design::accent_color)),
-        Tone::Warning => Some(disclosure::state_dot(design::warning_color)),
-        Tone::Plain | Tone::Error => None,
-    };
-    let content = crate::ui_controls::yielding(
-        words,
-        kept,
-        widget::row::with_children(status_cells)
-            .spacing(step::GAP_S)
-            .align_y(Alignment::Center),
-        compact,
-        step::GAP_S,
-    );
+    let (column, compact) = state.trailing(elapsed).view();
+    let content = crate::ui_controls::yielding(words, kept, column, compact, step::GAP_S);
     widget::row::with_children(vec![lead, content])
         .spacing(step::GAP_S)
         .align_y(Alignment::Center)
@@ -1506,7 +1535,7 @@ fn row_content(
 }
 
 /// A tracked task's state is independent of the tool that launched it.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum BackgroundState<'a> {
     Working,
     Waiting,
@@ -1537,12 +1566,23 @@ impl BackgroundState<'_> {
 
     /// The row's status for this state: a live caption while the agent works,
     /// and a warning while it waits on the person.
+    ///
+    /// The mark says each state but what an agent waits on, which its words
+    /// name; a failure is the row's leading glyph's to mark.
     fn status(self) -> RowStatus {
+        use disclosure::Mark;
+        let caption = self.caption();
         match self {
-            Self::Working => RowStatus::live(self.caption()),
-            Self::Waiting => RowStatus::warning(self.caption()),
-            Self::Failed => RowStatus::error(self.caption()),
-            _ => RowStatus::plain(self.caption()),
+            Self::Working => RowStatus::live(caption).quiet(),
+            Self::Waiting => RowStatus::warning(caption).quiet(),
+            Self::Failed => RowStatus::error(caption).quiet(),
+            Self::OnBackgroundWork(work) => RowStatus {
+                quiet: work.is_none(),
+                ..RowStatus::plain(caption).marked(Mark::WaitingOnBackgroundWork)
+            },
+            Self::Stopped | Self::Ended => RowStatus::plain(caption).marked(Mark::Stopped).quiet(),
+            Self::Denied => RowStatus::plain(caption).marked(Mark::Denied).quiet(),
+            Self::Finished => RowStatus::plain(caption).marked(Mark::Finished).quiet(),
         }
     }
 }
@@ -1656,7 +1696,7 @@ impl Runtime {
             [agent] if drawn.session.is_none() && drawn.name == joined(agent) => {
                 self.row_agent_name(agent)
             }
-            _ => drawn.shown(),
+            _ => (drawn.shown(), String::new()),
         };
         let open = match (listed.as_slice(), &recipient_whole.session) {
             ([agent], _) => Some(Action::SelectSubagent(self.target, Some(agent.id.clone()))),
@@ -1693,9 +1733,10 @@ impl Runtime {
             shown,
             tag,
             preview,
-            term: false,
+            agent_type: None,
             full: full.join("\n\n").trim().to_owned(),
             state,
+            elapsed: None,
             several: open.is_none() && listed.len() > 1,
             open,
             // Without the text inline, copying takes the raw call.
@@ -1753,16 +1794,21 @@ impl Runtime {
                 |title| format!("in channel “{title}”"),
             )
         });
-        let mut term = false;
+        let mut agent_type = None;
         let mut preview = if let Some((_, task)) = &cli_label {
             task.clone().unwrap_or_default()
         } else {
             match spawn.agents.as_slice() {
-                [agent] if agent.kind.trim() != label => {
-                    term = true;
-                    agent.kind.trim().to_owned()
+                [agent] => {
+                    let kind = agent.kind.trim();
+                    // An agent named only by its type, numbered or not,
+                    // does not repeat it.
+                    let named_by_type = kind == label
+                        || listed.is_some_and(|agent| Self::native_child_name(agent) == kind);
+                    agent_type = (!kind.is_empty() && !named_by_type)
+                        .then(|| AgentType::of(self.session.launch.provider, kind));
+                    String::new()
                 }
-                [_] => String::new(),
                 agents => agents
                     .iter()
                     .map(|agent| {
@@ -1788,7 +1834,6 @@ impl Runtime {
                         .as_deref()
                         == Some(title)
                 });
-            term = false;
             preview = if preview.is_empty() || duplicate_task {
                 destination.clone()
             } else {
@@ -1824,24 +1869,21 @@ impl Runtime {
             } else {
                 listed.is_some_and(|agent| agent.items.is_empty())
             };
-        let mut glyph = Icon::Agent;
+        // The agent's glyph leads whatever its state, which the trailing
+        // mark tells, once.
+        let glyph = Icon::Agent;
         // Use the observed task state while a native launch tool is still
         // settling, but keep an explicit launch failure visible.
         let state = match background
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
-            Some(state) => {
-                glyph = match state {
-                    BackgroundState::Waiting => Icon::AgentWaiting,
-                    BackgroundState::OnBackgroundWork(_) => Icon::AgentBackground,
-                    _ => Icon::Agent,
-                };
-                state.status()
-            }
+            Some(state) => state.status(),
             None => match status {
-                ToolStatus::Running if spawn.waits => RowStatus::live("Working"),
+                ToolStatus::Running if spawn.waits => RowStatus::live("Working").quiet(),
                 ToolStatus::Running => RowStatus::live("Starting"),
-                ToolStatus::Stopped => RowStatus::plain("Stopped"),
+                ToolStatus::Stopped => RowStatus::plain("Stopped")
+                    .marked(disclosure::Mark::Stopped)
+                    .quiet(),
                 // The verb says it: the agent never started.
                 ToolStatus::Failed | ToolStatus::Denied if unstarted => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
@@ -1849,7 +1891,7 @@ impl Runtime {
                 },
                 ToolStatus::Failed | ToolStatus::Denied => RowStatus {
                     detail: Some(failure(reading, output).to_owned()).filter(|why| !why.is_empty()),
-                    ..RowStatus::error("Failed")
+                    ..RowStatus::error("Failed").quiet()
                 },
                 // Completing the launch command does not complete the
                 // separate session: say how it stands, or only that it
@@ -1858,7 +1900,14 @@ impl Runtime {
                     Some(run) => run_status(run),
                     None => RowStatus::plain("Launch accepted"),
                 },
-                _ => run.map_or_else(|| RowStatus::plain("Finished"), run_status),
+                _ => run.map_or_else(
+                    || {
+                        RowStatus::plain("Finished")
+                            .marked(disclosure::Mark::Finished)
+                            .quiet()
+                    },
+                    run_status,
+                ),
             },
         };
         let open = if reading.cli {
@@ -1886,9 +1935,13 @@ impl Runtime {
             shown,
             tag,
             preview,
-            term,
+            agent_type,
             full: full.join("\n\n"),
             state,
+            // A started agent's time, not its launch's, or none at all.
+            elapsed: listed
+                .filter(|_| !unstarted)
+                .map(|agent| view::agent_elapsed_ms(agent, self.source_now_ms())),
             several: open.is_none() && self.listed_subagents(coordinated).nth(1).is_some(),
             open,
             copy: if spawn
@@ -1911,9 +1964,13 @@ impl Runtime {
             row.shown.clone(),
             row.tag.clone(),
             row.preview.clone(),
-            row.term,
+            row.agent_type.as_ref().and_then(AgentType::drawn),
         );
-        let content = row_content(row.glyph, words, &row.state);
+        let elapsed = row
+            .elapsed
+            .unwrap_or_else(|| disclosure::item_duration_ms(item, self.source_now_ms()))
+            .and_then(disclosure::shown_duration);
+        let content = row_content(row.glyph, words, &row.state, elapsed);
         let open_tool = self.item_expanded(&item.id);
         // The detail holds what was said and reported in full, then the
         // command or tool call that carried it.
@@ -2021,9 +2078,14 @@ impl Runtime {
             run.count.clone(),
             String::new(),
             run.preview.clone(),
-            false,
+            None,
         );
-        let content = row_content(Icon::Send, words, &run.state);
+        // The messages' time together, as a strip of steps counts its own.
+        let elapsed = self
+            .source_now_ms()
+            .and_then(|now| turn.working_for(now))
+            .and_then(disclosure::shown_duration);
+        let content = row_content(Icon::Send, words, &run.state, elapsed);
         let arrow = crate::ui_controls::passive_icon(
             if open {
                 Icon::ChevronDown
@@ -2089,7 +2151,10 @@ impl Runtime {
         if spawn.waits || coordinated.reading.cli {
             return None;
         }
-        let agents: Vec<&chat::Subagent> = self.listed_subagents(coordinated).collect();
+        let agents: Vec<&chat::Subagent> = self
+            .listed_subagents(coordinated)
+            .filter(|agent| !agent.last_seen_running())
+            .collect();
         let any = |wanted: ToolStatus| agents.iter().any(|agent| agent.status == wanted);
         if agents.is_empty() {
             None
@@ -2343,6 +2408,82 @@ impl Runtime {
 mod identity_tests {
     use super::*;
 
+    /// A type someone chose follows the agent's name after the row's
+    /// separator, so it does not read as part of the name; the default type
+    /// is left off, and a type that is the agent's only name is not repeated.
+    #[test]
+    fn an_agent_row_sets_a_chosen_type_apart_from_its_name() {
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let row = |runtime: &mut Runtime, input: serde_json::Value, status: ToolStatus| {
+            let step = claude_step("Agent", input, "");
+            let Kind::Spawn(spawn) = step.reading.kind.clone() else {
+                panic!("an Agent call starts an agent");
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .clear();
+            runtime.spawn_row(&step, &spawn, status, "")
+        };
+        let chosen = row(
+            &mut runtime,
+            serde_json::json!({"description": "Find callers", "prompt": "Find them.", "subagent_type": "Explore"}),
+            ToolStatus::Running,
+        );
+        assert_eq!(
+            (chosen.verb, chosen.shown.as_str()),
+            ("Started", "Find callers")
+        );
+        assert_eq!(chosen.preview, "");
+        let kind = chosen.agent_type.as_ref().unwrap();
+        assert_eq!(kind.drawn().as_deref(), Some("· Explore"));
+        assert!(chosen.described().1.ends_with(" · Explore"));
+
+        // Refused, the row reads "Couldn't start Review the change", with
+        // nothing run on after the name.
+        for (status, verb) in [
+            (ToolStatus::Running, "Started"),
+            (ToolStatus::Failed, "Couldn't start"),
+        ] {
+            let step = claude_step(
+                "Agent",
+                serde_json::json!({"description": "Review the change", "prompt": "Review it.", "subagent_type": "general-purpose"}),
+                "",
+            );
+            let Kind::Spawn(spawn) = step.reading.kind.clone() else {
+                panic!("an Agent call starts an agent");
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+                id: "toolu_step".into(),
+                kind: String::new(),
+                description: "Review the change".into(),
+                status,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            }];
+            let default = runtime.spawn_row(&step, &spawn, status, "");
+            assert_eq!(
+                (default.verb, default.shown.as_str()),
+                (verb, "Review the change")
+            );
+            assert_eq!(default.preview, "");
+            assert_eq!(default.agent_type.as_ref().unwrap().drawn(), None);
+            let (tip, name) = default.described();
+            assert!(tip.contains("general-purpose"), "{tip}");
+            assert!(name.contains("general-purpose"), "{name}");
+        }
+
+        let unnamed = row(
+            &mut runtime,
+            serde_json::json!({"prompt": "", "subagent_type": "Explore"}),
+            ToolStatus::Running,
+        );
+        assert_eq!(unnamed.label, "Explore");
+        assert_eq!(unnamed.agent_type, None);
+    }
+
     #[test]
     fn cli_spawn_preview_names_the_destination_without_repeating_the_task() {
         let (runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
@@ -2460,9 +2601,9 @@ mod identity_tests {
     }
 
     /// A background agent's row says what it waits on in the words its tab
-    /// uses, and shows its type whole or not at all.
+    /// uses, and leaves off the type it was started as by default.
     #[test]
-    fn a_waiting_agents_row_names_what_it_waits_on_and_its_type_is_a_whole_term() {
+    fn a_waiting_agents_row_names_what_it_waits_on_and_leaves_off_the_default_type() {
         let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
         let reading = claude_step(
             "Agent",
@@ -2500,8 +2641,15 @@ mod identity_tests {
             |runtime: &Runtime| runtime.spawn_row(&reading, &spawn, ToolStatus::Succeeded, "");
         let started = row(&runtime);
         assert_eq!(started.shown, "Review restart safety");
-        assert_eq!(started.preview, "general-purpose");
-        assert!(started.term, "the type is drawn whole or left out");
+        // Claude Code's default type says nothing on the row, but the
+        // tooltip and the accessible name still give it.
+        assert_eq!(started.preview, "");
+        let kind = started.agent_type.as_ref().expect("the agent has a type");
+        assert_eq!(kind.name, "general-purpose");
+        assert_eq!(kind.drawn(), None);
+        let (tip, name) = started.described();
+        assert!(tip.contains("general-purpose"), "{tip}");
+        assert!(name.ends_with(" · general-purpose"), "{name}");
         assert_eq!(started.state.text, "Waiting on scripts/restart-check");
         let agent = &runtime.snapshot.subagents[0];
         assert_eq!(
@@ -2540,6 +2688,16 @@ mod identity_tests {
             .push(running_command("soak", "scripts/soak").into());
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on 2 commands");
+        // Drawn muted after the agent's name, beside the mark of waiting on
+        // its own work, reading on from the name.
+        assert_eq!(
+            row(&runtime).state.trailing(None),
+            disclosure::Trailing {
+                detail: Some("waiting on 2 commands".into()),
+                mark: Some(disclosure::Mark::WaitingOnBackgroundWork),
+                elapsed: None,
+            }
+        );
         // A long command is cut once, where the tab cuts it, and the row's
         // bound leaves that cut whole.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].items =
@@ -2547,16 +2705,26 @@ mod identity_tests {
         observe(&mut runtime);
         let long = row(&runtime).state.text;
         assert_eq!(long, "Waiting on scripts/restart-check-ev…");
-        assert_eq!(long.chars().count(), STATUS_CHARS);
+        assert_eq!(long.chars().count(), disclosure::STATUS_CHARS);
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0]
             .items
             .clear();
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Waiting on background work");
+        // Work it does not name is told by the mark alone.
+        assert_eq!(row(&runtime).state.trailing(None).detail, None);
         // Settled, it names no work.
         std::sync::Arc::make_mut(&mut runtime.snapshot).subagents[0].status = ToolStatus::Succeeded;
         observe(&mut runtime);
         assert_eq!(row(&runtime).state.text, "Finished");
+        assert_eq!(
+            row(&runtime).state.trailing(Some("4m 2s".into())),
+            disclosure::Trailing {
+                detail: None,
+                mark: Some(disclosure::Mark::Finished),
+                elapsed: Some("4m 2s".into()),
+            }
+        );
     }
 
     /// A row for several agents names what one waits on only when it is the
@@ -2685,6 +2853,8 @@ mod identity_tests {
             if worked {
                 assert_eq!(row.verb, "Started");
                 assert_eq!(row.state.text, "Failed");
+                // Its failure is marked once, by the row's leading glyph.
+                assert_eq!(row.state.trailing(None), disclosure::Trailing::default());
                 // The tooltip names the agent whole, then how it stands.
                 assert!(
                     tip.starts_with(&format!("Started {}\n\nFailed: {refusal}", row.label)),
@@ -2835,8 +3005,8 @@ mod identity_tests {
                 "Started",
                 "Review restart safety".into(),
                 tag.into(),
-                "general-purpose".into(),
-                true,
+                String::new(),
+                Some("· Explore".into()),
             );
             lay(words, width)
         };
@@ -2875,7 +3045,7 @@ mod identity_tests {
             "Review restart safety".into(),
             " 2".into(),
             "general-purpose ".repeat(40),
-            false,
+            None,
         );
         let kept = lay(kept, 4000.0).size().width;
         assert_eq!(kept, verb + gap + whole[0] + whole[1]);
@@ -2883,7 +3053,7 @@ mod identity_tests {
         // that it fades, and the state keeps its place beside it.
         let long = "Confirm every supported upgrade path still migrates from the oldest release";
         let kept = |name: &str| {
-            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), true);
+            let (_, kept) = row_words("Started", name.into(), String::new(), String::new(), None);
             lay(kept, 4000.0).size().width
         };
         assert_eq!(
@@ -2965,16 +3135,9 @@ mod identity_tests {
 
     #[test]
     fn agents_a_step_cannot_name_are_counted() {
-        let reading = |cli| Coordination {
-            kind: Kind::Act(Act::Agents),
-            outcome: Default::default(),
-            subagents: Vec::new(),
-            cli,
-        };
         let listed = |id: &str| (id == "thread-a").then(|| "reviewer".to_owned());
         let agents = |ids: &[&str]| ids.iter().map(|id| id.to_string()).collect::<Vec<_>>();
-        let native = reading(false);
-        let phrase = |ids: &[&str]| agents_phrase(&native, &agents(ids), &listed);
+        let phrase = |ids: &[&str]| agents_phrase(&agents(ids), &listed);
         assert_eq!(phrase(&["thread-a"]), "reviewer");
         assert_eq!(
             phrase(&["thread-a", "019a4c2e-7f10-7c3e-9b1d-2f5e8a6c4d01"]),
@@ -2985,11 +3148,9 @@ mod identity_tests {
             "reviewer and 2 other agents"
         );
         assert_eq!(phrase(&["019a4c2e-7f10", "019a4c2e-7f11"]), "2 agents");
-        // A `cagents` agent goes by the short ID the CLI prints for it.
-        assert_eq!(
-            agents_phrase(&reading(true), &agents(&["95fcd1b9e0aa"]), &listed),
-            "95fcd1b9"
-        );
+        // A `cagents` agent the conversation does not list is known only by
+        // its ID, an address rather than a name, so it is counted too.
+        assert_eq!(phrase(&["95fcd1b9e0aa"]), "an agent");
     }
 
     #[test]
@@ -3068,7 +3229,8 @@ mod identity_tests {
         spawn.channel = Some(channel);
         assert_eq!(
             spawn_details(&reading, &spawn, None),
-            format!("cagents agent · codex · gpt-reported · low · Channel {channel}")
+            "cagents agent · codex · gpt-reported · low",
+            "a channel's ID is no name to show"
         );
         spawn.placement = Some(crate::agent_execution::Placement::Worktree {
             repository: "/repo".into(),
@@ -3090,9 +3252,10 @@ mod identity_tests {
             shown: shown.to_owned(),
             tag: String::new(),
             preview: "The repo is now at /srv".to_owned(),
-            term: false,
+            agent_type: None,
             full: "The repo is now at /srv/repos/t3code.".to_owned(),
             state,
+            elapsed: None,
             open,
             several: false,
             copy: "Copy message",
@@ -3197,18 +3360,22 @@ mod identity_tests {
             session: Some("95fcd1b9e3a4".into()),
             live: true,
         };
-        let (shown, id) = titled.shown();
-        assert_eq!(id, " (95fcd1b9)");
-        assert!(
-            shown.chars().count() + id.chars().count() <= LABEL_CHARS + 1,
-            "{shown}{id}"
-        );
+        // The session's ID is its address, not a name: the row shows the
+        // title alone, and a session with none as another session.
+        let shown = titled.shown();
+        assert!(!shown.contains("95fcd1b9"), "{shown}");
+        assert!(shown.chars().count() <= LABEL_CHARS + 1, "{shown}");
+        let untitled = Recipient {
+            name: String::new(),
+            ..titled
+        };
+        assert_eq!(untitled.shown(), "another session");
         // A phrase the row draws whole.
         let report = Recipient {
             name: "the conversation that started it".into(),
             session: None,
             live: false,
         };
-        assert_eq!(report.shown(), (report.name.clone(), String::new()));
+        assert_eq!(report.shown(), report.name);
     }
 }

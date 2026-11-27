@@ -3,23 +3,23 @@
 
 use serde::{Deserialize, Serialize};
 
-pub(crate) mod cleanup;
+pub mod cleanup;
 
-pub(crate) use crate::daemon::holder_registry::{Process, Record};
+pub use crate::daemon::holder_registry::{Process, Record};
 use crate::model::{BootId, TerminalId, TerminalSession};
 
-pub(crate) fn directory() -> Result<std::path::PathBuf, String> {
+pub fn directory() -> Result<std::path::PathBuf, String> {
     crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Terminal)
 }
 
-pub(crate) use crate::daemon::holder_registry::socket;
+pub use crate::daemon::holder_registry::socket;
 
-pub(crate) fn evidence(socket: &std::path::Path) -> Result<Option<Record>, String> {
+pub fn evidence(socket: &std::path::Path) -> Result<Option<Record>, String> {
     crate::daemon::holder_registry::evidence(socket, crate::daemon::holder_registry::Kind::Terminal)
 }
 
-#[cfg(test)]
-pub(crate) fn discover(directory: &std::path::Path, boot: &BootId) -> Result<Vec<Record>, String> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn discover(directory: &std::path::Path, boot: &BootId) -> Result<Vec<Record>, String> {
     crate::daemon::holder_registry::discover(
         directory,
         boot,
@@ -37,7 +37,7 @@ pub struct Recovery {
     /// The actual restart recipe retained by this original holder. It must
     /// survive adoption even when the published source is a fresh/shell tuple.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) execution_recipe: Option<crate::model::LaunchRecipe>,
+    pub execution_recipe: Option<crate::model::LaunchRecipe>,
 }
 
 impl Recovery {

@@ -82,6 +82,8 @@ pub struct Unread {
     pub newest: Option<String>,
     /// Items asked for again that the conversation no longer has.
     pub gone: Vec<String>,
+    /// More changed items are waiting after this bounded read.
+    pub more: bool,
 }
 
 impl Store {
@@ -186,6 +188,7 @@ impl Store {
             // What does not fit is served by the next read.
             self.following.changed(&id);
         }
+        unread.more = left;
         unread.newest = self
             .db
             .prepare_cached("SELECT id FROM items ORDER BY ordinal DESC LIMIT 1")?
@@ -413,7 +416,9 @@ mod tests {
         assert!(!first.has_earlier);
         assert_eq!(first.items[0].id, "b0");
         assert!(first.items.len() < count);
+        assert!(first.more);
         let rest = store.unread(&[]).unwrap();
+        assert!(!rest.more);
         assert!(!rest.restarted && !rest.has_earlier);
         assert_eq!(first.items.len() + rest.items.len(), count);
         assert_eq!(
@@ -488,7 +493,9 @@ mod tests {
         }
         let first = store.unread(&[]).unwrap();
         assert!(first.items.len() < count);
+        assert!(first.more);
         let rest = store.unread(&[]).unwrap();
+        assert!(!rest.more);
         assert_eq!(first.items.len() + rest.items.len(), count);
         assert_eq!(
             rest.items.last().map(|item| item.id.as_str()),

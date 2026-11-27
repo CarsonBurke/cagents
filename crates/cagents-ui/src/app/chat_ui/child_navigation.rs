@@ -4,12 +4,13 @@ use super::*;
 mod reveal;
 
 /// Where the chooser lists a child: what asks something of the reader first,
-/// then what is still going, then what has finished.
+/// then what is still going, what finished, and earlier observations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Section {
     Attention,
     Working,
     Finished,
+    Earlier,
 }
 
 impl Section {
@@ -17,6 +18,7 @@ impl Section {
         match rank(child) {
             0 => Self::Working,
             FINISHED => Self::Finished,
+            EARLIER => Self::Earlier,
             _ => Self::Attention,
         }
     }
@@ -26,6 +28,7 @@ impl Section {
             Self::Attention => "Needs attention",
             Self::Working => "Working",
             Self::Finished => "Finished",
+            Self::Earlier => "Earlier",
         }
     }
 }
@@ -56,6 +59,9 @@ fn child_key(id: &str) -> [u8; 32] {
 /// Working children lead, so what is still running is what the reader sees
 /// first; a question or a failure follows them, and finished work goes last.
 fn rank(child: &chat::Subagent) -> u8 {
+    if child.last_seen_running() {
+        return EARLIER;
+    }
     match child.status {
         // A child waiting on its own background work is alive and asks nothing
         // of anyone, so it stays with the working ones rather than in attention.
@@ -70,6 +76,7 @@ fn rank(child: &chat::Subagent) -> u8 {
 /// The rank of a child that finished, stopped or ended. Finished children
 /// fold into one control on the strip rather than each keeping a tab.
 const FINISHED: u8 = 3;
+const EARLIER: u8 = 4;
 
 fn needs_attention(child: &chat::Subagent) -> bool {
     matches!(rank(child), 1 | 2)
@@ -80,6 +87,9 @@ fn finished(child: &chat::Subagent) -> bool {
 }
 
 fn child_icon(child: &chat::Subagent) -> Icon {
+    if child.last_seen_running() {
+        return Icon::History;
+    }
     match child.status {
         chat::ToolStatus::Waiting => Icon::AgentBackground,
         chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
@@ -148,6 +158,11 @@ fn direct_tabs<'a>(
 
 /// How many characters of its name a child's tab shows.
 pub(super) const TAB_CHARS: usize = 24;
+
+/// The most characters a chooser row's activity line shows of a report or
+/// detail; past it the line fades out, as it does where the row runs out of
+/// room.
+const ACTIVITY_CHARS: usize = 160;
 
 /// What a tab shows of `name` before any number: the name itself, or its
 /// first [`TAB_CHARS`] characters when the tab cuts it, which is then marked.
@@ -315,6 +330,7 @@ fn span(millis: u64) -> String {
 /// long ago any other child last did something.
 fn row_time(child: &chat::Subagent, report: Option<&chat::Item>, now: u64) -> Option<String> {
     match Section::of(child) {
+        Section::Earlier => None,
         Section::Working => first_activity(child).map(|start| span(now.saturating_sub(start))),
         _ => last_activity(child, report).map(|last| {
             cagents::account::format_ago(
@@ -514,11 +530,13 @@ impl Runtime {
     }
 
     /// While a subagent's transcript is open, the main conversation's own
-    /// work, a question for the reader or a failure is marked on its tab,
-    /// since its transcript is not there to say so. What its subagents do is
-    /// on their own tabs, so it is not repeated here.
-    pub(super) fn parent_tab_state(&self) -> Option<(Icon, &str)> {
-        let (glyph, label) = self.conversation_status_base(false);
+    /// work, a question for the reader, a usage limit or a failure is marked
+    /// on its tab, since its transcript is not there to say so. What its
+    /// subagents do is on their own tabs, so it is not repeated here. It is
+    /// the status the inspector gives the conversation, so a usage limit
+    /// reads as one rather than as a bare error.
+    pub(super) fn parent_tab_state(&self) -> Option<(Icon, String)> {
+        let (glyph, label) = self.own_conversation_status();
         match glyph? {
             Icon::AgentWorking if self.snapshot.busy => Some((Icon::AgentWorking, label)),
             glyph
@@ -528,7 +546,7 @@ impl Runtime {
             {
                 Some((glyph, label))
             }
-            glyph @ (Icon::Warning | Icon::Error) => Some((glyph, label)),
+            glyph @ (Icon::Warning | Icon::Error | Icon::UsageLimit) => Some((glyph, label)),
             _ => None,
         }
     }
@@ -545,17 +563,17 @@ impl Runtime {
         child_ordinal(&self.snapshot.subagents, &self.child_ordinals, child)
     }
 
-    /// A chooser row's accessible name. It ends with the exact child ID,
-    /// which tells apart rows whose names and tasks read the same.
+    /// A chooser row's accessible name. `label` carries the number that
+    /// tells apart children whose names read the same, as their tabs do;
+    /// the child's ID is the provider's address for it, not a name.
     pub(super) fn child_choice_name(&self, child: &chat::Subagent, label: &str) -> String {
         let status = self.native_child_status(child);
         match Self::native_child_task(child).filter(|_| !Self::named_by_task(child)) {
             Some(task) => format!(
-                "{label} · {status} · Task: {} · {}",
+                "{label} · {status} · Task: {}",
                 Self::short_description(task, 120),
-                child.id
             ),
-            None => format!("{label} · {status} · {}", child.id),
+            None => format!("{label} · {status}"),
         }
     }
 
@@ -730,12 +748,15 @@ impl Runtime {
         report: Option<&chat::Item>,
     ) -> String {
         let status = self.native_child_status(child);
+        if child.last_seen_running() {
+            return status.to_owned();
+        }
         let detail = child.detail.trim();
         let reported = || {
             report
                 .and_then(report_text)
                 .and_then(|text| text.lines().map(str::trim).find(|line| !line.is_empty()))
-                .map(|line| Self::short_description(line, 160))
+                .map(|line| line.chars().take(ACTIVITY_CHARS + 1).collect())
         };
         let failure = || {
             chat::failure::Failure::parse(self.session.launch.provider, detail)
@@ -780,7 +801,7 @@ impl Runtime {
                     .lines()
                     .map(str::trim)
                     .find(|line| !line.is_empty())
-                    .map(|line| Self::short_description(line, 160))
+                    .map(|line| line.chars().take(ACTIVITY_CHARS + 1).collect())
             })),
         }
     }
@@ -841,11 +862,10 @@ impl Runtime {
                             design::caption(section.heading())
                                 .class(cosmic::theme::Text::Custom(design::muted_text))
                                 .into(),
-                            design::caption(count.to_string())
-                                .class(cosmic::theme::Text::Custom(design::muted_text))
-                                .into(),
+                            crate::ui_controls::count_badge(count.to_string(), Default::default()),
                         ])
-                        .spacing(space::XS),
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center),
                     )
                     .padding([0.0, space::S])
                     .height(Length::Fixed(HEADING_HEIGHT))
@@ -971,23 +991,17 @@ impl Runtime {
         let chosen = self.selected_subagent.as_ref() == Some(&child.id);
         let label = self.child_label(child, 80);
         let name = self.child_choice_name(child, &label);
+        // Shown in full, to fade where the row runs out of room.
+        let label = self.child_label(child, usize::MAX);
         let line = |text: String, muted: bool| {
-            let text = design::caption(text)
-                .wrapping(iced::widget::text::Wrapping::None)
-                .ellipsize(iced::widget::text::Ellipsize::End(
-                    iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-                ));
+            let text = crate::ui_controls::FadeText::caption(text);
             if muted {
                 text.class(cosmic::theme::Text::Custom(design::muted_text))
             } else {
                 text
             }
         };
-        let title = design::body(label.into_owned())
-            .wrapping(iced::widget::text::Wrapping::None)
-            .ellipsize(iced::widget::text::Ellipsize::End(
-                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-            ));
+        let title = crate::ui_controls::fade_text(label.into_owned());
         let mut parts = vec![
             widget::container(status_mark(child))
                 .width(Length::Fixed(f32::from(design::COMPACT_ICON_SIZE)))
@@ -995,6 +1009,7 @@ impl Runtime {
             widget::column::with_children(vec![
                 title.width(Length::Fill).into(),
                 line(self.child_activity(child, report), true)
+                    .limit(ACTIVITY_CHARS)
                     .width(Length::Fill)
                     .into(),
             ])
@@ -1044,6 +1059,36 @@ mod tests {
             background: true,
             items: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_listed_unloaded_running_child_has_a_static_status_in_the_chooser() {
+        let mut child = active(child("earlier", chat::ToolStatus::Running, false), 1, 1);
+        child.detail = chat::UNLOADED_CHILD_RUNNING.into();
+        assert_eq!(Section::of(&child), Section::Earlier);
+        assert_eq!(row_time(&child, None, 60_000), None);
+        assert_eq!(child_icon(&child), Icon::History);
+        let children = [child.clone()];
+        assert!(direct_tabs(&children, None, None).is_empty());
+        assert_eq!(direct_tabs(&children, Some(&child.id), None), [&child]);
+        assert_eq!(
+            super::super::view::AgentWork::default().caption(&child),
+            chat::UNLOADED_CHILD_RUNNING
+        );
+
+        let (runtime, _) = super::super::view::prepared_runtime_for_test(&[]);
+        let mut other = child.clone();
+        other.id = "earlier-2".into();
+        let first = runtime.child_choice_name(&child, "Reviewer 1");
+        let second = runtime.child_choice_name(&other, "Reviewer 2");
+        assert!(first.starts_with("Reviewer 1 · "));
+        assert!(second.starts_with("Reviewer 2 · "));
+        assert!(first.contains(chat::UNLOADED_CHILD_RUNNING));
+        assert!(second.contains(chat::UNLOADED_CHILD_RUNNING));
+        assert_eq!(
+            runtime.child_activity(&child, None),
+            chat::UNLOADED_CHILD_RUNNING
+        );
     }
 
     fn named(id: &str, kind: &str, status: chat::ToolStatus, waiting: bool) -> chat::Subagent {

@@ -1,0 +1,286 @@
+//! One blocking wait for courier edges and absolute Unix deadlines.
+//!
+//! An edge raised at any point after [`Wait::begin_pass`] ends the next
+//! [`Wait::until`] at once, so a pass never sleeps through a change it did
+//! not see.
+
+#[cfg(not(target_os = "linux"))]
+pub(super) use portable::Wait;
+
+/// The descriptors where the kernel provides them, or a condition variable
+/// when it refuses to create them, so the courier keeps delivering either way.
+#[cfg(target_os = "linux")]
+pub(super) enum Wait {
+    Descriptors(linux::Wait),
+    Portable(portable::Wait),
+}
+
+#[cfg(target_os = "linux")]
+impl Wait {
+    pub(super) fn new() -> Self {
+        match linux::Wait::new() {
+            Ok(wait) => Self::Descriptors(wait),
+            Err(error) => {
+                tracing::warn!(%error, "cannot create the courier's wait descriptors; using a condition variable");
+                Self::Portable(portable::Wait::new())
+            }
+        }
+    }
+
+    pub(super) fn wake(&self) {
+        match self {
+            Self::Descriptors(wait) => wait.wake(),
+            Self::Portable(wait) => wait.wake(),
+        }
+    }
+
+    pub(super) fn begin_pass(&self) {
+        match self {
+            Self::Descriptors(wait) => wait.begin_pass(),
+            Self::Portable(wait) => wait.begin_pass(),
+        }
+    }
+
+    pub(super) fn until(&self, unix_ms: u64) -> std::io::Result<()> {
+        match self {
+            Self::Descriptors(wait) => wait.until(unix_ms),
+            Self::Portable(wait) => wait.until(unix_ms),
+        }
+    }
+
+    pub(super) fn edge_within(&self, timeout: std::time::Duration) -> std::io::Result<()> {
+        match self {
+            Self::Descriptors(wait) => wait.edge_within(timeout),
+            Self::Portable(wait) => wait.edge_within(timeout),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn portable() -> Self {
+        Self::Portable(portable::Wait::new())
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod linux {
+    use std::{
+        io,
+        os::fd::{AsRawFd, FromRawFd, OwnedFd},
+        time::Duration,
+    };
+
+    /// An eventfd for edges and a realtime timerfd for the deadline, which
+    /// counts time spent suspended.
+    pub(in super::super) struct Wait {
+        edge: OwnedFd,
+        deadline: OwnedFd,
+    }
+
+    impl Wait {
+        pub(in super::super) fn new() -> io::Result<Self> {
+            // SAFETY: Each call returns a fresh descriptor or -1. Neither takes
+            // pointers, and both descriptors are private to the courier.
+            let edge = owned(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })?;
+            let deadline =
+                owned(unsafe { libc::timerfd_create(libc::CLOCK_REALTIME, libc::TFD_CLOEXEC) })?;
+            Ok(Self { edge, deadline })
+        }
+
+        pub(in super::super) fn wake(&self) {
+            // SAFETY: the eventfd is live. An already full counter stays readable.
+            while unsafe { libc::eventfd_write(self.edge.as_raw_fd(), 1) } < 0
+                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {}
+        }
+
+        /// Drains coalesced edges. The courier calls this under its state
+        /// lock before taking the generation for the next scan, so a later
+        /// edge stays readable.
+        pub(in super::super) fn begin_pass(&self) {
+            let mut count = 0;
+            // SAFETY: the eventfd is nonblocking and `count` can hold its value.
+            while unsafe { libc::eventfd_read(self.edge.as_raw_fd(), &mut count) } < 0
+                && io::Error::last_os_error().kind() == io::ErrorKind::Interrupted
+            {}
+        }
+
+        /// Blocks until an edge or `unix_ms`, in milliseconds since the epoch.
+        pub(in super::super) fn until(&self, unix_ms: u64) -> io::Result<()> {
+            let deadline = libc::itimerspec {
+                it_interval: libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                },
+                it_value: libc::timespec {
+                    tv_sec: (unix_ms / 1000).try_into().unwrap_or(libc::time_t::MAX),
+                    tv_nsec: ((unix_ms % 1000) * 1_000_000) as libc::c_long,
+                },
+            };
+            // An absolute realtime deadline is already due on resume if it
+            // elapsed during suspend. A discontinuous clock change also wakes
+            // the scan, which recomputes the deadlines from the new time.
+            // Rearming resets any expiration left unread.
+            // SAFETY: the descriptor is live and `deadline` is initialized.
+            let armed = unsafe {
+                libc::timerfd_settime(
+                    self.deadline.as_raw_fd(),
+                    libc::TFD_TIMER_ABSTIME | libc::TFD_TIMER_CANCEL_ON_SET,
+                    &deadline,
+                    std::ptr::null_mut(),
+                )
+            };
+            if armed < 0 {
+                let error = io::Error::last_os_error();
+                // Setting the new deadline can report that the previous one
+                // was cancelled. The caller should recompute after that change.
+                return if error.raw_os_error() == Some(libc::ECANCELED) {
+                    Ok(())
+                } else {
+                    Err(error)
+                };
+            }
+            let mut descriptors = [
+                libc::pollfd {
+                    fd: self.edge.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: self.deadline.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ];
+            loop {
+                // SAFETY: poll borrows both live descriptors and writes only
+                // into the supplied initialized array.
+                if unsafe {
+                    libc::poll(
+                        descriptors.as_mut_ptr(),
+                        descriptors.len() as libc::nfds_t,
+                        -1,
+                    )
+                } > 0
+                {
+                    if descriptors
+                        .iter()
+                        .any(|descriptor| descriptor.revents & libc::POLLIN != 0)
+                    {
+                        return Ok(());
+                    }
+                    return Err(io::Error::other(
+                        "courier wait descriptor became unavailable",
+                    ));
+                }
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        }
+
+        /// Blocks until an edge or `timeout` elapses on the monotonic clock,
+        /// without the deadline timer, for when [`Wait::until`] failed.
+        pub(in super::super) fn edge_within(&self, timeout: Duration) -> io::Result<()> {
+            let mut descriptor = libc::pollfd {
+                fd: self.edge.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let timeout = timeout.as_millis().min(libc::c_int::MAX as u128) as libc::c_int;
+            // SAFETY: poll borrows the live eventfd and writes only into
+            // `descriptor`.
+            match unsafe { libc::poll(&mut descriptor, 1, timeout) } {
+                0 => Ok(()),
+                ready if ready > 0 && descriptor.revents & libc::POLLIN != 0 => Ok(()),
+                ready if ready > 0 => Err(io::Error::other(
+                    "courier edge descriptor became unavailable",
+                )),
+                _ => match io::Error::last_os_error() {
+                    error if error.kind() == io::ErrorKind::Interrupted => Ok(()),
+                    error => Err(error),
+                },
+            }
+        }
+    }
+
+    fn owned(fd: libc::c_int) -> io::Result<OwnedFd> {
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the call produced a fresh descriptor and transfers it here.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+mod portable {
+    use std::{
+        io,
+        sync::{Condvar, Mutex},
+        time::Duration,
+    };
+
+    /// The longest one sleep lasts. A condition variable waits on a clock
+    /// that stops while the machine is suspended, so a far deadline is
+    /// compared with the wall clock again this often.
+    const RECHECK: Duration = Duration::from_secs(15);
+
+    /// A flag for edges and a condition variable to sleep on.
+    pub(in super::super) struct Wait {
+        edge: Mutex<bool>,
+        changed: Condvar,
+    }
+
+    impl Wait {
+        pub(in super::super) fn new() -> Self {
+            Self {
+                edge: Mutex::new(false),
+                changed: Condvar::new(),
+            }
+        }
+
+        pub(in super::super) fn wake(&self) {
+            *self.edge.lock().unwrap_or_else(|p| p.into_inner()) = true;
+            self.changed.notify_one();
+        }
+
+        pub(in super::super) fn begin_pass(&self) {
+            *self.edge.lock().unwrap_or_else(|p| p.into_inner()) = false;
+        }
+
+        /// Blocks until an edge or `unix_ms`, in milliseconds since the epoch.
+        pub(in super::super) fn until(&self, unix_ms: u64) -> io::Result<()> {
+            let mut edge = self.edge.lock().unwrap_or_else(|p| p.into_inner());
+            while !*edge {
+                let remaining = unix_ms.saturating_sub(crate::host::agent_execution::now());
+                if remaining == 0 {
+                    break;
+                }
+                edge = self
+                    .changed
+                    .wait_timeout(edge, Duration::from_millis(remaining).min(RECHECK))
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+            Ok(())
+        }
+
+        /// Blocks until an edge or `timeout` elapses.
+        pub(in super::super) fn edge_within(&self, timeout: Duration) -> io::Result<()> {
+            let deadline = std::time::Instant::now() + timeout;
+            let mut edge = self.edge.lock().unwrap_or_else(|p| p.into_inner());
+            while !*edge {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    break;
+                }
+                edge = self
+                    .changed
+                    .wait_timeout(edge, remaining)
+                    .unwrap_or_else(|p| p.into_inner())
+                    .0;
+            }
+            Ok(())
+        }
+    }
+}

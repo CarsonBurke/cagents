@@ -28,6 +28,10 @@ pub(super) fn isolated(variable: &str, test: impl FnOnce()) {
         eprint!("{}", String::from_utf8_lossy(&output.stderr));
         return;
     }
+    // The fixture process supplies the same pre-exec tracker as a native
+    // retained helper. Never enable process-wide sweeping in the harness.
+    #[cfg(target_os = "macos")]
+    crate::daemon::adopted_orphans::become_sweeper();
     test();
 }
 
@@ -167,13 +171,16 @@ fn a_half_closed_client_gets_its_reply_and_frees_its_worker() {
             method: "state".into(),
             args: json!([0]),
         };
-        let next = || {
+        let next = |stage| {
             let deadline = Instant::now() + TIMEOUT;
             loop {
                 if let Some(call) = connections.next() {
                     return call;
                 }
-                assert!(Instant::now() < deadline, "no call was queued");
+                assert!(
+                    Instant::now() < deadline,
+                    "no call was queued after {stage}"
+                );
                 thread::sleep(Duration::from_millis(1));
             }
         };
@@ -183,7 +190,7 @@ fn a_half_closed_client_gets_its_reply_and_frees_its_worker() {
         connections.admit(served);
         send(&client, &request, TIMEOUT).unwrap();
         client.shutdown(std::net::Shutdown::Write).unwrap();
-        let (_, reply) = next().into_parts();
+        let (_, reply) = next("write shutdown").into_parts();
         reply
             .send(connections::Answer::Value(Ok(json!("answered"))))
             .wait();
@@ -206,6 +213,6 @@ fn a_half_closed_client_gets_its_reply_and_frees_its_worker() {
         assert_eq!(connections.workers(), (0, 1));
         send(&client, &request, TIMEOUT).unwrap();
         drop(client);
-        assert_eq!(next().method(), "state");
+        assert_eq!(next("peer close").method(), "state");
     });
 }

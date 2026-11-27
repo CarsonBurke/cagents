@@ -56,12 +56,12 @@ impl LinkKey {
     }
 
     #[cfg(any(test, feature = "host"))]
-    pub(crate) fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Self {
+    pub fn from_bytes(bytes: [u8; SECRET_BYTES]) -> Self {
         Self(bytes)
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn bytes(&self) -> &[u8; SECRET_BYTES] {
+    pub fn bytes(&self) -> &[u8; SECRET_BYTES] {
         &self.0
     }
 }
@@ -137,7 +137,7 @@ pub struct Claim {
 /// What this computer's daemon signs for a session: the device's nonce, the
 /// peer the link names this computer as, and the session's claim.
 #[cfg(feature = "host")]
-pub(crate) fn proof(
+pub fn proof(
     key: &LinkKey,
     nonce: &[u8; SECRET_BYTES],
     peer: uuid::Uuid,
@@ -169,7 +169,7 @@ fn mac(
 
 /// Whether `proof` is what [`proof`] signs, compared in constant time.
 #[cfg(feature = "host")]
-pub(crate) fn verify(
+pub fn verify(
     key: &LinkKey,
     nonce: &[u8; SECRET_BYTES],
     peer: uuid::Uuid,

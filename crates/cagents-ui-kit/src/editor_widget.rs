@@ -776,7 +776,7 @@ where
 
     fn input_method<'b>(
         &self,
-        state: &'b State<Highlighter>,
+        state: &'b State<Highlighter, Theme>,
         renderer: &Renderer,
         layout: Layout<'_>,
     ) -> InputMethod<&'b str> {
@@ -814,8 +814,37 @@ where
     }
 }
 
-/// Ctrl+Delete / Ctrl+Backspace delete the adjacent word, then the usual
-/// iced editor chords (copy/cut/paste/select-all and caret motion).
+/// How far a modified Backspace or Delete reaches: the platform's chord
+/// for the adjacent word, or on macOS also Command for the rest of the line.
+///
+/// Ctrl deletes a word on Linux and Option does on macOS, as each system's
+/// own text fields do; iced's editor treats any modified Backspace as a
+/// single character.
+pub fn deletion_motion(modifiers: keyboard::Modifiers, key: &keyboard::Key) -> Option<Motion> {
+    use keyboard::{Modifiers, key::Named};
+    let forward = match key.as_ref() {
+        keyboard::Key::Named(Named::Backspace) => false,
+        keyboard::Key::Named(Named::Delete) => true,
+        _ => return None,
+    };
+    let (backward, ahead) = if cfg!(target_os = "macos") {
+        if modifiers == Modifiers::ALT {
+            (Motion::WordLeft, Motion::WordRight)
+        } else if modifiers == Modifiers::LOGO {
+            (Motion::Home, Motion::End)
+        } else {
+            return None;
+        }
+    } else if modifiers.control() && !modifiers.alt() && !modifiers.shift() {
+        (Motion::WordLeft, Motion::WordRight)
+    } else {
+        return None;
+    };
+    Some(if forward { ahead } else { backward })
+}
+
+/// The platform's word and line deletions (see [`deletion_motion`]), then the
+/// usual iced editor chords (copy/cut/paste/select-all and caret motion).
 pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
     // Every editor on screen sees every key press. Only the focused one may
     // act on it, or Ctrl+Backspace typed anywhere else would delete a word
@@ -823,22 +852,11 @@ pub fn default_bindings<Message>(press: KeyPress) -> Option<Binding<Message>> {
     if !matches!(press.status, Status::Focused { .. }) {
         return None;
     }
-    if press.modifiers.command() && !press.modifiers.alt() && !press.modifiers.shift() {
-        match press.key.as_ref() {
-            keyboard::Key::Named(keyboard::key::Named::Delete) => {
-                return Some(Binding::Sequence(vec![
-                    Binding::Select(Motion::WordRight),
-                    Binding::Delete,
-                ]));
-            }
-            keyboard::Key::Named(keyboard::key::Named::Backspace) => {
-                return Some(Binding::Sequence(vec![
-                    Binding::Select(Motion::WordLeft),
-                    Binding::Delete,
-                ]));
-            }
-            _ => {}
-        }
+    if let Some(motion) = deletion_motion(press.modifiers, &press.key) {
+        return Some(Binding::Sequence(vec![
+            Binding::Select(motion),
+            Binding::Delete,
+        ]));
     }
     Binding::from_key_press(press)
 }
@@ -862,7 +880,7 @@ pub fn history_command(press: &KeyPress) -> Option<HistoryCommand> {
     {
         return None;
     }
-    match press.key.to_latin(press.physical_key)?.to_ascii_lowercase() {
+    match crate::interaction::latin_key(&press.key, press.physical_key)? {
         'z' if press.modifiers.shift() => Some(HistoryCommand::Redo),
         'z' => Some(HistoryCommand::Undo),
         'y' if !press.modifiers.shift() => Some(HistoryCommand::Redo),
@@ -1875,7 +1893,7 @@ where
 
 /// The state of a [`TextEditor`].
 #[derive(Debug)]
-pub struct State<Highlighter: text::Highlighter> {
+pub struct State<Highlighter: text::Highlighter, Theme = cosmic::Theme> {
     focus: Option<Focus>,
     preedit: Option<input_method::Preedit>,
     last_click: Option<mouse::Click>,
@@ -1887,7 +1905,10 @@ pub struct State<Highlighter: text::Highlighter> {
     scrollbar_grab: Option<f32>,
     horizontal_grab: Option<f32>,
     scrollbar_target: Option<ScrollTarget>,
-    last_theme: RefCell<Option<String>>,
+    /// The theme the buffer's highlights were last formatted against. Its
+    /// name alone does not identify its colours: a system theme keeps its
+    /// name when the accent changes (#3583).
+    last_theme: RefCell<Option<Theme>>,
     highlighter: RefCell<Highlighter>,
     highlighter_settings: Highlighter::Settings,
     highlighter_format_address: usize,
@@ -1920,7 +1941,7 @@ impl Focus {
     }
 }
 
-impl<Highlighter: text::Highlighter> State<Highlighter> {
+impl<Highlighter: text::Highlighter, Theme> State<Highlighter, Theme> {
     /// Leaves native focus without turning an outside pointer press into an
     /// editor action. External result controls still own the selected buffer.
     fn blur(&mut self) {
@@ -1936,7 +1957,7 @@ impl<Highlighter: text::Highlighter> State<Highlighter> {
     }
 }
 
-impl<Highlighter: text::Highlighter> operation::Focusable for State<Highlighter> {
+impl<Highlighter: text::Highlighter, Theme> operation::Focusable for State<Highlighter, Theme> {
     fn is_focused(&self) -> bool {
         self.focus.is_some()
     }
@@ -1954,15 +1975,15 @@ impl<Highlighter, Message, Theme, Renderer> Widget<Message, Theme, Renderer>
     for TextEditor<'_, Highlighter, Message, Theme, Renderer>
 where
     Highlighter: text::Highlighter,
-    Theme: Catalog,
+    Theme: Catalog + Clone + PartialEq + 'static,
     Renderer: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     fn tag(&self) -> widget::tree::Tag {
-        widget::tree::Tag::of::<State<Highlighter>>()
+        widget::tree::Tag::of::<State<Highlighter, Theme>>()
     }
 
     fn state(&self) -> widget::tree::State {
-        widget::tree::State::new(State {
+        widget::tree::State::new(State::<Highlighter, Theme> {
             focus: None,
             preedit: None,
             last_click: None,
@@ -2013,7 +2034,7 @@ where
         limits: &layout::Limits,
     ) -> layout::Node {
         let mut internal = self.content.0.borrow_mut();
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
 
         if state.highlighter_format_address != self.highlighter_format as usize {
             state.highlighter.borrow_mut().change_line(0);
@@ -2143,7 +2164,7 @@ where
         _viewport: &Rectangle,
     ) {
         let geometry = self.scroll_geometry(layout.bounds());
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
         // Every later branch may return early, and the wheel needs the current
         // modifiers no matter which one does, so record them first. Losing
         // window focus also loses the key release that would clear Shift, so a
@@ -2178,19 +2199,39 @@ where
         }
         if self.on_hover.is_some() || self.on_definition.is_some() {
             let text_bounds = layout.bounds().shrink(self.text_padding());
-            let hit = pointer
-                .filter(|point| text_bounds.contains(*point))
-                .and_then(|point| {
-                    let internal = self.content.0.borrow();
-                    let point = point
-                        - text_bounds.position()
-                        - Vector::new(internal.horizontal_translation(), 0.0);
-                    let cursor = internal.editor.buffer().hit(point.x, point.y)?;
-                    Some(Position {
-                        line: cursor.line,
-                        column: cursor.index,
+            // Hit testing walks the buffer's layout, so only the events
+            // that read the character under the pointer pay for it.
+            let hit = || {
+                pointer
+                    .filter(|point| text_bounds.contains(*point))
+                    .and_then(|point| {
+                        let internal = self.content.0.borrow();
+                        let point = point
+                            - text_bounds.position()
+                            - Vector::new(internal.horizontal_translation(), 0.0);
+                        let cursor = internal.editor.buffer().hit(point.x, point.y)?;
+                        Some(Position {
+                            line: cursor.line,
+                            column: cursor.index,
+                        })
                     })
-                });
+            };
+            // A hover needs ending only when the application has something
+            // to dismiss: the hover was published, or a popup is anchored in
+            // the text, such as a diagnostic the keyboard opened. Otherwise a
+            // hover still dwelling never reached the application, and ending
+            // it would publish a message for every character the pointer
+            // crosses.
+            let popup_shown = self.popup.is_some() && self.popup_at.is_some();
+            let end_hover = |state: &mut State<Highlighter, Theme>,
+                             shell: &mut Shell<'_, Message>| {
+                if let Some((_, _, sent)) = state.hover.take()
+                    && (sent || popup_shown)
+                    && let Some(on_hover) = &self.on_hover
+                {
+                    shell.publish(on_hover(None));
+                }
+            };
             match event {
                 Event::Mouse(mouse::Event::CursorMoved { .. }) => {
                     if pointer.is_some_and(|point| {
@@ -2200,12 +2241,9 @@ where
                     }) {
                         return;
                     }
+                    let hit = hit();
                     if state.hover.map(|hover| hover.0) != hit {
-                        if state.hover.take().is_some()
-                            && let Some(on_hover) = &self.on_hover
-                        {
-                            shell.publish(on_hover(None));
-                        }
+                        end_hover(state, shell);
                         state.hover = hit.map(|at| (at, Instant::now(), false));
                     }
                     if let Some((_, started, false)) = state.hover {
@@ -2223,23 +2261,17 @@ where
                     }
                 }
                 Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
-                    if state.modifiers.command()
-                        && hit.is_some()
-                        && self.on_definition.is_some() =>
+                    if state.modifiers.command() && self.on_definition.is_some() =>
                 {
-                    shell.publish(self.on_definition.as_ref().unwrap()(hit.unwrap()));
-                    shell.capture_event();
-                    return;
+                    if let Some(at) = hit() {
+                        shell.publish(self.on_definition.as_ref().unwrap()(at));
+                        shell.capture_event();
+                        return;
+                    }
                 }
                 Event::Keyboard(keyboard::Event::KeyPressed { .. })
                 | Event::Mouse(mouse::Event::CursorLeft)
-                | Event::Window(window::Event::Unfocused) => {
-                    if state.hover.take().is_some()
-                        && let Some(on_hover) = &self.on_hover
-                    {
-                        shell.publish(on_hover(None));
-                    }
-                }
+                | Event::Window(window::Event::Unfocused) => end_hover(state, shell),
                 _ => {}
             }
         }
@@ -2335,7 +2367,7 @@ where
         }
         // Handle context menu and focus-loss on clicks outside.
         {
-            let state = tree.state.downcast_mut::<State<Highlighter>>();
+            let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
             let text_bounds = layout.bounds();
 
             if matches!(
@@ -2371,7 +2403,7 @@ where
         // Process pending edits from context menu
         // publishes via on_edit so the app calls content.perform().
         {
-            let state = tree.state.downcast_mut::<State<Highlighter>>();
+            let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
             if let Some(action) = state.pending_edit.take()
                 && let Some(on_edit) = self.on_edit.as_ref()
             {
@@ -2383,7 +2415,7 @@ where
             return;
         };
 
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
         let is_redraw = matches!(event, Event::Window(window::Event::RedrawRequested(_now)),);
 
         match event {
@@ -2529,10 +2561,11 @@ where
                         H: text::Highlighter,
                         R: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
                         Message,
+                        T,
                     >(
                         binding: Binding<Message>,
                         content: &Content<R>,
-                        state: &mut State<H>,
+                        state: &mut State<H, T>,
                         on_edit: &dyn Fn(Action) -> Message,
                         clipboard: &mut dyn Clipboard,
                         shell: &mut Shell<'_, Message>,
@@ -2654,20 +2687,12 @@ where
         let bounds = layout.bounds();
 
         let mut internal = self.content.0.borrow_mut();
-        let state = tree.state.downcast_ref::<State<Highlighter>>();
+        let state = tree.state.downcast_ref::<State<Highlighter, Theme>>();
 
         let font = self.font.unwrap_or_else(|| renderer.default_font());
 
-        let theme_name = theme.name();
-
-        if state
-            .last_theme
-            .borrow()
-            .as_ref()
-            .is_none_or(|last_theme| last_theme != theme_name)
-        {
+        if theme_changed(&state.last_theme, theme) {
             state.highlighter.borrow_mut().change_line(0);
-            let _ = state.last_theme.borrow_mut().replace(theme_name.to_owned());
         }
 
         internal.editor.highlight(
@@ -3008,7 +3033,7 @@ where
         _renderer: &Renderer,
         operation: &mut dyn widget::Operation,
     ) {
-        let state = tree.state.downcast_mut::<State<Highlighter>>();
+        let state = tree.state.downcast_mut::<State<Highlighter, Theme>>();
 
         operation.focusable(self.id.as_ref(), layout.bounds(), state);
     }
@@ -3051,7 +3076,10 @@ where
         Some(overlay::Element::new(Box::new(EditorPopup {
             content: popup,
             tree: &mut tree.children[0],
-            bounds: &mut tree.state.downcast_mut::<State<Highlighter>>().popup_bounds,
+            bounds: &mut tree
+                .state
+                .downcast_mut::<State<Highlighter, Theme>>()
+                .popup_bounds,
             anchor: Rectangle::new(anchor, Size::new(1.0, height)),
         })))
     }
@@ -3167,7 +3195,7 @@ impl<'a, Highlighter, Message, Theme, Renderer>
 where
     Highlighter: text::Highlighter,
     Message: 'a,
-    Theme: Catalog + 'a,
+    Theme: Catalog + Clone + PartialEq + 'static,
     Renderer: text::Renderer<Font = cosmic::iced::Font, Editor = NativeEditor>,
 {
     fn from(text_editor: TextEditor<'a, Highlighter, Message, Theme, Renderer>) -> Self {
@@ -3210,9 +3238,9 @@ enum Ime {
 }
 
 impl<Message> Update<Message> {
-    fn from_event<H: Highlighter>(
+    fn from_event<H: Highlighter, Theme>(
         event: &Event,
-        state: &State<H>,
+        state: &State<H, Theme>,
         bounds: Rectangle,
         padding: Padding,
         cursor: mouse::Cursor,
@@ -3491,9 +3519,86 @@ impl ScrollGeometry {
     }
 }
 
+/// Whether `theme` differs from the one the buffer was last highlighted
+/// against, remembering it when it does.
+///
+/// The highlights' formats are resolved from the theme and stored in the
+/// buffer, so they are formatted again whenever anything they could have read
+/// changes. A theme's name is not enough: a system theme keeps it when its
+/// accent or another colour changes. Comparing the theme costs a few hundred
+/// colour comparisons a frame, which is nothing beside shaping the text.
+fn theme_changed<Theme: Clone + PartialEq>(last: &RefCell<Option<Theme>>, theme: &Theme) -> bool {
+    let mut last = last.borrow_mut();
+    if last.as_ref() == Some(theme) {
+        return false;
+    }
+    *last = Some(theme.clone());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Changing the system accent keeps the theme's name, and a Markdown
+    /// buffer's bullets and links are drawn in that accent, so the buffer must
+    /// be highlighted again when the accent changes (#3583).
+    #[test]
+    fn an_accent_change_under_the_same_theme_name_highlights_again() {
+        use crate::editor_highlight::{self, Highlight, Settings};
+        use cosmic::cosmic_theme::palette::Srgba;
+        use cosmic::iced::theme::Base as _;
+        use std::sync::Arc;
+
+        let system = |accent: Srgba| {
+            let mut theme = cosmic::Theme::dark().cosmic().clone();
+            theme.accent.base = accent;
+            theme.accent_text = Some(accent);
+            cosmic::Theme::system(Arc::new(theme))
+        };
+        let blue = system(Srgba::new(0.2, 0.4, 0.9, 1.0));
+        let orange = system(Srgba::new(0.9, 0.5, 0.1, 1.0));
+        assert_eq!(blue.name(), orange.name(), "the accent keeps the name");
+
+        let mut highlighter = editor_highlight::Highlighter::new(&Settings {
+            code: cosmic::iced::highlighter::Settings {
+                theme: cosmic::iced::highlighter::Theme::Base16Ocean,
+                token: "md".to_owned(),
+            },
+            markdown: true,
+            font: cosmic::iced::Font::MONOSPACE,
+        });
+        let bullet: Vec<(std::ops::Range<usize>, Highlight)> = highlighter
+            .highlight_line("- [link](https://example.com)")
+            .collect();
+        let inks = |theme: &cosmic::Theme| {
+            bullet
+                .iter()
+                .map(|(_, highlight)| editor_highlight::format(highlight, theme).color)
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(
+            inks(&blue),
+            inks(&orange),
+            "the Markdown inks follow the accent"
+        );
+
+        let last = RefCell::<Option<cosmic::Theme>>::default();
+        assert!(theme_changed(&last, &blue), "the first draw highlights");
+        assert!(
+            !theme_changed(&last, &blue.clone()),
+            "an unchanged theme keeps the highlights"
+        );
+        assert!(
+            theme_changed(&last, &orange),
+            "a new accent highlights again"
+        );
+        assert!(!theme_changed(&last, &orange));
+        assert!(
+            theme_changed(&last, &cosmic::Theme::light()),
+            "so does a new theme"
+        );
+    }
 
     fn native_state(editor: &NativeEditor) -> Vec<(String, String)> {
         editor
@@ -5636,6 +5741,146 @@ mod tests {
             .on_action(|action| action)
     }
 
+    /// Sweeping the pointer across text publishes nothing until it rests on
+    /// one character for the dwell: a hover that never reached the
+    /// application needs no ending, and each published message costs the
+    /// application an update. Moving off a published hover ends it once.
+    #[test]
+    fn only_a_published_hover_is_ended_when_the_pointer_moves_on() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Probe {
+            Edit,
+            Hover(Option<Position>),
+        }
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(4));
+        let mut editor = TextEditor::new(&content)
+            .font(cosmic::iced::Font::MONOSPACE)
+            .size(16.0)
+            .wrapping(Wrapping::None)
+            .height(Length::Fill)
+            .on_action(|_| Probe::Edit)
+            .on_hover(Probe::Hover);
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Probe, cosmic::Theme, cosmic::Renderer>);
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let deliver = |editor: &mut TextEditor<'_, highlighter::PlainText, Probe>,
+                       tree: &mut widget::Tree,
+                       event: Event,
+                       at: Point| {
+            let mut published = Vec::new();
+            let mut shell = Shell::new(&mut published);
+            editor.update(
+                tree,
+                &event,
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+            published
+        };
+        let moved = |x: f32| {
+            (
+                Event::Mouse(mouse::Event::CursorMoved {
+                    position: Point::new(x, 12.0),
+                }),
+                Point::new(x, 12.0),
+            )
+        };
+        let mut swept = Vec::new();
+        for step in 0..12 {
+            let (event, at) = moved(20.0 + step as f32 * 9.0);
+            swept.extend(deliver(&mut editor, &mut tree, event, at));
+        }
+        assert_eq!(swept, [], "a sweep that never dwells publishes nothing");
+
+        let (_, rest) = moved(20.0 + 11.0 * 9.0);
+        let dwelt = deliver(
+            &mut editor,
+            &mut tree,
+            Event::Window(window::Event::RedrawRequested(
+                Instant::now() + Duration::from_secs(1),
+            )),
+            rest,
+        );
+        assert!(
+            matches!(dwelt.as_slice(), [Probe::Hover(Some(_))]),
+            "a dwell publishes the hover: {dwelt:?}"
+        );
+
+        let (event, at) = moved(20.0);
+        assert_eq!(
+            deliver(&mut editor, &mut tree, event, at),
+            [Probe::Hover(None)],
+            "moving off a published hover ends it"
+        );
+        let (event, at) = moved(20.0 + 6.0 * 9.0);
+        assert_eq!(
+            deliver(&mut editor, &mut tree, event, at),
+            [],
+            "the hover it ended was the only one published"
+        );
+    }
+
+    /// A popup anchored in the text, such as a diagnostic the keyboard
+    /// opened, is still dismissed by the pointer moving on, though the
+    /// editor never published a hover of its own.
+    #[test]
+    fn moving_the_pointer_still_dismisses_an_anchored_popup() {
+        #[derive(Debug, Clone, PartialEq)]
+        enum Probe {
+            Edit,
+            Hover(Option<Position>),
+        }
+        let renderer = headless_renderer();
+        let content = Content::with_text(&"abcdefghij".repeat(4));
+        let mut editor = TextEditor::new(&content)
+            .font(cosmic::iced::Font::MONOSPACE)
+            .size(16.0)
+            .wrapping(Wrapping::None)
+            .height(Length::Fill)
+            .on_action(|_| Probe::Edit)
+            .on_hover(Probe::Hover)
+            .popup(
+                Some(cosmic::widget::text("A diagnostic").into()),
+                Some(Position { line: 0, column: 2 }),
+            );
+        let mut tree =
+            widget::Tree::new(&editor as &dyn Widget<Probe, cosmic::Theme, cosmic::Renderer>);
+        let node = editor.layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, WHEEL_VIEWPORT),
+        );
+        let bounds = Rectangle::new(Point::ORIGIN, WHEEL_VIEWPORT);
+        let mut published = Vec::new();
+        // Past the gutter, and characters apart, so the second move leaves
+        // the first's hover.
+        for x in [60.0, 100.0] {
+            let at = Point::new(x, 12.0);
+            let mut shell = Shell::new(&mut published);
+            editor.update(
+                &mut tree,
+                &Event::Mouse(mouse::Event::CursorMoved { position: at }),
+                Layout::new(&node),
+                mouse::Cursor::Available(at),
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut shell,
+                &bounds,
+            );
+        }
+        assert_eq!(published, [Probe::Hover(None)]);
+    }
+
     #[test]
     fn shift_wheel_pans_the_unwrapped_canvas_to_both_bounds() {
         let renderer = headless_renderer();
@@ -6278,8 +6523,8 @@ mod tests {
                 Status::Active
             },
         };
-        let ctrl = keyboard::Modifiers::CTRL;
-        let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+        let ctrl = keyboard::Modifiers::COMMAND;
+        let ctrl_shift = keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT;
         assert_eq!(
             history_command(&press("z", ctrl, true)),
             Some(HistoryCommand::Undo)
@@ -6310,5 +6555,34 @@ mod tests {
             default_bindings::<()>(backspace).is_none(),
             "an unfocused editor must not delete a word typed at another widget"
         );
+    }
+
+    #[test]
+    fn modified_deletions_reach_as_far_as_the_platforms_text_fields() {
+        use keyboard::{Modifiers, key::Named};
+        let backspace = keyboard::Key::Named(Named::Backspace);
+        let delete = keyboard::Key::Named(Named::Delete);
+        let word = if cfg!(target_os = "macos") {
+            Modifiers::ALT
+        } else {
+            Modifiers::CTRL
+        };
+        assert_eq!(deletion_motion(word, &backspace), Some(Motion::WordLeft));
+        assert_eq!(deletion_motion(word, &delete), Some(Motion::WordRight));
+        assert_eq!(deletion_motion(word | Modifiers::SHIFT, &backspace), None);
+        assert_eq!(deletion_motion(Modifiers::empty(), &backspace), None);
+        assert_eq!(
+            deletion_motion(word, &keyboard::Key::Character("w".into())),
+            None
+        );
+        let line = deletion_motion(Modifiers::LOGO, &backspace);
+        if cfg!(target_os = "macos") {
+            assert_eq!(line, Some(Motion::Home));
+            assert_eq!(deletion_motion(Modifiers::LOGO, &delete), Some(Motion::End));
+            // Control+Backspace is a terminal habit, not a Mac text chord.
+            assert_eq!(deletion_motion(Modifiers::CTRL, &backspace), None);
+        } else {
+            assert_eq!(line, None);
+        }
     }
 }

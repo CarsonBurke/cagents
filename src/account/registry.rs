@@ -37,7 +37,7 @@ const VERSION: u32 = 5;
 /// A registry larger than this is not one cagents wrote.
 const MAX_BYTES: u64 = 256 * 1024;
 
-#[cfg(all(test, feature = "host"))]
+#[cfg(all(any(test, feature = "test-support"), feature = "host"))]
 thread_local! {
     static FAIL_NEXT_WRITE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
@@ -48,14 +48,14 @@ thread_local! {
 /// write the list or start a process, and the person who asked is waiting
 /// for the answer either way.
 #[cfg(feature = "host")]
-pub(crate) const LIST_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
+pub const LIST_PATIENCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Makes `attempt` again while it fails with [`ListHeld`], until `patience`
 /// has passed. Each attempt must take its locks without waiting and release
 /// them all when it fails, so nothing is held between attempts: a request
 /// already admitted to the daemon can wait on these locks.
 #[cfg(feature = "host")]
-pub(crate) fn patiently<T>(
+pub fn patiently<T>(
     patience: std::time::Duration,
     mut attempt: impl FnMut() -> io::Result<T>,
 ) -> io::Result<T> {
@@ -256,7 +256,7 @@ impl Registry {
     /// Credential homes affected by an externally proposed preference edit.
     /// Include physical aliases and both ends of changed routing preferences.
     #[cfg(feature = "host")]
-    pub(crate) fn changed_account_homes(&self, next: &Self, homes: Option<&Homes>) -> Vec<PathBuf> {
+    pub fn changed_account_homes(&self, next: &Self, homes: Option<&Homes>) -> Vec<PathBuf> {
         let mut keys = std::collections::BTreeSet::new();
         for account in self.accounts.iter().chain(&next.accounts) {
             if self.find(account.key) != next.find(account.key)
@@ -1018,7 +1018,7 @@ pub struct LaunchAccountLease {
 /// The registry is read without its lock: it is replaced by rename, and a
 /// launch may already hold the account lifecycle lock.
 #[cfg(feature = "host")]
-pub(crate) fn selection_marker(home_of: impl Fn(&str) -> Option<String>) -> Option<String> {
+pub fn selection_marker(home_of: impl Fn(&str) -> Option<String>) -> Option<String> {
     let linked: Vec<PathBuf> = Store::installation()
         .and_then(|store| read(&store.path()).ok())
         .map(|registry| {
@@ -1044,7 +1044,7 @@ pub(crate) fn selection_marker(home_of: impl Fn(&str) -> Option<String>) -> Opti
 
 /// Called immediately around an actual process creation, including probes.
 /// Live attachment never needs this lease and remains usable after removal.
-pub(crate) fn authorize_spawn(
+pub fn authorize_spawn(
     environment: &std::collections::BTreeMap<String, String>,
     provider: Option<Provider>,
 ) -> Result<Option<LaunchAccountLease>, LaunchAccountError> {
@@ -1149,9 +1149,9 @@ impl Store {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn try_create_pending_reserved(
+    pub fn try_create_pending_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         provider: Provider,
         started_at: u64,
@@ -1214,7 +1214,7 @@ impl Store {
     // Legacy destructive fixture support only. Product lifecycle operations
     // require daemon admission and preserve managed/abandoned home files.
     // Registry absence or an old parked name grants no deletion authority.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn remove_home(
         &self,
         homes: &Homes,
@@ -1257,7 +1257,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_register_pending_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         account: Registered,
         system: &[(Provider, Identity)],
@@ -1309,9 +1309,9 @@ impl Store {
     /// probe could not see - a removal, a sign-in, a newer cagents writing
     /// the registry - can have changed in between unnoticed.
     #[cfg(feature = "host")]
-    pub(crate) fn try_restore_reserved(
+    pub fn try_restore_reserved(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         homes: &Homes,
         account: Registered,
         system: &[(Provider, Identity)],
@@ -1384,16 +1384,17 @@ impl Store {
         )
     }
 
-    fn path(&self) -> PathBuf {
+    /// Path of the account registry file.
+    pub fn path(&self) -> PathBuf {
         self.directory.join(FILE_NAME)
     }
 
-    #[cfg(all(test, feature = "host"))]
-    pub(crate) fn fail_next_write_for_test(&self) {
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
+    pub fn fail_next_write_for_test(&self) {
         FAIL_NEXT_WRITE.with(|path| *path.borrow_mut() = Some(self.path()));
     }
 
-    pub(crate) fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
+    pub fn lock(&self) -> io::Result<crate::instance::OwnedLock> {
         crate::secure_file::prepare_private_directory(&self.directory)?;
         crate::instance::owned_lock(&self.directory.join(LOCK_NAME), libc::LOCK_EX)
     }
@@ -1410,7 +1411,7 @@ impl Store {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn try_load(&self) -> io::Result<Registry> {
+    pub fn try_load(&self) -> io::Result<Registry> {
         let _lock = self.try_lock()?;
         read(&self.path())
     }
@@ -1424,9 +1425,9 @@ impl Store {
     }
 
     #[cfg(feature = "host")]
-    pub(crate) fn try_update_reserved<T>(
+    pub fn try_update_reserved<T>(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         change: impl FnOnce(&mut Registry) -> T,
     ) -> io::Result<(Registry, T)> {
         self.try_update_reserved_then(reservation, change, |_| {})
@@ -1437,7 +1438,7 @@ impl Store {
     #[cfg(feature = "host")]
     pub(crate) fn try_update_reserved_then<T>(
         &self,
-        reservation: &crate::host::AccountReservation,
+        reservation: &impl super::remote::Reservation,
         change: impl FnOnce(&mut Registry) -> T,
         after_write: impl FnOnce(&Registry),
     ) -> io::Result<(Registry, T)> {
@@ -1547,7 +1548,7 @@ fn read(path: &Path) -> io::Result<Registry> {
 
 /// Replaces the file at `path` with `registry`, and says when it was written.
 fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<Written> {
-    #[cfg(all(test, feature = "host"))]
+    #[cfg(all(any(test, feature = "test-support"), feature = "host"))]
     if FAIL_NEXT_WRITE.with(|next| {
         let mut next = next.borrow_mut();
         if next.as_deref() == Some(path) {
@@ -1952,6 +1953,8 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("existing-codex");
         fs::create_dir(&home).unwrap();
+        // The interactive linker supplies the checked, canonical home.
+        let home = home.canonicalize().unwrap();
         let history = home.join("session_index.jsonl");
         fs::write(&history, "saved session").unwrap();
         let store = Store::at(directory.path().join("config"));
@@ -2118,6 +2121,7 @@ mod tests {
         let managed_home = homes.path(Provider::Codex, managed_key);
         fs::create_dir_all(&managed_home).unwrap();
         registry.accounts[0].linked_home = Some(managed_home.clone());
+        let selected = managed_home.canonicalize().unwrap();
         registry.accounts.push(Registered {
             key: managed_key,
             provider: Provider::Codex,
@@ -2132,7 +2136,7 @@ mod tests {
             registry.link(
                 Provider::Codex,
                 Uuid::new_v4(),
-                managed_home,
+                selected,
                 None,
                 Some(&homes),
                 3
@@ -2216,6 +2220,7 @@ mod tests {
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
         let (key, home) = homes.create(Provider::Claude, None).unwrap();
+        let selected = home.canonicalize().unwrap();
         let history = home.join("history.jsonl");
         fs::write(&history, "saved conversation").unwrap();
         fs::File::open(&home)
@@ -2268,7 +2273,7 @@ mod tests {
             registry.link(
                 Provider::Claude,
                 Uuid::new_v4(),
-                home.clone(),
+                selected.clone(),
                 Some(&home),
                 Some(&homes),
                 2
@@ -2280,7 +2285,7 @@ mod tests {
             registry.link(
                 Provider::Claude,
                 Uuid::new_v4(),
-                home,
+                selected,
                 None,
                 Some(&homes),
                 2

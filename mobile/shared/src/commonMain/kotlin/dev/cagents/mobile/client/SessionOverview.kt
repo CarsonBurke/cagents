@@ -24,15 +24,6 @@ sealed interface AttentionItem {
     data class Waiting(val entry: SessionEntry) : AttentionItem {
         override val key get() = "waiting/${entry.session.id}"
     }
-
-    /**
-     * Pull requests awaiting the person's review. The phone can't open them,
-     * and a busy account has hundreds, so they are counted on one card
-     * rather than listed ahead of the sessions.
-     */
-    data class Reviews(val notices: List<Notice>) : AttentionItem {
-        override val key get() = "reviews"
-    }
 }
 
 /**
@@ -66,8 +57,11 @@ data class SessionOverview(
             // Notices arrive newest first. Only those asking something of the
             // person are cards; an outcome is marked on its session's row, and
             // one notice per session stands for the older ones.
-            val (asks, outcomeNotices) = notices.partition { it.kind in ASKS }
-            val (reviews, requests) = asks.partition { it.kind == NoticeKind.ReviewRequested }
+            // Review notices record that a request was seen. The bridge
+            // doesn't know whether the request is still active on GitHub.
+            val (requests, outcomeNotices) = notices
+                .filterNot { it.kind == NoticeKind.ReviewRequested }
+                .partition { it.asks }
             // A request whose session has moved on (answered, or closed)
             // no longer asks anything.
             val asking = requests
@@ -93,9 +87,7 @@ data class SessionOverview(
             val attention = asking.map { group ->
                 val newest = group.first()
                 AttentionItem.FromNotice(newest, newest.session?.let(bySession::get), group.map { it.id })
-            } +
-                waiting.map { AttentionItem.Waiting(it) } +
-                listOfNotNull(reviews.takeIf { it.isNotEmpty() }?.let { AttentionItem.Reviews(it) })
+            } + waiting.map { AttentionItem.Waiting(it) }
 
             val listed = entries.filterNot { it.session.activity == Activity.Waiting && !it.session.exited }
             val (working, rest) = listed.partition {
@@ -110,14 +102,5 @@ data class SessionOverview(
                 outcomes = outcomes,
             )
         }
-
-        /** Notice kinds that ask something of the person, as on the desktop. */
-        private val ASKS = setOf(
-            NoticeKind.Waiting,
-            NoticeKind.ReviewRequested,
-            NoticeKind.MessageReceived,
-            NoticeKind.AutomationPaused,
-            NoticeKind.AutomationBlocked,
-        )
     }
 }

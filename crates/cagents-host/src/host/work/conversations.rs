@@ -1,0 +1,2295 @@
+//! The pull requests each watched conversation worked on or mentioned, and
+//! the worktrees it edited.
+//!
+//! A window watching a conversation's inspector subscribes to it. This
+//! service then reads the provider's own transcript files incrementally,
+//! keeps what they point at, and resolves that against what the Work board
+//! already knows: the conversation's project, its worktrees and branches, and
+//! the pull requests its forge poll found. Only pull requests the board does
+//! not hold are looked up, a few per pass, through the same `gh` budget, and
+//! what was read last is kept while GitHub cannot be reached.
+
+use super::{
+    super::{
+        delivery::{DeliveryQueue, Outbound},
+        state::{ClientId, SharedHost},
+    },
+    Handle, Signal, board, forge,
+    items::Items,
+    now_unix_ms,
+    transcript::{self, Format, Reader},
+};
+use crate::{
+    agent::Provider,
+    github::{GitHubError, GitHubService, polling},
+    github_identity::{GitHubRepoKey, PullRequestKey},
+    model::{ProjectId, TerminalId},
+    pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
+    terminal_ipc::ServerMessage,
+    work::{
+        Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree, DiffStat,
+        PullRequest, TranscriptCoverage,
+    },
+};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::File,
+    io,
+    os::unix::fs::{FileExt as _, MetadataExt as _},
+    path::{Component, Path, PathBuf},
+    sync::{
+        Arc, Mutex, MutexGuard, Weak,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
+
+mod files;
+
+#[cfg(test)]
+mod tests;
+
+/// Coalesce bursts of active output and continue bounded reads.
+const TICK: Duration = Duration::from_secs(2);
+/// Retry file coverage while the directory or watch backend is unavailable.
+const UNWATCHED_TRANSCRIPT: Duration = Duration::from_secs(10);
+/// How long what was read of an unwatched conversation is kept, so coming
+/// back to it, or showing the inspector again, does not read it all again.
+const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
+/// The most of one file read in a pass; a larger backlog continues next pass.
+const READ_PER_PASS: u64 = 8 * 1024 * 1024;
+/// The newest part of a transcript read when it is first watched.
+const FIRST_READ: u64 = 64 * 1024 * 1024;
+/// Lines longer than this, such as an attached image or a huge tool output,
+/// are skipped. They name no pull request worth listing, so skipping one
+/// does not make the list partial.
+const MAX_LINE: usize = 4 * 1024 * 1024;
+/// Distinct references kept per conversation; the oldest mentions go first.
+const REFERENCES: usize = 256;
+/// Distinct edited directories kept per conversation; the least recently
+/// edited go first. Worktrees are resolved from them when a list is built,
+/// so a worktree the board scans later is still found.
+const EDITED_DIRECTORIES: usize = 256;
+/// Subagent transcripts read per conversation, the most recently written
+/// first.
+const SUBAGENTS: usize = 256;
+/// Forge lookups per pass, across every watched conversation.
+const LOOKUPS_PER_PASS: usize = 4;
+/// Edited worktrees diffed in one pass; the rest wait for the next.
+const MEASURES_PER_PASS: usize = 4;
+/// Of the mentions, only the most recent are looked up.
+const MENTIONS_LOOKED_UP: usize = 24;
+const OPEN_FOR: Duration = Duration::from_secs(60);
+/// An open pull request only mentioned shows its state, not its checks or
+/// review, so it is asked about less often.
+const MENTIONED_OPEN_FOR: Duration = Duration::from_secs(10 * 60);
+const FINISHED_FOR: Duration = Duration::from_secs(30 * 60);
+const NOT_A_PULL_REQUEST_FOR: Duration = Duration::from_secs(24 * 60 * 60);
+const BRANCH_MISSING_FOR: Duration = Duration::from_secs(10 * 60);
+const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+#[derive(Default)]
+pub(super) struct Conversations {
+    state: Mutex<State>,
+    /// Only conversations with input queued need their transcript read.
+    inputs_changed: Mutex<BTreeSet<TerminalId>>,
+    /// Inspected conversations whose transcript was looked for and not
+    /// found. Their provider writes it once a turn starts, which no file
+    /// watch sees, so their activity is input. Nothing is locked while
+    /// this is held.
+    unlocated: Mutex<BTreeSet<TerminalId>>,
+    watching: AtomicBool,
+    projection: AtomicU64,
+    pub(super) signal: Signal,
+}
+
+#[derive(Default)]
+struct State {
+    watched: BTreeMap<TerminalId, Watched>,
+    /// What GitHub said about pull requests the board does not list, by key.
+    observed: BTreeMap<PullRequestKeyOrd, Observed>,
+    /// Which pull request heads a branch, by (base repository, branch).
+    branches: BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+    forge_error: Option<String>,
+    /// The line totals of edited worktrees' uncommitted changes, by path,
+    /// with the status they were measured at.
+    measured: BTreeMap<PathBuf, Measured>,
+    /// Lookups that failed in a row, and when the last did; while GitHub
+    /// cannot be reached, lookups back off rather than retry every pass.
+    failures: u32,
+    failed: Option<Instant>,
+}
+
+impl State {
+    fn lookup_retry(&self) -> Option<Instant> {
+        self.failed
+            .map(|failed| failed + backoff(self.failures))
+            .filter(|&due| due > Instant::now())
+    }
+
+    fn succeeded(&mut self) {
+        self.forge_error = None;
+        self.failures = 0;
+        self.failed = None;
+    }
+
+    fn failed(&mut self, error: &GitHubError) {
+        self.forge_error = Some(error.to_string());
+        self.failures = self.failures.saturating_add(1);
+        self.failed = Some(Instant::now());
+    }
+}
+
+/// As the board backs off: 30 s doubling, at most 30 min.
+fn backoff(failures: u32) -> Duration {
+    (Duration::from_secs(30) * 2_u32.saturating_pow(failures.saturating_sub(1).min(6)))
+        .min(FINISHED_FOR)
+}
+
+#[derive(Debug, Clone, Default)]
+struct Observed {
+    pull_request: Option<PullRequest>,
+    /// What it changes and its head's checks, as last read with it.
+    detail: Detail,
+    observed_at_unix_ms: Option<u64>,
+    /// When it merged or closed, when GitHub said.
+    finished_at_unix_ms: Option<u64>,
+    checked: Option<Instant>,
+    /// GitHub says the number is an issue, or there is no such pull request.
+    missing: bool,
+    failures: u32,
+}
+
+impl Observed {
+    fn refresh_at(&self, worked_on: bool) -> Option<Instant> {
+        let checked = self.checked?;
+        let wait =
+            if self.missing {
+                NOT_A_PULL_REQUEST_FOR
+            } else if self.failures > 0 {
+                backoff(self.failures)
+            } else if self.pull_request.as_ref().is_some_and(|pull_request| {
+                pull_request.state != crate::work::PullRequestState::Open
+            }) {
+                FINISHED_FOR
+            } else if worked_on {
+                OPEN_FOR
+            } else {
+                MENTIONED_OPEN_FOR
+            };
+        Some(checked + wait)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BranchLookup {
+    number: Option<u64>,
+    checked: Instant,
+}
+
+struct Watched {
+    watchers: BTreeMap<ClientId, Weak<DeliveryQueue>>,
+    source: Source,
+    facts: Option<(u64, Option<Arc<Facts>>)>,
+    files: BTreeMap<PathBuf, Cursor>,
+    /// How far cagents' own record of the conversation has been read, for a
+    /// conversation whose transcript files are not.
+    items: Items,
+    references: BTreeMap<Reference, Aggregate>,
+    /// Absolute directories files were edited in, with when they last were
+    /// and whether only subagents edited there.
+    edited: BTreeMap<PathBuf, Edit>,
+    sequence: u64,
+    coverage: TranscriptCoverage,
+    revision: u64,
+    sent: Option<ConversationPullRequests>,
+    unwatched_since: Option<Instant>,
+    /// The provider's conversation ID `source` was located for, so finding
+    /// the transcript, a search for Codex, happens once per conversation ID.
+    located_id: Option<String>,
+    /// Searching for a Codex rollout walks its dated directories, so a
+    /// search that found nothing is not repeated before this, unless the
+    /// conversation's input or activity changes first.
+    search_after: Option<Instant>,
+    searches_missed: u32,
+    input: InputRead,
+}
+
+#[derive(Default)]
+struct InputRead {
+    read: Option<Instant>,
+    due: Option<Instant>,
+}
+
+impl InputRead {
+    fn changed(&mut self, now: Instant) {
+        sooner(&mut self.due, self.read.map_or(now, |read| read + TICK));
+    }
+
+    fn complete(&mut self, again: Option<Duration>) {
+        let now = Instant::now();
+        self.read = Some(now);
+        self.due = again.map(|delay| now + delay);
+    }
+}
+
+fn sooner(next: &mut Option<Instant>, at: Instant) {
+    *next = Some(next.map_or(at, |pending| pending.min(at)));
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct NextPass {
+    deadline: Option<Instant>,
+    reset: Option<u64>,
+}
+
+impl NextPass {
+    fn due(&self) -> bool {
+        self.deadline.is_some_and(|at| Instant::now() >= at)
+            || self.reset.is_some_and(super::pause_over)
+    }
+
+    fn wait_for(&self) -> Option<Duration> {
+        self.deadline
+            .map(|at| at.saturating_duration_since(Instant::now()))
+            .into_iter()
+            .chain(self.reset.map(|until| {
+                super::pause_ends(until)
+                    .saturating_duration_since(Instant::now())
+                    .min(super::PAUSED_WAKE)
+            }))
+            .min()
+    }
+}
+
+/// Where a pass found the conversation's transcript.
+enum Location {
+    /// As before, or not looked for this pass.
+    Unchanged,
+    Found(String, Source),
+    /// A search found no transcript for the conversation's ID yet.
+    Missed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Source {
+    /// Not located yet: the conversation may not have reported its ID.
+    Pending,
+    Located(Located),
+    /// No transcript file is read; cagents' own record of the conversation
+    /// is, whatever its provider calls the conversation, from before it
+    /// names it.
+    Recorded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Located {
+    format: Format,
+    directory: PathBuf,
+    transcript: PathBuf,
+    /// Where Claude Code keeps this conversation's subagent transcripts.
+    subagents: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Edit {
+    by_subagent: bool,
+    seen: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct Aggregate {
+    relation: Relation,
+    /// Every signal came from a subagent.
+    by_subagent: bool,
+    seen: u64,
+}
+
+struct Cursor {
+    identity: (u64, u64),
+    offset: u64,
+    partial: Vec<u8>,
+    /// Skipping the rest of a line that started before the first read, or
+    /// that grew longer than a line may be.
+    skipping: bool,
+    reader: Reader,
+    truncated: bool,
+}
+
+impl Watched {
+    fn new() -> Self {
+        Self {
+            watchers: BTreeMap::new(),
+            source: Source::Pending,
+            facts: None,
+            files: BTreeMap::new(),
+            items: Items::default(),
+            references: BTreeMap::new(),
+            edited: BTreeMap::new(),
+            sequence: 0,
+            coverage: TranscriptCoverage::Pending,
+            revision: 0,
+            sent: None,
+            unwatched_since: None,
+            located_id: None,
+            search_after: None,
+            searches_missed: 0,
+            input: InputRead::default(),
+        }
+    }
+
+    /// Records what a read found. A command run on "the current branch" is
+    /// pinned to the branch checked out now, so a later switch does not move
+    /// it to another branch's pull request.
+    fn apply(&mut self, scanned: Scanned, facts: Option<&Facts>) {
+        for mut found in scanned.found {
+            let Some(facts) = facts else {
+                self.record(found);
+                continue;
+            };
+            let Reference::CurrentBranch { directory } = &found.signal.reference else {
+                self.record(found);
+                continue;
+            };
+            let directory = match directory {
+                Some(directory) => normalize(&facts.directory.join(directory)),
+                None => facts.directory.clone(),
+            };
+            if found.signal.relation == Relation::Edited {
+                self.edited_in(directory.clone(), found.by_subagent);
+            }
+            if let Some(branch) = facts
+                .project
+                .as_ref()
+                .and_then(|project| project.worktree(&directory)?.branch.clone())
+            {
+                found.signal.reference = Reference::Branch {
+                    repository: None,
+                    name: branch,
+                };
+            }
+            self.record(found);
+        }
+        self.coverage = scanned.coverage;
+    }
+
+    /// Pins each edit made on a branch to the pull request the branch heads
+    /// while the edit is still that pull request's work, so the edit stays
+    /// with it after it merges and its worktree is removed or moves on. An
+    /// edit not yet pinned is judged by the branch as it is now.
+    fn pin_edits(
+        &mut self,
+        facts: Option<&Facts>,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+        branches: &BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+    ) {
+        let Some((facts, project)) = facts.and_then(|facts| Some((facts, facts.project.as_ref()?)))
+        else {
+            return;
+        };
+        let pinned = self
+            .references
+            .iter()
+            .filter_map(|(reference, aggregate)| {
+                let Reference::Branch {
+                    repository: None,
+                    name,
+                } = reference
+                else {
+                    return None;
+                };
+                if aggregate.relation != Relation::Edited {
+                    return None;
+                }
+                let Resolved::Key(key) = resolve(reference, facts, branches) else {
+                    return None;
+                };
+                (project.edits_belong_to(&key, name, observed) == Some(true))
+                    .then(|| (reference.clone(), key))
+            })
+            .collect::<Vec<_>>();
+        for (reference, key) in pinned {
+            let Some(edit) = self.references.remove(&reference) else {
+                continue;
+            };
+            let entry = self
+                .references
+                .entry(Reference::PullRequest(key))
+                .or_insert(edit);
+            entry.relation = entry.relation.min(edit.relation);
+            entry.by_subagent &= edit.by_subagent;
+            entry.seen = entry.seen.max(edit.seen);
+        }
+    }
+
+    fn edited_in(&mut self, directory: PathBuf, by_subagent: bool) {
+        self.sequence += 1;
+        let seen = self.sequence;
+        let entry = self
+            .edited
+            .entry(directory)
+            .or_insert(Edit { by_subagent, seen });
+        entry.by_subagent &= by_subagent;
+        entry.seen = seen;
+        if self.edited.len() > EDITED_DIRECTORIES {
+            let oldest = self
+                .edited
+                .iter()
+                .min_by_key(|(_, edit)| edit.seen)
+                .map(|(directory, _)| directory.clone());
+            if let Some(oldest) = oldest {
+                self.edited.remove(&oldest);
+            }
+        }
+    }
+
+    fn record(&mut self, found: transcript::Found) {
+        self.sequence += 1;
+        let sequence = self.sequence;
+        let entry = self
+            .references
+            .entry(found.signal.reference)
+            .or_insert(Aggregate {
+                relation: found.signal.relation,
+                by_subagent: found.by_subagent,
+                seen: sequence,
+            });
+        entry.relation = entry.relation.min(found.signal.relation);
+        entry.by_subagent &= found.by_subagent;
+        entry.seen = sequence;
+        if self.references.len() > REFERENCES {
+            // The oldest mention goes, then the oldest of anything.
+            let oldest = self
+                .references
+                .iter()
+                .min_by_key(|(_, aggregate)| (aggregate.relation.worked_on(), aggregate.seen))
+                .map(|(reference, _)| reference.clone());
+            if let Some(oldest) = oldest {
+                self.references.remove(&oldest);
+            }
+        }
+    }
+}
+
+/// What resolving a conversation's references needs from the board, copied
+/// out so neither lock is held while reading files or asking GitHub.
+struct Facts {
+    directory: PathBuf,
+    project: Option<ProjectFacts>,
+}
+
+#[derive(Clone)]
+struct ProjectFacts {
+    id: ProjectId,
+    snapshot: Option<Arc<forge::Snapshot>>,
+    local: Option<Arc<super::scan::Local>>,
+    forge_error: Option<String>,
+    /// When the board last listed the project's pull requests.
+    synced_at_unix_ms: Option<u64>,
+}
+
+impl ProjectFacts {
+    fn of(tracked: &super::Tracked) -> Self {
+        Self {
+            id: tracked.id,
+            snapshot: tracked.snapshot.clone(),
+            local: tracked.local.clone(),
+            forge_error: match &tracked.forge {
+                crate::work::Forge::Unavailable { reason } => Some(reason.clone()),
+                crate::work::Forge::Synced { error, .. } => error.clone(),
+                crate::work::Forge::Pending | crate::work::Forge::NotGitHub => None,
+            },
+            synced_at_unix_ms: match &tracked.forge {
+                crate::work::Forge::Synced { at_unix_ms, .. } => Some(*at_unix_ms),
+                _ => None,
+            },
+        }
+    }
+
+    fn repository(&self) -> Option<&GitHubRepoKey> {
+        self.snapshot
+            .as_deref()
+            .map(|snapshot| &snapshot.repository)
+    }
+
+    /// Whether one of the project's worktrees has `branch` checked out.
+    fn has_branch(&self, branch: &str) -> bool {
+        self.local.as_deref().is_some_and(|local| {
+            local
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.branch.as_deref() == Some(branch))
+        })
+    }
+
+    /// Whether edits made on `branch` now are work on its pull request
+    /// `key`: it is open, or a worktree still has `branch` at its head
+    /// commit, or at one that is the pull request's own work though GitHub's
+    /// head has since moved past it. A branch name reused after its pull
+    /// request merged or closed is new work, not an edit of that pull
+    /// request. `None` until GitHub has described the pull request.
+    fn edits_belong_to(
+        &self,
+        key: &PullRequestKeyOrd,
+        branch: &str,
+        observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+    ) -> Option<bool> {
+        let (open, head, finished_at) = match self.listed(key) {
+            Some(found) => (
+                found.state.0 == "OPEN",
+                found.head_ref_oid.as_str(),
+                finished_at(found),
+            ),
+            None => {
+                let observation = observed.get(key)?;
+                let found = observation.pull_request.as_ref()?;
+                (
+                    found.state == crate::work::PullRequestState::Open,
+                    found.head_oid.as_str(),
+                    observation.finished_at_unix_ms,
+                )
+            }
+        };
+        Some(
+            open || self.local.as_deref().is_some_and(|local| {
+                local.worktrees.iter().any(|worktree| {
+                    worktree.branch.as_deref() == Some(branch)
+                        && worktree.head.as_ref().is_some_and(|found| {
+                            found.oid == head
+                                || Self::left_behind(local, worktree, found, head, finished_at)
+                        })
+                })
+            }),
+        )
+    }
+
+    /// Whether `worktree`, at `found` on the branch of a finished pull
+    /// request whose head is `head`, holds that pull request's work which
+    /// GitHub's head has moved past: the default branch merged into it there
+    /// before it landed, or a rebase pushed from elsewhere. Its commits must
+    /// be its own, beyond the default branch, so a name made again from the
+    /// default branch is new work; and either the pull request's head
+    /// contains them, or they were all made before it finished, which no
+    /// commit on a reused name can be.
+    fn left_behind(
+        local: &super::scan::Local,
+        worktree: &super::scan::Worktree,
+        found: &crate::work::Head,
+        head: &str,
+        finished_at_unix_ms: Option<u64>,
+    ) -> bool {
+        worktree
+            .comparison
+            .as_ref()
+            .is_some_and(|comparison| comparison.ahead > 0)
+            && (local
+                .ancestry
+                .get(&(found.oid.clone(), head.to_owned()))
+                .copied()
+                .unwrap_or(false)
+                || found
+                    .committed_at_unix_ms
+                    .zip(finished_at_unix_ms)
+                    .is_some_and(|(committed, finished)| committed < finished))
+    }
+
+    /// The worktree containing `directory`, the deepest when they nest.
+    fn worktree(&self, directory: &Path) -> Option<&super::scan::Worktree> {
+        self.local
+            .as_deref()?
+            .worktrees
+            .iter()
+            .filter(|worktree| directory.starts_with(&worktree.path))
+            .max_by_key(|worktree| worktree.path.components().count())
+    }
+
+    fn listed(&self, key: &PullRequestKeyOrd) -> Option<&crate::github::PullRequest> {
+        let snapshot = self.snapshot.as_deref()?;
+        if RepoKeyOrd::from(&snapshot.repository) != key.repository {
+            return None;
+        }
+        snapshot
+            .pull_requests
+            .iter()
+            .chain(snapshot.others.values())
+            .find(|pull_request| pull_request.number == key.number)
+    }
+}
+
+pub(super) fn checkout_facts_changed(
+    before: Option<&super::scan::Local>,
+    after: &super::scan::Local,
+) -> bool {
+    before.is_none_or(|before| {
+        before.worktrees.len() != after.worktrees.len()
+            || before
+                .worktrees
+                .iter()
+                .zip(&after.worktrees)
+                .any(|(before, after)| {
+                    before.path != after.path
+                        || before.branch != after.branch
+                        || before.head != after.head
+                        || before.dirty != after.dirty
+                        // Whether a merged pull request's branch was left
+                        // behind reads these.
+                        || before.comparison.as_ref().map(|c| c.ahead)
+                            != after.comparison.as_ref().map(|c| c.ahead)
+                })
+            || before.ancestry != after.ancestry
+    })
+}
+
+/// A reference turned into a pull request, or what must be asked to do so.
+enum Resolved {
+    Key(PullRequestKeyOrd),
+    /// The pull request heading `branch` is not known yet.
+    Branch {
+        base: GitHubRepoKey,
+        head: GitHubRepoKey,
+        branch: String,
+    },
+    Deferred(Instant),
+    Nothing,
+}
+
+impl Handle {
+    /// Tells the conversation loop about a chat the daemon now hosts. One
+    /// whose record is read is followed from the next pass rather than after
+    /// the loop's idle wait.
+    pub(in crate::host) fn chat_added(&self, conversation: TerminalId, provider: Provider) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
+        if recorded_provider(provider) {
+            self.input_changed(conversation);
+        } else {
+            self.conversation_identity_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn conversation_identity_changed(&self, conversation: TerminalId) {
+        if self.0.conversations.watching.load(Ordering::Acquire) {
+            self.input_changed(conversation);
+        }
+    }
+
+    /// A conversation started or settled a turn. One whose inspector is
+    /// still looking for its transcript looks again: Claude writes it with
+    /// the first prompt, and Codex after a resume.
+    pub(in crate::host) fn activity_changed(&self, conversation: TerminalId) {
+        let unlocated = self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(&conversation);
+        if unlocated {
+            self.input_changed(conversation);
+        }
+    }
+
+    pub(in crate::host) fn input_changed(&self, conversation: TerminalId) {
+        let conversations = &self.0.conversations;
+        if conversations
+            .inputs_changed
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(conversation)
+        {
+            conversations.signal.notify();
+        }
+    }
+
+    pub(super) fn projection_changed(&self) {
+        self.0
+            .conversations
+            .projection
+            .fetch_add(1, Ordering::Release);
+        if self.0.conversations.watching.load(Ordering::Acquire) {
+            self.0.conversations.signal.notify();
+        }
+    }
+
+    fn conversations(&self) -> MutexGuard<'_, State> {
+        self.0
+            .conversations
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Subscribes `client` to one conversation's pull requests and returns
+    /// them as of the revision it starts from.
+    pub(in crate::host) fn watch_conversation(
+        &self,
+        host: &SharedHost,
+        client: ClientId,
+        conversation: TerminalId,
+        delivery: Weak<DeliveryQueue>,
+    ) -> Result<(u64, ConversationPullRequests), String> {
+        if !host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .contains_key(&conversation)
+        {
+            return Err("No such conversation".into());
+        }
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        let facts = self.facts(host, conversation, true).map(Arc::new);
+        let mut state = self.conversations();
+        // A connection watches one conversation at a time.
+        for watched in state.watched.values_mut() {
+            watched.watchers.remove(&client);
+        }
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
+        let watched = watched.entry(conversation).or_insert_with(Watched::new);
+        watched.watchers.insert(client, delivery);
+        watched.unwatched_since = None;
+        watched.pin_edits(facts.as_deref(), observed, branches);
+        let mut list = assemble(
+            watched,
+            facts.as_deref(),
+            observed,
+            branches,
+            forge_error.clone(),
+        );
+        with_measured(&mut list, measured);
+        let mut comparable = list.clone();
+        comparable.generated_at_unix_ms = 0;
+        if watched.sent.as_ref() != Some(&comparable) {
+            watched.sent = Some(comparable);
+            watched.revision += 1;
+        }
+        let revision = watched.revision;
+        watched.facts = Some((projection, facts));
+        self.0.conversations.watching.store(true, Ordering::Release);
+        drop(state);
+        self.input_changed(conversation);
+        Ok((revision, list))
+    }
+
+    pub(in crate::host) fn unwatch_conversation(&self, client: ClientId) {
+        let mut state = self.conversations();
+        for watched in state.watched.values_mut() {
+            if watched.watchers.remove(&client).is_some() {
+                self.0.conversations.signal.notify();
+                break;
+            }
+        }
+    }
+
+    pub(super) fn conversation_loop(&self) {
+        let owner = Arc::downgrade(&self.0);
+        let mut files = files::Watches::new(move |id| {
+            if let Some(inner) = owner.upgrade() {
+                Handle(inner).input_changed(id);
+            }
+        });
+        let signal = &self.0.conversations.signal;
+        while let Some(observed) = signal.observe() {
+            let Some(host) = self.0.host.upgrade() else {
+                break;
+            };
+            let next = super::super::service::attempt("Conversation pull requests", || {
+                Ok(self.conversation_pass(&host, &mut files))
+            })
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "conversation pull requests are temporarily unavailable");
+                NextPass {
+                    deadline: Some(Instant::now() + TICK),
+                    reset: None,
+                }
+            });
+            drop(host);
+            // A monotonic wait sleeps through suspend. Check the wall clock
+            // during a quota pause without running another conversation pass.
+            while signal.observe() == Some(observed) && !next.due() {
+                signal.wait_for_change(observed, next.wait_for());
+            }
+        }
+    }
+
+    /// Reads changed records and watched transcripts, then publishes any
+    /// changed lists. Only watches, retention and incomplete record reads
+    /// can need another pass without input.
+    fn conversation_pass(&self, host: &SharedHost, files: &mut files::Watches) -> NextPass {
+        let dirty = std::mem::take(
+            &mut *self
+                .0
+                .conversations
+                .inputs_changed
+                .lock()
+                .unwrap_or_else(|p| p.into_inner()),
+        );
+        // A recorded conversation is followed from startup even when no
+        // window shows it, but its SQLite store is read only after a change.
+        let followed = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .iter()
+            .filter(|(_, record)| recorded_provider(record.session.launch.provider))
+            .map(|(conversation, _)| *conversation)
+            .collect::<BTreeSet<_>>();
+        let (conversations, read, was_watching) = {
+            let mut state = self.conversations();
+            state.watched.retain(|conversation, watched| {
+                watched
+                    .watchers
+                    .retain(|_, delivery| delivery.strong_count() > 0);
+                if watched.watchers.is_empty() {
+                    let since = *watched.unwatched_since.get_or_insert_with(Instant::now);
+                    followed.contains(conversation) || since.elapsed() < KEPT_UNWATCHED
+                } else {
+                    watched.unwatched_since = None;
+                    true
+                }
+            });
+            for conversation in &followed {
+                state
+                    .watched
+                    .entry(*conversation)
+                    .or_insert_with(Watched::new);
+            }
+            let conversations = state
+                .watched
+                .iter()
+                .filter(|(_, watched)| !watched.watchers.is_empty())
+                .map(|(conversation, _)| *conversation)
+                .collect::<Vec<_>>();
+            let was_watching = self
+                .0
+                .conversations
+                .watching
+                .swap(!conversations.is_empty(), Ordering::AcqRel);
+            let now = Instant::now();
+            let read = state
+                .watched
+                .iter_mut()
+                .filter_map(|(id, watched)| {
+                    let followed = followed.contains(id);
+                    if !followed && watched.watchers.is_empty() {
+                        return None;
+                    }
+                    if dirty.contains(id) {
+                        watched.input.changed(now);
+                        // What changed may be what a missed search lacked,
+                        // and may still be on its way: Claude writes the
+                        // transcript after taking the turn's prompt. Look
+                        // now, and soon after.
+                        watched.search_after = None;
+                        watched.searches_missed = 0;
+                    }
+                    let due = |at: Option<Instant>| at.is_some_and(|at| at <= now);
+                    (due(watched.input.due)
+                        || due(watched.search_after)
+                        || (followed && watched.source == Source::Pending))
+                        .then_some(*id)
+                })
+                .collect::<Vec<_>>();
+            (conversations, read, was_watching)
+        };
+        files.retain(|id| conversations.contains(&id) && !followed.contains(&id));
+        let mut facts = conversations
+            .iter()
+            .map(|id| (*id, self.watched_facts(host, *id)))
+            .collect::<BTreeMap<_, _>>();
+        if was_watching || !conversations.is_empty() {
+            // A live inspector keeps only its own project at the watched
+            // forge cadence, even when its cached facts do not need reading.
+            let projects = facts
+                .values()
+                .filter_map(|facts| Some(facts.as_ref()?.project.as_ref()?.id))
+                .collect::<BTreeSet<_>>();
+            for tracked in self.shared().projects.values_mut() {
+                tracked.conversation_watched = projects.contains(&tracked.id);
+            }
+        }
+        for conversation in &read {
+            let watched = conversations.contains(conversation);
+            let (known, search_due) = self
+                .conversations()
+                .watched
+                .get(conversation)
+                .map(|watched| {
+                    (
+                        watched.located_id.clone(),
+                        watched
+                            .search_after
+                            .is_none_or(|after| Instant::now() >= after),
+                    )
+                })
+                .unwrap_or_default();
+            let located = locate(host, *conversation, known.as_deref(), search_due);
+            let (source, mut cursors, mut items) = {
+                let mut state = self.conversations();
+                let Some(watched) = state.watched.get_mut(conversation) else {
+                    continue;
+                };
+                if search_due {
+                    watched.search_after = None;
+                }
+                if matches!(located, Location::Missed) {
+                    watched.searches_missed = watched.searches_missed.saturating_add(1);
+                    watched.search_after =
+                        Some(Instant::now() + search_backoff(watched.searches_missed));
+                    // So activity during the rest of this pass is not lost.
+                    if !watched.watchers.is_empty() {
+                        self.0
+                            .conversations
+                            .unlocated
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .insert(*conversation);
+                    }
+                }
+                if let Location::Found(id, source) = located {
+                    watched.searches_missed = 0;
+                    watched.search_after = None;
+                    watched.located_id = Some(id);
+                    if watched.source != source {
+                        // A new conversation ID, after `/clear` or a resume,
+                        // is a new transcript.
+                        watched.source = source;
+                        watched.files.clear();
+                        watched.items = Items::default();
+                        watched.references.clear();
+                        watched.edited.clear();
+                    }
+                }
+                (
+                    watched.source.clone(),
+                    std::mem::take(&mut watched.files),
+                    std::mem::take(&mut watched.items),
+                )
+            };
+            // Watching and unwatching take the same lock, so the files and
+            // the record are read without it. Only this thread moves the
+            // cursors.
+            let (scanned, again) = match &source {
+                Source::Recorded => {
+                    let (scanned, read) = recorded(host, *conversation, &mut items);
+                    let retry = match read {
+                        RecordRead::Complete => None,
+                        RecordRead::More => Some(TICK),
+                        // Followed conversations no one shows wait for their
+                        // next write rather than retrying unattended.
+                        RecordRead::Failed => watched.then_some(UNWATCHED_TRANSCRIPT),
+                    };
+                    (scanned, retry)
+                }
+                Source::Located(located) => {
+                    let covered = files.cover(*conversation, located);
+                    let scanned = scan(&source, &mut cursors);
+                    let retry = match &scanned.coverage {
+                        TranscriptCoverage::Pending => Some(TICK),
+                        _ if !covered => Some(UNWATCHED_TRANSCRIPT),
+                        _ => None,
+                    };
+                    (scanned, retry)
+                }
+                Source::Pending => (scan(&source, &mut cursors), None),
+            };
+            // Work on "the current branch" is pinned to the branch checked
+            // out as it is read.
+            if !watched
+                && scanned
+                    .found
+                    .iter()
+                    .any(|found| matches!(found.signal.reference, Reference::CurrentBranch { .. }))
+            {
+                facts.insert(
+                    *conversation,
+                    self.facts(host, *conversation, false).map(Arc::new),
+                );
+            }
+            let mut state = self.conversations();
+            if let Some(watched) = state.watched.get_mut(conversation)
+                && watched.source == source
+            {
+                watched.files = cursors;
+                watched.items = items;
+                watched.input.complete(again);
+                watched.apply(scanned, facts.get(conversation).and_then(Option::as_deref));
+            }
+        }
+        let unlocated = self
+            .conversations()
+            .watched
+            .iter()
+            .filter(|(_, watched)| !watched.watchers.is_empty() && watched.searches_missed > 0)
+            .map(|(conversation, _)| *conversation)
+            .collect();
+        *self
+            .0
+            .conversations
+            .unlocated
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = unlocated;
+        let deadline = self.conversation_deadline(&followed);
+        if conversations.is_empty() {
+            return NextPass {
+                deadline,
+                reset: None,
+            };
+        }
+        let mut next = self.look_up(&conversations, &facts);
+        let more_diffs = self.measure(&conversations, &facts);
+        let proof = Arc::new(
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .proof()
+                .clone(),
+        );
+        let mut state = self.conversations();
+        let State {
+            watched,
+            observed,
+            branches,
+            measured,
+            forge_error,
+            ..
+        } = &mut *state;
+        for conversation in conversations {
+            let Some(watched) = watched.get_mut(&conversation) else {
+                continue;
+            };
+            let facts = facts.get(&conversation).and_then(Option::as_deref);
+            watched.pin_edits(facts, observed, branches);
+            let mut list = assemble(watched, facts, observed, branches, forge_error.clone());
+            with_measured(&mut list, measured);
+            let mut comparable = list.clone();
+            comparable.generated_at_unix_ms = 0;
+            if watched.sent.as_ref() == Some(&comparable) {
+                continue;
+            }
+            watched.sent = Some(comparable);
+            watched.revision += 1;
+            let revision = watched.revision;
+            watched.watchers.retain(|_, delivery| {
+                let Some(delivery) = delivery.upgrade() else {
+                    return false;
+                };
+                delivery
+                    .push(Outbound::broadcast(
+                        &proof,
+                        ServerMessage::ConversationPullRequests {
+                            conversation,
+                            revision,
+                            pull_requests: Box::new(list.clone()),
+                        },
+                    ))
+                    .is_ok()
+            });
+            if watched.watchers.is_empty() {
+                self.0.conversations.signal.notify();
+            }
+        }
+        if let Some(deadline) = deadline {
+            sooner(&mut next.deadline, deadline);
+        }
+        if more_diffs {
+            sooner(&mut next.deadline, Instant::now() + TICK);
+        }
+        next
+    }
+
+    fn conversation_deadline(&self, followed: &BTreeSet<TerminalId>) -> Option<Instant> {
+        self.conversations()
+            .watched
+            .iter()
+            .filter_map(|(id, watched)| {
+                if !followed.contains(id) && watched.watchers.is_empty() {
+                    watched.unwatched_since.map(|since| since + KEPT_UNWATCHED)
+                } else {
+                    watched
+                        .search_after
+                        .into_iter()
+                        .chain(watched.input.due)
+                        .min()
+                }
+            })
+            .min()
+    }
+
+    /// Project placement reads the workspace registry and Git metadata.
+    /// A transcript tick can reuse that answer until Work publishes facts.
+    fn watched_facts(&self, host: &SharedHost, conversation: TerminalId) -> Option<Arc<Facts>> {
+        let projection = self.0.conversations.projection.load(Ordering::Acquire);
+        if let Some((seen, facts)) = self
+            .conversations()
+            .watched
+            .get(&conversation)
+            .and_then(|watched| watched.facts.as_ref())
+            && *seen == projection
+        {
+            return facts.clone();
+        }
+        let facts = self.facts(host, conversation, true).map(Arc::new);
+        if let Some(watched) = self.conversations().watched.get_mut(&conversation) {
+            watched.facts = Some((projection, facts.clone()));
+        }
+        facts
+    }
+
+    /// The board's facts for a conversation's directory. Watching a
+    /// conversation counts as reading its own project, so `read` tracks it
+    /// and keeps that project's forge poll at the watched cadence; other
+    /// projects and the board's tickets are not read. A conversation nobody
+    /// shows is not read that way: it takes what the board already knows of
+    /// its project, if the board tracks it, and adds no forge poll.
+    fn facts(&self, host: &SharedHost, conversation: TerminalId, read: bool) -> Option<Facts> {
+        let directory = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .get(&conversation)?
+            .session
+            .launch
+            .recipe
+            .working_directory
+            .clone();
+        let directory = std::fs::canonicalize(&directory).unwrap_or(directory);
+        let selected = self
+            .resolve(host, &crate::work::Scope::Project(directory.clone()))
+            .ok();
+        let mut shared = self.shared();
+        let watching = shared.watching;
+        let project = selected.and_then(|selected| {
+            let (repository, name) = selected.into_iter().next()?;
+            if !read {
+                return shared.projects.get(&repository).map(ProjectFacts::of);
+            }
+            let new = !shared.projects.contains_key(&repository);
+            let tracked = shared.track(&repository, &name);
+            if tracked.read(watching) {
+                self.0.forge.notify();
+            }
+            let facts = ProjectFacts::of(tracked);
+            if new {
+                self.0.scanner.notify();
+            }
+            Some(facts)
+        });
+        Some(Facts { directory, project })
+    }
+
+    /// Measures the uncommitted lines of each worktree a watched
+    /// conversation edited whose status changed since it was last measured.
+    /// The board's scan, which its file watcher drives, says when one did, so
+    /// an unchanged worktree is never diffed again.
+    fn measure(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) -> bool {
+        let due = {
+            let mut state = self.conversations();
+            let mut wanted = BTreeMap::new();
+            for conversation in conversations {
+                let (Some(watched), Some(Some(facts))) =
+                    (state.watched.get(conversation), facts.get(conversation))
+                else {
+                    continue;
+                };
+                let Some(project) = &facts.project else {
+                    continue;
+                };
+                for (worktree, _) in edited(watched, project) {
+                    wanted.insert(worktree.path.clone(), Fingerprint::of(worktree));
+                }
+            }
+            state.measured.retain(|path, _| wanted.contains_key(path));
+            wanted
+                .into_iter()
+                .filter(|(path, fingerprint)| {
+                    state
+                        .measured
+                        .get(path)
+                        .is_none_or(|measured| measured.fingerprint != *fingerprint)
+                })
+                .collect::<Vec<_>>()
+        };
+        let more = due.len() > MEASURES_PER_PASS;
+        let git = crate::repository::RepositoryService::system("git");
+        for (path, fingerprint) in due.into_iter().take(MEASURES_PER_PASS) {
+            let diff = match &fingerprint.dirty {
+                // Until its status is read there is nothing to say.
+                None => None,
+                Some(dirty) if dirty.paths == 0 => Some(DiffStat::default()),
+                Some(_) => git
+                    .uncommitted_line_totals(&path, &self.0.cancellation)
+                    .ok()
+                    .map(|(additions, deletions)| DiffStat {
+                        additions,
+                        deletions,
+                    }),
+            };
+            self.conversations()
+                .measured
+                .insert(path, Measured { fingerprint, diff });
+        }
+        more
+    }
+
+    /// Asks GitHub about the few pull requests and branches most worth it.
+    fn look_up(
+        &self,
+        conversations: &[TerminalId],
+        facts: &BTreeMap<TerminalId, Option<Arc<Facts>>>,
+    ) -> NextPass {
+        let mut cached_deadline = None;
+        // In rank order across conversations, so the budget goes to what
+        // they worked on before what they mentioned.
+        let lookups = {
+            let state = self.conversations();
+            if let Some(due) = state.lookup_retry() {
+                return NextPass {
+                    deadline: Some(due),
+                    reset: None,
+                };
+            }
+            let now = Instant::now();
+            let mut lookups: Vec<(Relation, Lookup)> = Vec::new();
+            for conversation in conversations {
+                let (Some(watched), Some(Some(facts))) =
+                    (state.watched.get(conversation), facts.get(conversation))
+                else {
+                    continue;
+                };
+                let mut mentions = 0;
+                for (reference, aggregate) in ranked(watched) {
+                    let worked_on = aggregate.relation.worked_on();
+                    if !worked_on {
+                        mentions += 1;
+                        if mentions > MENTIONS_LOOKED_UP {
+                            break;
+                        }
+                    }
+                    let lookup = match resolve(reference, facts, &state.branches) {
+                        Resolved::Key(key) => {
+                            let listed = facts
+                                .project
+                                .as_ref()
+                                .is_some_and(|project| project.listed(&key).is_some());
+                            if listed {
+                                continue;
+                            }
+                            if let Some(due) = state
+                                .observed
+                                .get(&key)
+                                .and_then(|read| read.refresh_at(worked_on))
+                                .filter(|&due| due > now)
+                            {
+                                sooner(&mut cached_deadline, due);
+                                continue;
+                            }
+                            Lookup::PullRequest(key)
+                        }
+                        // A name merely checked out may be a path or a branch
+                        // never pushed; GitHub is asked about it only while a
+                        // worktree has it.
+                        Resolved::Branch { branch, .. }
+                            if aggregate.relation == Relation::CheckedOut
+                                && matches!(reference, Reference::Branch { .. })
+                                && !facts
+                                    .project
+                                    .as_ref()
+                                    .is_some_and(|project| project.has_branch(&branch)) =>
+                        {
+                            continue;
+                        }
+                        Resolved::Branch { base, head, branch } => Lookup::Branch {
+                            base: RepoKeyOrd::from(&base),
+                            head: RepoKeyOrd::from(&head),
+                            branch,
+                        },
+                        Resolved::Deferred(due) => {
+                            sooner(&mut cached_deadline, due);
+                            continue;
+                        }
+                        Resolved::Nothing => continue,
+                    };
+                    match lookups.iter_mut().find(|(_, known)| *known == lookup) {
+                        Some((relation, _)) => *relation = (*relation).min(aggregate.relation),
+                        None => lookups.push((aggregate.relation, lookup)),
+                    }
+                }
+            }
+            lookups.sort_by_key(|(relation, _)| *relation);
+            lookups
+        };
+        let mut next = self.run_lookups(&GitHubService::system("gh"), lookups);
+        if let Some(due) = cached_deadline {
+            sooner(&mut next.deadline, due);
+        }
+        next
+    }
+
+    fn run_lookups<E: crate::repository::ProcessExecutor>(
+        &self,
+        gh: &GitHubService<E>,
+        lookups: impl IntoIterator<Item = (Relation, Lookup)>,
+    ) -> NextPass {
+        let cancellation = &self.0.cancellation;
+        let mut checked_hosts = BTreeSet::new();
+        let mut limited = BTreeMap::new();
+        let mut reads = 0;
+        let mut next = NextPass::default();
+        for (relation, lookup) in lookups {
+            let repository = lookup.repository();
+            let authority = repository.authority();
+            // A transport worker binds the credential context. Use its
+            // published budget here without reading the credentials for a
+            // request that cannot run.
+            if checked_hosts.insert(authority.clone())
+                && let Some(limit) = polling::rate_limit(&authority)
+            {
+                limited.insert(authority.clone(), limit);
+            }
+            if limited.contains_key(&authority) {
+                continue;
+            }
+            if reads == LOOKUPS_PER_PASS {
+                sooner(&mut next.deadline, Instant::now() + TICK);
+                continue;
+            }
+
+            let result = match &lookup {
+                Lookup::Branch { head, branch, .. } => {
+                    gh.resolve_branch(&repository, &head.into(), branch, None, cancellation)
+                }
+                Lookup::PullRequest(key) => gh
+                    .view_with_timeout(&key.into(), cancellation, LOOKUP_TIMEOUT)
+                    .map(Some),
+            };
+            reads += 1;
+            // A fresh rate limit answers the lookup without invalidating
+            // existing observations or holding up other hosts. A reset too
+            // close to trust uses the same outage backoff as the board.
+            if let Err(error) = &result
+                && let Some(limit) = error.rate_limit()
+                && super::rate_limit_pause(limit.retry_at).is_some()
+            {
+                self.conversations().succeeded();
+                limited.insert(authority, limit);
+            } else {
+                let mut state = self.conversations();
+                let found = match result {
+                    Ok(found) => {
+                        state.succeeded();
+                        found
+                    }
+                    Err(error) if answered(&error) => None,
+                    Err(error) => {
+                        if let Lookup::PullRequest(key) = lookup {
+                            let entry = state.observed.entry(key).or_default();
+                            entry.checked = Some(Instant::now());
+                            entry.failures = entry.failures.saturating_add(1);
+                        }
+                        state.failed(&error);
+                        next.deadline = state.lookup_retry();
+                        return next;
+                    }
+                };
+                match lookup {
+                    Lookup::Branch { base, branch, .. } => {
+                        if let Some(found) = &found
+                            && let Ok(key) = PullRequestKey::new(repository, found.number)
+                        {
+                            let read = observed_now(found);
+                            if let Some(due) = read.refresh_at(relation.worked_on()) {
+                                sooner(&mut next.deadline, due);
+                            }
+                            state.observed.insert((&key).into(), read);
+                        }
+                        let checked = Instant::now();
+                        if found.is_none() {
+                            sooner(&mut next.deadline, checked + BRANCH_MISSING_FOR);
+                        }
+                        state.branches.insert(
+                            (base, branch),
+                            BranchLookup {
+                                number: found.map(|found| found.number),
+                                checked,
+                            },
+                        );
+                    }
+                    Lookup::PullRequest(key) => {
+                        let entry = state.observed.entry(key).or_default();
+                        if let Some(found) = found {
+                            *entry = observed_now(&found);
+                        } else {
+                            entry.checked = Some(Instant::now());
+                            entry.missing = true;
+                            entry.failures = 0;
+                        }
+                        if let Some(due) = entry.refresh_at(relation.worked_on()) {
+                            sooner(&mut next.deadline, due);
+                        }
+                    }
+                }
+            }
+        }
+        let limit = limited.values().min_by_key(|limit| limit.retry_at);
+        next.reset = limit.map(|limit| {
+            // The shared budget can already be ending. Wait for it when it
+            // reports a near reset before admission; only a new refusal at
+            // that time demonstrates clock skew.
+            super::rate_limit_pause(limit.retry_at)
+                .unwrap_or_else(|| limit.retry_at.saturating_add(1))
+        });
+        self.conversations().forge_error = limit.map(ToString::to_string);
+        next
+    }
+}
+
+/// A question for GitHub.
+#[derive(PartialEq, Eq)]
+enum Lookup {
+    PullRequest(PullRequestKeyOrd),
+    /// Which pull request `head`'s `branch` opens against `base`.
+    Branch {
+        base: RepoKeyOrd,
+        head: RepoKeyOrd,
+        branch: String,
+    },
+}
+
+impl Lookup {
+    fn repository(&self) -> GitHubRepoKey {
+        match self {
+            Self::PullRequest(key) => (&key.repository).into(),
+            Self::Branch { base, .. } => base.into(),
+        }
+    }
+}
+
+/// What a pull request's row shows beyond its state: the lines it changes
+/// and its head's checks.
+#[derive(Debug, Clone, Default)]
+struct Detail {
+    diff: Option<DiffStat>,
+    checks: Vec<Check>,
+}
+
+impl Detail {
+    fn of(found: &crate::github::PullRequest) -> Self {
+        let diff = found
+            .additions
+            .zip(found.deletions)
+            .map(|(additions, deletions)| DiffStat {
+                additions,
+                deletions,
+            });
+        let mut checks = found
+            .check_summaries()
+            .into_iter()
+            .filter_map(|check| {
+                let state = check.work_state()?;
+                Some(Check {
+                    name: check.name,
+                    workflow: check.workflow,
+                    state,
+                    url: check.link.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        checks.sort_by(|a, b| {
+            a.state
+                .cmp(&b.state)
+                .then_with(|| a.workflow.cmp(&b.workflow))
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        Self { diff, checks }
+    }
+}
+
+fn observed_now(found: &crate::github::PullRequest) -> Observed {
+    Observed {
+        pull_request: Some(board::convert(found, false)),
+        detail: Detail::of(found),
+        observed_at_unix_ms: Some(now_unix_ms()),
+        finished_at_unix_ms: finished_at(found),
+        checked: Some(Instant::now()),
+        missing: false,
+        failures: 0,
+    }
+}
+
+/// When `found` merged or, not merged, closed.
+fn finished_at(found: &crate::github::PullRequest) -> Option<u64> {
+    let at = found
+        .merged_at
+        .as_deref()
+        .or(found.closed_at.as_deref())?
+        .parse::<jiff::Timestamp>()
+        .ok()?;
+    u64::try_from(at.as_millisecond()).ok()
+}
+
+/// GitHub answered that this number names no pull request: an issue, or
+/// nothing at all. Neither changes soon.
+/// GitHub answered about this one pull request or branch: it is not one,
+/// its repository does not exist or is hidden, or several match. Unlike a
+/// failure to reach GitHub, this says nothing about any other lookup.
+fn answered(error: &GitHubError) -> bool {
+    let text = match error {
+        GitHubError::Process(failure) => String::from_utf8_lossy(&failure.stderr).into_owned(),
+        GitHubError::InvalidResponse { source, .. } => return answered(source),
+        GitHubError::Inspection(_) | GitHubError::Validation(_) => return true,
+        error => error.to_string(),
+    };
+    text.contains("Could not resolve to a PullRequest")
+        || text.contains("Could not resolve to a Repository")
+        || text.contains("no pull requests found")
+}
+
+/// A conversation's references, worked-on first, strongest first, then most
+/// recent.
+fn ranked(watched: &Watched) -> impl Iterator<Item = (&Reference, &Aggregate)> + '_ {
+    let mut references = watched.references.iter().collect::<Vec<_>>();
+    references.sort_by(|(_, a), (_, b)| a.relation.cmp(&b.relation).then(b.seen.cmp(&a.seen)));
+    references.into_iter()
+}
+
+fn resolve(
+    reference: &Reference,
+    facts: &Facts,
+    branches: &BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+) -> Resolved {
+    let project = facts.project.as_ref();
+    let repository = project.and_then(ProjectFacts::repository);
+    let branch_in = |head: Option<&GitHubRepoKey>, name: &str| -> Resolved {
+        let name = crate::work::branch_name(name);
+        let Some(name) = name.to_str() else {
+            return Resolved::Nothing;
+        };
+        let (Some(project), Some(base)) = (project, repository) else {
+            return Resolved::Nothing;
+        };
+        let snapshot = project.snapshot.as_deref();
+        // A branch pushed elsewhere than the project's own remotes is no
+        // branch of this project.
+        if let (Some(head), Some(snapshot)) = (head, snapshot)
+            && !snapshot
+                .remotes
+                .iter()
+                .chain(std::iter::once(&snapshot.repository))
+                .any(|remote| remote.same_repository(head))
+        {
+            return Resolved::Nothing;
+        }
+        if let Some(found) = snapshot.and_then(|snapshot| snapshot.for_branch(name, None)) {
+            return Resolved::Key(PullRequestKeyOrd {
+                repository: base.into(),
+                number: found.number,
+            });
+        }
+        match branches.get(&(base.into(), name.to_owned())) {
+            Some(BranchLookup {
+                number: Some(number),
+                ..
+            }) => Resolved::Key(PullRequestKeyOrd {
+                repository: base.into(),
+                number: *number,
+            }),
+            Some(BranchLookup { checked, .. }) if checked.elapsed() < BRANCH_MISSING_FOR => {
+                Resolved::Deferred(*checked + BRANCH_MISSING_FOR)
+            }
+            _ => Resolved::Branch {
+                base: base.clone(),
+                head: head.unwrap_or(base).clone(),
+                branch: name.to_owned(),
+            },
+        }
+    };
+    match reference {
+        Reference::PullRequest(key) => Resolved::Key(key.clone()),
+        Reference::Number(number) => match repository {
+            Some(repository) => Resolved::Key(PullRequestKeyOrd {
+                repository: repository.into(),
+                number: *number,
+            }),
+            None => Resolved::Nothing,
+        },
+        Reference::Branch { repository, name } => {
+            let head = repository.as_ref().map(GitHubRepoKey::from);
+            branch_in(head.as_ref(), name)
+        }
+        Reference::CurrentBranch { directory } => {
+            let Some(project) = project else {
+                return Resolved::Nothing;
+            };
+            let directory = match directory {
+                Some(directory) => normalize(&facts.directory.join(directory)),
+                None => facts.directory.clone(),
+            };
+            match project
+                .worktree(&directory)
+                .and_then(|worktree| worktree.branch.as_deref())
+            {
+                Some(branch) => branch_in(None, branch),
+                None => Resolved::Nothing,
+            }
+        }
+    }
+}
+
+/// `..` and `.` removed lexically: the directory may no longer exist.
+fn normalize(path: &Path) -> PathBuf {
+    let mut normal = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                normal.pop();
+            }
+            Component::CurDir => {}
+            component => normal.push(component),
+        }
+    }
+    normal
+}
+
+fn assemble(
+    watched: &Watched,
+    facts: Option<&Facts>,
+    observed: &BTreeMap<PullRequestKeyOrd, Observed>,
+    branches: &BTreeMap<(RepoKeyOrd, String), BranchLookup>,
+    forge_error: Option<String>,
+) -> ConversationPullRequests {
+    let project = facts.and_then(|facts| facts.project.as_ref());
+    let repository = project.and_then(ProjectFacts::repository).cloned();
+    // The branch where the conversation works heads its current pull
+    // request, which belongs in the list even before anything touches it.
+    let current = facts.and_then(|facts| {
+        match resolve(
+            &Reference::CurrentBranch { directory: None },
+            facts,
+            branches,
+        ) {
+            Resolved::Key(key) => Some(key),
+            _ => None,
+        }
+    });
+    let mut rows: BTreeMap<PullRequestKeyOrd, (Aggregate, bool)> = BTreeMap::new();
+    if let Some(current) = &current {
+        rows.insert(
+            current.clone(),
+            (
+                Aggregate {
+                    relation: Relation::CheckedOut,
+                    by_subagent: false,
+                    seen: 0,
+                },
+                true,
+            ),
+        );
+    }
+    for (reference, aggregate) in &watched.references {
+        let Some(facts) = facts else {
+            break;
+        };
+        let Resolved::Key(key) = resolve(reference, facts, branches) else {
+            continue;
+        };
+        // An edit is pinned to the branch it was made on, whose name may
+        // since head an old pull request rather than the work.
+        if aggregate.relation == Relation::Edited
+            && let Reference::Branch {
+                repository: None,
+                name,
+            } = reference
+            && let Some(project) = project
+            && project.edits_belong_to(&key, name, observed) == Some(false)
+        {
+            continue;
+        }
+        match rows.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert((*aggregate, false));
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let (row, current_branch) = entry.get_mut();
+                row.relation = row.relation.min(aggregate.relation);
+                // The current branch is the conversation's own, not a
+                // subagent's.
+                row.by_subagent &= aggregate.by_subagent && !*current_branch;
+                row.seen = row.seen.max(aggregate.seen);
+            }
+        }
+    }
+    let mut pull_requests = rows
+        .into_iter()
+        .filter_map(|(key, (aggregate, current_branch))| {
+            let listed = project
+                .and_then(|project| project.listed(&key))
+                .map(|found| (board::convert(found, false), Detail::of(found)));
+            let observation = observed.get(&key);
+            if listed.is_none() && observation.is_some_and(|observation| observation.missing) {
+                return None;
+            }
+            // A bare number is shown only once GitHub says it names a pull
+            // request; a URL or a branch names one already.
+            let named_by_number = watched.references.iter().any(|(reference, _)| {
+                matches!(reference, Reference::Number(number) if *number == key.number)
+            }) && !watched.references.iter().any(|(reference, _)| {
+                matches!(reference, Reference::PullRequest(other) if *other == key)
+            });
+            let (pull_request, detail) = match listed {
+                Some((pull_request, detail)) => (Some(pull_request), detail),
+                None => observation.map_or_else(
+                    || (None, Detail::default()),
+                    |observation| (observation.pull_request.clone(), observation.detail.clone()),
+                ),
+            };
+            if pull_request.is_none() && named_by_number && !current_branch {
+                return None;
+            }
+            // Nothing in the conversation touched the branch's pull request,
+            // so it is listed only while it is still the branch's: open, or
+            // at the checkout's commit. An old merged one is not.
+            if current_branch && aggregate.seen == 0 {
+                let head = facts
+                    .zip(project)
+                    .and_then(|(facts, project)| project.worktree(&facts.directory))
+                    .and_then(|worktree| worktree.head.as_ref())
+                    .map(|head| head.oid.as_str());
+                let still_the_branch_s = pull_request.as_ref().is_some_and(|found| {
+                    found.state == crate::work::PullRequestState::Open
+                        || head.is_some_and(|head| found.head_oid == head)
+                });
+                if !still_the_branch_s {
+                    return None;
+                }
+            }
+            let observed_at_unix_ms = match (&pull_request, observation) {
+                (Some(_), Some(observation)) if observation.pull_request.is_some() => {
+                    observation.observed_at_unix_ms
+                }
+                // The board's listing is as old as its last sync, which a
+                // later pass does not change.
+                (Some(_), _) => project.and_then(|project| project.synced_at_unix_ms),
+                (None, _) => None,
+            };
+            // The key is kept in one case; show the spelling GitHub uses.
+            let spelled = GitHubRepoKey::from(&key.repository);
+            let canonical = match (&repository, &pull_request) {
+                (Some(own), _) if own.same_repository(&spelled) => own.clone(),
+                (_, Some(pull_request)) => PullRequestKey::from_url(&pull_request.url)
+                    .ok()
+                    .map(|found| found.repository)
+                    .filter(|found| found.same_repository(&spelled))
+                    .unwrap_or(spelled),
+                _ => spelled,
+            };
+            Some((
+                aggregate.seen,
+                ConversationPullRequest {
+                    repository: canonical,
+                    number: key.number,
+                    relation: aggregate.relation,
+                    by_subagent: aggregate.by_subagent,
+                    current_branch,
+                    pull_request,
+                    observed_at_unix_ms,
+                    diff: detail.diff,
+                    checks: detail.checks,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    pull_requests.sort_by(|(a_seen, a), (b_seen, b)| {
+        a.relation
+            .cmp(&b.relation)
+            .then(b.current_branch.cmp(&a.current_branch))
+            .then(b_seen.cmp(a_seen))
+    });
+    let forge_error = project
+        .and_then(|project| project.forge_error.clone())
+        .or(forge_error);
+    ConversationPullRequests {
+        generated_at_unix_ms: now_unix_ms(),
+        repository,
+        transcript: watched.coverage.clone(),
+        forge_error,
+        worktrees: facts
+            .zip(project)
+            .map_or_else(Vec::new, |(facts, project)| {
+                edited_worktrees(watched, project, |worktree| {
+                    let branch = worktree.branch.as_deref()?;
+                    let Resolved::Key(key) = resolve(
+                        &Reference::Branch {
+                            repository: None,
+                            name: branch.to_owned(),
+                        },
+                        facts,
+                        branches,
+                    ) else {
+                        return None;
+                    };
+                    if project.edits_belong_to(&key, branch, observed) == Some(false) {
+                        return None;
+                    }
+                    pull_requests
+                        .iter()
+                        .any(|(_, row)| {
+                            row.relation != Relation::Mentioned
+                                && row.number == key.number
+                                && RepoKeyOrd::from(&row.repository) == key.repository
+                        })
+                        .then_some(key.number)
+                })
+            }),
+        pull_requests: pull_requests.into_iter().map(|(_, row)| row).collect(),
+    }
+}
+
+/// The project's worktrees holding the directories `watched` edited, most
+/// recently edited first. A directory outside every worktree, such as another
+/// project's, names none.
+///
+/// `listed` names the worked-on pull request a worktree's branch heads, if
+/// any.
+fn edited_worktrees(
+    watched: &Watched,
+    project: &ProjectFacts,
+    listed: impl Fn(&super::scan::Worktree) -> Option<u64>,
+) -> Vec<ConversationWorktree> {
+    edited(watched, project)
+        .into_iter()
+        .map(|(worktree, edit)| ConversationWorktree {
+            path: worktree.path.clone(),
+            branch: worktree
+                .branch
+                .as_deref()
+                .map(|name| crate::work::branch_display(&crate::work::branch_name(name))),
+            by_subagent: edit.by_subagent,
+            changed_paths: worktree.dirty.as_ref().map(|dirty| dirty.paths),
+            // Filled in from what was measured, which the scan does not hold.
+            diff: None,
+            pull_request: listed(worktree),
+        })
+        .collect()
+}
+
+/// The project's worktrees holding the directories `watched` edited, with
+/// how they were edited, most recently edited first.
+fn edited<'a>(
+    watched: &Watched,
+    project: &'a ProjectFacts,
+) -> Vec<(&'a super::scan::Worktree, Edit)> {
+    let mut worktrees: BTreeMap<&Path, (&super::scan::Worktree, Edit)> = BTreeMap::new();
+    for (directory, edit) in &watched.edited {
+        let Some(worktree) = project.worktree(directory) else {
+            continue;
+        };
+        worktrees
+            .entry(worktree.path.as_path())
+            .and_modify(|(_, found)| {
+                found.by_subagent &= edit.by_subagent;
+                found.seen = found.seen.max(edit.seen);
+            })
+            .or_insert((worktree, *edit));
+    }
+    let mut worktrees = worktrees.into_values().collect::<Vec<_>>();
+    worktrees.sort_by(|(_, a), (_, b)| b.seen.cmp(&a.seen));
+    worktrees
+}
+
+/// What a worktree's uncommitted lines were measured against: a commit or
+/// any change to its status, which the scan reads again on every edit,
+/// measures it again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Fingerprint {
+    head: Option<String>,
+    dirty: Option<crate::work::Dirty>,
+}
+
+impl Fingerprint {
+    fn of(worktree: &super::scan::Worktree) -> Self {
+        Self {
+            head: worktree.head.as_ref().map(|head| head.oid.clone()),
+            dirty: worktree.dirty.clone(),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Measured {
+    fingerprint: Fingerprint,
+    diff: Option<DiffStat>,
+}
+
+fn with_measured(list: &mut ConversationPullRequests, measured: &BTreeMap<PathBuf, Measured>) {
+    for worktree in &mut list.worktrees {
+        worktree.diff = measured
+            .get(&worktree.path)
+            .and_then(|measured| measured.diff);
+    }
+}
+
+/// Where a conversation's provider keeps its transcript, once it has
+/// reported which conversation it is.
+///
+/// Returns nothing new while the conversation ID is still `known`.
+/// Waits between searches that found nothing: 5 s, doubling to 2 min.
+fn search_backoff(missed: u32) -> Duration {
+    (Duration::from_secs(5) * 2_u32.saturating_pow(missed.saturating_sub(1).min(5)))
+        .min(Duration::from_secs(120))
+}
+
+/// Finds the conversation's transcript when its provider ID is new. A
+/// Codex search runs only while `search_due`.
+fn locate(
+    host: &SharedHost,
+    conversation: TerminalId,
+    known: Option<&str>,
+    search_due: bool,
+) -> Location {
+    let (provider, recipe, session_id) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&conversation) else {
+            return Location::Unchanged;
+        };
+        (
+            record.session.launch.provider,
+            record.session.launch.recipe.clone(),
+            record
+                .handle
+                .session_id()
+                .or_else(|| record.session.launch.session_id.clone()),
+        )
+    };
+    // cagents is the client of these providers, so its own record of the
+    // conversation is read, from before the provider names its ID.
+    if recorded_provider(provider) {
+        let id = session_id.unwrap_or_default();
+        return if known == Some(id.as_str()) {
+            Location::Unchanged
+        } else {
+            Location::Found(id, Source::Recorded)
+        };
+    }
+    let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
+        return Location::Unchanged;
+    };
+    if !search_due {
+        return Location::Unchanged;
+    }
+    let Some(root) = provider.session_root(&recipe) else {
+        return Location::Unchanged;
+    };
+    let directory = std::fs::canonicalize(&recipe.working_directory)
+        .unwrap_or_else(|_| recipe.working_directory.clone());
+    match provider {
+        Provider::Claude => {
+            let transcript = match crate::agent::claude_transcript_for_start(&root, &directory, &id)
+            {
+                Ok(transcript) => transcript,
+                Err(crate::agent::ClaudeTranscriptError::Unavailable(_)) => {
+                    return Location::Missed;
+                }
+                Err(crate::agent::ClaudeTranscriptError::Invalid(_)) => return Location::Unchanged,
+            };
+            Location::Found(
+                id,
+                Source::Located(Located {
+                    format: Format::Claude,
+                    directory,
+                    subagents: Some(transcript.with_extension("").join("subagents")),
+                    transcript,
+                }),
+            )
+        }
+        Provider::Codex => match codex_rollout(&root.join("sessions"), &id) {
+            Some(transcript) => Location::Found(
+                id,
+                Source::Located(Located {
+                    format: Format::Codex,
+                    directory,
+                    transcript,
+                    subagents: None,
+                }),
+            ),
+            None => Location::Missed,
+        },
+        Provider::Omp | Provider::Antigravity | Provider::Muse => Location::Unchanged,
+    }
+}
+
+/// Codex names a thread's rollout `rollout-<time>-<thread id>.jsonl` under
+/// dated directories; the newest are searched first.
+fn codex_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
+    fn newest_first(directory: &Path) -> Vec<PathBuf> {
+        let mut entries = std::fs::read_dir(directory)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .collect::<Vec<_>>();
+        entries.sort_by(|a, b| b.cmp(a));
+        entries
+    }
+    let suffix = format!("-{id}.jsonl");
+    let mut visited = 0;
+    for year in newest_first(sessions).into_iter().take(4) {
+        for month in newest_first(&year) {
+            for day in newest_first(&month) {
+                for file in newest_first(&day) {
+                    visited += 1;
+                    if visited > 50_000 {
+                        return None;
+                    }
+                    if file
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("rollout-") && name.ends_with(&suffix))
+                    {
+                        return Some(file);
+                    }
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Reads what each of the conversation's transcript files gained since the
+/// last pass.
+#[cfg(test)]
+fn read(watched: &mut Watched) {
+    let scanned = scan(&watched.source, &mut watched.files);
+    watched.apply(scanned, None);
+}
+
+/// Reads what cagents' own record of the conversation gained since the last
+/// pass. Only the conversation's handle is taken under the host's lock; the
+/// record is read without it.
+fn recorded(
+    host: &SharedHost,
+    conversation: TerminalId,
+    items: &mut Items,
+) -> (Scanned, RecordRead) {
+    let handle = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&conversation)
+        .map(|record| record.handle.clone());
+    let mut found = Vec::new();
+    let read = match handle.map(|handle| handle.unread(&items.again())) {
+        Some(Ok((unread, busy))) => {
+            let more = unread.more;
+            items.read(unread, busy, &mut found);
+            if more {
+                RecordRead::More
+            } else {
+                RecordRead::Complete
+            }
+        }
+        Some(Err(error)) => {
+            items.failed(error);
+            RecordRead::Failed
+        }
+        // Gone: what was read stays as it was.
+        None => RecordRead::Complete,
+    };
+    (
+        Scanned {
+            found,
+            coverage: items.coverage(),
+        },
+        read,
+    )
+}
+
+/// How far one read of a conversation's record got.
+enum RecordRead {
+    Complete,
+    /// It stopped at its batch limit with more unread.
+    More,
+    Failed,
+}
+
+/// Whether cagents' own record of `provider`'s conversations is read for
+/// their work, rather than a transcript file of the provider's.
+fn recorded_provider(provider: Provider) -> bool {
+    matches!(
+        provider,
+        Provider::Omp | Provider::Antigravity | Provider::Muse
+    )
+}
+
+/// What one read of a conversation's transcripts found.
+struct Scanned {
+    found: Vec<transcript::Found>,
+    coverage: TranscriptCoverage,
+}
+
+/// Reads the new part of a conversation's transcripts. It needs only the
+/// cursors, so no lock is held while it reads.
+fn scan(source: &Source, cursors: &mut BTreeMap<PathBuf, Cursor>) -> Scanned {
+    let located = match source {
+        // Looked for and not there yet: the conversation has reported no
+        // ID, or its provider has written no transcript. All of nothing has
+        // been read, so a reader shows that it has no work rather than
+        // that its work is on its way.
+        Source::Pending => {
+            return Scanned {
+                found: Vec::new(),
+                coverage: TranscriptCoverage::Complete,
+            };
+        }
+        // Read from the conversation's record by `recorded`, not here.
+        Source::Recorded => {
+            return Scanned {
+                found: Vec::new(),
+                coverage: TranscriptCoverage::Pending,
+            };
+        }
+        Source::Located(located) => located.clone(),
+    };
+    let mut files = vec![(located.transcript.clone(), false)];
+    let mut capped = false;
+    if let Some(subagents) = &located.subagents {
+        let mut children = std::fs::read_dir(subagents)
+            .into_iter()
+            .flatten()
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+                    && path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| name.starts_with("agent-"))
+            })
+            .collect::<Vec<_>>();
+        // The newest subagents are read when there are too many to read.
+        capped = children.len() > SUBAGENTS;
+        children.sort_by_cached_key(|path| {
+            std::cmp::Reverse(
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            )
+        });
+        files.extend(
+            children
+                .into_iter()
+                .take(SUBAGENTS)
+                .map(|path| (path, true)),
+        );
+    }
+    let mut complete = true;
+    let mut unavailable = None;
+    let mut found = Vec::new();
+    for (path, subagent) in files {
+        match read_file(cursors, &path, located.format, subagent, &mut found) {
+            Ok(caught_up) => complete &= caught_up,
+            Err(error) if error.kind() == io::ErrorKind::NotFound && subagent => {}
+            Err(error) => {
+                if !subagent {
+                    unavailable = Some(format!("The transcript cannot be read: {error}"));
+                }
+            }
+        }
+    }
+    let truncated = cursors.values().any(|cursor| cursor.truncated);
+    let coverage = match unavailable {
+        Some(reason) if cursors.is_empty() => TranscriptCoverage::Unavailable { reason },
+        _ if !complete => TranscriptCoverage::Pending,
+        _ if truncated || capped => TranscriptCoverage::Partial,
+        _ => TranscriptCoverage::Complete,
+    };
+    Scanned { found, coverage }
+}
+
+/// Reads the new part of one file, and reports whether it reached the end.
+fn read_file(
+    cursors: &mut BTreeMap<PathBuf, Cursor>,
+    path: &Path,
+    format: Format,
+    subagent: bool,
+    found: &mut Vec<transcript::Found>,
+) -> io::Result<bool> {
+    let file = File::open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not a regular file",
+        ));
+    }
+    let identity = (metadata.dev(), metadata.ino());
+    let size = metadata.len();
+    let cursor = cursors.entry(path.to_owned()).or_insert_with(|| {
+        let start = size.saturating_sub(FIRST_READ);
+        // Starting mid-file, the first line is whole only when the byte
+        // before it ends a line.
+        let mut before = [0];
+        let mid_line = start > 0
+            && (file.read_exact_at(&mut before, start - 1).is_err() || before[0] != b'\n');
+        Cursor {
+            identity,
+            offset: start,
+            partial: Vec::new(),
+            skipping: mid_line,
+            reader: Reader::new(format, subagent),
+            truncated: start > 0,
+        }
+    });
+    if cursor.identity != identity || cursor.offset > size {
+        // Replaced or rewritten: read it again from its start.
+        *cursor = Cursor {
+            identity,
+            offset: 0,
+            partial: Vec::new(),
+            skipping: false,
+            reader: Reader::new(format, subagent),
+            truncated: false,
+        };
+    }
+    let end = size.min(cursor.offset + READ_PER_PASS);
+    let mut buffer = vec![0; (end - cursor.offset) as usize];
+    file.read_exact_at(&mut buffer, cursor.offset)?;
+    cursor.offset = end;
+    let mut rest = buffer.as_slice();
+    while let Some(newline) = rest.iter().position(|byte| *byte == b'\n') {
+        let (line, after) = rest.split_at(newline);
+        rest = &after[1..];
+        if cursor.skipping || cursor.partial.len() + line.len() > MAX_LINE {
+            cursor.skipping = false;
+            cursor.partial.clear();
+            continue;
+        }
+        if cursor.partial.is_empty() {
+            cursor.reader.line(line, found);
+        } else {
+            cursor.partial.extend_from_slice(line);
+            let whole = std::mem::take(&mut cursor.partial);
+            cursor.reader.line(&whole, found);
+        }
+    }
+    if !cursor.skipping {
+        cursor.partial.extend_from_slice(rest);
+        if cursor.partial.len() > MAX_LINE {
+            cursor.partial.clear();
+            cursor.skipping = true;
+        }
+    }
+    Ok(end == size)
+}

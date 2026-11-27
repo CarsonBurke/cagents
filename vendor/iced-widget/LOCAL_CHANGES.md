@@ -89,3 +89,12 @@ Local change: selection span (src/text_editor.rs)
 `Content::selection_span` returns the editor's `selection_span`: the span a
 word or line selection covers, which `Content::cursor` does not report. See
 vendor/iced-core/README.cagents.md.
+
+## Disabled checkboxes report it (cagents #3514)
+
+A `Checkbox` without `on_toggle` is drawn as disabled, and its accessibility
+node now says so with `set_disabled`, as a button without `on_press` already
+does. Upstream announced such a checkbox as enabled, and the app's tooltips,
+which read a control's node to hide a name tip on a disabled control, showed
+one on a greyed-out option. The regression is in
+crates/cagents-ui-kit/src/interaction.rs (the disabled tooltip tests).

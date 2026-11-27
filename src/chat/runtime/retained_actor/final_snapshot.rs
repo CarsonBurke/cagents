@@ -1,7 +1,7 @@
 //! Exact bounded final publication retained until host cleanup is acknowledged.
 #[cfg(test)]
 use super::transport::RemoteActor;
-use super::transport::{ActorIdentity, PROTOCOL, RetirementReceipt};
+use super::transport::{ActorIdentity, PROTOCOL, RetirementReceipt, payload_digest};
 use super::{MAX_FRAME, execution_exit};
 use crate::{
     chat::{self, Snapshot},
@@ -12,26 +12,53 @@ use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
     io::{Read, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 /// Observation is not retirement authority. Only the validated capsule grants
 /// a caller access to the authenticated, fully joined retirement descriptor.
 #[derive(Debug)]
-pub(crate) enum RetirementInspection {
+pub enum RetirementInspection {
     Running,
     ExitedUnproved,
     Verified(VerifiedRetirement),
 }
 /// Boxed so the inspection, and each owner that carries one, stays small.
 #[derive(Debug)]
-pub(crate) struct VerifiedRetirement(Box<RetirementReceipt>);
+pub struct VerifiedRetirement {
+    receipt: Box<RetirementReceipt>,
+    queued_messages: Option<Vec<chat::QueuedMessage>>,
+    queue_digest: Option<[u8; 32]>,
+}
 impl VerifiedRetirement {
-    pub(crate) fn receipt(&self) -> &RetirementReceipt {
-        &self.0
+    pub fn receipt(&self) -> &RetirementReceipt {
+        &self.receipt
     }
-    #[cfg(test)]
-    pub(crate) fn into_receipt(self) -> RetirementReceipt {
-        *self.0
+
+    /// The immutable final queue is replayable only by an exact issued
+    /// descriptor of this actor. It is never input to the successor.
+    pub fn queue_for(&self, source: &chat::Session) -> Option<chat::ExitedQueue> {
+        if source != &self.receipt.source && !self.receipt.previous_sources.contains(source) {
+            return None;
+        }
+        Some(chat::ExitedQueue {
+            messages: recovery_queue(
+                &self.receipt.identity.record,
+                self.queue_digest,
+                self.queued_messages.as_deref(),
+            )?,
+            confirmed_session: self.receipt.confirmed_session.clone(),
+            account_scope: self
+                .receipt
+                .launch_account_scope
+                .as_ref()
+                .ok()
+                .map(crate::account::scope::LaunchAccountScope::queue_fingerprint),
+        })
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn into_receipt(self) -> RetirementReceipt {
+        *self.receipt
     }
 }
 
@@ -50,11 +77,28 @@ struct Receipt {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     confirmed_session: Option<String>,
     snapshot: Snapshot,
+    #[cfg(target_os = "macos")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    detached_cleanup_proved: bool,
     /// The snapshot was reduced after retirement and is no transcript. Older
     /// readers ignore this field, which is safe because none of them reads a
     /// retired receipt's snapshot.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     compacted: bool,
+    /// Older compactors discarded all queue entries. Their default-empty
+    /// snapshot cannot prove that the provider really held no messages.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    queue_retained: bool,
+    /// Exact input is separate from the bounded transcript, so old readers can
+    /// still read and validate the final receipt without recovering the queue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    queue_digest: Option<[u8; 32]>,
+}
+
+impl Receipt {
+    fn final_queue(self) -> Option<Vec<chat::QueuedMessage>> {
+        (!self.compacted || self.queue_retained).then_some(self.snapshot.queued_messages)
+    }
 }
 fn path(record: &Record) -> Result<PathBuf, String> {
     Ok(registry::directory(Kind::Native)?.join(format!(
@@ -72,6 +116,8 @@ pub(super) fn save(
     scope: Result<&crate::account::scope::LaunchAccountScope, &str>,
     confirmed_session: Option<&str>,
     snapshot: &Snapshot,
+    queue_digest: Option<[u8; 32]>,
+    #[cfg(target_os = "macos")] detached_cleanup_proved: bool,
 ) -> Result<(), String> {
     let bytes = serde_json::to_vec(&Receipt {
         installed,
@@ -83,7 +129,11 @@ pub(super) fn save(
         launch_account_scope: scope.cloned().map_err(str::to_owned),
         confirmed_session: confirmed_session.map(str::to_owned),
         snapshot: snapshot.clone(),
+        #[cfg(target_os = "macos")]
+        detached_cleanup_proved,
         compacted: false,
+        queue_retained: false,
+        queue_digest,
     })
     .map_err(|error| error.to_string())?;
     if bytes.len() > MAX_FRAME - 64 * 1024 {
@@ -91,7 +141,14 @@ pub(super) fn save(
             "The final retained publication exceeds the private bounded snapshot capacity".into(),
         );
     }
-    save_at(&path(&identity.record)?, &bytes)
+    let path = path(&identity.record)?;
+    #[cfg(target_os = "macos")]
+    let path = if detached_cleanup_proved {
+        path
+    } else {
+        path.with_extension("final-spared")
+    };
+    save_at(&path, &bytes)
 }
 /// Publishes a complete receipt by rename, without fsync. Receipts live in the
 /// runtime directory beside the boot-bound holder records that validate them,
@@ -118,6 +175,80 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     }
     result
 }
+fn recovery_path(record: &Record) -> Result<PathBuf, String> {
+    Ok(path(record)?.with_extension("final-queue"))
+}
+
+pub(super) fn save_recovery_queue(
+    record: &Record,
+    messages: &[chat::QueuedMessage],
+) -> Result<[u8; 32], String> {
+    let size =
+        postcard::experimental::serialized_size(messages).map_err(|error| error.to_string())?;
+    if size > MAX_FRAME {
+        return Err("The final retained input queue exceeds its recovery limit".into());
+    }
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(size)
+        .map_err(|_| "Could not allocate the final retained input queue")?;
+    bytes.resize(size, 0);
+    postcard::to_slice(messages, &mut bytes).map_err(|error| error.to_string())?;
+    // Publish the body before a reader can see a final receipt that names it.
+    let digest = payload_digest(&bytes);
+    save_at(&recovery_path(record)?, &bytes)?;
+    Ok(digest)
+}
+
+pub(super) fn read_recovery_queue(
+    record: &Record,
+    expected_digest: [u8; 32],
+) -> Result<Vec<chat::QueuedMessage>, String> {
+    let file = crate::secure_file::open_existing_private_file_readonly(&recovery_path(record)?)
+        .map_err(|error| error.to_string())?;
+    let mut bytes = Vec::new();
+    file.take((MAX_FRAME + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|error| error.to_string())?;
+    if bytes.len() > MAX_FRAME || payload_digest(&bytes) != expected_digest {
+        return Err("The final retained input queue does not match its receipt".into());
+    }
+    postcard::from_bytes(&bytes).map_err(|error| error.to_string())
+}
+
+fn recovery_queue(
+    record: &Record,
+    digest: Option<[u8; 32]>,
+    previews: Option<&[chat::QueuedMessage]>,
+) -> Option<Vec<chat::QueuedMessage>> {
+    if let Some(digest) = digest {
+        match read_recovery_queue(record, digest) {
+            Ok(messages) => return Some(messages),
+            Err(error) => {
+                tracing::warn!(%error, session = %record.terminal, "Could not read the exact retired input queue");
+                // Prefer unknown to a stale display queue when a distinct
+                // authenticated recovery projection was supposed to exist.
+                return None;
+            }
+        }
+    }
+    previews.map(<[chat::QueuedMessage]>::to_vec)
+}
+
+pub(super) fn read_exited_recovery_queue(
+    identity: &ActorIdentity,
+    proof: &HostSessionProof,
+    source: &chat::Session,
+) -> Result<Option<Vec<chat::QueuedMessage>>, String> {
+    let receipt = read_receipt(&identity.record)?;
+    validate_publication(&receipt, identity, proof, source)?;
+    Ok(recovery_queue(
+        &identity.record,
+        receipt.queue_digest,
+        receipt.final_queue().as_deref(),
+    ))
+}
+
 pub(super) fn read(
     identity: &ActorIdentity,
     proof: &HostSessionProof,
@@ -135,10 +266,8 @@ fn read_receipt(record: &Record) -> Result<Receipt, String> {
         .ok_or_else(|| "The helper has not published its final retained snapshot".into())
 }
 fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String> {
-    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record)?) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.to_string()),
+    let Some((file, _)) = open_publication(&path(record)?, "final-spared")? else {
+        return Ok(None);
     };
     let mut bytes = Vec::new();
     file.take((MAX_FRAME + 1) as u64)
@@ -149,6 +278,28 @@ fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String>
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
     Ok(Some(receipt))
+}
+/// Older helpers and daemons only see the exact receipt filenames.
+fn open_publication(
+    exact: &Path,
+    #[cfg_attr(target_os = "linux", allow(unused_variables))] spared_extension: &str,
+) -> Result<Option<(std::fs::File, PathBuf)>, String> {
+    use crate::secure_file::open_existing_private_file_readonly as open;
+    match open(exact) {
+        Ok(file) => return Ok(Some((file, exact.to_path_buf()))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let spared = exact.with_extension(spared_extension);
+        match open(&spared) {
+            Ok(file) => return Ok(Some((file, spared))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(None)
 }
 fn validate_publication(
     receipt: &Receipt,
@@ -199,6 +350,15 @@ pub(super) fn close_proved(
     proof: &HostSessionProof,
     source: &chat::Session,
 ) -> Result<bool, String> {
+    close_proved_with_scope(identity, proof, source, false)
+}
+
+pub(super) fn close_proved_with_scope(
+    identity: &ActorIdentity,
+    proof: &HostSessionProof,
+    source: &chat::Session,
+    require_exact: bool,
+) -> Result<bool, String> {
     if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
@@ -207,7 +367,14 @@ pub(super) fn close_proved(
     let Some(receipt) = read_receipt_if_published(&identity.record)? else {
         return Ok(false);
     };
-    validate_publication(&receipt, identity, proof, source).map(|()| true)
+    validate_publication(&receipt, identity, proof, source)?;
+    #[cfg(target_os = "linux")]
+    let _ = require_exact;
+    #[cfg(target_os = "macos")]
+    if require_exact && !receipt.detached_cleanup_proved {
+        return Ok(false);
+    }
+    Ok(true)
 }
 const MAX_RETIREMENT: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -222,6 +389,12 @@ fn retirement_path(record: &Record) -> Result<PathBuf, String> {
 }
 pub(super) fn publish_retirement(receipt: RetirementReceipt) -> Result<(), String> {
     let path = retirement_path(&receipt.identity.record)?;
+    #[cfg(target_os = "macos")]
+    let path = if receipt.detached_cleanup_proved {
+        path
+    } else {
+        path.with_extension("retired-spared")
+    };
     let bytes = serde_json::to_vec(&Retirement {
         protocol: PROTOCOL,
         semantic_acknowledged: true,
@@ -294,14 +467,9 @@ fn inspect_retirement_with_proof(
     if !execution_exit::identity_absent(&record.root)? {
         return Ok(RetirementInspection::ExitedUnproved);
     }
-    let file =
-        match crate::secure_file::open_existing_private_file_readonly(&retirement_path(record)?) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(RetirementInspection::ExitedUnproved);
-            }
-            Err(error) => return Err(error.to_string()),
-        };
+    let Some((file, _)) = open_publication(&retirement_path(record)?, "retired-spared")? else {
+        return Ok(RetirementInspection::ExitedUnproved);
+    };
     let mut bytes = Vec::new();
     file.take((MAX_RETIREMENT + 1) as u64)
         .read_to_end(&mut bytes)
@@ -322,13 +490,16 @@ fn inspect_retirement_with_proof(
         AttachmentProof::SavedSameBoot => &saved.receipt.proof,
     };
     validate_retirement(&saved, record, proof, expected_identity)?;
-    validate_retired_final(&saved.receipt)?;
+    let final_receipt = read_receipt(&saved.receipt.identity.record)?;
+    validate_retired_publication(&final_receipt, &saved.receipt)?;
     if registry::retirement_pending(record).map_err(|error| error.to_string())? {
         return Ok(RetirementInspection::ExitedUnproved);
     }
-    Ok(RetirementInspection::Verified(VerifiedRetirement(
-        Box::new(saved.receipt),
-    )))
+    Ok(RetirementInspection::Verified(VerifiedRetirement {
+        receipt: Box::new(saved.receipt),
+        queue_digest: final_receipt.queue_digest,
+        queued_messages: final_receipt.final_queue(),
+    }))
 }
 
 fn validate_retirement(
@@ -398,10 +569,6 @@ fn validate_retirement(
     }
     Ok(())
 }
-fn validate_retired_final(receipt: &RetirementReceipt) -> Result<(), String> {
-    let final_receipt = read_receipt(&receipt.identity.record)?;
-    validate_retired_publication(&final_receipt, receipt)
-}
 fn validate_retired_publication(
     final_receipt: &Receipt,
     receipt: &RetirementReceipt,
@@ -412,6 +579,10 @@ fn validate_retired_publication(
         &receipt.proof,
         &receipt.source,
     )?;
+    #[cfg(target_os = "macos")]
+    if final_receipt.detached_cleanup_proved != receipt.detached_cleanup_proved {
+        return Err("Retired helper changed its detached cleanup scope".into());
+    }
     if final_receipt.installed != receipt.installed
         || final_receipt.launch_account_scope != receipt.launch_account_scope
         || final_receipt.confirmed_session != receipt.confirmed_session
@@ -426,8 +597,8 @@ fn validate_retired_publication(
     }
     Ok(())
 }
-#[cfg(test)]
-pub(super) fn retired_actor_receipt(
+#[cfg(any(test, feature = "test-support"))]
+pub fn retired_actor_receipt(
     record: &Record,
     current: &HostSessionProof,
 ) -> Result<Option<RetirementReceipt>, String> {
@@ -439,12 +610,8 @@ pub(super) fn retired_actor_receipt(
 
 /// What a committed retirement still needs from its final receipt.
 ///
-/// Every reader of a retired receipt validates its identity, proof, source and
-/// account fields, and only `exited` from the snapshot. The transcript, the
-/// subagent frames and the other collections are read solely by a close whose
-/// reply was lost, which precedes retirement. They are by far the largest part
-/// of the receipt, so this keeps the snapshot's scalar description and drops
-/// the collections.
+/// A retry can still recover the queued inputs from this exact receipt. The
+/// transcript and subagent frames only serve a lost reply before retirement.
 fn retired_remnant(snapshot: &Snapshot) -> Snapshot {
     Snapshot {
         sampled_at: snapshot.sampled_at,
@@ -457,6 +624,7 @@ fn retired_remnant(snapshot: &Snapshot) -> Snapshot {
         title: snapshot.title.clone(),
         error: snapshot.error.clone(),
         read_only_reason: snapshot.read_only_reason.clone(),
+        queued_messages: snapshot.queued_messages.clone(),
         exited: snapshot.exited,
         ..Default::default()
     }
@@ -468,6 +636,7 @@ fn compact(receipt: &mut Receipt) -> bool {
     }
     receipt.snapshot = retired_remnant(&receipt.snapshot);
     receipt.compacted = true;
+    receipt.queue_retained = true;
     true
 }
 
@@ -489,7 +658,9 @@ pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Re
     {
         return Ok(0);
     }
-    let path = path(record)?;
+    let Some((_, path)) = open_publication(&path(record)?, "final-spared")? else {
+        return Ok(0);
+    };
     let mut receipt = read_receipt(record)?;
     if !compact(&mut receipt) {
         return Ok(0);
@@ -505,13 +676,13 @@ pub(super) fn compact_retired(record: &Record, current: &HostSessionProof) -> Re
 /// Runtime receipts of actors that no helper or provider backs, for the
 /// daemon's receipt collection tests. Each is published through the same
 /// writers a helper uses, so every reader validates it as it would a real one.
-#[cfg(test)]
-pub(crate) mod fixture {
+#[cfg(any(test, feature = "test-support"))]
+pub mod fixture {
     use super::*;
 
     /// How far an actor got toward a retirement its receipts can prove.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) enum Stage {
+    pub enum Stage {
         /// The helper is still running.
         Running,
         /// The helper ended, but its provider may still be running.
@@ -525,18 +696,18 @@ pub(crate) mod fixture {
     }
 
     /// One published actor: its exact holder record and issued conversation.
-    pub(crate) struct Actor {
-        pub(crate) record: Record,
-        pub(crate) source: chat::Session,
-        pub(crate) final_receipt: PathBuf,
-        pub(crate) retirement_receipt: PathBuf,
+    pub struct Actor {
+        pub record: Record,
+        pub source: chat::Session,
+        pub final_receipt: PathBuf,
+        pub retirement_receipt: PathBuf,
     }
 
     /// Publishes `stage`'s receipts for actor `instance` of the lease `proof`.
     ///
     /// `ended` is a process that has exited and been reaped; the calling
     /// process stands in for anything `stage` says is still running.
-    pub(crate) fn publish(
+    pub fn publish(
         instance: uuid::Uuid,
         proof: &HostSessionProof,
         ended: &registry::Process,
@@ -606,9 +777,14 @@ pub(crate) mod fixture {
             scope,
             Some(&session),
             &snapshot,
+            None,
+            #[cfg(target_os = "macos")]
+            true,
         )
         .unwrap();
         publish_retirement(RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -645,7 +821,7 @@ pub(crate) mod fixture {
     }
 
     /// Whether the final receipt at `path` was compacted.
-    pub(crate) fn compacted(path: &std::path::Path) -> bool {
+    pub fn compacted(path: &std::path::Path) -> bool {
         let receipt: Receipt = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
         receipt.compacted
     }
@@ -696,7 +872,11 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
+            queue_retained: false,
+            queue_digest: None,
         };
         assert!(validate_publication(&live, &identity, &proof, &source).is_err());
         identity.record.root = reaped_process();
@@ -784,9 +964,15 @@ mod tests {
                 exited: true,
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             compacted: false,
+            queue_retained: false,
+            queue_digest: None,
         };
         let make = || RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -874,9 +1060,15 @@ mod tests {
                 items: vec![item; 64],
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             compacted: false,
+            queue_retained: false,
+            queue_digest: None,
         };
         let retired = RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
@@ -900,6 +1092,16 @@ mod tests {
         assert!(reread.compacted);
         assert!(validate_publication(&reread, &identity, &proof, &source).is_ok());
         assert!(validate_retired_publication(&reread, &retired).is_ok());
+        assert_eq!(reread.final_queue(), Some(Vec::new()));
+        let mut previously_compacted =
+            serde_json::from_slice::<serde_json::Value>(&reduced).unwrap();
+        previously_compacted
+            .as_object_mut()
+            .unwrap()
+            .remove("queue_retained");
+        let previously_compacted: Receipt = serde_json::from_value(previously_compacted).unwrap();
+        assert!(validate_retired_publication(&previously_compacted, &retired).is_ok());
+        assert_eq!(previously_compacted.final_queue(), None);
 
         // An older daemon reads the same bytes as an ordinary exited receipt,
         // which is all its retirement checks look at.
@@ -929,6 +1131,8 @@ mod tests {
             protocol: PROTOCOL,
             semantic_acknowledged: true,
             receipt: RetirementReceipt {
+                #[cfg(target_os = "macos")]
+                detached_cleanup_proved: true,
                 installed: true,
                 identity: identity.clone(),
                 proof: proof.clone(),
@@ -1022,6 +1226,18 @@ mod tests {
             return;
         }
         let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+        use std::os::unix::fs::MetadataExt;
+        let home = root.join("account");
+        std::fs::create_dir(&home).unwrap();
+        let metadata = std::fs::metadata(&home).unwrap();
+        let captured = crate::account::scope::LaunchAccountScope {
+            provider: crate::agent::Provider::Claude,
+            canonical_home: home,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            registered_id: None,
+            purge_ids: Vec::new(),
+        };
         let gate = root.join("exit-helper");
         struct Parent {
             child: Child,
@@ -1074,8 +1290,20 @@ os.waitpid(pid,0)
         source.native_continuity =
             chat::NativeContinuity::RetainedClaudeActor { protocol: PROTOCOL };
         std::fs::create_dir_all(registry::directory(Kind::Native).unwrap()).unwrap();
+        let text = "A final follow-up with λ and notes\n".repeat(700);
+        let preview = chat::QueuedMessage::new("held-follow-up".into(), text.clone());
+        assert!(!preview.editable);
+        let queued = chat::QueuedMessage {
+            text,
+            editable: true,
+            delivery: chat::QueueDelivery::NextStep,
+            ..preview.clone()
+        };
+        let recovery_digest =
+            save_recovery_queue(&identity.record, std::slice::from_ref(&queued)).unwrap();
         let snapshot = Snapshot {
             exited: true,
+            queued_messages: vec![preview],
             session_id: source.launch.session_id.clone(),
             items: vec![std::sync::Arc::new(chat::Item {
                 started_at: None,
@@ -1090,6 +1318,28 @@ os.waitpid(pid,0)
             })],
             ..Default::default()
         };
+        #[cfg(target_os = "macos")]
+        {
+            save(
+                true,
+                &identity,
+                &proof,
+                &source,
+                &[],
+                None,
+                Err("fixture unknown account"),
+                source.launch.session_id.as_deref(),
+                &snapshot,
+                None,
+                false,
+            )
+            .unwrap();
+            let legacy_path = path(&identity.record).unwrap();
+            assert!(!legacy_path.exists());
+            assert!(close_proved(&identity, &proof, &source).unwrap());
+            assert!(!close_proved_with_scope(&identity, &proof, &source, true).unwrap());
+            std::fs::remove_file(legacy_path.with_extension("final-spared")).unwrap();
+        }
         save(
             true,
             &identity,
@@ -1097,18 +1347,23 @@ os.waitpid(pid,0)
             &source,
             &[],
             None,
-            Err("fixture unknown account"),
+            Ok(&captured),
             source.launch.session_id.as_deref(),
             &snapshot,
+            Some(recovery_digest),
+            #[cfg(target_os = "macos")]
+            true,
         )
         .unwrap();
         let receipt = RetirementReceipt {
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: true,
             installed: true,
             identity: identity.clone(),
             proof: proof.clone(),
             source: source.clone(),
             previous_sources: Vec::new(),
-            launch_account_scope: Err("fixture unknown account".into()),
+            launch_account_scope: Ok(captured.clone()),
             confirmed_session: source.launch.session_id.clone(),
             paired_holder: None,
         };
@@ -1168,10 +1423,37 @@ os.waitpid(pid,0)
             read(&identity, &proof, &source).is_err(),
             "a released transcript is never served as the actor's final state"
         );
-        assert!(matches!(
-            inspect_retirement(&identity.record, &proof).unwrap(),
-            RetirementInspection::Verified(_)
-        ));
+        // The first resume can lose its response after the actor is gone and
+        // compaction ran. A retry still has precisely the issued final queue.
+        for _ in 0..2 {
+            let RetirementInspection::Verified(retired) =
+                inspect_retirement(&identity.record, &proof).unwrap()
+            else {
+                panic!("the retired provider's queue must remain recoverable");
+            };
+            assert_eq!(
+                retired.queue_for(&source),
+                Some(chat::ExitedQueue {
+                    messages: vec![queued.clone()],
+                    account_scope: Some(captured.queue_fingerprint()),
+                    confirmed_session: source.launch.session_id.clone(),
+                })
+            );
+            let mut different_source = source.clone();
+            different_source
+                .launch
+                .recipe
+                .arguments
+                .push("--other-pane".into());
+            assert_eq!(retired.queue_for(&different_source), None);
+        }
+        save_at(&recovery_path(&identity.record).unwrap(), b"wrong body").unwrap();
+        let RetirementInspection::Verified(retired) =
+            inspect_retirement(&identity.record, &proof).unwrap()
+        else {
+            panic!("damaged queue data cannot revoke a separate retirement proof");
+        };
+        assert_eq!(retired.queue_for(&source), None);
         assert!(retirement_proved(&identity, &proof).unwrap());
         assert!(
             retired_actor_receipt(&identity.record, &proof)
@@ -1287,7 +1569,11 @@ os.waitpid(pid,0)
                 title: Some("final".into()),
                 ..Default::default()
             },
+            #[cfg(target_os = "macos")]
+            detached_cleanup_proved: false,
             compacted: false,
+            queue_retained: false,
+            queue_digest: None,
         };
         save_at(&path, &serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert_eq!(

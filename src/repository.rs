@@ -30,6 +30,8 @@ use std::{
 mod branch_census;
 pub use branch_census::{Divergence, RefTip};
 mod complete_inventory;
+#[cfg(target_os = "macos")]
+pub(crate) use complete_inventory::resolved_git_executable;
 mod pr_checkout;
 mod pr_creation;
 #[cfg(any(test, feature = "test-support"))]
@@ -602,6 +604,11 @@ pub struct ChangedPath {
     /// against absence; binary, conflicted, and unreadable paths stay unmeasured.
     pub added_lines: Option<u64>,
     pub removed_lines: Option<u64>,
+    /// The object the index holds for this path, on a tracked change. A
+    /// path staged again with different contents keeps its status code, and
+    /// this is what tells its staged and unstaged comparisons are out of date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_oid: Option<String>,
 }
 
 /// One path in a committed comparison (branch or commit diff), which has no
@@ -971,6 +978,49 @@ pub enum FileInventoryRead {
     Changed(Box<FileInventory>),
 }
 
+/// Identifies everything one [`RepositorySnapshot`] was read from; see
+/// [`RepositoryService::snapshot_if_changed`]. Opaque: it is only ever
+/// compared with the digest of a later read of the same worktree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SnapshotDigest([u8; 32]);
+
+#[cfg(any(test, feature = "test-support"))]
+impl SnapshotDigest {
+    /// A digest no read produces, for tests of what holds one.
+    pub fn fixture(seed: u8) -> Self {
+        Self([seed; 32])
+    }
+}
+
+/// What one [`RepositoryService::snapshot_if_changed`] read found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SnapshotRead {
+    /// The worktree reads exactly as the caller's digest describes, so the
+    /// snapshot it holds still stands and nothing past the listing was read.
+    Unchanged,
+    Changed {
+        snapshot: Box<RepositorySnapshot>,
+        /// `None` when a changed file was written too recently to be told
+        /// apart from a later write; the next read is then a full one.
+        digest: Option<SnapshotDigest>,
+    },
+}
+
+/// A file modified at most this long before a snapshot read began may be
+/// modified again with the same timestamp, so its identity proves nothing.
+/// Two seconds covers the coarsest timestamps a worktree may sit on (FAT's).
+pub const SNAPSHOT_RACY_WINDOW: Duration = Duration::from_secs(2);
+
+/// The reads [`RepositoryService::snapshot_if_changed`] decides on.
+struct SnapshotListing {
+    status: StatusSnapshot,
+    status_output: Vec<u8>,
+    files: ProcessOutput,
+    remotes_command: CommandSpec,
+    remotes: ProcessOutput,
+    refs: ProcessOutput,
+}
+
 /// The paths one worktree's index tracks, for watching them.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IndexPaths {
@@ -1262,6 +1312,22 @@ pub struct StageRequest {
 pub struct UnstageRequest {
     pub worktree: PathBuf,
     pub selection: Vec<PathSelection>,
+}
+
+/// Hunks of one file's diff, for [`RepositoryService::apply_index_patch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPatchRequest {
+    pub worktree: PathBuf,
+    pub path: RepoPath,
+    /// The index text the hunks were cut from. The patch applies only while
+    /// the index entry still holds exactly these bytes, so it never lands on
+    /// text the user was not shown.
+    pub index: String,
+    /// The patch's `@@` sections, with no file header.
+    pub hunks: String,
+    /// When staging, the working-tree text the added lines were read from;
+    /// `None` when they come from the index or HEAD, as unstaging's do.
+    pub worktree_text: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1937,6 +2003,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
                     submodule,
                     added_lines: None,
                     removed_lines: None,
+                    index_oid: None,
                 });
             }
             b'?' => {
@@ -1951,6 +2018,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
                     submodule: false,
                     added_lines: None,
                     removed_lines: None,
+                    index_oid: None,
                 });
             }
             // Only reported with `--ignored`, which this service never passes;
@@ -2006,6 +2074,8 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
 struct ChangedRecord<'a> {
     xy: &'a [u8],
     submodule: bool,
+    /// `hI`, absent for a deletion staged from the index.
+    index_oid: Option<String>,
     path: &'a [u8],
 }
 
@@ -2023,9 +2093,15 @@ fn parse_changed_record<'a>(
             "XY status must contain two bytes",
         ));
     }
+    // A staged deletion has an all-zero `hI`: there is nothing in the index.
+    let index_oid = std::str::from_utf8(fields[7])
+        .ok()
+        .filter(|oid| is_hex_oid(oid) && oid.bytes().any(|byte| byte != b'0'))
+        .map(str::to_owned);
     Ok(ChangedRecord {
         xy,
         submodule: fields[2].first() == Some(&b'S'),
+        index_oid,
         path: fields[count - 1],
     })
 }
@@ -2077,6 +2153,7 @@ fn push_changed_entries(
             submodule: record.submodule,
             added_lines: None,
             removed_lines: None,
+            index_oid: record.index_oid.clone(),
         });
     }
     Ok(())
@@ -2664,6 +2741,104 @@ fn file_inventory_digest(files: &[u8], status: &[u8]) -> FileInventoryDigest {
     FileInventoryDigest(hasher.finalize().into())
 }
 
+/// SHA-256 over the snapshot's options, every raw listing, and the filesystem
+/// identity of every path status reports, or `None` when one of those paths
+/// was modified or changed at or after `racy_after`.
+///
+/// Status alone cannot stand for the line counts: an unstaged file edited
+/// again keeps its status line, and an untracked file's line is only its
+/// name. Their contents cannot change without changing the identity hashed
+/// here, except within one timestamp tick, which the racy window excludes.
+/// The ctime is checked as well as the mtime because a copy that restores
+/// the mtime (`cp -p`, `rsync -t`) leaves only the ctime current.
+///
+/// Not covered: configuration that changes line counts without changing
+/// status, such as `.git/info/attributes` or a `diff` driver. A read after
+/// any other change picks it up.
+///
+/// A path stamped in the future, as an archive or a skewed network
+/// filesystem can leave it, counts as racy until the clock passes it. Every
+/// read runs in full until then; none is ever wrongly reported unchanged.
+fn snapshot_digest(
+    worktree: &Path,
+    options: SnapshotOptions,
+    listing: &SnapshotListing,
+    racy_after: std::time::SystemTime,
+) -> Option<SnapshotDigest> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::MetadataExt;
+
+    let mut hasher = Sha256::new();
+    let part = |hasher: &mut Sha256, bytes: &[u8]| {
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(bytes);
+    };
+    part(&mut hasher, worktree.as_os_str().as_encoded_bytes());
+    part(
+        &mut hasher,
+        &[
+            u8::from(options.untracked_changes),
+            u8::from(options.untracked_files),
+        ],
+    );
+    part(&mut hasher, &listing.status_output);
+    part(&mut hasher, &listing.files.stdout);
+    part(
+        &mut hasher,
+        &listing.remotes.exit_code.unwrap_or(-1).to_le_bytes(),
+    );
+    part(&mut hasher, &listing.remotes.stdout);
+    part(&mut hasher, &listing.refs.stdout);
+    for entry in &listing.status.entries {
+        let Ok(metadata) = fs::symlink_metadata(worktree.join(entry.path.as_path())) else {
+            hasher.update([0]);
+            continue;
+        };
+        let changed = std::time::UNIX_EPOCH
+            + Duration::new(
+                metadata.ctime().max(0) as u64,
+                metadata.ctime_nsec().clamp(0, 999_999_999) as u32,
+            );
+        if changed >= racy_after
+            || metadata
+                .modified()
+                .map_or(true, |modified| modified >= racy_after)
+        {
+            return None;
+        }
+        hasher.update([1]);
+        for field in [
+            metadata.dev(),
+            metadata.ino(),
+            u64::from(metadata.mode()),
+            metadata.size(),
+            metadata.mtime() as u64,
+            metadata.mtime_nsec() as u64,
+            metadata.ctime() as u64,
+            metadata.ctime_nsec() as u64,
+        ] {
+            hasher.update(field.to_le_bytes());
+        }
+    }
+    Some(SnapshotDigest(hasher.finalize().into()))
+}
+
+/// Parses `git config --get-regexp ^remote\.`, whose exit 1 only means the
+/// repository has no remotes configured.
+fn remote_records(
+    command: &CommandSpec,
+    output: ProcessOutput,
+) -> Result<Vec<RemoteRecord>, RepositoryError> {
+    if output.success {
+        let parsed = parse_remote_config(&output.stdout);
+        invalid_output(parsed, output)
+    } else if output.exit_code == Some(1) {
+        Ok(Vec::new())
+    } else {
+        Err(git_failure(command, output).into())
+    }
+}
+
 /// Parses `git ls-files -t -z` index records into each path and whether its
 /// entry is skip-worktree (`S`). Conflict stages repeat a path.
 fn parse_tagged_index_paths(output: &[u8]) -> Result<Vec<(RepoPath, bool)>, GitParseError> {
@@ -2887,6 +3062,77 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
         Ok(text) => DiffSide::Text { text, bytes: size },
         Err(_) => DiffSide::InvalidUtf8 { bytes: size },
     }
+}
+
+/// Checks that `body` is only `@@` sections whose lines match the counts in
+/// their headers, as [`RepositoryService::apply_index_patch`] needs: nothing
+/// after them may reach `git apply` as a further file's patch.
+fn validate_hunks(body: &str) -> Result<(), &'static str> {
+    fn counts(header: &str) -> Option<(u64, u64)> {
+        let (ranges, _) = header.strip_prefix("@@ -")?.split_once(" @@")?;
+        let (old, new) = ranges.split_once(" +")?;
+        let number = |digits: &str| {
+            digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+        };
+        let count = |range: &str| {
+            let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+            number(start).and(number(count))
+        };
+        Some((count(old)?, count(new)?))
+    }
+    let mut lines = body.split_inclusive('\n').peekable();
+    if lines.peek().is_none() {
+        return Err("the patch has no hunks");
+    }
+    while let Some(header) = lines.next() {
+        let (mut old, mut new) = counts(header).ok_or("the patch has a malformed hunk header")?;
+        if old == 0 && new == 0 {
+            return Err("the patch has an empty hunk");
+        }
+        while old > 0 || new > 0 {
+            let line = lines
+                .next()
+                .filter(|line| line.ends_with('\n'))
+                .ok_or("a hunk is shorter than its header says")?;
+            match line.as_bytes()[0] {
+                b' ' if old > 0 && new > 0 => (old, new) = (old - 1, new - 1),
+                b'-' if old > 0 => old -= 1,
+                b'+' if new > 0 => new -= 1,
+                _ => return Err("a hunk line does not match its header"),
+            }
+            // The line before it has no final newline.
+            lines.next_if(|line| line.starts_with("\\ ") && line.ends_with('\n'));
+        }
+    }
+    Ok(())
+}
+
+/// A patch file name as Git writes one: bare when it is plain printable
+/// ASCII, otherwise C-quoted, which `git apply` reads back exactly.
+fn quote_patch_name(name: &[u8]) -> Vec<u8> {
+    if name
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        return name.to_vec();
+    }
+    let mut quoted = vec![b'"'];
+    for &byte in name {
+        match byte {
+            b'"' | b'\\' => quoted.extend_from_slice(&[b'\\', byte]),
+            b'\t' => quoted.extend_from_slice(b"\\t"),
+            b'\n' => quoted.extend_from_slice(b"\\n"),
+            b' ' => quoted.push(b' '),
+            byte if byte.is_ascii_graphic() => quoted.push(byte),
+            byte => quoted.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+        }
+    }
+    quoted.push(b'"');
+    quoted
 }
 
 /// Reads one comparison side from the worktree.
@@ -3829,6 +4075,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parsed, output)
     }
 
+    /// Refuses removing `worktree` while its detached HEAD holds commits that
+    /// no branch, remote-tracking branch or tag contains. Removing the
+    /// worktree drops its HEAD, the one thing that points at them, so they
+    /// would be lost without a word. A worktree on a branch keeps its commits
+    /// on that branch and is never refused.
+    ///
+    /// The count runs from `repository` against the commit Git listed, so it
+    /// works for a worktree whose directory is already gone. A count that
+    /// fails or times out refuses too: removal is never authorized blind.
+    pub fn refuse_losing_detached_commits(
+        &self,
+        repository: &Path,
+        worktree: &WorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        if !worktree.detached {
+            return Ok(());
+        }
+        let Some(head) = worktree.head_oid.as_deref() else {
+            return Err(
+                "Git listed this worktree's HEAD as detached without a commit, \
+                 so the worktree was kept."
+                    .into(),
+            );
+        };
+        let short = head.get(..12).unwrap_or(head);
+        let command = self
+            .git_read(
+                repository,
+                [
+                    "rev-list",
+                    "--count",
+                    head,
+                    "--not",
+                    "--branches",
+                    "--remotes",
+                    "--tags",
+                ],
+            )
+            .timeout(Duration::from_secs(30))
+            .output_limits(64, 64 * 1024);
+        let count = self
+            .run_checked(&command, cancellation)
+            .map_err(RepositoryError::from)
+            .and_then(|output| {
+                let parsed = parse_utf8_line(&output.stdout, "rev-list count")?;
+                parsed
+                    .parse::<u64>()
+                    .map_err(|_| RepositoryError::InvalidOutput {
+                        field: "rev-list count",
+                        reason: "count is not a number".into(),
+                    })
+            })
+            .map_err(|error| {
+                format!(
+                    "Could not check whether detached HEAD {short} has commits on no branch, \
+                     tag or remote, so the worktree was kept: {error}"
+                )
+            })?;
+        match count {
+            0 => Ok(()),
+            count => Err(format!(
+                "Detached HEAD {short} has {count} commit{} on no branch, tag or remote, \
+                 which deleting the worktree would lose. Keep {} on a branch first, \
+                 for example with `git branch NAME {short}`.",
+                if count == 1 { "" } else { "s" },
+                if count == 1 { "it" } else { "them" },
+            )),
+        }
+    }
+
     /// Line counts for one uncommitted area. The staged form compares HEAD to
     /// the index and also works on an unborn branch, where Git compares against
     /// the empty tree.
@@ -4066,13 +4383,24 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         untracked: bool,
         cancellation: &CancellationToken,
     ) -> Result<StatusSnapshot, RepositoryError> {
+        self.status_with_output(worktree, untracked, cancellation)
+            .map(|(status, _)| status)
+    }
+
+    /// [`Self::status_with_untracked`] with the raw output it parsed.
+    fn status_with_output(
+        &self,
+        worktree: &Path,
+        untracked: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(StatusSnapshot, Vec<u8>), RepositoryError> {
         let command = self.status_command_with_untracked(worktree, untracked);
         let output = self.run_checked(&command, cancellation)?;
         let parsed = parse_status(&output.stdout);
         match parsed {
             Ok(mut status) => {
                 status.untracked_omitted = !untracked;
-                Ok(status)
+                Ok((status, output.stdout))
             }
             Err(error) => Err(RepositoryError::InvalidGitOutput {
                 error,
@@ -4098,8 +4426,107 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
-        let mut status =
-            self.status_with_untracked(worktree, options.untracked_changes, cancellation)?;
+        let listing = self.snapshot_listing(worktree, options, cancellation)?;
+        self.complete_snapshot(worktree, listing, cancellation)
+    }
+
+    /// [`Self::snapshot_with_options`] for a caller that already holds the
+    /// snapshot `previous` describes.
+    ///
+    /// Status, the file listing, remotes and refs are always read: together
+    /// with the identity of every changed file they are what decides whether
+    /// anything changed. Only when something did are the two `diff --numstat`
+    /// walks run and untracked files read for their line counts, which on a
+    /// large change set cost several times the status read itself.
+    ///
+    /// The digest covers each changed path's inode, size, mode, mtime and
+    /// ctime, so rewriting a file that was already modified, which leaves its
+    /// status line exactly as it was, still reads as a change. A file written
+    /// within [`SNAPSHOT_RACY_WINDOW`] of the read could be written again
+    /// within the same timestamp tick, so such a read returns no digest and
+    /// the next one is read in full. The window is measured on this
+    /// machine's clock, so a network filesystem whose server runs more than
+    /// that far behind can defeat it.
+    pub fn snapshot_if_changed(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        previous: Option<&SnapshotDigest>,
+        cancellation: &CancellationToken,
+    ) -> Result<SnapshotRead, RepositoryError> {
+        let racy_after = std::time::SystemTime::now()
+            .checked_sub(SNAPSHOT_RACY_WINDOW)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        self.snapshot_settled_before(worktree, options, previous, racy_after, cancellation)
+    }
+
+    /// [`Self::snapshot_if_changed`] trusting the identity of files last
+    /// written before `racy_after`.
+    fn snapshot_settled_before(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        previous: Option<&SnapshotDigest>,
+        racy_after: std::time::SystemTime,
+        cancellation: &CancellationToken,
+    ) -> Result<SnapshotRead, RepositoryError> {
+        let listing = self.snapshot_listing(worktree, options, cancellation)?;
+        let digest = snapshot_digest(worktree, options, &listing, racy_after);
+        if digest.is_some() && digest.as_ref() == previous {
+            return Ok(SnapshotRead::Unchanged);
+        }
+        let snapshot = self.complete_snapshot(worktree, listing, cancellation)?;
+        Ok(SnapshotRead::Changed {
+            snapshot: Box::new(snapshot),
+            digest,
+        })
+    }
+
+    /// The reads that decide whether a snapshot changed, parsed only as far
+    /// as finding the changed paths.
+    fn snapshot_listing(
+        &self,
+        worktree: &Path,
+        options: SnapshotOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<SnapshotListing, RepositoryError> {
+        let (status, status_output) =
+            self.status_with_output(worktree, options.untracked_changes, cancellation)?;
+
+        let files_command = if options.untracked_files {
+            self.working_files_command(worktree)
+        } else {
+            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
+        };
+        let files = self.run_checked(&files_command, cancellation)?;
+        let remotes_command = self.remotes_command(worktree);
+        let remotes = self.run(&remotes_command, cancellation)?;
+        let refs = self.run_checked(&self.refs_command(worktree), cancellation)?;
+        Ok(SnapshotListing {
+            status,
+            status_output,
+            files,
+            remotes_command,
+            remotes,
+            refs,
+        })
+    }
+
+    /// Everything a listing leaves out: line counts and the parsed records.
+    fn complete_snapshot(
+        &self,
+        worktree: &Path,
+        listing: SnapshotListing,
+        cancellation: &CancellationToken,
+    ) -> Result<RepositorySnapshot, RepositoryError> {
+        let SnapshotListing {
+            mut status,
+            files,
+            remotes_command,
+            remotes,
+            refs,
+            ..
+        } = listing;
         for (staged, area) in [(true, ChangeArea::Staged), (false, ChangeArea::Unstaged)] {
             let output = self.run_checked(&self.numstat_command(worktree, staged), cancellation)?;
             let parsed = parse_numstat(&output.stdout);
@@ -4108,20 +4535,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         }
         measure_untracked(worktree, &mut status.entries, cancellation);
 
-        let files_command = if options.untracked_files {
-            self.working_files_command(worktree)
-        } else {
-            self.git_read(worktree, ["ls-files", "-tc", "--exclude-standard", "-z"])
-        };
-        let output = self.run_checked(&files_command, cancellation)?;
-        let parsed = parse_working_files(&output.stdout);
-        let files = invalid_output(parsed, output)?;
-
-        let remotes = self.remotes(worktree, cancellation)?;
-
-        let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
-        let parsed = parse_refs(&output.stdout);
-        let refs = invalid_output(parsed, output)?;
+        let parsed = parse_working_files(&files.stdout);
+        let files = invalid_output(parsed, files)?;
+        let remotes = remote_records(&remotes_command, remotes)?;
+        let parsed = parse_refs(&refs.stdout);
+        let refs = invalid_output(parsed, refs)?;
 
         Ok(RepositorySnapshot {
             status,
@@ -4145,16 +4563,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<Vec<RemoteRecord>, RepositoryError> {
         let command = self.remotes_command(worktree);
         let output = self.run(&command, cancellation)?;
-        // `--get-regexp` exits 1 when nothing matches, which only means the
-        // repository has no remotes configured.
-        if output.success {
-            let parsed = parse_remote_config(&output.stdout);
-            invalid_output(parsed, output)
-        } else if output.exit_code == Some(1) {
-            Ok(Vec::new())
-        } else {
-            Err(git_failure(&command, output).into())
-        }
+        remote_records(&command, output)
     }
 
     /// The commit HEAD points at, or `None` on an unborn branch.
@@ -5239,6 +5648,91 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .stdin(pathspec_input(&indexed));
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
+    }
+
+    /// Applies hunks of one file's diff to its index entry, leaving the
+    /// working tree alone: staging or unstaging part of a file.
+    ///
+    /// The request carries only the `@@` sections; the header naming the
+    /// file is written here, from the validated path, so a patch can never
+    /// reach another one. `git apply` checks every context line against the
+    /// index and writes it once or not at all, so a hunk built from a
+    /// comparison the index has since moved past is refused, not misapplied.
+    pub fn apply_index_patch(
+        &self,
+        request: &IndexPatchRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let worktree = request.worktree.as_path();
+        let path = &request.path;
+        let rejected = |reason: String| {
+            Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            })
+        };
+        if let Err(problem) = validate_hunks(&request.hunks) {
+            return rejected(format!("{path}: {problem}"));
+        }
+        if let Some(text) = &request.worktree_text {
+            // The new lines are the working file's bytes, as shown. Where
+            // Git's clean filters would change those bytes on staging, as
+            // autocrlf, an eol attribute or LFS do, they are not what
+            // staging the file would record.
+            let hash = |filter: OsString| {
+                let arguments = [OsString::from("hash-object"), filter, "--stdin".into()];
+                self.run_checked(
+                    &self
+                        .git_literal_read(worktree, arguments)
+                        .stdin(text.as_bytes()),
+                    cancellation,
+                )
+                .map(|output| output.stdout)
+            };
+            let mut filtered = OsString::from("--path=");
+            filtered.push(path.as_os_str());
+            if hash(filtered)? != hash("--no-filters".into())? {
+                return rejected(format!(
+                    "{path}: Git converts this file when staging it, so stage the whole file"
+                ));
+            }
+        }
+        let mut entry = OsString::from(":0:");
+        entry.push(path.as_os_str());
+        let index = self.run(
+            &self.git_literal_read(worktree, [OsString::from("cat-file"), "blob".into(), entry]),
+            cancellation,
+        )?;
+        if !index.success || index.stdout != request.index.as_bytes() {
+            return rejected(format!(
+                "{path} changed in the index since this diff was read; try again once it refreshes"
+            ));
+        }
+        let name = |side: &[u8]| {
+            let mut name = side.to_vec();
+            name.extend_from_slice(path.as_bytes());
+            quote_patch_name(&name)
+        };
+        let (old, new) = (name(b"a/"), name(b"b/"));
+        let mut patch = b"diff --git ".to_vec();
+        for (part, separator) in [(&old, &b" "[..]), (&new, b"\n--- "), (&old, b"\n+++ ")] {
+            patch.extend_from_slice(part);
+            patch.extend_from_slice(separator);
+        }
+        patch.extend_from_slice(&new);
+        patch.push(b'\n');
+        patch.extend_from_slice(request.hunks.as_bytes());
+        let command = self
+            .git_mutation(worktree, ["apply", "--cached", "--whitespace=nowarn", "-"])
+            .stdin(patch);
+        Ok(self.run_mutation(
+            &command,
+            vec![path.clone()],
+            MutationScope::AllOrNothing,
+            cancellation,
+        ))
     }
 
     /// Whether `core.sparseCheckout` is on for this worktree.
@@ -7931,6 +8425,37 @@ mod tests {
     }
 
     #[test]
+    fn a_tracked_change_names_what_the_index_holds() {
+        let staged = "1111111111111111111111111111111111111111";
+        let restaged = "2222222222222222222222222222222222222222";
+        let none = "0000000000000000000000000000000000000000";
+        let input = format!(
+            "# branch.oid {staged}\0# branch.head main\x001 MM N... 100644 100644 100644 {staged} {restaged} file\x001 D. N... 100644 000000 000000 {staged} {none} gone\0"
+        );
+        let status = parse_status(input.as_bytes()).unwrap();
+        let oids = status
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.as_path().to_str().unwrap(),
+                    entry.index_oid.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Both halves of a staged and modified file compare against the same
+        // index object, and a staged deletion leaves none.
+        assert_eq!(
+            oids,
+            [
+                ("file", Some(restaged)),
+                ("file", Some(restaged)),
+                ("gone", None)
+            ]
+        );
+    }
+
+    #[test]
     fn rejects_missing_rename_source_and_malformed_ab() {
         assert!(parse_status(b"2 R. N... 100644 100644 100644 a b R100 path\0").is_err());
         assert!(parse_status(b"# branch.ab +x -2\0").is_err());
@@ -7997,11 +8522,14 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         mod scale_support {
             include!("../tests/support/repository_scale.rs");
         }
+        #[cfg(target_os = "linux")]
         use scale_support::isolated_large_pathspec_test;
 
+        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
         #[test]
         fn small_membership_queries_do_not_enumerate_large_index_or_head_tree() {
             isolated_large_pathspec_test(
@@ -8235,6 +8763,129 @@ mod tests {
         }
 
         #[test]
+        fn a_snapshot_reads_unchanged_until_anything_it_shows_changes() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("tracked.txt"), "one\n").unwrap();
+            git(root, &["add", "tracked.txt"]);
+            git(root, &["commit", "-m", "base"]);
+            fs::write(root.join("tracked.txt"), "one\ntwo\n").unwrap();
+            fs::write(root.join("untracked.txt"), "a\n").unwrap();
+            let cancel = CancellationToken::new();
+            // Every write below finished before its read began, so none is
+            // racy; the window itself has its own test.
+            let read_with = |options: SnapshotOptions, previous: Option<&SnapshotDigest>| {
+                service()
+                    .snapshot_settled_before(
+                        root,
+                        options,
+                        previous,
+                        std::time::SystemTime::now(),
+                        &cancel,
+                    )
+                    .unwrap()
+            };
+            let read = |previous| read_with(SnapshotOptions::default(), previous);
+            let changed = |read: SnapshotRead| match read {
+                SnapshotRead::Changed { snapshot, digest } => {
+                    (*snapshot, digest.expect("no write is racy"))
+                }
+                SnapshotRead::Unchanged => panic!("the read should have seen a change"),
+            };
+            let added = |snapshot: &RepositorySnapshot, area: ChangeArea| {
+                snapshot.status.area(area).next().unwrap().added_lines
+            };
+
+            let (first, digest) = changed(read(None));
+            assert_eq!(added(&first, ChangeArea::Unstaged), Some(1));
+            assert_eq!(read(Some(&digest)), SnapshotRead::Unchanged);
+
+            // Editing a file that is already modified leaves its status line
+            // as it was; only the line counts move.
+            fs::write(root.join("tracked.txt"), "one\ntwo\nthree\n").unwrap();
+            let (edited, digest) = changed(read(Some(&digest)));
+            assert_eq!(edited.status.entries.len(), first.status.entries.len());
+            assert_eq!(added(&edited, ChangeArea::Unstaged), Some(2));
+
+            // A rewrite of the same size is told apart by its times alone.
+            // Two writes this close can share a coarse timestamp, which the
+            // racy window exists for, so this one names its own mtime.
+            fs::write(root.join("tracked.txt"), "one\nTWO\nthree\n").unwrap();
+            fs::File::options()
+                .write(true)
+                .open(root.join("tracked.txt"))
+                .unwrap()
+                .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000))
+                .unwrap();
+            let (_, digest) = changed(read(Some(&digest)));
+
+            // An untracked file's status line is only its name.
+            fs::write(root.join("untracked.txt"), "a\nb\nc\n").unwrap();
+            let (grown, digest) = changed(read(Some(&digest)));
+            assert_eq!(added(&grown, ChangeArea::Untracked), Some(3));
+
+            // Staging changes the index and nothing in the worktree.
+            git(root, &["add", "tracked.txt"]);
+            let (staged, digest) = changed(read(Some(&digest)));
+            assert_eq!(added(&staged, ChangeArea::Staged), Some(2));
+
+            // A new branch or remote moves no file but is listed.
+            git(root, &["branch", "topic"]);
+            let (branched, digest) = changed(read(Some(&digest)));
+            assert_eq!(branched.local_refs.len(), 2);
+            git(
+                root,
+                &["remote", "add", "origin", "https://example.invalid/r"],
+            );
+            let (remote, digest) = changed(read(Some(&digest)));
+            assert_eq!(remote.remotes.len(), 1);
+
+            // A read the caller asks for differently is a different read.
+            let collapsed = SnapshotOptions {
+                untracked_changes: false,
+                untracked_files: true,
+            };
+            assert!(matches!(
+                read_with(collapsed, Some(&digest)),
+                SnapshotRead::Changed { .. }
+            ));
+            assert_eq!(read(Some(&digest)), SnapshotRead::Unchanged);
+        }
+
+        /// A file written just now could be written again within the same
+        /// timestamp tick, so its identity is not trusted to stand for it.
+        #[test]
+        fn a_freshly_written_change_is_never_reported_unchanged() {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "-b", "main"]);
+            fs::write(root.join("fresh.txt"), "one\n").unwrap();
+            let cancel = CancellationToken::new();
+            let SnapshotRead::Changed { digest, .. } = service()
+                .snapshot_if_changed(root, SnapshotOptions::default(), None, &cancel)
+                .unwrap()
+            else {
+                panic!("a read without a digest always reads in full");
+            };
+            assert_eq!(digest, None);
+            // The same file is trusted once it was written before the cutoff.
+            let SnapshotRead::Changed { digest, .. } = service()
+                .snapshot_settled_before(
+                    root,
+                    SnapshotOptions::default(),
+                    None,
+                    std::time::SystemTime::now(),
+                    &cancel,
+                )
+                .unwrap()
+            else {
+                panic!("a read without a digest always reads in full");
+            };
+            assert!(digest.is_some());
+        }
+
+        #[test]
         fn collapsed_untracked_snapshot_skips_untracked_status_and_file_listing() {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
@@ -8385,7 +9036,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let root = directory.path();
             git(root, &["init", "-b", "feature"]);
+            #[cfg(target_os = "linux")]
             let unusual = RepoPath::from_bytes(b":(glob)*\n\xff").unwrap();
+            #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+            let unusual = RepoPath::from_bytes(":(glob)*\n雪".as_bytes()).unwrap();
             for name in ["old.txt", "deleted.txt", "unselected.txt"] {
                 fs::write(root.join(name), b"base\n").unwrap();
             }
@@ -12282,12 +12936,12 @@ mod tests {
         refs.extend_from_slice(b"\0\0\0*\n");
         let service = fake_service(vec![
             success(&status),
-            success(b"4\t1\tsrc/main.rs\0"),
-            success(b""),
             success(b"H src/main.rs\0H Cargo.toml\0"),
             // No remotes configured.
             exit(1, b""),
             success(&refs),
+            success(b"4\t1\tsrc/main.rs\0"),
+            success(b""),
         ]);
         let snapshot = service
             .snapshot(worktree.path(), &CancellationToken::new())
@@ -12313,9 +12967,9 @@ mod tests {
         assert!(snapshot.remotes.is_empty());
         assert_eq!(snapshot.local_refs.len(), 1);
         let commands = service.executor.commands.lock().unwrap();
-        assert!(commands[1].arguments.contains(&OsString::from("--cached")));
-        assert!(!commands[2].arguments.contains(&OsString::from("--cached")));
-        assert_eq!(commands[3].arguments.last(), Some(&OsString::from("-z")));
+        assert_eq!(commands[1].arguments.last(), Some(&OsString::from("-z")));
+        assert!(commands[4].arguments.contains(&OsString::from("--cached")));
+        assert!(!commands[5].arguments.contains(&OsString::from("--cached")));
     }
 
     #[test]
@@ -12406,11 +13060,11 @@ mod tests {
         status.extend_from_slice(b"? new.txt\0");
         let service = fake_service(vec![
             success(&status),
-            success(b""),
-            success(b""),
             success(b"? new.txt\0H Cargo.toml\0H src/main.rs\0"),
             // No remotes configured.
             exit(1, b""),
+            success(b""),
+            success(b""),
             success(b""),
         ]);
         let snapshot = service
@@ -12424,6 +13078,60 @@ mod tests {
         );
         assert_eq!(snapshot.files.tracked_count, 2);
         assert_eq!(snapshot.status.dirty.untracked, 1);
+    }
+
+    /// The reads past the listing are what an unchanged worktree is spared:
+    /// both numstat walks, and with them every untracked file's contents.
+    #[test]
+    fn an_unchanged_snapshot_runs_only_the_listing_reads() {
+        let mut status = status_headers();
+        status.extend_from_slice(b"? new.txt\0");
+        let listing = || {
+            vec![
+                success(&status),
+                success(b"? new.txt\0H Cargo.toml\0"),
+                exit(1, b""),
+                success(b""),
+            ]
+        };
+        // An empty worktree: the listed file is absent, so nothing is racy.
+        let worktree = tempfile::tempdir().unwrap();
+        let mut outputs = listing();
+        outputs.extend([success(b""), success(b"")]);
+        let read = fake_service(outputs)
+            .snapshot_if_changed(
+                worktree.path(),
+                SnapshotOptions::default(),
+                None,
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let SnapshotRead::Changed {
+            digest: Some(digest),
+            ..
+        } = read
+        else {
+            panic!("an absent path is not racy: {read:?}");
+        };
+
+        let executor = Arc::new(FakeExecutor::with_outputs(listing()));
+        let read = RepositoryService::new("git", Arc::clone(&executor))
+            .snapshot_if_changed(
+                worktree.path(),
+                SnapshotOptions::default(),
+                Some(&digest),
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        assert_eq!(read, SnapshotRead::Unchanged);
+        let commands = executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(
+            commands
+                .iter()
+                .all(|command| !command.arguments.contains(&OsString::from("--numstat"))),
+            "{commands:?}"
+        );
     }
 
     #[test]
@@ -15893,7 +16601,7 @@ mod worktree_journal_tests {
         let mut intended_child = intended_command.spawn().unwrap();
         let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
         let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        let mut unrelated = Command::new("/bin/true");
+        let mut unrelated = Command::new("true");
         // SAFETY: only async-signal-safe read/write on live inherited fds.
         unsafe {
             unrelated.pre_exec(move || {

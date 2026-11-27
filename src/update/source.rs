@@ -11,11 +11,15 @@ use super::{UpdateError, impact, invalid};
 use crate::{
     control::{ControlClient, ControlError},
     model::HostSessionProof,
+    pinned_process::{PinnedProcess, peer_credentials},
 };
+#[cfg(test)]
 use std::{
     fs::{self, File},
+    os::fd::AsRawFd,
+};
+use std::{
     io,
-    os::fd::{AsRawFd, FromRawFd},
     os::unix::net::UnixStream,
     path::{Path, PathBuf},
     time::{Duration, Instant},
@@ -23,7 +27,7 @@ use std::{
 
 /// A source daemon authenticated at the protocol it serves: its exact local
 /// peer is pinned and rechecked against the kernel-held lease per request.
-pub(crate) struct Client {
+pub struct Client {
     pub(super) client: ControlClient,
     pub(super) peer: Peer,
     /// How long requests the source refuses as busy are asked again.
@@ -73,7 +77,7 @@ const SOURCE_BUSY_PATIENCE: Duration = Duration::from_secs(30);
 
 /// How long source requests refused as busy keep being asked again.
 #[derive(Clone, Copy, Debug)]
-pub(crate) enum BusyPatience {
+pub enum BusyPatience {
     /// Each request may be asked again for this long.
     PerRequest(Duration),
     /// Every request shares this deadline, so a run of several requests ends
@@ -87,7 +91,7 @@ impl BusyPatience {
     pub(crate) const PER_REQUEST: Self = Self::PerRequest(SOURCE_BUSY_PATIENCE);
     /// Each request is asked once; a busy refusal is final.
     #[cfg(any(feature = "host", test))]
-    pub(crate) const ONCE: Self = Self::PerRequest(Duration::ZERO);
+    pub const ONCE: Self = Self::PerRequest(Duration::ZERO);
 
     /// One deadline, `patience` from now, for every request that uses it.
     pub(crate) fn shared_for(patience: Duration) -> Self {
@@ -185,12 +189,17 @@ fn prepare_reply(reply: Result<(u64, u64), ControlError>) -> Result<(u64, u64), 
 
 pub(crate) struct Peer {
     pid: u32,
-    start: String,
-    process: File,
+    /// Pinned from the socket's kernel-recorded peer, so a later process
+    /// reusing the number cannot authenticate this connection.
+    process: PinnedProcess,
     socket: PathBuf,
 }
 
 impl Peer {
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
     /// Authenticate an already verified serving proof without protocol discovery.
     pub(super) fn confirm_serving(
         socket: &Path,
@@ -209,39 +218,19 @@ impl Peer {
     }
 
     pub(super) fn observe(stream: &UnixStream, socket: &Path) -> Result<Self, UpdateError> {
-        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
-        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
-        // SAFETY: both buffers have the exact initialized kernel ABI layout.
-        if unsafe {
-            libc::getsockopt(
-                stream.as_raw_fd(),
-                libc::SOL_SOCKET,
-                libc::SO_PEERCRED,
-                (&mut credentials as *mut libc::ucred).cast(),
-                &mut length,
-            )
-        } != 0
-        {
-            return Err(io::Error::last_os_error().into());
-        }
-        if length as usize != std::mem::size_of::<libc::ucred>()
-            || credentials.uid != crate::daemon::current_uid()
-            || credentials.pid <= 1
-        {
+        let credentials = peer_credentials(stream)?;
+        if credentials.uid != crate::daemon::current_uid() || credentials.pid <= 1 {
             return Err(invalid("The upgrade source is not an owned local daemon"));
         }
-        // Pin the original socket peer before observing its process epoch.
-        // A later reused numeric PID cannot authenticate this connection.
-        // SAFETY: pidfd_open takes scalar arguments and returns a new owned FD.
-        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, credentials.pid, 0) };
-        if descriptor < 0 {
-            return Err(io::Error::last_os_error().into());
-        }
-        // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
-        let process = unsafe { File::from_raw_fd(descriptor as i32) };
+        let process = PinnedProcess::open(credentials.pid).map_err(|error| {
+            if error.kind() == io::ErrorKind::NotFound {
+                invalid("The original upgrade source has exited or changed")
+            } else {
+                error.into()
+            }
+        })?;
         let peer = Self {
-            pid: credentials.pid as u32,
-            start: process_start(credentials.pid as u32)?,
+            pid: credentials.pid,
             process,
             socket: socket.to_owned(),
         };
@@ -265,35 +254,29 @@ impl Peer {
 
     pub(super) fn executable(&self) -> Result<PathBuf, UpdateError> {
         self.alive()?;
-        let executable = fs::read_link(format!("/proc/{}/exe", self.pid))?;
-        self.alive()?;
-        Ok(executable)
+        self.process
+            .executable()
+            .map_err(|error| self.vanished(error))
     }
 
     fn alive(&self) -> Result<(), UpdateError> {
-        let mut poll = libc::pollfd {
-            fd: self.process.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: poll points to one initialized writable pollfd.
-        if unsafe { libc::poll(&mut poll, 1, 0) } != 0 || process_start(self.pid)? != self.start {
+        if self.process.exited()? {
             return Err(invalid("The original upgrade source has exited or changed"));
         }
         Ok(())
     }
-}
 
-fn process_start(pid: u32) -> Result<String, UpdateError> {
-    let raw = fs::read_to_string(format!("/proc/{pid}/stat"))?;
-    raw.rsplit_once(')')
-        .and_then(|(_, fields)| fields.split_whitespace().nth(19))
-        .map(str::to_owned)
-        .ok_or_else(|| invalid("The upgrade source process epoch is unavailable"))
+    fn vanished(&self, error: io::Error) -> UpdateError {
+        if error.kind() == io::ErrorKind::NotFound {
+            invalid("The original upgrade source has exited or changed")
+        } else {
+            error.into()
+        }
+    }
 }
 
 impl Client {
-    pub(crate) fn connect(socket: &Path) -> Result<Self, ControlError> {
+    pub fn connect(socket: &Path) -> Result<Self, ControlError> {
         if crate::device::is_remote() {
             return Err(ControlError::Configure(io::Error::other(
                 "Cross-version application upgrades require the local source daemon",
@@ -446,11 +429,11 @@ impl Client {
         self.peer.pid
     }
 
-    pub(crate) fn protocol(&self) -> u16 {
+    pub fn protocol(&self) -> u16 {
         self.client.protocol()
     }
 
-    pub(crate) fn proof(&self) -> &HostSessionProof {
+    pub fn proof(&self) -> &HostSessionProof {
         self.client.proof()
     }
 
@@ -565,7 +548,7 @@ impl Client {
 
     /// Capture history once, immediately before a confirmed service stop. The
     /// returned snapshot is not evidence that shutdown was accepted.
-    pub(crate) fn capture_chat_snapshot(
+    pub fn capture_chat_snapshot(
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, UpdateError> {
@@ -603,8 +586,7 @@ impl InstalledIdentity {
             (Some(before), Some(current), Some(proof), Some(after_proof))
                 if self.protocol == after.protocol
                     && proof == after_proof
-                    && before.pid == current.pid
-                    && before.start == current.start
+                    && matches!(before.process.is_same_process(&current.process), Ok(true))
                     && before.socket == current.socket =>
             {
                 before.verify(proof)?;
@@ -624,7 +606,7 @@ impl InstalledIdentity {
         match (&self.peer, &self.proof, executable) {
             (Some(peer), Some(proof), Some(expected)) => {
                 peer.verify(proof)?;
-                let current = fs::read_link(format!("/proc/{}/exe", peer.pid))?;
+                let current = peer.executable()?;
                 if current != expected {
                     return Err(invalid(
                         "The installed source owner changed before worker selection",
@@ -655,8 +637,8 @@ impl InstalledIdentity {
 /// readiness checks on every qualified source. A source sends the chat
 /// events in [`UNSOLICITED_SINCE`] unasked once its protocol has them.
 /// Keep this beside source admission so adding support always runs the proof.
-#[cfg(test)]
-pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
     (
         "ClientRequest",
         &[
@@ -731,8 +713,8 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
 /// Chat events a source sends attached clients unasked, from the protocol
 /// that introduced each. The source clients accept them, so a source serving
 /// one must send it as this build reads it.
-#[cfg(test)]
-pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
     ("ServerMessage", "chat_limit", 160),
     ("ServerMessage", "chat_agent_addresses", 173),
     ("ServerMessage", "chat_active_model", 182),
@@ -742,8 +724,8 @@ pub(crate) const UNSOLICITED_SINCE: &[(&str, &str, u16)] = &[
 /// Lifecycle requests and their replies that the source clients use only with
 /// a source whose protocol has them, from the protocol that introduced each.
 /// From there they are frozen like the rest of [`LIFECYCLE_VARIANTS`].
-#[cfg(test)]
-pub(crate) const LIFECYCLE_SINCE: &[(&str, &str, u16)] = &[
+#[cfg(any(test, feature = "test-support"))]
+pub const LIFECYCLE_SINCE: &[(&str, &str, u16)] = &[
     ("ClientRequest", "ListPage", 190),
     ("ServerResponse", "listed_page", 190),
 ];
@@ -805,6 +787,18 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
         protocol: 198,
         // The signed releases 0.2.0 to 0.2.3 all serve it.
         release: "0.2.0–0.2.3",
+    },
+    ReleasedSource {
+        protocol: 203,
+        release: "0.2.4+local.cf5aa63a2",
+    },
+    ReleasedSource {
+        protocol: 208,
+        release: "0.2.4 local builds",
+    },
+    ReleasedSource {
+        protocol: 209,
+        release: "0.2.4 local builds",
     },
 ];
 
@@ -894,10 +888,22 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         202,
         "intermediate #3840 protocol; no release qualified as a live-update source",
     ),
+    (
+        205,
+        "intermediate #3959 protocol; superseded by 206 without a qualified installed update source",
+    ),
+    (
+        206,
+        "#4227 protocol; main encoded the queue-hold capability at an unrecorded position and no installed update source was qualified",
+    ),
+    (
+        207,
+        "intermediate #4235 protocol; no released install was qualified as a live-update source",
+    ),
 ];
 
-#[cfg(test)]
-pub(crate) fn protocols() -> impl Iterator<Item = u16> {
+#[cfg(any(test, feature = "test-support"))]
+pub fn protocols() -> impl Iterator<Item = u16> {
     RELEASED_SOURCES
         .iter()
         .map(|source| source.protocol)
@@ -908,7 +914,7 @@ pub(crate) fn protocols() -> impl Iterator<Item = u16> {
 /// Whether a live update may start from a daemon serving this protocol. Every
 /// qualified source speaks this release's wire for the frozen lifecycle and
 /// inspector subset, so one client serves them all.
-pub(crate) fn is_qualified_source(protocol: u16) -> bool {
+pub fn is_qualified_source(protocol: u16) -> bool {
     protocol == crate::terminal_ipc::PROTOCOL_VERSION
         || RELEASED_SOURCES
             .iter()
@@ -1563,6 +1569,9 @@ mod admission_message_tests {
                 187,
                 191,
                 198,
+                203,
+                208,
+                209,
                 crate::terminal_ipc::PROTOCOL_VERSION
             ]
         );
@@ -1582,7 +1591,9 @@ mod admission_message_tests {
                  protocol 173 (0.1.3+local.43678f2fb), protocol 175 (0.1.3+local.c73002744), \
                  protocol 177 (0.1.3+local.374370965), protocol 178 (0.1.3+local.3b1e81a4d), \
                  protocol 179 (0.1.3+local.43f253ef8), protocol 187 (0.1.3+local.ccd4134c6), \
-                 protocol 191 (0.1.3+local.e8bbb84f2), protocol 198 (0.2.0–0.2.3) and protocol {}.",
+                 protocol 191 (0.1.3+local.e8bbb84f2), protocol 198 (0.2.0–0.2.3), \
+                 protocol 203 (0.2.4+local.cf5aa63a2), protocol 208 (0.2.4 local builds), \
+                 protocol 209 (0.2.4 local builds) and protocol {}.",
                 crate::terminal_ipc::PROTOCOL_VERSION
             )));
             assert!(message.contains("did not request preparation or shutdown"));

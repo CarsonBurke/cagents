@@ -2303,6 +2303,7 @@ fn worktree_rename_uses_the_old_baseline_and_suppresses_the_source_row() {
             unstaged: true,
             status: Some(" R".into()),
             directory: false,
+            index_oid: None,
         }]
     );
 }
@@ -2336,6 +2337,7 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: true,
                 status: Some("??".into()),
                 directory: false,
+                index_oid: None,
             },
             RepositoryFile {
                 path: PathBuf::from("renamed.md"),
@@ -2345,6 +2347,8 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: false,
                 status: Some("R ".into()),
                 directory: false,
+                // The object Git stores for the staged contents.
+                index_oid: Some("4eea88a852fde1261c409090a7aae3f0d957e349".into()),
             },
             RepositoryFile {
                 path: PathBuf::from("tracked.md"),
@@ -2354,6 +2358,7 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: true,
                 status: Some(" M".into()),
                 directory: false,
+                index_oid: Some("9b0bc14618e153a36acf33348cda02d0082f4470".into()),
             },
         ]
     );
@@ -2450,6 +2455,7 @@ fn save_completion_keeps_edits_made_while_the_write_was_in_flight_dirty() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let mut document = EditorDocument::unlinked(
         path.clone(),
@@ -3140,6 +3146,7 @@ fn obsolete_save_completion_cannot_change_document_or_release_navigation_fence()
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let mut document = EditorDocument::unlinked(
         path.clone(),
@@ -3258,6 +3265,7 @@ fn active_save_rejects_open_reload_and_discard_transitions() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let identity = AsyncIdentity {
         card,
@@ -3471,6 +3479,7 @@ fn file_list_refresh_does_not_obsolete_a_pending_document_load() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.document = DocumentState::Loading { predecessor: None };
 
@@ -3508,6 +3517,7 @@ fn file_list_refresh_does_not_obsolete_a_pending_document_load() {
             unstaged: false,
             status: Some("M ".into()),
             directory: false,
+            index_oid: None,
         }]),
     });
 
@@ -3544,6 +3554,7 @@ fn file_list_refresh_does_not_obsolete_an_active_save() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let identity = AsyncIdentity {
         card,
@@ -3942,6 +3953,7 @@ fn inspector_projection_tracks_loading_conflict_and_active_diff_facts() {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.files = FileListState::Ready(vec![file.clone()]);
     runtime.selected = Some(file);
@@ -3963,6 +3975,9 @@ fn inspector_projection_tracks_loading_conflict_and_active_diff_facts() {
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: Vec::new(),
             split_rows: Vec::new(),
             inline_change_starts: vec![0, 2],
@@ -4028,6 +4043,7 @@ fn direct_diff_basis_action_cannot_select_an_absent_basis() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.diff_basis = DiffBasis::IndexToWorktree;
     let card = CardId::new();
@@ -4059,6 +4075,7 @@ fn successful_save_invalidates_hidden_diff_then_loads_fresh_changes_on_demand() 
             unstaged: !tracked,
             status: (!tracked).then(|| "??".into()),
             directory: false,
+            index_oid: None,
         });
         let mut document = EditorDocument::unlinked(
             path.clone(),
@@ -4152,6 +4169,7 @@ fn diff_completions_are_fenced_per_basis_and_preserve_the_active_viewport() {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.diff_basis = DiffBasis::IndexToWorktree;
     runtime.diff_change = 2;
@@ -4227,6 +4245,7 @@ fn stale_file_completion_cannot_replace_current_selection() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.document = DocumentState::Loading { predecessor: None };
     let stale = AsyncIdentity {
@@ -4959,12 +4978,16 @@ fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.set_diff_state(
         DiffBasis::IndexToWorktree,
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: vec![inline; 100_000],
             split_rows: vec![split; 100_000],
             inline_change_starts: vec![0, 50_000, 99_999],
@@ -5951,6 +5974,9 @@ fn change_navigation_realizes_far_rows_before_programmatic_scroll() {
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: vec![
                 InlineDiffRow {
                     old_line: Some(1),
@@ -8551,6 +8577,7 @@ fn diff_runtime(card: CardId) -> (RepositoryRuntime, AsyncIdentity) {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.generation = 1;
     runtime.files = FileListState::Ready(vec![file.clone()]);
@@ -8578,6 +8605,9 @@ fn model_with(additions: u32) -> DiffModel {
     DiffModel {
         line_counts: [0; 2],
         before: Arc::from(""),
+        after: Arc::from(""),
+        hunks: Vec::new(),
+        absent: [false; 2],
         inline_rows: Vec::new(),
         split_rows: Vec::new(),
         inline_change_starts: Vec::new(),
@@ -9064,6 +9094,7 @@ fn opening_an_image_reconciles_the_mounted_file_list_and_renders_pixels() {
         unstaged: true,
         status: Some("??".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.files = FileListState::Ready(vec![file.clone()]);
     let mut tree = Tree::new(view(card, &runtime).as_widget());
@@ -9618,7 +9649,7 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
     run_git(root.path(), ["add", "tracked.txt"]);
 
     let cancellation = CancellationToken::new();
-    let FileListRead::Listed(Some(digest), files) =
+    let FileListRead::Listed(Some((digest, _)), files) =
         read_repository_files(root.path(), None, &cancellation).unwrap()
     else {
         panic!("a read with nothing to compare against always lists");
@@ -11994,4 +12025,424 @@ fn a_language_chosen_through_a_link_is_the_shown_files_choice() {
         runtime.shown_language_choice(),
         Some(DocumentLanguage::PlainText)
     );
+}
+
+/// A one-page document has no pages to turn, so its toolbar offers no page
+/// controls; a longer one offers all four.
+#[test]
+fn a_one_page_document_draws_no_page_controls() {
+    use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
+    let renderer = headless_renderer();
+    let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+    let message = None;
+    let names = |pages: usize| -> Vec<String> {
+        let mut element = pdf_document_view(
+            CardId::new(),
+            pages,
+            rendering_view(0, crate::editor::PdfTone::Original),
+            &handle,
+            1,
+            1,
+            612.0,
+            false,
+            &message,
+        );
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 700.0)),
+        );
+        let nodes =
+            element
+                .as_widget()
+                .a11y_nodes(Layout::new(&node), &tree, mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter_map(|node| node.node().label().map(ToOwned::to_owned))
+            .collect()
+    };
+    let controls = ["First page", "Previous page", "Next page", "Last page"];
+    let one = names(1);
+    assert!(
+        one.iter().any(|name| name == "Draw the page larger"),
+        "{one:?}"
+    );
+    for control in controls {
+        assert!(
+            !one.iter().any(|name| name == control),
+            "{control}: {one:?}"
+        );
+    }
+    let three = names(3);
+    for control in controls {
+        assert!(
+            three.iter().any(|name| name == control),
+            "{control}: {three:?}"
+        );
+    }
+}
+
+/// Staging new contents of a file that was already staged and modified
+/// leaves its `MM` as it was; only the index object says the comparisons
+/// against the index are out of date.
+#[test]
+fn restaging_a_file_under_the_same_status_refreshes_its_comparisons() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
+    let staged = Some("1111111111111111111111111111111111111111".to_owned());
+    runtime
+        .selected
+        .as_mut()
+        .unwrap()
+        .index_oid
+        .clone_from(&staged);
+    let selected = runtime.selected.clone().unwrap();
+    let FileListState::Ready(files) = &runtime.files else {
+        panic!("file list")
+    };
+    let mut files = files.clone();
+    let file = files
+        .iter_mut()
+        .find(|file| file.path == selected.path)
+        .unwrap();
+    file.index_oid = Some("2222222222222222222222222222222222222222".into());
+    assert_eq!(file.status, selected.status, "the same status code");
+    runtime.file_list_loading = true;
+    runtime.background_file_refresh = true;
+    let identity = AsyncIdentity {
+        card,
+        path: ".".into(),
+        worktree: runtime.descriptor.worktree.clone(),
+        generation: runtime.file_list_generation,
+    };
+    let task = runtime.update(RepositoryAction::FilesLoaded {
+        identity,
+        result: Ok(files),
+    });
+    assert!(task.units() > 0, "the selected file's status is read again");
+    assert!(
+        !runtime.diffs.iter().any(|(basis, state)| {
+            !basis.is_immutable() && matches!(state, DiffState::Ready(..))
+        }),
+        "no comparison against the old index is kept as current"
+    );
+}
+
+/// A save marks the selected row modified without learning what the index
+/// holds, so the listed index object that the next read brings is not news:
+/// the visible comparison stays.
+#[test]
+fn a_listed_index_object_the_selection_never_recorded_keeps_its_comparisons() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
+    let selected = runtime.selected.clone().unwrap();
+    assert_eq!(selected.index_oid, None, "a save records no index object");
+    let FileListState::Ready(files) = &runtime.files else {
+        panic!("file list")
+    };
+    let mut files = files.clone();
+    let file = files
+        .iter_mut()
+        .find(|file| file.path == selected.path)
+        .unwrap();
+    *file = RepositoryFile {
+        index_oid: Some("1111111111111111111111111111111111111111".into()),
+        ..selected.clone()
+    };
+    runtime.file_list_loading = true;
+    runtime.background_file_refresh = true;
+    let identity = AsyncIdentity {
+        card,
+        path: ".".into(),
+        worktree: runtime.descriptor.worktree.clone(),
+        generation: runtime.file_list_generation,
+    };
+    let _ = runtime.update(RepositoryAction::FilesLoaded {
+        identity,
+        result: Ok(files),
+    });
+    assert!(
+        matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Ready(..))
+        ),
+        "the visible comparison is kept"
+    );
+}
+
+/// A digest of some real read; only the `HEAD` deposited beside it matters.
+fn any_inventory_digest() -> FileInventoryDigest {
+    let root = tempdir().unwrap();
+    git_fixture(root.path());
+    let FileListRead::Listed(Some((digest, _)), _) =
+        read_repository_files(root.path(), None, &CancellationToken::new()).unwrap()
+    else {
+        panic!("a first read lists");
+    };
+    digest
+}
+
+fn list_identity(runtime: &RepositoryRuntime, card: CardId) -> AsyncIdentity {
+    AsyncIdentity {
+        card,
+        path: ".".into(),
+        worktree: runtime.descriptor.worktree.clone(),
+        generation: runtime.file_list_generation,
+    }
+}
+
+/// The read that first sees a commit is the only one that sees `HEAD`
+/// move, whether the periodic refresh or the reader asked for it, so it
+/// retires the staged and unstaged comparisons even though no row changed.
+#[test]
+fn a_moved_head_retires_the_comparisons_against_the_old_index() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
+    runtime.set_diff_state(
+        DiffBasis::HeadToIndex,
+        DiffState::ready(staged_text_diff(crate::diff_view::build_diff(
+            "old\n", "new\n",
+        ))),
+    );
+    runtime.list_head = Some(Some("1".repeat(40)));
+    *runtime.file_list_deposit.lock().unwrap() = Some(ListDeposit {
+        generation: runtime.file_list_generation,
+        digest: any_inventory_digest(),
+        head: Some("2".repeat(40)),
+    });
+    let FileListState::Ready(files) = &runtime.files else {
+        panic!("file list")
+    };
+    let files = files.clone();
+    runtime.file_list_loading = true;
+    runtime.background_file_refresh = false;
+    let identity = list_identity(&runtime, card);
+    let _ = runtime.update(RepositoryAction::FilesLoaded {
+        identity,
+        result: Ok(files),
+    });
+    for basis in [DiffBasis::HeadToIndex, DiffBasis::IndexToWorktree] {
+        assert!(
+            !matches!(runtime.diff_state(&basis), Some(DiffState::Ready(..))),
+            "{basis:?} is not kept as current"
+        );
+    }
+}
+
+/// A comparison Git cannot name for a `HEAD` is not asked for again on
+/// every read, while one set aside only because a save began meanwhile is.
+#[test]
+fn a_committed_comparison_is_named_again_once_per_head() {
+    let card = CardId::new();
+    let (mut runtime, identity) = working_diff_runtime(card, "old\n", "new\n");
+    let shown = DiffBasis::CommitToParent {
+        oid: fixture_oid(1),
+        parent: Some(fixture_oid(2)),
+    };
+    runtime.diff_basis = shown.clone();
+    runtime.list_head = Some(Some(fixture_oid(3).as_str().into()));
+    let unchanged = |runtime: &mut RepositoryRuntime| {
+        let identity = list_identity(runtime, card);
+        runtime
+            .update(RepositoryAction::FileListUnchanged { identity })
+            .units()
+    };
+    assert!(unchanged(&mut runtime) > 0, "a moved HEAD asks");
+    assert_eq!(unchanged(&mut runtime), 0, "once at a time");
+    let _ = runtime.update(RepositoryAction::DiffBasisRefreshed {
+        identity: identity.clone(),
+        previous: shown.clone(),
+        result: Err("git failed".into()),
+    });
+    assert_eq!(
+        unchanged(&mut runtime),
+        0,
+        "a failure for this HEAD is final"
+    );
+    assert_eq!(runtime.diff_basis, shown, "and keeps the old comparison");
+
+    runtime.list_head = Some(Some(fixture_oid(4).as_str().into()));
+    assert!(unchanged(&mut runtime) > 0, "a newer HEAD asks again");
+    let DocumentState::Editable(document) = &mut runtime.document else {
+        panic!("an editable buffer")
+    };
+    document.active_save = Some(SaveTicket {
+        id: 1,
+        identity: identity.clone(),
+        revision: document.revision,
+        history_revision: u64::MAX,
+        snapshot_source: document.content.text_snapshot(),
+        snapshot: document.content.text(),
+    });
+    let _ = runtime.update(RepositoryAction::DiffBasisRefreshed {
+        identity,
+        previous: shown.clone(),
+        result: Ok(ResolvedBasis::Ready(DiffBasis::CommitToParent {
+            oid: fixture_oid(4),
+            parent: Some(fixture_oid(3)),
+        })),
+    });
+    assert_eq!(runtime.diff_basis, shown, "not replaced under a save");
+    let DocumentState::Editable(document) = &mut runtime.document else {
+        panic!("an editable buffer")
+    };
+    document.active_save = None;
+    assert!(unchanged(&mut runtime) > 0, "asked again after the save");
+}
+
+/// Each hunk of the working comparison stages as its own patch against the
+/// index, built from the comparison on screen; a comparison the buffer has
+/// moved past offers nothing to stage.
+#[test]
+fn each_working_hunk_stages_as_its_own_index_patch() {
+    let card = CardId::new();
+    let before = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+    let after = "a\nB\nc\nd\ne\nf\ng\nh\nI\nj\n";
+    let (mut runtime, _) = working_diff_runtime(card, before, after);
+    let model = runtime.current_diff_model().unwrap().clone();
+    assert_eq!(model.hunks.len(), 2);
+    assert_eq!(
+        runtime.hunk_offers(),
+        HunkOffers {
+            stage: Some(true),
+            revert: true
+        }
+    );
+    for index in 0..model.hunks.len() {
+        let hunk = &model.hunk_ref(index).unwrap();
+        let Some(HunkStaging::Patch(request)) = runtime.hunk_staging(hunk, true) else {
+            panic!("hunk {index} stages as a patch");
+        };
+        assert_eq!(
+            request.hunks,
+            model.hunk_patch(index, PatchTarget::Before).unwrap()
+        );
+        assert_eq!(request.index, *model.before);
+        assert_eq!(request.worktree_text.as_deref(), Some(&*model.after));
+        assert_eq!(request.path.as_os_str(), "notes.txt");
+        // Staging is not unstaging.
+        assert_eq!(runtime.hunk_staging(hunk, false), None);
+    }
+    // A hunk with the same lines from another comparison names nothing here.
+    let elsewhere = crate::diff_view::build_diff(before, after);
+    assert_eq!(elsewhere.hunks, model.hunks);
+    assert_eq!(
+        runtime.hunk_staging(&elsewhere.hunk_ref(0).unwrap(), true),
+        None
+    );
+    // An admitted Git mutation retires every hunk action until the refresh
+    // after it: reverting a hunk it is staging would split index and file.
+    assert!(runtime.can_revert_hunks());
+    runtime.index_mutation_started();
+    assert_eq!(
+        runtime.hunk_staging(&model.hunk_ref(0).unwrap(), true),
+        None
+    );
+    assert!(!runtime.can_revert_hunks());
+    runtime.index_mutation_finished();
+    assert!(runtime.can_revert_hunks());
+    runtime.source_surface = SourceSurface::Editor;
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+    }));
+    assert_ne!(buffer_text(&runtime), after);
+    assert_eq!(
+        runtime.hunk_staging(&model.hunk_ref(0).unwrap(), true),
+        None
+    );
+    assert!(!runtime.can_revert_hunks());
+
+    // A refresh for any other reason, such as a save or Refresh, does not
+    // end a mutation; only the host's report of its completion does.
+    let (mut runtime, _) = working_diff_runtime(card, before, after);
+    runtime.index_mutation_started();
+    drop(runtime.refresh_after_mutation(card));
+    assert!(runtime.index_mutation_in_flight);
+    runtime.index_mutation_finished();
+    assert!(!runtime.index_mutation_in_flight);
+}
+
+/// Reverting one hunk edits the buffer, CR and missing final newline
+/// included, and one Undo in the editor brings the change back.
+#[test]
+fn reverting_a_hunk_is_one_undoable_buffer_edit() {
+    let card = CardId::new();
+    for (before, after) in [
+        (
+            "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\n",
+            "one\r\n2\r\nthree\r\nfour\r\nfive\r\nsix\r\n7\r\n",
+        ),
+        ("a\nb\nc\nd\ne\nf\ng\nh\n", "a\nb\nc\nd\ne\nf\ng\nh\ni"),
+        ("keep\nold\n", "keep\n"),
+    ] {
+        let (mut runtime, _) = working_diff_runtime(card, before, after);
+        let model = runtime.current_diff_model().unwrap().clone();
+        let last = model.hunks.len() - 1;
+        let hunk = model.hunk_ref(last).unwrap();
+        drop(runtime.update(RepositoryAction::RevertHunk { card, hunk }));
+        let (span, restored) = model.hunk_reversal(last).unwrap();
+        let mut expected = after.to_owned();
+        expected.replace_range(span, restored);
+        assert_eq!(buffer_text(&runtime), expected, "{after:?}");
+        assert!(runtime.is_dirty());
+        // The comparison now lags the buffer, so nothing else can revert
+        // against it until it is rebuilt.
+        assert!(!runtime.can_revert_hunks());
+        // History steps belong to the editor, where the revert is undone.
+        runtime.source_surface = SourceSurface::Editor;
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), after, "{after:?}");
+    }
+}
+
+/// The staged comparison unstages against the index, its new side, and has
+/// no buffer to revert; a created file is one hunk staged as the file.
+#[test]
+fn staged_hunks_unstage_and_a_new_file_stages_whole() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "a\nb\n", "a\nB\n");
+    let mut staged = crate::diff_view::build_diff("a\nb\n", "a\nB\n");
+    runtime.diff_basis = DiffBasis::HeadToIndex;
+    runtime.set_diff_state(
+        DiffBasis::HeadToIndex,
+        DiffState::ready(staged_text_diff(staged.clone())),
+    );
+    assert_eq!(
+        runtime.hunk_offers(),
+        HunkOffers {
+            stage: Some(false),
+            revert: false
+        }
+    );
+    let Some(HunkStaging::Patch(request)) =
+        runtime.hunk_staging(&staged.hunk_ref(0).unwrap(), false)
+    else {
+        panic!("a staged hunk unstages as a patch");
+    };
+    assert_eq!(
+        request.hunks,
+        staged.hunk_patch(0, PatchTarget::After).unwrap()
+    );
+    assert_eq!(request.index, *staged.after);
+    assert_eq!(request.worktree_text, None);
+
+    staged.absent = [true, false];
+    runtime.selected = Some(RepositoryFile {
+        path: PathBuf::from("notes.txt"),
+        staged: true,
+        status: Some("A ".into()),
+        ..RepositoryFile::default()
+    });
+    runtime.set_diff_state(
+        DiffBasis::HeadToIndex,
+        DiffState::ready(staged_text_diff(staged.clone())),
+    );
+    assert!(matches!(
+        runtime.hunk_staging(&staged.hunk_ref(0).unwrap(), false),
+        Some(HunkStaging::File(selection)) if selection.path.as_os_str() == "notes.txt"
+    ));
 }

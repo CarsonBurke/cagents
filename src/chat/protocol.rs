@@ -25,6 +25,21 @@ pub(crate) fn unknown_tool(provider: &str, tool: &str) -> String {
     format!("{provider} called a tool that doesn't exist: {tool}")
 }
 
+/// Whether a form's scalar answer was left blank, which reads as the field
+/// being absent rather than as an empty value.
+///
+/// The UI answers every field a form shows, so a field the reader left
+/// untouched, or typed into and cleared, arrives as no value; one empty
+/// string means the same. An adapter omits a blank optional field from its
+/// reply and reports a blank required one as missing.
+pub(crate) fn blank_form_answer(values: &[String]) -> bool {
+    match values {
+        [] => true,
+        [only] => only.is_empty(),
+        _ => false,
+    }
+}
+
 /// Startup recovery for the same card and exact conversation. Unavailable
 /// means another attempt may succeed after an external condition changes;
 /// it promises neither immediate success nor automatic replay of uncertain
@@ -80,18 +95,18 @@ pub enum TransportSpec {
 pub struct ProcessSpec {
     /// Private spawn evidence and an optional caller-validated directory. Never
     /// serialized into launch recipes or provider configuration.
-    pub(crate) execution: Option<std::sync::Arc<ExecutionContext>>,
+    pub execution: Option<std::sync::Arc<ExecutionContext>>,
     /// Recognizes the messages the daemon delivered among the prompts the
     /// transcript records, so they are shown as messages rather than as the
     /// user's own words.
-    pub(crate) messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
+    pub messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     /// Opt-in tolerance for non-JSON lines on JSON-lines stdout. `None` keeps
     /// such output immediately fatal. The function reports whether a skipped
     /// line hides a protocol frame, which must never be dropped silently.
-    pub(crate) stdout_noise: Option<fn(&[u8]) -> bool>,
+    pub stdout_noise: Option<fn(&[u8]) -> bool>,
     /// The Work tracker reads this conversation from cagents' own record,
     /// so the record remembers every change from the start for it.
-    pub(crate) followed: bool,
+    pub followed: bool,
     pub transport: TransportSpec,
     pub program: String,
     pub arguments: Vec<String>,
@@ -129,7 +144,7 @@ impl From<&crate::model::LaunchRecipe> for ProcessSpec {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum LaunchOutcome {
+pub enum LaunchOutcome {
     #[default]
     NoProvider,
     TeardownProved,
@@ -139,7 +154,7 @@ pub(crate) enum LaunchOutcome {
 /// An exact owner, retained until startup is installed or cleanup is proved.
 /// Implementations must be bounded and idempotent; a caller timeout or an
 /// unverified process exit is not a teardown receipt.
-pub(crate) trait LaunchCleanup: Send + Sync {
+pub trait LaunchCleanup: Send + Sync {
     fn cleanup(&self) -> Result<LaunchOutcome, String>;
 }
 
@@ -150,7 +165,7 @@ struct LaunchOwnership {
 }
 
 #[derive(Default)]
-pub(crate) struct ExecutionContext {
+pub struct ExecutionContext {
     pub directory: Option<std::sync::Arc<std::fs::File>>,
     expected_directory: Option<crate::agent_execution::DirectoryIdentity>,
     ownership: std::sync::Mutex<LaunchOwnership>,
@@ -158,15 +173,15 @@ pub(crate) struct ExecutionContext {
 }
 
 impl ExecutionContext {
-    #[cfg(test)]
-    pub(crate) fn capture(path: &std::path::Path) -> Result<Self, String> {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn capture(path: &std::path::Path) -> Result<Self, String> {
         Self::capture_for_start(path).map_err(|error| error.to_string())
     }
 
     /// Pin the selected directory before an ordinary native provider starts.
     /// The descriptor remains authoritative after a same-filesystem move;
     /// opening a replacement at the old spelling never changes its identity.
-    pub(crate) fn capture_for_start(path: &std::path::Path) -> Result<Self, SetupError> {
+    pub fn capture_for_start(path: &std::path::Path) -> Result<Self, SetupError> {
         use std::os::unix::fs::OpenOptionsExt;
         let relative = path.strip_prefix("/").map_err(|_| {
             SetupError::Invalid("The selected provider directory must be absolute".into())
@@ -208,19 +223,19 @@ impl ExecutionContext {
         Ok(context)
     }
 
-    pub(crate) fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
+    pub fn new(directory: Option<std::sync::Arc<std::fs::File>>) -> Self {
         Self {
             directory,
             ..Default::default()
         }
     }
-    pub(crate) fn restored(identity: crate::agent_execution::DirectoryIdentity) -> Self {
+    pub fn restored(identity: crate::agent_execution::DirectoryIdentity) -> Self {
         Self {
             expected_directory: Some(identity),
             ..Default::default()
         }
     }
-    pub(crate) fn directory_identity(
+    pub fn directory_identity(
         &self,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
         self.directory_identity_for_start()
@@ -271,14 +286,14 @@ impl ExecutionContext {
     }
     /// Claim before asynchronous work may spawn, or synchronously at child
     /// creation when the caller itself performs the entire spawn attempt.
-    pub(crate) fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) {
+    pub fn claim_owner(&self, owner: std::sync::Arc<dyn LaunchCleanup>) {
         *self.ownership.lock().unwrap_or_else(|p| p.into_inner()) = LaunchOwnership {
             outcome: LaunchOutcome::Uncertain,
             owner: Some(owner),
         };
     }
-    #[cfg(test)]
-    pub(crate) fn outcome(&self) -> LaunchOutcome {
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn outcome(&self) -> LaunchOutcome {
         self.ownership
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -286,13 +301,13 @@ impl ExecutionContext {
     }
     /// The host's exact actor record now owns cleanup; do not retain a second
     /// strong Handle through the actor's own execution context.
-    pub(crate) fn installed(&self) {
+    pub fn installed(&self) {
         self.ownership
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .owner = None;
     }
-    pub(crate) fn reconcile_cleanup(&self) -> Result<LaunchOutcome, String> {
+    pub fn reconcile_cleanup(&self) -> Result<LaunchOutcome, String> {
         let owner = {
             let state = self.ownership.lock().unwrap_or_else(|p| p.into_inner());
             match &state.owner {
@@ -345,14 +360,11 @@ impl ExecutionContext {
         self.verify_directory(path)?;
         Ok(true)
     }
-    pub(crate) fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
+    pub fn verify_directory(&self, path: &std::path::Path) -> Result<(), String> {
         self.verify_directory_for_start(path)
             .map_err(|error| error.to_string())
     }
-    pub(crate) fn verify_directory_for_start(
-        &self,
-        path: &std::path::Path,
-    ) -> Result<(), SetupError> {
+    pub fn verify_directory_for_start(&self, path: &std::path::Path) -> Result<(), SetupError> {
         let Some(expected) = self.directory_identity_for_start()? else {
             return Ok(());
         };
@@ -390,7 +402,7 @@ impl ProcessSpec {
     /// Remove what the process must not receive: the launch's removals, and
     /// any provider session's identity, which a recipe saved before it was
     /// withheld may still hold.
-    pub(crate) fn withhold_environment(&mut self) {
+    pub fn withhold_environment(&mut self) {
         self.environment.retain(|name, _| {
             !self.unset_environment.contains(name) && !crate::agent::is_session_variable(name)
         });
@@ -476,6 +488,11 @@ pub trait Adapter: Send {
     fn outcome_pending(&self) -> bool {
         false
     }
+    /// Exact inputs still known to be held, in the order they would run.
+    /// `None` means this adapter has no verified recovery queue to report.
+    fn recovery_queue(&self) -> Option<Vec<super::QueuedMessage>> {
+        None
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
@@ -496,6 +513,12 @@ pub trait Adapter: Send {
     fn refresh_metadata(&mut self) -> Option<Step> {
         None
     }
+    /// Whether `frame`, one of this adapter's queued writes, is a request it
+    /// made on its own for display data. A provider that exits cleanly
+    /// before reading such a request lost no input of the reader's.
+    fn expendable_write(&self, _frame: &Value) -> bool {
+        false
+    }
     /// Identity reported by the initialized server on this exact connection.
     /// Only a holder with a verified provider contract can use it for durable
     /// ownership; an executable's separate `--version` output is insufficient.
@@ -503,13 +526,55 @@ pub trait Adapter: Send {
         None
     }
 }
+
+/// Keeps the submitted input alongside the projection shown while it waits.
+/// Most messages fit in the projection, so they need no separate text.
+struct QueuedInput {
+    preview: super::QueuedMessage,
+    full_text: Option<String>,
+}
+
+impl QueuedInput {
+    fn new(
+        id: String,
+        text: String,
+        attachments: Vec<super::Attachment>,
+        delivery: super::QueueDelivery,
+    ) -> Self {
+        let (preview_text, full_text) = if text.len() > super::QueuedMessage::PREVIEW_BYTES {
+            // Let the ordinary preview formatter mark the text as truncated
+            // without cloning the entire input for it.
+            let end = text.ceil_char_boundary(super::QueuedMessage::PREVIEW_BYTES + 1);
+            (text[..end].to_owned(), Some(text))
+        } else {
+            (text, None)
+        };
+        let mut preview = super::QueuedMessage::new(id, preview_text);
+        preview.attachments = attachments;
+        preview.delivery = delivery;
+        Self { preview, full_text }
+    }
+
+    fn recovery(&self) -> super::QueuedMessage {
+        super::QueuedMessage {
+            id: self.preview.id.clone(),
+            text: self
+                .full_text
+                .as_ref()
+                .unwrap_or(&self.preview.text)
+                .clone(),
+            editable: true,
+            delivery: self.preview.delivery,
+            attachments: self.preview.attachments.clone(),
+        }
+    }
+}
+
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     launch.provider.create_chat(launch)
 }
 
-pub(crate) fn create_for_start(
-    launch: &Launch,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
+pub fn create_for_start(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
         crate::agent::Provider::Codex => codex::create_for_start(launch),
         crate::agent::Provider::Claude => claude::create_for_start(launch),
@@ -538,11 +603,11 @@ pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
 
 /// Reconstruct a saved reader without granting permission to launch a provider.
 /// Support is deliberately limited to adapters with a local history transport.
-pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+pub fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     create_history_for_start(launch).map_err(|error| error.to_string())
 }
 
-pub(crate) fn create_history_for_start(
+pub fn create_history_for_start(
     launch: &Launch,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
@@ -627,7 +692,7 @@ mod launch_tests {
 
     #[test]
     fn provider_directory_observation_requires_a_pinned_exact_launch_directory() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let other = root.path().join("other");
         std::fs::create_dir(&original).unwrap();
@@ -663,7 +728,7 @@ mod launch_tests {
 
     #[test]
     fn startup_directory_io_retries_same_pin_but_replacement_and_unsafe_paths_do_not() {
-        let root = tempfile::tempdir().unwrap();
+        let root = crate::test_fixture::tempdir().unwrap();
         let original = root.path().join("original");
         let parked = root.path().join("parked");
         assert!(matches!(

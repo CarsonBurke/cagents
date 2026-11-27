@@ -1,0 +1,2193 @@
+//! Single-writer durable attention, independent of workspace/card persistence.
+use std::{
+    collections::BTreeSet,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
+
+use diesel::{connection::SimpleConnection, prelude::*, sqlite::SqliteConnection};
+use uuid::Uuid;
+
+use crate::notifications::{
+    Event, Notice, Target,
+    review::{Census, ScanPoint},
+};
+
+const MAX_SESSIONS: i64 = 2048;
+const KEYS_PER_SESSION: i64 = 32;
+
+mod schema {
+    diesel::table! {
+        notices (session) {
+            session -> Text,
+            id -> Text,
+            event -> Text,
+            delivered -> Bool,
+            acknowledged -> Bool,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        seen (ordinal) {
+            session -> Text,
+            evidence -> Text,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        owners (session) {
+            session -> Text,
+            window -> Text,
+            ordinal -> BigInt,
+        }
+    }
+    diesel::table! {
+        review_requests_seen (identity) {
+            identity -> Text,
+        }
+    }
+    diesel::table! {
+        portal_group_withdrawals (id) {
+            id -> Text,
+        }
+    }
+    diesel::table! {
+        review_watches (repository) {
+            repository -> Text,
+            watched -> BigInt,
+        }
+    }
+    diesel::table! {
+        review_notice_points (id) {
+            id -> Text,
+            point -> Text,
+        }
+    }
+    diesel::table! {
+        review_censuses (repository, viewer) {
+            repository -> Text,
+            viewer -> Text,
+            sequence -> BigInt,
+            census -> Text,
+        }
+    }
+    diesel::table! {
+        review_census_stamps (repository, viewer) {
+            repository -> Text,
+            viewer -> Text,
+            stamp -> Text,
+        }
+    }
+    diesel::table! {
+        retained_attention_turns (session) {
+            session -> Text,
+            actor -> Text,
+            generation -> BigInt,
+            outcome_through -> BigInt,
+        }
+    }
+    diesel::allow_tables_to_appear_in_same_query!(notices, seen, owners, review_requests_seen);
+}
+use schema::{
+    notices, owners, portal_group_withdrawals, retained_attention_turns, review_census_stamps,
+    review_censuses, review_notice_points, review_requests_seen, review_watches, seen,
+};
+
+// PRAGMAs describe the SQLite connection rather than application rows.
+#[derive(diesel::QueryableByName)]
+struct SchemaVersion {
+    #[diesel(sql_type = diesel::sql_types::Integer)]
+    user_version: i32,
+}
+
+/// A journal connection, with the notices it last decoded.
+pub(super) struct Journal(SqliteConnection, Option<Listed>);
+
+/// What `list` decoded at one revision of the database.
+struct Listed {
+    revision: Revision,
+    notices: Vec<Notice>,
+}
+
+/// Every committed write changes this: `total_changes` counts rows this
+/// connection modified, and `data_version` changes when another connection
+/// commits. A rolled-back write still counts, which only costs a reread.
+#[derive(diesel::QueryableByName, Clone, Copy, PartialEq, Eq)]
+struct Revision {
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    changes: i64,
+    #[diesel(sql_type = diesel::sql_types::BigInt)]
+    data_version: i64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(super) struct Admission {
+    pub superseded: bool,
+    pub retained: Option<(Uuid, u64)>,
+    pub resolved_waiting: bool,
+    pub withdraw_previous: bool,
+}
+
+impl Journal {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        drop(
+            crate::secure_file::open_private_append_file(path)
+                .map_err(|error| error.to_string())?,
+        );
+        // A URI preserves non-UTF8 filesystem names and quotes SQLite's URI
+        // metacharacters. A lossy display path could open a different database.
+        let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let uri = url::Url::from_file_path(absolute)
+            .map_err(|()| "Notification journal path cannot be represented as a file URI")?;
+        let mut connection =
+            SqliteConnection::establish(uri.as_str()).map_err(|error| error.to_string())?;
+        let version: SchemaVersion = diesel::sql_query("PRAGMA user_version")
+            .get_result(&mut connection)
+            .map_err(|error| error.to_string())?;
+        if version.user_version > 3 {
+            return Err("Notification journal was created by a newer cagents version".into());
+        }
+        connection
+            .batch_execute("PRAGMA busy_timeout=1000;")
+            .map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA journal_mode=WAL;")
+            .map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA synchronous=FULL;")
+            .map_err(|error| error.to_string())?;
+        connection.batch_execute("CREATE TABLE IF NOT EXISTS notices (
+                session TEXT PRIMARY KEY, id TEXT NOT NULL, event TEXT NOT NULL,
+                delivered INTEGER NOT NULL, acknowledged INTEGER NOT NULL,
+                ordinal INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS seen (
+                session TEXT NOT NULL, evidence TEXT NOT NULL, ordinal INTEGER PRIMARY KEY AUTOINCREMENT,
+                UNIQUE(session, evidence));
+            CREATE TABLE IF NOT EXISTS owners (session TEXT PRIMARY KEY, window TEXT NOT NULL, ordinal INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_requests_seen (identity TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS portal_group_withdrawals (id TEXT PRIMARY KEY);
+            CREATE TABLE IF NOT EXISTS review_watches (repository TEXT PRIMARY KEY, watched INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_notice_points (id TEXT PRIMARY KEY, point TEXT NOT NULL);
+            CREATE TABLE IF NOT EXISTS review_censuses (repository TEXT NOT NULL, viewer TEXT NOT NULL,
+                sequence INTEGER NOT NULL, census TEXT NOT NULL, PRIMARY KEY(repository,viewer));
+            CREATE INDEX IF NOT EXISTS review_census_sequence ON review_censuses(sequence);
+            CREATE TABLE IF NOT EXISTS review_census_stamps (repository TEXT NOT NULL, viewer TEXT NOT NULL,
+                stamp TEXT NOT NULL, PRIMARY KEY(repository,viewer));
+            INSERT OR IGNORE INTO review_census_stamps (repository,viewer,stamp)
+                SELECT repository,viewer,json_extract(census,'$.start') FROM review_censuses
+                WHERE CASE WHEN json_valid(census) THEN json_type(census,'$.start') = 'object' ELSE 0 END;
+            CREATE TABLE IF NOT EXISTS retained_attention_turns (
+                session TEXT PRIMARY KEY, actor TEXT NOT NULL, generation INTEGER NOT NULL,
+                outcome_through INTEGER NOT NULL);
+            PRAGMA user_version=3;").map_err(|error| error.to_string())?;
+        Ok(Self(connection, None))
+    }
+
+    /// The broker remains the sole writer. A reader can observe committed
+    /// identities while that broker works on presentation and desktop delivery.
+    pub(super) fn open_reader(path: &Path) -> Result<Self, String> {
+        drop(
+            crate::secure_file::open_existing_private_file_readonly(path)
+                .map_err(|error| error.to_string())?,
+        );
+        let absolute = std::path::absolute(path).map_err(|error| error.to_string())?;
+        let mut url = url::Url::from_file_path(absolute)
+            .map_err(|()| "Notification journal path cannot be represented as a file URI")?;
+        url.query_pairs_mut().append_pair("mode", "ro");
+        let mut connection =
+            SqliteConnection::establish(url.as_str()).map_err(|error| error.to_string())?;
+        connection
+            .batch_execute("PRAGMA query_only=ON; PRAGMA busy_timeout=100;")
+            .map_err(|error| error.to_string())?;
+        Ok(Self(connection, None))
+    }
+
+    pub(super) fn unread_session_ids(
+        &mut self,
+        sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<std::collections::BTreeMap<Uuid, crate::model::TerminalId>, String> {
+        notices::table
+            .filter(notices::acknowledged.eq(false))
+            .select((notices::session, notices::id))
+            .limit(MAX_SESSIONS)
+            .load::<(String, String)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .filter_map(|(key, id)| {
+                let session = key
+                    .parse()
+                    .ok()
+                    .filter(|session| sessions.contains(session))?;
+                Some(Uuid::parse_str(&id).map(|id| (id, session)))
+            })
+            .collect::<Result<_, _>>()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(super) fn committed_notices(path: &Path) -> Result<Vec<Notice>, String> {
+        Self::open_reader(path)?.list()
+    }
+
+    pub fn remember_review_watch(&mut self, repository: &str, seconds: i64) -> Result<(), String> {
+        diesel::sql_query(
+            "INSERT INTO review_watches(repository,watched) VALUES (?1,?2)
+             ON CONFLICT(repository) DO UPDATE SET watched=MAX(watched,excluded.watched)",
+        )
+        .bind::<diesel::sql_types::Text, _>(repository)
+        .bind::<diesel::sql_types::BigInt, _>(seconds)
+        .execute(&mut self.0)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+    }
+
+    pub fn last_review_watch(&mut self, repository: &str) -> Result<Option<i64>, String> {
+        review_watches::table
+            .find(repository)
+            .select(review_watches::watched)
+            .first(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn review_census(
+        &mut self,
+        repository: &str,
+        viewer: &str,
+    ) -> Result<Option<Census>, String> {
+        review_censuses::table
+            .find((repository, viewer))
+            .select(review_censuses::census)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// The small ordering fence survives eviction of the full membership map.
+    pub fn review_census_stamp(
+        &mut self,
+        repository: &str,
+        viewer: &str,
+    ) -> Result<Option<ScanPoint>, String> {
+        review_census_stamps::table
+            .find((repository, viewer))
+            .select(review_census_stamps::stamp)
+            .first::<String>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?
+            .map(|value| serde_json::from_str(&value).map_err(|error| error.to_string()))
+            .transpose()
+    }
+
+    /// Accept the census and retire its exact notices together. Replaying a
+    /// committed census must leave legacy observations accepted after it alone.
+    pub fn commit_review_reconciliation(
+        &mut self,
+        acceptance: Option<(&str, &Census)>,
+        ids: Vec<Uuid>,
+    ) -> Result<Vec<Uuid>, String> {
+        if acceptance.is_none() && ids.is_empty() {
+            return Ok(ids);
+        }
+        let acceptance = acceptance
+            .map(|(repository, census)| {
+                Ok::<_, serde_json::Error>((
+                    repository,
+                    &census.viewer,
+                    serde_json::to_string(&census.start)?,
+                    serde_json::to_string(census)?,
+                ))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                if let Some((repository, viewer, stamp, value)) = acceptance {
+                    diesel::insert_into(review_census_stamps::table)
+                        .values((
+                            review_census_stamps::repository.eq(repository),
+                            review_census_stamps::viewer.eq(viewer),
+                            review_census_stamps::stamp.eq(&stamp),
+                        ))
+                        .on_conflict((review_census_stamps::repository, review_census_stamps::viewer))
+                        .do_update()
+                        .set(review_census_stamps::stamp.eq(&stamp))
+                        .execute(connection)?;
+                    diesel::sql_query(
+                        "INSERT INTO review_censuses(repository,viewer,sequence,census)
+                         VALUES (?1,?2,(SELECT coalesce(max(sequence),0)+1 FROM review_censuses),?3)
+                         ON CONFLICT(repository,viewer) DO UPDATE
+                         SET sequence=excluded.sequence,census=excluded.census",
+                    )
+                    .bind::<diesel::sql_types::Text, _>(repository)
+                    .bind::<diesel::sql_types::Text, _>(viewer)
+                    .bind::<diesel::sql_types::Text, _>(value)
+                    .execute(connection)?;
+                    diesel::sql_query(
+                        "DELETE FROM review_censuses WHERE sequence IN
+                         (SELECT sequence FROM review_censuses ORDER BY sequence DESC LIMIT -1 OFFSET 256)",
+                    )
+                    .execute(connection)?;
+                }
+                let mut committed = Vec::with_capacity(ids.len());
+                for id in ids {
+                    if acknowledge_notice(connection, id, false)?.is_some() {
+                        committed.push(id);
+                    }
+                }
+                Ok(committed)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn review_points(&mut self) -> Result<std::collections::HashMap<Uuid, ScanPoint>, String> {
+        review_notice_points::table
+            .select((review_notice_points::id, review_notice_points::point))
+            .load::<(String, String)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(id, point)| {
+                Ok((
+                    Uuid::parse_str(&id).map_err(|error| error.to_string())?,
+                    serde_json::from_str(&point).map_err(|error| error.to_string())?,
+                ))
+            })
+            .collect()
+    }
+
+    pub fn record_review(
+        &mut self,
+        event: Event,
+        point: &ScanPoint,
+        suppressed: bool,
+    ) -> Result<Option<Notice>, String> {
+        let key = event.target.storage_key();
+        let result =
+            self.record_with_review_point(event, suppressed, Admission::default(), Some(point))?;
+        if result.is_none() {
+            // The same immutable request can receive newer positive evidence
+            // without resetting its existing delivery or acknowledgement.
+            let id = notices::table
+                .find(key)
+                .select(notices::id)
+                .first::<String>(&mut self.0)
+                .optional()
+                .map_err(|error| error.to_string())?;
+            if let Some(id) = id {
+                let previous = review_notice_points::table
+                    .find(&id)
+                    .select(review_notice_points::point)
+                    .first::<String>(&mut self.0)
+                    .optional()
+                    .map_err(|error| error.to_string())?
+                    .map(|stored| serde_json::from_str::<ScanPoint>(&stored))
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                if previous
+                    .as_ref()
+                    .is_none_or(|old| old != point && old.precedes_census(point))
+                {
+                    let value = serde_json::to_string(point).map_err(|error| error.to_string())?;
+                    diesel::insert_into(review_notice_points::table)
+                        .values((
+                            review_notice_points::id.eq(&id),
+                            review_notice_points::point.eq(&value),
+                        ))
+                        .on_conflict(review_notice_points::id)
+                        .do_update()
+                        .set(review_notice_points::point.eq(&value))
+                        .execute(&mut self.0)
+                        .map_err(|error| error.to_string())?;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    /// Coalesce latest attention without resurrecting dismissed duplicates.
+    pub fn record(&mut self, event: Event, suppressed: bool) -> Result<Option<Notice>, String> {
+        self.record_admitted(event, suppressed, Admission::default())
+    }
+
+    pub fn record_admitted(
+        &mut self,
+        event: Event,
+        suppressed: bool,
+        admission: Admission,
+    ) -> Result<Option<Notice>, String> {
+        self.record_with_review_point(event, suppressed, admission, None)
+    }
+
+    fn record_with_review_point(
+        &mut self,
+        event: Event,
+        suppressed: bool,
+        admission: Admission,
+        point: Option<&ScanPoint>,
+    ) -> Result<Option<Notice>, String> {
+        event.validate()?;
+        let point = point
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let acknowledged = admission.superseded || admission.resolved_waiting;
+        let retained = admission
+            .retained
+            .map(|(actor, sequence)| {
+                i64::try_from(sequence).map(|sequence| (actor.to_string(), sequence))
+            })
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        let session = event.target().storage_key();
+        let evidence = serde_json::to_string(&event.evidence).map_err(|error| error.to_string())?;
+        let serialized = serde_json::to_string(&event).map_err(|error| error.to_string())?;
+        let result = self
+            .0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                if let Some((actor, sequence)) = &retained
+                    && retained_attention_turns::table
+                        .find(&session)
+                        .filter(retained_attention_turns::actor.eq(actor))
+                        .filter(retained_attention_turns::outcome_through.ge(*sequence))
+                        .select(retained_attention_turns::generation)
+                        .first::<i64>(connection)
+                        .optional()?
+                        .is_some()
+                {
+                    return Ok(None);
+                }
+                if let Target::PullRequest(request) = &event.target {
+                    // Immutable review identity outlives bounded payloads and
+                    // dismissal; every new request node receives its own alert.
+                    debug_assert!(request.validate().is_ok());
+                    let inserted = diesel::insert_into(review_requests_seen::table)
+                        .values(review_requests_seen::identity.eq(&session))
+                        .on_conflict_do_nothing()
+                        .execute(connection)?;
+                    if inserted == 0 {
+                        return Err(diesel::result::Error::RollbackTransaction);
+                    }
+                }
+                let ordinal = diesel::insert_into(seen::table)
+                    .values((seen::session.eq(&session), seen::evidence.eq(&evidence)))
+                    .on_conflict_do_nothing()
+                    .returning(seen::ordinal)
+                    .get_result::<i64>(connection)
+                    .optional()?;
+                let Some(ordinal) = ordinal else {
+                    if matches!(event.target, Target::SessionInbox(_)) {
+                        // Same arrival, potentially a successor terminal. Keep
+                        // notice identity/dismissal/delivery; refresh routing
+                        // metadata without publishing the backlog again.
+                        diesel::update(notices::table.find(&session))
+                            .set(notices::event.eq(&serialized))
+                            .execute(connection)?;
+                        if let Some(source) = event.source_session()
+                            && let Some(window) = owners::table
+                                .find(source.to_string())
+                                .select(owners::window)
+                                .first::<String>(connection)
+                                .optional()?
+                        {
+                            remember_owner(connection, &session, &window)?;
+                        }
+                        return Ok(None);
+                    }
+                    return Err(diesel::result::Error::RollbackTransaction);
+                };
+                if admission.withdraw_previous
+                    && !acknowledged
+                    && let Some(previous) = notices::table
+                        .find(&session)
+                        .select(notices::id)
+                        .first::<String>(connection)
+                        .optional()?
+                {
+                    remember_notice_withdrawal(connection, &session, &previous)?;
+                }
+                let owner = event
+                    .source_session()
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| session.clone());
+                let window = owners::table
+                    .find(&owner)
+                    .select(owners::window)
+                    .first::<String>(connection)
+                    .optional()?;
+                if let Some(window) = &window {
+                    remember_owner(connection, &session, window)?;
+                }
+                let notice = Notice {
+                    id: Uuid::new_v4(),
+                    event,
+                    delivered: suppressed || acknowledged,
+                    acknowledged,
+                    window,
+                };
+                let values = (
+                    notices::id.eq(notice.id.to_string()),
+                    notices::event.eq(&serialized),
+                    notices::delivered.eq(notice.delivered),
+                    notices::acknowledged.eq(notice.acknowledged),
+                    notices::ordinal.eq(ordinal),
+                );
+                let insert = diesel::insert_into(notices::table)
+                    .values((notices::session.eq(&session), values.clone()));
+                let written = if acknowledged {
+                    // Keep settled evidence without replacing a newer notice.
+                    insert.on_conflict_do_nothing().execute(connection)?
+                } else {
+                    insert
+                        .on_conflict(notices::session)
+                        .do_update()
+                        .set(values)
+                        .execute(connection)?
+                };
+                if let Some(point) = point.filter(|_| written != 0) {
+                    diesel::insert_into(review_notice_points::table)
+                        .values((
+                            review_notice_points::id.eq(notice.id.to_string()),
+                            review_notice_points::point.eq(point),
+                        ))
+                        .execute(connection)?;
+                }
+                let recent_seen = diesel::alias!(seen as recent_seen);
+                diesel::delete(
+                    seen::table.filter(seen::session.eq(&session)).filter(
+                        seen::ordinal.ne_all(
+                            recent_seen
+                                .filter(recent_seen.field(seen::session).eq(&session))
+                                .select(recent_seen.field(seen::ordinal))
+                                .order(recent_seen.field(seen::ordinal).desc())
+                                .limit(KEYS_PER_SESSION),
+                        ),
+                    ),
+                )
+                .execute(connection)?;
+                let evicted = notices::table
+                    .order(notices::ordinal.desc())
+                    .offset(MAX_SESSIONS)
+                    .select((notices::session, notices::id))
+                    .load::<(String, String)>(connection)?;
+                for (key, id) in evicted {
+                    // The portal may already display this notice, including a
+                    // previously resolved automation that has not been withdrawn.
+                    if admission.withdraw_previous || key.starts_with("automation:") {
+                        remember_notice_withdrawal(connection, &key, &id)?;
+                    }
+                    diesel::delete(notices::table.find(&key)).execute(connection)?;
+                }
+                diesel::delete(
+                    seen::table
+                        .filter(seen::session.ne_all(notices::table.select(notices::session))),
+                )
+                .execute(connection)?;
+                diesel::sql_query(
+                    "DELETE FROM review_notice_points WHERE id NOT IN (SELECT id FROM notices)",
+                )
+                .execute(connection)?;
+                prune_owners(connection)?;
+                Ok((written != 0 && !admission.superseded).then_some(notice))
+            });
+        match result {
+            Err(diesel::result::Error::RollbackTransaction) => Ok(None),
+            other => other.map_err(|error| error.to_string()),
+        }
+    }
+
+    /// The retained notices, newest first. The broker lists after each batch
+    /// of work, usually with nothing written since the previous list, so an
+    /// unchanged database reuses the notices already decoded.
+    pub fn list(&mut self) -> Result<Vec<Notice>, String> {
+        // Read the revision first. A commit that lands during the load then
+        // forces another read rather than being attributed to this one.
+        let revision = diesel::sql_query(
+            "SELECT total_changes() AS changes, data_version FROM pragma_data_version",
+        )
+        .get_result::<Revision>(&mut self.0)
+        .map_err(|error| error.to_string())?;
+        if let Some(listed) = &self.1
+            && listed.revision == revision
+        {
+            return Ok(listed.notices.clone());
+        }
+        self.1 = None;
+        let notices = self.load()?;
+        self.1 = Some(Listed {
+            revision,
+            notices: notices.clone(),
+        });
+        Ok(notices)
+    }
+
+    fn load(&mut self) -> Result<Vec<Notice>, String> {
+        notices::table
+            .left_join(owners::table.on(owners::session.eq(notices::session)))
+            .select((
+                notices::id,
+                notices::event,
+                notices::delivered,
+                notices::acknowledged,
+                owners::window.nullable(),
+            ))
+            .order(notices::ordinal.desc())
+            .load::<(String, String, bool, bool, Option<String>)>(&mut self.0)
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .map(|(id, event, delivered, acknowledged, window)| {
+                Ok(Notice {
+                    id: id.parse().map_err(|error: uuid::Error| error.to_string())?,
+                    event: Event::from_journal(&event).map_err(|error| error.to_string())?,
+                    delivered,
+                    acknowledged,
+                    window,
+                })
+            })
+            .collect()
+    }
+
+    pub fn automation_notice(&mut self, automation: Uuid) -> Result<Option<(Uuid, u64)>, String> {
+        let serialized = notices::table
+            .find(format!("automation:{automation}"))
+            .select((notices::id, notices::event))
+            .first::<(String, String)>(&mut self.0)
+            .optional()
+            .map_err(|error| error.to_string())?;
+        serialized
+            .map(|(notice, serialized)| {
+                let event = Event::from_journal(&serialized).map_err(|error| error.to_string())?;
+                match event.target {
+                    Target::Automation { id, sequence } if id == automation => {
+                        let notice = notice.parse::<Uuid>().map_err(|error| error.to_string())?;
+                        Ok((notice, sequence))
+                    }
+                    _ => Err("Notification journal contains the wrong automation identity".into()),
+                }
+            })
+            .transpose()
+    }
+
+    pub fn remember_notice_withdrawal(&mut self, target: &Target, id: Uuid) -> Result<(), String> {
+        self.0
+            .transaction(|connection| {
+                remember_notice_withdrawal(connection, &target.storage_key(), &id.to_string())
+            })
+            .map_err(|error: diesel::result::Error| error.to_string())
+    }
+
+    #[cfg(test)]
+    pub fn group_withdrawals(&mut self) -> Result<Vec<Uuid>, String> {
+        self.group_withdrawals_for(&[])
+            .map(|groups| groups.into_iter().collect())
+    }
+
+    /// Drain a bounded page. A group that could be posted now is always
+    /// looked up even when older withdrawals fill that page.
+    pub fn group_withdrawals_for(&mut self, current: &[Uuid]) -> Result<BTreeSet<Uuid>, String> {
+        let durable = portal_group_withdrawals::table;
+        let mut ids: Vec<String> = durable
+            .select(portal_group_withdrawals::id)
+            .order(portal_group_withdrawals::id)
+            .limit(MAX_SESSIONS)
+            .load(&mut self.0)
+            .map_err(|error| error.to_string())?;
+        if !current.is_empty() {
+            ids.extend(
+                durable
+                    .filter(
+                        portal_group_withdrawals::id.eq_any(current.iter().map(Uuid::to_string)),
+                    )
+                    .select(portal_group_withdrawals::id)
+                    .load::<String>(&mut self.0)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        ids.into_iter()
+            .map(|id| id.parse().map_err(|error: uuid::Error| error.to_string()))
+            .collect()
+    }
+
+    pub fn finish_group_withdrawal(&mut self, id: Uuid) -> Result<(), String> {
+        diesel::sql_query("DELETE FROM portal_group_withdrawals WHERE id=?1")
+            .bind::<diesel::sql_types::Text, _>(id.to_string())
+            .execute(&mut self.0)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn acknowledge_sessions(
+        &mut self,
+        sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<Vec<(String, String)>, String> {
+        self.0
+            .transaction(|db| acknowledge_sessions(db, sessions))
+            .map_err(|error: diesel::result::Error| error.to_string())
+    }
+
+    pub fn acknowledge_retained_turn(
+        &mut self,
+        session: crate::model::TerminalId,
+        actor: Uuid,
+        generation: u64,
+        through: u64,
+        predecessors: &std::collections::BTreeSet<crate::model::TerminalId>,
+    ) -> Result<Option<Vec<(String, String)>>, String> {
+        let generation = i64::try_from(generation).map_err(|error| error.to_string())?;
+        let through = i64::try_from(through).map_err(|error| error.to_string())?;
+        let mut sessions = predecessors.clone();
+        sessions.insert(session);
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|db| {
+                let started = diesel::sql_query(
+                    "INSERT INTO retained_attention_turns(session,actor,generation,outcome_through)
+                 VALUES (?1,?2,?3,?4)
+                 ON CONFLICT(session) DO UPDATE SET actor=excluded.actor,
+                    generation=excluded.generation,outcome_through=excluded.outcome_through
+                 WHERE retained_attention_turns.actor!=excluded.actor
+                    OR retained_attention_turns.generation<excluded.generation",
+                )
+                .bind::<diesel::sql_types::Text, _>(session.to_string())
+                .bind::<diesel::sql_types::Text, _>(actor.to_string())
+                .bind::<diesel::sql_types::BigInt, _>(generation)
+                .bind::<diesel::sql_types::BigInt, _>(through)
+                .execute(db)?;
+                if started == 0 {
+                    return Ok(None);
+                }
+                acknowledge_sessions(db, &sessions).map(Some)
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn delivered(&mut self, id: Uuid) -> Result<(), String> {
+        diesel::update(notices::table.filter(notices::id.eq(id.to_string())))
+            .set(notices::delivered.eq(true))
+            .execute(&mut self.0)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
+    }
+
+    /// Remove opt-in excerpts without changing attention, delivery or evidence
+    /// identities. Turning privacy back on must also cover restored notices.
+    pub fn clear_content(&mut self) -> Result<Vec<(Uuid, Target)>, String> {
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                let rows = notices::table
+                    .select((notices::session, notices::id, notices::event))
+                    .load::<(String, String, String)>(connection)?;
+                let mut changed = Vec::new();
+                for (target, id, serialized) in rows {
+                    let mut event = Event::from_journal(&serialized)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    if event.content.take().is_none() {
+                        continue;
+                    }
+                    let serialized = serde_json::to_string(&event)
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    let id = id
+                        .parse()
+                        .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                    diesel::update(notices::table.find(target))
+                        .set(notices::event.eq(serialized))
+                        .execute(connection)?;
+                    changed.push((id, event.target));
+                }
+                Ok(changed)
+            })
+            .map_err(|error| format!("Could not clear private notification previews: {error}"))
+    }
+
+    pub fn acknowledge(&mut self, id: Uuid) -> Result<Option<String>, String> {
+        self.acknowledge_notice(id, false)
+    }
+
+    pub(super) fn acknowledge_with_withdrawal(
+        &mut self,
+        id: Uuid,
+    ) -> Result<Option<String>, String> {
+        self.acknowledge_notice(id, true)
+    }
+
+    fn acknowledge_notice(
+        &mut self,
+        id: Uuid,
+        save_withdrawal: bool,
+    ) -> Result<Option<String>, String> {
+        self.0
+            .transaction(|connection| acknowledge_notice(connection, id, save_withdrawal))
+            .map_err(|error: diesel::result::Error| error.to_string())
+    }
+
+    /// Keep replay evidence and ownership. Only the request that still
+    /// supplies this target's attention may lose its unread state.
+    pub fn acknowledge_waiting(
+        &mut self,
+        target: &Target,
+        matches_source: impl FnOnce(&Event) -> bool,
+    ) -> Result<Option<Uuid>, String> {
+        let key = target.storage_key();
+        self.0
+            .transaction(|connection| {
+                let notice = notices::table
+                    .find(&key)
+                    .filter(notices::acknowledged.eq(false));
+                let row = notice
+                    .select((notices::id, notices::event))
+                    .first::<(String, String)>(connection)
+                    .optional()?;
+                let Some((id, event)) = row else {
+                    return Ok(None);
+                };
+                let event = Event::from_journal(&event)
+                    .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                if event.evidence.kind != crate::notifications::Kind::Waiting
+                    || !matches_source(&event)
+                {
+                    return Ok(None);
+                }
+                let parsed = id
+                    .parse()
+                    .map_err(|_| diesel::result::Error::RollbackTransaction)?;
+                // Withdraw both identities in the same transaction that acknowledges the notice.
+                remember_notice_withdrawal(connection, &key, &id)?;
+                diesel::update(notice)
+                    .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+                    .execute(connection)?;
+                Ok(Some(parsed))
+            })
+            .map_err(|error: diesel::result::Error| error.to_string())
+    }
+
+    pub fn retire(&mut self, target: Target) -> Result<(), String> {
+        let key = target.storage_key();
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                let notice = notices::table.find(&key);
+                if let Some(id) = notice
+                    .select(notices::id)
+                    .first::<String>(connection)
+                    .optional()?
+                {
+                    remember_notice_withdrawal(connection, &key, &id)?;
+                    diesel::delete(notice).execute(connection)?;
+                }
+                diesel::delete(seen::table.filter(seen::session.eq(&key))).execute(connection)?;
+                diesel::delete(owners::table.find(&key)).execute(connection)?;
+                diesel::sql_query("DELETE FROM retained_attention_turns WHERE session=?1")
+                    .bind::<diesel::sql_types::Text, _>(&key)
+                    .execute(connection)?;
+                Ok(())
+            })
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn remember_window(
+        &mut self,
+        sessions: impl IntoIterator<Item = crate::model::TerminalId>,
+        window: &str,
+    ) -> Result<(), String> {
+        self.0
+            .transaction::<_, diesel::result::Error, _>(|connection| {
+                for session in sessions {
+                    remember_owner(connection, &session.to_string(), window)?;
+                }
+                prune_owners(connection)
+            })
+            .map_err(|error| error.to_string())
+    }
+}
+
+fn acknowledge_notice(
+    connection: &mut SqliteConnection,
+    id: Uuid,
+    save_withdrawal: bool,
+) -> QueryResult<Option<String>> {
+    let id = id.to_string();
+    let notice = notices::table.filter(notices::id.eq(&id));
+    let row = notice
+        .select((notices::session, notices::acknowledged))
+        .first::<(String, bool)>(connection)
+        .optional()?;
+    let Some((key, acknowledged)) = row else {
+        return Ok(None);
+    };
+    if !acknowledged {
+        if save_withdrawal || key.starts_with("automation:") || key.starts_with("review:") {
+            remember_notice_withdrawal(connection, &key, &id)?;
+        }
+        diesel::update(notice)
+            .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+            .execute(connection)?;
+    }
+    Ok(Some(key))
+}
+
+fn remember_notice_withdrawal(
+    connection: &mut SqliteConnection,
+    key: &str,
+    id: &str,
+) -> QueryResult<()> {
+    let group = super::batching::desktop_id_for_key(key);
+    diesel::sql_query("INSERT OR IGNORE INTO portal_group_withdrawals(id) VALUES (?1), (?2)")
+        .bind::<diesel::sql_types::Text, _>(group.to_string())
+        .bind::<diesel::sql_types::Text, _>(id)
+        .execute(connection)
+        .map(|_| ())
+}
+
+fn acknowledge_sessions(
+    db: &mut SqliteConnection,
+    sessions: &std::collections::BTreeSet<crate::model::TerminalId>,
+) -> QueryResult<Vec<(String, String)>> {
+    let sessions: Vec<_> = sessions.iter().map(ToString::to_string).collect();
+    let acknowledged = diesel::update(
+        notices::table.filter(
+            notices::session
+                .eq_any(sessions)
+                .and(notices::acknowledged.eq(false)),
+        ),
+    )
+    .set((notices::acknowledged.eq(true), notices::delivered.eq(true)))
+    .returning((notices::session, notices::id))
+    .load::<(String, String)>(db)?;
+    for (session, id) in &acknowledged {
+        remember_notice_withdrawal(db, session, id)?;
+    }
+    Ok(acknowledged)
+}
+
+fn remember_owner(
+    connection: &mut SqliteConnection,
+    session: &str,
+    window: &str,
+) -> QueryResult<()> {
+    let ordinal = owners::table
+        .select(diesel::dsl::max(owners::ordinal))
+        .first::<Option<i64>>(connection)?
+        .unwrap_or(0)
+        + 1;
+    let values = (owners::window.eq(window), owners::ordinal.eq(ordinal));
+    diesel::insert_into(owners::table)
+        .values((owners::session.eq(session), values))
+        .on_conflict(owners::session)
+        .do_update()
+        .set(values)
+        .execute(connection)
+        .map(|_| ())
+}
+
+fn prune_owners(connection: &mut SqliteConnection) -> QueryResult<()> {
+    let recent_owners = diesel::alias!(owners as recent_owners);
+    diesel::delete(
+        owners::table.filter(
+            owners::session.ne_all(
+                recent_owners
+                    .select(recent_owners.field(owners::session))
+                    .order(recent_owners.field(owners::ordinal).desc())
+                    .limit(MAX_SESSIONS),
+            ),
+        ),
+    )
+    .execute(connection)
+    .map(|_| ())
+}
+
+/// The first wait before reopening a journal that failed to open.
+const FIRST_REOPEN: Duration = Duration::from_secs(1);
+/// The longest wait between attempts, so a journal that comes back, such as
+/// a database another daemon held locked through an update, is in use again
+/// within a minute.
+const LAST_REOPEN: Duration = Duration::from_secs(60);
+
+/// The broker's journal, or why it could not be opened and when to try again.
+/// A failure to open is often temporary: a lock still held by the daemon this
+/// one replaced, or a full or briefly unavailable data directory.
+pub(super) struct Reopening {
+    path: Option<PathBuf>,
+    journal: Result<Journal, String>,
+    next_attempt: Instant,
+    delay: Duration,
+}
+
+impl Reopening {
+    /// Opens the journal at `path`, or records why it is unavailable; with no
+    /// path there is nothing to retry.
+    pub(super) fn open(path: Option<PathBuf>, now: Instant) -> Self {
+        let journal = path
+            .as_deref()
+            .ok_or_else(|| "Notification data directory is unavailable".to_owned())
+            .and_then(Journal::open);
+        Self {
+            path,
+            journal,
+            next_attempt: now + FIRST_REOPEN,
+            delay: FIRST_REOPEN,
+        }
+    }
+
+    pub(super) fn journal(&mut self) -> Result<&mut Journal, &String> {
+        self.journal.as_mut().map_err(|error| &*error)
+    }
+
+    /// Preserve work that reached an open journal but failed to write.
+    pub(super) fn retry_failed_write(&mut self, error: String, now: Instant) -> Instant {
+        self.journal = Err(error);
+        self.delay = FIRST_REOPEN;
+        self.next_attempt = now + self.delay;
+        self.next_attempt
+    }
+
+    /// Keep later broker writes fenced behind a failed ordered write.
+    pub(super) fn suspend(&mut self, error: String, now: Instant) {
+        self.journal = Err(error);
+        self.next_attempt = now + self.delay;
+        self.delay = (self.delay * 2).min(LAST_REOPEN);
+    }
+
+    /// Finish previously accepted settlement at shutdown, once.
+    pub(super) fn journal_for_shutdown(&mut self) -> Result<&mut Journal, &String> {
+        if self.journal.is_err()
+            && let Some(path) = &self.path
+        {
+            self.journal = Journal::open(path);
+        }
+        self.journal()
+    }
+
+    /// When a failed journal is next tried, if it can be.
+    pub(super) fn retry_at(&self) -> Option<Instant> {
+        (self.journal.is_err() && self.path.is_some()).then_some(self.next_attempt)
+    }
+
+    /// Tries a failed journal again once its wait has passed, doubling the
+    /// wait after each failure. Returns the error the journal recovered from,
+    /// when this attempt opened it.
+    pub(super) fn reopen_if_due(&mut self, now: Instant) -> Option<String> {
+        let path = self.path.as_deref()?;
+        if self.journal.is_ok() || now < self.next_attempt {
+            return None;
+        }
+        match Journal::open(path) {
+            Ok(journal) => std::mem::replace(&mut self.journal, Ok(journal)).err(),
+            // Keep the first error: it is the one the broker reported.
+            Err(error) => {
+                tracing::debug!(%error, "the notification journal is still unavailable");
+                self.delay = (self.delay * 2).min(LAST_REOPEN);
+                self.next_attempt = now + self.delay;
+                None
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_retained_turn_acknowledgement_does_not_replay_over_its_new_outcome() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let predecessor = TerminalId::new();
+        let actor = Uuid::new_v4();
+        // Commit the predecessor's event without any notification publication.
+        let prior = journal
+            .record(event(predecessor, "predecessor"), false)
+            .unwrap()
+            .unwrap();
+        let unrelated = journal
+            .record(event(TerminalId::new(), "unrelated"), false)
+            .unwrap()
+            .unwrap();
+        let old = journal
+            .record(event(session, "prior-turn"), false)
+            .unwrap()
+            .unwrap();
+        let cleared = journal
+            .acknowledge_retained_turn(session, actor, 7, 41, &[predecessor].into())
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cleared
+                .into_iter()
+                .map(|(_, notice)| notice)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [prior.id.to_string(), old.id.to_string()].into(),
+        );
+        let admission = |sequence| Admission {
+            retained: Some((actor, sequence)),
+            ..Admission::default()
+        };
+        let current = journal
+            .record_admitted(event(session, "current-turn"), false, admission(42))
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(
+            journal
+                .acknowledge_retained_turn(session, actor, 7, 41, &Default::default())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            journal
+                .record_admitted(event(session, "late-prior-turn"), false, admission(41))
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            journal
+                .list()
+                .unwrap()
+                .iter()
+                .filter(|notice| !notice.acknowledged)
+                .map(|notice| notice.id)
+                .collect::<std::collections::BTreeSet<_>>(),
+            [unrelated.id, current.id].into(),
+        );
+    }
+    use crate::{
+        agent::Provider,
+        model::TerminalId,
+        notifications::{Evidence, Kind},
+    };
+    use rusqlite::Connection;
+
+    #[test]
+    fn listing_reads_again_after_any_committed_write() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let notice = journal
+            .record(event(session, "done"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(journal.list().unwrap(), std::slice::from_ref(&notice));
+        assert_eq!(journal.list().unwrap(), std::slice::from_ref(&notice));
+
+        // Writes through this connection.
+        journal.remember_window([session], "primary").unwrap();
+        assert_eq!(
+            journal.list().unwrap()[0].window.as_deref(),
+            Some("primary")
+        );
+        journal.acknowledge(notice.id).unwrap();
+        assert!(journal.list().unwrap()[0].acknowledged);
+
+        // Another connection's commit changes only its data_version.
+        let other = Connection::open(&path).unwrap();
+        other
+            .execute("UPDATE notices SET event = 'unreadable'", [])
+            .unwrap();
+        assert!(journal.list().is_err());
+        other
+            .execute(
+                "UPDATE notices SET event = ?1",
+                [serde_json::to_string(&notice.event).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(journal.list().unwrap()[0].id, notice.id);
+    }
+
+    #[test]
+    fn a_journal_that_failed_to_open_is_reopened_after_a_bounded_wait() {
+        let directory = tempfile::tempdir().unwrap();
+        let data = directory.path().join("data");
+        // The data directory is not yet usable, as a full disk or a mount that
+        // has not appeared leaves it.
+        std::fs::write(&data, b"").unwrap();
+        let path = data.join("agent-attention.sqlite3");
+        let start = Instant::now();
+        let mut slot = Reopening::open(Some(path.clone()), start);
+        assert!(slot.journal().is_err());
+        assert_eq!(slot.retry_at(), Some(start + FIRST_REOPEN));
+
+        assert_eq!(slot.reopen_if_due(start + FIRST_REOPEN), None);
+        assert!(slot.journal().is_err());
+        let doubled = start + FIRST_REOPEN + FIRST_REOPEN * 2;
+        assert_eq!(slot.retry_at(), Some(doubled));
+
+        std::fs::remove_file(&data).unwrap();
+        std::fs::create_dir(&data).unwrap();
+        assert_eq!(slot.reopen_if_due(doubled - Duration::from_millis(1)), None);
+        assert!(slot.journal().is_err(), "a wait is not cut short");
+        let recovered = slot.reopen_if_due(doubled).expect("the journal reopens");
+        assert!(!recovered.is_empty());
+        assert!(slot.journal().unwrap().list().unwrap().is_empty());
+        assert_eq!(slot.retry_at(), None);
+        assert_eq!(slot.reopen_if_due(doubled + LAST_REOPEN), None);
+
+        let mut waits = Vec::new();
+        let blocked = directory.path().join("blocked");
+        std::fs::write(&blocked, b"").unwrap();
+        let mut never = Reopening::open(Some(blocked.join("journal")), start);
+        let mut now = start;
+        for _ in 0..10 {
+            let next = never.retry_at().unwrap();
+            waits.push(next - now);
+            now = next;
+            never.reopen_if_due(now);
+        }
+        assert_eq!(
+            waits[..3],
+            [FIRST_REOPEN, FIRST_REOPEN * 2, FIRST_REOPEN * 4]
+        );
+        assert_eq!(*waits.last().unwrap(), LAST_REOPEN, "the wait is bounded");
+
+        let mut unplaced = Reopening::open(None, start);
+        assert!(unplaced.journal().is_err());
+        assert_eq!(
+            unplaced.retry_at(),
+            None,
+            "without a path nothing is retried"
+        );
+    }
+
+    #[test]
+    fn disabling_previews_clears_retained_text_without_changing_acknowledgement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let mut original = event(TerminalId::new(), "one");
+        original.content = Some(crate::notifications::Content {
+            conversation: "Private conversation".into(),
+            preview: "Private response".into(),
+            request: None,
+        });
+        let notice = journal.record(original, false).unwrap().unwrap();
+        journal.delivered(notice.id).unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        let cleared = journal.clear_content().unwrap();
+        assert_eq!(cleared.len(), 1);
+        assert_eq!(cleared[0].0, notice.id);
+        assert_eq!(cleared[0].1, notice.event.target);
+        assert!(journal.clear_content().unwrap().is_empty());
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        let retained = reopened.list().unwrap();
+        assert_eq!(retained[0].id, notice.id);
+        assert!(retained[0].acknowledged && retained[0].delivered);
+        assert!(retained[0].event.content.is_none());
+    }
+
+    #[test]
+    fn an_acknowledged_or_evicted_notice_keeps_its_portal_cleanup_after_reopening() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite");
+        let mut journal = Journal::open(&path).unwrap();
+        let automation = Uuid::new_v4();
+        let target = Target::Automation {
+            id: automation,
+            sequence: 1,
+        };
+        let notice = journal
+            .record(
+                Event {
+                    target: target.clone(),
+                    source_session: None,
+                    provider: None,
+                    directory: None,
+                    destination: None,
+                    evidence: Evidence {
+                        key: format!("automation:{automation}:lifecycle:1"),
+                        kind: Kind::AutomationPaused,
+                    },
+                    content: None,
+                },
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        journal.delivered(notice.id).unwrap();
+        let mut expected = vec![notice.id, super::super::batching::desktop_id(&target)];
+        expected.sort();
+
+        journal.acknowledge(notice.id).unwrap();
+        let read_back = |journal: &mut Journal| {
+            let mut ids = journal.group_withdrawals().unwrap();
+            ids.sort();
+            ids
+        };
+        assert_eq!(read_back(&mut journal), expected);
+        for id in &expected {
+            journal.finish_group_withdrawal(*id).unwrap();
+        }
+
+        // An unrelated admission evicts the old row. The same transaction
+        // must remember the portal cleanup even if reconciliation runs later.
+        diesel::sql_query(
+            "WITH RECURSIVE rows(n) AS (
+                VALUES(1) UNION ALL SELECT n+1 FROM rows WHERE n < ?1-1
+             )
+             INSERT INTO notices(session,id,event,delivered,acknowledged,ordinal)
+             SELECT 'fixture:' || n, 'fixture:' || n, '', 0, 0, n+1 FROM rows",
+        )
+        .bind::<diesel::sql_types::BigInt, _>(MAX_SESSIONS)
+        .execute(&mut journal.0)
+        .unwrap();
+        diesel::sql_query("UPDATE notices SET ordinal=0 WHERE session=?1")
+            .bind::<diesel::sql_types::Text, _>(target.storage_key())
+            .execute(&mut journal.0)
+            .unwrap();
+        let newer = Event {
+            target: Target::Session(TerminalId::new()),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: "unrelated completion".into(),
+                kind: Kind::Succeeded,
+            },
+            content: None,
+        };
+        journal.record(newer, false).unwrap().unwrap();
+        assert!(journal.automation_notice(automation).unwrap().is_none());
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        assert_eq!(read_back(&mut reopened), expected);
+    }
+
+    #[test]
+    fn acknowledgement_of_first_question_cannot_swallow_the_next_waiting_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("notifications.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        let mut first = event(session, "turn:waiting:1");
+        first.evidence.kind = Kind::Waiting;
+        let first = journal.record(first, false).unwrap().unwrap();
+        let mut second = event(session, "turn:waiting:2");
+        second.evidence.kind = Kind::Waiting;
+        let second = journal.record(second, false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        assert!(journal.acknowledge(first.id).unwrap().is_none());
+        let notices = journal.list().unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].id, second.id);
+        assert!(!notices[0].acknowledged);
+    }
+
+    #[test]
+    fn settling_a_request_clears_waiting_without_retiring_replay_evidence_or_outcomes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("notifications.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        let mut waiting = event(session, "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let first = journal.record(waiting.clone(), false).unwrap().unwrap();
+        let target = Target::Session(session);
+        assert_eq!(
+            journal.acknowledge_waiting(&target, |_| true).unwrap(),
+            Some(first.id)
+        );
+        assert!(journal.list().unwrap()[0].acknowledged);
+        assert!(journal.record(waiting, false).unwrap().is_none());
+
+        let finished = journal
+            .record(event(session, "turn:finished"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            journal.acknowledge_waiting(&target, |_| true).unwrap(),
+            None
+        );
+        assert_eq!(journal.list().unwrap(), [finished]);
+    }
+
+    #[test]
+    fn an_already_resolved_request_is_acknowledged_when_its_evidence_is_first_committed() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let mut waiting = event(TerminalId::new(), "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let notice = journal
+            .record_admitted(
+                waiting.clone(),
+                false,
+                Admission {
+                    resolved_waiting: true,
+                    ..Admission::default()
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(notice.acknowledged);
+        assert!(notice.delivered);
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.list().unwrap(), [notice]);
+        assert!(journal.record(waiting, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_superseded_wait_does_not_publish_or_overwrite_newer_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("notifications.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let mut waiting = event(session, "turn:waiting:1");
+        waiting.evidence.kind = Kind::Waiting;
+        let admission = Admission {
+            superseded: true,
+            resolved_waiting: true,
+            ..Admission::default()
+        };
+        assert!(
+            journal
+                .record_admitted(waiting.clone(), false, admission)
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.list().unwrap()[0].acknowledged);
+        let newer = journal
+            .record(event(session, "next-turn:finished"), false)
+            .unwrap()
+            .unwrap();
+        waiting.evidence.key = "turn:waiting:2".into();
+        assert!(
+            journal
+                .record_admitted(waiting.clone(), false, admission)
+                .unwrap()
+                .is_none()
+        );
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.record(waiting, false).unwrap().is_none());
+        assert_eq!(journal.list().unwrap(), [newer]);
+    }
+
+    fn seed_owners(journal: &mut Journal) {
+        let rows: Vec<_> = (1..MAX_SESSIONS)
+            .map(|i| {
+                (
+                    owners::session.eq(format!("old-{i}")),
+                    owners::window.eq("other"),
+                    owners::ordinal.eq(10000 + i),
+                )
+            })
+            .collect();
+        diesel::insert_into(owners::table)
+            .values(rows)
+            .execute(&mut journal.0)
+            .unwrap();
+    }
+
+    fn inbox_event(
+        lineage: crate::agent_execution::Lineage,
+        session: TerminalId,
+        message: crate::model::MessageId,
+    ) -> Event {
+        Event {
+            content: None,
+            target: Target::SessionInbox(lineage),
+            source_session: Some(session),
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: message.to_string(),
+                kind: Kind::MessageReceived,
+            },
+        }
+    }
+
+    #[test]
+    fn a_reply_read_during_its_hold_never_replaces_dismissed_older_attention() {
+        use crate::agent_execution::{
+            Lineage,
+            mailbox::{Message, Party, Receipt, State},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let lineage = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let party = |lineage: Lineage| Party {
+            lineage: Some(lineage),
+            session: Some(lineage.0),
+            title: None,
+        };
+        let message = |from, to, created_ms| Message {
+            id: crate::model::MessageId::new(),
+            from,
+            to,
+            reply_to: None,
+            body: "private message".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms,
+        };
+        let older = message(Party::user(), party(lineage), 1000);
+        registry.post_message(&older).unwrap();
+        let notice = journal
+            .record(
+                inbox_event(
+                    lineage,
+                    lineage.0,
+                    registry.reconcile_message_attention(50).unwrap()[&lineage],
+                ),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        let mut ask = message(party(lineage), party(other), 1);
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(lineage), 3);
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        // The real ask path peeks replies and acknowledges a receipt during
+        // their hold, independently of the older unread inbox message.
+        registry
+            .acknowledge_messages(Some(lineage), None, &Receipt { ids: vec![held.id] }, 50)
+            .unwrap();
+        for now in [50, 100] {
+            let head = registry.reconcile_message_attention(now).unwrap()[&lineage];
+            assert_eq!(head, older.id);
+            assert!(
+                journal
+                    .record(inbox_event(lineage, lineage.0, head), false)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        // Expiring the original ask cannot turn its already-read reply into
+        // an arrival either; the eligible head remains durable.
+        registry.prune_messages(2).unwrap();
+        assert_eq!(
+            registry.reconcile_message_attention(200).unwrap()[&lineage],
+            older.id
+        );
+        let current = journal.list().unwrap().pop().unwrap();
+        assert_eq!(current.id, notice.id);
+        assert!(current.acknowledged && current.delivered);
+    }
+
+    #[test]
+    fn held_reply_release_does_not_reannounce_a_dismissed_later_arrival() {
+        use crate::agent_execution::{
+            Lineage,
+            mailbox::{Message, Party, Receipt, State},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let mut registry =
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let lineage = Lineage(TerminalId::new());
+        let other = Lineage(TerminalId::new());
+        let party = |lineage: Lineage| Party {
+            lineage: Some(lineage),
+            session: Some(lineage.0),
+            title: None,
+        };
+        let message = |from, to| Message {
+            id: crate::model::MessageId::new(),
+            from,
+            to,
+            reply_to: None,
+            body: "private message".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 1,
+        };
+        let mut ask = message(party(lineage), party(other));
+        ask.wait_until_ms = Some(100);
+        registry.post_message(&ask).unwrap();
+        let mut held = message(party(other), party(lineage));
+        held.reply_to = Some(ask.id);
+        registry.post_message(&held).unwrap();
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&lineage)
+        );
+        let ordinary = message(Party::user(), party(lineage));
+        registry.post_message(&ordinary).unwrap();
+        let notice = journal
+            .record(
+                inbox_event(
+                    lineage,
+                    lineage.0,
+                    registry.reconcile_message_attention(50).unwrap()[&lineage],
+                ),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        // Dismissing the alert does not acknowledge either message.
+        assert!(
+            registry
+                .pending_message_lineages()
+                .unwrap()
+                .contains(&lineage)
+        );
+        registry
+            .acknowledge_messages(
+                Some(lineage),
+                None,
+                &Receipt {
+                    ids: vec![ordinary.id],
+                },
+                50,
+            )
+            .unwrap();
+        assert!(
+            !registry
+                .reconcile_message_attention(50)
+                .unwrap()
+                .contains_key(&lineage)
+        );
+        assert!(
+            journal
+                .record(
+                    inbox_event(
+                        lineage,
+                        lineage.0,
+                        registry.reconcile_message_attention(100).unwrap()[&lineage]
+                    ),
+                    false
+                )
+                .unwrap()
+                .is_none()
+        );
+        let current = journal.list().unwrap().pop().unwrap();
+        assert_eq!(current.id, notice.id);
+        assert!(current.acknowledged && current.delivered);
+    }
+
+    #[test]
+    fn inbox_dismissal_survives_restart_and_successor_but_new_arrival_reactivates() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        let session = TerminalId::new();
+        let lineage = crate::agent_execution::Lineage(session);
+        let message = crate::model::MessageId::new();
+        let original = journal
+            .record(inbox_event(lineage, session, message), false)
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(original.id).unwrap();
+        let lifecycle = journal
+            .record(event(session, "finished"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        let successor = TerminalId::new();
+        journal.remember_window([successor], "successor").unwrap();
+        assert!(
+            journal
+                .record(inbox_event(lineage, successor, message), false)
+                .unwrap()
+                .is_none()
+        );
+        let inbox = journal
+            .list()
+            .unwrap()
+            .into_iter()
+            .find(|notice| notice.event.target == Target::SessionInbox(lineage))
+            .unwrap();
+        assert_eq!(inbox.id, original.id);
+        assert!(inbox.acknowledged && inbox.delivered);
+        assert_eq!(inbox.event.source_session(), Some(successor));
+        assert_eq!(inbox.window.as_deref(), Some("successor"));
+        let next = journal
+            .record(
+                inbox_event(lineage, successor, crate::model::MessageId::new()),
+                false,
+            )
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, original.id);
+        assert!(!next.acknowledged && !next.delivered);
+        journal.retire(Target::SessionInbox(lineage)).unwrap();
+        assert_eq!(journal.list().unwrap()[0].id, lifecycle.id);
+    }
+
+    #[test]
+    fn failed_notice_write_rolls_back_replay_and_owner_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        journal.remember_window([session], "owned").unwrap();
+        journal.0.batch_execute("CREATE TRIGGER reject_notice BEFORE INSERT ON notices BEGIN SELECT RAISE(ABORT, 'injected write failure'); END;").unwrap();
+        let mut run = event(session, "run");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        assert!(journal.record(run.clone(), false).is_err());
+        assert_eq!(
+            seen::table
+                .count()
+                .get_result::<i64>(&mut journal.0)
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            owners::table
+                .count()
+                .get_result::<i64>(&mut journal.0)
+                .unwrap(),
+            1
+        );
+        journal
+            .0
+            .batch_execute("DROP TRIGGER reject_notice;")
+            .unwrap();
+        assert!(journal.record(run, false).unwrap().is_some());
+    }
+
+    #[test]
+    fn database_uri_preserves_unusual_file_names_and_uri_metacharacters() {
+        #[cfg(target_os = "linux")]
+        use std::os::unix::ffi::OsStringExt;
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "linux")]
+        let name = std::ffi::OsString::from_vec(b"attention-\xff?#%.sqlite3".to_vec());
+        #[cfg(target_os = "macos")] // APFS requires valid UTF-8.
+        let name = std::ffi::OsString::from("attention-雪?#%.sqlite3");
+        let path = directory.path().join(name);
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal
+            .record(event(TerminalId::new(), "uri"), false)
+            .unwrap()
+            .unwrap();
+        drop(journal);
+        assert_eq!(Journal::open(&path).unwrap().list().unwrap(), vec![notice]);
+        assert!(path.is_file());
+        assert!(
+            !directory
+                .path()
+                .join("attention-\u{fffd}?#%.sqlite3")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn typed_schema_matches_existing_sqlite_columns_and_durability() {
+        #[derive(diesel::QueryableByName)]
+        struct Durability {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            synchronous: i32,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Timeout {
+            #[diesel(sql_type = diesel::sql_types::Integer)]
+            timeout: i32,
+        }
+        #[derive(diesel::QueryableByName)]
+        struct Mode {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            journal_mode: String,
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(
+            diesel::sql_query("PRAGMA synchronous")
+                .get_result::<Durability>(&mut journal.0)
+                .unwrap()
+                .synchronous,
+            2
+        );
+        assert_eq!(
+            diesel::sql_query("PRAGMA busy_timeout")
+                .get_result::<Timeout>(&mut journal.0)
+                .unwrap()
+                .timeout,
+            1000
+        );
+        assert_eq!(
+            diesel::sql_query("PRAGMA journal_mode")
+                .get_result::<Mode>(&mut journal.0)
+                .unwrap()
+                .journal_mode,
+            "wal"
+        );
+        // Read through the old driver: no format conversion or new ledger.
+        let legacy = Connection::open(&path).unwrap();
+        for (table, expected) in [
+            (
+                "notices",
+                vec![
+                    ("session", "TEXT"),
+                    ("id", "TEXT"),
+                    ("event", "TEXT"),
+                    ("delivered", "INTEGER"),
+                    ("acknowledged", "INTEGER"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            (
+                "seen",
+                vec![
+                    ("session", "TEXT"),
+                    ("evidence", "TEXT"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            (
+                "owners",
+                vec![
+                    ("session", "TEXT"),
+                    ("window", "TEXT"),
+                    ("ordinal", "INTEGER"),
+                ],
+            ),
+            ("review_requests_seen", vec![("identity", "TEXT")]),
+        ] {
+            let actual: Vec<(String, String)> = legacy
+                .prepare("SELECT name,type FROM pragma_table_info(?1) ORDER BY cid")
+                .unwrap()
+                .query_map([table], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                actual,
+                expected
+                    .into_iter()
+                    .map(|(name, kind)| (name.to_owned(), kind.to_owned()))
+                    .collect::<Vec<_>>()
+            );
+        }
+        assert_eq!(
+            legacy
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i32>(0))
+                .unwrap(),
+            3
+        );
+        let notice = journal
+            .record(event(TerminalId::new(), "compatible"), false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            legacy
+                .query_row("SELECT id FROM notices", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            notice.id.to_string()
+        );
+    }
+
+    fn event(session: TerminalId, key: &str) -> Event {
+        Event {
+            content: None,
+            target: crate::notifications::Target::Session(session),
+            source_session: Some(session),
+            provider: Some(Provider::Codex),
+            directory: Some("/project".into()),
+            destination: None,
+            evidence: Evidence {
+                key: key.into(),
+                kind: Kind::Succeeded,
+            },
+        }
+    }
+
+    #[test]
+    fn run_attention_survives_source_retirement_and_replay_keeps_dismissal() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.remember_window([session], "owned").unwrap();
+        let mut run = event(session, "accepted-run");
+        run.target = Target::AgentRun(crate::model::RunId::from_uuid(session.as_uuid()));
+        let notice = journal.record(run.clone(), false).unwrap().unwrap();
+        journal
+            .record(event(session, "provider-turn"), false)
+            .unwrap();
+        journal.retire(Target::Session(session)).unwrap();
+        assert_eq!(journal.list().unwrap(), vec![notice.clone()]);
+        assert_eq!(notice.window.as_deref(), Some("owned"));
+        journal.acknowledge(notice.id).unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.record(run, false).unwrap().is_none());
+        let stored = journal.list().unwrap();
+        assert_eq!(stored.len(), 1);
+        assert!(stored[0].acknowledged);
+        assert_eq!(stored[0].event.target(), notice.event.target());
+    }
+
+    #[test]
+    fn new_run_owner_uses_owner_recency_even_when_attention_is_infrequent() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        seed_owners(&mut journal);
+        journal.remember_window([session], "chosen").unwrap();
+        let mut run = event(session, "first-attention");
+        run.target = Target::AgentRun(crate::model::RunId::new());
+        journal.record(run, false).unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
+    fn review_identity_survives_notice_eviction_restart_and_new_request() {
+        use crate::notifications::{Target, review::ReviewRequest};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let request = ReviewRequest {
+            host: "github.com".into(),
+            port: None,
+            owner: "owner".into(),
+            repository: "repo".into(),
+            number: 51,
+            viewer: "viewer".into(),
+            request: "request-one".into(),
+        };
+        let make = |request: ReviewRequest| Event {
+            content: None,
+            evidence: Evidence {
+                key: request.request.clone(),
+                kind: Kind::ReviewRequested,
+            },
+            target: Target::PullRequest(request),
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: Some(crate::notifications::Destination {
+                application: crate::notifications::Application::Ceditor,
+                window: "review".into(),
+            }),
+        };
+        let mut journal = Journal::open(&path).unwrap();
+        let first = journal
+            .record(make(request.clone()), false)
+            .unwrap()
+            .unwrap();
+        journal.acknowledge(first.id).unwrap();
+        // Notice payload compaction/removal is independent of this identity.
+        journal
+            .retire(Target::PullRequest(request.clone()))
+            .unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        // The acknowledgement and both portal identities survived after
+        // the notice row was removed and before any desktop withdrawal ran.
+        let withdrawals = journal.group_withdrawals_for(&[]).unwrap();
+        assert_eq!(
+            withdrawals,
+            [
+                first.id,
+                crate::host::notifications::batching::desktop_id(&first.event.target()),
+            ]
+            .into()
+        );
+        assert!(
+            journal
+                .record(make(request.clone()), false)
+                .unwrap()
+                .is_none()
+        );
+        let mut renamed = request.clone();
+        renamed.repository = "renamed".into();
+        assert!(journal.record(make(renamed), false).unwrap().is_none());
+        let mut again = request;
+        again.request = "request-two".into();
+        assert!(journal.record(make(again), false).unwrap().is_some());
+    }
+
+    #[test]
+    fn version_one_journal_keeps_legacy_attention_and_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.remember_window([session], "saved").unwrap();
+        let notice = journal
+            .record(event(session, "old"), true)
+            .unwrap()
+            .unwrap();
+        let legacy = serde_json::json!({"session":session,"provider":Provider::Codex,"directory":"/project","evidence":{"key":"old","kind":"Succeeded"}});
+        diesel::update(notices::table)
+            .set(notices::event.eq(legacy.to_string()))
+            .execute(&mut journal.0)
+            .unwrap();
+        journal.0.batch_execute("PRAGMA user_version=1").unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert_eq!(journal.list().unwrap(), vec![notice]);
+    }
+
+    #[test]
+    fn owner_recency_survives_infrequent_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        seed_owners(&mut journal);
+        journal.remember_window([session], "chosen").unwrap();
+        journal
+            .record(event(session, "first-attention"), false)
+            .unwrap();
+        journal
+            .remember_window([TerminalId::new()], "other")
+            .unwrap();
+        assert_eq!(journal.list().unwrap()[0].window.as_deref(), Some("chosen"));
+    }
+
+    #[test]
+    fn newer_journal_schema_is_rejected_without_schema_changes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("PRAGMA user_version=4; CREATE TABLE future(value TEXT);")
+            .unwrap();
+        drop(connection);
+        assert!(Journal::open(&path).err().unwrap().contains("newer"));
+        let connection = Connection::open(&path).unwrap();
+        let version: u32 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let notices: i32 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE name='notices'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(notices, 0);
+    }
+
+    #[test]
+    fn focus_suppression_and_owner_identity_survive_reconnect_without_resurrection() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        journal.remember_window([session], "named").unwrap();
+        let notice = journal
+            .record(event(session, "turn"), true)
+            .unwrap()
+            .unwrap();
+        assert!(notice.delivered);
+        assert_eq!(notice.window.as_deref(), Some("named"));
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(
+            journal
+                .record(event(session, "turn"), false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(journal.list().unwrap(), vec![notice]);
+        journal.retire(Target::Session(session)).unwrap();
+        assert!(journal.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn replay_after_restart_never_resurrects_delivered_or_acknowledged_attention() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("attention.sqlite3");
+        let session = TerminalId::new();
+        let mut journal = Journal::open(&path).unwrap();
+        let notice = journal
+            .record(event(session, "first"), false)
+            .unwrap()
+            .unwrap();
+        journal.delivered(notice.id).unwrap();
+        journal.acknowledge(notice.id).unwrap();
+        drop(journal);
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(
+            journal
+                .record(event(session, "first"), false)
+                .unwrap()
+                .is_none()
+        );
+        assert!(journal.list().unwrap()[0].acknowledged);
+        let next = journal
+            .record(event(session, "second"), false)
+            .unwrap()
+            .unwrap();
+        assert_ne!(next.id, notice.id);
+        assert!(
+            journal
+                .record(event(session, "first"), false)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(journal.list().unwrap(), vec![next]);
+        journal.retire(Target::Session(session)).unwrap();
+        assert!(journal.list().unwrap().is_empty());
+    }
+
+    #[test]
+    fn ledger_and_session_storage_are_bounded() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(&directory.path().join("attention.sqlite3")).unwrap();
+        let session = TerminalId::new();
+        for number in 0..KEYS_PER_SESSION + 5 {
+            journal
+                .record(event(session, &number.to_string()), true)
+                .unwrap();
+        }
+        let count: i64 = seen::table.count().get_result(&mut journal.0).unwrap();
+        assert_eq!(count, KEYS_PER_SESSION);
+        assert_eq!(journal.list().unwrap().len(), 1);
+        assert!(journal.list().unwrap()[0].delivered);
+    }
+
+    #[test]
+    fn automation_lifecycle_replay_keeps_latest_notice_and_actor_retirement_separate() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("automation.sqlite3");
+        let id = Uuid::new_v4();
+        let make = |sequence, kind| Event {
+            target: Target::Automation { id, sequence },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: Evidence {
+                key: format!("automation:{id}:lifecycle:{sequence}"),
+                kind,
+            },
+            content: None,
+        };
+        let old = make(17, Kind::AutomationPaused);
+        let current = make(18, Kind::AutomationBlocked);
+        let mut journal = Journal::open(&path).unwrap();
+        let first = journal.record(old.clone(), false).unwrap().unwrap();
+        journal.acknowledge(first.id).unwrap();
+        let second = journal.record(current.clone(), false).unwrap().unwrap();
+        assert_ne!(first.id, second.id);
+        journal
+            .retire(Target::Session(TerminalId::from_uuid(id)))
+            .unwrap();
+        journal
+            .retire(Target::AgentRun(crate::model::RunId::from_uuid(id)))
+            .unwrap();
+        assert_eq!(
+            journal.list().unwrap(),
+            vec![second.clone()],
+            "actor predecessor retirement cannot own automation history"
+        );
+        journal.acknowledge(first.id).unwrap();
+        assert!(!journal.list().unwrap()[0].acknowledged);
+        drop(journal);
+        let mut reopened = Journal::open(&path).unwrap();
+        assert!(
+            reopened.record(old, false).unwrap().is_none(),
+            "older durable duplicate cannot restore its earlier target or kind"
+        );
+        assert_eq!(reopened.list().unwrap(), vec![second.clone()]);
+        reopened.acknowledge(second.id).unwrap();
+        assert!(reopened.record(current, false).unwrap().is_none());
+        let final_notice = reopened.list().unwrap().pop().unwrap();
+        assert_eq!(final_notice.id, second.id);
+        assert!(final_notice.acknowledged);
+    }
+}

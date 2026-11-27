@@ -190,6 +190,7 @@ for line in sys.stdin:
         "claude-success".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     ));
     assert!(
         tokio::time::timeout(Duration::from_millis(75), &mut pending_reset)
@@ -238,6 +239,7 @@ for line in sys.stdin:
         "claude-success".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(
@@ -251,6 +253,7 @@ for line in sys.stdin:
         "claude-service-unavailable".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(fresh.status, ConsumeStatus::Unavailable);
@@ -262,6 +265,7 @@ for line in sys.stdin:
         "claude-success".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(
@@ -285,6 +289,7 @@ for line in sys.stdin:
         "claude-lost-reply".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -303,6 +308,7 @@ for line in sys.stdin:
         "claude-lost-reply".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(
@@ -321,6 +327,7 @@ for line in sys.stdin:
         "claude-account".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -350,6 +357,7 @@ for line in sys.stdin:
         "claude-empty".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::NoCredit);
@@ -378,6 +386,7 @@ for line in sys.stdin:
         "changed-login".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unavailable);
@@ -450,6 +459,7 @@ for line in sys.stdin:
         "claude-session-lost-reply".into(),
         claude_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -488,6 +498,7 @@ for line in sys.stdin:
         "claude-session-lost-reply".into(),
         claude_identity,
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed);
@@ -523,6 +534,7 @@ for line in sys.stdin:
         "codex-success".into(),
         codex_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -541,6 +553,7 @@ for line in sys.stdin:
         "codex-lost-reply".into(),
         codex_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unconfirmed, "{response:?}");
@@ -552,6 +565,7 @@ for line in sys.stdin:
         "codex-lost-reply".into(),
         codex_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Reset, "{response:?}");
@@ -562,6 +576,7 @@ for line in sys.stdin:
         "codex-empty".into(),
         codex_identity.clone(),
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::NoCredit);
@@ -648,6 +663,7 @@ for line in sys.stdin:
         "claude-lost-reply".into(),
         codex_identity,
         cache.clone(),
+        None,
     )
     .await;
     assert_eq!(response.status, ConsumeStatus::Unavailable);

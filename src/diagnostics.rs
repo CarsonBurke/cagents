@@ -6,7 +6,7 @@ use std::{
     fs::File,
     io::{self, Read, Write},
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::AsRawFd,
         unix::{ffi::OsStrExt, fs::MetadataExt},
     },
     path::{Component, Path, PathBuf},
@@ -479,21 +479,19 @@ fn c_name(name: &std::ffi::OsStr) -> io::Result<CString> {
     CString::new(name.as_bytes()).map_err(|_| unsafe_path())
 }
 fn open_at(parent: &File, name: &std::ffi::OsStr, flags: i32, mode: u32) -> io::Result<File> {
-    let name = c_name(name)?;
-    // SAFETY: owned descriptor and terminated name; the returned fd is uniquely owned.
-    let fd = unsafe {
-        libc::openat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
-            mode,
-        )
-    };
-    if fd < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(unsafe { File::from_raw_fd(fd) })
-    }
+    crate::descriptor::openat(
+        parent.as_raw_fd(),
+        &c_name(name)?,
+        flags | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        libc::mode_t::try_from(mode).map_err(|_| unsafe_path())?,
+    )
+    .map(File::from)
+}
+
+fn sealed_system_link(name: &std::ffi::OsStr) -> bool {
+    let component = Path::new("/").join(name);
+    std::fs::symlink_metadata(&component)
+        .is_ok_and(|metadata| crate::secure_file::is_sealed_system_link(&component, &metadata))
 }
 
 /// Hold every ancestor while descending; a renamed ancestor cannot redirect
@@ -521,6 +519,18 @@ fn directory(path: &Path, create: bool) -> io::Result<File> {
                     parent.sync_all()?;
                 }
                 open_at(&parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
+            }
+            Err(error) if index == 1 && sealed_system_link(name) => {
+                // Darwin's `/var` and `/tmp` are fixed links to
+                // `private/<name>` on the sealed system volume; descend there.
+                let private = open_at(
+                    &parent,
+                    "private".as_ref(),
+                    libc::O_RDONLY | libc::O_DIRECTORY,
+                    0,
+                )
+                .map_err(|_| error)?;
+                open_at(&private, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?
             }
             Err(error) => return Err(error),
         };
@@ -2123,6 +2133,20 @@ mod process_tests {
             ));
             panic!("{content}");
         }
+        if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("debug_panic")) {
+            local_debug_panic_fixture();
+        }
+        if std::env::var_os(TEST_MODE).as_deref()
+            == Some(std::ffi::OsStr::new("debug_thread_panic"))
+        {
+            let worker = std::thread::Builder::new()
+                .name("panicking-worker".into())
+                .spawn(local_debug_panic_fixture)
+                .unwrap();
+            assert!(worker.join().is_err());
+            record(Event::Exit { success: true });
+            return;
+        }
         if std::env::var_os(TEST_MODE).as_deref() == Some(std::ffi::OsStr::new("recovered")) {
             let content =
                 std::hint::black_box(String::from("RECOVERED_SECRET prompt https://private.test"));
@@ -2189,6 +2213,12 @@ mod process_tests {
         assert!(!take_failure_notice());
         assert_eq!(std::fs::read(file).unwrap(), before);
     }
+    /// A named frame for the backtrace tests to find.
+    #[inline(never)]
+    fn local_debug_panic_fixture() {
+        panic!("local debug panic fixture");
+    }
+
     #[cfg(all(feature = "ui", target_os = "linux"))]
     fn missing_accessibility_bus_fixture(root: PathBuf) {
         use iced_accessibility::accesskit::{
@@ -2308,7 +2338,14 @@ mod process_tests {
 
     #[test]
     fn sink_failure_is_nonfatal_and_reported_once_without_recursive_logging() {
-        for mode in ["unsafe_file", "write_failure"] {
+        // The write failure is forced with RLIMIT_FSIZE, which Darwin does not
+        // enforce on these appends.
+        let modes: &[&str] = if cfg!(target_os = "linux") {
+            &["unsafe_file", "write_failure"]
+        } else {
+            &["unsafe_file"]
+        };
+        for &mode in modes {
             let root = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -2480,5 +2517,71 @@ mod process_tests {
             assert!(!evidence.contains(forbidden));
             assert!(!String::from_utf8_lossy(&output.stderr).contains(forbidden));
         }
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("stack backtrace"));
+    }
+
+    /// A local debug capture prints a backtrace for a panic on the thread
+    /// the test harness runs the fixture on and on one it spawns, without
+    /// RUST_BACKTRACE set, and leaves the choice to RUST_BACKTRACE when it is
+    /// set.
+    #[test]
+    fn local_debug_panics_print_a_backtrace_without_rust_backtrace() {
+        let run = |mode: &str, rust_backtrace: Option<&str>| {
+            let root = tempfile::tempdir().unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "diagnostics::process_tests::subprocess_fixture",
+                    "--nocapture",
+                ])
+                .env(TEST_STATE, root.path())
+                .env(TEST_MODE, mode)
+                .env("XDG_STATE_HOME", root.path())
+                .env("CAGENTS_LOCAL_DEBUG", "1")
+                .env_remove("RUST_BACKTRACE");
+            if let Some(value) = rust_backtrace {
+                command.env("RUST_BACKTRACE", value);
+            }
+            let output = command.output().unwrap();
+            (
+                output.status.success(),
+                String::from_utf8(output.stderr).unwrap(),
+            )
+        };
+        for (mode, succeeds, thread) in [
+            ("debug_panic", false, None),
+            ("debug_thread_panic", true, Some("panicking-worker")),
+        ] {
+            let (success, stderr) = run(mode, None);
+            assert_eq!(success, succeeds, "{mode}: {stderr}");
+            assert!(
+                stderr.contains("local debug panic fixture"),
+                "{mode}: {stderr}"
+            );
+            if let Some(thread) = thread {
+                assert!(
+                    stderr.contains(&format!("thread '{thread}'")),
+                    "{mode}: {stderr}"
+                );
+            }
+            let backtrace = stderr
+                .split_once("stack backtrace:")
+                .unwrap_or_else(|| panic!("{mode}: no backtrace: {stderr}"))
+                .1;
+            assert!(
+                backtrace.contains("local_debug_panic_fixture"),
+                "{mode}: {stderr}"
+            );
+            assert_eq!(
+                stderr.matches("stack backtrace:").count(),
+                1,
+                "{mode}: {stderr}"
+            );
+        }
+        // An explicit RUST_BACKTRACE=0 is respected.
+        let (_, stderr) = run("debug_panic", Some("0"));
+        assert!(stderr.contains("local debug panic fixture"), "{stderr}");
+        assert!(!stderr.contains("stack backtrace:"), "{stderr}");
     }
 }

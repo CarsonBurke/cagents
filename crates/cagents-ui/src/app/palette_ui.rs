@@ -16,6 +16,12 @@ pub(super) struct State {
     query: Option<String>,
     selected: Option<EntryIdentity>,
     move_pane: Option<CardId>,
+    /// Every result the open palette offers, built when it opens and by the
+    /// projections, which run after whatever could change one; the view and
+    /// the keys read them rather than walking the workspace again.
+    entries: Vec<Entry>,
+    /// The entries the query matches, best first, as indices into `entries`.
+    matches: Vec<usize>,
 }
 impl State {
     pub(super) fn pressed_key_filter(&self) -> Option<&keyboard::Event> {
@@ -29,6 +35,46 @@ impl State {
     pub(super) fn is_open(&self) -> bool {
         self.query.is_some() || self.recording.is_some() || self.filtering_key
     }
+
+    /// The results the query matches, best first.
+    fn results(&self) -> impl ExactSizeIterator<Item = &Entry> + '_ {
+        self.matches.iter().map(|index| &self.entries[*index])
+    }
+
+    /// The results as the projection oracle compares them.
+    #[cfg(any(test, feature = "development"))]
+    pub(super) fn projection_view(&self) -> String {
+        format!(
+            "{:?}",
+            self.results()
+                .map(|entry| (&entry.label, &entry.detail, &entry.identity))
+                .collect::<Vec<_>>()
+        )
+    }
+}
+
+/// A palette result, with what matching and ranking read of it computed once.
+#[derive(Debug)]
+struct Entry {
+    label: String,
+    /// What a query is matched against: the label without its kind's prefix,
+    /// lowercased.
+    search: String,
+    detail: Detail,
+    message: Message,
+    identity: Option<EntryIdentity>,
+    category: char,
+    /// Ties between equal scores go to recent results, then common commands.
+    rank: (usize, u8),
+}
+
+/// What a result shows beside its label.
+#[derive(Debug, PartialEq)]
+enum Detail {
+    Text(String),
+    /// A pane's activity, read when the row is drawn: it changes as agents
+    /// work, without a projection.
+    PaneStatus(CardId),
 }
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -212,6 +258,7 @@ mod matching;
 #[cfg(test)]
 thread_local! {
     static SCORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static CANDIDATE_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -219,10 +266,16 @@ fn match_score(label: &str, query: &str) -> Option<usize> {
     match_score_lowered(label, &matching::lowercase(query))
 }
 
+#[cfg(test)]
 fn match_score_lowered(label: &str, lowered_query: &str) -> Option<usize> {
+    score_lowered(&matching::lowercase(label), lowered_query)
+}
+
+/// How well an entry's lowercased search text matches a lowercased query.
+fn score_lowered(lowered_label: &str, lowered_query: &str) -> Option<usize> {
     #[cfg(test)]
     SCORES.with(|scores| scores.set(scores.get() + 1));
-    crate::search_match::score(&matching::lowercase(label), lowered_query)
+    crate::search_match::score(lowered_label, lowered_query)
 }
 
 fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static, Message> {
@@ -234,11 +287,10 @@ fn highlighted_label(label: &str, query: &str, moving: bool) -> Element<'static,
     let searchable = search_label(label, moving);
     let offset = label.len() - searchable.len();
     let matches = matching::highlighted_ranges(searchable, query, offset);
-    widget::container(crate::ui_controls::fade_highlighted(
-        label,
-        &matches,
-        cosmic::theme::Text::Custom(design::accent_text),
-    ))
+    widget::container(
+        crate::ui_controls::fade_text(label.to_owned())
+            .highlight(&matches, cosmic::theme::Text::Custom(design::accent_text)),
+    )
     .width(Length::Fill)
     .clip(true)
     .class(design::transparent())
@@ -277,6 +329,7 @@ impl Cagents {
                 self.palette.query = None;
                 self.palette.recording_error = None;
                 self.palette.reassign = None;
+                self.refresh_palette();
                 Task::none()
             }
             Action::FilterKey => {
@@ -286,6 +339,7 @@ impl Cagents {
                 self.palette.query = None;
                 self.palette.reassign = None;
                 self.palette.recording_error = None;
+                self.refresh_palette();
                 Task::none()
             }
             Action::Reassign => {
@@ -375,6 +429,7 @@ impl Cagents {
                 self.chrome_ui.close();
                 self.palette.query = Some(String::new());
                 self.palette.move_pane = None;
+                self.refresh_palette();
                 self.capture_first_palette_entry();
                 iced::widget::operation::focus(widget::Id::new("palette.query"))
                     .map(cosmic::Action::App)
@@ -386,6 +441,7 @@ impl Cagents {
                 }
                 let task = self.update_palette(Action::Open);
                 self.palette.move_pane = Some(card);
+                self.refresh_palette();
                 self.capture_first_palette_entry();
                 task
             }
@@ -398,12 +454,18 @@ impl Cagents {
                 self.palette.recording_error = None;
                 self.palette.move_pane = None;
                 self.palette.selected = None;
+                self.refresh_palette();
                 self.workspace
                     .focused()
                     .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
             }
             Action::Query(query) => {
-                self.palette.query = Some(query);
+                // A query opens a closed palette, which holds no entries yet.
+                if self.palette.query.replace(query).is_none() {
+                    self.refresh_palette();
+                } else {
+                    self.filter_palette();
+                }
                 self.capture_first_palette_entry();
                 self.reveal_palette_selection()
             }
@@ -489,6 +551,7 @@ impl Cagents {
         self.palette.query = None;
         self.palette.move_pane = None;
         self.palette.selected = None;
+        self.refresh_palette();
         let command = self.dispatch(message);
         let save = if self.settings_path.is_some() {
             self.save_settings_task(false)
@@ -589,15 +652,14 @@ impl Cagents {
                 };
                 if let Some(name) = name {
                     let mut chord = String::new();
-                    for (held, name) in [
-                        (modifiers.control(), "Ctrl+"),
-                        (modifiers.alt(), "Alt+"),
-                        (modifiers.logo(), "Super+"),
-                        (modifiers.shift(), "Shift+"),
-                    ] {
-                        if held {
-                            chord.push_str(name);
-                        }
+                    for name in settings::ModifierNames::CURRENT.held(
+                        modifiers.control(),
+                        modifiers.alt(),
+                        modifiers.logo(),
+                        modifiers.shift(),
+                    ) {
+                        chord.push_str(name);
+                        chord.push('+');
                     }
                     chord.push_str(if name == "," {
                         "Comma"
@@ -642,18 +704,23 @@ impl Cagents {
         } = event
             && modifiers.is_empty()
         {
-            let entries = self.palette_entries();
-            let count = entries.len();
-            let selected = self.selected_palette_index(&entries);
+            let count = self.palette.matches.len();
+            let selected = self.selected_palette_index();
+            let identity = |palette: &State, index: usize| {
+                palette
+                    .results()
+                    .nth(index)
+                    .and_then(|entry| entry.identity.clone())
+            };
             match key {
                 keyboard::key::Named::ArrowDown if count > 0 => {
                     let next = selected.map_or(0, |index| (index + 1) % count);
-                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
+                    self.palette.selected = identity(&self.palette, next);
                     return Some((self.reveal_palette_selection(), Projection::Unchanged));
                 }
                 keyboard::key::Named::ArrowUp if count > 0 => {
                     let next = selected.map_or(count - 1, |index| (index + count - 1) % count);
-                    self.palette.selected = EntryIdentity::capture(&entries[next].2);
+                    self.palette.selected = identity(&self.palette, next);
                     return Some((self.reveal_palette_selection(), Projection::Unchanged));
                 }
                 keyboard::key::Named::Enter => {
@@ -733,21 +800,112 @@ impl Cagents {
     }
 
     fn capture_first_palette_entry(&mut self) {
-        self.palette.selected = self
-            .palette_entries()
-            .first()
-            .and_then(|(_, _, message)| EntryIdentity::capture(message));
+        let first = self
+            .palette
+            .results()
+            .next()
+            .and_then(|entry| entry.identity.clone());
+        self.palette.selected = first;
     }
 
-    fn selected_palette_index(&self, entries: &[(String, String, Message)]) -> Option<usize> {
+    /// Where the selection is among the results the palette shows.
+    fn selected_palette_index(&self) -> Option<usize> {
         let selected = self.palette.selected.as_ref()?;
-        entries
+        self.palette
+            .results()
+            .position(|entry| selected.matches(&entry.message))
+    }
+
+    /// Builds the open palette's results again from the workspace, keeping
+    /// its query. A closed palette keeps none.
+    pub(super) fn refresh_palette(&mut self) {
+        if self.palette.query.is_none() {
+            self.palette.entries = Vec::new();
+            self.palette.matches = Vec::new();
+            return;
+        }
+        let moving = self.palette.move_pane.is_some();
+        self.palette.entries = self
+            .palette_candidates()
+            .into_iter()
+            .map(|candidate| self.palette_entry(candidate, moving, true))
+            .collect();
+        self.filter_palette();
+    }
+
+    /// Matches the results already built against the query.
+    fn filter_palette(&mut self) {
+        let matches = self.palette_matches(&self.palette.entries);
+        self.palette.matches = matches;
+    }
+
+    fn palette_entry(
+        &self,
+        (label, detail, message): (String, String, Message),
+        moving: bool,
+        live_status: bool,
+    ) -> Entry {
+        let recent = entry_key(&message)
+            .and_then(|key| {
+                self.settings
+                    .palette_recents
+                    .iter()
+                    .position(|recent| *recent == key)
+            })
+            .unwrap_or(usize::MAX);
+        let common = match message {
+            Message::RunCommand(Command::NewTerminal) => 0,
+            Message::RunCommand(Command::NewThread) => 1,
+            Message::RunCommand(Command::OpenSettings) => 2,
+            _ => 3,
+        };
+        Entry {
+            search: matching::lowercase(search_label(&label, moving)),
+            label,
+            detail: match message {
+                Message::Palette(Action::FocusPane(card)) if live_status => {
+                    Detail::PaneStatus(card)
+                }
+                _ => Detail::Text(detail),
+            },
+            identity: EntryIdentity::capture(&message),
+            category: entry_category(&message),
+            message,
+            rank: (recent, common),
+        }
+    }
+
+    /// The indices of the `entries` the query matches, best first; equal
+    /// matches keep their order.
+    fn palette_matches(&self, entries: &[Entry]) -> Vec<usize> {
+        let moving = self.palette.move_pane.is_some();
+        let (category, query) =
+            palette_mode_query(self.palette.query.as_deref().unwrap_or(""), moving);
+        let query = matching::lowercase(query);
+        let mut scored: Vec<_> = entries
             .iter()
-            .position(|(_, _, message)| selected.matches(message))
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                if category.is_some_and(|category| entry.category != category) {
+                    return None;
+                }
+                let score = score_lowered(&entry.search, &query)?;
+                Some(((score, entry.rank.0, entry.rank.1), index))
+            })
+            .collect();
+        scored.sort_by_key(|(key, _)| *key);
+        scored.into_iter().map(|(_, index)| index).collect()
+    }
+
+    fn palette_detail<'a>(&self, detail: &'a Detail) -> &'a str {
+        match detail {
+            Detail::Text(text) => text,
+            Detail::PaneStatus(card) => self.palette_pane_status(*card),
+        }
     }
 
     fn reveal_palette_selection(&self) -> Task<Message> {
-        self.selected_palette_index(&self.palette_entries())
+        self.selected_palette_index()
             .map_or_else(Task::none, |index| {
                 crate::interaction::reveal_list_selection(
                     widget::Id::new("palette.commands"),
@@ -910,9 +1068,21 @@ impl Cagents {
         }
     }
 
+    /// The results the query matches, best first, built afresh from the
+    /// workspace rather than read from what the palette keeps.
     fn palette_entries(&self) -> Vec<(String, String, Message)> {
+        self.filter_palette_entries(self.palette_candidates())
+    }
+
+    /// Everything the palette can offer, unranked.
+    fn palette_candidates(&self) -> Vec<(String, String, Message)> {
+        // The projection oracle's own full projection builds them too.
+        #[cfg(test)]
+        if !super::projection_oracle::verifying() {
+            CANDIDATE_BUILDS.with(|builds| builds.set(builds.get() + 1));
+        }
         if let Some(card) = self.palette.move_pane {
-            return self.filter_palette_entries(self.pane_move_palette_entries(card));
+            return self.pane_move_palette_entries(card);
         }
         let mut entries: Vec<_> = workspace_widget::GLOBAL_SHORTCUT_DESCRIPTORS
             .iter()
@@ -992,7 +1162,7 @@ impl Cagents {
                 ));
             }
         }
-        self.filter_palette_entries(entries)
+        entries
     }
 
     fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, String, Message)> {
@@ -1019,36 +1189,20 @@ impl Cagents {
         entries: Vec<(String, String, Message)>,
     ) -> Vec<(String, String, Message)> {
         let moving = self.palette.move_pane.is_some();
-        let (category, query) =
-            palette_mode_query(self.palette.query.as_deref().unwrap_or(""), moving);
-        let query = matching::lowercase(query);
-        let mut scored: Vec<_> = entries
+        let entries: Vec<_> = entries
             .into_iter()
-            .filter_map(|entry| {
-                let (label, _, message) = &entry;
-                if category.is_some_and(|category| entry_category(message) != category) {
-                    return None;
-                }
-                let score = match_score_lowered(search_label(label, moving), &query)?;
-                let recent = entry_key(message)
-                    .and_then(|key| {
-                        self.settings
-                            .palette_recents
-                            .iter()
-                            .position(|recent| *recent == key)
-                    })
-                    .unwrap_or(usize::MAX);
-                let common = match message {
-                    Message::RunCommand(Command::NewTerminal) => 0,
-                    Message::RunCommand(Command::NewThread) => 1,
-                    Message::RunCommand(Command::OpenSettings) => 2,
-                    _ => 3,
-                };
-                Some(((score, recent, common), entry))
-            })
+            .map(|entry| self.palette_entry(entry, moving, false))
             .collect();
-        scored.sort_by_key(|(key, _)| *key);
-        scored.into_iter().map(|(_, entry)| entry).collect()
+        let matches = self.palette_matches(&entries);
+        let mut entries: Vec<_> = entries.into_iter().map(Some).collect();
+        matches
+            .into_iter()
+            .filter_map(|index| entries[index].take())
+            .map(|entry| {
+                let detail = self.palette_detail(&entry.detail).to_owned();
+                (entry.label, detail, entry.message)
+            })
+            .collect()
     }
 
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
@@ -1092,17 +1246,19 @@ impl Cagents {
         )
         .id(widget::Id::new("palette.query"))
         .on_input(|query| Message::Palette(Action::Query(query)));
-        let entries = self.palette_entries();
-        let selected = self.selected_palette_index(&entries);
-        let rows: Vec<Element<'_, Message>> = entries
-            .into_iter()
+        let selected = self.selected_palette_index();
+        let moving = self.palette.move_pane.is_some();
+        let (_, needle) = palette_mode_query(query, moving);
+        let rows: Vec<Element<'_, Message>> = self
+            .palette
+            .results()
             .enumerate()
-            .filter_map(|(index, (label, chord, message))| {
-                let identity = EntryIdentity::capture(&message)?;
-                let (_, needle) = palette_mode_query(query, self.palette.move_pane.is_some());
+            .filter_map(|(index, entry)| {
+                let identity = entry.identity.clone()?;
+                let label = entry.label.as_str();
                 let row = widget::row::with_children(vec![
-                    highlighted_label(&label, needle, self.palette.move_pane.is_some()),
-                    design::caption(chord)
+                    highlighted_label(label, needle, moving),
+                    design::caption(self.palette_detail(&entry.detail))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
                 ])
@@ -1119,7 +1275,9 @@ impl Cagents {
                 .padding([0, 12])
                 .width(Length::Fill)
                 .height(ROW_HEIGHT)
-                .on_press(Message::Palette(Action::Run(MessageBox(Box::new(message)))))
+                .on_press(Message::Palette(Action::Run(MessageBox(Box::new(
+                    entry.message.clone(),
+                )))))
                 .into();
                 Some(row::owned(identity, button))
             })
@@ -1861,7 +2019,7 @@ mod tests {
                 modified_key: keyboard::Key::Character("t".into()),
                 physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyT),
                 location: keyboard::Location::Standard,
-                modifiers: keyboard::Modifiers::CTRL,
+                modifiers: keyboard::Modifiers::COMMAND,
                 text: None,
                 repeat,
             };
@@ -1968,6 +2126,37 @@ mod tests {
         let filtered = app.filter_palette_entries(entries);
         assert_eq!(SCORES.with(|scores| scores.get()), count);
         assert_eq!(filtered.len(), 2);
+    }
+
+    #[test]
+    fn typing_and_drawing_reuse_the_entries_the_palette_built() {
+        super::super::projection_oracle::disable_settling();
+        let mut app = settings_focus_fixture();
+        drop(app.update(Message::Palette(Action::Open)));
+        CANDIDATE_BUILDS.with(|builds| builds.set(0));
+        for query in ["s", "se", "set", "se"] {
+            drop(app.update(Message::Palette(Action::Query(query.into()))));
+            drop(app.palette_surface());
+        }
+        assert_eq!(CANDIDATE_BUILDS.with(|builds| builds.get()), 0);
+        let fresh = app.palette_entries();
+        let cached: Vec<_> = app
+            .palette
+            .results()
+            .map(|entry| (entry.label.clone(), entry.message.clone()))
+            .collect();
+        assert!(!cached.is_empty());
+        assert_eq!(
+            format!("{cached:?}"),
+            format!(
+                "{:?}",
+                fresh
+                    .into_iter()
+                    .map(|(label, _, message)| (label, message))
+                    .collect::<Vec<_>>()
+            ),
+            "a refiltered query shows what a fresh build would"
+        );
     }
 
     #[test]
@@ -2305,6 +2494,25 @@ mod tests {
         assert!(!app.apply_reported_title(id, "fish /some/path".into()));
         assert_eq!(app.card_state(id).unwrap().title, "Migration agent");
     }
+
+    #[test]
+    fn an_open_palette_shows_a_pane_renamed_through_an_update() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        drop(app.update(Message::Palette(Action::Open)));
+        drop(app.update(Message::Palette(Action::Query("@".into()))));
+        let renamed = |app: &Cagents| app.palette.projection_view().contains("Migration agent");
+        assert!(!renamed(&app));
+        for action in [
+            chrome_ui::Action::Rename(id),
+            chrome_ui::Action::RenameChanged("Migration agent".into()),
+            chrome_ui::Action::RenameSubmit,
+        ] {
+            drop(app.update(Message::ChromeUi(action)));
+        }
+        assert_eq!(app.card_state(id).unwrap().title, "Migration agent");
+        assert!(renamed(&app), "{}", app.palette.projection_view());
+    }
     #[test]
     fn card_index_tolerates_insertions_before_the_cached_position() {
         let mut app = super::super::tests::context_inspector_test_app(true);
@@ -2592,6 +2800,8 @@ mod tests {
         );
         assert_button(&before, replacement, "Unrelated archive held agent");
         app.card_state_mut(replacement).unwrap().title = "Held new agent".into();
+        // As the projection after the rename rebuilds them.
+        app.refresh_palette();
         assert_eq!(app.palette_entries().len(), 2);
         assert!(
             matches!(app.palette_entries()[0].2, Message::Palette(Action::FocusPane(id)) if id == replacement)
@@ -2637,6 +2847,8 @@ mod tests {
         );
         assert!(messages.is_empty());
         app.card_state_mut(replacement).unwrap().title = "Held new agent".into();
+        // As the projection after the rename rebuilds them.
+        app.refresh_palette();
         assert_eq!(
             app.palette_entries().len(),
             2,
@@ -2704,6 +2916,14 @@ mod tests {
             crate::model::WorktreeId::new(),
         );
         assert_eq!(app.palette_entries()[0].1, "• Unread");
+        // The row already built reads the new status when it draws, without
+        // a projection building the entries again.
+        let shown = app
+            .palette
+            .results()
+            .find(|entry| entry.identity == Some(EntryIdentity::Pane(target)))
+            .map(|entry| app.palette_detail(&entry.detail));
+        assert_eq!(shown, Some("• Unread"));
         let (_, messages) = palette_pointer_step(
             &app,
             &mut tree,
@@ -2735,7 +2955,9 @@ mod tests {
         durable.cards.push(fresh);
         let entries = app.palette_entries();
         assert!(matches!(entries[0].2, Message::Palette(Action::FocusPane(id)) if id == fresh_id));
-        assert_eq!(app.selected_palette_index(&entries), Some(1));
+        // As the projection after the workspace changed builds them.
+        app.refresh_palette();
+        assert_eq!(app.selected_palette_index(), Some(1));
         drop(app.update(Message::Palette(Action::Submit)));
         assert_eq!(app.active_workspace.as_ref(), Some(&path));
         assert_eq!(app.workspace.focused(), Some(target));
@@ -3073,7 +3295,7 @@ mod settings_recorder_tests {
             drop(app.update(press(
                 keyboard::Key::Character("p".into()),
                 keyboard::key::Code::KeyP,
-                keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+                keyboard::Modifiers::COMMAND | keyboard::Modifiers::SHIFT,
             )));
             assert!(app.palette.is_open());
             let event = if release_key {
@@ -3106,6 +3328,8 @@ mod settings_recorder_tests {
 
     #[test]
     fn settings_capture_yields_to_a_current_form_dialog_and_resumes_after_escape() {
+        let names = settings::ModifierNames::CURRENT;
+        let recorded = format!("{}+{}+F8", names.control, names.alt);
         for filtering in [false, true] {
             let mut app = super::super::tests::context_inspector_test_app(true);
             let field = SettingsField::ShortcutToggleProjects;
@@ -3164,14 +3388,14 @@ mod settings_recorder_tests {
                 "exposed capture accepts the fresh chord"
             );
             if filtering {
-                assert_eq!(app.settings_search, "Ctrl+Alt+F8");
+                assert_eq!(app.settings_search, recorded);
                 assert_eq!(app.settings, settings);
             } else {
                 assert!(
                     app.settings
                         .keyboard_shortcuts
                         .toggle_projects
-                        .contains(&"Ctrl+Alt+F8".into())
+                        .contains(&recorded)
                 );
                 assert!(app.settings_invalid.is_empty());
             }
@@ -3191,12 +3415,16 @@ mod settings_recorder_tests {
         };
         let modifiers =
             keyboard::Modifiers::CTRL | keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
-        for (value, physical, chord) in [
-            ("л", keyboard::key::Code::KeyK, "Ctrl+Alt+Shift+K"),
-            ("!", keyboard::key::Code::Digit1, "Ctrl+Alt+Shift+1"),
-            (",", keyboard::key::Code::Comma, "Ctrl+Alt+Shift+Comma"),
-            ("+", keyboard::key::Code::Equal, "Ctrl+Alt+Shift+Plus"),
+        let names = settings::ModifierNames::CURRENT;
+        let held = format!("{}+{}+{}", names.control, names.alt, names.shift);
+        for (value, physical, key) in [
+            ("л", keyboard::key::Code::KeyK, "K"),
+            ("!", keyboard::key::Code::Digit1, "1"),
+            (",", keyboard::key::Code::Comma, "Comma"),
+            ("+", keyboard::key::Code::Equal, "Plus"),
         ] {
+            let chord = format!("{held}+{key}");
+            let chord = chord.as_str();
             let mut app = super::super::tests::context_inspector_test_app(false);
             let field = SettingsField::ShortcutToggleProjects;
             let pressed = event(value, physical, modifiers);
@@ -3264,13 +3492,14 @@ mod settings_recorder_tests {
             .keyboard_shortcuts
             .toggle_projects
             .clone();
+        let primary = settings::ModifierNames::CURRENT.primary;
         for (chord, reason) in [
-            ("Ctrl+C", "interrupts"),
-            ("Ctrl+Tab", "Cycle recent panes"),
-            ("Ctrl+=", "Increase font size"),
+            ("Ctrl+C".to_owned(), "interrupts"),
+            ("Ctrl+Tab".to_owned(), "Cycle recent panes"),
+            (format!("{primary}+="), "Increase font size"),
         ] {
             drop(app.update_palette(Action::Record(field)));
-            drop(app.record_shortcut(field, chord.into()));
+            drop(app.record_shortcut(field, chord.clone()));
             assert!(
                 app.palette
                     .recording_error

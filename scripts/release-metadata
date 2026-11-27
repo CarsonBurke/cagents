@@ -42,6 +42,11 @@ from pathlib import Path
 SCHEMA = 2
 REPOSITORY = "CarsonBurke/cagents"
 TARGET = "x86_64-unknown-linux-gnu"
+# Apple Silicon macOS, built on a Mac by scripts/package-macos. A release
+# carries it alongside Linux when its bundle holds the archive.
+DARWIN_TARGET = "aarch64-apple-darwin"
+DARWIN_INSTALLER = "install-macos.sh"
+DARWIN_CHECKSUMS = "SHA256SUMS-macos"
 METADATA = "release-metadata.json"
 SIGNATURE = "release-metadata.json.sig"
 # Every trust generation's published metadata name; see metadata_name.
@@ -108,6 +113,22 @@ def products(version: str, names: set[str]) -> dict:
     return found
 
 
+def darwin_target(version: str, names: set[str]) -> dict | None:
+    """The macOS target, when DIR holds its archive; it then needs all three
+    of its files."""
+    archive = f"cagents-{version}-{DARWIN_TARGET}.tar.gz"
+    files = {archive, DARWIN_INSTALLER, DARWIN_CHECKSUMS}
+    present = files & names
+    if not present:
+        return None
+    if present != files:
+        raise Refused(f"a macOS release needs {archive}, {DARWIN_INSTALLER} and {DARWIN_CHECKSUMS}")
+    return {
+        "target": DARWIN_TARGET, "os": "macos", "architecture": "aarch64",
+        "products": {"cagents": {"archive": archive, "installer": DARWIN_INSTALLER, "checksums": DARWIN_CHECKSUMS}},
+    }
+
+
 def build(directory: Path, version: str, source_commit: str, protocol: int, notes: str) -> dict:
     if not VERSION.match(version):
         raise Refused("version must be a stable semantic version without a leading v")
@@ -118,6 +139,15 @@ def build(directory: Path, version: str, source_commit: str, protocol: int, note
     if len(notes.encode()) > NOTES_LIMIT:
         raise Refused(f"release notes exceed {NOTES_LIMIT} bytes")
     files = payloads(directory)
+    names = {path.name for path in files}
+    targets = [{
+        "target": TARGET, "os": "linux", "architecture": "x86_64", "libc": "gnu",
+        "minimum_glibc": "2.35",
+        "products": products(version, names),
+    }]
+    darwin = darwin_target(version, names)
+    if darwin is not None:
+        targets.append(darwin)
     return {
         "schema_version": SCHEMA,
         "repository": REPOSITORY,
@@ -126,11 +156,7 @@ def build(directory: Path, version: str, source_commit: str, protocol: int, note
         "protocol": protocol,
         "notes": notes,
         "assets": {path.name: {"size": path.stat().st_size, "sha256": digest(path)} for path in files},
-        "targets": [{
-            "target": TARGET, "os": "linux", "architecture": "x86_64", "libc": "gnu",
-            "minimum_glibc": "2.35",
-            "products": products(version, {path.name for path in files}),
-        }],
+        "targets": targets,
     }
 
 

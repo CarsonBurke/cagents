@@ -1006,7 +1006,10 @@ impl State {
             .into(),
         ];
         if pending > 0 {
-            label.push(count_pill(pending));
+            label.push(crate::ui_controls::count_badge(
+                pending.to_string(),
+                crate::ui_controls::CountTone::OnAccent,
+            ));
         }
         let button = button::custom(
             widget::row::with_children(label)
@@ -1415,30 +1418,6 @@ fn comment_count(count: u64) -> String {
         1 => "1 comment".into(),
         count => format!("{count} comments"),
     }
-}
-
-fn count_pill<'a>(count: u64) -> Element<'a, Action> {
-    widget::container(
-        design::caption(count.to_string())
-            .wrapping(iced::widget::text::Wrapping::None)
-            .class(cosmic::theme::Text::Default),
-    )
-    .padding([0, 5])
-    .class(cosmic::theme::Container::custom(|_| {
-        widget::container::Style {
-            // The pill sits on the accent fill of a primary button, so it
-            // shades that fill rather than adding a hue of its own.
-            background: Some(iced::Background::Color(iced::Color::from_rgba(
-                0.0, 0.0, 0.0, 0.2,
-            ))),
-            border: iced::Border {
-                radius: design::RADIUS_L.into(),
-                ..Default::default()
-            },
-            ..Default::default()
-        }
-    }))
-    .into()
 }
 
 /// One review verdict: a radio mark, its name, and what it tells the author.
@@ -2006,6 +1985,14 @@ pub mod test_support {
             vec![],
         ));
         state.selected = Some(RepoPath::parse("file.rs").unwrap());
+        state
+    }
+
+    /// A review that has opened with no file chosen yet, as one does when
+    /// it is picked from the list.
+    pub fn ready_unselected() -> State {
+        let mut state = ready();
+        state.selected = None;
         state
     }
 

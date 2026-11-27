@@ -117,9 +117,7 @@ impl Recognizer for Transducer {
 }
 
 /// Converts a source's rate to 16 kHz; a no-op at 16 kHz.
-pub fn resampler(
-    rate: u32,
-) -> Result<Box<dyn FnMut(&[f32]) -> Vec<f32> + Send>, CaptureError> {
+pub fn resampler(rate: u32) -> Result<Box<dyn FnMut(&[f32]) -> Vec<f32> + Send>, CaptureError> {
     if rate == SAMPLE_RATE {
         return Ok(Box::new(<[f32]>::to_vec));
     }

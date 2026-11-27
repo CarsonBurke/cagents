@@ -2269,10 +2269,8 @@ impl State {
     /// Refresh, which stays the same control while any foreground request
     /// is in flight, whether Refresh started it or not ("Opening agent…"):
     /// disabled, with progress in place of its glyph and the request as its
-    /// name, so a keyboard user's focus stays on it.
-    ///
-    /// Its tooltip belongs to the glyph rather than the button, so it can
-    /// still name the request while the button is disabled.
+    /// name, so a keyboard user's focus stays on it. While disabled, its
+    /// tooltip says what it is waiting for.
     fn refresh_control(&self, progress: Option<&'static str>) -> Element<'_, Action> {
         let label = progress.unwrap_or(if self.run.is_some() {
             "Refresh run"
@@ -2289,12 +2287,11 @@ impl State {
                 .size(crate::design::ROW_ICON_SIZE)
                 .into(),
         };
-        widget::button::custom(crate::interaction::tooltip(
+        let control = widget::button::custom(
             widget::container(glyph)
                 .class(crate::design::transparent())
                 .center(Length::Fill),
-            label,
-        ))
+        )
         .id(refresh_id())
         .name(label)
         .class(crate::ui_controls::control_style(
@@ -2303,9 +2300,11 @@ impl State {
         ))
         .width(crate::design::PRIMARY_CONTROL_SIZE)
         .height(crate::design::PRIMARY_CONTROL_SIZE)
-        .padding(0)
-        .on_press_maybe(progress.is_none().then_some(Action::Refresh))
-        .into()
+        .padding(0);
+        match progress {
+            Some(_) => crate::interaction::disabled_tooltip(control, label),
+            None => crate::interaction::tooltip(control.on_press(Action::Refresh), label),
+        }
     }
 
     fn view_layout(&self, size: cosmic::iced::Size) -> Element<'_, Action> {

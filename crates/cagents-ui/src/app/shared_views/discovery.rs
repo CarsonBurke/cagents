@@ -838,6 +838,7 @@ mod tests {
         chats: 5,
         loose_terminals: 6,
         closed_cards: 16,
+        historical_views: 1850,
     };
 
     /// SplitMix64, so a failing sequence replays from its seed.

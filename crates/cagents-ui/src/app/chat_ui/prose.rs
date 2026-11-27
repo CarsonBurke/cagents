@@ -446,6 +446,26 @@ pub(super) fn palettes(blocks: &HashMap<u64, CodeBlock>) -> Palettes {
         )
     })
 }
+
+/// The theme's colours that Markdown settings carry into what they build.
+///
+/// A row or block built once per fingerprint keeps these until its
+/// fingerprint changes, so the fingerprint has to hold them: an accent change,
+/// or a switch between two dark app themes, leaves `dark` as it was (#3583).
+pub(super) fn inks(style: &markdown::Style) -> impl std::hash::Hash + use<> {
+    let rgba = |color: iced::Color| color.into_rgba8();
+    let highlight = &style.inline_code_highlight;
+    (
+        rgba(style.link_color),
+        style.inline_code_color.map(rgba),
+        match highlight.background {
+            iced::Background::Color(color) => Some(rgba(color)),
+            iced::Background::Gradient(_) => None,
+        },
+        rgba(highlight.border.color),
+    )
+}
+
 fn palette(cached: &CachedItem, dark: bool) -> Arc<PaletteMap> {
     cached
         .palette_views
@@ -554,6 +574,14 @@ pub(super) fn items_for_test(
     items: &[markdown::Item],
     target: Target,
 ) -> Element<'static, Message> {
+    renderer_for_test(cached, items, target).items(
+        items,
+        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
+    )
+}
+
+#[cfg(test)]
+fn renderer_for_test(cached: &CachedItem, items: &[markdown::Item], target: Target) -> Renderer {
     Renderer {
         document: prose_document::Document::from_items(items),
         root_path: 1,
@@ -576,10 +604,6 @@ pub(super) fn items_for_test(
         dark: true,
         find: None,
     }
-    .items(
-        items,
-        design::markdown_settings(&cosmic::Theme::dark(), design::TEXT_TRANSCRIPT),
-    )
 }
 
 #[derive(Clone)]
@@ -644,6 +668,23 @@ impl Renderer {
         };
         self.item(item, index, settings)
     }
+    /// What every block of this document is kept by, before anything a
+    /// block adds of its own, colours included.
+    fn block_revision(&self, settings: &markdown::Settings) -> crate::fingerprint::Hasher {
+        use std::hash::Hash;
+        let mut revision = crate::fingerprint::hasher();
+        (
+            self.revision,
+            settings.text_size.0.to_bits(),
+            settings.style.font,
+            &self.find,
+            self.dark,
+            inks(&settings.style),
+        )
+            .hash(&mut revision);
+        revision
+    }
+
     fn items_at(&self, settings: markdown::Settings) -> Element<'static, Message> {
         let prose_document::Node::Items(items) = self.node() else {
             unreachable!("items path")
@@ -682,15 +723,7 @@ impl Renderer {
                 use std::hash::{Hash, Hasher};
                 let renderer = self.child(index as u32);
                 let key = selection::logical_identity(&renderer.item, &renderer.path);
-                let mut revision = crate::fingerprint::hasher();
-                (
-                    self.revision,
-                    settings.text_size.0.to_bits(),
-                    settings.style.font,
-                    &self.find,
-                    self.dark,
-                )
-                    .hash(&mut revision);
+                let mut revision = self.block_revision(&settings);
                 // A block showing an image draws again once its preview is
                 // decoded, released or found missing.
                 if markdown::shows_image(item) {
@@ -1385,6 +1418,42 @@ fn alignment(column: &markdown::Column) -> iced::alignment::Horizontal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block is kept apart from its row, so it needs the accent too: a
+    /// rebuilt row would otherwise reuse a block's old link colours (#3583).
+    #[test]
+    fn a_new_accent_builds_each_block_again() {
+        use cosmic::cosmic_theme::palette::Srgba;
+        use std::hash::Hasher;
+        let cached = CachedItem::new(
+            &ItemContent::Text {
+                text: "A [link](https://example.com) and `code`.".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let renderer = renderer_for_test(
+            &cached,
+            &[],
+            Target {
+                card: CardId::new(),
+                generation: 0,
+            },
+        );
+        let revision = |accent: Srgba| {
+            let mut theme = cosmic::Theme::dark().cosmic().clone();
+            theme.accent.base = accent;
+            theme.accent_text = Some(accent);
+            let theme = cosmic::Theme::system(Arc::new(theme));
+            renderer
+                .block_revision(&design::markdown_settings(&theme, design::TEXT_TRANSCRIPT))
+                .finish()
+        };
+        let blue = Srgba::new(0.2, 0.4, 0.9, 1.0);
+        assert_eq!(revision(blue), revision(blue));
+        assert_ne!(revision(blue), revision(Srgba::new(0.9, 0.5, 0.1, 1.0)));
+    }
 
     #[test]
     fn a_new_block_is_settled_and_an_open_one_is_not() {

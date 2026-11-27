@@ -146,26 +146,27 @@ fn projection_resource(kind: &CardKind) -> Option<ProjectionResource> {
     }
 }
 
-/// Each open card's worktree during one projection, with how many cards
-/// each path holds, so a view no card resolves to is known without a scan.
+/// Each open card's worktree during one projection, and the cards each path
+/// holds, so a view's cards are known without a scan.
 #[derive(Default)]
 struct CardWorktrees {
     paths: HashMap<CardId, PathBuf>,
-    counts: HashMap<PathBuf, usize>,
+    cards: HashMap<PathBuf, HashSet<CardId>>,
 }
 
 impl CardWorktrees {
-    fn get(&self, card: CardId) -> Option<&PathBuf> {
-        self.paths.get(&card)
+    fn holds(&self, path: &Path) -> bool {
+        self.cards.contains_key(path)
     }
 
-    fn holds(&self, path: &Path) -> bool {
-        self.counts.contains_key(path)
+    /// The cards resolving to `path`, in no particular order.
+    fn cards_in(&self, path: &Path) -> impl Iterator<Item = CardId> + '_ {
+        self.cards.get(path).into_iter().flatten().copied()
     }
 
     fn insert(&mut self, card: CardId, path: PathBuf) {
         self.remove(card);
-        *self.counts.entry(path.clone()).or_default() += 1;
+        self.cards.entry(path.clone()).or_default().insert(card);
         self.paths.insert(card, path);
     }
 
@@ -173,10 +174,10 @@ impl CardWorktrees {
         let Some(path) = self.paths.remove(&card) else {
             return;
         };
-        if let Some(count) = self.counts.get_mut(&path) {
-            *count -= 1;
-            if *count == 0 {
-                self.counts.remove(&path);
+        if let Some(cards) = self.cards.get_mut(&path) {
+            cards.remove(&card);
+            if cards.is_empty() {
+                self.cards.remove(&path);
             }
         }
     }
@@ -277,9 +278,19 @@ pub(super) const PANE_KEPT_ELSEWHERE: &str =
     "This pane couldn't be removed everywhere, so it may come back. Close it again if it does.";
 
 /// A Close the registry refused or never received. The pane stays closed
-/// here, under its identity, but other windows may still show it.
-pub(super) const PANE_CLOSED_HERE_KEPT_ELSEWHERE: &str =
-    "This pane closed here, but other windows may still show it. Close it there if they do.";
+/// here, under its identity, but other windows may still show it. The notice
+/// comes once the pane is gone, so it names the pane when it has a title.
+pub(super) fn pane_closed_here_kept_elsewhere(title: Option<&str>) -> String {
+    match title {
+        Some(title) => format!(
+            "The pane \u{201c}{title}\u{201d} closed here, but other windows may still show it. Close it there if they do."
+        ),
+        None => {
+            "This pane closed here, but other windows may still show it. Close it there if they do."
+                .to_owned()
+        }
+    }
+}
 
 /// Any other pane edit the registry would not save: a rename, a resize, a
 /// move or an added pane. This window then shows the panes as saved.
@@ -956,8 +967,10 @@ impl Cagents {
             // The pane stays closed here whatever the registry kept: storage
             // holds its tombstone, and the view does not bring it back.
             tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here");
-            self.notices
-                .record(TransientNotice::warning(PANE_CLOSED_HERE_KEPT_ELSEWHERE));
+            let notice = pane_closed_here_kept_elsewhere(
+                self.closed_pane_notice_title(card, scope).as_deref(),
+            );
+            self.notices.record(TransientNotice::warning(notice));
             return;
         }
         if kept && self.closes_in_background(card) {
@@ -3672,6 +3685,9 @@ impl Cagents {
             }
         }
         phase.mark(stage("selected_prepare", "shared_worktrees"));
+        // Whether the registry lists a pane, read once for every pane this
+        // pass projects rather than by a walk of every view for each.
+        let listed = self.registry_listed_panes();
         let mut projected_scopes = Vec::new();
         for view in views {
             if selected.is_some_and(|selected| !selected.contains(&view.scope)) {
@@ -3690,26 +3706,28 @@ impl Cagents {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
                 // Most views are historical: no card resolves to them at all.
                 Scope::Worktree { path, .. } if !local_worktrees.holds(path) => Vec::new(),
-                Scope::Worktree { path, .. } => {
-                    let channel_cards = self
-                        .durable
-                        .channels
-                        .iter()
-                        .flat_map(|channel| channel.cards.iter().copied())
-                        .collect::<HashSet<_>>();
-                    self.durable
-                        .cards
-                        .iter()
-                        .filter(|card| {
-                            shows_in_worktree(card)
-                                && !channel_cards.contains(&card.id)
-                                && local_worktrees.get(card.id) == Some(path)
-                        })
-                        .map(|card| card.id)
-                        .collect()
-                }
+                Scope::Worktree { path, .. } => self.worktree_strip_cards(&local_worktrees, path),
             };
-            tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
+            #[cfg(test)]
+            self.shared_views
+                .view_projection_count
+                .set(self.shared_views.view_projection_count.get() + 1);
+            // A historical worktree view, with no pane listed and no card
+            // resolving to it, projects nothing unless it is the active strip.
+            let historical = match &view.scope {
+                Scope::Worktree { path, .. } => {
+                    current.is_empty()
+                        && view.panes.is_empty()
+                        && !(self.durable.active_channel.is_none()
+                            && self.active_workspace.as_ref() == Some(path))
+                }
+                Scope::Channel(_) => false,
+            };
+            if historical {
+                projected_scopes.push(view.scope);
+                continue;
+            }
+            tasks.push(self.project_shared_view_with_cards(&view, &owned, &listed, current));
             if !view.panes.is_empty() {
                 for pane in &view.panes {
                     if let Some(path) = self
@@ -3795,8 +3813,10 @@ impl Cagents {
     ) {
         self.shared_views.blocked.clear();
         let display_index = views::ManagedDisplayIndex::new(&self.workspace_model);
-        self.shared_views.quarantined =
-            quarantined_managed_panes(&self.workspace_model, views, &display_index);
+        let fenced_before = std::mem::replace(
+            &mut self.shared_views.quarantined,
+            quarantined_managed_panes(&self.workspace_model, views, &display_index),
+        );
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -3808,6 +3828,9 @@ impl Cagents {
         // the canonical descriptor required by its persistence checkpoint.
         let alias_candidates = unowned_aliases(self.durable.cards.iter(), owned);
         let mut adoptions = Vec::new();
+        // Panes that already take one alias's draft this pass: a second
+        // alias's text must not replace it.
+        let mut drafted = HashSet::new();
         for view in views {
             for shared in &view.panes {
                 let aliases = projection_resource(&shared.kind)
@@ -3822,6 +3845,9 @@ impl Cagents {
                     continue;
                 }
                 for alias in aliases {
+                    // A kept copy of a draft is this window's own and is never
+                    // admitted, so nothing waits on it and it holds nothing back.
+                    let copy = self.is_retained_chat_copy(alias);
                     let ready = self.shared_views.initialized.contains(&view.scope)
                         && !self.shared_views.seeding.contains(&view.scope)
                         && match &view.scope {
@@ -3837,6 +3863,9 @@ impl Cagents {
                                 .any(|project| &project.repository == repository),
                         };
                     if !ready {
+                        if copy {
+                            continue;
+                        }
                         for scope in self.local_scopes_listing_with_topology(alias, topology) {
                             if scope != view.scope {
                                 self.shared_views.blocked.insert(scope);
@@ -3844,31 +3873,66 @@ impl Cagents {
                         }
                         continue;
                     }
-                    let local_work = self.shared_chat_has_local_work(alias);
-                    let can_adopt = if matches!(shared.kind, CardKind::Terminal(_)) {
-                        self.can_rekey_shared_terminal_draft(alias, shared.id)
-                    } else {
-                        !local_work
-                    };
-                    if !can_adopt {
-                        self.shared_views.blocked.insert(view.scope.clone());
-                        for scope in self.local_scopes_listing_with_topology(alias, topology) {
-                            self.shared_views.blocked.insert(scope);
+                    let resolution = if matches!(shared.kind, CardKind::Terminal(_)) {
+                        if self.can_rekey_shared_terminal_draft(alias, shared.id) {
+                            AliasResolution::Adopt
+                        } else {
+                            AliasResolution::Block
                         }
-                        self.status = Some(TransientNotice::warning(
-                            "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
-                        ));
-                        continue;
+                    } else {
+                        self.chat_alias_resolution(alias, shared, copy, &drafted)
+                    };
+                    if resolution == AliasResolution::MoveDraft {
+                        drafted.insert(shared.id);
                     }
-                    if selected.is_none_or(|selected| selected.contains(&view.scope)) {
-                        adoptions.push((view.scope.clone(), alias, shared.clone()));
+                    match resolution {
+                        AliasResolution::Adopt | AliasResolution::MoveDraft => {
+                            if selected.is_none_or(|selected| selected.contains(&view.scope)) {
+                                adoptions.push((
+                                    view.scope.clone(),
+                                    alias,
+                                    shared.clone(),
+                                    resolution == AliasResolution::MoveDraft,
+                                ));
+                            }
+                        }
+                        // The copy stays beside the pane, saying what it is,
+                        // until the reader closes it.
+                        AliasResolution::Keep => {}
+                        AliasResolution::Fence => {
+                            // Only this alias stays as it is; the view's
+                            // other panes, its canonical one included, go on.
+                            self.shared_views.quarantined.insert(alias);
+                            if !fenced_before.contains(&alias) {
+                                let pane = self.alias_name(alias);
+                                self.status = Some(TransientNotice::warning(format!(
+                                    "{pane} is open twice, and both panes have unsent text. cagents kept the older one as a copy: copy what you need from it, then close it."
+                                )));
+                            }
+                        }
+                        AliasResolution::Block => {
+                            // Projecting the view would attach what the alias
+                            // still runs to a second pane beside it, so the
+                            // whole view waits for it.
+                            self.shared_views.blocked.insert(view.scope.clone());
+                            for scope in self.local_scopes_listing_with_topology(alias, topology) {
+                                self.shared_views.blocked.insert(scope);
+                            }
+                            let pane = self.alias_name(alias);
+                            self.status = Some(TransientNotice::warning(format!(
+                                "{pane} has a new identity in the shared workspace. Finish or discard its unsent work there, and the rest of its view opens."
+                            )));
+                        }
                     }
                 }
             }
         }
-        for (scope, alias, shared) in adoptions {
+        for (scope, alias, shared, move_draft) in adoptions {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
+            }
+            if move_draft {
+                self.move_unsent_chat(alias, shared.id);
             }
             if let CardKind::Terminal(session) = &shared.kind {
                 if !self.rekey_shared_terminal_draft(alias, shared.id) {
@@ -3896,12 +3960,118 @@ impl Cagents {
             }
             if matches!(shared.kind, CardKind::Chat(_)) {
                 self.carry_draft_model(alias, shared.id);
+                self.forget_adopted_chat_alias(alias);
             }
             self.detach_shared_pane(alias);
             self.remove_shared_channel_member(alias);
         }
     }
 
+    /// A chat alias a view's pane replaced keeps nothing this window saves
+    /// or waits on: no saved draft, no local custody, no pending admission.
+    fn forget_adopted_chat_alias(&mut self, alias: CardId) {
+        self.forget_saved_chat_draft(alias);
+        self.shared_views.retained.remove(&alias);
+        if self.durable.local_only_cards.contains(&alias)
+            || self.durable.pending_chat_admissions.contains_key(&alias)
+        {
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.local_only_cards.remove(&alias);
+            durable.pending_chat_admissions.remove(&alias);
+        }
+    }
+
+    /// What becomes of a local chat `alias` of the view's `shared` pane.
+    fn chat_alias_resolution(
+        &self,
+        alias: CardId,
+        shared: &Pane,
+        copy: bool,
+        drafted: &HashSet<CardId>,
+    ) -> AliasResolution {
+        if !self.shared_chat_has_local_work(alias) {
+            return AliasResolution::Adopt;
+        }
+        let same_conversation = match (self.card_state(alias).map(|card| &card.kind), &shared.kind)
+        {
+            (Some(CardKind::Chat(local)), CardKind::Chat(canonical)) => {
+                super::chat_ui::same_conversation(local, canonical)
+            }
+            _ => false,
+        };
+        // Text and attachments can move to the pane that now holds the same
+        // conversation, when it has none of its own. Anything else in flight
+        // stays with the runtime that started it.
+        if same_conversation
+            && !self.chat_alias_busy(alias)
+            && !drafted.contains(&shared.id)
+            && !self.shared_chat_has_local_work(shared.id)
+        {
+            return AliasResolution::MoveDraft;
+        }
+        if copy {
+            AliasResolution::Keep
+        } else if self.chat_awaiting_admission(alias) && !self.chat_alias_busy(alias) {
+            // Saved, not running: it can stay beside the view's pane as is.
+            AliasResolution::Fence
+        } else {
+            AliasResolution::Block
+        }
+    }
+
+    /// Why the view of channel pane `card` is held back, said to the pane's
+    /// reader, when its view has reached this window but can't open yet.
+    pub(super) fn channel_pane_view_hold(&self, card: CardId) -> Option<&'static str> {
+        let channel = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.cards.contains(&card))?;
+        let scope = Scope::Channel(channel.id);
+        if !self.shared_views.initialized.contains(&scope) {
+            None
+        } else if self.shared_views.seed_failures.contains_key(&scope) {
+            Some(
+                "cagents couldn't restore this channel into the shared workspace, so this pane can't open yet.",
+            )
+        } else if self.shared_views.seeding.contains(&scope) {
+            Some("This pane opens once cagents finishes restoring its channel.")
+        } else if self.shared_views.blocked.contains(&scope) {
+            Some(
+                "This pane opens once cagents finishes restoring another view that shares a conversation with this channel.",
+            )
+        } else {
+            None
+        }
+    }
+
+    /// How a notice names local pane `alias`.
+    fn alias_name(&self, alias: CardId) -> String {
+        self.card_state(alias)
+            .map(|card| card.title.trim())
+            .filter(|title| !title.is_empty())
+            .map_or_else(
+                || "A pane".to_owned(),
+                |title| format!("\u{201c}{title}\u{201d}"),
+            )
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AliasResolution {
+    /// Retire the alias; the view's pane takes its place.
+    Adopt,
+    /// Retire the alias after moving its unsent draft to the view's pane.
+    MoveDraft,
+    /// A kept draft copy stays beside the view's pane, holding nothing back.
+    Keep,
+    /// The alias stays as it is, alone; the rest of its view goes on.
+    Fence,
+    /// The alias still runs or changes, so its whole view waits for it.
+    Block,
+}
+
+impl Cagents {
     /// Removing an alias or moving a pane to a worktree must leave a valid
     /// saved channel even when its now-empty inactive view needs no projection.
     fn remove_shared_channel_member(&mut self, id: CardId) {
@@ -3925,9 +4095,8 @@ impl Cagents {
         let CardKind::Terminal(terminal) = &pane.kind else {
             return;
         };
-        let already_projected = self.durable.cards.iter().any(|card| {
-            card.id == pane.id
-                && card.existence.is_open()
+        let already_projected = self.card_state(pane.id).is_some_and(|card| {
+            card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(session) if session.id == terminal.id)
         });
         if already_projected {
@@ -3940,11 +4109,7 @@ impl Cagents {
             // projection-local deduplication.
             self.shared_views.restoration_requests.remove(&pane.id);
         }
-        if self.session.is_none() || !self.durable.cards.iter().any(|source| {
-            source.id != pane.id
-                && !source.existence.is_open()
-                && matches!(&source.kind, CardKind::Terminal(session) if session.id == terminal.id)
-        }) {
+        if self.session.is_none() || !self.closed_terminal_elsewhere(pane.id, terminal.id) {
             return;
         }
         // Resolving the recipe's actual archived owner belongs to the ordered
@@ -3965,7 +4130,8 @@ impl Cagents {
     fn project_shared_view(&mut self, view: &View, owned: &HashSet<CardId>) -> Task<Message> {
         let viewport = self.workspace.capture_viewport_anchor();
         let current = self.local_view_cards(&view.scope);
-        let projection = self.project_shared_view_with_cards(view, owned, current);
+        let listed = self.registry_listed_panes();
+        let projection = self.project_shared_view_with_cards(view, owned, &listed, current);
         Task::batch([projection, self.finish_shared_viewport_projection(viewport)])
     }
 
@@ -3993,16 +4159,38 @@ impl Cagents {
                 .is_some_and(|card| matches!(&card.kind, CardKind::Chat(_)))
     }
 
+    /// The cards a worktree view's strip holds here: open, not a utility page,
+    /// in no channel and resolving to `path`, in the workspace's card order.
+    /// Only the few cards resolving to `path` are visited, never every card
+    /// the workspace has ever opened.
+    fn worktree_strip_cards(&self, local_worktrees: &CardWorktrees, path: &Path) -> Vec<CardId> {
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut members = local_worktrees
+            .cards_in(path)
+            .filter(|card| !channel_cards.contains(card))
+            .filter_map(|card| {
+                let index = self.card_index(card)?;
+                shows_in_worktree(&self.durable.cards[index]).then_some((index, card))
+            })
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|&(index, _)| index);
+        members.into_iter().map(|(_, card)| card).collect()
+    }
+
+    /// `listed` holds every pane the registry's raw views list, which
+    /// projecting a view leaves as it is.
     fn project_shared_view_with_cards(
         &mut self,
         view: &View,
         owned: &HashSet<CardId>,
+        listed: &HashSet<CardId>,
         mut current: Vec<CardId>,
     ) -> Task<Message> {
-        #[cfg(test)]
-        self.shared_views
-            .view_projection_count
-            .set(self.shared_views.view_projection_count.get() + 1);
         let index = match &view.scope {
             Scope::Channel(id) => {
                 let Some(index) = self
@@ -4181,11 +4369,7 @@ impl Cagents {
                 }
             }
             let pane: &Pane = &projected;
-            let accepted_default = self
-                .workspace_model
-                .views
-                .iter()
-                .any(|view| view.panes.iter().any(|shared| shared.id == pane.id));
+            let accepted_default = listed.contains(&pane.id);
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
@@ -4730,6 +4914,38 @@ impl Cagents {
             .is_some_and(|card| card.id == id && matches!(card.existence, Existence::Closed { .. }))
             && !self.shared_views.quarantined.contains(&id)
             && !self.chat_close_returns_through_stop(id)
+    }
+
+    /// The title a notice names `card` by, open or closed, when it has one.
+    pub(in crate::app) fn pane_notice_title(&self, card: CardId) -> Option<String> {
+        self.card_state(card)
+            .map(|state| self.card_display_title(state))
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// The title a notice names `card` by once it has closed out of `scope`.
+    /// A chat named for its channel no longer belongs to that channel, so it
+    /// is named as its tab was while it was open there, not by its provider.
+    pub(in crate::app) fn closed_pane_notice_title(
+        &self,
+        card: CardId,
+        scope: &Scope,
+    ) -> Option<String> {
+        let state = self.card_state(card)?;
+        let channel = match scope {
+            Scope::Channel(id) => self
+                .durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == *id && !channel.title.is_empty()),
+            Scope::Worktree { .. } => None,
+        };
+        let title = match self.chat_channel_title(state, channel) {
+            Some(title) if !self.chrome_ui.user_titles.contains_key(&card) => title,
+            _ => self.card_display_title(state),
+        };
+        (!title.is_empty()).then(|| title.to_owned())
     }
 
     /// Whether a pane missing from its shared view should close here. Only a

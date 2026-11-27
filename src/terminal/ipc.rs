@@ -328,7 +328,25 @@ use crate::{
 /// request to one is written without it.
 ///
 /// Version 203 appends the provider CLI inventory query and reply.
-pub const PROTOCOL_VERSION: u16 = 203;
+///
+/// Version 205 appends `Capabilities::send_queued_now`, `Snapshot::send_now`
+/// and `Command::SendQueuedNow`, which hand what is queued to a turn blocked
+/// on long work without stopping its subagents. An older client is sent
+/// snapshots without both fields; one read from an older update source has
+/// neither.
+///
+/// Version 206 appends `ChatHoldsFollowups`: whether a window holds messages
+/// the person wrote for a conversation's next turn, which go before the
+/// courier's. An older client never sends it.
+///
+/// Version 207 appends `queue_holds` to chat capabilities. Earlier clients
+/// receive the capabilities they know, and earlier update sources omit it.
+/// Version 208 appends connection-scoped mobile watch invalidations.
+///
+/// Version 209 adds review monitor reports and complete review censuses.
+///
+/// Version 210 adds exact exited queue reads, resume receipts and acknowledgements.
+pub const PROTOCOL_VERSION: u16 = 210;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -356,10 +374,11 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-pub(crate) use older_clients::{
+pub use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
-    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, USAGE_COMPACT_LIMIT, WAIT_KINDS,
-    WAITING_TOOL_STATUS, decoding_before, decoding_from, encoding_before, encoding_for,
+    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT,
+    WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing, before_queue_holds, before_send_queued_now,
+    decoding_before, decoding_from, encoding_before, encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -367,6 +386,11 @@ pub use older_clients::{OlderClient, is_cli_peer, older_client};
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
 pub const MAX_FRAME_BYTES: usize = 8 * 1024 * 1024;
+/// Retired input can be much larger than an interactive frame. The retained
+/// helper and direct providers each bound their receipts. Reserve headroom
+/// above the largest admitted direct provider queue (64 MiB).
+pub const MAX_EXITED_QUEUE_BYTES: usize = 72 * 1024 * 1024;
+pub const EXITED_QUEUE_PAGE_BYTES: usize = 2 * 1024 * 1024;
 /// Client requests carry at most a one-MiB byte vector plus small scalars.
 pub const MAX_CLIENT_FRAME_BYTES: usize = 2 * 1024 * 1024;
 pub const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -397,15 +421,12 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
 
 /// This computer's daemon socket, even while another device is selected.
 pub fn local_daemon_socket_path() -> io::Result<PathBuf> {
-    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
-        .map(PathBuf::from)
-        .filter(|path| path.is_absolute())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "XDG_RUNTIME_DIR is not set to an absolute path",
-            )
-        })?;
+    let runtime = instance::runtime_base()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set to an absolute path",
+        )
+    })?;
     Ok(runtime
         .join(instance::runtime_subdirectory())
         .join(SOCKET_FILE_NAME))
@@ -559,6 +580,8 @@ pub enum ClientRequest {
     },
     ChatList,
     /// Acknowledge activity without enabling or reading presentation.
+    /// Explicit read of an attached conversation. Terminal-output observation
+    /// and its replay on reconnect use `TerminalAcknowledge`.
     ChatAcknowledge {
         chat_id: TerminalId,
         epoch: u64,
@@ -864,6 +887,55 @@ pub enum ClientRequest {
         nonce: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus,
+    /// Whether this attached window holds follow-ups the person wrote for
+    /// the chat's next turn, which its provider has no queue to take. The
+    /// courier starts no turn ahead of them for a short while once the turn
+    /// ends. Detaching or disconnecting withdraws it.
+    ChatHoldsFollowups {
+        chat_id: TerminalId,
+        held: bool,
+    },
+    /// Watch one mobile projection until this connection disconnects.
+    WatchMobile {
+        topic: MobileWatch,
+    },
+    /// Report watcher presence or the boundary of an exact review census.
+    ObserveReviewMonitor {
+        update: crate::notifications::review::MonitorUpdate,
+    },
+    /// Prepare this exact resume and return the exited provider's final queue.
+    ChatPrepareResumeWithQueue {
+        source: crate::chat::Session,
+    },
+    /// Observe the launch scope of this exact active provider descriptor.
+    ChatQueueRecipientScope {
+        session: crate::chat::Session,
+    },
+    /// Read the next part of an authenticated receipt on the same connection.
+    ChatReadExitedQueuePage {
+        source: TerminalId,
+        receipt: uuid::Uuid,
+        offset: u32,
+    },
+    /// Read a completed native actor's exact queue without reopening it.
+    ChatReadExitedQueue {
+        source: crate::chat::Session,
+        execution: Option<uuid::Uuid>,
+    },
+    /// Release an exact queue after its recipient durably saved the input.
+    ChatCommitExitedQueue {
+        source: crate::chat::Session,
+        queue_ids: Vec<String>,
+    },
+}
+
+/// Read-only invalidations for the SSH bridge. They do not confer window
+/// presence, assign notification destinations or make a surface visible.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
+pub enum MobileWatch {
+    Sessions,
+    Notifications,
+    Conversation(TerminalId),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -986,7 +1058,7 @@ pub struct ServerEnvelope {
 // Never stored: delivery unpacks each reply at once, so boxing would only add an allocation.
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug)]
-pub(crate) enum PreparedResponse {
+pub enum PreparedResponse {
     Decoded(ServerResponse),
     EncodedChat { chat_id: TerminalId, bytes: Vec<u8> },
 }
@@ -998,7 +1070,7 @@ impl From<ServerResponse> for PreparedResponse {
 }
 #[cfg(feature = "host")]
 impl PreparedResponse {
-    pub(crate) fn decode(self) -> Result<ServerResponse, String> {
+    pub fn decode(self) -> Result<ServerResponse, String> {
         match self {
             Self::Decoded(response) => Ok(response),
             Self::EncodedChat { bytes, .. } => {
@@ -1180,6 +1252,19 @@ pub enum ServerMessage {
         terminal_id: TerminalId,
         instance: uuid::Uuid,
     },
+    /// Reread the projection, or end a conversation watch on removal.
+    MobileChanged {
+        topic: MobileWatch,
+    },
+    /// A completed native owner may have recoverable input. This edge is
+    /// independent of transcript visibility, and contains no queued messages.
+    ChatQueueEnded {
+        source: crate::chat::Session,
+        execution: uuid::Uuid,
+        /// This is the subscriber's attached execution, rather than an
+        /// earlier archived execution with the same pane ID.
+        current: bool,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1355,6 +1440,112 @@ pub enum ServerResponse {
         proof: [u8; crate::device_trust::SECRET_BYTES],
     },
     ProviderStatus(Vec<crate::account::provider_install::ProviderStatus>),
+    ChatResumePreparedWithQueue {
+        source: TerminalId,
+        queued: Option<ExitedQueuePage>,
+        prepared: Result<crate::chat::Session, ProtocolError>,
+    },
+    ChatQueueRecipientScope {
+        source: TerminalId,
+        account_scope: Option<[u8; 32]>,
+    },
+    ChatExitedQueuePage {
+        source: TerminalId,
+        page: ExitedQueuePage,
+    },
+    ChatExitedQueue {
+        source: TerminalId,
+        queued: Option<ExitedQueuePage>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExitedQueuePage {
+    pub receipt: uuid::Uuid,
+    pub total: u32,
+    pub offset: u32,
+    pub bytes: Vec<u8>,
+}
+
+/// One exact transfer, validated before its payload can reach a surface.
+pub(crate) struct ExitedQueueCollector {
+    source: TerminalId,
+    receipt: uuid::Uuid,
+    total: usize,
+    bytes: Vec<u8>,
+}
+
+impl ExitedQueueCollector {
+    pub(crate) fn start(source: TerminalId, first: ExitedQueuePage) -> Result<Self, ()> {
+        let total = first.total as usize;
+        if first.receipt.is_nil() || total == 0 || total > MAX_EXITED_QUEUE_BYTES {
+            return Err(());
+        }
+        let mut collector = Self {
+            source,
+            receipt: first.receipt,
+            total,
+            bytes: Vec::new(),
+        };
+        collector.append(source, first)?;
+        Ok(collector)
+    }
+
+    pub(crate) fn append(&mut self, source: TerminalId, page: ExitedQueuePage) -> Result<(), ()> {
+        if source != self.source
+            || page.receipt != self.receipt
+            || page.total as usize != self.total
+            || page.offset as usize != self.bytes.len()
+            || self.bytes.len() == self.total
+            || page.bytes.len() != (self.total - self.bytes.len()).min(EXITED_QUEUE_PAGE_BYTES)
+        {
+            return Err(());
+        }
+        if self.bytes.is_empty() {
+            self.bytes.try_reserve_exact(self.total).map_err(|_| ())?;
+        }
+        self.bytes.extend(page.bytes);
+        Ok(())
+    }
+
+    pub(crate) fn next_request(&self) -> Option<ClientRequest> {
+        (self.bytes.len() < self.total).then_some(ClientRequest::ChatReadExitedQueuePage {
+            source: self.source,
+            receipt: self.receipt,
+            offset: self.bytes.len() as u32,
+        })
+    }
+
+    pub(crate) fn finish(self) -> Result<crate::chat::ExitedQueue, ()> {
+        if self.bytes.len() != self.total {
+            return Err(());
+        }
+        let (queue, trailing): (crate::chat::ExitedQueue, _) =
+            postcard::take_from_bytes(&self.bytes).map_err(|_| ())?;
+        if trailing.is_empty() && queue.messages.len() <= crate::chat::QueuedMessage::LIMIT {
+            return Ok(queue);
+        }
+        Err(())
+    }
+}
+
+/// Assemble one immutable queue before handing it to a caller.
+pub(crate) fn collect_exited_queue<E>(
+    source: TerminalId,
+    first: ExitedQueuePage,
+    mut read: impl FnMut(ClientRequest) -> Result<ServerResponse, E>,
+    invalid: impl Fn() -> E,
+) -> Result<crate::chat::ExitedQueue, E> {
+    let mut collector = ExitedQueueCollector::start(source, first).map_err(|()| invalid())?;
+    while let Some(request) = collector.next_request() {
+        match read(request)? {
+            ServerResponse::ChatExitedQueuePage { source, page } => {
+                collector.append(source, page).map_err(|()| invalid())?;
+            }
+            _ => return Err(invalid()),
+        }
+    }
+    collector.finish().map_err(|()| invalid())
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -2472,7 +2663,7 @@ impl FrameCodec {
 
     /// Append an already encoded response after the ordinary envelope header.
     #[cfg(feature = "host")]
-    pub(crate) fn write_encoded_response(
+    pub fn write_encoded_response(
         &mut self,
         writer: &mut impl Write,
         version: u16,
@@ -2547,7 +2738,7 @@ pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<
     read_frame_with_limit(reader, MAX_FRAME_BYTES)
 }
 
-pub(crate) fn read_frame_with_limit<T: DeserializeOwned>(
+pub fn read_frame_with_limit<T: DeserializeOwned>(
     reader: &mut impl Read,
     maximum: usize,
 ) -> Result<Option<T>, FrameError> {

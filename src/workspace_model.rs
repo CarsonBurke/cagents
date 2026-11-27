@@ -177,7 +177,7 @@ pub struct PaneMove {
 
 mod conversation_titles;
 #[cfg(feature = "host")]
-pub(crate) use conversation_titles::image_placeholder_prompt;
+pub use conversation_titles::image_placeholder_prompt;
 pub use conversation_titles::{channel_title, channel_title_from_prompt};
 
 /// The identity of a registry that has never been created.
@@ -837,9 +837,22 @@ pub fn repository_display_name(repository: &Path) -> String {
         .unwrap_or_else(|| repository.display().to_string())
 }
 
+/// The primary checkout of the project keyed by `repository`, the directory a
+/// person opened and recognizes: the directory holding a Git checkout's own
+/// `.git`, and otherwise the key itself, which is a folder project's own
+/// directory. A repository whose Git directory is elsewhere, such as a
+/// submodule's, is named by that directory, since only Git can say where its
+/// checkout is.
+pub fn primary_checkout(repository: &Path) -> &Path {
+    match repository.parent() {
+        Some(parent) if repository.file_name().is_some_and(|name| name == ".git") => parent,
+        _ => repository,
+    }
+}
+
 /// A Git repository with one linked worktree, for tests of checkouts.
-#[cfg(test)]
-pub(crate) struct CheckoutFixture {
+#[cfg(any(test, feature = "test-support"))]
+pub struct CheckoutFixture {
     pub directory: tempfile::TempDir,
     /// The repository key: the common Git directory, canonical.
     pub repository: PathBuf,
@@ -847,9 +860,13 @@ pub(crate) struct CheckoutFixture {
     pub linked: PathBuf,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-support"))]
 impl CheckoutFixture {
-    pub(crate) fn new() -> Self {
+    #[allow(
+        clippy::new_without_default,
+        reason = "it creates repositories on disk, which is no default value"
+    )]
+    pub fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let main = directory.path().join("repo");
         std::fs::create_dir(&main).unwrap();

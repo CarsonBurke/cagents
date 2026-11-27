@@ -8,7 +8,8 @@
 use std::path::PathBuf;
 
 #[cfg(feature = "host")]
-pub(crate) mod bundled;
+pub mod bundled;
+pub mod concurrency;
 pub mod directory;
 pub mod mailbox;
 pub mod permission;
@@ -27,8 +28,6 @@ pub const MAX_PROMPT_BYTES: usize = 256 * 1024;
 pub const MAX_RESULT_BYTES: usize = 1024 * 1024;
 pub const MAX_DIAGNOSTIC_BYTES: usize = 16 * 1024;
 pub const MAX_CHILDREN: usize = 64;
-pub const MAX_PARENT_RUNNING: usize = 8;
-pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
 
 /// The identity shown for a delegated agent, before or after its conversation
@@ -131,13 +130,24 @@ impl Authority {
 /// Internal acceptance failures; these are never serialized onto the wire.
 #[cfg(feature = "host")]
 #[derive(Debug, thiserror::Error)]
-pub(crate) enum AcceptanceError {
+pub enum AcceptanceError {
     #[error("{0}")]
     Invalid(String),
     #[error("{0}")]
     MailboxFull(String),
     #[error("{0}")]
     StoreBusy(String),
+    /// Nothing was accepted; the same request succeeds once a slot frees.
+    #[error("{0}")]
+    LimitReached(concurrency::LimitReached),
+}
+
+/// The refusal's own sentence, for a caller that reports only text.
+#[cfg(feature = "host")]
+impl From<AcceptanceError> for String {
+    fn from(error: AcceptanceError) -> Self {
+        error.to_string()
+    }
 }
 
 #[cfg(feature = "host")]
@@ -531,14 +541,14 @@ impl Agent {
 /// replacement directory or blocking interruption of an existing provider.
 #[cfg(feature = "host")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct DirectoryIdentity {
+pub struct DirectoryIdentity {
     pub device: u64,
     pub inode: u64,
 }
 
 #[cfg(feature = "host")]
 impl DirectoryIdentity {
-    pub(crate) fn from_metadata(metadata: &std::fs::Metadata) -> Self {
+    pub fn from_metadata(metadata: &std::fs::Metadata) -> Self {
         use std::os::unix::fs::MetadataExt;
         Self {
             device: metadata.dev(),
@@ -561,6 +571,34 @@ pub enum State {
 }
 
 impl State {
+    const ALL: [Self; 7] = [
+        Self::Accepted,
+        Self::Running,
+        Self::Waiting,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelled,
+        Self::Interrupted,
+    ];
+
+    /// The state's lowercase name, as stores and refusals spell it.
+    pub const fn key(self) -> &'static str {
+        match self {
+            Self::Accepted => "accepted",
+            Self::Running => "running",
+            Self::Waiting => "waiting",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+
+    /// The state [`State::key`] names.
+    pub fn from_key(key: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|state| state.key() == key)
+    }
+
     pub fn is_terminal(self) -> bool {
         matches!(
             self,
@@ -590,7 +628,7 @@ impl ResultSummary {
     }
 }
 
-pub(crate) fn truncate(text: &mut String, limit: usize) -> bool {
+pub fn truncate(text: &mut String, limit: usize) -> bool {
     if text.len() <= limit {
         return false;
     }
@@ -734,6 +772,9 @@ pub struct ConsoleView {
     pub run: Run,
 }
 
+/// An open agent and the run that says where it stands: its interrupted run
+/// when it has one, which holds its slot until the agent is closed, and
+/// otherwise its latest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Summary {
     pub agent: Agent,

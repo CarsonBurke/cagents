@@ -205,7 +205,7 @@ fn list_from_path(path: &Path) -> io::Result<Vec<Device>> {
     }
 }
 /// Whether `name` can name a saved device.
-pub(crate) fn validate_name(name: &str) -> io::Result<()> {
+pub fn validate_name(name: &str) -> io::Result<()> {
     if name == "local"
         || name.is_empty()
         || name.len() > 16
@@ -566,7 +566,7 @@ impl ConnectionContext {
         });
         fs::set_permissions(&transport.directory, fs::Permissions::from_mode(0o700))?;
         let path = transport.directory.join("daemon.sock");
-        let listener = UnixListener::bind(&path)?;
+        let listener = crate::descriptor::bind(&path)?;
         listener.set_nonblocking(true)?;
         let owned = transport.clone();
         let worker = thread::Builder::new()
@@ -611,7 +611,7 @@ fn record_bridge_error(transport: &Transport, error: &io::Error) {
     ));
 }
 fn run_bridge(listener: UnixListener, transport: Arc<Transport>) {
-    run_bridge_with(listener, transport, UnixListener::accept);
+    run_bridge_with(listener, transport, crate::descriptor::accept);
 }
 fn run_bridge_with(
     listener: UnixListener,
@@ -702,7 +702,8 @@ fn spawn_stream(
     if transport.cancelled.is_cancelled() {
         return Err(io::Error::other("device connection is closed"));
     }
-    let listening = || control.is_some_and(|control| UnixStream::connect(control).is_ok());
+    let listening =
+        || control.is_some_and(|control| crate::descriptor::connect_settled(control).is_ok());
     let cold = control.is_some() && !listening();
     let child = bridge_command(transport, control)
         .stdin(Stdio::piped())
@@ -1159,25 +1160,21 @@ pub(crate) fn bridge_socket() -> io::Result<PathBuf> {
             "a daemon bridge cannot target another device",
         ));
     }
+    // Darwin always resolves its own runtime directory; see
+    // `instance::runtime_base`.
+    #[cfg(target_os = "linux")]
     if std::env::var_os("XDG_RUNTIME_DIR").is_none() {
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::unix::process::CommandExt;
-            // SSH sessions often lack the login session's runtime variable.
-            // Re-exec with a child environment instead of mutating the process
-            // environment while other library threads may be running.
-            let directory = bridge_runtime_directory(std::path::Path::new("/run/user"), unsafe {
-                libc::geteuid()
-            })?;
-            return Err(Command::new(std::env::current_exe()?)
-                .args(std::env::args_os().skip(1))
-                .env("XDG_RUNTIME_DIR", directory)
-                .exec());
-        }
-        #[cfg(not(target_os = "linux"))]
-        return Err(io::Error::other(
-            "XDG_RUNTIME_DIR is missing; configure an owned private runtime directory for the remote daemon",
-        ));
+        use std::os::unix::process::CommandExt;
+        // SSH sessions often lack the login session's runtime variable.
+        // Re-exec with a child environment instead of mutating the process
+        // environment while other library threads may be running.
+        let directory = bridge_runtime_directory(std::path::Path::new("/run/user"), unsafe {
+            libc::geteuid()
+        })?;
+        return Err(Command::new(std::env::current_exe()?)
+            .args(std::env::args_os().skip(1))
+            .env("XDG_RUNTIME_DIR", directory)
+            .exec());
     }
     if crate::control::daemon_autostart_disabled() {
         crate::terminal::ipc::daemon_socket_path()
@@ -1190,7 +1187,7 @@ pub(crate) fn bridge_socket() -> io::Result<PathBuf> {
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
 pub fn serve_stdio() -> io::Result<()> {
     let path = bridge_socket()?;
-    let stream = match UnixStream::connect(&path) {
+    let stream = match crate::descriptor::connect_settled(&path) {
         Ok(stream) => stream,
         Err(error)
             if crate::control::daemon_autostart_disabled()
@@ -1482,7 +1479,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let transport = fixture_transport(context.device.clone(), directory.path().to_path_buf());
         let path = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let owned = transport.clone();
         let worker = thread::spawn(move || run_bridge(listener, owned));
@@ -1514,7 +1511,7 @@ mod tests {
             directory.path().to_path_buf(),
         );
         let path = directory.path().join("daemon.sock");
-        let listener = UnixListener::bind(&path).unwrap();
+        let listener = crate::descriptor::bind(&path).unwrap();
         listener.set_nonblocking(true).unwrap();
         let (accepted_tx, accepted_rx) = std::sync::mpsc::channel();
         let mut failures = 3;
@@ -1527,7 +1524,7 @@ mod tests {
                 }
                 // Counted rather than forwarded, so no SSH starts; the loop
                 // goes straight back to accepting.
-                let (stream, _) = listener.accept()?;
+                let (stream, _) = crate::descriptor::accept(listener)?;
                 drop(stream);
                 accepted_tx.send(()).unwrap();
                 Err(io::ErrorKind::Interrupted.into())
@@ -1555,7 +1552,7 @@ mod tests {
             });
             let transport = fixture_transport(context.device.clone(), root.path().to_path_buf());
             let stopped = root.path().join("daemon.sock");
-            let listener = UnixListener::bind(&stopped).unwrap();
+            let listener = crate::descriptor::bind(&stopped).unwrap();
             listener.set_nonblocking(true).unwrap();
             let owned = transport.clone();
             let worker = thread::spawn(move || {
@@ -2245,14 +2242,16 @@ mod tests {
             .unwrap();
         let pid = child.id();
         let (mut client, server) = UnixStream::pair().unwrap();
+        // Before the guard closes the other end: Darwin refuses socket
+        // options on a stream whose peer has shut down.
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
         let forwarding = Forwarding::start(child, server, None).unwrap();
         let start = Instant::now();
         drop(forwarding);
         assert!(start.elapsed() < Duration::from_secs(2));
         use std::io::Read;
-        client
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
         assert_eq!(client.read(&mut [0]).unwrap(), 0);
         // SAFETY: this exact child PID is queried without waiting or sending a
         // signal. ECHILD proves the guard has already reaped it.

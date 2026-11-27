@@ -661,7 +661,10 @@ mod tests {
     fn a_named_lead_stands_for_the_members_whatever_their_order() {
         let mut named = members(&[(Codex, MemberState::Working)], 0);
         named.add_lead(Claude, MemberState::Approval);
-        assert_eq!(named.lead(), Some(Member::Agent(Claude, MemberState::Approval)));
+        assert_eq!(
+            named.lead(),
+            Some(Member::Agent(Claude, MemberState::Approval))
+        );
         assert_eq!(named.peek(), Some(Codex));
         assert_eq!(named.len(), 2);
     }

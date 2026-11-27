@@ -24,9 +24,13 @@ mod sqlite_contracts;
 #[macro_export]
 macro_rules! refuse_filtered_test_run {
     () => {
-        #[cfg(all(test, target_os = "linux"))]
+        #[cfg(all(test, any(target_os = "linux", target_os = "macos")))]
         #[used]
-        #[unsafe(link_section = ".init_array")]
+        #[cfg_attr(target_os = "linux", unsafe(link_section = ".init_array"))]
+        #[cfg_attr(
+            target_os = "macos",
+            unsafe(link_section = "__DATA,__mod_init_func,mod_init_funcs")
+        )]
         static REFUSE_FILTERED_TEST_RUN: extern "C" fn() = {
             extern "C" fn refuse() {
                 $crate::refuse_filtered_test_run(
@@ -65,8 +69,11 @@ pub fn refuse_filtered_test_run(mut arguments: impl Iterator<Item = String>) {
 
 crate::test_binary_setup!();
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) mod retained_fixture;
+// The host crate's tests share the retained-fixture supervisor. Darwin
+// compiles it so those tests build there, and it fails closed when run.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub mod retained_fixture;
 #[cfg(all(test, feature = "host", target_os = "linux"))]
 #[path = "../tests/support/retained_fixture_tests.rs"]
 mod retained_fixture_tests;

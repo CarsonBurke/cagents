@@ -297,6 +297,13 @@ impl UsageSnapshot {
     }
 }
 
+/// Verified by the daemon from the connection binding, never from reset input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResetActor {
+    pub lineage: crate::agent_execution::Lineage,
+    pub session: Option<crate::model::TerminalId>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConsumeRequest {
     pub account: AccountId,

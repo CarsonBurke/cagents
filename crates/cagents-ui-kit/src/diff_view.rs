@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Weak},
 };
 
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -48,12 +48,52 @@ pub struct SplitDiffRow {
     pub new_changed: Vec<Range<usize>>,
 }
 
+/// One change region, as 0-based line ranges of each side's text.
+///
+/// A pure insertion has an empty `before` range at the line it goes before,
+/// and a pure deletion an empty `after` range.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct DiffHunk {
+    pub before: Range<u32>,
+    pub after: Range<u32>,
+}
+
+/// One hunk of one comparison, as an action drawn from it names it.
+///
+/// It holds the comparison's texts weakly, which keeps their allocations
+/// from being reused, so it never matches a later comparison that merely has
+/// a hunk with the same line ranges.
+#[derive(Debug, Clone)]
+pub struct HunkRef {
+    pub hunk: DiffHunk,
+    texts: [Weak<str>; 2],
+}
+
+/// The side of a comparison a hunk patch is checked against and changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PatchTarget {
+    /// The old side takes the hunk's new lines: staging a working-tree hunk
+    /// into the index.
+    Before,
+    /// The new side gives the hunk's lines back: unstaging an index hunk.
+    After,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DiffModel {
     /// Complete line extents, retained for constant-time review anchor checks.
     pub line_counts: [usize; 2],
     /// Exact source baseline, including original line endings and final newline.
     pub before: Arc<str>,
+    /// Exact compared text, as exact as [`Self::before`].
+    pub after: Arc<str>,
+    /// Every change region, in file order: hunk `i` is the one whose rows
+    /// start at `change_starts(mode)[i]`.
+    pub hunks: Vec<DiffHunk>,
+    /// Whether `[before, after]` was a path that does not exist, which reads
+    /// as empty text. Creating or deleting a file is a whole-file change, not
+    /// a hunk of one.
+    pub absent: [bool; 2],
     pub inline_rows: Vec<InlineDiffRow>,
     pub split_rows: Vec<SplitDiffRow>,
     pub inline_change_starts: Vec<usize>,
@@ -884,6 +924,94 @@ impl DiffModel {
         self.additions == 0 && self.deletions == 0
     }
 
+    /// Names hunk `index` of this comparison for an action to carry.
+    pub fn hunk_ref(&self, index: usize) -> Option<HunkRef> {
+        Some(HunkRef {
+            hunk: self.hunks.get(index)?.clone(),
+            texts: [Arc::downgrade(&self.before), Arc::downgrade(&self.after)],
+        })
+    }
+
+    /// Which of this comparison's hunks `hunk` names, if it was drawn from
+    /// this comparison rather than an earlier one.
+    pub fn hunk_index(&self, hunk: &HunkRef) -> Option<usize> {
+        let [before, after] = &hunk.texts;
+        (std::ptr::addr_eq(before.as_ptr(), Arc::as_ptr(&self.before))
+            && std::ptr::addr_eq(after.as_ptr(), Arc::as_ptr(&self.after)))
+        .then(|| {
+            self.hunks
+                .iter()
+                .position(|candidate| *candidate == hunk.hunk)
+        })
+        .flatten()
+    }
+
+    /// Whether the comparison creates or deletes the file, so that its one
+    /// hunk is the whole file and is staged, unstaged or reverted as one.
+    pub fn changes_existence(&self) -> bool {
+        self.absent[0] != self.absent[1]
+    }
+
+    /// The `@@` section of a unified diff that changes the `target` side's
+    /// text by hunk `index` alone, for `git apply` to check and apply there.
+    ///
+    /// Context is the target's own lines, so another hunk nearby never makes
+    /// the patch disagree with the text it is applied to. Lines keep their
+    /// exact bytes, CR included, and one without a final newline is marked
+    /// as `git diff` marks it. `None` when there is no such hunk.
+    pub fn hunk_patch(&self, index: usize, target: PatchTarget) -> Option<String> {
+        let hunk = self.hunks.get(index)?;
+        let (target_text, other_text, own, other) = match target {
+            PatchTarget::Before => (&self.before, &self.after, &hunk.before, &hunk.after),
+            PatchTarget::After => (&self.after, &self.before, &hunk.after, &hunk.before),
+        };
+        let lines: Vec<&str> = target_text.split_inclusive('\n').collect();
+        let replacement: Vec<&str> = other_text
+            .split_inclusive('\n')
+            .skip(other.start as usize)
+            .take(other.len())
+            .collect();
+        let (start, end) = (own.start as usize, own.end as usize);
+        if end > lines.len() || replacement.len() != other.len() {
+            return None;
+        }
+        let lead = start.saturating_sub(FOLD_CONTEXT);
+        let tail = (end + FOLD_CONTEXT).min(lines.len());
+        let old_count = tail - lead;
+        let new_count = old_count - (end - start) + replacement.len();
+        // A side with no lines in the patch names the line it follows.
+        let first = |count: usize| if count == 0 { lead } else { lead + 1 };
+        let mut patch = format!(
+            "@@ -{},{old_count} +{},{new_count} @@\n",
+            first(old_count),
+            first(new_count)
+        );
+        let mut push = |marker: char, line: &str| {
+            patch.push(marker);
+            patch.push_str(line);
+            if !line.ends_with('\n') {
+                patch.push_str("\n\\ No newline at end of file\n");
+            }
+        };
+        lines[lead..start].iter().for_each(|line| push(' ', line));
+        lines[start..end].iter().for_each(|line| push('-', line));
+        replacement.iter().for_each(|line| push('+', line));
+        lines[end..tail].iter().for_each(|line| push(' ', line));
+        Some(patch)
+    }
+
+    /// `after` with hunk `index` given back its `before` lines, as the byte
+    /// range of `after` to replace and the text replacing it.
+    pub fn hunk_reversal(&self, index: usize) -> Option<(Range<usize>, &str)> {
+        let hunk = self.hunks.get(index)?;
+        let span = |text: &str, lines: &Range<u32>| {
+            Some(line_offset(text, lines.start as usize)?..line_offset(text, lines.end as usize)?)
+        };
+        let replaced = span(&self.after, &hunk.after)?;
+        let restored = span(&self.before, &hunk.before)?;
+        Some((replaced, &self.before[restored]))
+    }
+
     pub fn change_starts(&self, mode: DiffMode) -> &[usize] {
         match mode {
             DiffMode::Inline => &self.inline_change_starts,
@@ -1024,7 +1152,7 @@ impl RenderedDiff {
                         new_label,
                     });
                 }
-                let model = match build_document_diff(
+                let mut model = match build_document_diff(
                     old.text().unwrap_or_default(),
                     new.text().unwrap_or_default(),
                     path,
@@ -1035,6 +1163,10 @@ impl RenderedDiff {
                     Some(model) => model,
                     None => return Self::Error("repository operation cancelled".into()),
                 };
+                model.absent = [
+                    matches!(old, crate::repository::DiffSide::Absent),
+                    matches!(new, crate::repository::DiffSide::Absent),
+                ];
                 Self::Text {
                     model,
                     old_label,
@@ -1120,6 +1252,9 @@ fn build_diff_rows(
         let mut model = DiffModel {
             line_counts: [lines.len(); 2],
             before: Arc::clone(before),
+            after: Arc::clone(before),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: Vec::with_capacity(lines.len()),
             split_rows: Vec::with_capacity(lines.len()),
             inline_change_starts: Vec::new(),
@@ -1181,9 +1316,14 @@ fn build_diff_rows(
     let mut after_endings = HashMap::<&str, u8>::new();
     let mut intraline_budget = 4_000_000usize;
     let mut pairing_budget = 1_000_000usize;
+    let mut hunks = Vec::new();
 
     for hunk in diff.hunks() {
         check_cancelled(cancellation)?;
+        hunks.push(DiffHunk {
+            before: hunk.before.clone(),
+            after: hunk.after.clone(),
+        });
         append_context(
             &before_lines,
             &after_lines,
@@ -1323,6 +1463,9 @@ fn build_diff_rows(
     Ok(DiffModel {
         line_counts: [before_lines.len(), after_lines.len()],
         before: Arc::clone(before),
+        after: Arc::from(after),
+        hunks,
+        absent: [false; 2],
         inline_rows,
         split_rows,
         inline_change_starts,
@@ -1333,6 +1476,18 @@ fn build_diff_rows(
         max_line_width: [0; 2],
         syntax: DiffSyntax::default(),
     })
+}
+
+/// The byte offset line `line` (0-based) starts at; the text's length for
+/// the line after its last.
+fn line_offset(text: &str, line: usize) -> Option<usize> {
+    if line == 0 {
+        return Some(0);
+    }
+    text.match_indices('\n')
+        .nth(line - 1)
+        .map(|(index, _)| index + 1)
+        .or_else(|| (line == text.split_inclusive('\n').count()).then_some(text.len()))
 }
 
 /// Unchanged rows kept beside every change, as `git diff` does by default.
@@ -1963,6 +2118,179 @@ mod tests {
     use super::*;
     use crate::repository::{DiffSide, Oid, ValidatedRefName};
 
+    /// Comparisons whose hunks a patch has to carry exactly: several far
+    /// apart, two within each other's context, CRLF, a final line gaining
+    /// or losing its newline, a line ending changing alone, and an empty
+    /// file that exists.
+    const HUNK_CASES: &[(&str, &str, &str)] = &[
+        (
+            "separate",
+            "1\n2\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\n",
+            "1\ntwo\n3\n4\n5\n6\n7\n8\n9\n10\n11\n12\n13\n14\n15\n16\n17\n18\neighteen and on\n",
+        ),
+        (
+            "adjacent",
+            "a\nb\nc\nd\ne\nf\ng\nh\n",
+            "a\nb\nC\nd\nE\nf\ng\nh\n",
+        ),
+        (
+            "crlf",
+            "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\neight\r\n",
+            "one\r\n2\r\nthree\r\nfour\r\nfive\r\nsix\r\n7\r\neight\r\n",
+        ),
+        ("loses newline", "a\nb\nc\n", "a\nb\nc"),
+        ("gains newline", "a\nb\nc", "a\nb\nc\nd\n"),
+        ("neither newline", "a\nb\nc", "a\nB\nc"),
+        ("ending only", "a\r\nb\nc\n", "a\nb\nc\n"),
+        ("filled", "", "x\ny\n"),
+        ("emptied", "x\ny\n", ""),
+    ];
+
+    fn git_output(root: &Path, arguments: &[&str]) -> Vec<u8> {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["-c", "core.autocrlf=false", "-c", "core.fsmonitor=false"])
+            .args(arguments)
+            .output()
+            .expect("git runs");
+        assert!(
+            output.status.success(),
+            "git {arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output.stdout
+    }
+
+    /// A repository whose index holds `staged` as `f.txt`.
+    fn indexed(staged: &str) -> tempfile::TempDir {
+        let directory = tempdir().unwrap();
+        git_output(directory.path(), &["init", "-q"]);
+        fs::write(directory.path().join("f.txt"), staged).unwrap();
+        git_output(directory.path(), &["add", "f.txt"]);
+        directory
+    }
+
+    fn index_text(root: &Path) -> String {
+        String::from_utf8(git_output(root, &["show", ":f.txt"])).unwrap()
+    }
+
+    /// Applies hunk `index` of `model` to the index through the service,
+    /// as staging (`target` Before, the index) or unstaging (After) does.
+    fn apply_hunk(root: &Path, model: &DiffModel, index: usize, target: PatchTarget) {
+        let staging = target == PatchTarget::Before;
+        let request = crate::repository::IndexPatchRequest {
+            worktree: root.to_path_buf(),
+            path: RepoPath::parse("f.txt").unwrap(),
+            index: if staging { &model.before } else { &model.after }.to_string(),
+            hunks: model.hunk_patch(index, target).unwrap(),
+            worktree_text: staging.then(|| model.after.to_string()),
+        };
+        let outcome = RepositoryService::system("git")
+            .apply_index_patch(&request, &CancellationToken::new())
+            .unwrap();
+        assert!(
+            matches!(outcome, crate::repository::MutationOutcome::Applied { .. }),
+            "{outcome:?} for\n{}",
+            request.hunks
+        );
+    }
+
+    /// `text` with the lines `own` replaced by `other`'s lines `theirs`.
+    fn spliced(text: &str, own: &Range<u32>, other: &str, theirs: &Range<u32>) -> String {
+        let lines: Vec<&str> = text.split_inclusive('\n').collect();
+        let replacement = other
+            .split_inclusive('\n')
+            .skip(theirs.start as usize)
+            .take(theirs.len());
+        lines[..own.start as usize]
+            .iter()
+            .copied()
+            .chain(replacement)
+            .chain(lines[own.end as usize..].iter().copied())
+            .collect()
+    }
+
+    /// Staging one hunk moves exactly that hunk into the index, whichever
+    /// it is, and staging them one at a time arrives at the working text.
+    #[test]
+    fn staging_one_hunk_moves_only_that_hunk_into_the_index() {
+        for (name, before, after) in HUNK_CASES {
+            let model = build_diff(before, after);
+            assert!(!model.hunks.is_empty(), "{name}");
+            for (index, hunk) in model.hunks.iter().enumerate() {
+                let repository = indexed(before);
+                apply_hunk(repository.path(), &model, index, PatchTarget::Before);
+                assert_eq!(
+                    index_text(repository.path()),
+                    spliced(before, &hunk.before, after, &hunk.after),
+                    "{name} hunk {index}"
+                );
+            }
+            let repository = indexed(before);
+            loop {
+                let staged = index_text(repository.path());
+                let remaining = build_diff(&staged, after);
+                if remaining.hunks.is_empty() {
+                    break;
+                }
+                apply_hunk(repository.path(), &remaining, 0, PatchTarget::Before);
+            }
+            assert_eq!(index_text(repository.path()), *after, "{name}");
+        }
+    }
+
+    /// Unstaging checks the patch against the index, the new side, so a
+    /// staged hunk next to another comes out alone.
+    #[test]
+    fn unstaging_one_hunk_gives_the_index_back_only_that_hunk() {
+        for (name, before, after) in HUNK_CASES {
+            let model = build_diff(before, after);
+            for (index, hunk) in model.hunks.iter().enumerate() {
+                let repository = indexed(after);
+                apply_hunk(repository.path(), &model, index, PatchTarget::After);
+                assert_eq!(
+                    index_text(repository.path()),
+                    spliced(after, &hunk.after, before, &hunk.before),
+                    "{name} hunk {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_reversal_gives_one_hunk_back_its_old_lines() {
+        for (name, before, after) in HUNK_CASES {
+            let model = build_diff(before, after);
+            for (index, hunk) in model.hunks.iter().enumerate() {
+                let (span, restored) = model.hunk_reversal(index).unwrap();
+                let mut reverted = after.to_string();
+                reverted.replace_range(span, restored);
+                assert_eq!(
+                    reverted,
+                    spliced(after, &hunk.after, before, &hunk.before),
+                    "{name} hunk {index}"
+                );
+            }
+        }
+        assert!(build_diff("a\n", "b\n").hunk_reversal(1).is_none());
+    }
+
+    #[test]
+    fn a_patch_marks_the_final_line_without_a_newline() {
+        let model = build_diff("a\nb\nc\n", "a\nb\nc");
+        assert_eq!(
+            model.hunk_patch(0, PatchTarget::Before).unwrap(),
+            "@@ -1,3 +1,3 @@\n a\n b\n-c\n+c\n\\ No newline at end of file\n"
+        );
+        assert_eq!(
+            build_diff("", "x\n")
+                .hunk_patch(0, PatchTarget::Before)
+                .unwrap(),
+            "@@ -0,0 +1,1 @@\n+x\n"
+        );
+    }
+
     /// The default syntax theme, spelled once for the call sites that only
     /// need *a* theme rather than a particular one.
     const AUTO: crate::settings::EditorSyntaxTheme = crate::settings::EditorSyntaxTheme::Auto;
@@ -2095,6 +2423,8 @@ mod tests {
     /// What keeping the grammar costs the process, and whether letting it go
     /// gives that back: resident memory before a load, while kept after
     /// highlighting a few languages, and once the linger has passed.
+    // Reads glibc's resident set from `/proc` and trims glibc's heap.
+    #[cfg(target_os = "linux")]
     #[test]
     #[ignore = "measurement; run with --ignored --nocapture"]
     fn what_a_kept_grammar_costs_the_process() {
@@ -3673,6 +4003,13 @@ mod tests {
                 let changed = vec![0..split];
                 let native = shaped_line_width(text, &changed, &syntax);
                 let cached = ShapeKey::new(text, &syntax, MONO).width(&mut words);
+                // Darwin's native paragraph can report an unbounded width
+                // for some glyph runs. The cached path must agree there too.
+                #[cfg(target_os = "macos")]
+                if native == f32::INFINITY {
+                    assert_eq!(cached, native, "{text:?}, font {font:?}");
+                    continue;
+                }
                 assert!(
                     (native - cached).abs() < 0.02,
                     "{text:?}: native {native}, cached {cached}, font {font:?}"

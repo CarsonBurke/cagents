@@ -196,7 +196,7 @@ mod wire_json {
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn execute(operation: Operation) -> Result<Reply, String> {
+pub fn execute(operation: Operation) -> Result<Reply, String> {
     use crate::fs_safety;
     use std::fs;
     match operation {
@@ -610,6 +610,18 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
             let destination = root.join(".worktrees").join(name);
             crate::secure_file::reject_symlink_components(&destination)
                 .map_err(|error| error.to_string())?;
+            // Git refuses a dirty worktree itself, but not one whose detached
+            // HEAD is the only thing holding its commits.
+            let service = crate::repository::RepositoryService::system("git");
+            let cancellation = CancellationToken::new();
+            let records = service
+                .list_worktrees(root, &cancellation)
+                .map_err(|error| error.to_string())?;
+            let record = records
+                .iter()
+                .find(|record| record.path == destination)
+                .ok_or("worktree is not registered with Git")?;
+            service.refuse_losing_detached_commits(root, record, &cancellation)?;
             command.args(["worktree", "remove", "--"]).arg(destination)
         }
         GitOperation::Diff { staged } => {
@@ -1359,6 +1371,46 @@ mod tests {
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
+        // A detached worktree whose HEAD alone holds a commit is kept; once
+        // a branch holds that commit it is removed.
+        invoke(GitOperation::CreateWorktree {
+            name: "detached".into(),
+            branch: "feature/detached".into(),
+        })
+        .unwrap();
+        let detached = root.join(".worktrees/detached");
+        let run_in = |arguments: &[&str]| {
+            let output = std::process::Command::new("git")
+                .current_dir(&detached)
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .args(arguments)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run_in(&["switch", "--detach"]);
+        run_in(&["commit", "--allow-empty", "-m", "detached only"]);
+        let refusal = invoke(GitOperation::RemoveWorktree {
+            name: "detached".into(),
+        })
+        .unwrap_err();
+        assert!(refusal.contains("1 commit on no branch"), "{refusal}");
+        assert!(detached.is_dir());
+        run_in(&["branch", "rescue"]);
+        invoke(GitOperation::RemoveWorktree {
+            name: "detached".into(),
+        })
+        .unwrap();
+        assert!(!detached.exists());
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
         let linked_directory = crate::repository::retained_managed_fixture_directory();
@@ -1479,6 +1531,11 @@ mod tests {
         for mode in [0o755, 0o664, 0o4755, 0o2755] {
             std::fs::write(&path, "before").unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
+            let original_mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777;
+            #[cfg(target_os = "linux")]
+            assert_eq!(original_mode, mode);
+            #[cfg(target_os = "macos")]
+            assert_eq!(original_mode & 0o777, mode & 0o777);
             execute(Operation::Write {
                 root: directory.path().to_owned(),
                 path: "file".into(),
@@ -1489,11 +1546,13 @@ mod tests {
             assert_eq!(std::fs::read_to_string(&path).unwrap(), "after");
             assert_eq!(
                 std::fs::metadata(&path).unwrap().permissions().mode() & 0o7777,
-                mode
+                original_mode
             );
         }
     }
 
+    // The fixture writes Linux's POSIX ACL extended attribute.
+    #[cfg(target_os = "linux")]
     #[test]
     fn device_save_preserves_access_acl() {
         use std::os::fd::AsRawFd;
@@ -1871,7 +1930,7 @@ fn accounts() -> Result<Reply, String> {
 /// Chooses the default account for `provider`, as
 /// [`Operation::AccountDefault`] asks, under the daemon's shared admission.
 #[cfg(feature = "host")]
-pub(crate) fn account_default(
+pub fn account_default(
     expected_revision: u64,
     provider: crate::agent::Provider,
     selection: &crate::account::preferences::DefaultSelection,
@@ -1898,7 +1957,7 @@ pub(crate) fn account_default(
 /// [`Operation::AccountsUpdate`] asks, under the daemon's shared admission:
 /// a held account list refuses at once rather than wait, retryably.
 #[cfg(feature = "host")]
-pub(crate) fn update_accounts(
+pub fn update_accounts(
     expected_revision: u64,
     proposal: serde_json::Value,
 ) -> Result<Reply, crate::account::remote::LifecycleError> {

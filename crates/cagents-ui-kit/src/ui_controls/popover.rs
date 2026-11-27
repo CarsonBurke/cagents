@@ -25,7 +25,146 @@ pub fn popover<'a, Message: Clone + 'static>(
         position,
         on_close,
         iced::Padding::new(space::XS),
+        design::elevated(),
     )
+}
+
+/// A context menu that the application opens itself, at `position`, drawn as
+/// COSMIC draws its native context menu: rows the menu's width that highlight
+/// whole, in the menu's text colour, with a dimmed row for an action that is
+/// unavailable. Build its rows with [`menu_item`].
+///
+/// Prefer [`crate::interaction::context_menu`], which opens the native menu
+/// on a right click by itself. This is for a surface that decides whether a
+/// right click is its own first, such as a terminal whose program may be
+/// reading the mouse.
+pub fn popover_menu<'a, Message: Clone + 'static>(
+    anchor: impl Into<Element<'a, Message>>,
+    items: Option<Vec<MenuItem<'a, Message>>>,
+    position: widget::popover::Position,
+    on_close: Message,
+) -> Element<'a, Message> {
+    let content = items.map(|items| menu_rows(items, on_close.clone()));
+    framed(
+        anchor,
+        content,
+        position,
+        on_close,
+        iced::Padding::new(design::BORDER_WIDTH),
+        cosmic::theme::Container::custom(menu_surface),
+    )
+}
+
+/// A [`popover_menu`]'s rows, sized as the native menu sizes them, with
+/// Escape sending `on_close`.
+pub fn menu_rows<'a, Message: Clone + 'static>(
+    items: Vec<MenuItem<'a, Message>>,
+    on_close: Message,
+) -> Element<'a, Message> {
+    // As wide as the native menu sizes itself for its longest row.
+    let width = items
+        .iter()
+        .map(|item| item.width)
+        .fold(MENU_MIN_WIDTH, f32::max);
+    // The native menu's column, which rounds the first and last rows'
+    // highlight into the surface's corners.
+    let rows = widget::menu::menu_column::MenuColumn::from_vec(
+        items.into_iter().map(|item| item.element).collect(),
+    )
+    .width(Length::Fixed(width));
+    // Escape closes the menu, as it does the native one, before the
+    // surface beneath (a terminal's program, say) can take it.
+    crate::interaction::unclaimed_key(rows, move |event| {
+        matches!(
+            event,
+            cosmic::iced::keyboard::Event::KeyPressed {
+                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+                ..
+            }
+        )
+        .then(|| on_close.clone())
+    })
+}
+
+/// The narrowest a native menu draws, and the widest it grows for its
+/// labels.
+const MENU_MIN_WIDTH: f32 = 240.0;
+const MENU_MAX_WIDTH: f32 = 480.0;
+
+/// A row of a [`popover_menu`].
+pub struct MenuItem<'a, Message> {
+    element: Element<'a, Message>,
+    width: f32,
+}
+
+/// A [`popover_menu`] row: `label`, with `hint` (such as the gesture or chord
+/// that does the same) at its trailing edge, pressed for `on_press`, or
+/// dimmed and inert without it. It is the native menu's own row.
+pub fn menu_item<'a, Message: Clone + 'a>(
+    label: impl Into<Cow<'a, str>>,
+    hint: Option<&'a str>,
+    on_press: Option<Message>,
+) -> MenuItem<'a, Message> {
+    let label = label.into();
+    let hint = hint.unwrap_or_default();
+    // The native menu's estimate of the row's width, so the two agree.
+    let width = ((label.chars().count() + hint.chars().count()) as f32 * 8.5 + 80.0)
+        .clamp(MENU_MIN_WIDTH, MENU_MAX_WIDTH)
+        .trunc();
+    let row = widget::menu::menu_button(vec![
+        // The native rows keep an icon's column even without one.
+        iced::widget::Space::new().width(14).into(),
+        iced::widget::Space::new().width(space::XXS).into(),
+        widget::text(label.clone()).into(),
+        iced::widget::Space::new().width(Length::Fill).into(),
+        widget::text(hint)
+            .class(cosmic::theme::Text::Custom(menu_hint))
+            .into(),
+    ])
+    .name(label)
+    .on_press_maybe(on_press);
+    MenuItem {
+        element: row.into(),
+        width,
+    }
+}
+
+/// A [`popover_menu`] rule between groups of rows, as the native menu draws
+/// one.
+pub fn menu_divider<'a, Message: 'a>() -> MenuItem<'a, Message> {
+    MenuItem {
+        element: widget::divider::horizontal::light().into(),
+        width: 0.0,
+    }
+}
+
+/// The native menu's surface: the background's component, its divider for
+/// an edge, and small corners. Opaque even under blur, as the native menu
+/// is when it draws inside the window rather than as its own surface.
+fn menu_surface(theme: &cosmic::Theme) -> widget::container::Style {
+    let cosmic = theme.cosmic();
+    let component = &cosmic.background(false).component;
+    widget::container::Style {
+        background: Some(iced::Background::Color(component.base.into())),
+        text_color: Some(component.on.into()),
+        icon_color: Some(component.on.into()),
+        border: iced::Border {
+            color: component.divider.into(),
+            width: design::BORDER_WIDTH,
+            radius: cosmic.corner_radii.radius_s.into(),
+        },
+        ..Default::default()
+    }
+}
+
+/// A native menu row's shortcut, in its label's colour at three quarters.
+fn menu_hint(theme: &cosmic::Theme) -> iced::widget::text::Style {
+    let mut color = theme.cosmic().background(theme.transparent).component.on;
+    color.alpha *= 0.75;
+    iced::widget::text::Style {
+        color: Some(color.into()),
+        ..Default::default()
+    }
 }
 
 /// A [`popover`] framing a [`popover_scroll`]: a body that scrolls as a whole.
@@ -51,6 +190,7 @@ pub fn scrolling_popover<'a, Message: Clone + 'static>(
             left: SCROLLING_FRAME,
             right: SCROLLING_FRAME,
         },
+        design::elevated(),
     )
 }
 
@@ -107,6 +247,7 @@ fn framed<'a, Message: Clone + 'static>(
     position: widget::popover::Position,
     on_close: Message,
     padding: iced::Padding,
+    class: cosmic::theme::Container<'static>,
 ) -> Element<'a, Message> {
     let mut popup = widget::popover(anchor)
         .position(position)
@@ -116,9 +257,7 @@ fn framed<'a, Message: Clone + 'static>(
         // reports a mouse interaction. Include the frame's padding and inert
         // content, which otherwise report None and expose controls beneath.
         popup = popup.popup(crate::interaction::opaque(
-            widget::container(content)
-                .padding(padding)
-                .class(design::elevated()),
+            widget::container(content).padding(padding).class(class),
         ));
     }
     popup.into()

@@ -117,35 +117,27 @@ pub(in crate::app) mod tests {
     }
 
     #[test]
-    fn project_keyboard_activation_matches_folder_review_and_retry_actions() {
+    fn project_keyboard_activation_matches_folder_and_retry_actions() {
         let (mut app, project, _) = fixture();
         let row = SelectionRow::Project(project);
         assert_eq!(
             app.sidebar_navigation_action(row),
             Some(SidebarAction::ToggleProject(project))
         );
+        // A folder folds as a repository does; its root opens from its row
+        // in the Worktrees pane.
         app.sidebar_model.projects[0].kind = ProjectKind::Folder;
-        assert_eq!(
-            app.sidebar_navigation_action(row),
-            Some(SidebarAction::OpenRepository {
-                project_id: project,
-                repository: "/selection-project".into(),
-            })
-        );
-        app.sidebar_model.projects[0].kind = ProjectKind::Git;
-        app.sidebar_state.apply(&SidebarAction::SetFilter(
-            sidebar::SidebarFilter::PullRequests,
-        ));
         assert_eq!(
             app.sidebar_navigation_action(row),
             Some(SidebarAction::ToggleProject(project))
         );
+        app.sidebar_model.projects[0].kind = ProjectKind::Git;
+        // A GitHub project's pull requests open from its Worktrees pane
+        // header; its sidebar header still only folds.
         app.sidebar_model.projects[0].github_ready = true;
         assert_eq!(
             app.sidebar_navigation_action(row),
-            Some(SidebarAction::BrowsePullRequests {
-                project_id: project
-            })
+            Some(SidebarAction::ToggleProject(project))
         );
         app.sidebar_model.projects[0].unreachable = Some("Missing folder".into());
         assert_eq!(
@@ -159,8 +151,42 @@ pub(in crate::app) mod tests {
         assert_eq!(app.sidebar_navigation_action(row), None);
     }
 
+    /// Enter on a search that finds only an empty folder goes into the
+    /// folder, as a search finding a pane goes to the pane: with nothing
+    /// under its heading, there is nothing to fold.
     #[test]
-    fn closing_search_clears_filters_and_restores_toggle_focus_in_both_densities() {
+    fn entering_a_search_that_finds_only_a_folder_opens_it() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let folder = ProjectId::new();
+        app.sidebar_model.projects.push(
+            SidebarProject::new(
+                folder,
+                RepositoryId::new(),
+                "fieldnotes".into(),
+                "/fieldnotes".into(),
+                Vec::new(),
+                Vec::new(),
+            )
+            .with_kind(ProjectKind::Folder),
+        );
+        drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
+            "fieldnotes".into(),
+        ))));
+        assert_eq!(app.visible_sidebar_rows(), [SelectionRow::Project(folder)]);
+        let expanded = app.sidebar_state.project_expanded(folder);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenFirstSearchResult)));
+        assert_eq!(app.sidebar_state.project_expanded(folder), expanded);
+        assert_eq!(
+            app.sidebar_state
+                .active_worktree()
+                .map(|key| key.canonical_path.clone()),
+            Some("/fieldnotes".into()),
+            "the folder's root is where the user now works"
+        );
+    }
+
+    #[test]
+    fn closing_search_clears_query_and_restores_toggle_focus_in_both_densities() {
         for compact in [false, true] {
             let (mut app, _, _) = fixture();
             app.chrome_ui.projects_collapsed = compact;
@@ -168,13 +194,9 @@ pub(in crate::app) mod tests {
             drop(app.update(Message::Sidebar(SidebarAction::SearchChanged(
                 "channel".into(),
             ))));
-            drop(app.update(Message::Sidebar(SidebarAction::SetFilter(
-                sidebar::SidebarFilter::PullRequests,
-            ))));
             let task = app.update(Message::Sidebar(SidebarAction::ToggleControls));
             assert!(!app.sidebar_state.controls_expanded());
             assert_eq!(app.sidebar_state.query(), "");
-            assert_eq!(app.sidebar_state.filter(), sidebar::SidebarFilter::All);
             assert_eq!(
                 super::super::tests::focused(&app, task),
                 Some(sidebar::search_toggle_focus_id())
