@@ -169,7 +169,7 @@ use crate::{
         RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot, UnstageRequest,
         WorktreeCreationOutcome, WorktreeRecord,
     },
-    repository_widget::{self, LspIntent, RepositoryAction, RepositoryRuntime},
+    repository_widget::{self, HunkStaging, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
         QUARANTINE_GUIDANCE, QuarantinedWrite, ReplacedIdentity, SessionRuntime, SessionSaveHealth,
         SessionSaveHealthEvent, WriteSubject,
@@ -8540,6 +8540,12 @@ impl Cagents {
         {
             runtime.restore_navigation(navigation);
         }
+        if self
+            .source_control_mutations
+            .contains_key(&runtime.descriptor.worktree)
+        {
+            runtime.index_mutation_started();
+        }
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -14989,6 +14995,14 @@ impl Cagents {
         );
         source.set_error(None);
         source.set_mutation(Some(kind));
+        // Their comparisons are stale until the completion refreshes them.
+        for runtime in self.cards.values_mut() {
+            if let CardRuntime::Repository(runtime) = runtime
+                && runtime.descriptor.worktree == key.canonical_path
+            {
+                runtime.index_mutation_started();
+            }
+        }
         Some(id)
     }
 
@@ -18815,6 +18829,56 @@ impl Cagents {
                     }
                 }))
             }
+            Message::Repository(RepositoryAction::StageHunk { card, hunk, stage }) => {
+                if self.modal_is_open() {
+                    return Task::none();
+                }
+                let Some(CardRuntime::Repository(runtime)) = self.cards.get(&card) else {
+                    return Task::none();
+                };
+                let Some(key) = self
+                    .sidebar_model
+                    .source_control
+                    .as_ref()
+                    .filter(|source| source.key.canonical_path == runtime.descriptor.worktree)
+                    .map(|source| source.key.clone())
+                else {
+                    return Task::none();
+                };
+                match runtime.hunk_staging(&hunk, stage) {
+                    Some(HunkStaging::File(selection)) => {
+                        self.dispatch(Message::Sidebar(if stage {
+                            SidebarAction::Stage {
+                                key,
+                                selection: vec![selection],
+                            }
+                        } else {
+                            SidebarAction::Unstage {
+                                key,
+                                selection: vec![selection],
+                            }
+                        }))
+                    }
+                    Some(HunkStaging::Patch(request)) => {
+                        let kind = if stage {
+                            MutationKind::Stage
+                        } else {
+                            MutationKind::Unstage
+                        };
+                        let Some(operation) = self.begin_mutation(&key, kind, None) else {
+                            return Task::none();
+                        };
+                        Self::mutation_task(key, operation, move |service, cancel| {
+                            let label = if stage { "Stage" } else { "Unstage" };
+                            (
+                                mutation_report(label, service.apply_index_patch(&request, cancel)),
+                                false,
+                            )
+                        })
+                    }
+                    None => Task::none(),
+                }
+            }
             Message::ResolvedDiffBasis { card, basis } => {
                 let task = match self.cards.get_mut(&card) {
                     Some(CardRuntime::Repository(runtime)) => repository_task(
@@ -20685,7 +20749,22 @@ impl Cagents {
                 operation,
                 report,
                 committed,
-            } => handled!(self.source_control_mutated(key, operation, report, committed)),
+            } => {
+                if self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    for runtime in self.cards.values_mut() {
+                        if let CardRuntime::Repository(runtime) = runtime
+                            && runtime.descriptor.worktree == key.canonical_path
+                        {
+                            runtime.index_mutation_finished();
+                        }
+                    }
+                }
+                handled!(self.source_control_mutated(key, operation, report, committed))
+            }
         };
         self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task
