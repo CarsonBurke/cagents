@@ -896,7 +896,7 @@ class Scenario:
                           "displayName": "Offline fixture"}], "nextCursor": None}
 
 
-def serve(connection, codex_home, scenario, request_lock):
+def serve(connection, codex_home, scenario, request_lock, notifications=None):
     header = bytearray()
     while b"\r\n\r\n" not in header:
         header.extend(transport.exact(connection, 1))
@@ -908,33 +908,50 @@ def serve(connection, codex_home, scenario, request_lock):
         key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
     connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
     send = threading.Lock()
-    while True:
-        try:
-            request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
-        except EOFError:
-            if scenario.never_confirm_close:
-                # A Close frame leaves the transport connected. Withhold its
-                # handshake until the peer disconnects; EOF returns immediately.
-                while connection.recv(65536):
-                    pass
-            raise
-        with request_lock:
-            responses = scenario.request(request, codex_home)
-            generations = scenario.playback(responses)
-        # A turn's later frames follow its pause on their own thread, so the
-        # client's requests in the meantime are still answered.
-        def play(responses=responses, generations=generations):
-            def publish(response):
-                with send:
-                    connection.sendall(transport.frame(response))
+    def send_response(response, opcode=1):
+        with send:
+            connection.sendall(transport.frame(response, opcode=opcode))
+
+    try:
+        while True:
             try:
-                scenario.play(responses, publish, request_lock, generations)
-            except (EOFError, ConnectionError):
-                pass
-        if any("_sleep" in response for response in responses):
-            threading.Thread(target=play, daemon=True).start()
-        else:
-            play()
+                request = transport.receive(connection, lambda payload: send_response(payload, opcode=10))
+            except EOFError:
+                if scenario.never_confirm_close:
+                    # A Close frame leaves the transport connected. Withhold its
+                    # handshake until the peer disconnects; EOF returns immediately.
+                    while connection.recv(65536):
+                        pass
+                raise
+            if notifications is not None and request.get("method") == "initialized":
+                notifications.subscribe(send_response)
+            with request_lock:
+                responses = scenario.request(request, codex_home)
+                generations = scenario.playback(responses)
+            # A turn's later frames follow its pause on their own thread, so the
+            # client's requests in the meantime are still answered.
+            def play(responses=responses, generations=generations):
+                def publish(response):
+                    if notifications is not None and "method" in response and "id" not in response:
+                        notifications.publish(response)
+                    else:
+                        try:
+                            send_response(response)
+                        except OSError:
+                            if notifications is None:
+                                raise
+                            notifications.unsubscribe(send_response)
+                try:
+                    scenario.play(responses, publish, request_lock, generations)
+                except (EOFError, ConnectionError):
+                    pass
+            if any("_sleep" in response for response in responses):
+                threading.Thread(target=play, daemon=True).start()
+            else:
+                play()
+    finally:
+        if notifications is not None:
+            notifications.unsubscribe(send_response)
 
 
 def main():

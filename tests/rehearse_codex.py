@@ -208,6 +208,27 @@ class PersistenceTests(unittest.TestCase):
                 self.assertEqual(resumed["thread"]["status"]["type"], "idle")
                 self.assertEqual(resumed["initialTurnsPage"]["data"][0]["status"], "completed")
 
+    def test_retained_playback_finishes_when_the_original_connection_is_lost(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = Path(directory) / "state"
+            scenario = adapter.scenario_class(peer, storage, Path("/first/control.sock"))()
+            remaining, generations = self.start_paused(scenario, directory)
+            notifications = adapter.RetainedNotifications()
+            lost, received = [], []
+
+            def closed(response):
+                lost.append(response)
+                raise OSError("the original connection closed")
+
+            notifications.subscribe(closed)
+            notifications.subscribe(received.append)
+            scenario.play(remaining, notifications.publish, threading.Lock(), generations)
+            self.assertEqual(len(lost), 1)
+            self.assertEqual(scenario.latest["status"], "completed")
+            completed = [frame for frame in received if frame.get("method") == "turn/completed"
+                         and frame["params"]["threadId"] == scenario.thread]
+            self.assertEqual(len(completed), 1)
+
     def test_interrupted_parent_and_running_child_survive_listener_replacement(self):
         with tempfile.TemporaryDirectory() as directory:
             storage = Path(directory) / "state"
