@@ -782,7 +782,10 @@ impl<'a> View<'a> {
                 popover_item(
                     Icon::Delete.handle(),
                     "Remove project…",
-                    "Asks first; its files stay on disk",
+                    match self.device {
+                        Some(device) => format!("Asks first; its files stay on {device}"),
+                        None => "Asks first; its files stay on disk".to_owned(),
+                    },
                     command(ProjectCommand::Remove),
                 )
                 .into(),
