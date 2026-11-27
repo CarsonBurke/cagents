@@ -1265,6 +1265,74 @@ async fn a_buffer_already_holding_the_new_file_needs_no_choice() {
     assert_eq!(runtime.editor_text().as_deref(), Some("same edit"));
 }
 
+#[tokio::test]
+async fn an_undone_reload_stays_a_choice_when_the_file_is_read_again() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert!(runtime.has_save_conflict());
+
+    // The same bytes again: nothing changed on disk, and nothing was chosen.
+    write_atomically(&path, "agent edits");
+    tokio::time::timeout(Duration::from_secs(2), change(card, &mut runtime))
+        .await
+        .ok();
+    assert!(runtime.has_save_conflict());
+    assert_eq!(runtime.auto_save_revision(), None);
+    assert!(
+        matches!(&runtime.document, DocumentState::Editable(document)
+        if document.disk_version.as_ref().is_some_and(|version| version.undone))
+    );
+}
+
+#[tokio::test]
+async fn discarding_edits_under_a_newer_file_takes_that_file() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+
+    let task = runtime.update(RepositoryAction::DiscardEdits { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+}
+
+#[tokio::test]
+async fn a_reload_that_changes_nothing_leaves_undo_alone() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("live.txt");
+    std::fs::write(&path, "disk").unwrap();
+    let (card, mut runtime) = opened(root.path(), "live.txt").await;
+    runtime.set_auto_save(true);
+    type_text(card, &mut runtime, "my edits").await;
+    write_atomically(&path, "agent edits");
+    changed_underneath(card, &mut runtime).await;
+    // Typed to the newer text by hand: Reload has nothing left to replace.
+    type_text(card, &mut runtime, "agent edits").await;
+    let task = runtime.update(RepositoryAction::Reload { card });
+    settle(&mut runtime, task).await;
+    assert!(!runtime.is_dirty() && !runtime.has_save_conflict());
+
+    type_text(card, &mut runtime, "more").await;
+    let task = runtime.update(RepositoryAction::Undo { card });
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.editor_text().as_deref(), Some("agent edits"));
+    assert!(!runtime.has_save_conflict(), "no reload was undone");
+}
+
 #[test]
 fn a_place_keeps_pointing_at_its_text_through_a_replacement() {
     let at = |line, column| text_editor::Position { line, column };

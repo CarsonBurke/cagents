@@ -1404,7 +1404,9 @@ impl EditorDocument {
         self.dirty = false;
         self.durability_warning = None;
         self.resolve_disk_state();
-        self.reload_undo = Some((replaced, disk_hash));
+        // Only a recorded step can be undone back to the replaced text; a
+        // buffer that already held the file's text recorded none.
+        self.reload_undo = (self.history.revision() != replaced).then_some((replaced, disk_hash));
         edits
     }
 
@@ -6786,6 +6788,7 @@ impl RepositoryRuntime {
             return Task::none();
         };
         let Some(version) = &document.disk_version else {
+            self.disk_comparison = None;
             return Task::none();
         };
         let identity = self.current_identity(card, document.path.clone());
@@ -7773,10 +7776,26 @@ impl RepositoryRuntime {
                             document.saved_history_revision = ticket.history_revision;
                             document.saved_snapshot = ticket.snapshot_source;
                             document.refresh_dirty();
+                            let undone = document
+                                .disk_version
+                                .as_ref()
+                                .is_some_and(|version| version.undone);
                             // The buffer now is the file, whichever version
                             // was waiting to be chosen.
                             document.resolve_disk_state();
                             self.disk_comparison = None;
+                            if undone && document.dirty {
+                                // Undone past this save while it was written:
+                                // the buffer is still text the reader took
+                                // back from the file, and must not be saved
+                                // over it unasked.
+                                document.conflict = true;
+                                document.disk_version = Some(DiskVersion {
+                                    text: document.saved_text.clone(),
+                                    disk_hash: content_hash,
+                                    undone: true,
+                                });
+                            }
                             document.durability_warning = match durability {
                                 SaveDurability::Durable => None,
                                 SaveDurability::Unconfirmed { error } => Some(format!(
@@ -7922,7 +7941,7 @@ impl RepositoryRuntime {
                     Ok(Some(model)) => RenderedDiff::Text {
                         model,
                         old_label: "On disk".into(),
-                        new_label: "Your edits".into(),
+                        new_label: "Your text".into(),
                     },
                     Ok(None) => return Task::none(),
                     Err(error) => RenderedDiff::Error(error),
@@ -7956,6 +7975,12 @@ impl RepositoryRuntime {
                 let DocumentState::Editable(document) = &mut self.document else {
                     return Task::none();
                 };
+                // The file already holds a newer version than the one the
+                // edits started from: discarding them means taking that, not
+                // going back to text that is no longer on disk.
+                if document.disk_version.is_some() {
+                    return self.update_inner(RepositoryAction::Reload { card });
+                }
                 // `discard_edits` changes the buffer without going through
                 // an editor action, so nothing else here would notice that
                 // the server's copy just became wrong.
@@ -11269,11 +11294,11 @@ fn disk_notice<'a>(
                 ),
                 (false, true) => (
                     "Changed on disk",
-                    "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version; Undo brings your edits back.",
+                    "Your unsaved edits are kept, and autosave is paused until you choose. Reload takes the new version, and you can undo it.",
                 ),
                 (false, false) => (
                     "Changed on disk",
-                    "Your unsaved edits are kept. Reload takes the new version; Undo brings your edits back.",
+                    "Your unsaved edits are kept. Reload takes the new version, and you can undo it.",
                 ),
             };
             (
@@ -11300,7 +11325,12 @@ fn disk_notice<'a>(
         } else if let Some(error) = document.error.as_deref() {
             let mut actions: Vec<Element<'a, RepositoryAction>> = Vec::new();
             if document.conflict {
-                actions.push(button::primary("Reload").on_press_maybe(reload).into());
+                actions.push(
+                    button::primary("Reload")
+                        .description("Open the file as it is on disk now")
+                        .on_press_maybe(reload)
+                        .into(),
+                );
                 // Saving over a missing or unreadable file recreates it, which
                 // is the reader's call.
                 actions.push(
@@ -11385,7 +11415,18 @@ fn disk_comparison_view<'a>(
         );
     }
     let mode = runtime.diff_mode;
-    crate::ui_controls::responsive(move |size| {
+    // Which side is which, in the tones the rows use: neither side is the
+    // reader's mistake, so the names say where the text is, not who is right.
+    let side = |label: &'static str, style: fn(&cosmic::Theme) -> iced::widget::text::Style| {
+        crate::design::caption(label).class(cosmic::theme::Text::Custom(style))
+    };
+    let legend = widget::row::with_children([
+        side("\u{2212} On disk", crate::design::removed_text).into(),
+        side("+ Your text", crate::design::added_text).into(),
+    ])
+    .spacing(space::M)
+    .padding([space::XS, space::M]);
+    let rows = crate::ui_controls::responsive(move |size| {
         let typography = runtime.diff_typography();
         let gutter = typography.gutter_width(model.row_count(DiffMode::Inline));
         let code_width = typography.code_width(model);
@@ -11459,8 +11500,8 @@ fn disk_comparison_view<'a>(
             .height(Length::Fill)
             .width(Length::Fill)
             .into()
-    })
-    .into()
+    });
+    widget::column::with_children([legend.into(), rows.into()]).into()
 }
 
 fn editable_document_view<'a>(
