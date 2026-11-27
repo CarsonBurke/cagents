@@ -457,7 +457,7 @@ class Profiles(unittest.TestCase):
         unread = Counter()
         for entry in planner.windows[0]["unread"]:
             unread[json.dumps(entry["owner"])] += 1
-        self.assertEqual(sorted(unread.values()), [3, 12, 120])
+        self.assertEqual(sorted(unread.values()), [1, 3, 9, 12, 120])
 
     def test_scale_multiplies_counts_but_not_structure(self):
         base = profiles.resolve("small")
