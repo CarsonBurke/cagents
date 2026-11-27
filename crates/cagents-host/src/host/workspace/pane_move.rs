@@ -206,6 +206,19 @@ fn attempt(
             // meanwhile. The edit's operation is spent, so moving that pane
             // takes a new request.
             None if opened => {
+                // A skipped insert can still create the destination view.
+                // Accept only the revision this edit produced directly from
+                // the one the move created, so window edits fence retirement.
+                if let Some(made) = made.as_mut()
+                    && made.home.channel == target
+                    && made.home.registry == receipt.identity
+                    && let Some(edge) = receipt.effects.views.iter().find(|view| {
+                        view.scope == to && view.before.unwrap_or(0) == made.view_revision
+                    })
+                    && let Some(revision) = edge.after
+                {
+                    made.view_revision = revision;
+                }
                 return Err(refused(
                     "A window showed this session in a pane meanwhile; run the move again to move that pane",
                 ));
