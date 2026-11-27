@@ -31,7 +31,10 @@ pub(super) enum SidebarRoute {
     },
     /// The device's worktree tools stand in for the worktree creation
     /// dialogs, which run Git on this computer (#688).
-    DeviceWorktrees { project_id: ProjectId },
+    DeviceWorktrees {
+        project_id: ProjectId,
+        from: Option<crate::model::WorktreeId>,
+    },
     /// The device's Changes or Files panel stands in for the source control
     /// and file lists, which read this computer's checkout.
     DeviceTool(Panel),
@@ -169,11 +172,12 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
             },
             ProjectCommand::NewWorktree => SidebarRoute::DeviceWorktrees {
                 project_id: *project_id,
+                from: None,
             },
-            ProjectCommand::NewWorktreeFromBranch => SidebarRoute::Unavailable(
-                "Starting a worktree from an existing branch isn't available in a device window \
-                 yet. Use New worktree, or git worktree in a terminal on the device.",
-            ),
+            ProjectCommand::NewWorktreeFromBranch => SidebarRoute::DeviceWorktrees {
+                project_id: *project_id,
+                from: Some((*worktree_id)?),
+            },
             ProjectCommand::PullRequest => SidebarRoute::PullRequest {
                 project_id: *project_id,
                 worktree_id: *worktree_id,
@@ -186,6 +190,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         },
         SidebarAction::NewWorktree { project_id, .. } => SidebarRoute::DeviceWorktrees {
             project_id: *project_id,
+            from: None,
         },
         SidebarAction::OpenPullRequest { url, .. } => SidebarRoute::OpenLink(url.clone()),
         SidebarAction::BrowsePullRequests { .. } | SidebarAction::CreatePullRequest { .. } => {
@@ -246,6 +251,7 @@ pub enum Action {
     Pathspec(String),
     WorktreeName(String),
     WorktreeBranch(String),
+    CreateWorktreeFromBranch,
     CommitMessage(String),
     OpenProject,
     /// Opens the dialog as a chooser for a project folder on the device,
@@ -324,6 +330,7 @@ pub(super) struct State {
     pathspec_auto: bool,
     worktree_name: String,
     worktree_branch: String,
+    worktree_source: Option<WorktreeSource>,
     commit_message: String,
     busy: bool,
     /// The device this window is switching to, until the switch settles.
@@ -343,8 +350,34 @@ pub(super) struct State {
     /// The dialog is choosing a project folder rather than browsing.
     choosing: bool,
     /// A chosen project's key and folder, entered once its checkouts load.
-    entering: Option<(PathBuf, PathBuf)>,
+    entering: Option<ProjectEntry>,
 }
+struct ProjectEntry {
+    repository: PathBuf,
+    path: PathBuf,
+    exact_checkout: bool,
+}
+
+struct WorktreeSource {
+    project_id: ProjectId,
+    repository: PathBuf,
+    main: PathBuf,
+    base: String,
+    branch: String,
+    folder: String,
+}
+
+impl WorktreeSource {
+    fn folder_name(&self) -> String {
+        let folder = self.folder.trim();
+        if folder.is_empty() {
+            self.branch.trim().replace('/', "-")
+        } else {
+            folder.to_owned()
+        }
+    }
+}
+
 struct ImageRequest {
     path: PathBuf,
     device: Option<String>,
@@ -375,6 +408,7 @@ impl Default for State {
             pathspec_auto: true,
             worktree_name: String::new(),
             worktree_branch: String::new(),
+            worktree_source: None,
             commit_message: String::new(),
             busy: false,
             switching: None,
@@ -456,6 +490,14 @@ impl Cagents {
             return Task::none();
         };
         if self.project_ui.closed.contains(&project.repository) {
+            if self
+                .device_ui
+                .entering
+                .as_ref()
+                .is_some_and(|entry| entry.repository == project.repository)
+            {
+                self.device_ui.entering = None;
+            }
             return Task::none();
         }
         let navigation = match result {
@@ -471,7 +513,7 @@ impl Cagents {
                     .device_ui
                     .entering
                     .as_ref()
-                    .is_some_and(|(key, _)| *key == project.repository)
+                    .is_some_and(|entry| entry.repository == project.repository)
                 {
                     // Not entered later, by a reload the user didn't ask for.
                     self.device_ui.entering = None;
@@ -532,22 +574,35 @@ impl Cagents {
     /// known, as a local Open repository does: the checkout holding the chosen
     /// folder opens in its channel, with a pane when the channel is new.
     fn enter_chosen_device_project(&mut self) -> Task<Message> {
-        let Some((key, _)) = &self.device_ui.entering else {
+        let Some(entry) = &self.device_ui.entering else {
             return Task::none();
         };
-        let loaded = self.sidebar_model.projects.iter().any(|project| {
-            project.repository == *key && !project.reloading && !project.worktrees.is_empty()
-        });
-        if !loaded {
-            return Task::none();
-        }
-        let Some((_, path)) = self.device_ui.entering.take() else {
+        let Some(project) = self.sidebar_model.projects.iter().find(|project| {
+            project.repository == entry.repository
+                && !project.reloading
+                && (entry.exact_checkout || !project.worktrees.is_empty())
+        }) else {
             return Task::none();
         };
-        if self.refuse_in_deleting_worktree(&path) {
+        let exact_available = !entry.exact_checkout
+            || project
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.path == entry.path);
+        let Some(entry) = self.device_ui.entering.take() else {
+            return Task::none();
+        };
+        if !exact_available {
+            self.status = Some(TransientNotice::warning(
+                "The device created the worktree but it is no longer in the checkout list.",
+            ));
             return Task::none();
         }
-        self.open_checkout(path, true, DurableChange::Content).1
+        if self.refuse_in_deleting_worktree(&entry.path) {
+            return Task::none();
+        }
+        self.open_checkout(entry.path, true, DurableChange::Content)
+            .1
     }
 
     /// The sidebar checkout Device worktrees names `name` in the project
@@ -593,7 +648,7 @@ impl Cagents {
                     panel: Panel::Files,
                 })
             }
-            SidebarRoute::DeviceWorktrees { project_id } => {
+            SidebarRoute::DeviceWorktrees { project_id, from } => {
                 let Some(project) = self.sidebar_model.project(project_id) else {
                     return Task::none();
                 };
@@ -603,12 +658,41 @@ impl Cagents {
                     ));
                     return Task::none();
                 }
-                // The main checkout, where the device creates `.worktrees/`.
                 let main = worktree_ui::project_main_checkout(project);
-                self.update_device(Action::OpenIn {
-                    path: Some(main),
-                    panel: Panel::Worktrees,
-                })
+                let Some(from) = from else {
+                    return self.update_device(Action::OpenIn {
+                        path: Some(main),
+                        panel: Panel::Worktrees,
+                    });
+                };
+                let Some(checkout) = project.worktrees.iter().find(|row| row.id == from) else {
+                    self.status = Some(TransientNotice::warning(CHECKOUT_NOT_LOADED));
+                    return Task::none();
+                };
+                let Some(branch) = checkout.branch.clone() else {
+                    self.status = Some(TransientNotice::warning(
+                        "This checkout is detached and has no starting branch.",
+                    ));
+                    return Task::none();
+                };
+                let source_path = checkout.path.clone();
+                let repository = project.repository.clone();
+                if self.refuse_in_deleting_worktree(&source_path) {
+                    return Task::none();
+                }
+                self.device_ui.open = true;
+                self.device_ui.configure = false;
+                self.device_ui.choosing = false;
+                self.device_ui.notice = None;
+                self.device_ui.worktree_source = Some(WorktreeSource {
+                    project_id,
+                    repository,
+                    main,
+                    base: branch,
+                    branch: String::new(),
+                    folder: String::new(),
+                });
+                iced::widget::operation::focus(widget::Id::new(WORKTREE_BRANCH_ID))
             }
             SidebarRoute::DeviceTool(panel) => self.update_device(Action::OpenIn {
                 path: self.active_workspace.clone(),
@@ -928,6 +1012,7 @@ impl Cagents {
                 ]);
             }
             Action::Open => {
+                self.device_ui.worktree_source = None;
                 self.device_ui.open = true;
                 self.device_ui.choosing = false;
                 self.device_ui.configure = false;
@@ -986,6 +1071,7 @@ impl Cagents {
                     self.device_ui.linked_fragment = None;
                 }
                 if !self.device_ui.busy {
+                    self.device_ui.worktree_source = None;
                     self.device_ui.open = false;
                     if was_open && self.daemon_health_ui.confirmation {
                         return self.focus_daemon_health_after_cover();
@@ -998,11 +1084,19 @@ impl Cagents {
                 return Task::none();
             }
             Action::WorktreeName(value) => {
-                self.device_ui.worktree_name = value;
+                if let Some(source) = &mut self.device_ui.worktree_source {
+                    source.folder = value;
+                } else {
+                    self.device_ui.worktree_name = value;
+                }
                 return Task::none();
             }
             Action::WorktreeBranch(value) => {
-                self.device_ui.worktree_branch = value;
+                if let Some(source) = &mut self.device_ui.worktree_source {
+                    source.branch = value;
+                } else {
+                    self.device_ui.worktree_branch = value;
+                }
                 return Task::none();
             }
             Action::Pathspec(value) => {
@@ -1043,6 +1137,37 @@ impl Cagents {
                 expected: self.device_ui.original.clone(),
                 content: self.device_ui.content.text(),
             }),
+            Action::CreateWorktreeFromBranch => {
+                let Some(source) = &self.device_ui.worktree_source else {
+                    return Task::none();
+                };
+                if self.sidebar_model.project(source.project_id).is_none()
+                    || self.project_ui.closed.contains(&source.repository)
+                    || self.project_ui.removing.contains_key(&source.repository)
+                {
+                    self.device_ui.notice =
+                        Some("The project is closing or has been removed.".into());
+                    return Task::none();
+                }
+                let branch = source.branch.trim();
+                if branch.is_empty() || self.device_ui.busy {
+                    return Task::none();
+                }
+                let name = source.folder_name();
+                if let Err(error) = crate::device_service::worktree_name(&name) {
+                    self.device_ui.notice = Some(error);
+                    return Task::none();
+                }
+                Some(Operation::Git {
+                    root: source.main.clone(),
+                    operation: GitOperation::CreateWorktreeFromBranch {
+                        repository: source.repository.clone(),
+                        name,
+                        branch: branch.to_owned(),
+                        base: source.base.clone(),
+                    },
+                })
+            }
             Action::Git(GitOperation::RemoveWorktree { ref name })
                 if self.device_checkout_named(name).is_some() =>
             {
@@ -1133,6 +1258,34 @@ impl Cagents {
                                 .map(cosmic::Action::App);
                         }
                     }
+                    Ok(Reply::WorktreeCreated { path })
+                        if matches!(
+                            pending,
+                            Some(Operation::Git {
+                                operation: GitOperation::CreateWorktreeFromBranch { .. },
+                                ..
+                            })
+                        ) =>
+                    {
+                        let Some(source) = self.device_ui.worktree_source.take() else {
+                            return Task::none();
+                        };
+                        self.device_ui.open = false;
+                        self.status =
+                            Some(TransientNotice::success("Worktree created on the device."));
+                        if self.sidebar_model.project(source.project_id).is_some() {
+                            self.device_ui.entering = Some(ProjectEntry {
+                                repository: source.repository.clone(),
+                                path,
+                                exact_checkout: true,
+                            });
+                            return self.repository_load_task(
+                                source.repository,
+                                Some(source.project_id),
+                                false,
+                            );
+                        }
+                    }
                     Ok(Reply::Text(text)) => {
                         if matches!(
                             pending,
@@ -1186,7 +1339,11 @@ impl Cagents {
                             // closes and the window enters the project.
                             self.device_ui.open = false;
                             self.device_ui.notice = None;
-                            self.device_ui.entering = Some((key, path));
+                            self.device_ui.entering = Some(ProjectEntry {
+                                repository: key,
+                                path,
+                                exact_checkout: false,
+                            });
                             return self.enter_chosen_device_project();
                         }
                         return self.update_device(Action::Browse);
@@ -1229,6 +1386,7 @@ impl Cagents {
                 GitOperation::Worktrees
                 | GitOperation::CreateWorktree { .. }
                 | GitOperation::RemoveWorktree { .. } => Panel::Worktrees,
+                GitOperation::CreateWorktreeFromBranch { .. } => self.device_ui.panel,
                 _ => Panel::Changes,
             };
         }
@@ -1237,9 +1395,20 @@ impl Cagents {
         self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
         self.device_ui.notice = None;
         let generation = self.device_ui.generation;
+        let request = if matches!(
+            operation,
+            Operation::Git {
+                operation: GitOperation::CreateWorktreeFromBranch { .. },
+                ..
+            }
+        ) {
+            crate::device_service::request_for_reader
+        } else {
+            crate::device_service::request
+        };
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || crate::device_service::request(operation))
+                tokio::task::spawn_blocking(move || request(operation))
                     .await
                     .unwrap_or_else(|error| Err(error.to_string()))
             },
@@ -1443,6 +1612,9 @@ impl Cagents {
 
     fn device_dialog_layout(&self, size: iced::Size) -> Element<'_, Message> {
         let state = &self.device_ui;
+        if let Some(source) = &state.worktree_source {
+            return self.device_branch_worktree_layout(source);
+        }
         if let Some(diff) = self.device_diff_layout(size) {
             return diff;
         }
@@ -1853,8 +2025,69 @@ impl Cagents {
             Length::Fill,
         )
     }
+
+    fn device_branch_worktree_layout<'a>(
+        &'a self,
+        source: &'a WorktreeSource,
+    ) -> Element<'a, Message> {
+        let state = &self.device_ui;
+        let device = crate::device::selected().map_or("the device", |device| device.name.as_str());
+        let submit = Message::Device(Action::CreateWorktreeFromBranch);
+        let ready = !state.busy && !source.branch.trim().is_empty();
+        let default_folder = source.branch.trim().replace('/', "-");
+        let folder_label = if default_folder.is_empty() {
+            "Worktree folder (optional)".to_owned()
+        } else {
+            format!("Worktree folder (defaults to {default_folder})")
+        };
+        let mut branch = crate::ui_controls::field::text("topic/new-work", &source.branch)
+            .id(widget::Id::new(WORKTREE_BRANCH_ID));
+        let mut folder = crate::ui_controls::field::text("", &source.folder);
+        if !state.busy {
+            branch = branch.on_input(|value| Message::Device(Action::WorktreeBranch(value)));
+            folder = folder.on_input(|value| Message::Device(Action::WorktreeName(value)));
+        }
+        if ready {
+            branch = branch.on_submit(|_| Message::Device(Action::CreateWorktreeFromBranch));
+            folder = folder.on_submit(|_| Message::Device(Action::CreateWorktreeFromBranch));
+        }
+        let mut fields = vec![
+            design::title("New worktree").into(),
+            design::body(format!("Starting from {} on {device}", source.base)).into(),
+            widget::column::with_children(vec![
+                design::caption("New branch").into(),
+                branch.width(Length::Fill).into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+            widget::column::with_children(vec![
+                design::caption(folder_label).into(),
+                folder.width(Length::Fill).into(),
+            ])
+            .spacing(space::XS)
+            .into(),
+        ];
+        if let Some(notice) = &state.notice {
+            fields.push(design::body(notice).into());
+        }
+        let create = crate::ui_controls::button::primary(if state.busy {
+            "Creating worktree…"
+        } else {
+            "Create worktree"
+        })
+        .on_press_maybe(ready.then_some(submit));
+        let cancel = crate::ui_controls::button::secondary("Cancel")
+            .on_press_maybe((!state.busy).then_some(Message::Device(Action::Close)));
+        dialog_ui::scrolling_surface_with_actions(
+            widget::column::with_children(fields).spacing(space::M),
+            widget::row::with_children(vec![cancel.into(), create.into()]).spacing(space::S),
+            600.0,
+            dialog_ui::MAX_HEIGHT,
+        )
+    }
 }
 
+const WORKTREE_BRANCH_ID: &str = "device.worktree.branch";
 const CHOOSER_FOLDER_ID: &str = "device.project-chooser.folder";
 
 /// The name a project opened on a device gets: its checkout's folder, not a
@@ -2850,10 +3083,20 @@ mod tests {
         ] {
             assert_eq!(
                 sidebar_route(&action),
-                Some(SidebarRoute::DeviceWorktrees { project_id }),
+                Some(SidebarRoute::DeviceWorktrees {
+                    project_id,
+                    from: None
+                }),
                 "{action:?}"
             );
         }
+        assert_eq!(
+            sidebar_route(&command(sidebar::ProjectCommand::NewWorktreeFromBranch)),
+            Some(SidebarRoute::DeviceWorktrees {
+                project_id,
+                from: Some(worktree_id)
+            }),
+        );
         // Deletion runs through the local confirmation, by the device's Git.
         for action in [
             command(sidebar::ProjectCommand::Delete),
@@ -2919,7 +3162,6 @@ mod tests {
         }
         for action in [
             command(sidebar::ProjectCommand::RepositoryUrl),
-            command(sidebar::ProjectCommand::NewWorktreeFromBranch),
             SidebarAction::RetryWorktreeOperation(crate::model::OperationId::new()),
             command(sidebar::ProjectCommand::OpenEditor("code".into())),
             SidebarAction::BrowsePullRequests { project_id },
@@ -3139,6 +3381,50 @@ mod tests {
         assert_eq!(app.device_ui.panel, Panel::Worktrees);
         assert_eq!(app.device_ui.path, main.display().to_string());
         settle(&mut app);
+
+        // The selected checkout supplies the base branch and the project
+        // supplies its managed directory, independent of the file browser.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: Some(linked_id),
+            command: sidebar::ProjectCommand::NewWorktreeFromBranch,
+        })));
+        app.device_ui.directory = PathBuf::from("/unrelated");
+        assert!(app.device_ui.open);
+        drop(app.update_device(Action::WorktreeBranch("topic/derived".into())));
+        drop(app.update_device(Action::CreateWorktreeFromBranch));
+        assert_eq!(
+            app.device_ui.pending,
+            Some(Operation::Git {
+                root: main.clone(),
+                operation: GitOperation::CreateWorktreeFromBranch {
+                    repository: main.join(".git"),
+                    name: "topic-derived".into(),
+                    branch: "topic/derived".into(),
+                    base: "feature".into(),
+                },
+            })
+        );
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::Loaded {
+            generation,
+            result: Err("The starting branch no longer exists.".into()),
+        }));
+        assert!(app.device_ui.open);
+        assert_eq!(
+            app.device_ui.worktree_source.as_ref().unwrap().branch,
+            "topic/derived"
+        );
+        assert!(
+            app.device_ui
+                .notice
+                .as_deref()
+                .unwrap()
+                .contains("starting branch")
+        );
+        drop(app.update_device(Action::Close));
+        assert!(!app.device_ui.open);
+        assert!(app.device_ui.worktree_source.is_none());
 
         // Deleting a linked worktree asks first, in the same confirmation
         // as a local one, rather than sending the user to the device tools.

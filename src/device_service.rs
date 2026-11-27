@@ -147,6 +147,13 @@ pub enum GitOperation {
     CheckWorktreeRemoval {
         name: String,
     },
+    /// Create a new branch and checkout starting at a named device branch.
+    CreateWorktreeFromBranch {
+        repository: PathBuf,
+        name: String,
+        branch: String,
+        base: String,
+    },
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Entry {
@@ -194,6 +201,9 @@ pub enum Reply {
     /// it was answered so its size is known before it is sent.
     Repository(String),
     SessionsClosed(Option<crate::project_sessions::ProjectSessionClosure>),
+    WorktreeCreated {
+        path: PathBuf,
+    },
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -377,7 +387,7 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
             expected,
             content,
         } => write_with_sync(&root, &path, &expected, &content, fs_safety::sync_directory),
-        Operation::Git { root, operation } => git(root, operation).map(Reply::Text),
+        Operation::Git { root, operation } => git(root, operation),
     }
 }
 
@@ -636,67 +646,43 @@ fn repository(request: crate::repository::RepositoryRequest) -> Result<String, S
 }
 
 #[cfg(feature = "host")]
-fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
+fn git(root: PathBuf, operation: GitOperation) -> Result<Reply, String> {
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
     let root = std::fs::canonicalize(root).map_err(|error| error.to_string())?;
     let lock = mutation_lock(root.clone());
     let _guard = lock.lock().unwrap_or_else(|poison| poison.into_inner());
     let mut command =
         CommandSpec::new("git")
-            .cwd(root)
+            .cwd(root.clone())
             .args(["--no-pager", "-c", "color.ui=false"]);
     command.stdout_limit = MAX_TEXT_BYTES as usize;
     command.timeout = Some(std::time::Duration::from_secs(30));
     let staging = matches!(&operation, GitOperation::Stage { .. });
+    let mut created = None;
     command = match operation {
         GitOperation::Status => command.args(["status", "--short", "--branch"]),
         GitOperation::Worktrees => command.args(["worktree", "list"]),
         GitOperation::CreateWorktree { name, branch } => {
-            worktree_name(&name)?;
-            if branch.starts_with('-') || branch.len() > 256 {
-                return Err("worktree branch must be a valid branch name".into());
-            }
-            let check = CommandSpec::new("git")
-                .cwd(
-                    command
-                        .current_dir
-                        .clone()
-                        .ok_or("repository directory unavailable")?,
-                )
-                .args(["check-ref-format", "--branch"])
-                .arg(&branch);
-            let check = SystemProcessExecutor
-                .execute(&check, &CancellationToken::new())
-                .map_err(|error| error.to_string())?;
-            if !check.success {
-                return Err("worktree branch must be a valid branch name".into());
-            }
-            let root = command
-                .current_dir
-                .as_ref()
-                .ok_or("repository directory unavailable")?;
-            let directory = root.join(crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY);
+            create_worktree_command(command, &name, &branch, None)?
+        }
+        GitOperation::CreateWorktreeFromBranch {
+            repository,
+            name,
+            branch,
+            base,
+        } => {
             let service = crate::repository::RepositoryService::system("git");
-            service
-                .ensure_managed_directory_ignored(root, &directory, &CancellationToken::new())
+            let actual = service
+                .common_dir(&root, &CancellationToken::new())
                 .map_err(|error| error.to_string())?;
-            service
-                .ignore_legacy_managed_worktrees(root, &CancellationToken::new())
-                .map_err(|error| error.to_string())?;
-            crate::secure_file::reject_symlink_components(&directory)
-                .map_err(|error| error.to_string())?;
-            match std::fs::create_dir(&directory) {
-                Ok(()) => {}
-                Err(error)
-                    if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
-                Err(error) => return Err(error.to_string()),
+            if actual != repository {
+                return Err("The checkout no longer belongs to the selected repository.".into());
             }
-            let destination = directory.join(name);
-            command
-                .args(["worktree", "add", "-b"])
-                .arg(branch)
-                .arg("--")
-                .arg(destination)
+            created = Some(
+                root.join(crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY)
+                    .join(&name),
+            );
+            create_worktree_command(command, &name, &branch, Some(&base))?
         }
         GitOperation::RemoveWorktree { name } => {
             let root = command
@@ -711,7 +697,9 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
                 .current_dir
                 .as_ref()
                 .ok_or("repository directory unavailable")?;
-            return Ok(removable_worktree(root, &name).err().unwrap_or_default());
+            return Ok(Reply::Text(
+                removable_worktree(root, &name).err().unwrap_or_default(),
+            ));
         }
         GitOperation::Diff { staged } => {
             let command = command.args(["diff", "--no-ext-diff", "--no-textconv"]);
@@ -755,8 +743,97 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
     if !output.success {
         return Err(String::from_utf8_lossy(&output.stderr).into_owned());
     }
-    String::from_utf8(output.stdout).map_err(|_| "Git output is not UTF-8".into())
+    if let Some(path) = created {
+        return Ok(Reply::WorktreeCreated { path });
+    }
+    String::from_utf8(output.stdout)
+        .map(Reply::Text)
+        .map_err(|_| "Git output is not UTF-8".into())
 }
+#[cfg(feature = "host")]
+fn create_worktree_command(
+    command: crate::process::CommandSpec,
+    name: &str,
+    branch: &str,
+    base: Option<&str>,
+) -> Result<crate::process::CommandSpec, String> {
+    use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
+    worktree_name(name)?;
+    let root = command
+        .current_dir
+        .as_ref()
+        .ok_or("repository directory unavailable")?;
+    let verify = |args: &[&str]| {
+        let mut check = CommandSpec::new("git")
+            .cwd(root)
+            .args(["check-ref-format"])
+            .args(args.iter().copied());
+        check.timeout = command.timeout;
+        SystemProcessExecutor
+            .execute(&check, &CancellationToken::new())
+            .map(|output| output.success)
+            .map_err(|error| error.to_string())
+    };
+    // The short name is passed to -b. Reject checkout shorthand before Git
+    // can expand it while checking a new branch name.
+    if branch.starts_with('-')
+        || branch.contains("@{")
+        || branch.len() > 256
+        || !verify(&["--branch", branch])?
+    {
+        return Err("Enter a valid name for the new branch.".into());
+    }
+    let start = if let Some(base) = base {
+        let reference = format!("refs/heads/{base}");
+        if base.len() > 256 || !verify(&[&reference])? {
+            return Err("The starting branch name is invalid.".into());
+        }
+        let mut find = CommandSpec::new("git")
+            .cwd(root)
+            .args(["show-ref", "--hash", "--verify", "--"])
+            .arg(reference);
+        find.timeout = command.timeout;
+        let output = SystemProcessExecutor
+            .execute(&find, &CancellationToken::new())
+            .map_err(|error| error.to_string())?;
+        if !output.success {
+            return Err(format!(
+                "The starting branch {base} no longer exists on this device."
+            ));
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+    } else {
+        None
+    };
+    let directory = root.join(crate::settings::DEFAULT_MANAGED_WORKTREE_DIRECTORY);
+    let service = crate::repository::RepositoryService::system("git");
+    service
+        .ensure_managed_directory_ignored(root, &directory, &CancellationToken::new())
+        .map_err(|error| error.to_string())?;
+    service
+        .ignore_legacy_managed_worktrees(root, &CancellationToken::new())
+        .map_err(|error| error.to_string())?;
+    crate::secure_file::reject_symlink_components(&directory).map_err(|error| error.to_string())?;
+    match std::fs::create_dir(&directory) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists && directory.is_dir() => {}
+        Err(error) => return Err(error.to_string()),
+    }
+    let mut command = command.args(["worktree", "add"]);
+    if start.is_some() {
+        command = command.arg("--no-track");
+    }
+    command = command
+        .arg("-b")
+        .arg(branch)
+        .arg("--")
+        .arg(directory.join(name));
+    if let Some(start) = start {
+        command = command.arg(start);
+    }
+    Ok(command)
+}
+
 /// Where worktree `name` of the repository at `root` is, when the device
 /// would remove it: checked without changing anything, for both the removal
 /// and the check a window runs before closing the worktree's sessions.
@@ -1562,6 +1639,84 @@ mod tests {
         );
         let after = snapshot(&answer);
         assert_eq!(after.status.entries[0].area, ChangeArea::Staged);
+    }
+
+    #[test]
+    fn worktree_creation_uses_the_exact_device_branch_tip() {
+        if crate::repository::isolated_git_test(concat!(
+            module_path!(),
+            "::worktree_creation_uses_the_exact_device_branch_tip"
+        )) {
+            return;
+        }
+        let directory = crate::repository::retained_managed_fixture_directory();
+        let root = directory.path().to_owned();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args([
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.invalid",
+                ])
+                .current_dir(&root)
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["commit", "--allow-empty", "-m", "main"]);
+        git(&["switch", "-c", "feature/start"]);
+        git(&["commit", "--allow-empty", "-m", "branch-only commit"]);
+        git(&["switch", "main"]);
+        // A tag of the same name must not influence the start point.
+        git(&["tag", "feature/start", "main"]);
+        let create = |repository: PathBuf, name: &str, base: &str| {
+            execute(Operation::Git {
+                root: root.clone(),
+                operation: GitOperation::CreateWorktreeFromBranch {
+                    repository,
+                    name: name.into(),
+                    branch: name.into(),
+                    base: base.into(),
+                },
+            })
+        };
+        let repository = root.canonicalize().unwrap().join(".git");
+        git(&["tag", "missing", "main"]);
+        assert!(
+            create(repository.clone(), "refused", "missing")
+                .unwrap_err()
+                .contains("no longer exists")
+        );
+        assert!(
+            create(root.join("wrong.git"), "refused", "feature/start")
+                .unwrap_err()
+                .contains("selected repository")
+        );
+        assert!(!root.join(".worktrees").exists());
+
+        assert_eq!(
+            create(repository, "derived", "feature/start").unwrap(),
+            Reply::WorktreeCreated {
+                path: root.canonicalize().unwrap().join(".worktrees/derived")
+            },
+        );
+        assert_eq!(
+            git(&["-C", ".worktrees/derived", "rev-parse", "HEAD"]),
+            git(&["rev-parse", "refs/heads/feature/start"]),
+        );
+        assert_eq!(
+            git(&["-C", ".worktrees/derived", "branch", "--show-current"]),
+            "derived\n"
+        );
+        assert_eq!(git(&["branch", "--show-current"]), "main\n");
     }
 
     #[test]

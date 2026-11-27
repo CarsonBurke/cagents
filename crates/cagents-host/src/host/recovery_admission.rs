@@ -311,6 +311,7 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
             GitOperation::Status
             | GitOperation::Worktrees
             | GitOperation::CreateWorktree { .. }
+            | GitOperation::CreateWorktreeFromBranch { .. }
             | GitOperation::Diff { .. }
             | GitOperation::Stage { .. }
             | GitOperation::Unstage { .. }

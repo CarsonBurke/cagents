@@ -1357,9 +1357,7 @@ impl<'a> View<'a> {
                 )
                 .into(),
             );
-            // A device window can't start a worktree from a branch or reach
-            // GitHub yet, so it offers neither.
-            if git && self.device.is_none() {
+            if git {
                 items.push(
                     popover_item(
                         Icon::WorktreeAdd.handle(),
@@ -1372,7 +1370,7 @@ impl<'a> View<'a> {
                     .on_press_maybe(branch.map(|_| command(ProjectCommand::NewWorktreeFromBranch)))
                     .into(),
                 );
-                if project.github_ready {
+                if project.github_ready && self.device.is_none() {
                     let pr = worktree.pull_request();
                     items.push(
                         popover_item(
