@@ -149,39 +149,35 @@ fn placed(directory: &Path, opened: &dyn Fn(&Path) -> bool) -> Placement {
     let checkout = checkout(directory);
     // An open folder keeps its own identity, as in `resolve`, and the nearest
     // open project wins over an enclosing one: a folder inside the checkout,
-    // then the checkout's repository, then a folder that encloses it.
-    let (inner, outer) = match &checkout {
-        Some((worktree, _)) => directory
+    // then the checkout's repository, then whatever holds the checkout.
+    let Some((worktree, common)) = checkout else {
+        let project = directory
             .ancestors()
-            .partition::<Vec<_>, _>(|ancestor| ancestor.starts_with(worktree)),
-        None => (Vec::new(), directory.ancestors().collect()),
+            .find(|ancestor| opened(ancestor))
+            .map(Path::to_path_buf);
+        return Placement {
+            worktree: None,
+            project,
+        };
     };
-    let project = inner
-        .into_iter()
+    let project = directory
+        .ancestors()
+        .take_while(|ancestor| ancestor.starts_with(&worktree))
         .find(|ancestor| opened(ancestor))
         .map(Path::to_path_buf)
+        .or_else(|| opened(&common).then_some(common))
+        // A submodule or a clone nested in an open repository is not opened
+        // itself; it belongs to the project of the checkout around it, which
+        // is nearer than any folder enclosing that checkout.
         .or_else(|| {
-            checkout
-                .as_ref()
-                .map(|(_, common)| common.clone())
-                .filter(|common| opened(common))
-        })
-        .or_else(|| {
-            outer
-                .into_iter()
-                .find(|ancestor| opened(ancestor))
-                .map(Path::to_path_buf)
+            worktree
+                .parent()
+                .and_then(|parent| placed(parent, opened).project)
         });
-    let worktree = checkout.map(|(worktree, _)| worktree);
-    // A submodule or a clone nested in an open repository is not opened
-    // itself; it belongs to the project of the checkout around it.
-    let project = project.or_else(|| {
-        worktree
-            .as_deref()
-            .and_then(Path::parent)
-            .and_then(|parent| placed(parent, opened).project)
-    });
-    Placement { worktree, project }
+    Placement {
+        worktree: Some(worktree),
+        project,
+    }
 }
 
 /// The working tree that contains `directory` and its Git common directory.
@@ -551,9 +547,21 @@ mod tests {
             place(&module, &model),
             Placement {
                 worktree: Some(module.canonicalize().unwrap()),
-                project: Some(key),
+                project: Some(key.clone()),
             }
         );
+        // #3432: an open folder enclosing the repository is farther from the
+        // submodule than the repository's own project.
+        let enclosing = root.path().canonicalize().unwrap();
+        model.projects.push(crate::workspace_model::ModelProject {
+            repository: enclosing.clone(),
+            name: "home".into(),
+            kind: ProjectKind::Folder,
+            ordinal: 2,
+        });
+        assert_eq!(place(&module, &model).project, Some(key.clone()));
+        assert_eq!(place(&repository.join("src"), &model).project, Some(key));
+        assert_eq!(place(root.path(), &model).project, Some(enclosing));
     }
 
     #[test]
