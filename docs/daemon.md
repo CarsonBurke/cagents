@@ -626,7 +626,7 @@ badged tray item with its own name, so it can run beside the installed
 production application. It does not register an autostart entry. Release builds
 without that feature are production builds.
 
-Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
+Manual sidebar order is stored by the selected device daemon and shared across windows, including a device window viewing that daemon. Drag project headers, or use the project menu's **Move project up** and **Move project down**, to arrange projects; a project opened since is listed after the arranged ones, by path, and `cagents project list` answers in the same order. A window that arranged its projects before the order was shared (wire protocol 211) carries its order over the first time it connects, unless another window has arranged them already. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
 
 ### Merged worktree notices
 
