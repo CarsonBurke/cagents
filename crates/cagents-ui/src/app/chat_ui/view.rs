@@ -2802,6 +2802,11 @@ impl Runtime {
             Some(chat::SendNow::Declined) if send_now > 0 => {
                 format!("Queued · {count} · couldn't send early")
             }
+            // Send now is disabled until the stop finishes, and a disabled
+            // control shows no tooltip, so the heading says why.
+            _ if self.snapshot.stopping() && send_now > 0 => {
+                format!("Queued · {count} · waiting for the turn to stop")
+            }
             _ if self.queue_held() => format!("Queued · {count} · waiting for you"),
             _ => format!("Queued · {count}"),
         }
