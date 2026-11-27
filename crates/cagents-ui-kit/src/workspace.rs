@@ -4260,7 +4260,7 @@ mod tests {
         let reflow = mean(start, ROUNDS * 20);
 
         eprintln!(
-            "strip workload, {PANES} panes: focus {focus:.2} us, Alt+R preset {cycle:.2} us, \
+            "strip workload, {PANES} panes: focus {focus:.2} us, width preset {cycle:.2} us, \
              drag step {drag:.2} us, viewport reflow {reflow:.2} us"
         );
     }

@@ -102,8 +102,8 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Clone focused pane | `Ctrl+Shift+D` |
 | Close focused pane | `Ctrl+W` |
 | Find in the focused pane / search projects | `Ctrl+F` |
-| Previous / next pane | `Ctrl+PageUp` / `Ctrl+PageDown` |
-| Cycle pane width | `Alt+R` |
+| Previous / next pane | `Alt+Q` / `Alt+R`, or `Ctrl+PageUp` / `Ctrl+PageDown` |
+| Cycle pane width | `Alt+Shift+R` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
@@ -121,7 +121,8 @@ selection is available before starting a conversation; provider capabilities
 determine which models and permission modes are available.
 
 - Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
-  its pane, **Alt+R** cycles its width, and **Ctrl+T** creates a native thread
+  its pane, **Alt+Q** and **Alt+R** move to the previous and next pane,
+  **Alt+Shift+R** cycles its width, and **Ctrl+T** creates a native thread
   tab. These chords are withheld from the terminal program. Other shell keys
   reach the program unless you bind them to workspace actions.
   **Ctrl+F** finds in the focused terminal,
@@ -130,8 +131,9 @@ determine which models and permission modes are available.
   `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
   also belong to the workspace.
 - Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
-  `Ctrl+Shift+R`. Those defaults now return to **Ctrl+W** and **Alt+R**;
-  customized shortcuts are kept. Older navigation and creation defaults also
+  `Ctrl+Shift+R`. Close has returned to **Ctrl+W**. Pane navigation now also
+  answers to **Alt+Q** and **Alt+R**, so width cycling moved to
+  **Alt+Shift+R**; customized shortcuts are kept. Older navigation and creation defaults also
   upgrade where they remain unchanged. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
@@ -142,7 +144,7 @@ determine which models and permission modes are available.
 - Use the command palette to search commands, panes, channels and workspaces.
   Keyboard settings let you record a chord, remove it, or reset a command;
   conflicts name the command that already uses the chord.
-- **Alt+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
+- **Alt+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan

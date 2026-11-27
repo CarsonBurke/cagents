@@ -1441,6 +1441,29 @@ fn global_shortcuts_match_configured_chords_and_repeat_presses() {
 
     // Column navigation repeats while held, and is reserved against the
     // process inside a card.
+    for (character, code, direction) in [
+        ("q", Code::KeyQ, FocusDirection::Left),
+        ("r", Code::KeyR, FocusDirection::Right),
+    ] {
+        for repeat in [false, true] {
+            assert_eq!(
+                global_shortcut(
+                    &key_press(character, code, keyboard::Modifiers::ALT, repeat),
+                    &shortcuts,
+                    FocusedPane::Terminal,
+                ),
+                Some(GlobalShortcut::FocusAdjacent(direction)),
+                "Alt+{character} must navigate on initial and repeated presses"
+            );
+            assert!(is_global_shortcut_chord(
+                &keyboard::Key::Character(character.into()),
+                keyboard::key::Physical::Code(code),
+                keyboard::Modifiers::ALT,
+                &shortcuts,
+                FocusedPane::Terminal,
+            ));
+        }
+    }
     for (named, code, direction) in [
         (
             keyboard::key::Named::PageUp,
@@ -1559,7 +1582,6 @@ fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
         character("e", Code::KeyE, ctrl),
         character("g", Code::KeyG, ctrl),
         character("p", Code::KeyP, ctrl),
-        character("q", Code::KeyQ, alt),
         character("w", Code::KeyW, alt),
         character("e", Code::KeyE, alt),
         character("g", Code::KeyG, alt),
@@ -1657,6 +1679,7 @@ fn project_search_and_pane_find_have_distinct_workspace_chords() {
 fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
     use keyboard::key::Code;
     let shortcuts = linux_shortcuts();
+    let alt_shift = keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
     for focused in [
         FocusedPane::Terminal,
         FocusedPane::Review,
@@ -1669,12 +1692,7 @@ fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
                 keyboard::Modifiers::CTRL,
                 GlobalShortcut::CloseFocusedCard,
             ),
-            (
-                "r",
-                Code::KeyR,
-                keyboard::Modifiers::ALT,
-                GlobalShortcut::CyclePaneWidth,
-            ),
+            ("R", Code::KeyR, alt_shift, GlobalShortcut::CyclePaneWidth),
         ] {
             assert!(is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),
@@ -3259,12 +3277,17 @@ fn only_configured_global_chords_are_reserved_from_card_children() {
     assert!(reserved("t".into(), Code::KeyT, ctrl_shift));
     assert!(reserved("t".into(), Code::KeyT, keyboard::Modifiers::CTRL));
     assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::CTRL));
-    assert!(!reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
+    assert!(reserved("q".into(), Code::KeyQ, keyboard::Modifiers::ALT));
     assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
     assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
     assert!(!reserved("w".into(), Code::KeyW, ctrl_shift));
     assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
     assert!(reserved("r".into(), Code::KeyR, keyboard::Modifiers::ALT));
+    assert!(reserved(
+        "R".into(),
+        Code::KeyR,
+        keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT
+    ));
     assert!(!reserved("r".into(), Code::KeyR, ctrl_shift));
     assert!(!reserved(
         "t".into(),
