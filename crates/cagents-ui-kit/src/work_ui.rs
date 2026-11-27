@@ -282,12 +282,21 @@ impl State {
                 self.now_unix_ms = now_unix_ms();
                 None
             }
+            // One popover at a time, however it was opened.
             Action::ScopeMenu(open) => {
                 self.scope_menu = open;
+                if open {
+                    self.menu = None;
+                    self.problems_open = false;
+                }
                 None
             }
             Action::Problems(open) => {
                 self.problems_open = open;
+                if open {
+                    self.menu = None;
+                    self.scope_menu = false;
+                }
                 None
             }
             Action::Scope(scope) => {
@@ -332,6 +341,10 @@ impl State {
                 }
             }
             Action::Menu(menu) => {
+                if menu.is_some() {
+                    self.scope_menu = false;
+                    self.problems_open = false;
+                }
                 self.menu = menu;
                 None
             }
@@ -653,12 +666,15 @@ impl State {
         );
         let mut line = vec![
             warning_icon(),
+            // Quieter than the cards: only the icon is in the warning colour.
             crate::ui_controls::FadeText::caption(summary)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
                 .width(Length::Fill)
                 .into(),
         ];
         line.extend(count.map(|count| {
             design::caption(count)
+                .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into()
         }));
@@ -1659,6 +1675,21 @@ fn rate_limit_reset(reason: &str) -> Option<&str> {
     crate::github::polling::RateLimit::reset_named_by(reason)
 }
 
+/// Whether the rate limit reset at clock time `a`, such as `00:10 UTC`,
+/// comes after the one at `b`. A reset names no date, and every project's is
+/// within the hour a quota lasts, so the nearer way around the clock decides,
+/// past midnight too.
+fn resets_later(a: &str, b: &str) -> bool {
+    fn minute(time: &str) -> Option<i32> {
+        let (hours, minutes) = time.strip_suffix(" UTC")?.split_once(':')?;
+        Some(hours.parse::<i32>().ok()? * 60 + minutes.parse::<i32>().ok()?)
+    }
+    match (minute(a), minute(b)) {
+        (Some(a), Some(b)) => (1..12 * 60).contains(&(a - b).rem_euclid(24 * 60)),
+        _ => a > b,
+    }
+}
+
 /// What the board could not read about the projects in `scope`, one entry
 /// per reason, those affecting the most projects first. A forge reason
 /// shared by projects GitHub answered before and projects it never has is
@@ -1681,10 +1712,10 @@ fn problems<'a>(board: &'a Board, scope: Option<&std::path::Path>) -> Vec<Proble
                 if kind == ProblemKind::PullRequestsStale {
                     problem.kind = kind;
                 }
-                // The reset still to come. A clock time without a date
-                // compares as text, which holds within the hours a limit
-                // lasts unless it spans midnight.
-                if reset > rate_limit_reset(problem.reason) {
+                // The reset still to come.
+                if let (Some(reset), Some(current)) = (reset, rate_limit_reset(problem.reason))
+                    && resets_later(reset, current)
+                {
                     problem.reason = reason;
                 }
                 problem
@@ -2086,6 +2117,14 @@ mod tests {
                 "16 projects".to_owned(),
             ],
         );
+    }
+
+    #[test]
+    fn a_reset_past_midnight_comes_after_one_before_it() {
+        assert!(resets_later("00:10 UTC", "23:58 UTC"));
+        assert!(!resets_later("23:58 UTC", "00:10 UTC"));
+        assert!(resets_later("19:05 UTC", "17:59 UTC"));
+        assert!(!resets_later("18:42 UTC", "18:42 UTC"));
     }
 
     #[test]

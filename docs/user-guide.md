@@ -500,9 +500,10 @@ A pin shows at once. A card's sessions are buttons that focus the session in
 whichever window shows it.
 
 Below the toolbar, one line counts the cards and says what the board could not
-read. A problem many projects share, such as GitHub's rate limit, which is the
-account's, reads once with how many projects it affects; clicking it lists
-each problem, its exact reason and the projects it affects.
+read. A problem many projects share, such as GitHub's rate limit, which
+applies to the whole account, reads once with how many projects it affects;
+clicking it, or pressing Enter on it, lists each problem, its exact reason and
+the projects it affects.
 
 ```sh
 cagents work                      # this project, the newest 10 cards of each column
