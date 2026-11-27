@@ -763,6 +763,15 @@ delivery_outcomes! {
     /// An input too large for one protocol frame.
     refused send OVERSIZED_INPUT: "This is too large to send to Claude, so it was not sent.",
         "Shorten it or split it into smaller messages.";
+    /// A request from a window the conversation stopped serving, as when it
+    /// restarted and the window has not reconnected to the new one yet.
+    refused send DETACHED_REQUEST: "This window isn't connected to the conversation right now, so this was not sent.",
+        "Reconnect the conversation, then try again.";
+    /// A request to an agent whose conversation restarted when the agent
+    /// could not safely move to the new one, as when nothing proved the
+    /// earlier one had stopped.
+    refused conversation UNFOLLOWED_RESTART: "This conversation restarted, and its agent couldn't safely move to the new one, so this was not sent.",
+        "Close and reopen the conversation to continue.";
     /// An input to a helper whose conversation is closing.
     refused conversation CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
         "Reopen the conversation to continue.";
@@ -960,6 +969,7 @@ mod tests {
             HANDOVER_INPUT,
             DAMAGED_INPUT,
             UNSETTLEABLE_INPUT,
+            DETACHED_REQUEST,
             ACCOUNT_SWITCH_BUSY,
             ACCOUNT_SWITCH_UNANSWERED,
             ACCOUNT_SWITCH_UNREACHED,
@@ -971,6 +981,7 @@ mod tests {
             UNSUPPORTED_INPUT,
             UNAVAILABLE_INPUT,
             UNRESOLVABLE_INPUT,
+            UNFOLLOWED_RESTART,
         ];
         // Every outcome is in exactly one of the two lists.
         assert_eq!(sends.len() + conversation.len(), ALL.len());

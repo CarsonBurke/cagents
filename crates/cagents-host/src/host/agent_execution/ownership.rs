@@ -3,6 +3,7 @@
 //! Answering a request that can grant the agent something is not: an owner
 //! whose approvals are limited relies on a person to give that answer.
 use super::*;
+use crate::chat::failure::delivery;
 use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,24 +72,52 @@ pub(in crate::host) fn interactive(
             }
             _ => true,
         };
+    // A conversation this daemon restarted may not have taken its agent over
+    // when it started, as when the earlier process was not yet known to have
+    // ended. Adoption proves that again under the agent's gate, so try once
+    // before refusing; it changes nothing when the agent already follows.
+    let agent = match claims
+        .then(|| running_successor(host, &agent, id))
+        .flatten()
+    {
+        Some(successor) => match adopt_resumed(host, &successor) {
+            Ok(true) => registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent(agent.id)
+                .map_err(unavailable)?,
+            Ok(false) => agent,
+            Err(error) => {
+                tracing::warn!(chat = %id, %error, "the restarted conversation did not take over its agent");
+                agent
+            }
+        },
+        None => agent,
+    };
     let gate = agent_gate(host, agent.id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     if claims {
-        let authorized = host
+        let refusal = match host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .chats
             .get(&id)
-            .is_some_and(|record| {
-                record.subscribers.contains_key(&client)
-                    && agent.session.as_ref().is_some_and(|source| {
-                        source.same_process(&HostedSession::Chat(record.session.clone()))
-                    })
-            });
-        if !authorized {
-            return Err(unavailable(
-                "The exact agent session is no longer attached".into(),
-            ));
+        {
+            None => Some(delivery::DETACHED_REQUEST),
+            Some(record) if !record.subscribers.contains_key(&client) => {
+                Some(delivery::DETACHED_REQUEST)
+            }
+            Some(record)
+                if !agent.session.as_ref().is_some_and(|source| {
+                    source.same_process(&HostedSession::Chat(record.session.clone()))
+                }) =>
+            {
+                Some(delivery::UNFOLLOWED_RESTART)
+            }
+            Some(_) => None,
+        };
+        if let Some(refusal) = refusal {
+            return Err(unavailable(refusal.into()));
         }
         registry
             .lock()
@@ -108,6 +137,21 @@ pub(in crate::host) fn interactive(
         }
     }
     apply(request)
+}
+
+/// The process this daemon runs as conversation `id`, when `agent` is bound
+/// to an earlier one under the same ID.
+fn running_successor(host: &SharedHost, agent: &Agent, id: TerminalId) -> Option<chat::Session> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = state.chats.get(&id)?;
+    let running = HostedSession::Chat(record.session.clone());
+    (record.session.proof.as_ref() == Some(state.proof())
+        && !record.handle.is_completed()
+        && agent
+            .session
+            .as_ref()
+            .is_some_and(|bound| bound.id() == id && !bound.same_process(&running)))
+    .then(|| record.session.clone())
 }
 
 /// Reconcile only the exact finished firing inspected by the scheduler. A
