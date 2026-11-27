@@ -2391,6 +2391,10 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     let _lock = inherited_lock(&state)?;
     let mut job: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
+    #[cfg(target_os = "macos")]
+    if job.id == job_id && matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
+        return ready_plan::recover_worker(&installation, &state, &mut job, &_lock);
+    }
     let resume_stage = cfg!(target_os = "macos") && job.phase == UpdatePhase::Verifying;
     if job.id != job_id || (job.phase != UpdatePhase::Starting && !resume_stage) {
         return Err(invalid("update job is no longer pending"));
@@ -3806,7 +3810,7 @@ fn private_create(path: &Path) -> io::Result<File> {
 fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>, UpdateError> {
     let mut file = OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file()

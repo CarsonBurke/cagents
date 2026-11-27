@@ -6,7 +6,7 @@ const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
 pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
 const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(target_os = "macos", derive(Serialize, Deserialize))]
 pub(super) struct Selection {
     current: PathBuf,
@@ -14,7 +14,7 @@ pub(super) struct Selection {
 }
 
 impl Selection {
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn previous_link(&self) -> Option<&Path> {
         self.previous_link.as_deref()
     }
@@ -82,13 +82,13 @@ pub(super) fn complete_selection(
     Ok(())
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 #[cfg_attr(target_os = "macos", derive(Serialize, Deserialize))]
 pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 impl Stamp {
-    fn daemon_inode(&self) -> (u64, u64) {
+    pub(super) fn daemon_inode(&self) -> (u64, u64) {
         let index = BINARIES
             .iter()
             .position(|&binary| binary == DAEMON_BINARY)
@@ -182,7 +182,7 @@ impl Candidate<'_> {
         }
     }
 
-    fn digest(&self) -> Result<String, UpdateError> {
+    pub(super) fn digest(&self) -> Result<String, UpdateError> {
         match self {
             Self::Local(root) => digest(root, &BINARIES),
             #[cfg(target_os = "macos")]

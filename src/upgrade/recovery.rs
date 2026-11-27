@@ -1706,11 +1706,88 @@ impl CapturedPreparation {
 }
 
 #[cfg(target_os = "macos")]
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadyPlanEvidence<'a> {
-    authority: &'a Authority,
+    authority: std::borrow::Cow<'a, Authority>,
     checkpoint: (u64, u64),
     capture_digest: String,
+}
+
+#[cfg(target_os = "macos")]
+impl ReadyPlanEvidence<'_> {
+    /// Rebind an untouched approval to the newly held locks. No generic
+    /// Ready checkpoint can grant this authority after coordinator loss.
+    pub(crate) fn reopen(
+        self,
+        target: &Path,
+        worker: &File,
+        guard: &UiUpdateGuard,
+        handoff: &LeaseHandoff,
+    ) -> Result<Receipt, String> {
+        let authority = self.authority.into_owned();
+        validate_host_context(&authority)?;
+        if authority.version != 1
+            || !matches!(authority.origin, Origin::AcknowledgedPrepare)
+            || authority.source.boot_id
+                != crate::daemon::read_boot_id().map_err(|error| error.to_string())?
+        {
+            return Err("The Ready plan does not belong to this boot's acknowledged update".into());
+        }
+        validate_authority_target(target, &authority).map_err(|error| error.to_string())?;
+        validate_received_checkpoint(&authority, Phase::Ready)?;
+        if validate_acknowledged_capture(&authority)?.as_deref() != Some(&self.capture_digest) {
+            return Err("The original Ready inventory capture changed".into());
+        }
+
+        let (fence, legacy) = guard
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        let daemon = handoff
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        for (file, path) in [
+            (worker, &authority.worker_path),
+            (&fence, &authority.fence_path),
+            (&daemon, &authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&legacy, &authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        if !handoff
+            .recorded_source_is(&authority.source)
+            .map_err(|error| error.to_string())?
+            || !crate::instance::state_claim::last_daemon_was(
+                &authority.daemon_path,
+                &authority.source,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err(
+                "Another daemon has used the saved work since this update stopped its source"
+                    .into(),
+            );
+        }
+        let original = open_checkpoint(&authority.checkpoint_path)?
+            .ok_or("The approved Ready checkpoint disappeared")?;
+        let metadata = original.metadata().map_err(|error| error.to_string())?;
+        if (metadata.dev(), metadata.ino()) != self.checkpoint {
+            return Err("The original Ready checkpoint was replaced".into());
+        }
+        let receipt = Receipt {
+            checkpoint: StandbyCheckpoint::Ready(original),
+            worker: worker.try_clone().map_err(|error| error.to_string())?,
+            fence,
+            legacy,
+            daemon: Some(daemon),
+            authority,
+        };
+        if !receipt.ready_before_restore()? {
+            return Err("The Ready checkpoint has already been claimed or changed".into());
+        }
+        Ok(receipt)
+    }
 }
 
 impl Receipt {
@@ -1792,7 +1869,7 @@ impl Receipt {
         }
         let metadata = checkpoint.metadata().map_err(|error| error.to_string())?;
         Ok(ReadyPlanEvidence {
-            authority: &self.authority,
+            authority: std::borrow::Cow::Borrowed(&self.authority),
             checkpoint: (metadata.dev(), metadata.ino()),
             capture_digest: validate_acknowledged_capture(&self.authority)?
                 .ok_or("The Ready checkpoint has no acknowledged preparation")?,
@@ -4448,6 +4525,10 @@ pub struct ReadyAdmission {
 
 #[cfg(all(target_os = "macos", feature = "host"))]
 impl ReadyAdmission {
+    pub fn source(&self) -> &HostSessionProof {
+        &self.authority.source
+    }
+
     pub fn checkpoint_digest(&self) -> &str {
         &self.authority.checkpoint_hash
     }
@@ -4578,7 +4659,7 @@ pub(crate) fn accept_ready_authority(
     Ok(ReadyAdmission { authority, custody })
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let checkpoint = {
@@ -4609,7 +4690,7 @@ fn validate_received_checkpoint(authority: &Authority, phase: Phase) -> Result<(
     Ok(())
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 fn validate_host_context(authority: &Authority) -> Result<(), String> {
     let layout =
         crate::update::locate(&crate::process::current_executable().map_err(|e| e.to_string())?)
