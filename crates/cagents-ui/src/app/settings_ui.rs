@@ -2822,10 +2822,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Grouped);
+        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
         let mut changed = initial;
         let project = ProjectId::new();
-        changed.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        changed.sidebar_worktrees = settings::SidebarWorktrees::Grouped;
         changed
             .sidebar_worktree_overrides
             .insert(project, settings::SidebarWorktrees::Expanded);
@@ -2836,7 +2836,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             observed.sidebar_worktrees,
-            settings::SidebarWorktrees::Hidden
+            settings::SidebarWorktrees::Grouped
         );
         assert_eq!(
             observed.sidebar_worktree_overrides.get(&project),

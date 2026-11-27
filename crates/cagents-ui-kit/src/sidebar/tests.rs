@@ -2215,17 +2215,17 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
         for (mode, pressed, tooltip) in [
             (
                 crate::settings::SidebarWorktrees::Grouped,
-                Toggled::False,
+                Toggled::True,
                 "Hide checkouts",
             ),
             (
                 crate::settings::SidebarWorktrees::Expanded,
-                Toggled::False,
+                Toggled::True,
                 "Hide checkouts",
             ),
             (
                 crate::settings::SidebarWorktrees::Hidden,
-                Toggled::True,
+                Toggled::False,
                 "Show checkouts (hidden in every project)",
             ),
         ] {
@@ -2258,8 +2258,8 @@ fn the_checkouts_toggle_says_what_it_does_in_every_project() {
             let toggle = buttons.get(bell + 1).expect("beside the bell");
             assert_eq!(
                 (toggle.label(), toggle.toggled()),
-                (Some(CHECKOUTS_TOGGLE_NAME), Some(pressed)),
-                "{mode:?}, compact {compact}: the name stays and the pressed state says it"
+                (Some("Show checkouts"), Some(pressed)),
+                "{mode:?}, compact {compact}: the name stays and it is pressed while they show"
             );
             assert!(
                 !buttons.iter().any(|node| node

@@ -107,7 +107,7 @@ relaunch_agents_on_upgrade = true
 check_for_updates = true
 work_stale_after_days = 7
 shortcut_defaults_revision = 6
-preference_defaults_revision = 2
+preference_defaults_revision = 3
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
@@ -177,6 +177,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `pull_request_open_target` | string | `"review"` | What opening a pull request in the sidebar does: `"review"` opens the in-app review pane, and `"link"` opens the pull request's web page as a link, using the settings above |
 | `managed_worktree_directory` | string | `".worktrees/"` | A path that is not blank and has no control characters. It can be absolute or relative to the repository root; an in-checkout destination is excluded clone-locally on creation |
 | `worktree_sort` | string | `"newest"` | `"newest"`, `"oldest"`, or `"alphabetical"`. The main worktree always comes first. Imported worktrees with no known creation date come after dated ones, sorted by path |
+| `sidebar_worktrees` | string | `"hidden"` | How the sidebar shows each project's checkouts: `"grouped"`, `"expanded"`, or `"hidden"`. Hidden lists each open pane under its project instead, and applies to every project whatever its own mode. The sidebar header's **Show checkouts** button switches between hidden and the visible mode last used |
 | `editor_auto_save` | boolean | `true` | Saves edited files after a pause. Auto-save stops when there is a conflict or a save error |
 | `editor_wrap_lines` | boolean | `false` | Wraps long lines in the native editor. When it is off, you scroll sideways |
 | `editor_wrap_prose` | boolean | `true` | Wraps Markdown and plain-text (`.txt`, `.text`) files even when `editor_wrap_lines` is off. Code files follow `editor_wrap_lines` only |
@@ -196,7 +197,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
 | `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
-| `preference_defaults_revision` | integer | `2` | The revision of the built-in preference defaults the file has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `preference_defaults_revision` | integer | `3` | The revision of the built-in preference defaults the file has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
 | `notifications.success` | boolean | `true` | Alerts for explicit successful turn completion |
@@ -391,11 +392,14 @@ them back as version 3 the next time it saves.
   with no new chord, it keeps its old default. The next save records
   `shortcut_defaults_revision = 6`, after which an old default you choose
   again is kept.
-- **New preference defaults:** a file without `preference_defaults_revision`
-  wrote every preference out, so a value matching an old default does not say
-  whether you chose it. `focus_follows_mouse = false`, the default before
-  revision 2, becomes `true`. The next save records
-  `preference_defaults_revision = 2`, after which `false` chosen again is kept.
+- **New preference defaults:** a file at an older `preference_defaults_revision`
+  (one without it is at revision 1) may hold a preference cagents wrote out
+  rather than one you chose, so a value matching a default a later revision
+  changed takes the new default. `focus_follows_mouse = false`, the default
+  before revision 2, becomes `true`. `sidebar_worktrees = "grouped"`, the
+  default before revision 3, becomes `"hidden"`; `"expanded"` is kept. The
+  next save records `preference_defaults_revision = 3`, after which an old
+  default chosen again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
   `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+R),

@@ -1349,6 +1349,11 @@ const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
 }
 
+/// Checkouts start hidden, with each open pane listed under its project.
+const fn default_sidebar_worktrees() -> SidebarWorktrees {
+    SidebarWorktrees::Hidden
+}
+
 const fn default_preference_defaults_revision() -> u32 {
     PREFERENCE_DEFAULTS_REVISION
 }
@@ -1366,6 +1371,10 @@ pub enum WorktreeSort {
 /// How a project's checkouts appear beside its channels: the repository's
 /// root checkout and its linked worktrees. Hidden draws none of them; each
 /// pane open in one gets a row of its own instead.
+///
+/// The type's default is the visible mode checkouts show in until another is
+/// chosen. The sidebar itself starts with them hidden; see
+/// [`default_sidebar_worktrees`].
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SidebarWorktrees {
@@ -1576,7 +1585,7 @@ pub struct AppSettings {
     pub auto_delete_merged_worktrees: bool,
     #[serde(default)]
     pub worktree_sort: WorktreeSort,
-    #[serde(default)]
+    #[serde(default = "default_sidebar_worktrees")]
     pub sidebar_worktrees: SidebarWorktrees,
     #[serde(default)]
     pub sidebar_worktree_overrides: BTreeMap<crate::model::ProjectId, SidebarWorktrees>,
@@ -1780,7 +1789,7 @@ impl Default for AppSettings {
             managed_worktree_directory: default_managed_worktree_directory(),
             auto_delete_merged_worktrees: false,
             worktree_sort: WorktreeSort::default(),
-            sidebar_worktrees: SidebarWorktrees::default(),
+            sidebar_worktrees: default_sidebar_worktrees(),
             sidebar_worktree_overrides: BTreeMap::new(),
             sidebar_worktrees_when_shown: SidebarWorktrees::default(),
             default_worktree_pane: DefaultPane::default(),
@@ -2015,15 +2024,40 @@ const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
 /// replaces each preference still holding a default that a later revision
 /// changed with this build's default.
 ///
-/// Revision 2 turned on `focus_follows_mouse`.
-pub const PREFERENCE_DEFAULTS_REVISION: u32 = 2;
+/// Revision 2 turned on `focus_follows_mouse`; revision 3 hid the sidebar's
+/// checkouts by default.
+pub const PREFERENCE_DEFAULTS_REVISION: u32 = 3;
 
 /// The revision a file without `preference_defaults_revision` is at.
 const FIRST_PREFERENCE_DEFAULTS_REVISION: u32 = 1;
 
 /// A preference default that a later revision changed: the key, the first
 /// revision with the new default, and the default it replaced.
-const RETIRED_PREFERENCE_DEFAULTS: &[(&str, u32, bool)] = &[("focus_follows_mouse", 2, false)];
+const RETIRED_PREFERENCE_DEFAULTS: &[(&str, u32, RetiredPreference)] = &[
+    ("focus_follows_mouse", 2, RetiredPreference::Bool(false)),
+    (
+        "sidebar_worktrees",
+        3,
+        RetiredPreference::String(SidebarWorktrees::Grouped.key()),
+    ),
+];
+
+/// A retired default, as the file wrote it.
+#[derive(Clone, Copy)]
+enum RetiredPreference {
+    Bool(bool),
+    String(&'static str),
+}
+
+impl RetiredPreference {
+    fn written_as(self, value: &toml::Value) -> bool {
+        match (self, value) {
+            (Self::Bool(retired), toml::Value::Boolean(value)) => retired == *value,
+            (Self::String(retired), toml::Value::String(value)) => retired == value,
+            _ => false,
+        }
+    }
+}
 
 /// A built-in default that a later revision replaced.
 struct RetiredShortcutDefault {
@@ -3147,7 +3181,11 @@ fn adopt_preference_defaults(table: &mut toml::Table) {
         return;
     }
     for (key, changed_at, retired) in RETIRED_PREFERENCE_DEFAULTS {
-        if revision < *changed_at && table.get(*key) == Some(&toml::Value::Boolean(*retired)) {
+        if revision < *changed_at
+            && table
+                .get(*key)
+                .is_some_and(|value| retired.written_as(value))
+        {
             table.remove(*key);
         }
     }
@@ -4725,7 +4763,8 @@ mod tests {
             .unwrap()
             .remove("sidebar_worktree_overrides");
         let legacy: AppSettings = legacy.try_into().unwrap();
-        assert_eq!(legacy.sidebar_worktrees, Grouped);
+        assert_eq!(legacy.sidebar_worktrees, Hidden);
+        assert_eq!(legacy.sidebar_worktrees_when_shown, Grouped);
         assert!(legacy.sidebar_worktree_overrides.is_empty());
         save(&path, &base).unwrap();
         let mut one = base.clone();
@@ -5574,6 +5613,60 @@ new_thread = "Alt+Shift+G"
         let path = path_in(&directory);
         revision_one_preferences(&path, true);
         assert!(load(&path).unwrap().focus_follows_mouse);
+    }
+
+    /// A file written at revision 2, as every save wrote it then, holding
+    /// `mode` as the sidebar's checkouts mode.
+    fn revision_two_sidebar_worktrees(path: &Path, mode: SidebarWorktrees) {
+        let mut document = written(&AppSettings::default()).unwrap();
+        let table = document.as_table_mut().unwrap();
+        table.insert("preference_defaults_revision".into(), 2.into());
+        table.insert("sidebar_worktrees".into(), mode.key().into());
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn checkouts_start_hidden_and_show_in_the_grouped_mode() {
+        let settings = AppSettings::default();
+        assert_eq!(settings.sidebar_worktrees, SidebarWorktrees::Hidden);
+        assert_eq!(
+            settings.toggled_sidebar_worktrees(),
+            SidebarWorktrees::Grouped
+        );
+    }
+
+    #[test]
+    fn hidden_checkouts_reach_files_that_wrote_the_old_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_two_sidebar_worktrees(&path, SidebarWorktrees::Grouped);
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.sidebar_worktrees, SidebarWorktrees::Hidden);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION
+        );
+        save(&path, &loaded).unwrap();
+        assert!(!saved(&path).contains_key("sidebar_worktrees"));
+
+        // Showing them again afterwards is a choice, and is kept.
+        let mut chosen = loaded;
+        chosen.set_sidebar_worktrees(chosen.toggled_sidebar_worktrees());
+        save(&path, &chosen).unwrap();
+        assert_eq!(
+            load(&path).unwrap().sidebar_worktrees,
+            SidebarWorktrees::Grouped
+        );
+    }
+
+    #[test]
+    fn an_old_file_that_chose_a_checkouts_mode_other_than_the_old_default_keeps_it() {
+        for mode in [SidebarWorktrees::Expanded, SidebarWorktrees::Hidden] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            revision_two_sidebar_worktrees(&path, mode);
+            assert_eq!(load(&path).unwrap().sidebar_worktrees, mode);
+        }
     }
 
     #[test]
