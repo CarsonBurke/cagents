@@ -516,7 +516,18 @@ fn a_new_terminal_whose_insert_was_not_queued_is_sent_again() {
     let open = std::mem::replace(&mut window.app.workspace_model_tx, closed);
     let card = new_terminal(&mut window);
     drop(window.app.reconcile_shared_views());
-    assert!(window.app.holds_unsent_creation());
+    assert!(window.app.holds_unqueued_creation());
+    // Nothing waits for an answer to an edit that never went.
+    assert!(
+        window
+            .app
+            .shared_views
+            .pending
+            .iter()
+            .all(|(_, _, change)| {
+                !matches!(change, Change::Insert { pane, .. } if pane.id == card)
+            })
+    );
 
     // Another edit to the view, which doesn't list it.
     let scope = window.scope.clone();
@@ -542,40 +553,35 @@ fn a_new_terminal_whose_insert_was_not_queued_is_sent_again() {
     window.app.workspace_model_tx = open;
     drop(window.app.reconcile_shared_views());
     assert_eq!(inserts(&window.rx, card), 1);
-    assert!(!window.app.holds_unsent_creation());
+    assert!(!window.app.holds_unqueued_creation());
     assert_open(&window, card);
 }
 
-/// Until its Insert is sent, a new terminal is owed a reconciliation by
-/// every edge, as an unpublished conversation is; a refused one waits for
-/// its Retry instead (#4490).
+/// Once its Insert goes unqueued, a new terminal is owed a reconciliation by
+/// every edge, as an unpublished conversation is, until the Insert is
+/// queued; a refused one waits for its Retry instead (#4490).
 #[test]
-fn an_unsent_new_terminal_is_owed_reconciliation() {
+fn an_unqueued_new_terminal_is_owed_reconciliation() {
     let mut window = window();
     drain(&window.rx);
     let (closed, receiver) = crate::app::workspace_model_sync::test_model_channel();
     drop(receiver);
     let open = std::mem::replace(&mut window.app.workspace_model_tx, closed);
     let card = new_terminal(&mut window);
-    assert!(window.app.holds_unsent_creation());
+    drop(window.app.reconcile_shared_views());
+    assert!(window.app.holds_unqueued_creation());
     window.app.workspace_model_tx = open;
     drop(window.app.reconcile_shared_views());
-    assert!(!window.app.holds_unsent_creation());
+    assert!(!window.app.holds_unqueued_creation());
     refuse(&mut window, card, "refused");
-    assert!(!window.app.holds_unsent_creation());
+    assert!(!window.app.holds_unqueued_creation());
 }
 
-/// A new terminal its view accepts while fencing its agent is admitted all
-/// the same: it shows as a fenced pane, waits for no Insert, and closes
-/// (#4490).
-#[test]
-fn a_new_terminal_its_view_fences_is_admitted_and_closes() {
-    let mut window = window();
-    drain(&window.rx);
-    let card = new_terminal(&mut window);
-    drop(window.app.reconcile_shared_views());
+/// Accepts `card`'s Insert into a view whose registry runs another session
+/// for its agent than the pane saved, which fences the pane.
+fn admit_fenced(window: &mut Window, card: CardId) {
     let scope = window.scope.clone();
-    admit_insert_with(&mut window, card, |model, pane| {
+    admit_insert_with(window, card, |model, pane| {
         let CardKind::Terminal(saved) = &pane.kind else {
             unreachable!()
         };
@@ -608,15 +614,23 @@ fn a_new_terminal_its_view_fences_is_admitted_and_closes() {
         });
     });
     assert!(window.app.shared_views.quarantined.contains(&card));
+}
+
+/// A new terminal its view accepts while fencing its agent waits for no
+/// Insert: it shows as a fenced pane, and closes (#4490).
+#[test]
+fn a_new_terminal_its_view_fences_waits_for_no_insert_and_closes() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    admit_fenced(&mut window, card);
     assert_open(&window, card);
-    assert!(
-        !window
-            .app
-            .durable
-            .pending_terminal_creations
-            .contains(&card)
-    );
-    assert!(!window.app.holds_unsent_creation());
+    assert!(!window.app.unpublished_pane(card));
+    assert!(!window.app.holds_unqueued_creation());
+    drain(&window.rx);
+    drop(window.app.reconcile_shared_views());
+    assert_eq!(inserts(&window.rx, card), 0);
 
     drop(window.app.update(Message::CloseCard(card)));
     drop(window.app.update(Message::CommitClose(card)));
@@ -627,4 +641,56 @@ fn a_new_terminal_its_view_fences_is_admitted_and_closes() {
             .card_state(card)
             .is_some_and(|card| card.existence.is_open())
     );
+}
+
+/// Once its fence lifts, a new terminal its view accepted while fenced
+/// starts, as one accepted unfenced does (#4490).
+#[test]
+fn a_new_terminal_starts_once_its_fence_lifts() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    admit_fenced(&mut window, card);
+    assert!(
+        window
+            .app
+            .durable
+            .pending_terminal_creations
+            .contains(&card)
+    );
+
+    // The registry no longer runs another session for it.
+    let scope = window.scope.clone();
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    model
+        .agents
+        .retain(|agent| agent.id.as_uuid() != card.as_uuid());
+    model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap()
+        .revision += 1;
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: None,
+                model,
+            }),
+    );
+    assert!(!window.app.shared_views.quarantined.contains(&card));
+    assert_open(&window, card);
+    // Admitted, its creation is settled and its start under way.
+    assert!(
+        !window
+            .app
+            .durable
+            .pending_terminal_creations
+            .contains(&card)
+    );
+    assert!(window.app.shared_views.attached.contains(&card));
 }

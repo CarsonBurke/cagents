@@ -2393,8 +2393,8 @@ impl Cagents {
             Some("a repository reconciliation is deferred")
         } else if self.holds_unpublished_local_chat() {
             Some("an unpublished local conversation needs reconciliation")
-        } else if self.holds_unsent_creation() {
-            Some("a new terminal's Insert is unsent")
+        } else if self.holds_unqueued_creation() {
+            Some("a new terminal's Insert wasn't queued")
         } else if self.channel_title_suggestion_pending() {
             Some("a channel name suggestion is waiting")
         } else if self.channel_ui.deletion_unsettled() {
