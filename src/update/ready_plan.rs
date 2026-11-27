@@ -172,10 +172,12 @@ impl Reservation<'_> {
         Ok(Some(original.image))
     }
 
-    fn original_process(&self) -> Result<crate::daemon::holder_registry::Process, UpdateError> {
-        let bytes = read(&source_process_path(&self.state(), &self.job))?.ok_or_else(|| {
-            invalid("The original daemon did not record an exact held-return identity")
-        })?;
+    fn original_process(
+        &self,
+    ) -> Result<Option<crate::daemon::holder_registry::Process>, UpdateError> {
+        let Some(bytes) = read(&source_process_path(&self.state(), &self.job))? else {
+            return Ok(None);
+        };
         let record: BoundSourceProcess = serde_json::from_slice(&bytes)?;
         if record.reservation_digest != self.stored_digest
             || record.process.pid <= 1
