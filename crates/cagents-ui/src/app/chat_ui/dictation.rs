@@ -583,14 +583,32 @@ fn is_marker(word: &str) -> bool {
 /// indentation or Markdown marker before it, or the end of a sentence or a
 /// colon, perhaps followed by a closing quote or bracket.
 fn starts_sentence(left: &str) -> bool {
-    let left = content(left).trim_end().trim_end_matches([
-        '"', '\'', ')', ']', '}', '\u{201d}', '\u{2019}', '\u{bb}', '*', '_',
-    ]);
-    left.is_empty() || left.ends_with(['.', '!', '?', ':', '\u{2026}'])
+    let left = without_closing_punctuation(content(left).trim_end());
+    left.is_empty() || ends_sentence(left)
 }
 
 /// Abbreviations whose period does not end a sentence.
 const ABBREVIATIONS: [&str; 8] = ["Mr.", "Mrs.", "Ms.", "Dr.", "St.", "e.g.", "i.e.", "vs."];
+
+fn without_closing_punctuation(text: &str) -> &str {
+    text.trim_end_matches([
+        '"', '\'', ')', ']', '}', '\u{201d}', '\u{2019}', '\u{bb}', '*', '_',
+    ])
+}
+
+fn ends_sentence(text: &str) -> bool {
+    if !text.ends_with('.') {
+        return text.ends_with(['!', '?', ':', '\u{2026}']);
+    }
+    let word = text
+        .split_whitespace()
+        .next_back()
+        .unwrap_or_default()
+        .trim_start_matches(|c: char| !c.is_alphanumeric());
+    !ABBREVIATIONS
+        .iter()
+        .any(|abbreviation| word.eq_ignore_ascii_case(abbreviation))
+}
 
 /// A word without the punctuation around it or a possessive "'s".
 fn bare(word: &str) -> &str {
@@ -617,7 +635,13 @@ fn mid_sentence_capitals(text: &str) -> impl Iterator<Item = &str> {
     text.lines().flat_map(|line| {
         let mut sentence_start = true;
         content(line).split_whitespace().filter_map(move |word| {
-            let ends = starts_sentence(word) && !ABBREVIATIONS.contains(&word);
+            let sentence_word = without_closing_punctuation(word);
+            // Inline markers and detached closing quotes leave the boundary
+            // set by the surrounding prose.
+            if sentence_word.is_empty() || is_marker(word) {
+                return None;
+            }
+            let ends = ends_sentence(sentence_word);
             let starts = std::mem::replace(&mut sentence_start, ends);
             let core = bare(word);
             (!starts && !is_i(core) && core.chars().next().is_some_and(char::is_uppercase))
@@ -1748,6 +1772,42 @@ mod tests {
         );
         assert_eq!(case("A plan.", "and "), "a plan.");
         assert_eq!(case("'Ask not'", "and "), "'ask not'");
+    }
+
+    #[test]
+    fn names_after_mid_line_markers_are_learned() {
+        for marker in ["-", ">", "*", "#", "2."] {
+            let mut names = HashSet::new();
+            remember_names(
+                &mut names,
+                &format!("the fix {marker} Carson said. {marker} Then we left"),
+            );
+            assert_eq!(names, HashSet::from(["Carson".to_owned()]), "{marker}");
+        }
+    }
+
+    #[test]
+    fn punctuation_around_an_abbreviation_keeps_the_sentence_going() {
+        for abbreviation in ["e.g.", "(e.g.", "Dr.,", "“Dr.”", "**Dr.**", "E.g."] {
+            let left = format!("We asked {abbreviation} ");
+            assert_eq!(fit_case("Someone else", &left, |_| false), "someone else");
+
+            let mut names = HashSet::new();
+            remember_names(&mut names, &format!("{left}Carson. Then we left"));
+            assert!(names.contains("Carson"), "{abbreviation}");
+            assert!(!names.contains("Then"), "{abbreviation}");
+        }
+        assert_eq!(
+            fit_case("Then we left", "Did you mean Dr.?", |_| false),
+            "Then we left"
+        );
+    }
+
+    #[test]
+    fn a_detached_closing_quote_preserves_a_sentence_boundary() {
+        let names = mid_sentence_capitals("He said «\u{2009}Nora left.\u{2009}» Then we left")
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Nora"]);
     }
 
     /// In the draft, a continuation lands lowercased, and a name the
