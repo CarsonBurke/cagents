@@ -149,6 +149,20 @@ pub fn plain_preview(text: &str) -> String {
     bounded_words(&without_controls(text), PREVIEW_LIMIT)
 }
 
+/// [`plain_preview`] of `text` followed by `ending`, with `text` cut rather
+/// than `ending` when both do not fit, as for a reason before the command
+/// that answers it.
+pub fn plain_preview_ending_with(text: &str, ending: &str) -> String {
+    let ending = plain_preview(ending);
+    let room = PREVIEW_LIMIT.saturating_sub(ending.chars().count() + 1);
+    let text = bounded_words(&without_controls(text), room);
+    match (text.is_empty(), ending.is_empty()) {
+        (true, _) => ending,
+        (_, true) => text,
+        _ => format!("{text} {ending}"),
+    }
+}
+
 fn without_controls(text: &str) -> String {
     // Work on a UTF-8 boundary and bound scanning before sanitization.
     let mut end = text.len().min(INPUT_LIMIT);
@@ -378,6 +392,25 @@ mod tests {
         assert!(result.ends_with('…'));
         assert!(!result.contains('\n'));
         assert!(title(&"🦀".repeat(1000)).chars().count() <= TITLE_LIMIT);
+    }
+
+    #[test]
+    fn a_preview_cuts_its_text_rather_than_its_ending() {
+        assert_eq!(
+            plain_preview_ending_with("Sign-in\nneeds attention.", "Then run `cagents resume ab`."),
+            "Sign-in needs attention. Then run `cagents resume ab`."
+        );
+        let result =
+            plain_preview_ending_with(&"word ".repeat(200), "Then run `cagents resume ab`.");
+        assert!(result.chars().count() <= PREVIEW_LIMIT);
+        assert!(
+            result.ends_with("… Then run `cagents resume ab`."),
+            "{result}"
+        );
+        // Already bounded, so showing it bounds it no further.
+        assert_eq!(plain_preview(&result), result);
+        assert_eq!(plain_preview_ending_with("", "Then."), "Then.");
+        assert_eq!(plain_preview_ending_with("Reason.", ""), "Reason.");
     }
 
     #[test]

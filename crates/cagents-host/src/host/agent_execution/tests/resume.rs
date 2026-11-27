@@ -87,6 +87,7 @@ fn confirmed_conversation(
         .confirmed_session_id()
         .expect("the fixture provider confirmed its conversation");
     chat.launch.session_id = Some(confirmed.clone());
+    // The history Claude saved, which a resume reads before it starts.
     let sanitized: String = project
         .to_str()
         .unwrap()
@@ -559,7 +560,7 @@ fn opt_in(resume: bool) {
 
 /// The daemon's own resume as it runs once the daemon serves.
 fn after_boot(host: &SharedHost) -> AfterBoot {
-    crate::host::agent_execution::resume::resume_after_boot(&Arc::downgrade(host))
+    crate::host::agent_execution::resume::resume_once_per_boot(&Arc::downgrade(host))
 }
 
 fn ran(outcome: AfterBoot) -> Pass {
@@ -655,6 +656,65 @@ fn a_conversation_this_boot_ran_is_not_resumed_by_itself() {
         "{pass:?}"
     );
     assert_eq!(stopped_ids(&host), [before.id]);
+}
+
+/// The fixture's agent shown in a pane paired with its provider's terminal,
+/// which only the app reopens, stopped with its daemon, then a new daemon on
+/// `boot`.
+fn stopped_paired_chat(boot: BootId) -> SharedHost {
+    let (host, request, path) = fixture();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
+    let (mut chat, _) = confirmed_conversation(&host, &path, &accepted);
+    let recipe = chat.launch.recipe.clone();
+    chat.terminal = Some(Box::new(crate::model::TerminalSession {
+        id: crate::model::TerminalId::new(),
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    }));
+    pane_in_a_new_channel(
+        &host,
+        &path.parent().unwrap().join("project"),
+        crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+        chat,
+    );
+    crate::host::finish_chat_shutdown(&host).unwrap();
+    drop(host);
+    daemon_on(boot)
+}
+
+/// A chat paired with its provider's terminal is left to its pane, and
+/// counted as left untried only when an earlier boot ran it: one this boot
+/// ran, as before an interrupted resume runs again, is not.
+#[test]
+fn a_paired_chat_is_left_untried_only_when_an_earlier_boot_ran_it() {
+    if in_child("a_paired_chat_is_left_untried_only_when_an_earlier_boot_ran_it") {
+        return;
+    }
+    opt_in(true);
+    let host = stopped_paired_chat(crate::daemon::read_boot_id().unwrap());
+    let pass = ran(after_boot(&host));
+    assert!(
+        pass.resumed.is_empty() && pass.failed.is_empty() && pass.left.is_empty(),
+        "{pass:?}"
+    );
+    drop(host);
+    let host = daemon_on(BootId::new("a-later-boot"));
+    let pass = ran(after_boot(&host));
+    assert!(
+        pass.resumed.is_empty() && pass.failed.is_empty(),
+        "{pass:?}"
+    );
+    assert_eq!(pass.left.len(), 1, "{pass:?}");
+    assert!(pass.left[0].terminal.is_some(), "{pass:?}");
 }
 
 /// Once a boot's resume ran, here with the setting off, a daemon restarted
@@ -829,9 +889,9 @@ fn a_pane_a_window_reopened_first_is_left_to_it() {
     )
     .unwrap();
     let pass = ran(after_boot(&host));
-    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    // Neither resumed by the pass nor reported as its failure.
     assert!(
-        pass.resumed.iter().all(|resumed| resumed.already_running),
+        pass.resumed.is_empty() && pass.failed.is_empty() && pass.left.is_empty(),
         "{pass:?}"
     );
     let state = host.lock().unwrap();
@@ -839,6 +899,12 @@ fn a_pane_a_window_reopened_first_is_left_to_it() {
         .chats
         .values()
         .filter(|record| record.handle.session_id().as_deref() == Some(conversation.as_str()))
-        .count();
-    assert_eq!(writers, 1);
+        .collect::<Vec<_>>();
+    // The one writer is the window's.
+    assert_eq!(writers.len(), 1);
+    assert!(
+        writers[0].subscribers.contains_key(&WINDOW),
+        "{:?}",
+        writers[0].subscribers.keys().collect::<Vec<_>>()
+    );
 }

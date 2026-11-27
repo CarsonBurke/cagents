@@ -24,7 +24,7 @@ pub(super) mod mailbox;
 mod ownership;
 pub(super) mod prompt_cache;
 mod resume;
-pub(super) use resume::after_boot as resume_after_boot;
+pub(super) use resume::resume_after_boot;
 pub(super) mod terminals;
 mod transcript;
 pub(super) mod working_directory;

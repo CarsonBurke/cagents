@@ -956,8 +956,8 @@ pub(super) struct Pass {
 /// first daemon of this boot to get this far, every stopped conversation an
 /// earlier boot ran, as `cagents resume --all` would. Each one that cannot
 /// resume is announced and stays listed by `cagents resume`.
-pub(in crate::host) fn after_boot(host: std::sync::Weak<crate::host::state::HostLock>) {
-    if let AfterBoot::Ran(pass) = resume_after_boot(&host) {
+pub(in crate::host) fn resume_after_boot(host: std::sync::Weak<crate::host::state::HostLock>) {
+    if let AfterBoot::Ran(pass) = resume_once_per_boot(&host) {
         tracing::info!(
             resumed = pass.resumed.len(),
             failed = pass.failed.len(),
@@ -968,7 +968,11 @@ pub(in crate::host) fn after_boot(host: std::sync::Weak<crate::host::state::Host
     }
 }
 
-pub(super) fn resume_after_boot(host: &std::sync::Weak<crate::host::state::HostLock>) -> AfterBoot {
+/// [`resume_after_boot`]'s pass, unless this boot's already ran or the
+/// person did not ask for one.
+pub(super) fn resume_once_per_boot(
+    host: &std::sync::Weak<crate::host::state::HostLock>,
+) -> AfterBoot {
     let Some(boot) = host.upgrade().map(|host| {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1027,13 +1031,16 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
             return interrupted();
         }
     };
-    drop(shared);
     let Listing {
         found,
         mut sources,
         unreadable,
-        in_app,
+        mut in_app,
     } = listing;
+    // As below: one this boot ran is no earlier boot's to report, as when an
+    // interrupted pass runs again.
+    in_app.retain(|session| !ran_this_boot(&shared, session));
+    drop(shared);
     for (session, error) in unreadable {
         tracing::info!(%session, %error, "not resumed: nothing saved to reopen");
     }
@@ -1062,7 +1069,7 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
             continue;
         }
         // Run by this boot already, as by a window that opened first.
-        if !super::super::chat::from_earlier_boot(&host, &source) {
+        if ran_this_boot(&host, &source) {
             tracing::info!(session = %stopped.id, "not resumed: this boot already ran it");
             continue;
         }
@@ -1107,6 +1114,16 @@ fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
         announce_left(&host, &pass.left);
     }
     pass
+}
+
+/// Whether `session`'s complete saved record says this boot ran it. One
+/// whose record is incomplete may be an earlier boot's.
+fn ran_this_boot(host: &SharedHost, session: &Session) -> bool {
+    session
+        .proof
+        .as_ref()
+        .is_some_and(|proof| proof.is_complete())
+        && !super::super::chat::from_earlier_boot(host, session)
 }
 
 /// Whether a window is attached to the daemon's record of `id`, as to the
@@ -1177,8 +1194,8 @@ fn announce(host: &SharedHost, event: impl FnOnce(&BootId) -> Option<crate::noti
     }
 }
 
-/// Says that `stopped` did not come back, why, and how to resume it. The
-/// command comes first, so a long reason cannot crowd it out.
+/// Says that `stopped` did not come back, why, and how to resume it. A long
+/// reason is cut, never the command after it.
 fn failure_notice(
     boot: &BootId,
     source: &Session,
@@ -1190,12 +1207,21 @@ fn failure_notice(
         .title
         .clone()
         .unwrap_or_else(|| stopped.provider.chat_title().to_owned());
+    let reason = reason.trim();
+    let reason = if reason.is_empty() || reason.ends_with(['.', '!', '?', '…']) {
+        reason.to_owned()
+    } else {
+        format!("{reason}.")
+    };
     notice(
         boot,
         source,
         "",
         &format!("{title} ({short})"),
-        &format!("Resume it with `cagents resume {short}`. {reason}"),
+        &crate::notifications::presentation::plain_preview_ending_with(
+            &reason,
+            &format!("Then run `cagents resume {short}`."),
+        ),
     )
 }
 
@@ -1210,9 +1236,9 @@ fn announce_failure(host: &SharedHost, source: &Session, stopped: &Stopped, reas
 fn left_notice(boot: &BootId, left: &[Session]) -> Option<crate::notifications::Event> {
     let first = left.first()?;
     let preview = match left.len() {
-        1 => "1 stopped session was not resumed. Resume it from its pane in the app, or see `cagents resume`.".to_owned(),
+        1 => "1 stopped session was not resumed. Resume it from the app; `cagents resume` shows what is still stopped.".to_owned(),
         count => format!(
-            "{count} stopped sessions were not resumed. Resume them from their panes in the app, or see `cagents resume`."
+            "{count} stopped sessions were not resumed. Resume them from the app; `cagents resume` shows what is still stopped."
         ),
     };
     Some(notice(boot, first, ":left", "Stopped sessions", &preview))
@@ -1314,16 +1340,29 @@ mod tests {
         assert_eq!(content.conversation, format!("Fix the parser ({short})"));
         assert_eq!(
             content.preview,
-            format!("Resume it with `cagents resume {short}`. Claude sign-in needs attention")
+            format!("Claude sign-in needs attention. Then run `cagents resume {short}`.")
         );
         let shown = presentation::message(&event, true);
         assert_eq!(shown.title, format!("Fix the parser ({short})"));
         assert!(
             shown.body.starts_with(&format!(
-                "Did not resume when this computer started: Resume it with `cagents resume {short}`."
+                "Did not resume when this computer started: Claude sign-in needs attention. Then run `cagents resume {short}`."
             )),
             "{}",
             shown.body
+        );
+        // A long reason is cut, never the command that resumes it.
+        let long = "The provider said no. ".repeat(40);
+        let event = failure_notice(&boot, &source, &stopped, &long);
+        let preview = &event.content.as_ref().unwrap().preview;
+        assert!(
+            preview.ends_with(&format!("… Then run `cagents resume {short}`.")),
+            "{preview}"
+        );
+        assert!(
+            presentation::message(&event, true)
+                .body
+                .contains(&format!("… Then run `cagents resume {short}`.")),
         );
         // Without previews, only what happened.
         let private = presentation::message(&event, false);
@@ -1339,6 +1378,15 @@ mod tests {
         assert!(preferences.allows(Kind::NotResumed, false));
         preferences.failure = false;
         assert!(!preferences.allows(Kind::NotResumed, false));
+
+        // A reason with nothing to add, or already cut, gains no period.
+        for (reason, preview) in [("", ""), ("Cut short…", "Cut short… ")] {
+            let event = failure_notice(&boot, &source, &stopped, reason);
+            assert_eq!(
+                event.content.unwrap().preview,
+                format!("{preview}Then run `cagents resume {short}`.")
+            );
+        }
 
         // An untitled one is named by its provider.
         let (source, stopped) = saved(None);
@@ -1363,14 +1411,14 @@ mod tests {
         event.validate().unwrap();
         assert_eq!(
             event.content.unwrap().preview,
-            "1 stopped session was not resumed. Resume it from its pane in the app, or see `cagents resume`."
+            "1 stopped session was not resumed. Resume it from the app; `cagents resume` shows what is still stopped."
         );
         let event = left_notice(&boot, &[one.clone(), two]).unwrap();
         assert_eq!(event.evidence.key, "resume-after-boot:boot:left");
         assert_eq!(event.source_session(), Some(one.id));
         assert_eq!(
             event.content.unwrap().preview,
-            "2 stopped sessions were not resumed. Resume them from their panes in the app, or see `cagents resume`."
+            "2 stopped sessions were not resumed. Resume them from the app; `cagents resume` shows what is still stopped."
         );
     }
 
