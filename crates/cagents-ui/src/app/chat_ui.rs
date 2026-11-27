@@ -15977,11 +15977,20 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
+                let resumes = runtime.resumes_in_place();
+                // The window is already reconnecting this agent's pane. The
+                // press makes that attempt now, and starts nothing it would
+                // not (see `reattach`).
+                if self.chat_ui.reattach.waits(target.card)
+                    && self.chat_runs_as_open_agent(target.card, &session)
+                {
+                    return self.reattach_now(target.card, Instant::now());
+                }
                 // Attaching again to an actor whose provider exited would only
                 // bring back the same stopped snapshot. Its conversation is
                 // resumed instead; the card keeps its transcript and draft
                 // while the daemon proves the old actor gone.
-                let intent = if runtime.resumes_in_place() {
+                let intent = if resumes {
                     chat::Intent::Resume
                 } else {
                     self.chat_retry_intent(target.card, &session)

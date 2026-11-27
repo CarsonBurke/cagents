@@ -1340,12 +1340,13 @@ shows **Reconnecting** meanwhile, and **Reconnect now** skips the wait. A chat
 that still cannot reconnect keeps **Reconnect** and the reason, and one notice
 says how many chats came back and how many did not. Reconnecting does what
 **Reconnect** does: a provider that went down with the daemon starts again on
-the same conversation. No message is sent again; one you had queued behind the
-interrupted turn is sent once the chat is ready. A chat whose provider had
-already stopped is not started again unasked, and neither is the chat of an
-agent started with `cagents agent spawn`: its pane rejoins the agent when the
-daemon still runs it, and keeps **Reconnect** otherwise. A window opened on
-another device does not reconnect its chats by itself; use **Reconnect** there.
+the same conversation. No message is sent again: one that was queued behind
+the interrupted turn returns to the composer for you to send. A chat whose
+provider had already stopped is not started again unasked, and neither is the
+chat of an agent started with `cagents agent spawn`: its pane rejoins the agent
+when the daemon still runs it, and keeps **Reconnect** otherwise. A window
+opened on another device does not reconnect its chats by itself; use
+**Reconnect** there.
 Transcripts use a private disk-backed cache and pageable display windows; use
 **Load earlier history** and **Jump to latest** to navigate. The cache is not a
 permanent archive or a fixed disk quota: explicitly closing the chat releases

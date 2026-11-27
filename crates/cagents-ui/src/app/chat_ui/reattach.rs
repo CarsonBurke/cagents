@@ -13,10 +13,12 @@
 //! was showing ([`chat::Intent::Restore`]), as its Reconnect would. A
 //! provider that went down with its daemon is started again on that
 //! conversation, since nothing else can show it, and no message is sent to
-//! it again: only one the reader had queued behind the turn goes, once the
-//! conversation takes it. The pane of an agent the daemon manages is the
-//! exception: only the daemon starts that agent's provider, so its pane
-//! rejoins what the daemon still hosts or keeps its button. An attempt never restarts a provider the
+//! it again. What still waited to be sent is treated as after Reconnect: a
+//! message the provider had queued returns to the composer, and one the
+//! pane held for a conversation not yet ready goes once it is. The pane of
+//! an agent the daemon manages is the exception: only the daemon starts that
+//! agent's provider, so its pane rejoins what the daemon still hosts or
+//! keeps its button. An attempt never restarts a provider the
 //! window saw stop, repeats a launch the reader asked for, gives a pane up
 //! for a draft, or answers a refusal that needs a decision; those stay with
 //! the pane's own controls. Like the window's own readers, it starts the
@@ -83,8 +85,8 @@ pub(super) struct Reattach {
     away: bool,
     /// Conversations that came back since the window last said how it went.
     reconnected: HashSet<CardId>,
-    /// How many conversations the notice that stands says could not.
-    reported_failed: usize,
+    /// The conversations the window last said could not come back.
+    reported_failed: HashSet<CardId>,
 }
 
 impl Reattach {
@@ -105,6 +107,13 @@ impl Reattach {
         self.chats
             .get(&card)
             .is_some_and(|lost| matches!(lost.step, Step::Waiting(_) | Step::Attaching(_)))
+    }
+
+    /// Whether `card`'s conversation waits for an attempt still to come.
+    pub(super) fn waits(&self, card: CardId) -> bool {
+        self.chats
+            .get(&card)
+            .is_some_and(|lost| matches!(lost.step, Step::Waiting(_)))
     }
 
     #[cfg(test)]
@@ -166,9 +175,9 @@ impl Cagents {
                 tracing::debug!(%card, attempts = lost.attempts, step = ?lost.step, "a conversation lost its connection");
             }
         }
-        self.show_reattaching();
-        self.report_reattach();
-        self.arm_reattach(now)
+        // Whatever was due while its timer's firing is still on its way is
+        // made here, and the timer armed for what is left.
+        self.pump_reattach(now)
     }
 
     /// The daemon's health changed. One that answers after it could not be
@@ -233,6 +242,16 @@ impl Cagents {
             return Task::none();
         }
         self.chat_ui.reattach.wake = None;
+        self.pump_reattach(now)
+    }
+
+    /// The reader does not wait for `card`'s next attempt: it is made now.
+    pub(super) fn reattach_now(&mut self, card: CardId, now: Instant) -> Task<Message> {
+        if let Some(lost) = self.chat_ui.reattach.chats.get_mut(&card)
+            && let Step::Waiting(due) = lost.step
+        {
+            lost.step = Step::Waiting(due.min(now));
+        }
         self.pump_reattach(now)
     }
 
@@ -568,30 +587,23 @@ impl Cagents {
         }
         let failed = reattach
             .chats
-            .values()
-            .filter(|lost| matches!(lost.step, Step::GaveUp { .. }))
-            .count();
+            .iter()
+            .filter_map(|(card, lost)| matches!(lost.step, Step::GaveUp { .. }).then_some(*card))
+            .collect::<HashSet<_>>();
         // One that came back and was lost for good since counts once, as
         // what it ended as.
         let reconnected = std::mem::take(&mut reattach.reconnected)
-            .into_iter()
-            .filter(|card| {
-                !matches!(
-                    reattach.chats.get(card),
-                    Some(Lost {
-                        step: Step::GaveUp { .. },
-                        ..
-                    })
-                )
-            })
+            .difference(&failed)
             .count();
         if reconnected == 0 && failed == reattach.reported_failed {
             return;
         }
         // The reader reconnecting the rest takes the count down with them,
-        // and a notice they dismissed is not raised again for that.
-        let fewer = reconnected == 0 && failed < reattach.reported_failed;
+        // and a notice they dismissed is not raised again for that. One more
+        // conversation left to them is news, whatever the count.
+        let fewer = reconnected == 0 && failed.is_subset(&reattach.reported_failed);
         reattach.reported_failed = failed;
+        let failed = reattach.reported_failed.len();
         if fewer
             && !self
                 .notices
@@ -1219,6 +1231,30 @@ mod tests {
         assert!(runtime.disconnected && !runtime.reattaching);
     }
 
+    /// Reconnect now on an agent's pane makes the attempt the window was
+    /// waiting to make, not the reader's own kind, which starts a provider.
+    #[test]
+    fn reconnect_now_on_a_managed_agents_pane_only_brings_its_attempt_forward() {
+        let mut app = test_app();
+        let card = live_chat(&mut app, Some("thread"));
+        let source = chat_runtime(&app, card).session.clone();
+        app.workspace_model
+            .agents
+            .push(crate::app::channel_ui::close_tests::agent(&source));
+        lose(&mut app, card, Instant::now());
+        assert_eq!(
+            chat_runtime(&app, card).stopped(false, false).primary,
+            Some(("Reconnect now", stopped::Press::Reconnect, true))
+        );
+        let target = chat_runtime(&app, card).target;
+        drop(app.update(Message::ChatUi(Action::Reconnect(target))));
+        assert_eq!(
+            app.chat_ui.attempt(card).map(|attempt| attempt.intent),
+            Some(chat::Intent::RestoreExisting)
+        );
+        assert_eq!(app.chat_ui.reattach.attempts(card), Some(1));
+    }
+
     /// A daemon still restoring after an update refuses the attempt, and the
     /// window reopens what it refused once the restore ends. An agent's pane
     /// is still only put back on what the daemon hosts then.
@@ -1247,6 +1283,9 @@ mod tests {
         drop(app.update_recovery_answered(Ok(StartupState::Ready)));
         drop(app.update(Message::ChatUi(Action::UpdateRecoveryReady)));
         assert!(attempt(&app, card).is_none(), "nothing starts at once");
+        // A later release finds nothing of this pane's left to retry.
+        drop(app.update(Message::ChatUi(Action::UpdateRecoveryReady)));
+        assert!(attempt(&app, card).is_none());
         make_attempt(&mut app, card);
         assert_eq!(
             app.chat_ui.attempt(card).map(|attempt| attempt.intent),
@@ -1336,21 +1375,24 @@ mod tests {
     }
 
     /// The reader who dismissed the notice and reconnects the rest by hand
-    /// is not told again each time the number goes down.
+    /// is not told again each time the number goes down. Another
+    /// conversation left to them is said, though the number is the same.
     #[test]
     fn a_dismissed_notice_stays_dismissed_as_the_reader_reconnects_the_rest() {
+        fn give_up(app: &mut Cagents, card: CardId) {
+            lose(app, card, Instant::now());
+            for _ in DELAYS {
+                make_attempt(app, card);
+                refuse(app, card, chat::Recovery::Unreached);
+            }
+            assert!(app.chat_ui.reattach.gave_up(card));
+        }
         let mut app = test_app();
         let first = live_chat(&mut app, Some("thread"));
         let second = live_chat(&mut app, Some("thread"));
-        for card in [first, second] {
-            lose(&mut app, card, Instant::now());
-            make_attempt(&mut app, card);
-            refuse(&mut app, card, chat::Recovery::Unreached);
-            for _ in 1..DELAYS.len() {
-                make_attempt(&mut app, card);
-                refuse(&mut app, card, chat::Recovery::Unreached);
-            }
-        }
+        let third = live_chat(&mut app, Some("thread"));
+        give_up(&mut app, first);
+        give_up(&mut app, second);
         assert_eq!(notices(&app).len(), 1);
         app.notices.clear();
         let target = chat_runtime(&app, first).target;
@@ -1358,6 +1400,15 @@ mod tests {
         reconnect(&mut app, first);
         assert!(!chat_runtime(&app, first).disconnected);
         assert!(notices(&app).is_empty());
+
+        give_up(&mut app, third);
+        assert_eq!(
+            notices(&app),
+            [(
+                NoticeSeverity::Warning,
+                format!("2 chats couldn't reconnect. {FAILED_NEXT}")
+            )]
+        );
     }
 
     /// A pane closed while it waits for the reader is no longer one of the
