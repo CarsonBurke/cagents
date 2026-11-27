@@ -21,9 +21,78 @@ const MAX_PROJECT_BACKOFF: Duration = Duration::from_secs(30 * 60);
 /// but never keeps a permanent application clock alive.
 const RECONCILIATION_RETRY: Duration = Duration::from_secs(10);
 /// How long after a watched change to the Changes panel's checkout the panel
-/// reads it again. An agent's edits come in bursts, and every change of one
+/// reads it again, and the least time between one such read ending and the
+/// next beginning. An agent's edits come in bursts, and every change of one
 /// lands in that one read.
 pub(super) const SOURCE_RELOAD_DELAY: Duration = Duration::from_millis(200);
+/// The longest an untracked path waits. A file written over and over that
+/// reads find nothing new in, such as an ignored log beside tracked files,
+/// waits twice as long after each such read, up to this.
+const MAX_UNTRACKED_RELOAD_DELAY: Duration = Duration::from_secs(5);
+
+/// When the Changes panel reads its checkout again because the watcher saw
+/// it change since the last read began. Unlike the periodic refresh, this
+/// runs unfocused and under a modal: watching agents work from another
+/// window is what the panel is for.
+#[derive(Debug, Default)]
+pub(super) struct SourceReload {
+    due: Option<Instant>,
+    /// A change since the last read began touched what the index or `HEAD`
+    /// describes, not only untracked paths.
+    tracked: bool,
+    /// The read in flight began for untracked paths alone.
+    reading_untracked: bool,
+    /// Reads in a row, begun for untracked paths alone, that found nothing.
+    quiet: u32,
+}
+
+impl SourceReload {
+    /// The watcher saw a change. The first change of a burst sets the
+    /// deadline and the rest join it, so a stream of writes still reads at
+    /// most once per [`SOURCE_RELOAD_DELAY`] plus the read itself.
+    pub(super) fn owe(&mut self, now: Instant, untracked_only: bool) {
+        let delay = if untracked_only {
+            (SOURCE_RELOAD_DELAY * 2u32.pow(self.quiet.min(5))).min(MAX_UNTRACKED_RELOAD_DELAY)
+        } else {
+            SOURCE_RELOAD_DELAY
+        };
+        let at = now + delay;
+        self.due = Some(self.due.map_or(at, |due| due.min(at)));
+        self.tracked |= !untracked_only;
+    }
+
+    pub(super) fn due(&self) -> Option<Instant> {
+        self.due
+    }
+
+    /// A read began, after every change reported so far.
+    pub(super) fn read_started(&mut self) {
+        self.reading_untracked = self.due.is_some() && !self.tracked;
+        self.due = None;
+        self.tracked = false;
+    }
+
+    /// A read finished, and `changed` says whether it found anything the
+    /// panel did not show. Changes seen meanwhile wait at least the delay
+    /// after it, so back-to-back reads leave Git and the panel room.
+    pub(super) fn read_finished(&mut self, now: Instant, changed: bool) {
+        if changed {
+            self.quiet = 0;
+        } else if self.reading_untracked {
+            self.quiet = self.quiet.saturating_add(1);
+        }
+        self.reading_untracked = false;
+        if let Some(due) = &mut self.due {
+            *due = (*due).max(now + SOURCE_RELOAD_DELAY);
+        }
+    }
+
+    /// The owed read is moot: the panel is hidden or a mutation will read.
+    fn forget(&mut self) {
+        self.due = None;
+        self.tracked = false;
+    }
+}
 
 #[derive(Default)]
 pub(super) struct State {
@@ -32,11 +101,7 @@ pub(super) struct State {
     pub(super) focused: bool,
     pub(super) source_generation: u64,
     pub(super) source_cancel: Option<CancellationToken>,
-    /// When the Changes panel reads its checkout again because the watcher
-    /// saw it change since the last read began. Unlike the periodic
-    /// refresh, this runs unfocused and under a modal: watching agents work
-    /// from another window is what the panel is for.
-    pub(super) source_reload_due: Option<Instant>,
+    pub(super) source_reload: SourceReload,
     pub(super) projects: HashMap<ProjectId, CancellationToken>,
     /// The next retry for consumers which have no completion-driven wake.
     /// This is state, rather than a fresh `now + interval` in
@@ -214,15 +279,6 @@ impl State {
         self.reconciliation_due = None;
     }
 
-    /// The watcher saw the Changes panel's checkout change. The first change
-    /// of a burst sets the deadline and the rest join it, so a stream of
-    /// writes still reads at most once per [`SOURCE_RELOAD_DELAY`] while
-    /// each read is quick, and once per read when they are slower.
-    pub(super) fn owe_source_reload(&mut self, now: Instant) {
-        self.source_reload_due
-            .get_or_insert(now + SOURCE_RELOAD_DELAY);
-    }
-
     pub(super) fn schedule_remote_started(&mut self, project_id: ProjectId) {
         self.schedule.started(project_id, Instant::now());
     }
@@ -339,7 +395,8 @@ impl Cagents {
         // steady stream of writes, cancelling would never let one finish.
         let source = self
             .refresh_ui
-            .source_reload_due
+            .source_reload
+            .due()
             .filter(|_| self.refresh_ui.source_cancel.is_none())
             .map_or_else(Subscription::none, |due| {
                 Subscription::run_with(SourceReloadDeadline(due), source_reload_stream)
@@ -355,45 +412,62 @@ impl Cagents {
         Subscription::batch([source, refresh])
     }
 
-    /// Whether a watched change in `project` can change what the Changes
-    /// panel shows: its own checkout's files, untracked ones included, or
-    /// refs and configuration every checkout shares.
-    pub(super) fn source_control_watch_changed(
+    /// What a watched change in `project` owes the Changes panel: `None`
+    /// when nothing it shows can have moved, otherwise whether only
+    /// untracked paths did. Its own checkout's files, index and `HEAD`, and
+    /// the refs and configuration every checkout shares, are what it shows.
+    pub(super) fn source_control_watch_change(
         &self,
         project: ProjectId,
         change: &crate::git_watch::Change,
-    ) -> bool {
-        self.workspace_view_shown().is_some()
-            && self
-                .sidebar_model
-                .source_control
-                .as_ref()
-                .is_some_and(|source| {
-                    let worktree = source.key.worktree_id;
-                    source.key.project_id == project
-                        && (change.worktrees.contains(&worktree)
-                            || change.untracked.contains(&worktree)
-                            || change.references
-                            || change.configuration
-                            || change.rescan)
-                })
-    }
-
-    fn source_reload_due(&mut self) -> Task<Message> {
-        self.refresh_ui.source_reload_due = None;
-        if self.workspace_view_shown().is_none() {
-            return Task::none();
-        }
-        // A mutation reads the worktree again when it finishes.
-        match self
+    ) -> Option<bool> {
+        self.workspace_view_shown()?;
+        let source = self
             .sidebar_model
             .source_control
             .as_ref()
+            .filter(|source| source.key.project_id == project)?;
+        let worktree = source.key.worktree_id;
+        if change.worktrees.contains(&worktree)
+            || change.references
+            || change.configuration
+            || change.rescan
+        {
+            Some(false)
+        } else {
+            change.untracked.contains(&worktree).then_some(true)
+        }
+    }
+
+    /// Whether the panel's read lists untracked files, and so whether their
+    /// changes are worth watching for.
+    pub(super) fn source_control_reads_untracked(&self) -> bool {
+        self.sidebar_state.section_expanded(PanelSection::Untracked)
+            || self.workspace_view_shown() == Some(super::context_sections::WorkspaceView::Files)
+    }
+
+    fn source_reload_fired(&mut self) -> Task<Message> {
+        // Queued before a read began: that read leaves this owed.
+        if self.refresh_ui.source_cancel.is_some() {
+            return Task::none();
+        }
+        let key = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            // A mutation reads the worktree again when it finishes.
             .filter(|source| !source.busy())
             .map(|source| source.key.clone())
-        {
-            Some(key) => self.reload_source_control(&key),
-            None => Task::none(),
+            .filter(|_| self.workspace_view_shown().is_some());
+        match key {
+            // A background read: the rows stay as they are, without the
+            // "Refreshing…" state or its stand-down of row actions, which a
+            // stream of agent writes would otherwise keep on.
+            Some(key) => self.source_control_snapshot_task(key),
+            None => {
+                self.refresh_ui.source_reload.forget();
+                Task::none()
+            }
         }
     }
 
@@ -531,7 +605,7 @@ impl Cagents {
                 self.main_window_focus_changed(focused)
             }
             Action::Focused(..) => Task::none(),
-            Action::SourceReload => self.source_reload_due(),
+            Action::SourceReload => self.source_reload_fired(),
         }
     }
 
@@ -941,8 +1015,12 @@ mod tests {
             .unwrap()
             .key
             .clone();
+        let finish_read = |app: &mut Cagents, read: SourceControlRead| {
+            let request = app.refresh_ui.source_generation;
+            drop(app.source_control_loaded(key.clone(), request, Ok(read)));
+        };
         // The read showing the panel started has finished.
-        app.cancel_source_read();
+        finish_read(&mut app, SourceControlRead::Unchanged { digest: None });
         app.refresh_ui.focused = false;
         assert_eq!(app.refresh_subscription().units(), 0);
 
@@ -950,24 +1028,35 @@ mod tests {
             worktrees: BTreeSet::from([worktree]),
             ..Change::default()
         };
-        assert!(!app.source_control_watch_changed(key.project_id, &change(WorktreeId::new())));
-        assert!(!app.source_control_watch_changed(ProjectId::new(), &change(key.worktree_id)));
+        assert_eq!(
+            app.source_control_watch_change(key.project_id, &change(WorktreeId::new())),
+            None
+        );
+        assert_eq!(
+            app.source_control_watch_change(ProjectId::new(), &change(key.worktree_id)),
+            None
+        );
         let untracked = Change {
             untracked: BTreeSet::from([key.worktree_id]),
             ..Change::default()
         };
-        assert!(app.source_control_watch_changed(key.project_id, &untracked));
-        assert!(app.refresh_ui.source_reload_due.is_none());
+        assert_eq!(
+            app.source_control_watch_change(key.project_id, &untracked),
+            Some(true)
+        );
 
         let now = Instant::now();
         for offset in 0..1_000 {
-            if app.source_control_watch_changed(key.project_id, &change(key.worktree_id)) {
+            if let Some(untracked_only) =
+                app.source_control_watch_change(key.project_id, &change(key.worktree_id))
+            {
                 app.refresh_ui
-                    .owe_source_reload(now + Duration::from_micros(offset));
+                    .source_reload
+                    .owe(now + Duration::from_micros(offset), untracked_only);
             }
         }
         assert_eq!(
-            app.refresh_ui.source_reload_due,
+            app.refresh_ui.source_reload.due(),
             Some(now + SOURCE_RELOAD_DELAY)
         );
         assert_ne!(
@@ -978,14 +1067,66 @@ mod tests {
         let generation = app.refresh_ui.source_generation;
         drop(app.update(Message::RefreshUi(Action::SourceReload)));
         assert_eq!(app.refresh_ui.source_generation, generation.wrapping_add(1));
-        assert!(app.refresh_ui.source_reload_due.is_none());
+        assert_eq!(app.refresh_ui.source_reload.due(), None);
+        assert_eq!(
+            app.sidebar_model
+                .source_control
+                .as_ref()
+                .unwrap()
+                .progress_label(),
+            None,
+            "a background read keeps the rows as they are"
+        );
 
-        // A change during that read waits for it rather than cancelling it.
-        app.refresh_ui.owe_source_reload(Instant::now());
-        assert!(app.refresh_ui.source_cancel.is_some());
+        // A change during that read waits for it rather than cancelling it,
+        // and then waits the delay after it.
+        app.refresh_ui.source_reload.owe(Instant::now(), false);
         assert_eq!(app.refresh_subscription().units(), 0);
-        app.cancel_source_read();
+        let generation = app.refresh_ui.source_generation;
+        drop(app.update(Message::RefreshUi(Action::SourceReload)));
+        assert_eq!(
+            app.refresh_ui.source_generation, generation,
+            "not cancelled"
+        );
+        let finished = Instant::now();
+        finish_read(&mut app, SourceControlRead::Unchanged { digest: None });
+        assert!(app.refresh_ui.source_cancel.is_none());
+        assert!(
+            app.refresh_ui
+                .source_reload
+                .due()
+                .is_some_and(|due| due >= finished + SOURCE_RELOAD_DELAY)
+        );
         assert_ne!(app.refresh_subscription().units(), 0);
+    }
+
+    /// A path written over and over that no read finds anything new in, such
+    /// as an ignored log beside tracked files, is read less and less often;
+    /// a tracked change, or a read that finds something, restores the pace.
+    #[test]
+    fn untracked_changes_that_read_as_nothing_back_off() {
+        let mut reload = SourceReload::default();
+        let delay = |reload: &mut SourceReload, untracked_only| {
+            let now = Instant::now();
+            reload.owe(now, untracked_only);
+            let delay = reload.due().unwrap() - now;
+            reload.read_started();
+            delay
+        };
+        let mut delays = Vec::new();
+        for _ in 0..8 {
+            delays.push(delay(&mut reload, true));
+            reload.read_finished(Instant::now(), false);
+        }
+        assert_eq!(delays[0], SOURCE_RELOAD_DELAY);
+        assert_eq!(delays[1], SOURCE_RELOAD_DELAY * 2);
+        assert_eq!(delays[7], MAX_UNTRACKED_RELOAD_DELAY);
+        assert_eq!(delay(&mut reload, false), SOURCE_RELOAD_DELAY);
+        // A tracked read that finds nothing leaves the pace where it was.
+        reload.read_finished(Instant::now(), false);
+        assert_eq!(delay(&mut reload, true), MAX_UNTRACKED_RELOAD_DELAY);
+        reload.read_finished(Instant::now(), true);
+        assert_eq!(delay(&mut reload, true), SOURCE_RELOAD_DELAY);
     }
 
     #[test]

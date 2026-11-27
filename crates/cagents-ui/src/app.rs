@@ -3372,6 +3372,9 @@ fn background_poll(message: &Message) -> bool {
                     | phone_ui::Action::Probed(_)
                     | phone_ui::Action::Progressed(_)
             )
+            // Starts a background read of the Changes panel and nothing
+            // else; the read's answer is projected when it lands.
+            | Message::RefreshUi(refresh_ui::Action::SourceReload)
     )
 }
 
@@ -14801,7 +14804,7 @@ impl Cagents {
         }
         self.cancel_source_read();
         // This read begins after every change the watcher has reported.
-        self.refresh_ui.source_reload_due = None;
+        self.refresh_ui.source_reload.read_started();
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
