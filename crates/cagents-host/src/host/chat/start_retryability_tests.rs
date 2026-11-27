@@ -244,10 +244,9 @@ for line in sys.stdin:
         "{}",
         failure.message
     );
-    assert!(
-        failure.message.contains("not executable"),
-        "{}",
-        failure.message
+    assert_eq!(
+        failure.message,
+        chat::failure::provider_not_installed(&source.launch.recipe.program)
     );
     assert!(!root.join("launches").exists());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
