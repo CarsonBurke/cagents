@@ -11,10 +11,19 @@ impl Cagents {
         request: u64,
         result: Result<SourceControlRead, String>,
     ) -> Handled {
-        if request != self.refresh_ui.source_generation || !self.source_control_is_bound(&key) {
+        if request != self.refresh_ui.source_generation {
             return ControlFlow::Break(Task::none());
         }
+        // The current read is over whatever became of its binding; left set,
+        // it would hold back every later read.
         self.refresh_ui.source_cancel = None;
+        let changed = !matches!(result, Ok(SourceControlRead::Unchanged { .. }));
+        self.refresh_ui
+            .source_reload
+            .read_finished(Instant::now(), changed);
+        if !self.source_control_is_bound(&key) {
+            return ControlFlow::Break(Task::none());
+        }
         let model = match result {
             Ok(SourceControlRead::Changed(model)) => *model,
             Ok(SourceControlRead::Unchanged { digest }) => {

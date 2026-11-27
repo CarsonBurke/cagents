@@ -266,7 +266,11 @@ impl State {
             })
             .filter_map(move |(record, _)| {
                 let key = (project, record.id);
-                let interval = if self.work.get(&key) == Some(&git_watch::Interest::Active) {
+                let interval = if self
+                    .work
+                    .get(&key)
+                    .is_some_and(|interest| *interest <= git_watch::Interest::Active)
+                {
                     FALLBACK_INTERVAL
                 } else if self.work.contains_key(&key) || newly_shown(&key) {
                     SHOWN_STALE
@@ -440,10 +444,16 @@ impl State {
                 }
                 let was = entry.interest(*project, &before);
                 let now = entry.interest(*project, &self.work);
+                let inspected = |interest: Option<&git_watch::Interest>| {
+                    interest == Some(&git_watch::Interest::Inspected)
+                };
                 now.iter().any(|(worktree, interest)| {
                     interest.watches_files()
                         != was.get(worktree).is_some_and(|was| was.watches_files())
                         || (interest.watches_files() && entry.unwatched.contains(worktree))
+                        // The watcher reports untracked paths from its plan,
+                        // which only a new plan changes.
+                        || inspected(Some(interest)) != inspected(was.get(worktree))
                 })
             })
             .collect::<Vec<_>>();
@@ -685,6 +695,17 @@ impl Cagents {
         if let Some(selected) = self.sidebar_state.selected_checkout() {
             work.insert(selected, git_watch::Interest::Active);
         }
+        // A Changes panel listing untracked files has its checkout report
+        // paths the index does not track, too.
+        if self.workspace_view_shown().is_some()
+            && self.source_control_reads_untracked()
+            && let Some(source) = self.sidebar_model.source_control.as_ref()
+        {
+            work.insert(
+                (source.key.project_id, source.key.worktree_id),
+                git_watch::Interest::Inspected,
+            );
+        }
         self.refresh_ui.git.set_work(work);
         self.start_git_reads()
     }
@@ -790,6 +811,58 @@ impl Cagents {
         self.refresh_ui.git.note_shown(shown, Instant::now());
     }
 
+    /// Takes in what the watcher saw, and says whether any of it can change
+    /// what the workspace projection derives. Untracked paths alone change
+    /// nothing there: they only owe the Changes panel a read, which the
+    /// projection does not wait on, so ignored output churning beside
+    /// tracked files does not rebuild the workspace on every batch.
+    pub(super) fn git_watch_changed(&mut self) -> bool {
+        let changes = self
+            .refresh_ui
+            .git
+            .watch
+            .as_ref()
+            .map(|watch| watch.monitor.drain())
+            .unwrap_or_default();
+        self.apply_git_changes(changes)
+    }
+
+    /// [`Self::git_watch_changed`] for changes already taken from the
+    /// watcher.
+    pub(super) fn apply_git_changes(
+        &mut self,
+        changes: impl IntoIterator<Item = (ProjectId, git_watch::Change)>,
+    ) -> bool {
+        // A wake with nothing drained keeps the projection it always had;
+        // only a batch known to hold untracked paths alone skips it.
+        let mut untracked_batch = None;
+        for (project, change) in changes {
+            untracked_batch = Some(untracked_batch.unwrap_or(true) && change.untracked_only());
+            // Unwatched files alone are routine with many worktrees;
+            // only metadata the watcher cannot see is worth saying.
+            if let Some(error) = &change.error
+                && change.unwatched.is_none()
+                && self
+                    .refresh_ui
+                    .git
+                    .entries
+                    .get(&project)
+                    .is_some_and(|entry| entry.fallback.as_ref() != Some(error))
+            {
+                self.status = Some(TransientNotice::warning(format!(
+                    "Local Git watching unavailable; checking once a minute: {error}"
+                )));
+            }
+            if let Some(untracked_only) = self.source_control_watch_change(project, &change) {
+                self.refresh_ui
+                    .source_reload
+                    .owe(Instant::now(), untracked_only);
+            }
+            self.refresh_ui.git.changed(project, change);
+        }
+        untracked_batch != Some(true)
+    }
+
     pub(super) fn update_git(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::Remote {
@@ -864,31 +937,7 @@ impl Cagents {
                 ]);
             }
             Action::Changed => {
-                let changes = self
-                    .refresh_ui
-                    .git
-                    .watch
-                    .as_ref()
-                    .map(|watch| watch.monitor.drain())
-                    .unwrap_or_default();
-                for (project, change) in changes {
-                    // Unwatched files alone are routine with many worktrees;
-                    // only metadata the watcher cannot see is worth saying.
-                    if let Some(error) = &change.error
-                        && change.unwatched.is_none()
-                        && self
-                            .refresh_ui
-                            .git
-                            .entries
-                            .get(&project)
-                            .is_some_and(|entry| entry.fallback.as_ref() != Some(error))
-                    {
-                        self.status = Some(TransientNotice::warning(format!(
-                            "Local Git watching unavailable; checking once a minute: {error}"
-                        )));
-                    }
-                    self.refresh_ui.git.changed(project, change);
-                }
+                self.git_watch_changed();
             }
             Action::Read {
                 project,
@@ -2766,7 +2815,7 @@ mod tests {
             );
             state.queue.contains(&project)
         };
-        use git_watch::Interest::{Active, Shown};
+        use git_watch::Interest::{Active, Inspected, Shown};
         assert!(
             replans(&mut state, &[(worked, Active)]),
             "it gains file watches"
@@ -2774,6 +2823,15 @@ mod tests {
         assert!(
             !replans(&mut state, &[(worked, Shown)]),
             "out of sight it keeps them, and the budget covers everything"
+        );
+        // Untracked paths are reported from the watcher's plan.
+        assert!(
+            replans(&mut state, &[(worked, Inspected)]),
+            "the Changes panel's checkout reports untracked paths"
+        );
+        assert!(
+            replans(&mut state, &[(worked, Shown)]),
+            "and stops when the panel leaves it"
         );
         // The budget falls short of the other checkout someone works in.
         state.entries.get_mut(&project).unwrap().unwatched = BTreeSet::from([other]);

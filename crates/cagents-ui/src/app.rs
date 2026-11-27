@@ -3376,6 +3376,9 @@ fn background_poll(message: &Message) -> bool {
                     | phone_ui::Action::Probed(_)
                     | phone_ui::Action::Progressed(_)
             )
+            // Starts a background read of the Changes panel and nothing
+            // else; the read's answer is projected when it lands.
+            | Message::RefreshUi(refresh_ui::Action::SourceReload)
     )
 }
 
@@ -14819,6 +14822,8 @@ impl Cagents {
             return Task::none();
         }
         self.cancel_source_read();
+        // This read begins after every change the watcher has reported.
+        self.refresh_ui.source_reload.read_started();
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
@@ -20607,6 +20612,13 @@ impl Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::WorktreesUi(action) => self.update_worktrees_ui(action),
+            Message::GitUi(git_ui::Action::Changed) => {
+                // Untracked paths alone only owe the Changes panel a read.
+                if !self.git_watch_changed() && !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
+                self.start_git_reads()
+            }
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
