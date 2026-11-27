@@ -16,7 +16,9 @@
 # nested-agents-scene/, frame shapes recorded from Claude Code 2.1.325:
 #
 #   launch  the lead starts a background soak test and eight background
-#           agents, one with a long name. Review starts a second opinion,
+#           agents, one with a long name, all of Claude Code's default
+#           general-purpose type but Trace, an Explore agent, whose row
+#           names its type. Review starts a second opinion,
 #           which starts a spot check; Audit forks a review skill; Trace
 #           starts a log reader, which starts a grep. Claude Code forwards
 #           each helper's conversation under the call that started it.
