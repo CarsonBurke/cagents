@@ -293,7 +293,10 @@ fn a_refused_new_terminal_closes_when_asked() {
 #[test]
 fn a_new_terminal_that_fails_to_start_says_it_did_not_open_and_why() {
     let mut window = window();
+    drain(&window.rx);
     let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    admit_insert(&mut window, card);
     let CardKind::Terminal(session) = &window.app.card_state(card).unwrap().kind else {
         unreachable!()
     };
@@ -442,4 +445,50 @@ fn an_admitted_new_terminal_that_failed_to_start_closes_when_asked() {
         })
         .count();
     assert_eq!(removals, 1);
+}
+
+/// A peer can complete the start between this window's Close and its
+/// commit. The pane then has a source, so nothing removes it by identity.
+#[test]
+fn a_failed_new_terminal_a_peer_started_is_not_removed_by_identity() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    admit_insert(&mut window, card);
+    let CardKind::Terminal(session) = &window.app.card_state(card).unwrap().kind else {
+        unreachable!()
+    };
+    let terminal = session.id;
+    drop(window.app.update(Message::TerminalStarted {
+        card,
+        terminal,
+        result: Err("terminal worker failed to start".into()),
+    }));
+    drain(&window.rx);
+
+    drop(window.app.update(Message::CloseCard(card)));
+    let scope = window.scope.clone();
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap();
+    view.revision += 1;
+    view.panes
+        .iter_mut()
+        .find(|pane| pane.id == card)
+        .unwrap()
+        .pending_terminal_start = false;
+    window.app.workspace_model = model;
+    drop(window.app.update(Message::CommitClose(card)));
+    drop(window.app.reconcile_shared_views());
+    assert!(
+        std::iter::from_fn(|| window.rx.try_recv().ok()).all(|edit| !matches!(
+            edit,
+            ModelEdit::ChangeView { change: Change::Remove { id }, .. } if id == card
+        ))
+    );
 }

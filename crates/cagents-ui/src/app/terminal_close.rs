@@ -203,6 +203,15 @@ impl Cagents {
     /// and can be closed again.
     pub(super) fn abandon_removal(&mut self, card: CardId) {
         self.shared_views.removals.remove(&card);
+        // A failed new terminal's Close that didn't go through removes
+        // nothing later; a fenced pane's stays until its view drops it.
+        if !self.shared_views.quarantined.contains(&card)
+            && self
+                .card_state(card)
+                .is_some_and(|card| matches!(card.kind, CardKind::Terminal(_)))
+        {
+            self.shared_views.fenced_closes.remove(&card);
+        }
         if self
             .workspace
             .pending_close()

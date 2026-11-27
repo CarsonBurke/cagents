@@ -1102,6 +1102,12 @@ impl Cagents {
             .refused_creations
             .insert(card, reason.to_owned());
         self.fail_terminal_creation(card, reason);
+        // Said where it can be seen from anywhere too, as a failed start is.
+        self.status = Some(
+            TransientNotice::error(super::terminal_failure::creation_title())
+                .with_details(reason.to_owned())
+                .with_key(NoticeKey::TerminalStart(card)),
+        );
     }
 
     /// Asks the registry again for a new terminal it refused. The pane waits
@@ -2783,6 +2789,15 @@ impl Cagents {
                     if !self.shared_views.fenced_closes.contains(&pane.id) {
                         continue;
                     }
+                    // A new terminal's Close removes it by identity only while
+                    // its start never ran. Once started, by a peer say, it
+                    // has a source, and an identity removal would bypass it.
+                    if matches!(pane.kind, CardKind::Terminal(_))
+                        && !pane.pending_terminal_start
+                        && !self.shared_views.quarantined.contains(&pane.id)
+                    {
+                        continue;
+                    }
                     held.insert(pane.id);
                     if self.shared_views.initialized.contains(&view.scope)
                         && self
@@ -4365,7 +4380,8 @@ impl Cagents {
             // A refused new terminal says so in its pane until it is
             // retried or closed; no view was ever asked to list it.
             if self.awaits_first_publication(id, view)
-                || self.shared_views.refused_creations.contains_key(&id)
+                || (self.shared_views.refused_creations.contains_key(&id)
+                    && !view.retired.contains(&id))
             {
                 continue;
             }
