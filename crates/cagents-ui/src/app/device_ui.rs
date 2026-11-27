@@ -252,6 +252,9 @@ pub enum Action {
     WorktreeBranch(String),
     CommitMessage(String),
     OpenProject,
+    /// Opens the dialog as a chooser for a project folder on the device,
+    /// which is what Open repository means in a device window.
+    ChooseProject,
     Loaded {
         generation: u64,
         result: Result<Reply, String>,
@@ -315,6 +318,8 @@ pub(super) struct State {
     notice: Option<String>,
     pub devices: Vec<String>,
     device_hosts: BTreeMap<String, String>,
+    /// The dialog is choosing a project folder rather than browsing.
+    choosing: bool,
 }
 struct ImageRequest {
     path: PathBuf,
@@ -361,6 +366,7 @@ impl Default for State {
                 .into_iter()
                 .map(|device| (device.name, device.host))
                 .collect(),
+            choosing: false,
         }
     }
 }
@@ -673,6 +679,7 @@ impl Cagents {
                 | Action::Visit(_)
                 | Action::Read(_)
                 | Action::OpenProject
+                | Action::ChooseProject
         ) && self.device_ui.dirty()
         {
             self.device_ui.notice = Some(
@@ -821,6 +828,7 @@ impl Cagents {
                     return self.open_device_image(path);
                 }
                 self.device_ui.panel = Panel::Files;
+                self.device_ui.choosing = false;
                 self.device_ui.linked_file = Some(file.into());
                 self.device_ui.linked_fragment = fragment;
                 self.device_ui.path = directory.display().to_string();
@@ -841,8 +849,17 @@ impl Cagents {
                 self.device_ui.path = path.display().to_string();
                 return self.update_device(Action::Open);
             }
+            Action::ChooseProject => {
+                self.device_ui.panel = Panel::Files;
+                self.device_ui.file = None;
+                let task = self.update_device(Action::Open);
+                // Set after Open, which starts every other use as browsing.
+                self.device_ui.choosing = self.device_ui.open;
+                return task;
+            }
             Action::Open => {
                 self.device_ui.open = true;
+                self.device_ui.choosing = false;
                 self.device_ui.configure = false;
                 self.device_ui.notice = None;
                 if self.device_ui.path.is_empty() {
@@ -884,6 +901,7 @@ impl Cagents {
             }
             Action::Close => {
                 let was_open = self.device_ui.open;
+                self.device_ui.choosing = false;
                 if let Some(image) = self.device_ui.image.take() {
                     image.task.abort();
                     self.device_ui.generation = self.device_ui.generation.wrapping_add(1);
@@ -1039,6 +1057,7 @@ impl Cagents {
                         });
                     }
                     Ok(Reply::Project { path, key, kind }) => {
+                        let chose = std::mem::take(&mut self.device_ui.choosing);
                         self.device_ui.path = path.display().to_string();
                         self.device_ui.notice =
                             Some(format!("Project opened on device: {}", path.display()));
@@ -1061,6 +1080,13 @@ impl Cagents {
                             kind,
                         };
                         self.publish_model_edit(edit);
+                        if chose {
+                            // Done, as a local folder chooser is: the project
+                            // is open behind the dialog.
+                            self.device_ui.open = false;
+                            self.device_ui.notice = None;
+                            return Task::none();
+                        }
                         return self.update_device(Action::Browse);
                     }
                     Ok(_) => self.device_ui.notice = Some("Unexpected device response".into()),
@@ -1334,6 +1360,9 @@ impl Cagents {
                 dialog_ui::MAX_HEIGHT,
             );
         }
+        if state.choosing && !state.configure {
+            return self.project_chooser_layout(size);
+        }
         let narrow = size.width < 900.0;
         let action = |action| Message::Device(action);
         let button = |label: &str, value: Action| {
@@ -1441,7 +1470,7 @@ impl Cagents {
                 icon(Icon::Refresh, "Browse directory", Action::Browse, true),
                 icon(
                     Icon::OpenFolder,
-                    "Open as workspace",
+                    "Open this folder as a project",
                     Action::OpenProject,
                     true,
                 ),
@@ -1721,6 +1750,171 @@ impl Cagents {
             1100.0,
             size.height.min(820.0),
             Length::Fill,
+        )
+    }
+}
+
+impl Cagents {
+    /// Open repository in a device window: a folder chooser on the device,
+    /// with one labelled way to finish.
+    fn project_chooser_layout(&self, size: iced::Size) -> Element<'_, Message> {
+        let state = &self.device_ui;
+        let device = crate::device::selected()
+            .map(|device| device.name.as_str())
+            .unwrap_or("this device");
+        let enabled = !state.busy;
+        let visit = |path: PathBuf| enabled.then_some(Message::Device(Action::Visit(path)));
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::row::with_children(vec![
+                design::heading(format!("Open a project on {device}"))
+                    .width(Length::Fill)
+                    .into(),
+                crate::ui_controls::icon_button(Icon::Close, "Cancel")
+                    .on_press(Message::Device(Action::Close))
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(space::M)
+            .into(),
+            design::caption(format!(
+                "Go to the project's folder on {device}, then choose Open project."
+            ))
+            .into(),
+            widget::row::with_children(vec![
+                crate::ui_controls::icon_button(Icon::ChevronUp, "Parent folder")
+                    .on_press_maybe(
+                        state
+                            .directory
+                            .parent()
+                            .and_then(|parent| visit(parent.to_owned())),
+                    )
+                    .into(),
+                crate::ui_controls::field::text("Folder", &state.path)
+                    .on_input(|value| Message::Device(Action::Path(value)))
+                    .on_submit(|_| Message::Device(Action::Browse))
+                    .width(Length::Fill)
+                    .into(),
+                crate::ui_controls::icon_button(Icon::Refresh, "Go to folder")
+                    .on_press_maybe(enabled.then_some(Message::Device(Action::Browse)))
+                    .into(),
+            ])
+            .align_y(Alignment::Center)
+            .spacing(space::XS)
+            .into(),
+        ];
+        // Where the device's other projects live is where another one most
+        // likely is, after the home folder.
+        let mut places: Vec<PathBuf> = crate::device::home().into_iter().cloned().collect();
+        for project in &self.sidebar_model.projects {
+            if let Some(parent) = worktree_ui::project_main_checkout(project).parent()
+                && !places.iter().any(|place| place == parent)
+            {
+                places.push(parent.to_owned());
+            }
+        }
+        if !places.is_empty() {
+            rows.push(
+                widget::row::with_children(
+                    places
+                        .into_iter()
+                        .take(4)
+                        .map(|place| {
+                            let label = place
+                                .file_name()
+                                .map(|name| name.to_string_lossy().into_owned())
+                                .unwrap_or_else(|| place.display().to_string());
+                            crate::interaction::tooltip(
+                                crate::ui_controls::button::secondary(label)
+                                    .icon(Icon::Folder)
+                                    .on_press_maybe(visit(place.clone())),
+                                place.display().to_string(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+                .spacing(space::S)
+                .into(),
+            );
+        }
+        if let Some(notice) = &state.notice {
+            rows.push(design::caption(notice).into());
+        }
+        if state.busy {
+            rows.push(design::caption("Loading…").into());
+        }
+        // Only folders can be projects; files would only be noise here.
+        let folders: Vec<Element<'_, Message>> = state
+            .entries
+            .iter()
+            .filter(|entry| entry.directory)
+            .map(|entry| {
+                widget::button::custom(
+                    widget::row::with_children(vec![
+                        widget::icon(Icon::Folder.handle())
+                            .size(design::ROW_ICON_SIZE)
+                            .into(),
+                        crate::ui_controls::fade_text(&entry.name)
+                            .width(Length::Fill)
+                            .into(),
+                    ])
+                    .spacing(space::S)
+                    .align_y(Alignment::Center),
+                )
+                .name(entry.name.clone())
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([6.0, space::S])
+                .width(Length::Fill)
+                .on_press_maybe(
+                    (!entry.symlink)
+                        .then(|| state.directory.join(&entry.name))
+                        .and_then(visit),
+                )
+                .into()
+            })
+            .collect();
+        let list: Element<'_, Message> = if folders.is_empty() && !state.busy {
+            widget::container(design::caption("No folders here"))
+                .center(Length::Fill)
+                .height(120)
+                .into()
+        } else {
+            crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::column::with_children(folders)
+                        .spacing(space::XXS)
+                        .padding(design::with_vertical_rail(Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height((size.height - 360.0).clamp(160.0, 420.0)),
+                design::dialog_base,
+            )
+        };
+        rows.push(list);
+        // Open project opens what the folder field names, typed or browsed.
+        let folder = Path::new(state.path.trim())
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned());
+        let open = crate::ui_controls::button::primary(match &folder {
+            Some(name) => format!("Open {name}"),
+            None => "Open project".into(),
+        })
+        .on_press_maybe(
+            (enabled && !state.path.trim().is_empty())
+                .then_some(Message::Device(Action::OpenProject)),
+        );
+        dialog_ui::scrolling_surface_with_actions(
+            widget::column::with_children(rows).spacing(space::M),
+            widget::row::with_children(vec![
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press(Message::Device(Action::Close))
+                    .into(),
+                open.into(),
+            ])
+            .spacing(space::S),
+            640.0,
+            dialog_ui::MAX_HEIGHT,
         )
     }
 }
@@ -2884,6 +3078,7 @@ mod tests {
             Action::Visit("/elsewhere".into()),
             Action::Read("second".into()),
             Action::OpenProject,
+            Action::ChooseProject,
         ] {
             let mut app = loaded_file();
             let generation = app.device_ui.generation;
@@ -3052,5 +3247,113 @@ mod tests {
                 Some(resume_ui::unavailable_message().as_str())
             );
         }
+    }
+
+    #[test]
+    fn choosing_a_project_on_a_device_closes_once_the_project_opens() {
+        const CHILD: &str = "CAGENTS_TEST_REMOTE_CHOOSE_PROJECT";
+        const TEST: &str =
+            "app::device_ui::tests::choosing_a_project_on_a_device_closes_once_the_project_opens";
+        if std::env::var_os(CHILD).is_none() {
+            let root = tempfile::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(CHILD, "1")
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        crate::device::save(crate::device::Device {
+            name: "chooser-test".into(),
+            host: "build-host".into(),
+            executable: "cagents".into(),
+        })
+        .unwrap();
+        crate::device::select(Some("chooser-test")).unwrap();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        // Open repository is a project chooser on the device.
+        drop(app.update(Message::OpenRepository));
+        assert!(app.device_ui.open);
+        assert!(app.device_ui.choosing);
+        assert_eq!(app.device_ui.panel, Panel::Files);
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::Loaded {
+            generation,
+            result: Ok(Reply::Directory {
+                path: "/srv/device-only".into(),
+                entries: vec![
+                    crate::device_service::Entry {
+                        name: "demo".into(),
+                        directory: true,
+                        symlink: false,
+                    },
+                    crate::device_service::Entry {
+                        name: "notes.txt".into(),
+                        directory: false,
+                        symlink: false,
+                    },
+                ],
+            }),
+        }));
+        assert!(app.device_ui.choosing, "browsing keeps the chooser");
+        drop(app.update_device(Action::Visit("/srv/device-only/demo".into())));
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::Loaded {
+            generation,
+            result: Ok(Reply::Directory {
+                path: "/srv/device-only/demo".into(),
+                entries: Vec::new(),
+            }),
+        }));
+        // A refusal keeps the chooser open and says why.
+        drop(app.update_device(Action::OpenProject));
+        assert!(matches!(
+            &app.device_ui.pending,
+            Some(Operation::Discover { path }) if path == Path::new("/srv/device-only/demo")
+        ));
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::Loaded {
+            generation,
+            result: Err("Not a project folder".into()),
+        }));
+        assert!(app.device_ui.open && app.device_ui.choosing);
+        assert_eq!(
+            app.device_ui.notice.as_deref(),
+            Some("Not a project folder")
+        );
+        // Success opens the project behind it and closes the chooser.
+        drop(app.update_device(Action::OpenProject));
+        let generation = app.device_ui.generation;
+        drop(app.update_device(Action::Loaded {
+            generation,
+            result: Ok(Reply::Project {
+                path: "/srv/device-only/demo".into(),
+                key: "/srv/device-only/demo/.git".into(),
+                kind: ProjectKind::Git,
+            }),
+        }));
+        assert!(!app.device_ui.open);
+        assert!(!app.device_ui.choosing);
+        assert!(!app.device_ui.busy);
+        assert_eq!(
+            app.active_workspace.as_deref(),
+            Some(Path::new("/srv/device-only/demo"))
+        );
+        // Browsing the device afterwards is the ordinary file browser.
+        drop(app.update_device(Action::OpenIn {
+            path: Some("/srv/device-only/demo".into()),
+            panel: Panel::Files,
+        }));
+        assert!(app.device_ui.open);
+        assert!(!app.device_ui.choosing);
     }
 }
