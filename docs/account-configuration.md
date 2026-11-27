@@ -93,6 +93,8 @@ the account again and shows the reported state. It never automatically retries
 a consume request. Keep the reported key for any deliberate retry of that same
 attempt; reuse both `--reset-id ID` and `--idempotency-key KEY` from the printed
 recovery command rather than creating a new operation.
+If the provider no longer lists that grant, the person can recover it from a
+system terminal using those same values.
 
 Claude's recurring session reset has no server idempotency contract; cagents
 cannot make that API idempotent. Its local request key only prevents submitting

@@ -15,13 +15,14 @@ pub(super) fn execute(
 ) -> Result<CommandOutput, AppError> {
     let interactive = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
     require_confirmation(yes, interactive)?;
+    let authority = Authority::from_environment();
     let recovery = idempotency_key.is_some();
     let key = idempotency_key.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     validate_key(&key)?;
     let mut client = control_daemon_client()?;
     let report = super::read_report(
         &mut client,
-        Authority::from_environment(),
+        authority.clone(),
         Query {
             provider: None,
             account: Some(account.clone()),
@@ -51,6 +52,7 @@ pub(super) fn execute(
     let now = i64::try_from(report.sampled_at / 1000).unwrap_or(i64::MAX);
     let selection =
         prepare_selection(resets, scope.as_deref(), reset_id.as_deref(), recovery, now)?;
+    require_verified_hosted_scope(&selection, authority.token().is_some())?;
     let name = account_name(info);
     let prompt = confirmation(&account, &name, &selection, recovery);
     if !yes {
@@ -83,9 +85,7 @@ pub(super) fn execute(
     // Print recovery coordinates before sending: a dropped connection must
     // not leave the caller with no way to reuse the original request key.
     eprintln!("{prompt}\nIf the result is unconfirmed, refresh usage before retrying:\n{retry}");
-    client
-        .authenticate(Authority::from_environment())
-        .map_err(protocol_error)?;
+    client.authenticate(authority).map_err(protocol_error)?;
     let outcome = submit(&mut client, request.clone()).map_err(|error| {
         AppError::new("account_reset_unconfirmed", format!(
             "The reset result is unconfirmed: {}. Refresh account usage before retrying. Reuse the same reset and key: {retry}",
@@ -116,6 +116,16 @@ fn require_confirmation(yes: bool, interactive: bool) -> Result<(), AppError> {
         "confirmation",
         "Using a reset requires --yes or an interactive confirmation",
     ))
+}
+
+fn require_verified_hosted_scope(selection: &Selection, hosted: bool) -> Result<(), AppError> {
+    if hosted && selection.reset.is_none() {
+        return Err(AppError::new(
+            "account_reset",
+            "The original reset scope is no longer listed. Ask the person to recover this attempt in a system terminal using the original reset ID, scope and idempotency key",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_key(key: &str) -> Result<(), AppError> {
@@ -653,6 +663,10 @@ mod tests {
             prepare_selection(&resets, Some("Fable"), Some("original"), true, 100).unwrap();
         assert_eq!(recovered.id, "original");
         assert!(recovered.reset.is_none());
+        assert!(require_verified_hosted_scope(&recovered, true).is_err());
+        assert!(require_verified_hosted_scope(&recovered, false).is_ok());
+        let verified = prepare_selection(&resets, Some("Fable"), Some("fable"), true, 100).unwrap();
+        assert!(require_verified_hosted_scope(&verified, true).is_ok());
     }
 
     #[test]
