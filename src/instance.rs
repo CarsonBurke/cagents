@@ -2422,15 +2422,30 @@ impl UiUpdateGuard {
         self.prepared.clear();
         self.release_launch_fence()?;
         self.closed.clear();
-        let mut errors = Vec::new();
         let mut notes = Vec::new();
+        let mut failures = Vec::new();
         for slot in slots {
             match launch_window_at(executable, false, Some(slot), None, self.restore_policy) {
-                Ok(Some(note)) => notes.push((slot.as_str(), note)),
+                Ok(Some(note)) => notes.push((slot.clone(), note)),
                 Ok(None) => {}
-                Err(error) => errors.push((slot.as_str(), error.to_string())),
+                Err(error) => failures.push((slot.clone(), error.to_string())),
             }
         }
+        let devices = || crate::device::list().unwrap_or_default();
+        let (errors, device_notes) = split_relaunch_failures(failures, |slot| {
+            window_device_identity(&self.runtime, slot, &devices())
+                .ok()
+                .flatten()
+        });
+        notes.extend(device_notes);
+        let errors: Vec<_> = errors
+            .iter()
+            .map(|(slot, error)| (slot.as_str(), error.clone()))
+            .collect();
+        let notes: Vec<_> = notes
+            .iter()
+            .map(|(window, note)| (window.as_str(), note.clone()))
+            .collect();
         let notes = (!notes.is_empty()).then(|| relaunch_failure(slots.len(), &notes));
         if errors.is_empty() {
             Ok(notes)
@@ -2485,6 +2500,26 @@ fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::
             ));
         }
     }
+}
+
+/// Splits the windows that did not reopen into errors, which say this build
+/// cannot open a window, and notes. A device window that cannot reach its
+/// device, or must wait for the device's update, says so on its own screen;
+/// that is no reason to take the update back. `device_of` names the device a
+/// window shows.
+fn split_relaunch_failures(
+    failures: Vec<(String, String)>,
+    device_of: impl Fn(&str) -> Option<String>,
+) -> (Vec<(String, String)>, Vec<(String, String)>) {
+    let mut errors = Vec::new();
+    let mut notes = Vec::new();
+    for (slot, error) in failures {
+        match device_of(&slot) {
+            Some(device) => notes.push((format!("the window on {device}"), error)),
+            None => errors.push((slot, error)),
+        }
+    }
+    (errors, notes)
 }
 
 /// What the update reports when windows did not reopen cleanly. Someone reads
@@ -5050,6 +5085,29 @@ mod tests {
         // It remains open, but must no longer hold the abandoned shared lock.
         assert!(inherited.is_some());
         assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn a_device_window_that_cannot_reopen_does_not_take_the_update_back() {
+        let device_slot = crate::device::scoped_window_slot("build-host", "primary");
+        let (errors, notes) = split_relaunch_failures(
+            vec![
+                (
+                    device_slot.clone(),
+                    "build-host runs an older cagents".into(),
+                ),
+                ("window-2".into(), "no display".into()),
+            ],
+            |slot| (slot == device_slot).then(|| "build-host".to_owned()),
+        );
+        assert_eq!(errors, [("window-2".to_owned(), "no display".to_owned())]);
+        assert_eq!(
+            notes,
+            [(
+                "the window on build-host".to_owned(),
+                "build-host runs an older cagents".to_owned()
+            )]
+        );
     }
 
     #[test]
