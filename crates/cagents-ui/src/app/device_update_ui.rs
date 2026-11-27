@@ -59,7 +59,8 @@ struct Run {
     status: RunStatus,
 }
 
-enum RunStatus {
+#[derive(Debug)]
+pub(super) enum RunStatus {
     /// The update's latest progress line.
     Running(String),
     Failed {
@@ -87,16 +88,16 @@ pub enum Action {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Success {
     /// Whether the device already had a compatible cagents.
-    unchanged: bool,
+    pub(super) unchanged: bool,
     /// Something the person should act on, such as an executable SSH
     /// commands cannot find.
-    note: Option<String>,
+    pub(super) note: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
-    error: String,
-    report: Option<String>,
+    pub(super) error: String,
+    pub(super) report: Option<String>,
 }
 
 /// What the strip is about: the device, what it needs, and whether a failed
@@ -292,127 +293,145 @@ impl Cagents {
     pub(super) fn device_update_banner(&self) -> Option<Element<'_, Message>> {
         let subject = self.device_update_subject()?;
         let device = subject.device;
-        let ours = crate::terminal_ipc::PROTOCOL_VERSION;
-        let run = self
+        let status = self
             .device_update_ui
             .run
             .as_ref()
-            .filter(|run| run.device == device);
-        let installing = subject.need == Need::Install;
-        let sendable = subject.need.sendable() && subject.blocked.is_none();
-        let running = matches!(run.map(|run| &run.status), Some(RunStatus::Running(_)));
+            .filter(|run| run.device == device)
+            .map(|run| &run.status);
         let enabled = !self.modal_is_open();
-        let (heading, detail): (String, Option<String>) = match (run.map(|run| &run.status), &subject.need) {
-            (Some(RunStatus::Running(line)), _) => (
-                if installing { format!("Installing cagents on {device}") } else { format!("Updating {device}") },
-                Some(line.clone()),
-            ),
-            (Some(RunStatus::Failed { error, .. }), _) => (
-                if installing { format!("Could not install cagents on {device}") } else { format!("Could not update {device}") },
-                Some(error.clone()),
-            ),
-            (None, Need::Install) => (
-                format!("{device} doesn't have cagents yet"),
-                Some("Install this computer's version there over SSH to connect.".to_owned()),
-            ),
-            (None, Need::Update(actual)) => (
-                match actual {
-                    Some(actual) => format!(
-                        "{device} runs an older cagents (protocol {actual}) than this computer (protocol {ours})"
-                    ),
-                    None => format!("{device} runs an older cagents than this computer"),
-                },
-                Some(
-                    "Update it to this computer's version to connect. Its terminals keep running, and conversations there finish their turn first."
-                        .to_owned(),
-                ),
-            ),
-            (None, Need::Newer(actual)) => (
-                format!(
-                    "{device} runs a newer cagents (protocol {actual}) than this computer (protocol {ours})"
-                ),
-                Some("Update cagents on this computer to connect to it.".to_owned()),
-            ),
-        };
-        // What stops this computer sending its cagents replaces the advice to.
-        let detail = match (run, subject.blocked) {
-            (None, Some(blocked)) if subject.need.sendable() => Some(blocked.to_owned()),
-            _ => detail,
-        };
-        let mut text = vec![design::heading(heading).into()];
-        if let Some(detail) = detail {
-            text.push(design::caption(detail).into());
-        }
-        if let Some(Run {
-            status:
-                RunStatus::Failed {
-                    report: Some(report),
-                    ..
-                },
-            ..
-        }) = run
-        {
-            text.push(design::caption(report.clone()).into());
-        }
-        let mut row = widget::row::with_children(vec![
-            widget::column::with_children(text)
-                .spacing(space::XXS)
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(space::S)
-        .align_y(Alignment::Center);
-        if sendable {
-            let offered = if installing {
-                format!("Install on {device}")
-            } else {
-                format!("Update {device}")
-            };
-            let busy = if installing {
-                "Installing…"
-            } else {
-                "Updating…"
-            };
-            let failed = matches!(run.map(|run| &run.status), Some(RunStatus::Failed { .. }));
-            row = row.push(
-                crate::ui_controls::button::primary(offered)
-                    .instead("Try again", failed)
-                    .instead(busy, running)
-                    .name(if installing {
-                        format!("Install this computer's cagents on {device}")
-                    } else {
-                        format!("Update {device} to this computer's cagents")
-                    })
-                    .on_press_maybe(
-                        (enabled && self.device_update_running().is_none())
-                            .then(|| Message::DeviceUpdate(Action::Start(device.to_owned()))),
-                    ),
-            );
-        }
-        // Nothing to dismiss while the update runs: it cannot be stopped
-        // from here.
-        if subject.offer && !running {
-            row = row.push(crate::interaction::tooltip(
-                widget::button::icon(Icon::Close)
-                    .id(widget::Id::new("device-update.dismiss"))
-                    .name(format!("Dismiss the offer for {device}"))
-                    .width(ICON_CONTROL_SIZE)
-                    .height(ICON_CONTROL_SIZE)
-                    .on_press_maybe(enabled.then_some(Message::DeviceUpdate(Action::Dismiss))),
-                "Dismiss",
-            ));
-        }
-        Some(
-            widget::container(row)
-                .padding(space::M)
-                .width(Length::Fill)
-                .class(cosmic::theme::Container::Dialog(false))
-                .into(),
-        )
+        let running = matches!(status, Some(RunStatus::Running(_)));
+        Some(strip(
+            device,
+            &subject.need,
+            subject.blocked,
+            status,
+            (enabled && self.device_update_running().is_none())
+                .then(|| Message::DeviceUpdate(Action::Start(device.to_owned()))),
+            (subject.offer && !running)
+                .then_some(enabled.then_some(Message::DeviceUpdate(Action::Dismiss))),
+        ))
     }
 }
 
-enum Event {
+/// Says which side is older, or that `device` has no cagents, and offers to
+/// send this computer's there: `start` begins it, and `dismiss`, when given,
+/// adds a close button (enabled when it holds a message). `status` follows
+/// the update once it has started. A window's strip and the screen a device
+/// window shows when it cannot reopen both show this.
+pub(super) fn strip<'a, M: Clone + 'static>(
+    device: &str,
+    need: &Need,
+    blocked: Option<&str>,
+    status: Option<&RunStatus>,
+    start: Option<M>,
+    dismiss: Option<Option<M>>,
+) -> Element<'a, M> {
+    let ours = crate::terminal_ipc::PROTOCOL_VERSION;
+    let installing = *need == Need::Install;
+    let sendable = need.sendable() && blocked.is_none();
+    let running = matches!(status, Some(RunStatus::Running(_)));
+    let (heading, detail): (String, Option<String>) = match (status, need) {
+        (Some(RunStatus::Running(line)), _) => (
+            if installing { format!("Installing cagents on {device}") } else { format!("Updating {device}") },
+            Some(line.clone()),
+        ),
+        (Some(RunStatus::Failed { error, .. }), _) => (
+            if installing { format!("Could not install cagents on {device}") } else { format!("Could not update {device}") },
+            Some(error.clone()),
+        ),
+        (None, Need::Install) => (
+            format!("{device} doesn't have cagents yet"),
+            Some("Install this computer's version there over SSH to connect.".to_owned()),
+        ),
+        (None, Need::Update(actual)) => (
+            match actual {
+                Some(actual) => format!(
+                    "{device} runs an older cagents (protocol {actual}) than this computer (protocol {ours})"
+                ),
+                None => format!("{device} runs an older cagents than this computer"),
+            },
+            Some(
+                "Update it to this computer's version to connect. Its terminals keep running, and conversations there finish their turn first."
+                    .to_owned(),
+            ),
+        ),
+        (None, Need::Newer(actual)) => (
+            format!(
+                "{device} runs a newer cagents (protocol {actual}) than this computer (protocol {ours})"
+            ),
+            Some("Update cagents on this computer to connect to it.".to_owned()),
+        ),
+    };
+    // What stops this computer sending its cagents replaces the advice to.
+    let detail = match (status, blocked) {
+        (None, Some(blocked)) if need.sendable() => Some(blocked.to_owned()),
+        _ => detail,
+    };
+    let mut text = vec![design::heading(heading).into()];
+    if let Some(detail) = detail {
+        text.push(design::caption(detail).into());
+    }
+    if let Some(RunStatus::Failed {
+        report: Some(report),
+        ..
+    }) = status
+    {
+        text.push(design::caption(report.clone()).into());
+    }
+    let mut row = widget::row::with_children(vec![
+        widget::column::with_children(text)
+            .spacing(space::XXS)
+            .width(Length::Fill)
+            .into(),
+    ])
+    .spacing(space::S)
+    .align_y(Alignment::Center);
+    if sendable {
+        let offered = if installing {
+            format!("Install on {device}")
+        } else {
+            format!("Update {device}")
+        };
+        let busy = if installing {
+            "Installing…"
+        } else {
+            "Updating…"
+        };
+        let failed = matches!(status, Some(RunStatus::Failed { .. }));
+        row = row.push(
+            crate::ui_controls::button::primary(offered)
+                .instead("Try again", failed)
+                .instead(busy, running)
+                .name(if installing {
+                    format!("Install this computer's cagents on {device}")
+                } else {
+                    format!("Update {device} to this computer's cagents")
+                })
+                .on_press_maybe(start.filter(|_| !running)),
+        );
+    }
+    // Nothing to dismiss while the update runs: it cannot be stopped
+    // from here.
+    if let Some(dismiss) = dismiss {
+        row = row.push(crate::interaction::tooltip(
+            widget::button::icon(Icon::Close)
+                .id(widget::Id::new("device-update.dismiss"))
+                .name(format!("Dismiss the offer for {device}"))
+                .width(ICON_CONTROL_SIZE)
+                .height(ICON_CONTROL_SIZE)
+                .on_press_maybe(dismiss),
+            "Dismiss",
+        ));
+    }
+    widget::container(row)
+        .padding(space::M)
+        .width(Length::Fill)
+        .class(cosmic::theme::Container::Dialog(false))
+        .into()
+}
+
+pub(super) enum Event {
     Line(String),
     Finished(Result<Success, Failure>),
 }
@@ -422,7 +441,7 @@ enum Event {
 const REPORT_LINES: usize = 12;
 
 /// Runs the CLI's update, streaming its progress lines, then its result.
-fn run_update(device: String) -> impl iced::futures::Stream<Item = Event> {
+pub(super) fn run_update(device: String) -> impl iced::futures::Stream<Item = Event> {
     let (sender, receiver) = async_channel::bounded(8);
     let spawned = std::thread::Builder::new()
         .name("device-update".into())

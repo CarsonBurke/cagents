@@ -16,6 +16,7 @@ use std::{
 
 #[cfg(test)]
 mod no_start_tests;
+pub mod placement;
 pub mod provision;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -87,6 +88,9 @@ impl Drop for ConnectionContext {
     }
 }
 static SELECTED: OnceLock<ConnectionContext> = OnceLock::new();
+/// `--device local` names this computer outright, so a window is not sent on
+/// to the device it last showed.
+static LOCAL_CHOSEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// sshd admits `MaxSessions` (10 by default) streams per connection; a refused
 /// one reconnects in full, so each master carries fewer and the next takes over.
 const STREAMS_PER_MASTER: usize = 8;
@@ -200,6 +204,10 @@ pub fn selected() -> Option<&'static Device> {
 pub fn is_remote() -> bool {
     selected().is_some()
 }
+/// Whether this process was asked for this computer by name.
+pub fn local_chosen() -> bool {
+    LOCAL_CHOSEN.load(std::sync::atomic::Ordering::Relaxed)
+}
 pub fn configuration_path() -> io::Result<PathBuf> {
     crate::instance::project_dirs()
         .map(|dirs| dirs.config_dir().join("devices.json"))
@@ -291,6 +299,9 @@ fn validate(device: &Device) -> io::Result<()> {
     Ok(())
 }
 pub fn select(name: Option<&str>) -> io::Result<()> {
+    if name == Some("local") {
+        LOCAL_CHOSEN.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     let Some(name) = name.filter(|name| *name != "local") else {
         return Ok(());
     };
@@ -328,7 +339,7 @@ pub fn window_slot(slot: Option<&str>) -> io::Result<Option<String>> {
         ))),
     }
 }
-pub(crate) fn scoped_window_slot(device: &str, slot: &str) -> String {
+pub fn scoped_window_slot(device: &str, slot: &str) -> String {
     use sha2::{Digest, Sha256};
     let digest = Sha256::digest(format!("{device}\0{slot}"));
     let mut suffix = String::new();

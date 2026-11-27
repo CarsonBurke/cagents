@@ -869,7 +869,12 @@ impl Cagents {
                 return Task::perform(
                     async move {
                         tokio::task::spawn_blocking(move || {
-                            open_device_window(&name, source.as_deref())
+                            let target = if replace {
+                                Target::Switch(window_origin())
+                            } else {
+                                Target::NewWindow { source }
+                            };
+                            open_device_window(&name, target)
                         })
                         .await
                         .unwrap_or_else(|error| Err(OpenFailure::Other(error.to_string())))
@@ -2093,42 +2098,71 @@ impl State {
 /// failure to this one, which says what went wrong: when the reason is one the
 /// person can fix from here, another cagents version on the device or none,
 /// the offer to fix it, and otherwise what the new window reported.
-fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailure> {
-    let executable = crate::companion::Product::Cli
-        .beside_current()
-        .map_err(|error| OpenFailure::Other(error.to_string()))?;
-    let json = |arguments: &[&str]| {
-        std::process::Command::new(&executable)
-            .arg("--json")
-            .args(arguments)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-            .map(|output| {
-                (
-                    output.status.success(),
-                    String::from_utf8_lossy(&output.stdout).into_owned(),
-                )
-            })
+/// Which window a device window opens as.
+enum Target {
+    /// Another window, copying navigation from `source` on the same device.
+    NewWindow { source: Option<String> },
+    /// This window, on the other device. Named by its slot on this computer,
+    /// when it has one, so it reopens there after a restart.
+    Switch(Option<String>),
+}
+
+/// This window's slot on this computer: its own on this computer, or the one
+/// a switch to the device it shows came from.
+fn window_origin() -> Option<String> {
+    let slot = crate::instance::window_slot();
+    let Some(device) = crate::device::selected() else {
+        return Some(slot.to_owned());
     };
+    crate::device::placement::origin(&device.name, slot)
+        .inspect_err(|error| tracing::warn!(%error, "could not read which window this is"))
+        .ok()
+        .flatten()
+}
+
+fn open_device_window(name: &str, target: Target) -> Result<(), OpenFailure> {
     let mut open = vec![
         "--device",
         name,
         "ui",
-        "--new-window",
         crate::instance::CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
     ];
-    if let Some(source) = source {
-        open.extend(["--source", source]);
+    match &target {
+        Target::Switch(Some(origin)) => open.extend(["--window", origin]),
+        Target::Switch(None) => open.push("--new-window"),
+        Target::NewWindow { source } => {
+            open.push("--new-window");
+            if let Some(source) = source {
+                open.extend(["--source", source]);
+            }
+        }
     }
-    let (opened, output) = json(&open).map_err(|error| OpenFailure::Other(error.to_string()))?;
+    let (opened, output) =
+        cli_json(&open).map_err(|error| OpenFailure::Other(error.to_string()))?;
     if opened {
+        if let Target::Switch(Some(origin)) = &target
+            && let Err(error) = crate::device::placement::record(origin, Some(name))
+        {
+            // The switch happened; only where the window reopens is lost.
+            tracing::warn!(%error, "could not record which device this window shows");
+        }
         return Ok(());
     }
+    Err(diagnose(
+        name,
+        device_update_ui::error_message(&output).as_deref(),
+    ))
+}
+
+/// Why device `name` did not open, given the reason its window reported:
+/// what it needs from this computer, when that is the cause. Opening a
+/// device window, a switch and a window reopening on its device all ask this.
+pub(super) fn diagnose(name: &str, reason: Option<&str>) -> OpenFailure {
+    let json = |arguments: &[&str]| cli_json(arguments);
     let failed = || {
-        device_update_ui::error_message(&output).map_or_else(
+        reason.map_or_else(
             || format!("Could not connect to {name}. Check its SSH connection and cagents daemon."),
-            |reason| sentence(&reason),
+            sentence,
         )
     };
     // The update's own inspection tells what the device lacks, a missing
@@ -2137,7 +2171,7 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
     if let Ok((_, checked)) = &check
         && let Some(checked) = device_update_ui::checked(checked)
     {
-        return Err(match (checked.need, checked.note) {
+        return match (checked.need, checked.note) {
             (Some(need), _) => OpenFailure::Needs {
                 need,
                 blocked: None,
@@ -2146,7 +2180,7 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
             // SSH commands cannot find.
             (None, Some(note)) => OpenFailure::Other(format!("{} {note}", failed())),
             (None, None) => OpenFailure::Other(failed()),
-        });
+        };
     }
     // It would not inspect, so it would not update either: say why, and,
     // when the device's daemon tells, which side is older.
@@ -2157,7 +2191,7 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
     let status = json(&["--device", name, "daemon", "status"])
         .map(|(_, output)| output)
         .unwrap_or_default();
-    Err(match device_update_ui::mismatch(&status) {
+    match device_update_ui::mismatch(&status) {
         Some(actual) => OpenFailure::Needs {
             need: device_update_ui::Need::of_protocol(actual),
             blocked: Some(refusal.unwrap_or_else(|| {
@@ -2165,7 +2199,25 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
             })),
         },
         None => OpenFailure::Other(failed()),
-    })
+    }
+}
+
+/// Runs this computer's CLI with `--json`: whether it succeeded, and what
+/// it printed.
+fn cli_json(arguments: &[&str]) -> std::io::Result<(bool, String)> {
+    let executable = crate::companion::Product::Cli.beside_current()?;
+    std::process::Command::new(executable)
+        .arg("--json")
+        .args(arguments)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .map(|output| {
+            (
+                output.status.success(),
+                String::from_utf8_lossy(&output.stdout).into_owned(),
+            )
+        })
 }
 
 /// `reason`, a CLI message, as a sentence that starts with a capital.

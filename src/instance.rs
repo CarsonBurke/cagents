@@ -75,13 +75,16 @@ pub const STARTUP_ERROR_MODE: &str = "--startup-error";
 pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
 pub const STARTUP_WAIT_MODE: &str = "--startup-wait";
 pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+/// A device window that could not reopen explains why and tries again.
+pub const DEVICE_RECONNECT_MODE: &str = "--device-reconnect";
 #[cfg(target_os = "linux")]
-const HELPER_MODES: [&str; 5] = [
+const HELPER_MODES: [&str; 6] = [
     CONFIRM_DAEMON_STOP_MODE,
     STARTUP_ERROR_MODE,
     STARTUP_UPDATE_MODE,
     STARTUP_WAIT_MODE,
     RENDER_PAGE_MODE,
+    DEVICE_RECONNECT_MODE,
 ];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` names the product that ships the embedded browser: it claims that
@@ -2642,6 +2645,31 @@ pub fn launch_window(new_window: bool, slot: Option<&str>, source: Option<&str>)
         WindowRestorePolicy::Ordinary,
     )
     .map(|_| ())
+}
+
+/// Opens saved window `slot` of `device` with this computer's UI. A start
+/// that fails is returned, not shown in a startup dialog: the caller explains
+/// it. An open window is brought forward instead.
+pub fn launch_device_window(device: &str, slot: &str) -> io::Result<()> {
+    crate::device::validate_name(device)?;
+    validate_window_slot(slot)?;
+    let executable = crate::companion::Product::Ui.beside_current()?;
+    let mut command = process::Command::new(executable);
+    command.args([
+        "--device",
+        device,
+        "--device-window-scoped",
+        "--window",
+        slot,
+        CALLER_REPORTS_STARTUP_FAILURE_ARGUMENT,
+    ]);
+    match crate::control::spawn_ui_process(&mut command) {
+        Ok(_) => Ok(()),
+        Err(error) if error.to_string() == ApplicationLeaseError::AlreadyRunning.to_string() => {
+            activate_window(slot).map(|_| ())
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// Session ids belong to a daemon/device namespace. Never resolve a local

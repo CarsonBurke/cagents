@@ -15,6 +15,7 @@ mod context_sections;
 mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
+mod device_reconnect;
 mod device_ui;
 mod device_update_ui;
 pub(crate) mod dialog_ui;
@@ -90,6 +91,7 @@ mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+pub use device_reconnect::{Request as DeviceReconnectRequest, run_device_reconnect};
 
 /// Fills the `slot` window's empty session store from a fixture plan and
 /// returns what it wrote as one JSON line. Refused by production builds and

@@ -4,8 +4,9 @@ use std::os::unix::process::CommandExt;
 use cagents::design::space;
 use cagents::instance::ui_options::{Options, parse};
 use cagents::instance::{
-    CONFIRM_DAEMON_STOP_MODE as CONFIRM_DAEMON_STOP, STARTUP_ERROR_MODE as STARTUP_ERROR,
-    STARTUP_UPDATE_MODE as STARTUP_UPDATE, STARTUP_WAIT_MODE as STARTUP_WAIT,
+    CONFIRM_DAEMON_STOP_MODE as CONFIRM_DAEMON_STOP, DEVICE_RECONNECT_MODE as DEVICE_RECONNECT,
+    STARTUP_ERROR_MODE as STARTUP_ERROR, STARTUP_UPDATE_MODE as STARTUP_UPDATE,
+    STARTUP_WAIT_MODE as STARTUP_WAIT,
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
@@ -24,6 +25,7 @@ const STILL_STARTING: &str = "--still-starting";
 /// ordinary startup, as when this window starts the daemon itself.
 const STARTUP_WAIT_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
 const STARTUP_WAIT_UPDATE: &str = "--update";
+const STARTUP_WAIT_DEVICE: &str = "--device";
 
 cagents::stamp_version!();
 
@@ -64,6 +66,7 @@ pub(crate) fn main_with_before_start(
     // user reads as the outcome of their shutdown request.
     let standalone = arguments.first().is_some_and(|argument| {
         argument == CONFIRM_DAEMON_STOP
+            || argument == DEVICE_RECONNECT
             || argument == STARTUP_ERROR
             || argument == STARTUP_UPDATE
             || argument == STARTUP_WAIT
@@ -215,7 +218,18 @@ fn report_startup_failure(message: &str, still_starting: bool, reported_by_calle
         && cagents::instance::window_restore_policy()
             != cagents::instance::WindowRestorePolicy::ExistingOnly
     {
-        let _ = spawn_startup_error_dialog(message, still_starting);
+        // A device window explains itself as a switch to it would, rather
+        // than with a dialog whose Retry opens this computer's window.
+        let _ = match DEVICE_WINDOW.get() {
+            Some((device, slot)) => {
+                spawn_device_reconnect(&cagents_ui::app::DeviceReconnectRequest {
+                    device: device.clone(),
+                    slot: slot.clone(),
+                    reason: message.to_owned(),
+                })
+            }
+            None => spawn_startup_error_dialog(message, still_starting),
+        };
     }
     // Reported last: the launcher kills this process as soon as it reads a
     // handshake error, so the dialog has to be detached before then.
@@ -235,6 +249,26 @@ fn truncated(message: &str) -> &str {
         Some((end, _)) => &message[..end],
         None => message,
     }
+}
+
+/// The device and slot of this window, when it is a device window, known
+/// before it connects so that a failure to connect can say which.
+static DEVICE_WINDOW: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+fn spawn_device_reconnect(
+    request: &cagents_ui::app::DeviceReconnectRequest,
+) -> std::io::Result<()> {
+    let payload = serde_json::to_string(request).map_err(std::io::Error::other)?;
+    std::process::Command::new(cagents::process::current_executable()?)
+        .args([DEVICE_RECONNECT, &payload])
+        .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
 }
 
 /// Re-runs this executable as a detached dialog. The failing process cannot
@@ -269,8 +303,14 @@ fn spawn_startup_wait_notice(kind: StartupWaitKind) -> std::io::Result<std::proc
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0);
-    if kind == StartupWaitKind::Update {
-        command.arg(STARTUP_WAIT_UPDATE);
+    match &kind {
+        StartupWaitKind::Daemon => {}
+        StartupWaitKind::Update => {
+            command.arg(STARTUP_WAIT_UPDATE);
+        }
+        StartupWaitKind::Device(name) => {
+            command.args([STARTUP_WAIT_DEVICE, name]);
+        }
     }
     // SAFETY: the hook makes only async-signal-safe syscalls before exec.
     unsafe {
@@ -401,10 +441,23 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         let request: cagents_ui::startup_window::Request = serde_json::from_str(payload)?;
         return cagents_ui::startup_window::run(request);
     }
+    if arguments.peek() == Some(&DEVICE_RECONNECT) {
+        arguments.next();
+        let payload = arguments.next().ok_or("missing device window context")?;
+        if payload.len() > 8192 || arguments.next().is_some() {
+            return Err("invalid device window context".into());
+        }
+        let request: cagents_ui::app::DeviceReconnectRequest = serde_json::from_str(payload)?;
+        return cagents_ui::app::run_device_reconnect(request);
+    }
     if arguments.peek() == Some(&STARTUP_WAIT) {
         arguments.next();
         let kind = if arguments.next_if_eq(&STARTUP_WAIT_UPDATE).is_some() {
             StartupWaitKind::Update
+        } else if arguments.next_if_eq(&STARTUP_WAIT_DEVICE).is_some() {
+            let name = arguments.next().ok_or("missing device name")?;
+            cagents::device::validate_name(name)?;
+            StartupWaitKind::Device(name.to_owned())
         } else {
             StartupWaitKind::Daemon
         };
@@ -459,6 +512,33 @@ fn seed_fixture_window(arguments: &[String]) -> Result<String, String> {
     cagents_ui::app::seed_fixture_window(std::path::Path::new(plan), slot, identity)
 }
 
+/// Connects to the selected device, if any. Reaching it can take a while,
+/// so a window nobody else is waiting on says it is connecting.
+fn prepare_device(caller_reports_startup_failure: bool) -> std::io::Result<()> {
+    let Some(device) = cagents::device::selected() else {
+        return Ok(());
+    };
+    if caller_reports_startup_failure {
+        return cagents::device::prepare();
+    }
+    std::thread::scope(|scope| {
+        let (done, finished) = std::sync::mpsc::channel();
+        let connecting = scope.spawn(move || {
+            let result = cagents::device::prepare();
+            let _ = done.send(());
+            result
+        });
+        if finished.recv_timeout(STARTUP_WAIT_NOTICE_DELAY).is_err() {
+            // Shown from this thread, which outlives startup: the notice
+            // ends with the thread that started it.
+            show_startup_wait_notice(StartupWaitKind::Device(device.name.clone()));
+        }
+        connecting
+            .join()
+            .unwrap_or_else(|_| Err(std::io::Error::other("connecting to the device panicked")))
+    })
+}
+
 fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         new_window,
@@ -467,25 +547,11 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         device,
         device_window_scoped,
         restore_policy,
-        caller_reports_startup_failure: _,
+        caller_reports_startup_failure,
     } = options;
     cagents::instance::initialize_window_restore_policy(restore_policy)?;
     let _device_cleanup = cagents::device::Cleanup;
     cagents::device::select(device)?;
-    cagents::device::prepare()?;
-    if !cagents::device::is_remote()
-        && let Some(executable) = cagents::control::staged_ui_executable(
-            #[cfg(target_os = "macos")]
-            &mut || show_startup_wait_notice(StartupWaitKind::Update),
-        )?
-    {
-        #[cfg(target_os = "macos")]
-        cagents::instance::dismiss_startup_wait_notice_before_exec();
-        // Preserve the original window arguments and any inherited pipe.
-        let mut command = std::process::Command::new(executable);
-        command.args(std::env::args_os().skip(1));
-        return Err(command.exec().into());
-    }
     let unique_slot = uuid::Uuid::new_v4().to_string();
     let remote_new_window = new_window && cagents::device::is_remote();
     let new_window = new_window && !remote_new_window;
@@ -500,6 +566,23 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         cagents::device::window_slot(slot)?
     };
     let slot = scoped_slot.as_deref();
+    if let (Some(device), Some(slot)) = (cagents::device::selected(), slot) {
+        let _ = DEVICE_WINDOW.set((device.name.clone(), slot.to_owned()));
+    }
+    prepare_device(caller_reports_startup_failure)?;
+    if !cagents::device::is_remote()
+        && let Some(executable) = cagents::control::staged_ui_executable(
+            #[cfg(target_os = "macos")]
+            &mut || show_startup_wait_notice(StartupWaitKind::Update),
+        )?
+    {
+        #[cfg(target_os = "macos")]
+        cagents::instance::dismiss_startup_wait_notice_before_exec();
+        // Preserve the original window arguments and any inherited pipe.
+        let mut command = std::process::Command::new(executable);
+        command.args(std::env::args_os().skip(1));
+        return Err(command.exec().into());
+    }
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
@@ -729,10 +812,12 @@ impl cosmic::Application for StartupError {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 enum StartupWaitKind {
     Daemon,
     Update,
+    /// A device window connecting to its device.
+    Device(String),
 }
 
 fn show_startup_wait_notice(kind: StartupWaitKind) {
@@ -786,16 +871,21 @@ impl cosmic::Application for StartupWait {
     }
 
     fn view(&self) -> cosmic::Element<'_, StartupWaitMessage> {
-        let (title, detail, note) = match self.kind {
+        let (title, detail, note) = match &self.kind {
             StartupWaitKind::Daemon => (
-                "Starting cagents",
-                "The cagents daemon is still starting. Your workspace opens as soon as it is ready.",
+                "Starting cagents".to_owned(),
+                "The cagents daemon is still starting. Your workspace opens as soon as it is ready.".to_owned(),
                 "Starting can take longer while it restores your sessions. Hiding this message does not stop cagents from opening.",
             ),
             StartupWaitKind::Update => (
-                "Finishing the update",
-                "Your workspace will open after cagents restores your sessions.",
+                "Finishing the update".to_owned(),
+                "Your workspace will open after cagents restores your sessions.".to_owned(),
                 "The update continues if you hide this window.",
+            ),
+            StartupWaitKind::Device(name) => (
+                format!("Connecting to {name}…"),
+                format!("Your {name} window opens as soon as the connection is ready."),
+                "Hiding this message does not stop the window from opening.",
             ),
         };
         let heading = cosmic::widget::row::with_children(vec![
@@ -835,7 +925,7 @@ fn run_startup_wait_notice(kind: StartupWaitKind) -> Result<(), Box<dyn std::err
             });
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, task) = Shell::init((core, kind));
+            let (shell, task) = Shell::init((core, kind.clone()));
             (shell, iced::Task::batch([open.discard(), task]))
         },
         Shell::update,
