@@ -122,10 +122,17 @@ impl Members {
         *slot = slot.saturating_add(1);
     }
 
-    /// Adds an agent and makes it the lead, whatever the display order.
-    pub fn add_lead(&mut self, provider: Provider, state: MemberState) {
-        self.add_agent(provider, state);
-        self.led = Some(Member::Agent(provider, state));
+    pub fn add(&mut self, member: Member) {
+        match member {
+            Member::Agent(provider, state) => self.add_agent(provider, state),
+            Member::Terminal => self.add_terminal(),
+        }
+    }
+
+    /// Adds a member and makes it the lead, whatever the display order.
+    pub fn add_lead(&mut self, member: Member) {
+        self.add(member);
+        self.led = Some(member);
     }
 
     pub fn add_terminal(&mut self) {
@@ -660,7 +667,7 @@ mod tests {
     #[test]
     fn a_named_lead_stands_for_the_members_whatever_their_order() {
         let mut named = members(&[(Codex, MemberState::Working)], 0);
-        named.add_lead(Claude, MemberState::Approval);
+        named.add_lead(Member::Agent(Claude, MemberState::Approval));
         assert_eq!(
             named.lead(),
             Some(Member::Agent(Claude, MemberState::Approval))

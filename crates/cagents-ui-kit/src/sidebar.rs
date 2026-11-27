@@ -46,8 +46,8 @@ pub use attention::{State as AttentionState, Summary as AttentionSummary};
 
 mod members;
 pub use members::{
-    Ground as MembersGround, MemberState as ChannelMemberState, Members as ChannelMembers,
-    view as members_mark,
+    Ground as MembersGround, Member as ChannelMember, MemberState as ChannelMemberState,
+    Members as ChannelMembers, view as members_mark,
 };
 
 mod rail;
