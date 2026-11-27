@@ -964,8 +964,13 @@ pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
         .map(|source| format!("protocol {} ({})", source.protocol, source.release))
         .collect::<Vec<_>>()
         .join(", ");
+    let install = if cfg!(target_os = "macos") {
+        "`sh /path/to/install-macos.sh`"
+    } else {
+        "`sh /path/to/install.sh` without --restart-daemon"
+    };
     invalid(format!(
-        "The running cagents service uses protocol {protocol}; live updates support only {released} and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's `sh /path/to/install.sh` without --restart-daemon, then reopen cagents.",
+        "The running cagents service uses protocol {protocol}; live updates support only {released} and protocol {}. This source check did not request preparation or shutdown, or create an update checkpoint.{release} To cold-install safely: save your work, finish or close every hosted session, and quit every cagents window. Using the running build's matching CLI, run `cagents --no-start daemon stop --require-empty` (it refuses while sessions remain), then verify `cagents --no-start daemon status` reports stopped. Run the downloaded release's {install}, then reopen cagents.",
         crate::terminal_ipc::PROTOCOL_VERSION,
     ))
 }
@@ -1630,7 +1635,12 @@ mod admission_message_tests {
             )));
             assert!(message.contains("did not request preparation or shutdown"));
             assert!(message.contains("--no-start daemon stop --require-empty"));
-            assert!(message.contains("sh /path/to/install.sh"));
+            let installer = if cfg!(target_os = "macos") {
+                "install-macos.sh"
+            } else {
+                "install.sh"
+            };
+            assert!(message.contains(&format!("sh /path/to/{installer}")));
             assert!(!message.contains("Update it to a build serving protocol 156"));
         }
     }
