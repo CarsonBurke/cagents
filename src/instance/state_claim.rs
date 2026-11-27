@@ -38,6 +38,9 @@ use super::*;
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::FileExt;
 
+#[cfg(any(target_os = "macos", test))]
+mod saved_owner;
+
 /// How a claim is recorded. Unknown fields are ignored so that a later version
 /// can add some without an earlier one reading its claim as missing.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -225,7 +228,7 @@ pub(crate) fn last_daemon_pid(
 ) -> io::Result<Option<u32>> {
     let claim = claims_directory()?.join(DAEMON_CLAIM);
     let guard = canonical_guard(lock);
-    Ok(read_path(&claim)?
+    Ok(saved_owner::read_path(&claim)?
         .filter(|record| names_source(record, &guard, proof, None))
         .map(|record| record.pid))
 }
@@ -256,15 +259,11 @@ pub(crate) fn claim_daemon_state_from(
     let claims = claims_directory()?;
     prepare_claim_directory(&claims, Claimant::Daemon)?;
     let ours = record(lock, Some(host_session))?;
-    let guard = ours.guard.clone();
-    acquire_checked(
+    saved_owner::acquire(
         &claims.join(DAEMON_CLAIM),
-        ours,
-        Claimant::Daemon,
+        &ours,
         DAEMON_PATIENCE,
-        |previous| {
-            previous.is_some_and(|previous| names_source(previous, &guard, source, source_pid))
-        },
+        |previous| names_source(previous, &ours.guard, source, source_pid),
     )
 }
 
@@ -530,28 +529,31 @@ fn acquire(
     claimant: Claimant,
     patience: Duration,
 ) -> io::Result<StateClaim> {
-    acquire_checked(path, ours, claimant, patience, |_| true)
+    acquire_with(path, &ours, claimant, patience, true, |file, _, _| {
+        write(file, &ours).map_err(|_| storage_unavailable(claimant))
+    })
 }
 
-fn acquire_checked(
+fn acquire_with(
     path: &Path,
-    ours: Record,
+    ours: &Record,
     claimant: Claimant,
     patience: Duration,
-    accepts: impl Fn(Option<&Record>) -> bool,
+    allow_takeover: bool,
+    publish_owner: impl FnOnce(&mut File, Record, &[u8]) -> io::Result<()>,
 ) -> io::Result<StateClaim> {
-    let unexpected =
-        || io::Error::other("The saved work no longer belongs to the update's acknowledged source");
     let started = std::time::Instant::now();
     let unreadable = || io::Error::other(unreadable(claimant));
     loop {
         let file = match open_claim(path, true) {
             Ok(file) => file,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                if !accepts(None) {
-                    return Err(unexpected());
+                if !allow_takeover {
+                    return Err(io::Error::other(
+                        "The saved work no longer belongs to the update's acknowledged source",
+                    ));
                 }
-                match create_claim(path, &ours) {
+                match create_claim(path, ours) {
                     Ok(lock) => return Ok(StateClaim { _lock: lock }),
                     Err(error)
                         if error.kind() == io::ErrorKind::AlreadyExists
@@ -582,15 +584,14 @@ fn acquire_checked(
                 }
                 // The last holder may have released the claim but left the
                 // runtime lease in use by an updater or store maintenance.
-                let last = read(&lock).map_err(|_| unreadable())?;
-                if !accepts(Some(&last)) {
-                    return Err(unexpected());
-                }
-                if last.guard != ours.guard && taken_within(&last.guard, HANDOFF) {
+                let bytes = read_record_bytes(&lock).map_err(|_| unreadable())?;
+                let last = decode_record(&bytes).map_err(|_| unreadable())?;
+                if allow_takeover && last.guard != ours.guard && taken_within(&last.guard, HANDOFF)
+                {
                     let foreign = other_boot(&last, ours.boot.as_deref());
                     return Err(io::Error::other(refusal(claimant, Some(&last), foreign)));
                 }
-                write(lock.file_mut(), &ours).map_err(|_| storage_unavailable(claimant))?;
+                publish_owner(lock.file_mut(), last, &bytes)?;
                 return Ok(StateClaim { _lock: lock });
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => match read_path(path) {
@@ -768,6 +769,10 @@ fn parse_locks(locks: &str, device: u64, inode: u64) -> Listed {
 }
 
 fn read(file: &File) -> io::Result<Record> {
+    decode_record(&read_record_bytes(file)?)
+}
+
+fn read_record_bytes(file: &File) -> io::Result<Vec<u8>> {
     let length = file.metadata()?.len();
     let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid saved-data claim");
     if length == 0 || length > MAX_RECORD_BYTES {
@@ -781,9 +786,14 @@ fn read(file: &File) -> io::Result<Record> {
             error
         }
     })?;
+    Ok(bytes)
+}
+
+fn decode_record(bytes: &[u8]) -> io::Result<Record> {
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid saved-data claim");
     // Future formats can add fields while retaining this ownership header.
     // Its guard still fences this data during an update or store maintenance.
-    let record: Record = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+    let record: Record = serde_json::from_slice(bytes).map_err(|_| invalid())?;
     if !record.guard.is_absolute() || record.guard.parent() != Some(&record.runtime) {
         return Err(invalid());
     }
@@ -1224,6 +1234,7 @@ mod tests {
     #[test]
     fn a_checked_handoff_keeps_an_intervening_saved_data_claim() {
         let root = tempfile::tempdir().unwrap();
+        prepare_claim_directory(root.path(), Claimant::Daemon).unwrap();
         let runtime = Runtime::new();
         let _owner = runtime.hold();
         let path = root.path().join(DAEMON_CLAIM);
@@ -1231,13 +1242,9 @@ mod tests {
         let other = record(&runtime.lock, Some("intervening")).unwrap();
         let successor = record(&runtime.lock, Some("successor")).unwrap();
         let handoff = || {
-            acquire_checked(
-                &path,
-                successor.clone(),
-                Claimant::Daemon,
-                Duration::ZERO,
-                |previous| previous == Some(&original),
-            )
+            saved_owner::acquire(&path, &successor, Duration::ZERO, |previous| {
+                previous == &original
+            })
         };
 
         assert!(handoff().is_err());
@@ -1249,7 +1256,8 @@ mod tests {
         assert_eq!(fs::read(&path).unwrap(), saved);
         drop(acquire(&path, original.clone(), Claimant::Daemon, Duration::ZERO).unwrap());
         drop(handoff().unwrap());
-        assert_eq!(read_path(&path).unwrap(), Some(successor));
+        assert_eq!(read_path(&path).unwrap(), Some(original));
+        assert_eq!(saved_owner::read_path(&path).unwrap(), Some(successor));
     }
 
     #[test]
