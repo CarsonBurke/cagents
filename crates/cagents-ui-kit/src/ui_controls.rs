@@ -37,8 +37,8 @@ mod yielding;
 pub use yielding::yielding;
 
 pub use display::{
-    COUNT_BADGE_HEIGHT, CountTone, badge, bounded_badge, change_counts, comment_card, count_badge,
-    count_badge_width_bound, display_path, on_accent_color,
+    COUNT_BADGE_HEIGHT, CountShape, CountTone, badge, bounded_badge, change_counts, comment_card,
+    count_badge, count_badge_width_bound, count_pill, display_path, on_accent_color,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use gauge::activity_animates;

@@ -229,40 +229,19 @@ fn count_pill<'a>(
     fill: fn(&cosmic::Theme) -> Color,
     ink: fn(&cosmic::Theme) -> Color,
 ) -> Element<'a, SidebarAction> {
-    let label = count_label(count);
     // A single digit is a circle; longer counts grow the pill leftwards over
     // the glyph, never past the cell.
-    let width = if label.len() == 1 {
-        Length::Fixed(PILL_HEIGHT)
-    } else {
-        Length::Shrink
-    };
-    widget::container(
-        widget::text(label)
-            .size(9.5)
-            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-                (PILL_HEIGHT - 2.0 * RING).into(),
-            ))
-            .font(design::heading_font())
-            .wrapping(cosmic::iced::widget::text::Wrapping::None),
+    crate::ui_controls::count_pill(
+        count_label(count),
+        crate::ui_controls::CountShape {
+            height: PILL_HEIGHT,
+            text_size: 9.5,
+            font: design::heading_font(),
+            inset: 1.5,
+            ring: Some((RING, ring)),
+        },
+        move |theme| (fill(theme), Some(ink(theme))),
     )
-    .padding([0.0, RING + 1.5])
-    .center_y(Length::Fixed(PILL_HEIGHT))
-    .align_x(Alignment::Center)
-    .width(width)
-    .class(theme::Container::custom(move |theme| {
-        widget::container::Style {
-            background: Some(Background::Color(fill(theme))),
-            text_color: Some(ink(theme)),
-            border: Border {
-                color: ring(theme),
-                width: RING,
-                radius: (PILL_HEIGHT / 2.0).into(),
-            },
-            ..Default::default()
-        }
-    }))
-    .into()
 }
 
 /// A status glyph on a disc of the tray's colour, which cuts it out of the
