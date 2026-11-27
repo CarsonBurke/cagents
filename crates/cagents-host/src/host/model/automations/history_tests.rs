@@ -1396,7 +1396,7 @@ fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
         // work, independently of the firing candidate selection.
         let mut unused = automation.clone();
         unused.revision = 2;
-        write_revision(tx, &unused).unwrap();
+        write_revision(tx, &unused, &test_identity().into()).unwrap();
         for index in 0..count {
             let request = Uuid::new_v4();
             let firing = Firing {
