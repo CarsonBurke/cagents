@@ -133,6 +133,22 @@ remove_owned_link() {
     fi
 }
 
+# The unit `cagents daemon boot enable` wrote, recognized by its first line;
+# a unit of the same name someone else wrote stays.
+remove_boot_unit() {
+    unit=$CONFIG_HOME/systemd/user/dev.cagents.Cagents.Daemon.service
+    [ -f "$unit" ] && [ ! -L "$unit" ] || return 0
+    [ "$(sed -n '1{p;q;}' "$unit")" = '# Installed by `cagents daemon boot enable`; `cagents daemon boot disable` removes it.' ] \
+        || return 0
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user disable dev.cagents.Cagents.Daemon.service >/dev/null 2>&1 || :
+    fi
+    rm -f "$unit" "$CONFIG_HOME/systemd/user/default.target.wants/dev.cagents.Cagents.Daemon.service"
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user daemon-reload >/dev/null 2>&1 || :
+    fi
+}
+
 is_managed_editor_launcher() {
     [ -f "$1" ] && [ ! -L "$1" ] \
         && [ "$(sed -n '2{p;q;}' "$1")" = '# cagents managed ceditor launcher v1' ]
@@ -265,6 +281,7 @@ uninstall_installation() {
     remove_owned_link "$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png"
     remove_owned_link "$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml"
     remove_owned_link "$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop"
+    remove_boot_unit
     remove_editor_launchers
 
     rm -f "$PREFIX/current"

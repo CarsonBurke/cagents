@@ -361,6 +361,7 @@ pub unsafe fn prepare_daemon_admission(
     unsafe {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
+        crate::instance::take_daemon_at_boot_marker();
     }
     // SAFETY: this is still the single-threaded entry point.
     let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
