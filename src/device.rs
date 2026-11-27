@@ -217,16 +217,17 @@ impl std::fmt::Display for Unresponsive {
             reached,
         } = self;
         let wait = answer_wait();
+        let status = ssh_command_hint(host, executable, "daemon status");
         match reached {
             Reached::BridgeStarted => write!(
                 f,
-                "{device}{UNRESPONSIVE_INFIX}its cagents daemon did not answer within {wait}. It may be busy or stuck: try again, or check it with `ssh {host} {executable} daemon status`."
+                "{device}{UNRESPONSIVE_INFIX}its cagents daemon did not answer within {wait}. It may be busy or stuck: try again, or check it with `{status}`."
             ),
             // An older cagents there never says it started, so this cannot
             // tell a slow login from a daemon that hung.
             Reached::LoggedIn => write!(
                 f,
-                "{device}{UNRESPONSIVE_INFIX}nothing came back from cagents there within {wait}. A slow login, such as a shell profile or home directory that hangs, or a stuck cagents daemon can cause this: check that `ssh {host} true` returns quickly and that `ssh {host} {executable} daemon status` answers, then try again."
+                "{device}{UNRESPONSIVE_INFIX}nothing came back from cagents there within {wait}. A slow login, such as a shell profile or home directory that hangs, or a stuck cagents daemon can cause this: check that `ssh {host} true` returns quickly and that `{status}` answers, then try again."
             ),
         }
     }
@@ -690,6 +691,27 @@ fn remote_executable(executable: &str) -> String {
     match executable.strip_prefix("~/") {
         Some(rest) => format!("\"$HOME\"/{}", quote(rest)),
         None => quote(executable),
+    }
+}
+/// `ssh HOST EXECUTABLE ARGUMENTS` as a person would type it on this
+/// computer. The device's shell, not this one, must read `~/`, and this
+/// shell must not split or expand anything else, so those are quoted.
+fn ssh_command_hint(host: &str, executable: &str, arguments: &str) -> String {
+    let plain = |path: &str| {
+        !path.is_empty()
+            && path
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"/._-+".contains(&byte))
+    };
+    if plain(executable) {
+        format!("ssh {host} {executable} {arguments}")
+    } else if executable.strip_prefix("~/").is_some_and(plain) {
+        format!("ssh {host} '{executable} {arguments}'")
+    } else {
+        format!(
+            "ssh {host} {}",
+            quote(&format!("{} {arguments}", remote_executable(executable)))
+        )
     }
 }
 /// Streams share an authenticated transport through OpenSSH multiplexing.
@@ -1360,6 +1382,12 @@ fn copy_transport(
             }
             Err(error) => return Err(error),
         };
+        // Before passing it on, so whoever reads it already sees the device
+        // as having answered.
+        if let Some(status) = answered {
+            status.answered.store(true, Ordering::Release);
+            status.awaiting.store(false, Ordering::Release);
+        }
         let mut offset = 0;
         while offset < count && !cancelled() {
             match writer.write(&buffer[offset..count]) {
@@ -1377,10 +1405,6 @@ fn copy_transport(
             break;
         }
         writer.flush()?;
-        if let Some(status) = answered {
-            status.answered.store(true, Ordering::Release);
-            status.awaiting.store(false, Ordering::Release);
-        }
     }
     Ok(total)
 }
@@ -1723,8 +1747,10 @@ fn failed_request_error(
         ),
         None => io::Error::other(
             format!(
-                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
-                device.name, device.host, device.host
+                "could not connect to device {} (SSH host {}): {error}; verify `{}`",
+                device.name,
+                device.host,
+                ssh_command_hint(&device.host, &device.executable, "daemon start")
             ) + &last_error
                 .map(|error| format!("; {error}"))
                 .unwrap_or_default(),
@@ -2504,6 +2530,34 @@ mod tests {
         assert_eq!(
             other.to_string(),
             "could not connect to device build-host (SSH host me@build-host): handshake refused; verify `ssh me@build-host cagents daemon start`; SSH to me@build-host exited 1: no such file"
+        );
+    }
+
+    /// A command the messages suggest runs as written on this computer:
+    /// the device's shell reads `~/`, and nothing is split here.
+    #[test]
+    fn a_suggested_ssh_command_reaches_the_saved_executable() {
+        assert_eq!(
+            ssh_command_hint("box", "/opt/cagents/bin/cagents", "daemon status"),
+            "ssh box /opt/cagents/bin/cagents daemon status"
+        );
+        assert_eq!(
+            ssh_command_hint("box", "~/.local/bin/cagents", "daemon status"),
+            "ssh box '~/.local/bin/cagents daemon status'"
+        );
+        assert_eq!(
+            ssh_command_hint("box", "~/my tools/cagents", "daemon start"),
+            r#"ssh box '"$HOME"/'\''my tools/cagents'\'' daemon start'"#
+        );
+        let slow = Unresponsive {
+            device: "box".into(),
+            host: "box".into(),
+            executable: "~/cagents".into(),
+            reached: Reached::BridgeStarted,
+        };
+        assert!(
+            slow.to_string()
+                .contains("check it with `ssh box '~/cagents daemon status'`.")
         );
     }
 
