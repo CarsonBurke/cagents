@@ -6416,8 +6416,8 @@ const CHECKOUTS_TOGGLE_NAME: &str = "Show checkouts";
 /// Shows or hides every project's checkouts, which start hidden. It is lit
 /// and pressed while they show, like any toggle that turns something on;
 /// its name stays fixed and the tooltip says what a press does. Hiding them
-/// by default overrides each project's own mode, which the tooltip says
-/// while they are hidden.
+/// by default overrides each project's own mode, so showing them is said to
+/// apply in every project, as the project menu says it.
 ///
 /// Only the All view lists checkouts: Attention names panes instead. The
 /// setting persists, so the toggle stays live elsewhere and its tooltip
@@ -6442,9 +6442,9 @@ fn checkouts_toggle(state: &SidebarState, modal_open: bool) -> Element<'static, 
 fn checkouts_toggle_tooltip(state: &SidebarState) -> &'static str {
     let shown = state.sidebar_worktrees.shows_checkouts();
     match (shown, state.filter == SidebarFilter::All) {
-        (false, true) => "Show checkouts (hidden in every project)",
+        (false, true) => "Show checkouts in every project",
         (true, true) => "Hide checkouts",
-        (false, false) => "Show checkouts in the All view (hidden in every project)",
+        (false, false) => "Show checkouts in the All view",
         (true, false) => "Hide checkouts in the All view",
     }
 }
@@ -9830,8 +9830,18 @@ fn context_controls_with_display<'a>(
         if let Some((global, override_mode)) = display.filter(|_| selection_count == Some(1) && git)
         {
             // A hidden default hides every project's checkouts, whatever
-            // mode the project has; that mode applies once they show.
-            let mut choices = vec![Item::CheckBox(
+            // mode the project has; that mode applies once they show, so
+            // the choices lead with showing them.
+            let mut choices = Vec::new();
+            if !global.shows_checkouts() {
+                choices.push(Item::Button(
+                    "Show checkouts in every project".into(),
+                    Some(worktree_icon()),
+                    ContextCommand::ShowCheckouts(project_id, global),
+                ));
+                choices.push(Item::Divider);
+            }
+            choices.push(Item::CheckBox(
                 if global.shows_checkouts() {
                     format!("Use default ({})", global.label())
                 } else {
@@ -9840,7 +9850,7 @@ fn context_controls_with_display<'a>(
                 None,
                 override_mode.is_none(),
                 ContextCommand::Display(project_id, None),
-            )];
+            ));
             choices.extend(
                 crate::settings::SidebarWorktrees::ALL
                     .into_iter()

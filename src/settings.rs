@@ -3187,6 +3187,14 @@ fn adopt_preference_defaults(table: &mut toml::Table) {
                 .is_some_and(|value| retired.written_as(value))
         {
             table.remove(*key);
+            // Checkouts the file showed grouped are hidden now; showing them
+            // again returns to the mode they were in.
+            if *key == "sidebar_worktrees" {
+                table.insert(
+                    "sidebar_worktrees_when_shown".to_owned(),
+                    SidebarWorktrees::Grouped.key().into(),
+                );
+            }
         }
     }
     table.insert(
@@ -4768,14 +4776,14 @@ mod tests {
         assert!(legacy.sidebar_worktree_overrides.is_empty());
         save(&path, &base).unwrap();
         let mut one = base.clone();
-        one.sidebar_worktrees = Hidden;
+        one.sidebar_worktrees = Expanded;
         one.sidebar_worktree_overrides.insert(first, Expanded);
         save_merged(&path, &base, &one).unwrap();
         let mut two = base.clone();
         two.sidebar_worktree_overrides.insert(second, Grouped);
         save_merged(&path, &base, &two).unwrap();
         let saved = load(&path).unwrap();
-        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(saved.sidebar_worktrees, Expanded);
         assert_eq!(
             saved.sidebar_worktree_overrides.get(&first),
             Some(&Expanded)
@@ -4786,7 +4794,7 @@ mod tests {
         );
         one.sidebar_worktree_overrides.remove(&first);
         let mut one_base = base.clone();
-        one_base.sidebar_worktrees = Hidden;
+        one_base.sidebar_worktrees = Expanded;
         one_base.sidebar_worktree_overrides.insert(first, Expanded);
         save_merged(&path, &one_base, &one).unwrap();
         let saved = load(&path).unwrap();
@@ -4795,7 +4803,7 @@ mod tests {
             saved.sidebar_worktree_overrides.get(&second),
             Some(&Grouped)
         );
-        assert_eq!(saved.sidebar_worktrees, Hidden);
+        assert_eq!(saved.sidebar_worktrees, Expanded);
     }
 
     #[test]
@@ -5615,14 +5623,31 @@ new_thread = "Alt+Shift+G"
         assert!(load(&path).unwrap().focus_follows_mouse);
     }
 
-    /// A file written at revision 2, as every save wrote it then, holding
-    /// `mode` as the sidebar's checkouts mode.
-    fn revision_two_sidebar_worktrees(path: &Path, mode: SidebarWorktrees) {
+    /// A file written at `revision`, as every save wrote it then, holding
+    /// `mode` as the sidebar's checkouts mode and `when_shown` as the mode
+    /// they last showed in.
+    fn old_sidebar_worktrees(
+        path: &Path,
+        revision: Option<i64>,
+        mode: SidebarWorktrees,
+        when_shown: SidebarWorktrees,
+    ) {
         let mut document = written(&AppSettings::default()).unwrap();
         let table = document.as_table_mut().unwrap();
-        table.insert("preference_defaults_revision".into(), 2.into());
+        match revision {
+            Some(revision) => table.insert("preference_defaults_revision".into(), revision.into()),
+            None => table.remove("preference_defaults_revision"),
+        };
         table.insert("sidebar_worktrees".into(), mode.key().into());
+        table.insert(
+            "sidebar_worktrees_when_shown".into(),
+            when_shown.key().into(),
+        );
         fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    fn revision_two_sidebar_worktrees(path: &Path, mode: SidebarWorktrees) {
+        old_sidebar_worktrees(path, Some(2), mode, SidebarWorktrees::Grouped);
     }
 
     #[test]
@@ -5655,6 +5680,43 @@ new_thread = "Alt+Shift+G"
         save(&path, &chosen).unwrap();
         assert_eq!(
             load(&path).unwrap().sidebar_worktrees,
+            SidebarWorktrees::Grouped
+        );
+    }
+
+    #[test]
+    fn hidden_checkouts_reach_files_from_before_the_revision_was_recorded() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        old_sidebar_worktrees(
+            &path,
+            None,
+            SidebarWorktrees::Grouped,
+            SidebarWorktrees::Grouped,
+        );
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.sidebar_worktrees, SidebarWorktrees::Hidden);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION
+        );
+    }
+
+    #[test]
+    fn showing_migrated_checkouts_returns_to_the_grouped_mode_they_were_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        // Once expanded, then hidden, then grouped: grouped is what showed.
+        old_sidebar_worktrees(
+            &path,
+            Some(2),
+            SidebarWorktrees::Grouped,
+            SidebarWorktrees::Expanded,
+        );
+        let loaded = load(&path).unwrap();
+        assert_eq!(loaded.sidebar_worktrees, SidebarWorktrees::Hidden);
+        assert_eq!(
+            loaded.toggled_sidebar_worktrees(),
             SidebarWorktrees::Grouped
         );
     }

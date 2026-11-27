@@ -12178,9 +12178,15 @@ fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
     let mut app = context_inspector_test_app(false);
     app.settings_write_blocked = false;
     app.settings_path = Some(path.clone());
+    app.settings
+        .set_sidebar_worktrees(settings::SidebarWorktrees::Grouped);
     app.save_settings_now().unwrap();
     let project = ProjectId::new();
     let mut external = settings::load(&path).unwrap();
+    assert_eq!(
+        external.sidebar_worktrees,
+        settings::SidebarWorktrees::Grouped
+    );
     external.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
     external
         .sidebar_worktree_overrides
@@ -15125,6 +15131,8 @@ fn shared_preferences_read_before_a_local_save_cannot_revert_it_after_acknowledg
     let mut app = context_inspector_test_app(false);
     app.settings_path = Some(path.clone());
     app.settings_write_blocked = false;
+    // Checkouts start hidden; show them so hiding them is a change.
+    app.settings.set_sidebar_worktrees(Grouped);
     app.save_settings_now().unwrap();
     let stale = Message::SharedPreferencesObserved {
         generation: app.settings_ack_generation,
