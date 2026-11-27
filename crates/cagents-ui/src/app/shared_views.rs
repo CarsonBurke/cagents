@@ -440,6 +440,10 @@ pub(super) struct State {
     /// Explicit moves wait for host acceptance before changing local membership.
     requested_transfers: HashMap<uuid::Uuid, CardId>,
     pub attached: HashSet<CardId>,
+    /// New terminals whose Insert has been published, until the view accepts
+    /// or drops them. Until then a view that does not list one has not yet
+    /// been asked to.
+    sent_creations: HashSet<CardId>,
     retained: HashSet<CardId>,
     /// Exact chat identity retired by an authoritative view, never inferred from EOF.
     pub closed_chats: HashMap<CardId, crate::chat::Session>,
@@ -502,7 +506,7 @@ impl State {
         };
         format!(
             "pending: {:?}\nblocked: {}\nquarantined: {}\nclosed: {}\nattached: {}\n\
-             retained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
+             sent creations: {}\nretained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
              requested transfers: {}\ndefaults: {}\nstrip detached: {}\n\
              closed chats: {}\nobserved chats: {}\nobserved terminals: {}\n\
              adoptions: {:?}\nchat adoptions: {}\nrestorations: {:?}\n\
@@ -512,6 +516,7 @@ impl State {
             set(&mut self.quarantined.iter().map(|id| format!("{id:?}"))),
             set(&mut self.closed.iter().map(|id| format!("{id:?}"))),
             set(&mut self.attached.iter().map(|id| format!("{id:?}"))),
+            set(&mut self.sent_creations.iter().map(|id| format!("{id:?}"))),
             set(&mut self.retained.iter().map(|id| format!("{id:?}"))),
             set(&mut self.seeding.iter().map(|scope| format!("{scope:?}"))),
             set(&mut self.seed_attempts.keys().map(|scope| format!("{scope:?}"))),
@@ -606,6 +611,11 @@ impl State {
             .retain(|card, terminal| open.get(card) == Some(terminal));
     }
 
+    /// Forgets sent Inserts for creations no longer pending.
+    pub(super) fn forget_sent_creations(&mut self, pending: &HashSet<CardId>) {
+        self.sent_creations.retain(|id| pending.contains(id));
+    }
+
     /// A copy of everything a publication reads or writes, so a test can
     /// publish the same state two ways. The copy keeps no discovery or view
     /// index, and its key sets are new sets.
@@ -651,6 +661,7 @@ impl State {
             source_bases,
             requested_transfers,
             attached,
+            sent_creations,
             retained,
             closed_chats,
             observed_chats,
@@ -693,6 +704,7 @@ impl State {
             source_bases: source_bases.clone(),
             requested_transfers: requested_transfers.clone(),
             attached: attached.clone(),
+            sent_creations: sent_creations.clone(),
             retained: retained.clone(),
             closed_chats: closed_chats.clone(),
             observed_chats: observed_chats.clone(),
@@ -1848,7 +1860,7 @@ impl Cagents {
                     .get(scope)
                     .is_some_and(|baseline| {
                         LocalPane::all_match(projected(), baseline)
-                            && !baseline.iter().any(|pane| self.unpublished_chat(pane.id))
+                            && !baseline.iter().any(|pane| self.unpublished_pane(pane.id))
                     });
             if settles {
                 settled.insert(scope.clone());
@@ -2509,16 +2521,16 @@ impl Cagents {
         projected_scopes: Vec<Scope>,
     ) {
         for scope in projected_scopes {
-            // Its baseline already lists exactly its panes, none of them a
-            // chat yet to be published.
+            // Its baseline already lists exactly its panes, none of them yet
+            // to be published.
             if projected.settled.contains(&scope) {
                 continue;
             }
             // The view this pass projected is what the registry holds. A
-            // chat yet to be published is not in it, so the publication
+            // pane yet to be published is not in it, so the publication
             // below inserts it rather than taking it as already shared.
             let mut panes = projected.panes.get(&scope).cloned().unwrap_or_default();
-            panes.retain(|pane| !self.unpublished_chat(pane.id));
+            panes.retain(|pane| !self.unpublished_pane(pane.id));
             self.shared_views.baseline.insert(scope, panes);
         }
         self.publish_projected_view_changes(projected, projection);
@@ -2875,6 +2887,7 @@ impl Cagents {
                     Change::Insert { pane, .. }
                         if self.durable.pending_terminal_creations.contains(&pane.id) =>
                     {
+                        self.shared_views.sent_creations.insert(pane.id);
                         pane.id.as_uuid()
                     }
                     _ => uuid::Uuid::new_v4(),
@@ -4158,9 +4171,24 @@ impl Cagents {
     /// admits it. It keeps its place here, and the publication that follows
     /// the projection inserts it. Kept as a local-only pane instead, it would
     /// never be published, and its first message would start unrecorded
-    /// (#2697).
+    /// (#2697). A new terminal whose Insert was held back the same way would
+    /// close without a word (#4380).
     fn awaits_first_publication(&self, id: CardId, view: &View) -> bool {
-        self.unpublished_chat(id) && !view.retired.contains(&id)
+        self.unpublished_pane(id) && !view.retired.contains(&id)
+    }
+
+    /// Whether `id` is a pane this window will share but has not asked any
+    /// view to hold yet: a chat it has neither shared nor kept local, or a
+    /// new terminal whose Insert is still unsent.
+    pub(super) fn unpublished_pane(&self, id: CardId) -> bool {
+        self.unpublished_chat(id) || self.unsent_creation(id)
+    }
+
+    /// A new terminal waiting for its first Insert. Once sent, the creation is
+    /// the view's to accept or refuse, and a view that drops it closes it.
+    fn unsent_creation(&self, id: CardId) -> bool {
+        self.durable.pending_terminal_creations.contains(&id)
+            && !self.shared_views.sent_creations.contains(&id)
     }
 
     /// Whether `id` is a chat this window has neither shared nor kept local,
@@ -4309,6 +4337,17 @@ impl Cagents {
                 continue;
             }
             if self.absence_closes_pane(id, view) {
+                // A new terminal closed this way disappears without a word
+                // (#4380, #4400); leave a trace of which view dropped it.
+                if self.durable.pending_terminal_creations.contains(&id) {
+                    tracing::warn!(
+                        card = %id,
+                        scope = ?view.scope,
+                        revision = view.revision,
+                        retired = view.retired.contains(&id),
+                        "closing a new terminal its shared view does not list"
+                    );
+                }
                 self.detach_shared_pane(id);
                 continue;
             }
@@ -4389,6 +4428,7 @@ impl Cagents {
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
+                self.shared_views.sent_creations.remove(&pane.id);
                 let explicit = self.durable.pending_terminal_creations.contains(&pane.id)
                     && Arc::make_mut(&mut self.durable)
                         .pending_terminal_creations
@@ -4999,6 +5039,7 @@ impl Cagents {
         Arc::make_mut(&mut self.durable)
             .pending_terminal_creations
             .remove(&id);
+        self.shared_views.sent_creations.remove(&id);
         self.shared_views.default_requests.remove(&id);
         self.shared_chat_detach(id);
         self.retire_lsp_card(id);
