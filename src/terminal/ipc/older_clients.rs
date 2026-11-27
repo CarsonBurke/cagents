@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 210,
+    proven_at: 211,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -164,6 +164,15 @@ pub fn before_queue_holds<T>(_: &T) -> bool {
     encoding_before(QUEUE_HOLDS)
 }
 
+/// The first protocol whose workspace model and edit effects carry the shared
+/// project order. A client before it is sent both without.
+pub const PROJECT_ORDER: u16 = 211;
+
+/// Omit the trailing project order from older wire layouts.
+pub fn before_project_order<T>(_: &T) -> bool {
+    encoding_before(PROJECT_ORDER)
+}
+
 /// Reads a struct whose last `omitted` fields a source from before the
 /// protocol that added them never encoded. Postcard reads a struct as a tuple
 /// of its fields, so the struct is read as a tuple of the fields that source
@@ -250,6 +259,16 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         SEND_QUEUED_NOW,
     ),
     ("cagents::chat::Capabilities", &["queue_holds"], QUEUE_HOLDS),
+    (
+        "cagents::workspace_model::WorkspaceModel",
+        &["project_order"],
+        PROJECT_ORDER,
+    ),
+    (
+        "cagents::workspace_model::delta::EditEffects",
+        &["project_order"],
+        PROJECT_ORDER,
+    ),
 ];
 
 /// Fields a later protocol added to a variant of a request's enum, which this

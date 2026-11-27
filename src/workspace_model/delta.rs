@@ -54,6 +54,14 @@ pub struct EditEffects {
     /// the agent's placement with it.
     pub agents: Vec<crate::agent_execution::Agent>,
     pub removed_agents: Vec<AgentId>,
+    /// The complete shared project order an order edit left, empty when
+    /// nothing is arranged; `None` when the edit did not order projects.
+    /// Closing a project drops it from the order without saying so here.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_project_order"
+    )]
+    pub project_order: Option<Vec<std::path::PathBuf>>,
 }
 
 impl EditEffects {
@@ -67,6 +75,7 @@ impl EditEffects {
             && self.navigation_orders.is_empty()
             && self.removed_agents.is_empty()
             && self.agents.is_empty()
+            && self.project_order.is_none()
     }
 }
 

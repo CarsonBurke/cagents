@@ -173,14 +173,7 @@ impl Cagents {
             SidebarAction::MaximizeWindow => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::Maximize)),
             SidebarAction::WindowMenu => Task::done(cosmic::Action::Cosmic(cosmic::app::Action::ShowWindowMenu)),
             SidebarAction::ReorderMember { project, source, before } => self.reorder_sidebar_member(project, source, before),
-            SidebarAction::ReorderProject { project, before } => {
-                if self.sidebar_model.reorder_project(project, before) {
-                    Arc::make_mut(&mut self.durable).project_order =
-                        self.sidebar_model.projects.iter().map(|project| project.id).collect();
-                    self.persist();
-                }
-                Task::none()
-            }
+            SidebarAction::ReorderProject { project, before } => self.reorder_sidebar_project(project, before),
             SidebarAction::CancelWorktreeOperation(id) => self.cancel_worktree_operation(id),
             SidebarAction::DismissWorktreeOperation(id) => self.dismiss_worktree_operation(id),
             SidebarAction::EditWorktreeOperation(id) => self.reopen_worktree_operation(id, false),

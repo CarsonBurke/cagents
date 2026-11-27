@@ -264,6 +264,31 @@ impl SidebarModel {
         });
     }
 
+    /// Lists projects in the shared order every window uses, by repository,
+    /// with a project it does not hold after every one it does, by path (see
+    /// [`crate::workspace_model::project_rank`]). Whether anything moved; an
+    /// order already in place leaves the list, and its revision, untouched.
+    pub fn apply_shared_project_order(&mut self, order: &[PathBuf]) -> bool {
+        fn key<'a>(
+            order: &[PathBuf],
+            project: &'a SidebarProject,
+        ) -> ((usize, &'a Path), ProjectId) {
+            (
+                crate::workspace_model::project_rank(order, &project.repository),
+                project.id,
+            )
+        }
+        if self
+            .projects
+            .is_sorted_by(|left, right| key(order, left) <= key(order, right))
+        {
+            return false;
+        }
+        self.projects
+            .sort_by(|left, right| key(order, left).cmp(&key(order, right)));
+        true
+    }
+
     pub fn reorder_project(&mut self, project: ProjectId, before: Option<ProjectId>) -> bool {
         let Some(from) = self.projects.iter().position(|entry| entry.id == project) else {
             return false;

@@ -346,7 +346,12 @@ use crate::{
 /// Version 209 adds review monitor reports and complete review censuses.
 ///
 /// Version 210 adds exact exited queue reads, resume receipts and acknowledgements.
-pub const PROTOCOL_VERSION: u16 = 210;
+///
+/// Version 211 shares the order of projects: `WorkspaceModel::project_order`
+/// and `EditEffects::project_order`, and the `ReorderProjects` and
+/// `SeedProjectOrder` edits that change it. An older client is sent the model
+/// and effects without it, and cannot send either edit.
+pub const PROTOCOL_VERSION: u16 = 211;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -376,9 +381,10 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 mod older_clients;
 pub use older_clients::{
     ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
-    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT,
-    WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing, before_queue_holds, before_send_queued_now,
-    decoding_before, decoding_from, encoding_before, encoding_for,
+    PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, PROJECT_ORDER, QUEUE_HOLDS, SEND_QUEUED_NOW,
+    USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing, before_project_order,
+    before_queue_holds, before_send_queued_now, decoding_before, decoding_from, encoding_before,
+    encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

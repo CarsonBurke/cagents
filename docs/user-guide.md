@@ -62,7 +62,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
   The tab's context menu also lists eligible channels; with many destinations,
   **Move to channel…** opens a searchable picker. The command palette lists
   the focused pane's channel destinations too.
-- Drag a project header to reorder projects; the order survives restarts.
+- Drag a project header to reorder projects; every window on the device, and a device window viewing it, shows the same order, and it survives restarts.
   Project headers stay visible while scrolling. The primary worktree stays
   first; **Settings → General → Worktrees** orders the rest by newest, oldest,
   or name.
