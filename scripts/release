@@ -389,7 +389,23 @@ trap 'rm -rf -- build-source' EXIT
 tar -xzf "$1/source.tar.gz" -C build-source
 export PATH=$HOME/.cargo/bin:/usr/bin:/bin:/usr/sbin:/sbin:$PATH
 export CARGO_TARGET_DIR=$HOME/Library/Caches/cagents-release/target SOURCE_DATE_EPOCH=$2
-build-source/scripts/package-macos --output "$1/dist" </dev/null 9>&-
+# Ghostty runs Zig from its own checkout, where a mise shim cannot see
+# cagents' pin. Put the installed executable on PATH before that build.
+case $(command -v zig || :) in
+    */shims/zig)
+        zig_version=$(sed -n \
+            's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)"[[:space:]]*$/\1/p' \
+            build-source/mise.toml)
+        [[ -n $zig_version ]] || { echo 'release: no Zig pin in mise.toml' >&2; exit 1; }
+        zig=$(mise exec "zig@$zig_version" -- which zig) \
+            || { echo "release: could not find Zig $zig_version through mise" >&2; exit 1; }
+        [[ $zig == /* && -x $zig && $zig != */shims/zig ]] \
+            || { echo 'release: mise did not resolve a Zig executable' >&2; exit 1; }
+        export PATH="${zig%/*}:$PATH"
+        ;;
+esac
+# rustup and Cargo find the checkout's toolchain and config from cwd.
+(cd build-source && scripts/package-macos --output "$1/dist" </dev/null 9>&-)
 BUILD
 MAC
     for name in "$(macos_archive)" install-macos.sh SHA256SUMS-macos; do

@@ -108,8 +108,10 @@ binaries.
 
 `scripts/package-macos` builds the Apple Silicon release on a Mac:
 `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`, `install-macos.sh` and
-`SHA256SUMS-macos`. It needs Xcode's command line tools and rustup; the
-toolchain comes from `rust-toolchain.toml`. It builds the four executables with
+`SHA256SUMS-macos`. It needs Xcode's command line tools, rustup and the Zig
+version pinned in `mise.toml`. Run it from the checkout so rustup selects
+`rust-toolchain.toml`. For a direct package build, use `mise exec --` if
+Zig is installed through mise. It builds the four executables with
 the release profile for macOS 11 or newer: the CLI, the daemon, the UI with
 the production identity `dev.cagents.Cagents` and without the integrated
 browser, and the dictation helper, linked against the pinned sherpa-onnx static
