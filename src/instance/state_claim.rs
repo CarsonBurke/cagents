@@ -378,7 +378,7 @@ pub(crate) fn served_elsewhere(claim: &Path, lock: &Path) -> io::Result<Option<S
     } else {
         recorded.guard != canonical_guard(lock) && guard_held(&recorded.guard)
     };
-    Ok(used.then(|| refusal(Claimant::Daemon, Some(&recorded), foreign)))
+    Ok(used.then(|| claim_refusal(claim, Claimant::Daemon, Some(&recorded), foreign)))
 }
 
 /// Claim one window's saved state for the window that holds its slot lock
@@ -589,7 +589,12 @@ fn acquire_with(
                 if allow_takeover && last.guard != ours.guard && taken_within(&last.guard, HANDOFF)
                 {
                     let foreign = other_boot(&last, ours.boot.as_deref());
-                    return Err(io::Error::other(refusal(claimant, Some(&last), foreign)));
+                    return Err(io::Error::other(claim_refusal(
+                        path,
+                        claimant,
+                        Some(&last),
+                        foreign,
+                    )));
                 }
                 publish_owner(lock.file_mut(), last, &bytes)?;
                 return Ok(StateClaim { _lock: lock });
@@ -604,7 +609,12 @@ fn acquire_with(
         if let Some(found) = &found {
             let foreign = other_boot(found, ours.boot.as_deref());
             if foreign || found.guard != ours.guard && guard_held(&found.guard) {
-                return Err(io::Error::other(refusal(claimant, Some(found), foreign)));
+                return Err(io::Error::other(claim_refusal(
+                    path,
+                    claimant,
+                    Some(found),
+                    foreign,
+                )));
             }
         }
         // Held, but by a predecessor in this runtime directory that has let
@@ -612,10 +622,38 @@ fn acquire_with(
         // lock is free and so is exiting too, or by one still writing its
         // record. Each resolves by itself.
         if started.elapsed() >= patience {
-            return Err(io::Error::other(refusal(claimant, found.as_ref(), false)));
+            return Err(io::Error::other(claim_refusal(
+                path,
+                claimant,
+                found.as_ref(),
+                false,
+            )));
         }
         std::thread::sleep(POLL);
     }
+}
+
+fn claim_refusal(
+    _path: &Path,
+    claimant: Claimant,
+    record: Option<&Record>,
+    foreign: bool,
+) -> StateInUse {
+    let reason = refusal(claimant, record, foreign);
+    // The native guard still excludes other runtimes during Ready admission.
+    // Its PID can be stale, and the Ready PID alone cannot rule out PID reuse.
+    #[cfg(target_os = "macos")]
+    if claimant != Claimant::Window
+        && reason.pid.is_some()
+        && let Some(record) = record
+        && !saved_owner::confirms_legacy_owner(_path, record)
+    {
+        return StateInUse {
+            pid: None,
+            ..reason
+        };
+    }
+    reason
 }
 
 fn refusal(claimant: Claimant, record: Option<&Record>, foreign: bool) -> StateInUse {

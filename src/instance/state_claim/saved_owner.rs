@@ -29,7 +29,29 @@ struct Anchor {
     digest: [u8; 32],
 }
 
+enum ClaimOwner {
+    Legacy(Record),
+    Ready(Record),
+}
+
+impl ClaimOwner {
+    fn into_record(self) -> Record {
+        match self {
+            Self::Legacy(record) | Self::Ready(record) => record,
+        }
+    }
+}
+
 pub(super) fn read_path(path: &Path) -> io::Result<Option<Record>> {
+    Ok(snapshot(path)?.map(ClaimOwner::into_record))
+}
+
+#[cfg(target_os = "macos")]
+pub(super) fn confirms_legacy_owner(path: &Path, expected: &Record) -> bool {
+    matches!(snapshot(path), Ok(Some(ClaimOwner::Legacy(owner))) if owner == *expected)
+}
+
+fn snapshot(path: &Path) -> io::Result<Option<ClaimOwner>> {
     let file = match open_claim(path, false) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -59,6 +81,7 @@ pub(super) fn acquire(
         |file, owner, bytes| {
             verify_named_claim(&directory, file)?;
             let (previous, anchor) = observe(&directory, file, owner, bytes)?;
+            let previous = previous.into_record();
             if previous.guard != ours.guard || previous.boot != ours.boot || !accepts(&previous) {
                 return Err(io::Error::other(
                     "The saved work no longer belongs to the update's acknowledged source",
@@ -110,7 +133,7 @@ fn observe(
     file: &File,
     mut owner: Record,
     bytes: &[u8],
-) -> io::Result<(Record, Anchor)> {
+) -> io::Result<(ClaimOwner, Anchor)> {
     let metadata = file.metadata()?;
     let anchor = Anchor {
         device: metadata.dev(),
@@ -128,8 +151,9 @@ fn observe(
         }
         owner.pid = witness.pid;
         owner.host_session = Some(witness.host_session);
+        return Ok((ClaimOwner::Ready(owner), anchor));
     }
-    Ok((owner, anchor))
+    Ok((ClaimOwner::Legacy(owner), anchor))
 }
 
 fn read(directory: &Root) -> io::Result<Option<Witness>> {
@@ -318,6 +342,51 @@ mod tests {
             super::super::read_path(&fixture.claim).unwrap(),
             Some(fixture.source)
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_refusal_names_a_pid_only_when_the_legacy_owner_is_current() {
+        let fixture = SavedClaim::new();
+        let other = tempfile::tempdir().unwrap();
+        let guard = other.path().join("cagentsd.lock");
+        let _other_lease = owned_lock(&guard, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let contender = record(&guard, Some("contender")).unwrap();
+        let check = |pid| {
+            let error = super::super::acquire(
+                &fixture.claim,
+                contender.clone(),
+                Claimant::Daemon,
+                Duration::ZERO,
+            )
+            .unwrap_err();
+            let launch_error = served_elsewhere(&fixture.claim, &guard).unwrap().unwrap();
+            for refusal in [state_in_use(&error).unwrap(), &launch_error] {
+                assert_eq!(refusal.runtime(), Some(fixture.source.runtime.as_path()));
+                assert_eq!(refusal.pid(), pid);
+            }
+        };
+
+        // A live process owns this PID in the fixture, as it would upon reuse.
+        let pid = process::id();
+        let successor = fixture.owner("successor", pid);
+        let claim = fixture.handoff(&fixture.source, &successor).unwrap();
+        check(None);
+        drop(claim);
+        check(None);
+
+        let legacy = fixture.owner("legacy", pid);
+        let claim = super::super::acquire(&fixture.claim, legacy, Claimant::Daemon, Duration::ZERO)
+            .unwrap();
+        check(Some(pid));
+        drop(claim);
+
+        fs::rename(&fixture.claim, fixture.root.path().join("original.lock")).unwrap();
+        drop(create_claim(&fixture.claim, &fixture.source).unwrap());
+        check(None);
+
+        fs::write(fixture.root.path().join(OWNER), b"invalid witness").unwrap();
+        check(None);
     }
 
     #[test]
