@@ -20,6 +20,34 @@ pub struct Found {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_result_leads_with_what_was_imported_and_names_only_real_counts() {
+        let report = |cookies, sites, skipped, undecryptable| Summary {
+            cancelled: false,
+            cookies,
+            sites,
+            profiles: 1,
+            skipped,
+            undecryptable,
+        };
+        assert_eq!(
+            summary(report(1, 1, 0, 0)),
+            "Imported 1 cookie for 1 site from 1 profile. Reload a tab to use its imported login."
+        );
+        assert_eq!(
+            summary(report(12, 3, 4, 2)),
+            "Imported 12 cookies for 3 sites from 1 profile. 4 unsupported, partitioned, or expired cookies were skipped. 2 cookies couldn't be decrypted and were skipped; signing in to those sites again in the source browser usually fixes this. Reload a tab to use its imported login."
+        );
+        assert_eq!(summary(report(0, 0, 0, 0)), "No cookies were imported.");
+        assert_eq!(
+            summary(Summary {
+                cancelled: true,
+                ..report(0, 0, 1, 0)
+            }),
+            "Stopped early. No cookies were imported. 1 unsupported, partitioned, or expired cookie was skipped."
+        );
+    }
+
     /// At the minimum 900x600 window with 150% interface scale, a long site
     /// list or error report scrolls, and the actions that finish, retry or
     /// cancel the import stay whole and inside the window.
@@ -360,6 +388,55 @@ impl Drop for State {
     }
 }
 
+/// "1 cookie", "2 cookies".
+fn count(n: usize, noun: &str) -> String {
+    format!("{n} {noun}{}", if n == 1 { "" } else { "s" })
+}
+
+struct Summary {
+    cancelled: bool,
+    cookies: usize,
+    sites: usize,
+    profiles: usize,
+    skipped: usize,
+    undecryptable: usize,
+}
+
+/// The finished import's result, leading with whether anything was imported
+/// and naming only the counts that are not zero.
+fn summary(report: Summary) -> String {
+    let mut text = String::new();
+    if report.cancelled {
+        text.push_str("Stopped early. ");
+    }
+    if report.cookies == 0 {
+        text.push_str("No cookies were imported.");
+    } else {
+        text.push_str(&format!(
+            "Imported {} for {} from {}.",
+            count(report.cookies, "cookie"),
+            count(report.sites, "site"),
+            count(report.profiles, "profile"),
+        ));
+    }
+    match report.skipped {
+        0 => {}
+        1 => text.push_str(" 1 unsupported, partitioned, or expired cookie was skipped."),
+        n => text.push_str(&format!(
+            " {n} unsupported, partitioned, or expired cookies were skipped."
+        )),
+    }
+    match report.undecryptable {
+        0 => {}
+        1 => text.push_str(" 1 cookie couldn't be decrypted and was skipped; signing in to its site again in the source browser usually fixes this."),
+        n => text.push_str(&format!(" {n} cookies couldn't be decrypted and were skipped; signing in to those sites again in the source browser usually fixes this.")),
+    }
+    if report.cookies > 0 {
+        text.push_str(" Reload a tab to use its imported login.");
+    }
+    text
+}
+
 fn message(action: Action) -> Message {
     Message::BrowserImport(action)
 }
@@ -637,23 +714,14 @@ impl Cagents {
             {
                 self.browser_import.confirm_cancel = false;
                 self.browser_import.phase = Phase::Finished(match result {
-                    Ok(report) => format!(
-                        "{}Imported {} cookies for {} sites from {} profiles. {} unsupported, partitioned, or expired cookies were skipped.{} Reload a tab to use its imported login.",
-                        if report.cancelled {
-                            "Stopped early. "
-                        } else {
-                            ""
-                        },
-                        report.cookies,
-                        report.sites,
-                        self.browser_import.profiles,
-                        report.skipped + self.browser_import.skipped,
-                        match self.browser_import.undecryptable {
-                            0 => String::new(),
-                            1 => " 1 cookie couldn't be read and was skipped.".into(),
-                            n => format!(" {n} cookies couldn't be read and were skipped."),
-                        }
-                    ),
+                    Ok(report) => summary(Summary {
+                        cancelled: report.cancelled,
+                        cookies: report.cookies,
+                        sites: report.sites,
+                        profiles: self.browser_import.profiles,
+                        skipped: report.skipped + self.browser_import.skipped,
+                        undecryptable: self.browser_import.undecryptable,
+                    }),
                     Err(error) => error,
                 });
             }
@@ -800,7 +868,11 @@ impl Cagents {
                                         crate::ui_controls::field::checkbox(
                                             found.selected.contains(&site.host),
                                         )
-                                        .label(format!("{} · {} cookies", site.host, site.cookies))
+                                        .label(format!(
+                                            "{} · {}",
+                                            site.host,
+                                            count(site.cookies, "cookie")
+                                        ))
                                         .on_toggle(
                                             move |selected| {
                                                 message(Action::Site(index, host.clone(), selected))
