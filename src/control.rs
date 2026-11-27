@@ -1058,6 +1058,9 @@ pub struct ControlClient {
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
     observed_conversation: Option<(u64, Box<crate::work::ConversationPullRequests>)>,
+    /// The newest device reading pushed while a correlated response was
+    /// pending; each is complete, so only the newest matters.
+    observed_device_stats: Option<(u64, crate::device_stats::DeviceStats)>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -1328,6 +1331,7 @@ impl ControlClient {
             mobile_watch: None,
             mobile_changed: false,
             observed_work: None,
+            observed_device_stats: None,
             observed_conversation: None,
             attached_chats: BTreeSet::new(),
             terminal_streams: BTreeSet::new(),
@@ -1527,6 +1531,58 @@ impl ControlClient {
             .try_clone()
             .map(Hangup)
             .map_err(ControlError::Configure)
+    }
+
+    /// Subscribes this connection to the device's load and returns the latest
+    /// reading, if one was taken yet, with the revision later readings from
+    /// [`Self::next_device_stats`] supersede.
+    pub fn watch_device_stats(
+        &mut self,
+    ) -> Result<(u64, Option<crate::device_stats::DeviceStats>), ControlError> {
+        match self.request_strict(ClientRequest::WatchDeviceStats)? {
+            ServerResponse::DeviceStats { revision, stats } => Ok((revision, stats)),
+            response => Err(unexpected_response("a device load subscription", &response)),
+        }
+    }
+
+    /// Blocks until the daemon sends a reading newer than `revision`.
+    ///
+    /// A reading comes only when a figure moves, so this drops the read
+    /// timeout rather than polling; a subscribed connection issues no further
+    /// requests.
+    pub fn next_device_stats(
+        &mut self,
+        revision: u64,
+    ) -> Result<(u64, crate::device_stats::DeviceStats), ControlError> {
+        if let Some((observed, stats)) = self.observed_device_stats.take()
+            && observed > revision
+        {
+            return Ok((observed, stats));
+        }
+        self.stream
+            .set_read_timeout(None)
+            .map_err(ControlError::Configure)?;
+        loop {
+            let envelope = self.read_envelope()?;
+            self.validate_pinned_envelope(&envelope)?;
+            match envelope.message {
+                ServerMessage::DeviceStats {
+                    revision: observed,
+                    stats,
+                } if observed > revision => return Ok((observed, stats)),
+                // The daemon is about to close this connection; the watcher
+                // reconnects to its successor.
+                ServerMessage::HostShuttingDown => return Err(ControlError::ConnectionClosed),
+                ServerMessage::Error(error) => {
+                    return Err(ControlError::Remote {
+                        code: error.code,
+                        message: error.message,
+                        retryable: error.retryable,
+                    });
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Subscribes to shared-model edges and returns the model in one round trip.
@@ -3318,6 +3374,14 @@ impl ControlClient {
                     self.observed_work = Some((revision, board));
                 }
             }
+            ServerMessage::DeviceStats { revision, stats } => {
+                if self
+                    .observed_device_stats
+                    .is_none_or(|(observed, _)| observed < revision)
+                {
+                    self.observed_device_stats = Some((revision, stats));
+                }
+            }
             ServerMessage::ConversationPullRequests {
                 revision,
                 pull_requests,
@@ -3622,6 +3686,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::MobileChanged { .. }
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
+        | ServerMessage::DeviceStats { .. }
         | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::ChatLimit { .. }
         | ServerMessage::ChatAgentAddresses { .. }
@@ -3656,6 +3721,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatQueueEnded { .. } => "chat_queue_ended",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
+        ServerMessage::DeviceStats { .. } => "device_stats",
         ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
         ServerMessage::AutomationProposalsChanged { .. } => "automation_proposals_changed",
     }
@@ -3708,6 +3774,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatQueueRecipientScope { .. } => "chat_queue_recipient_scope",
         ServerResponse::ChatExitedQueuePage { .. } => "chat_exited_queue_page",
         ServerResponse::ChatExitedQueue { .. } => "chat_exited_queue",
+        ServerResponse::DeviceStats { .. } => "device_stats",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",

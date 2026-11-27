@@ -188,6 +188,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
             | ClientRequest::WatchMobile { .. }
+            | ClientRequest::WatchDeviceStats
             | ClientRequest::ProviderStatus
     )
 }
@@ -589,7 +590,11 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
     // Outside the control gate: unwatching waits for a board being assembled,
     // which must not hold up a writer waiting at the gate.
-    let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
+    let (work, device_stats) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.work.clone(), state.device_stats.clone())
+    };
+    device_stats.unwatch(client_id);
     if let Some(work) = work {
         work.unwatch(client_id);
         work.unwatch_conversation(client_id);
@@ -1615,6 +1620,30 @@ fn process_admitted_request(
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
             })?;
             Ok((ServerResponse::Work(response), Vec::new(), false))
+        }
+        ClientRequest::WatchDeviceStats => {
+            drop(_shared);
+            let (watch, delivery, proof) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.device_stats.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                    Arc::new(state.proof().clone()),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, stats) = watch
+                .watch(client_id, delivery, proof)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::DeviceStats { revision, stats },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::WatchWork => {
             // Like a board read, the first answer may wait on scans.

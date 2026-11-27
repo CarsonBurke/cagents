@@ -96,6 +96,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
         | R::WatchWork
+        | R::WatchDeviceStats
         | R::WatchConversationPullRequests { .. }
         | R::Work(
             crate::work::Request::Board { .. }

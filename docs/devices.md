@@ -21,7 +21,8 @@ before opening a device window. It does not expose a TCP daemon listener or copy
 provider credential files to your desktop.
 
 Use the current-device control at the bottom right of the status bar. Its menu
-lists **This device** and your saved devices. Choose **Connect to a device…** to
+lists **This device** and your saved devices, with a check beside the one this
+window works on. Choose **Connect to a device…** below the list to
 enter an SSH host alias and remote executable (by default
 `~/.local/bin/cagents`, where the installer links it), then **Save and switch
 device**.
@@ -63,8 +64,19 @@ reports a stopped one as stopped. Other commands start it unless you pass
 `--no-start`.
 
 Choosing a device from the status-bar menu switches the current client after the
-new connection is ready. Its hosted jobs continue. Each device row also offers
-**Open in another window** for keeping local and remote clients open together.
+new connection is ready; the control says **Switching to NAME…** meanwhile. Its
+hosted jobs continue. Each device row also has an open-in-a-new-window button for
+keeping local and remote clients open together.
+
+Beside the control, the status bar shows the window's device's processor,
+memory and disk use, each as a ring and a percentage, read on that device by
+its daemon. A figure turns amber at 80% and red at 90%. Processor use is
+smoothed over a few seconds, and disk use is the file system holding the
+device user's home directory. Hover for cores and load average, memory and swap
+in gigabytes, and disk use of its capacity. A device that isn't reporting shows
+empty rings and a dash. The daemon reads these only while a window is
+watching, every two seconds, and sends a reading only when a shown figure
+changes.
 Named windows are scoped to their device; the internal `device-` namespace is reserved.
 
 **Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
@@ -198,7 +210,7 @@ Per-pane device switching is tracked separately in [#687](https://github.com/Car
 Choose a device from the bottom-right device menu to switch the current window.
 The replacement connects successfully before the current client closes; daemon
 jobs continue. Save or discard editor changes before switching. Each device row
-also has an **Open in another window** action, so a desktop window and a build-host
+also has an open-in-a-new-window button, so a desktop window and a build-host
 window can stay open together.
 
 A switched window stays on its device: `cagents ui`, the desktop icon and a

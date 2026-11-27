@@ -158,6 +158,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReadExitedQueue { .. }
         | R::ChatCommitExitedQueue { .. }
         | R::WatchConversationPullRequests { .. }
+        // A window's status bar; a session keeping the sampler running would
+        // be a cost nobody sees.
+        | R::WatchDeviceStats
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }

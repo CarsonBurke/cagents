@@ -5866,7 +5866,7 @@ impl Runtime {
                         match choice.usage_fraction {
                             Some(fraction) => row.push(crate::ui_controls::budget_radial_toned(
                                 fraction,
-                                choice.tone.color().map(design::Tone::Themed),
+                                choice.tone.ring_tone(),
                             )),
                             None => row.push(
                                 iced::widget::Space::new()

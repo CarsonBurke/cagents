@@ -12,6 +12,7 @@ mod chat;
 mod client;
 mod control_gate;
 mod delivery;
+mod device_stats;
 mod device_trust;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;

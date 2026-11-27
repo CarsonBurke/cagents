@@ -323,9 +323,10 @@ fn radial_sweep(fraction: f32) -> Option<(f32, f32)> {
 /// A ring whose filled sweep is the supplied budget fraction.
 /// Callers pass the fraction described by the adjacent text: left or used.
 ///
-/// The sweep uses the same muted neutral ink as inactive navigation icons,
-/// so a healthy status line is not a row of competing colours; a caller whose
-/// budget is in trouble tones it with [`budget_radial_toned`].
+/// The sweep takes the theme accent, so every ring in the window reads as one
+/// family of measurements against its neutral track; a caller whose budget is
+/// in trouble, or whose figure is stale, tones it with
+/// [`budget_radial_toned`].
 ///
 /// The linear capsule this replaces cost a status line the width of a whole
 /// caption and, at the height a caption row allows, read as a crack in the
@@ -336,8 +337,9 @@ pub fn budget_radial<'a, Message: 'a>(fraction: f32) -> Element<'a, Message> {
     budget_radial_toned(fraction, None)
 }
 
-/// A [`budget_radial`] whose sweep takes `tone` instead of the neutral ink,
-/// for a gauge whose budget is in trouble and should say so on its own.
+/// A [`budget_radial`] whose sweep takes `tone` instead of the accent, for a
+/// gauge whose budget is in trouble, or whose figure is out of date, and
+/// should say so on its own.
 pub fn budget_radial_toned<'a, Message: 'a>(
     fraction: f32,
     tone: Option<crate::design::Tone>,
@@ -423,7 +425,7 @@ impl<Message> cosmic::iced::advanced::Widget<Message, cosmic::Theme, cosmic::Ren
             sweep: radial_sweep(self.fraction),
             track: crate::design::track(theme),
             used: self.tone.map_or_else(
-                || crate::design::muted_icon_color(theme),
+                || crate::design::accent_color(theme),
                 |tone| tone.resolve(theme),
             ),
             size: bounds.size(),

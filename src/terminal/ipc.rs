@@ -360,7 +360,11 @@ use crate::{
 /// Version 214 appends the `CheckWorktreeRemoval` device Git operation, which
 /// says whether a worktree's removal would be refused without removing it. A
 /// daemon before it could not decode it.
-pub const PROTOCOL_VERSION: u16 = 214;
+///
+/// Version 215 appends `WatchDeviceStats`, its `DeviceStats` answer and the
+/// `DeviceStats` readings that follow, for the status bar's view of the
+/// device's processors, memory and disk. An older client is never sent one.
+pub const PROTOCOL_VERSION: u16 = 215;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -942,6 +946,11 @@ pub enum ClientRequest {
         source: crate::chat::Session,
         queue_ids: Vec<String>,
     },
+    /// Subscribe this connection to the device's load. The answer is the
+    /// latest reading, and [`ServerMessage::DeviceStats`] follows whenever a
+    /// figure a window shows moves. The device is read only while some
+    /// connection watches.
+    WatchDeviceStats,
 }
 
 /// Read-only invalidations for the SSH bridge. They do not confer window
@@ -1280,6 +1289,13 @@ pub enum ServerMessage {
         /// earlier archived execution with the same pane ID.
         current: bool,
     },
+    /// A newer reading of the device's load, for a connection that sent
+    /// [`ClientRequest::WatchDeviceStats`]. Each supersedes every earlier
+    /// revision.
+    DeviceStats {
+        revision: u64,
+        stats: crate::device_stats::DeviceStats,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1471,6 +1487,12 @@ pub enum ServerResponse {
     ChatExitedQueue {
         source: TerminalId,
         queued: Option<ExitedQueuePage>,
+    },
+    /// The answer to [`ClientRequest::WatchDeviceStats`]: the latest reading,
+    /// or none while the first is still being taken.
+    DeviceStats {
+        revision: u64,
+        stats: Option<crate::device_stats::DeviceStats>,
     },
 }
 

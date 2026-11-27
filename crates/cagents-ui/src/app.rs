@@ -16,6 +16,7 @@ mod context_sections;
 mod daemon_health_ui;
 mod daemon_recovery;
 mod daemon_stop;
+mod device_load_ui;
 mod device_reconnect;
 mod device_ui;
 mod device_update_ui;
@@ -5595,6 +5596,8 @@ pub enum Message {
     AccountUi(account_ui::Action),
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
+    /// A new reading of this window's device's load.
+    DeviceLoad(device_load_ui::DeviceLoad),
     WorktreesUi(crate::worktrees_ui::Action),
     AutomationApproval(automation_approval::Action),
     /// The shell's light or dark mode changed, so a rendered document page no
@@ -17537,6 +17540,7 @@ impl Application for Cagents {
             part!("account", self.account_subscription()),
             part!("automation", self.automation_subscription()),
             part!("work", self.work_subscription()),
+            part!("device load", self.device_load_subscription()),
             part!(
                 "conversation pull request",
                 self.conversation_pull_request_subscription()
@@ -20934,6 +20938,10 @@ impl Cagents {
             Message::SessionRecovery(action) => self.update_session_recovery(action),
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
+            Message::DeviceLoad(load) => {
+                self.device_ui.load = load;
+                Task::none()
+            }
             Message::CursorBlink(blink) => {
                 // Every text cursor reads this on its next frame; the redraw
                 // that follows this message shows one turned steady mid-blink.
