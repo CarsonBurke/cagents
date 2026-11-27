@@ -781,13 +781,19 @@ fn notice_surface_with_footer<'a>(
         .spacing(space::S)
         .into();
     let content = match footer {
-        // Aligned with the body, past the severity icon.
+        // Aligned with the body, past the severity icon. A row rather than
+        // a padded container, whose default style would replace the
+        // severity's text colour with the window's.
         Some(footer) => widget::column::with_children(vec![
             row,
-            widget::container(footer)
-                .padding(Padding::ZERO.left(f32::from(ICON_SIZE) + space::S))
-                .width(Length::Fill)
-                .into(),
+            widget::row::with_children(vec![
+                iced::widget::Space::new()
+                    .width(f32::from(ICON_SIZE) + space::S)
+                    .into(),
+                footer,
+            ])
+            .width(Length::Fill)
+            .into(),
         ])
         .spacing(space::XS)
         .into(),
