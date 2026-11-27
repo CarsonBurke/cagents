@@ -522,11 +522,18 @@ forward() {
         status) runner=(retry_transfer '124 255' 'status request' read_on_host) ;;
         shot) runner=(on_host) ;;
     esac
-    "${runner[@]}" "$remote_prelude"'
+    "${runner[@]}" "$remote_prelude
+$(app_settings)"'
         [ -x "$tool/scripts/native-evidence" ] ||
             { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
         evidence "$@"
     ' "$@"
+}
+
+# The caller's settings native-evidence passes to the app, such as
+# WGPU_BACKEND=gl for the OpenGL fallback.
+app_settings() {
+    [ -z "${WGPU_BACKEND+x}" ] || printf 'export WGPU_BACKEND=%q\n' "$WGPU_BACKEND"
 }
 
 # forward, with the caller's compiler settings, which a fresh login on HOST

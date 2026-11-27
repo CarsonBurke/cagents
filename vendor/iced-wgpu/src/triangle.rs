@@ -273,6 +273,12 @@ impl State {
 }
 
 impl Pipeline {
+    /// The size of the multisampled targets every window shares, when there
+    /// are any; see [`msaa::Pipeline::size`].
+    pub fn msaa_size(&self) -> Option<Size<u32>> {
+        self.msaa.as_ref().and_then(msaa::Pipeline::size)
+    }
+
     pub fn new(
         device: &wgpu::Device,
         format: wgpu::TextureFormat,
@@ -295,11 +301,21 @@ fn render<'a>(
     bounds: Rectangle,
     group: impl Iterator<Item = (&'a Layer, &'a [Mesh], Transformation)>,
 ) {
+    // Every mesh drawn here is clipped to the layer, so the layer's pixels
+    // are all this pass changes.
+    let Some(region) = bounds.snap() else {
+        return;
+    };
+
     {
-        let mut render_pass = if let Some((_state, pipeline)) = &mut msaa {
-            pipeline.render_pass(encoder)
+        let (mut render_pass, attachment) = if let Some((_state, pipeline)) =
+            &mut msaa
+        {
+            let (pass, size) = pipeline.render_pass(encoder);
+
+            (pass, Some(size))
         } else {
-            encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("iced_wgpu.triangle.render_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: target,
@@ -314,7 +330,9 @@ fn render<'a>(
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
-            })
+            });
+
+            (pass, None)
         };
 
         for (layer, meshes, transformation) in group {
@@ -327,10 +345,42 @@ fn render<'a>(
                 &mut render_pass,
             );
         }
+
+        // The OpenGL backend resolves the multisampled attachment with a
+        // framebuffer blit when the pass ends, and a blit only writes inside
+        // the scissor still set: that of the last mesh drawn. The rest of the
+        // resolve texture, shared by every window, would keep what earlier
+        // passes resolved there, and the blend below would draw it again, so
+        // rings and arcs from other layers, frames and windows piled up
+        // wherever no later mesh covered them. Resolving the whole layer
+        // writes every pixel the blend reads.
+        if let Some(attachment) = attachment {
+            let scissor = clamp(region, attachment);
+
+            render_pass.set_scissor_rect(
+                scissor.x,
+                scissor.y,
+                scissor.width,
+                scissor.height,
+            );
+        }
     }
 
     if let Some((state, pipeline)) = msaa {
-        state.render(pipeline, encoder, target);
+        state.render(pipeline, encoder, target, region);
+    }
+}
+
+/// `region` without what lies past `size`.
+fn clamp(region: Rectangle<u32>, size: Size<u32>) -> Rectangle<u32> {
+    let x = region.x.min(size.width);
+    let y = region.y.min(size.height);
+
+    Rectangle {
+        x,
+        y,
+        width: region.width.min(size.width - x),
+        height: region.height.min(size.height - y),
     }
 }
 
@@ -955,5 +1005,156 @@ mod gradient {
                 constants_layout,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::core::{Color, Font, Pixels, Rectangle, Renderer as _, Size};
+    use crate::graphics::mesh::{self, Indexed, Mesh, SolidVertex2D};
+    use crate::graphics::{Antialiasing, Shell, Viewport, color};
+    use crate::{Engine, Renderer};
+
+    use std::future::Future;
+    use std::pin::pin;
+    use std::task::{Context, Poll, Waker};
+
+    const SIZE: u32 = 64;
+
+    /// Native wgpu resolves these futures when they are first polled.
+    fn ready<T>(future: impl Future<Output = T>) -> T {
+        let mut future = pin!(future);
+        let mut context = Context::from_waker(Waker::noop());
+
+        loop {
+            if let Poll::Ready(value) = future.as_mut().poll(&mut context) {
+                return value;
+            }
+        }
+    }
+
+    /// A renderer on the OpenGL backend with multisampled meshes, as a
+    /// machine without a working Vulkan driver gets, or `None` without one.
+    fn gl_renderer() -> Option<Renderer> {
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends: wgpu::Backends::GL,
+            ..Default::default()
+        });
+        let adapter = ready(instance.request_adapter(
+            &wgpu::RequestAdapterOptions::default(),
+        ))
+        .ok()?;
+        let (device, queue) =
+            ready(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .ok()?;
+        let engine = Engine::new(
+            &adapter,
+            device,
+            queue,
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+            Some(Antialiasing::MSAAx4),
+            Shell::headless(),
+        );
+
+        Some(Renderer::new(engine, Font::DEFAULT, Pixels(16.0)))
+    }
+
+    fn square(bounds: Rectangle, color: Color) -> Mesh {
+        let corner = |x: f32, y: f32| SolidVertex2D {
+            position: [x, y],
+            color: color::pack(color),
+        };
+        let (left, top) = (bounds.x, bounds.y);
+        let (right, bottom) = (left + bounds.width, top + bounds.height);
+
+        Mesh::Solid {
+            buffers: Indexed {
+                vertices: vec![
+                    corner(left, top),
+                    corner(right, top),
+                    corner(right, bottom),
+                    corner(left, bottom),
+                ],
+                indices: vec![0, 1, 2, 0, 2, 3],
+            },
+            transformation: crate::core::Transformation::IDENTITY,
+            clip_bounds: bounds,
+        }
+    }
+
+    fn pixel(frame: &[u8], x: u32, y: u32) -> [u8; 4] {
+        let at = ((y * SIZE + x) * 4) as usize;
+
+        frame[at..at + 4].try_into().expect("an RGBA pixel")
+    }
+
+    #[test]
+    fn a_mesh_is_not_drawn_again_after_it_is_gone() {
+        let Some(mut renderer) = gl_renderer() else {
+            eprintln!("skipped: no OpenGL adapter to render with");
+            return;
+        };
+        let viewport =
+            Viewport::with_physical_size(Size::new(SIZE, SIZE), 1.0);
+        let whole = Rectangle::with_size(Size::new(SIZE as f32, SIZE as f32));
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+
+        // The first frame draws a square in the top left corner.
+        renderer.reset(whole);
+        mesh::Renderer::draw_mesh(
+            &mut renderer,
+            square(Rectangle::new([4.0, 4.0].into(), [16.0, 16.0].into()), red),
+        );
+        let first = renderer.screenshot(&viewport, Color::BLACK);
+        assert_eq!(pixel(&first, 12, 12), [255, 0, 0, 255]);
+
+        // The next draws only one in a layer of its own at the bottom right.
+        renderer.reset(whole);
+        let corner = Rectangle::new([40.0, 40.0].into(), [20.0, 20.0].into());
+        renderer.start_layer(corner);
+        mesh::Renderer::draw_mesh(
+            &mut renderer,
+            square(Rectangle::new([44.0, 44.0].into(), [12.0, 12.0].into()), red),
+        );
+        renderer.end_layer();
+        let next = renderer.screenshot(&viewport, Color::BLACK);
+
+        assert_eq!(pixel(&next, 50, 50), [255, 0, 0, 255]);
+        assert_eq!(
+            pixel(&next, 12, 12),
+            [0, 0, 0, 255],
+            "the first frame's square is drawn again where no mesh is"
+        );
+    }
+    #[test]
+    fn every_mesh_in_a_layer_is_drawn_not_only_the_last() {
+        let Some(mut renderer) = gl_renderer() else {
+            eprintln!("skipped: no OpenGL adapter to render with");
+            return;
+        };
+        let viewport =
+            Viewport::with_physical_size(Size::new(SIZE, SIZE), 1.0);
+        let whole = Rectangle::with_size(Size::new(SIZE as f32, SIZE as f32));
+        let red = Color::from_rgb(1.0, 0.0, 0.0);
+
+        // Each mesh is clipped to its own square, so the last one leaves its
+        // clip set when the pass ends.
+        renderer.reset(whole);
+        mesh::Renderer::draw_mesh(
+            &mut renderer,
+            square(Rectangle::new([4.0, 4.0].into(), [16.0, 16.0].into()), red),
+        );
+        mesh::Renderer::draw_mesh(
+            &mut renderer,
+            square(Rectangle::new([44.0, 44.0].into(), [12.0, 12.0].into()), red),
+        );
+        let frame = renderer.screenshot(&viewport, Color::BLACK);
+
+        assert_eq!(pixel(&frame, 50, 50), [255, 0, 0, 255]);
+        assert_eq!(
+            pixel(&frame, 12, 12),
+            [255, 0, 0, 255],
+            "only the last mesh of the layer is drawn"
+        );
     }
 }

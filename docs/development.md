@@ -2456,7 +2456,10 @@ harness, it provides:
 - **Isolation.** The fixture has its own HOME, XDG directories, daemon and runtime
   directory, and the compositor has separate ones, so a session leaves the desktop's
   settings alone. The app starts from an empty environment: nothing from your shell
-  reaches it except locale and terminal settings, and where Cargo and rustup live. `claude` is the offline
+  reaches it except locale and terminal settings, `WGPU_BACKEND` (`gl` renders
+  with the OpenGL fallback a machine without a working Vulkan driver gets, also
+  through `--remote`; it is not remembered, so set it on every `start`,
+  `relaunch` and `open-window` of both sides), and where Cargo and rustup live. `claude` is the offline
   [synthetic provider](chat-composer-fixture.md), the same file on both sides, and
   `gh` always fails unless `$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge`
   exists, which makes it an offline, signed-in github.com with project avatars

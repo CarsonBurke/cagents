@@ -1,4 +1,4 @@
-use crate::core::{Size, Transformation};
+use crate::core::{Rectangle, Size, Transformation};
 use crate::graphics;
 
 use std::num::NonZeroU64;
@@ -138,32 +138,61 @@ impl Pipeline {
     ) -> Targets {
         let mut targets = self.targets.write().expect("Write MSAA targets");
 
-        match targets.as_mut() {
+        // Every window's renderer shares these targets, so they only grow,
+        // to fit each window in both directions: replacing them with one
+        // window's size would leave another window, wider or taller, drawing
+        // past their edge.
+        let size = match targets.as_ref() {
             Some(targets)
                 if region_size.width <= targets.size.width
-                    && region_size.height <= targets.size.height => {}
-            _ => {
-                *targets = Some(Targets::new(
-                    device,
-                    self.format,
-                    &self.texture_layout,
-                    self.sample_count,
-                    region_size,
-                ));
+                    && region_size.height <= targets.size.height =>
+            {
+                None
             }
+            Some(targets) => Some(Size::new(
+                region_size.width.max(targets.size.width),
+                region_size.height.max(targets.size.height),
+            )),
+            None => Some(region_size),
+        };
+
+        if let Some(size) = size {
+            *targets = Some(Targets::new(
+                device,
+                self.format,
+                &self.texture_layout,
+                self.sample_count,
+                size,
+            ));
         }
 
         targets.as_ref().unwrap().clone()
     }
 
+    /// The size of the shared targets, once a window has prepared them.
+    ///
+    /// Meshes are uploaded with a projection onto targets of this size, so a
+    /// window that presents its uploads again must prepare them anew once
+    /// another window has grown the targets.
+    pub fn size(&self) -> Option<Size<u32>> {
+        self.targets
+            .read()
+            .expect("Read MSAA targets")
+            .as_ref()
+            .map(|targets| targets.size)
+    }
+
+    /// Begins a pass that draws meshes into the cleared multisampled
+    /// attachment, which is resolved into the texture [`State::render`]
+    /// blends onto the frame. Returns the attachment's size too.
     pub fn render_pass<'a>(
         &self,
         encoder: &'a mut wgpu::CommandEncoder,
-    ) -> wgpu::RenderPass<'a> {
+    ) -> (wgpu::RenderPass<'a>, Size<u32>) {
         let targets = self.targets.read().expect("Read MSAA targets");
         let targets = targets.as_ref().unwrap();
 
-        encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+        let pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("iced_wgpu.triangle.render_pass"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &targets.attachment,
@@ -178,7 +207,9 @@ impl Pipeline {
             timestamp_writes: None,
             occlusion_query_set: None,
             multiview_mask: None,
-        })
+        });
+
+        (pass, targets.size)
     }
 }
 
@@ -330,11 +361,15 @@ impl State {
         Transformation::orthographic(targets.size.width, targets.size.height)
     }
 
+    /// Blends the resolved meshes onto `target` within `bounds`, the
+    /// physical region they were drawn in. Outside it the resolve texture
+    /// holds nothing this pass drew.
     pub fn render(
         &self,
         pipeline: &Pipeline,
         encoder: &mut wgpu::CommandEncoder,
         target: &wgpu::TextureView,
+        bounds: Rectangle<u32>,
     ) {
         let mut render_pass =
             encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -354,6 +389,12 @@ impl State {
                 multiview_mask: None,
             });
 
+        render_pass.set_scissor_rect(
+            bounds.x,
+            bounds.y,
+            bounds.width,
+            bounds.height,
+        );
         render_pass.set_pipeline(&pipeline.raw);
         render_pass.set_bind_group(0, &self.constants, &[]);
         render_pass.set_bind_group(
