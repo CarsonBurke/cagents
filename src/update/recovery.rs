@@ -2,7 +2,7 @@
 //! No checkpoint in this module is replayed, promoted, archived or removed.
 use super::*;
 use crate::{
-    model::{HostSessionProof, TerminalContinuity, TerminalSession},
+    model::{HostSessionProof, TerminalContinuity, TerminalId, TerminalSession},
     terminal_ipc::{StartupState, TerminalDescriptor},
 };
 use source::BusyPatience;
