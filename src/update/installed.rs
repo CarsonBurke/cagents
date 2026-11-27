@@ -7,6 +7,7 @@ pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
 const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
 #[derive(PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", derive(Serialize, Deserialize))]
 pub(super) struct Selection {
     current: PathBuf,
     previous_link: Option<PathBuf>,
@@ -82,6 +83,7 @@ pub(super) fn complete_selection(
 }
 
 #[derive(PartialEq, Eq)]
+#[cfg_attr(target_os = "macos", derive(Serialize, Deserialize))]
 pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -405,6 +407,21 @@ pub(super) fn perform(
             startup_attempted = true;
             startup_owned = true;
             let receipt = survivors.recovery_receipt();
+            #[cfg(target_os = "macos")]
+            let ready_plan = receipt
+                .filter(|receipt| receipt.is_ready())
+                .map(|receipt| {
+                    super::ready_plan::record(
+                        state,
+                        job,
+                        receipt,
+                        root,
+                        &selection,
+                        &before,
+                        &staged.identity.digest,
+                    )
+                })
+                .transpose()?;
             let activate = |standby: &mut crate::daemon::standby::Parked, job: &mut UpdateJob| {
                 standby.activate(&daemon, handoff.as_ref(), receipt, timeout, || {
                     let _ = report_overdue_startup(state, job);
@@ -417,6 +434,9 @@ pub(super) fn perform(
                     if standby.exited_during_start(&error)
                         && receipt
                             .is_some_and(|receipt| receipt.ready_before_restore() == Ok(true))
+                        && ready_plan.as_ref().is_some_and(|plan| {
+                            plan.unchanged().is_ok_and(|unchanged| unchanged)
+                        })
                         && Selection::capture(&layout)
                             .is_ok_and(|current| current == selection)
                         && stamp(root).is_ok_and(|current| current == before) =>

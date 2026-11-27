@@ -116,8 +116,12 @@ fn inventory_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover-inventory.json"))
 }
 
-#[cfg(feature = "host")]
-fn persist(state: &Path, target: &Path, bytes: &[u8], exclusive: bool) -> Result<(), UpdateError> {
+pub(super) fn persist(
+    state: &Path,
+    target: &Path,
+    bytes: &[u8],
+    exclusive: bool,
+) -> Result<(), UpdateError> {
     let temporary = state.join(format!(".cutover-{}", uuid::Uuid::new_v4()));
     let saved = (|| {
         let mut file = private_create(&temporary)?;
