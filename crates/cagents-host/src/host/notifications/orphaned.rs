@@ -93,31 +93,31 @@ fn include_abandoned(
     evidence: &crate::upgrade::handoff::Store,
     saved: &mut std::collections::BTreeSet<TerminalId>,
 ) -> Result<(), String> {
-    let Some(checkpoint) = evidence.load_abandoned()? else {
-        return Ok(());
-    };
-    // The archive is retained even after identity reconciliation, and is
-    // never replayed. Conservatively keep only the sessions it can name.
-    for (current, previous) in checkpoint
-        .terminals
-        .iter()
-        .map(|entry| (&entry.source, &entry.previous_sources))
-        .chain(
-            checkpoint
-                .carried
-                .iter()
-                .map(|entry| (&entry.source, &entry.previous_sources)),
-        )
-    {
-        saved.insert(current.id);
-        saved.extend(previous.iter().map(|entry| entry.id));
-    }
-    for entry in &checkpoint.chats {
-        for source in std::iter::once(&entry.source)
-            .chain(entry.previous_sources.iter().map(|entry| &entry.source))
+    // Archives remain after identity reconciliation and never replay. Keep
+    // attention for the exact sessions each archive names.
+    for checkpoint in evidence.abandoned_checkpoints()? {
+        let checkpoint = checkpoint?;
+        for (current, previous) in checkpoint
+            .terminals
+            .iter()
+            .map(|entry| (&entry.source, &entry.previous_sources))
+            .chain(
+                checkpoint
+                    .carried
+                    .iter()
+                    .map(|entry| (&entry.source, &entry.previous_sources)),
+            )
         {
-            saved.insert(source.id);
-            saved.extend(source.terminal.iter().map(|terminal| terminal.id));
+            saved.insert(current.id);
+            saved.extend(previous.iter().map(|entry| entry.id));
+        }
+        for entry in &checkpoint.chats {
+            for source in std::iter::once(&entry.source)
+                .chain(entry.previous_sources.iter().map(|entry| &entry.source))
+            {
+                saved.insert(source.id);
+                saved.extend(source.terminal.iter().map(|terminal| terminal.id));
+            }
         }
     }
     Ok(())

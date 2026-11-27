@@ -142,7 +142,12 @@ fn main() -> std::process::ExitCode {
     // admission, so a refused start is in the development log too.
     unsafe { cagents::instance::redirect_development_daemon_log() };
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
-    let admission = match unsafe { cagents_host::host::prepare_daemon_admission() } {
+    let admission = match unsafe {
+        cagents_host::host::prepare_daemon_admission(
+            #[cfg(target_os = "macos")]
+            standby.as_ref(),
+        )
+    } {
         Ok(admission) => admission,
         Err(error) => {
             if let Some(standby) = &standby {

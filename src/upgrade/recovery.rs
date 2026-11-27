@@ -1716,6 +1716,149 @@ pub(crate) struct ReadyPlanEvidence<'a> {
 
 #[cfg(target_os = "macos")]
 impl ReadyPlanEvidence<'_> {
+    pub(crate) fn same_boot(&self) -> io::Result<bool> {
+        Ok(self.authority.source.boot_id == crate::daemon::read_boot_id()?)
+    }
+
+    pub(crate) fn names_current_runtime(&self) -> Result<bool, String> {
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+        Ok(same_authority_path(
+            &self.authority.daemon_path,
+            &paths.lock,
+        ))
+    }
+
+    pub(crate) fn names_job(&self, state: &Path, job: &str) -> bool {
+        self.authority.job == job && self.authority.worker_path == state.join("lock")
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn same_authority(&self, authority: &Authority) -> bool {
+        let original = self.authority.as_ref();
+        original.job == authority.job
+            && original.checkpoint_hash == authority.checkpoint_hash
+            && original.job_request_hash == authority.job_request_hash
+            && original.target == authority.target
+            && original.target_hash == authority.target_hash
+            && original.source == authority.source
+    }
+
+    pub(crate) fn claim_exists(&self) -> Result<bool, String> {
+        match fs::symlink_metadata(ready_claim_path(&self.authority)?) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.to_string()),
+        }
+    }
+
+    pub(crate) fn source(&self) -> &HostSessionProof {
+        &self.authority.source
+    }
+
+    pub(crate) fn saved_windows(&self) -> &[String] {
+        &self.authority.windows
+    }
+
+    /// Keep the original saved work eligible for the selected source when the
+    /// candidate disappeared before obtaining permission to touch it.
+    pub(crate) fn verify_unclaimed_source(
+        &self,
+        worker: &File,
+        guard: &UiUpdateGuard,
+        handoff: &LeaseHandoff,
+    ) -> Result<(), String> {
+        let authority = &self.authority;
+        if authority.version != 1
+            || !matches!(authority.origin, Origin::AcknowledgedPrepare)
+            || !self.same_boot().map_err(|error| error.to_string())?
+            || !self.names_current_runtime()?
+            || self.claim_exists()?
+        {
+            return Err("The selected source no longer owns the untouched Ready checkpoint".into());
+        }
+        let (fence, legacy) = guard
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        let daemon = handoff
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        for (file, path) in [
+            (worker, &authority.worker_path),
+            (&fence, &authority.fence_path),
+            (&daemon, &authority.daemon_path),
+        ] {
+            validate_lock(file, path).map_err(|error| error.to_string())?;
+        }
+        validate_lock_mode(&legacy, &authority.legacy_path, "READ")
+            .map_err(|error| error.to_string())?;
+        if !handoff
+            .recorded_source_is(&authority.source)
+            .map_err(|error| error.to_string())?
+            || !crate::instance::state_claim::last_daemon_was(
+                &authority.daemon_path,
+                &authority.source,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            return Err("A different daemon has used the saved work".into());
+        }
+        validate_received_checkpoint(authority, Phase::Ready)?;
+        let original = open_checkpoint(&authority.checkpoint_path)?
+            .ok_or("The approved Ready checkpoint disappeared")?;
+        let metadata = original.metadata().map_err(|error| error.to_string())?;
+        if (metadata.dev(), metadata.ino()) != self.checkpoint
+            || digest(&read_checkpoint_input(&original)?) != authority.checkpoint_hash
+            || validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest)
+        {
+            return Err("The original Ready checkpoint or inventory changed".into());
+        }
+        let state = authority
+            .worker_path
+            .parent()
+            .ok_or("The update directory disappeared")?;
+        let request = read_checkpoint(&state.join(format!("{}.request", authority.job)))?
+            .ok_or("Recovery update request disappeared")?;
+        if digest(&request) != authority.job_request_hash {
+            return Err("The recovery update request changed after preparation".into());
+        }
+        validate_request_origin(authority, &request)?;
+        Ok(())
+    }
+
+    pub(crate) fn claimed_process_exited(&self) -> Result<bool, String> {
+        #[derive(Deserialize)]
+        struct Claim {
+            version: u16,
+            job: String,
+            request_digest: String,
+            checkpoint_digest: String,
+            capture_digest: String,
+            source: HostSessionProof,
+            target: PathBuf,
+            successor: crate::daemon::holder_registry::Process,
+        }
+
+        let authority = &self.authority;
+        let path = ready_claim_path(authority)?;
+        let bytes = read_checkpoint(&path)?.ok_or("The update's Ready claim is missing")?;
+        let claim: Claim = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        if claim.version != 1
+            || claim.job != authority.job
+            || claim.request_digest != authority.job_request_hash
+            || claim.checkpoint_digest != authority.checkpoint_hash
+            || claim.capture_digest != self.capture_digest
+            || claim.source != authority.source
+            || claim.target != authority.target
+            || claim.successor.pid <= 1
+            || claim.successor.start == 0
+            || !self.same_boot().map_err(|error| error.to_string())?
+        {
+            return Err("The installed update has no exact claimant to settle".into());
+        }
+        crate::pinned_process::exited_since(claim.successor.pid as u32, claim.successor.start)
+            .map_err(|error| error.to_string())
+    }
+
     /// Rebind an untouched approval to the newly held locks. No generic
     /// Ready checkpoint can grant this authority after coordinator loss.
     pub(crate) fn reopen(
@@ -4677,6 +4820,7 @@ pub(crate) fn accept_ready_authority(
         .ok_or_else(|| io::Error::other("Installed Ready activation has no original capture"))?;
     // This precedes runtime publication, saved-state admission and every
     // startup path that can act on the original provider or its database.
+    crate::update::admit_shared_ready(&authority).map_err(io::Error::other)?;
     let successor = crate::daemon::new_host_session_proof()?;
     if successor.boot_id != authority.source.boot_id {
         return Err(io::Error::other(

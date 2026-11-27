@@ -95,7 +95,7 @@ impl TerminalChanges {
         Self::watch_directory(&directory)
     }
 
-    fn watch_directory(directory: &Path) -> Result<Self, UpdateError> {
+    pub(super) fn watch_directory(directory: &Path) -> Result<Self, UpdateError> {
         let (receiver, sender) = UnixDatagram::pair()?;
         receiver.set_nonblocking(true)?;
         sender.set_nonblocking(true)?;

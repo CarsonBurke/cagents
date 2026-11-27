@@ -273,6 +273,8 @@ pub fn claim_daemon_state(lock: &Path, host_session: &str) -> io::Result<StateCl
 /// Claim this instance's daemon state for maintenance of the stopped daemon's
 /// store, which holds its runtime lease `lock`.
 pub fn claim_store_maintenance(lock: &Path) -> io::Result<StateClaim> {
+    #[cfg(target_os = "macos")]
+    crate::update::require_no_activation().map_err(io::Error::other)?;
     claim_daemon_state_in(&claims_directory()?, lock, None, Claimant::Maintenance)
 }
 

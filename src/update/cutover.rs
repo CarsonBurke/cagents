@@ -24,7 +24,7 @@ struct Intent {
 
 #[derive(Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
-enum Stage {
+pub(super) enum Stage {
     Pending,
     Deferred,
 }
@@ -116,6 +116,7 @@ fn inventory_path(state: &Path, job: &str) -> PathBuf {
     state.join(format!("{job}.cutover-inventory.json"))
 }
 
+#[cfg(any(feature = "host", target_os = "macos", test))]
 pub(super) fn persist(
     state: &Path,
     target: &Path,
@@ -433,6 +434,17 @@ pub(crate) fn record(
         persist(&state, &witness_path, &witness, true)?;
     }
     intent.persist(&state)
+}
+
+pub(super) fn recorded_selection(
+    layout: &InstallLayout,
+    state: &Path,
+    job: &UpdateJob,
+) -> Result<Option<Stage>, UpdateError> {
+    let Some(intent) = read(state, &job.id)? else {
+        return Ok(None);
+    };
+    Ok((intent.names_selected(layout)? && has_witness(state, &job.id)?).then_some(intent.stage))
 }
 
 /// An unrelated job must not replace the unfinished status between the
