@@ -722,6 +722,129 @@ fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
     Some(deliveries)
 }
 
+/// Initialize the serving daemon under its runtime and saved-data leases.
+/// The returned services stay owned by the daemon until its main loop exits.
+fn initialize_serving_host(
+    host: &SharedHost,
+    paths: &RuntimePaths,
+    first_this_boot: bool,
+) -> Result<(Option<notifications::Broker>, activity::Monitor), HostError> {
+    // Before anything is launched, so the epoch precedes every launch.
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof_handle();
+    crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
+    // Before anything is launched or adopted: sessions launched through this
+    // entry by an earlier daemon now run the CLI that speaks this protocol.
+    if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
+        tracing::warn!(
+            %error,
+            "sessions will name this version's CLI directory, which a later update does not follow"
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // Capture the login shell's PATH before admitting native provider
+        // launches. The bounded shell probe imports only PATH and is cached.
+        // LaunchServices and launchd can both start with a shorter PATH.
+        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            let _ = runtime.block_on(crate::account::probe::search_path());
+        }
+    }
+    let codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
+    let native_chat_capacity = crate::native_chat_capacity::load()? as usize;
+    let chat_deliveries = open_chat_deliveries();
+    let prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.codex_listeners = codex_listeners;
+        state.native_chat_capacity = native_chat_capacity;
+        state.chat_deliveries = chat_deliveries;
+        state.prompt_cache = prompt_cache;
+        state.enable_holder_recovery();
+    }
+    // A daemon that cannot open the shared-model store still hosts terminals.
+    // The model is reported unavailable to the clients that ask for it, which is
+    // what keeps a window from mistaking a broken store for an empty registry
+    // and donating its state over and over.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("opening workspace model", None);
+    match model::Registry::open() {
+        Ok(mut registry) => {
+            match crate::agent_execution::concurrency::Setting::configured() {
+                Ok(setting) => registry.use_concurrency(setting),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "the agent concurrency limits cannot be configured; the defaults apply"
+                ),
+            }
+            // Before any client reads the model: a window must never see a
+            // worktree's panes outside its checkout's channel.
+            match registry.adopt_worktree_views() {
+                Ok(adopted) if adopted.strips > 0 => tracing::info!(
+                    strips = adopted.strips,
+                    panes = adopted.panes,
+                    channels = adopted.created_channels,
+                    kept = adopted.kept,
+                    failed = adopted.failed,
+                    "moved worktree strips into their checkouts' channels"
+                ),
+                Ok(_) => {}
+                Err(error) => tracing::error!(%error, "worktree strips were not moved into \
+                                                     channels; they still open as strips"),
+            }
+            host.lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .install_model(registry)
+        }
+        Err(error) => {
+            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
+                                    not be shared between windows")
+        }
+    }
+    workspace::titles::install(host);
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("workspace model opened", None);
+    let notification_application = crate::instance::notification_daemon_application(
+        &crate::process::current_executable()?,
+        std::env::args_os()
+            .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
+    )?;
+    let notification_broker = match notifications::Broker::start(host, notification_application) {
+        Ok(broker) => Some(broker),
+        Err(error) => {
+            tracing::warn!(%error, "agent notifications are unavailable");
+            None
+        }
+    };
+    if let Some(broker) = &notification_broker {
+        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
+    }
+    // Cache sweeps preserve unretired helper journals and live Store leases.
+    if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
+        tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
+    }
+    if let Err(error) = daemon::codex_temp::sweep() {
+        tracing::warn!(%error, "stale Codex temporary directories could not be swept");
+    }
+    if let Err(error) = start_scope_collection() {
+        tracing::warn!(%error, "empty session scopes were not collected");
+    }
+    // This mandatory thread service must be available before any adoption
+    // can discard the holder's replay copy. It observes no process until the
+    // same HostState publishes one; it initiates no execution.
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("starting activity monitor", None);
+    let agent_activity = activity::Monitor::start(host)?;
+    #[cfg(all(test, target_os = "linux"))]
+    observe_fixture_startup("activity monitor started", None);
+    Ok((notification_broker, agent_activity))
+}
+
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("host run entered", None);
@@ -803,112 +926,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     if let Some(ready) = &ready_admission {
         ready.begin_workspace_effects()?;
     }
-    // Before anything is launched, so the epoch precedes every launch.
-    crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
-    // Before anything is launched or adopted: sessions launched through this
-    // entry by an earlier daemon now run the CLI that speaks this protocol.
-    if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
-        tracing::warn!(
-            %error,
-            "sessions will name this version's CLI directory, which a later update does not follow"
-        );
-    }
-    #[cfg(target_os = "macos")]
-    {
-        // Capture the login shell's PATH before admitting native provider
-        // launches. The bounded shell probe imports only PATH and is cached.
-        // LaunchServices and launchd can both start with a shorter PATH.
-        if let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            let _ = runtime.block_on(crate::account::probe::search_path());
-        }
-    }
-    let mut initial = HostState::new(proof);
-    initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
-    initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
-    initial.chat_deliveries = open_chat_deliveries();
-    initial.prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
-    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
-    host.lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .enable_holder_recovery();
-    // A daemon that cannot open the shared-model store still hosts terminals.
-    // The model is reported unavailable to the clients that ask for it, which is
-    // what keeps a window from mistaking a broken store for an empty registry
-    // and donating its state over and over.
-    #[cfg(all(test, target_os = "linux"))]
-    observe_fixture_startup("opening workspace model", None);
-    match model::Registry::open() {
-        Ok(mut registry) => {
-            match crate::agent_execution::concurrency::Setting::configured() {
-                Ok(setting) => registry.use_concurrency(setting),
-                Err(error) => tracing::warn!(
-                    %error,
-                    "the agent concurrency limits cannot be configured; the defaults apply"
-                ),
-            }
-            // Before any client reads the model: a window must never see a
-            // worktree's panes outside its checkout's channel.
-            match registry.adopt_worktree_views() {
-                Ok(adopted) if adopted.strips > 0 => tracing::info!(
-                    strips = adopted.strips,
-                    panes = adopted.panes,
-                    channels = adopted.created_channels,
-                    kept = adopted.kept,
-                    failed = adopted.failed,
-                    "moved worktree strips into their checkouts' channels"
-                ),
-                Ok(_) => {}
-                Err(error) => tracing::error!(%error, "worktree strips were not moved into \
-                                                     channels; they still open as strips"),
-            }
-            host.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .install_model(registry)
-        }
-        Err(error) => {
-            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
-                                    not be shared between windows")
-        }
-    }
-    workspace::titles::install(&host);
-    #[cfg(all(test, target_os = "linux"))]
-    observe_fixture_startup("workspace model opened", None);
-    let notification_application = crate::instance::notification_daemon_application(
-        &crate::process::current_executable()?,
-        std::env::args_os()
-            .any(|argument| argument == crate::instance::CEDITOR_NOTIFICATION_ARGUMENT),
-    )?;
-    let notification_broker = match notifications::Broker::start(&host, notification_application) {
-        Ok(broker) => Some(broker),
-        Err(error) => {
-            tracing::warn!(%error, "agent notifications are unavailable");
-            None
-        }
-    };
-    if let Some(broker) = &notification_broker {
-        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
-    }
-    // Cache sweeps preserve unretired helper journals and live Store leases.
-    if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
-        tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
-    }
-    if let Err(error) = daemon::codex_temp::sweep() {
-        tracing::warn!(%error, "stale Codex temporary directories could not be swept");
-    }
-    if let Err(error) = start_scope_collection() {
-        tracing::warn!(%error, "empty session scopes were not collected");
-    }
-    // This mandatory thread service must be available before any adoption
-    // can discard the holder's replay copy. It observes no process until the
-    // same HostState publishes one; it initiates no execution.
-    #[cfg(all(test, target_os = "linux"))]
-    observe_fixture_startup("starting activity monitor", None);
-    let _agent_activity = activity::Monitor::start(&host)?;
-    #[cfg(all(test, target_os = "linux"))]
-    observe_fixture_startup("activity monitor started", None);
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
+    let (_notification_broker, _agent_activity) =
+        initialize_serving_host(&host, &paths, first_this_boot)?;
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
