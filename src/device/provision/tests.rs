@@ -121,6 +121,24 @@ fn a_compatible_device_is_left_alone() {
     let mut stopped = remote;
     stopped.protocol = Some(PROTOCOL_VERSION);
     assert_eq!(action(&stopped, &Daemon::Stopped), Action::Nothing);
+    // Sending the build again cannot help reach a daemon this computer could
+    // not; the note says what might.
+    stopped.off_path = true;
+    let unreachable = plan(
+        &device("cagents"),
+        &OURS,
+        &stopped,
+        &Daemon::Unknown("not found".into()),
+    )
+    .unwrap();
+    assert_eq!(unreachable.action, Action::Nothing);
+    assert!(
+        unreachable
+            .note
+            .unwrap()
+            .contains("/home/user/.local/bin/cagents")
+    );
+    stopped.off_path = false;
     stopped.protocol = Some(PROTOCOL_VERSION - 1);
     assert!(matches!(
         action(&stopped, &Daemon::Stopped),

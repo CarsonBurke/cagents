@@ -449,6 +449,19 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
                 note: None,
             });
         }
+        Daemon::Unknown(error) if remote.protocol == Some(PROTOCOL_VERSION) => {
+            // This build is already there; sending it again cannot help reach
+            // its daemon.
+            let installed_link = format!("{}/.local/bin/cagents", remote.home);
+            return Ok(Plan {
+                action: Action::Nothing,
+                note: Some(if remote.off_path {
+                    unreachable_note(device, &installed_link)
+                } else {
+                    format!("This computer could not reach {name}'s daemon: {error}")
+                }),
+            });
+        }
         _ => {}
     }
     // The daemon or the installed CLI, whichever is newer: a stopped daemon
@@ -737,13 +750,13 @@ impl Session {
             stdin.write_all(INSTALLER.as_bytes())
         })?;
         progress(Step::Installing);
-        // The installer reports to the person, so its output is theirs; this
-        // command's own stdout stays free for its result.
-        let status = self
+        // The installer addresses someone at the device's desktop, so its
+        // report is shown only when it fails.
+        let output = self
             .command("sh -s")
             .stdin(Stdio::piped())
-            .stdout(io::stderr())
-            .stderr(Stdio::inherit())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
             .spawn()
             .and_then(|mut child| {
                 child.stdin.take().expect("piped stdin").write_all(
@@ -757,12 +770,16 @@ impl Session {
                     )
                     .as_bytes(),
                 )?;
-                child.wait()
+                child.wait_with_output()
             })?;
-        if !status.success() {
+        if !output.status.success() {
+            let report =
+                String::from_utf8_lossy(&output.stdout) + String::from_utf8_lossy(&output.stderr);
             return Err(io::Error::other(format!(
-                "{}'s installer did not stage cagents {version} ({status}); its own message is above. Nothing on {} changed unless it says so.",
-                self.name, self.name
+                "{name}'s installer did not stage cagents {version} ({status}). Nothing on {name} changed unless it says so:\n{report}",
+                name = self.name,
+                status = output.status,
+                report = report.trim_end()
             )));
         }
         Ok(sent)

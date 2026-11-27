@@ -168,10 +168,7 @@ fn update(
                         eprintln!();
                     }
                 } else if first {
-                    eprintln!(
-                        "Sending cagents {version} to {name} ({} MB)…",
-                        total / 1_000_000
-                    );
+                    eprintln!("Sending cagents {version} to {name}…");
                 }
                 return;
             }
@@ -196,9 +193,7 @@ fn update(
         Outcome::AlreadyCompatible { running: false } => (
             "compatible",
             None,
-            format!(
-                "{name}'s cagents already uses protocol {protocol}; its daemon starts when you connect. Nothing changed."
-            ),
+            format!("{name}'s cagents already uses protocol {protocol}. Nothing changed."),
         ),
         Outcome::Updated { sent } => (
             "updated",
