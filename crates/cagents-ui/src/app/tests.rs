@@ -10826,8 +10826,8 @@ async fn progress_occupies_the_notice_slot_until_it_is_done() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-        Some("Indexing (40%)")
+        app.lsp_contexts[&card].attachment.context.notice,
+        Some(inspector::LspNotice::Progress("Indexing (40%)".into()))
     );
 
     app.apply_lsp_event(
@@ -11943,6 +11943,7 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
         .notice
         .clone()
         .expect("the desync is reported");
+    assert!(failure.is_failure(), "a desync is a failure, not progress");
 
     for done in [false, true] {
         app.apply_lsp_event(
@@ -11957,8 +11958,8 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
                 .await,
         );
         assert_eq!(
-            app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-            Some(failure.as_str()),
+            app.lsp_contexts[&card].attachment.context.notice.as_ref(),
+            Some(&failure),
             "progress with done={done} replaced the failure"
         );
     }
@@ -11978,8 +11979,8 @@ async fn progress_does_not_erase_a_failure_the_user_has_not_read() {
             .await,
     );
     assert_eq!(
-        app.lsp_contexts[&card].attachment.context.notice.as_deref(),
-        Some("Indexing (10%)")
+        app.lsp_contexts[&card].attachment.context.notice,
+        Some(inspector::LspNotice::Progress("Indexing (10%)".into()))
     );
     app.lsp.begin_shutdown().await;
 }

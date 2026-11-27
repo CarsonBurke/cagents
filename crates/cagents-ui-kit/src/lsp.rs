@@ -187,8 +187,16 @@ pub enum LspStatus {
     /// No server is configured for this document, or LSP is switched off
     /// entirely by an empty `language_servers` list.
     Disabled,
-    /// The server could not be used at all: the executable is absent, the path
-    /// cannot be addressed as a document URI, or no async runtime is running.
+    /// The configured executable is not installed: `program`, the command's
+    /// first word, names no executable file on `PATH`. Restarting cannot fix
+    /// this; installing it and retrying can.
+    Missing {
+        /// [`LanguageServerSettings::id`] of the server that claims the file.
+        server: String,
+        program: String,
+    },
+    /// The server could not be used at all: the path cannot be addressed as a
+    /// document URI, no async runtime is running, or a limit refused it.
     Unavailable { reason: String },
     /// The process is spawned and `initialize` is in flight.
     Starting,
@@ -2010,7 +2018,30 @@ struct LaunchSpec {
     root: PathBuf,
 }
 
-type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, String> + Send + Sync>;
+type TransportFactory = Arc<dyn Fn(&LaunchSpec) -> Result<Transport, LaunchError> + Send + Sync>;
+
+/// Why a server's process could not be launched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LaunchError {
+    /// The command's first word names no executable on `PATH`: the one cause
+    /// the user fixes by installing something rather than by restarting.
+    Missing {
+        program: String,
+    },
+    Other(String),
+}
+
+impl From<String> for LaunchError {
+    fn from(reason: String) -> Self {
+        Self::Other(reason)
+    }
+}
+
+impl From<&str> for LaunchError {
+    fn from(reason: &str) -> Self {
+        Self::Other(reason.to_owned())
+    }
+}
 
 /// Keep the original directory inode allocated while a server owns its root.
 /// A path can be renamed and replaced between watchdog polls; existence alone
@@ -2078,7 +2109,7 @@ fn is_executable_file(path: &Path) -> bool {
 /// this process's `PATH` and working directory.
 ///
 /// See [`resolve_program_in`] for why resolution cannot be left to the child.
-fn resolve_program(program: &str) -> Result<PathBuf, String> {
+fn resolve_program(program: &str) -> Result<PathBuf, LaunchError> {
     let working_directory = std::env::current_dir()
         .map_err(|error| format!("the working directory could not be read: {error}"))?;
     resolve_program_in(
@@ -2102,7 +2133,7 @@ fn resolve_program_in(
     program: &str,
     search_path: Option<&OsStr>,
     working_directory: &Path,
-) -> Result<PathBuf, String> {
+) -> Result<PathBuf, LaunchError> {
     let named = Path::new(program);
     // A command naming a path is honoured as written, only anchored: the
     // configuration named a file rather than a program to search for.
@@ -2118,12 +2149,14 @@ fn resolve_program_in(
             return Ok(candidate);
         }
     }
-    Err(format!("`{program}` was not found on PATH"))
+    Err(LaunchError::Missing {
+        program: program.to_owned(),
+    })
 }
 
 /// Spawns the configured executable directly: never a shell, always its own
 /// process group so a misbehaving server tree can be terminated wholesale.
-fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, String> {
+fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, LaunchError> {
     let (program, arguments) = spec
         .command
         .split_first()
@@ -2142,9 +2175,11 @@ fn spawn_process_transport(spec: &LaunchSpec) -> Result<Transport, String> {
     command.process_group(0);
     let child = command.spawn().map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
-            format!("`{program}` was not found on PATH")
+            LaunchError::Missing {
+                program: program.clone(),
+            }
         } else {
-            format!("`{program}` could not be started: {error}")
+            LaunchError::Other(format!("`{program}` could not be started: {error}"))
         }
     })?;
     let mut child = ChildProcess::new(child)
@@ -2655,7 +2690,16 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
     }
     let transport = match (context.transport)(&context.launch) {
         Ok(transport) => transport,
-        Err(reason) => {
+        Err(LaunchError::Missing { program }) => {
+            context
+                .set_status(LspStatus::Missing {
+                    server: context.key.server_id.to_string(),
+                    program,
+                })
+                .await;
+            return;
+        }
+        Err(LaunchError::Other(reason)) => {
             context.set_status(LspStatus::Unavailable { reason }).await;
             return;
         }

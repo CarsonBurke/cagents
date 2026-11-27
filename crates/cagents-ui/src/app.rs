@@ -5965,7 +5965,11 @@ impl LspInspectorState {
     /// Recomputes the single notice the surface renders from the two
     /// independent things that can want it.
     fn refresh_notice(&mut self) {
-        self.attachment.context.notice = self.failure.clone().or_else(|| self.progress.clone());
+        self.attachment.context.notice = self
+            .failure
+            .clone()
+            .map(inspector::LspNotice::Failure)
+            .or_else(|| self.progress.clone().map(inspector::LspNotice::Progress));
     }
 }
 
@@ -14114,7 +14118,7 @@ impl Cagents {
             let state = self.lsp_contexts.entry(card).or_default();
             state.blocked_by_other_buffer = true;
             state.attachment.context.status = Some(LspStatus::Unavailable {
-                reason: "This file is already open for language tools in another pane. Close that file there, then restart the language server here.".into(),
+                reason: "This file is already open for language tools in another pane. Close it there, then choose Retry here.".into(),
             });
             return self.flush_pending_lsp_jump_with_source(card, path, Some(text));
         }
@@ -14507,11 +14511,18 @@ impl Cagents {
                     state.failure = None;
                     state.progress = None;
                     state.refresh_notice();
+                    state.attachment.context.details_open = false;
                     state.attachment.context.status = Some(self.lsp.status(doc));
                 }
                 if let Some(CardRuntime::Repository(runtime)) = self.cards.get_mut(&card) {
                     runtime.dismiss_editor_results();
                     runtime.set_editor_diagnostics(Vec::new());
+                }
+                Task::none()
+            }
+            InspectorAction::ToggleLanguageServerDetails(card) => {
+                if let Some(state) = self.lsp_contexts.get_mut(&card) {
+                    state.attachment.context.details_open ^= true;
                 }
                 Task::none()
             }
@@ -15494,6 +15505,7 @@ impl Cagents {
                 iced::clipboard::write(diagnostic.copy_text()).map(cosmic::Action::App)
             }
             action @ (InspectorAction::RestartLanguageServer(_)
+            | InspectorAction::ToggleLanguageServerDetails(_)
             | InspectorAction::DismissLspResults(_)
             | InspectorAction::JumpToLspDiagnostic { .. }
             | InspectorAction::JumpToLspLocation { .. }) => self.update_lsp(action),

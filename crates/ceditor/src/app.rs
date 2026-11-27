@@ -916,6 +916,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 
 fn language_server_failure(status: LspStatus) -> Option<String> {
     match status {
+        LspStatus::Missing { program, .. } => Some(format!("`{program}` was not found on PATH")),
         LspStatus::Unavailable { reason } => Some(reason),
         LspStatus::Failed {
             reason,

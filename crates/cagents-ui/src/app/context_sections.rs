@@ -127,6 +127,9 @@ enum Height {
     /// Its own content's height, up to this many pixels, past which it
     /// scrolls.
     Content { height: f32 },
+    /// Exactly this height: a few status lines, which never grow into the
+    /// room a list would.
+    Fit { height: f32 },
 }
 
 /// The rows the Work list keeps room for, whatever it holds and whether or
@@ -323,9 +326,16 @@ impl Cagents {
                 _ => None,
             })
             .collect();
+        let fitted: f32 = panes
+            .iter()
+            .filter_map(|pane| match (&pane.body, pane.height) {
+                (Some(_), Height::Fit { height }) => Some(height),
+                _ => None,
+            })
+            .sum();
         // With nothing sharing the height, the first open list grows into
-        // what the headers and the other lists leave, rather than scrolling
-        // within a few rows above an empty panel.
+        // what the headers, the other lists and the fitted sections leave,
+        // rather than scrolling within a few rows above an empty panel.
         let mut lead = (!shared).then(|| {
             lead_list_height(
                 self.context_sections_height
@@ -333,7 +343,7 @@ impl Cagents {
                     - activity_height,
                 panes.len(),
                 lists.first().copied().unwrap_or_default(),
-                lists.iter().skip(1).sum(),
+                lists.iter().skip(1).sum::<f32>() + fitted,
             )
         });
         let mut children: Vec<Element<'_, Message>> = Vec::with_capacity(panes.len() * 3 + 3);
@@ -377,6 +387,10 @@ impl Cagents {
                     Height::Content { height } => widget::container(body)
                         .width(Length::Fill)
                         .height(lead.take().unwrap_or(height))
+                        .into(),
+                    Height::Fit { height } => widget::container(body)
+                        .width(Length::Fill)
+                        .height(height)
                         .into(),
                 });
             }
@@ -908,8 +922,18 @@ impl Cagents {
                 scope: None,
                 description: None,
                 // A request's failure notice lingers until it is dismissed.
-                controls: lsp.notice.is_some().then(dismiss).into_iter().collect(),
-                height: Height::Share,
+                controls: lsp
+                    .notice
+                    .as_ref()
+                    .is_some_and(inspector::LspNotice::is_failure)
+                    .then(dismiss)
+                    .into_iter()
+                    .collect(),
+                // A section that only says how the server is doing is a
+                // line or two, not a share of the panel; diagnostics and
+                // unfolded details scroll in a share.
+                height: inspector::problems_status_height(card, lsp)
+                    .map_or(Height::Share, |height| Height::Fit { height }),
                 body: open
                     .then(|| inspector::problems_view(card, lsp).map(Message::ContextInspector)),
             });
