@@ -15,13 +15,15 @@ pub use crate::pinned_process::{PeerCredentials, peer_credentials};
 pub mod codex_temp;
 pub mod holder_registry;
 pub(crate) mod hosting;
-#[cfg(feature = "host")]
-pub use hosting::peer_requires_session_authority;
 pub mod lease_handoff;
 #[cfg(feature = "host")]
 pub mod lost_processes;
 #[cfg(feature = "host")]
 pub mod owned_children;
+#[cfg(feature = "host")]
+mod peer_scope;
+#[cfg(feature = "host")]
+pub use peer_scope::peer_requires_session_authority;
 #[cfg(feature = "host")]
 pub mod process_scope;
 #[doc(hidden)]

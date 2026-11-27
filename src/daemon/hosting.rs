@@ -1,4 +1,4 @@
-//! Process ancestry for recognizing hosted sessions and protecting their daemons.
+//! Whether a hosted session may stop a development daemon.
 //!
 //! A hosted session must never stop the daemon that hosts it, or one hosting
 //! a session it descends from: that ends its own terminal or chat and every
@@ -33,7 +33,7 @@ use super::RuntimePaths;
 use crate::instance;
 
 const DAEMON_EXECUTABLE: &str = "cagentsd";
-const MAX_ANCESTORS: usize = 1024;
+pub(super) const MAX_ANCESTORS: usize = 1024;
 
 /// Newline-separated runtime directories of the daemons hosting the session
 /// that started a development instance; see the module documentation.
@@ -158,7 +158,7 @@ fn runs_daemon_executable(process: &Path) -> bool {
     fs::read_link(process.join("exe")).is_ok_and(|executable| daemon_executable(&executable))
 }
 
-fn daemon_executable(executable: &Path) -> bool {
+pub(super) fn daemon_executable(executable: &Path) -> bool {
     executable.file_name().is_some_and(|name| {
         let name = name.as_bytes();
         name.strip_suffix(b" (deleted)").unwrap_or(name) == DAEMON_EXECUTABLE.as_bytes()
@@ -178,85 +178,6 @@ pub(crate) fn parent_of(process: &Path) -> io::Result<u32> {
         .and_then(|fields| fields.split_ascii_whitespace().nth(1))
         .and_then(|parent| parent.parse().ok())
         .ok_or_else(|| io::Error::other("malformed stat"))
-}
-
-/// Whether the local socket peer must present a session credential before
-/// using user-scoped requests. Unavailable or changing kernel evidence
-/// cannot grant user scope. Ancestry can only restrict a peer.
-#[cfg(feature = "host")]
-pub fn peer_requires_session_authority(
-    socket: &std::os::unix::net::UnixStream,
-    peer: super::PeerCredentials,
-) -> bool {
-    !matches!(hosted_peer(socket, peer), Ok(false))
-}
-
-#[cfg(feature = "host")]
-fn hosted_peer(
-    socket: &std::os::unix::net::UnixStream,
-    peer: super::PeerCredentials,
-) -> io::Result<bool> {
-    use super::PinnedProcess;
-
-    let uid = super::current_uid();
-    if peer.uid != uid || peer.pid <= 1 {
-        return Err(io::ErrorKind::PermissionDenied.into());
-    }
-    #[cfg(target_os = "linux")]
-    if fs::read_link("/proc/self")? != Path::new(&std::process::id().to_string()) {
-        return Err(io::Error::other(
-            "procfs is not in the daemon's PID namespace",
-        ));
-    }
-    let mut process = PinnedProcess::socket_peer(socket, peer.pid)?;
-    if process.exited()? {
-        return Err(io::ErrorKind::NotFound.into());
-    }
-    #[cfg(target_os = "linux")]
-    if crate::daemon::process_scope::in_session_scope(peer.pid)? {
-        return Ok(true);
-    }
-
-    for _ in 0..MAX_ANCESTORS {
-        let parent = process.parent_pid()?;
-        if parent == std::process::id() {
-            return Ok(true);
-        }
-        if parent == 1 {
-            return Ok(false);
-        }
-        // A peer with invisible ancestry cannot prove that it is external.
-        let ancestor = PinnedProcess::open(parent)?;
-        if process.parent_pid()? != parent {
-            return Err(io::Error::other("the peer's ancestry changed"));
-        }
-        if ancestor.uid()? == uid && is_host(&ancestor)? {
-            return Ok(true);
-        }
-        process = ancestor;
-    }
-    Err(io::Error::other("the peer's ancestry is too deep"))
-}
-
-#[cfg(feature = "host")]
-fn is_host(process: &super::PinnedProcess) -> io::Result<bool> {
-    // The ancestor can be a retained holder launched by an earlier daemon.
-    // A normal login ancestor such as sshd can deny executable lookup, so
-    // also recognize the dedicated daemon and holder kernel process names.
-    match process.executable() {
-        Ok(path) if daemon_executable(&path) => return Ok(true),
-        Ok(_) => {}
-        Err(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::PermissionDenied | io::ErrorKind::NotFound
-            ) => {}
-        Err(error) => return Err(error),
-    }
-    Ok(matches!(
-        process.command_name()?.as_slice(),
-        b"cagentsd" | b"cagents-holder" | b"cagents-native"
-    ))
 }
 
 fn daemon_runtime_directories(environment: &[u8]) -> Option<Vec<PathBuf>> {
