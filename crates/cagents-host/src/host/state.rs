@@ -4289,6 +4289,43 @@ impl HostState {
         Ok(update.promotions.is_empty())
     }
 
+    pub(super) fn parked_terminal_results(&self) -> Result<Option<BTreeSet<TerminalId>>, String> {
+        let update = self
+            .parked_update
+            .as_ref()
+            .ok_or("No carried terminal update is staged")?;
+        let mut completed = BTreeSet::new();
+        for id in &update.expected {
+            let record = self
+                .terminals
+                .get(id)
+                .ok_or_else(|| format!("Terminal {id} disappeared after promotion"))?;
+            if !record
+                .handle
+                .holder_identity()
+                .is_some_and(|holder| holder.holder.is_current())
+            {
+                return Err(format!("Terminal {id} lost its original holder"));
+            }
+            if record.handle.startup_unresolved() {
+                return Err(format!("Terminal {id} did not confirm promotion"));
+            }
+            if record.handle.is_completed() {
+                if !record.handle.retained_original_result() {
+                    return Err(format!(
+                        "Terminal {id} could not confirm its original final screen"
+                    ));
+                }
+                completed.insert(*id);
+            } else if record.handle.original_root_exited().map_err(|error| {
+                format!("Terminal {id} could not verify its original root: {error}")
+            })? {
+                return Ok(None);
+            }
+        }
+        Ok(Some(completed))
+    }
+
     pub(super) fn retained_terminal_results(&self) -> BTreeSet<TerminalId> {
         self.terminals
             .iter()

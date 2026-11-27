@@ -588,6 +588,8 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
+    #[cfg(target_os = "macos")]
+    completed_screen_cached: AtomicBool,
     /// An adopted original has not proved its startup commit. Its raw prefix
     /// and parked reader remain on the original worker until explicit Close.
     startup_unresolved: AtomicBool,
@@ -708,6 +710,8 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
+            #[cfg(target_os = "macos")]
+            completed_screen_cached: AtomicBool::new(false),
             startup_unresolved: AtomicBool::new(false),
             startup_parked: AtomicBool::new(false),
             startup_diagnostic: Mutex::new(None),
@@ -2745,15 +2749,24 @@ impl TerminalHandle {
     #[cfg(target_os = "macos")]
     pub fn retained_original_result(&self) -> bool {
         self.is_completed()
+            && self
+                .inner
+                .published
+                .completed_screen_cached
+                .load(Ordering::Acquire)
             && self.inner.published.has_retained_holder()
-            && self.holder_identity().is_some_and(|record| {
-                record.holder.is_current()
-                    && crate::pinned_process::exited_since(
-                        record.root.pid as u32,
-                        record.root.start,
-                    )
-                    .is_ok_and(|exited| exited)
-            })
+            && self
+                .holder_identity()
+                .is_some_and(|record| record.holder.is_current())
+            && self.original_root_exited().is_ok_and(|exited| exited)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn original_root_exited(&self) -> std::io::Result<bool> {
+        let record = self
+            .holder_identity()
+            .ok_or_else(|| std::io::Error::other("The original holder is missing"))?;
+        crate::pinned_process::exited_since(record.root.pid as u32, record.root.start)
     }
 
     pub fn is_parked_for_update(&self) -> bool {
@@ -3961,6 +3974,8 @@ impl Worker {
             .store(completion.ownership_released, Ordering::Release);
         if let Some(completion) = completion.event {
             published.emit_event(&events, completion);
+            #[cfg(target_os = "macos")]
+            crate::daemon::wake();
         }
         if let Some((close, drained)) = completion.natural_close {
             use super::ipc::TerminalCloseResult;
@@ -4332,10 +4347,16 @@ impl Worker {
             drop(self.holder);
         } else if !shutting_down && completion.is_some() && self.holder.registered() {
             self.holder.prove_cleanup();
-            if let Err(error) = carry::screen(&mut self.terminal, holder::MAX_SCREEN)
+            match carry::screen(&mut self.terminal, holder::MAX_SCREEN)
                 .and_then(|screen| self.holder.cache_screen(&screen))
             {
-                self.error("retain completed terminal screen", error);
+                Ok(()) => {
+                    #[cfg(target_os = "macos")]
+                    self.published
+                        .completed_screen_cached
+                        .store(true, Ordering::Release);
+                }
+                Err(error) => self.error("retain completed terminal screen", error),
             }
             *self
                 .published
