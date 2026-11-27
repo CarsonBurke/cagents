@@ -204,27 +204,64 @@ fn check_unit_is_read(unit: &Path) -> Result<(), AppError> {
 }
 
 fn disable(unit: &Path) -> Result<CommandOutput, AppError> {
+    let mut warnings = Vec::new();
     match unit_file(unit)? {
         UnitFile::Foreign => return Err(foreign(unit)),
         UnitFile::Absent => {}
         UnitFile::Ours(_) => {
             // Disabling stops nothing: the unit only ever started the daemon,
             // which keeps running with its sessions until `cagents daemon stop`.
-            systemctl(&["disable", UNIT])?;
+            // Without a user manager to ask, as under `sudo` or `su`, the
+            // files go anyway: its link is what `systemctl disable` removes.
+            if let Err(error) = systemctl(&["disable", UNIT]) {
+                warnings.push(format!(
+                    "{}; removed the unit's files directly, which the user manager reads at its next start",
+                    error.message
+                ));
+                let wants = unit
+                    .parent()
+                    .expect("a unit path has a directory")
+                    .join("default.target.wants")
+                    .join(UNIT);
+                if std::fs::symlink_metadata(&wants).is_ok_and(|metadata| metadata.is_symlink())
+                    && let Err(error) = std::fs::remove_file(&wants)
+                {
+                    warnings.push(format!("Cannot remove {}: {error}", wants.display()));
+                }
+            }
             std::fs::remove_file(unit).map_err(|error| {
                 AppError::new(
                     "daemon_boot",
                     format!("Cannot remove {}: {error}", unit.display()),
                 )
             })?;
-            systemctl(&["daemon-reload"])?;
+            if warnings.is_empty()
+                && let Err(error) = systemctl(&["daemon-reload"])
+            {
+                warnings.push(error.message);
+            }
         }
     }
     // A daemon started later in this boot is no longer one the unit started.
-    if let Ok(record) = crate::instance::daemon_started_at_boot_record() {
-        let _ = std::fs::remove_file(record);
+    match crate::instance::daemon_started_at_boot_directory() {
+        Ok(directory) => {
+            let record = crate::instance::daemon_started_at_boot_record(&directory);
+            match std::fs::remove_file(&record) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => warnings.push(format!("Cannot remove {}: {error}", record.display())),
+            }
+        }
+        Err(error) => warnings.push(format!(
+            "Cannot find the daemon's runtime directory ({error}), so a daemon an update starts later in this boot may still take its session variables from the user manager"
+        )),
     }
-    Ok(status_output(unit, &read_status(unit)?))
+    let mut output = status_output(unit, &read_status(unit)?);
+    if !warnings.is_empty() {
+        output.data["warnings"] = json!(warnings);
+        output.human = format!("{}\n{}", warnings.join("\n"), output.human);
+    }
+    Ok(output)
 }
 
 fn read_status(unit: &Path) -> Result<Status, AppError> {

@@ -11,7 +11,15 @@
 //! Only these variables: the rest of the user manager's environment is not
 //! the session's, and the daemon's own `PATH` and the like stay as they are.
 use portable_pty::CommandBuilder;
-use std::{process::Command, process::Stdio};
+use std::{
+    io::Read,
+    process::{Command, Stdio},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 /// What a graphical login imports into the user manager for its programs to
 /// reach the display, the desktop and the login's agents.
@@ -33,12 +41,59 @@ pub(super) fn refresh(command: &mut CommandBuilder, launch: &crate::model::Launc
     if !crate::instance::daemon_started_at_boot() {
         return;
     }
-    match current() {
+    match cached(Instant::now(), current) {
         Some(environment) => apply(command, &not_the_launchs(environment, launch)),
-        None => tracing::debug!(
-            "the user manager's environment is unavailable; the terminal keeps the daemon's"
-        ),
+        None => {
+            if !UNAVAILABLE_REPORTED.swap(true, Ordering::Relaxed) {
+                tracing::warn!(
+                    "the user manager's environment is unavailable; terminals keep the daemon's display and agent variables until it answers"
+                );
+            }
+        }
     }
+}
+
+static UNAVAILABLE_REPORTED: AtomicBool = AtomicBool::new(false);
+
+/// How long one reading serves the terminals that start after it, such as a
+/// window's restored panes, which would otherwise each ask in turn.
+const FRESH: Duration = Duration::from_secs(1);
+/// How long a failed reading stands, so a wedged bus costs one deadline
+/// rather than one per terminal.
+const FAILED_FRESH: Duration = Duration::from_secs(10);
+/// The whole reading's limit. busctl's own timeout bounds each of its calls,
+/// not the process.
+const DEADLINE: Duration = Duration::from_secs(2);
+
+/// The last reading, or a new one from `read` once it is stale. Concurrent
+/// launches wait for the one reading in progress rather than start their own.
+fn cached(now: Instant, read: impl FnOnce() -> Option<Vec<String>>) -> Option<Vec<String>> {
+    static LAST: Mutex<Option<(Instant, Option<Vec<String>>)>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    cached_in(&mut last, now, read)
+}
+
+fn cached_in(
+    last: &mut Option<(Instant, Option<Vec<String>>)>,
+    now: Instant,
+    read: impl FnOnce() -> Option<Vec<String>>,
+) -> Option<Vec<String>> {
+    if let Some((at, reading)) = last.as_ref() {
+        let fresh = if reading.is_some() {
+            FRESH
+        } else {
+            FAILED_FRESH
+        };
+        if now.saturating_duration_since(*at) < fresh {
+            return reading.clone();
+        }
+    }
+    let reading = read();
+    if reading.is_some() {
+        UNAVAILABLE_REPORTED.store(false, Ordering::Relaxed);
+    }
+    *last = Some((now, reading.clone()));
+    reading
 }
 
 /// `environment` without the variables `launch` sets or unsets itself.
@@ -80,8 +135,11 @@ pub(super) fn apply(command: &mut CommandBuilder, environment: &[String]) {
 /// rather than whatever bus the daemon's environment names. The property is
 /// a string array, so values need no unquoting, unlike `systemctl
 /// show-environment`'s output.
+///
+/// The user manager's runtime directory is the user's own, not the
+/// isolated one a development or test daemon may have in `XDG_RUNTIME_DIR`.
 fn current() -> Option<Vec<String>> {
-    let output = Command::new("busctl")
+    let mut child = Command::new("busctl")
         .env(
             "XDG_RUNTIME_DIR",
             format!("/run/user/{}", crate::daemon::current_uid()),
@@ -98,11 +156,38 @@ fn current() -> Option<Vec<String>> {
             "Environment",
         ])
         .stdin(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
-        .ok()
-        .filter(|output| output.status.success())?;
-    parse(&output.stdout)
+        .spawn()
+        .ok()?;
+    let mut stdout = child.stdout.take()?;
+    // Read beside the wait, so a large environment cannot fill the pipe and
+    // stall busctl before it exits.
+    let reader = std::thread::Builder::new()
+        .name("cagents-manager-env".into())
+        .spawn(move || {
+            let mut output = Vec::new();
+            stdout.read_to_end(&mut output).map(|_| output)
+        })
+        .ok();
+    let deadline = Instant::now() + DEADLINE;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            _ => {
+                // Not yet reaped, so the PID is still this child's.
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+        }
+    };
+    let output = reader?.join().ok()?.ok()?;
+    status.filter(|status| status.success())?;
+    parse(&output)
 }
 
 /// `busctl --json` prints a property as `{"type":"as","data":[...]}`.
@@ -121,6 +206,33 @@ pub(super) fn parse(output: &[u8]) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn one_reading_serves_launches_close_behind_it() {
+        let start = Instant::now();
+        let mut last = None;
+        let reading = || Some(vec!["DISPLAY=:0".to_owned()]);
+        assert_eq!(cached_in(&mut last, start, reading), reading());
+        // Within a second the reading stands; `read` is not called.
+        let unread = || -> Option<Vec<String>> { panic!("read again") };
+        assert_eq!(
+            cached_in(&mut last, start + Duration::from_millis(500), unread),
+            reading()
+        );
+        assert_eq!(
+            cached_in(&mut last, start + Duration::from_secs(2), || None),
+            None
+        );
+        // A failure stands longer, so a wedged bus is asked once.
+        assert_eq!(
+            cached_in(&mut last, start + Duration::from_secs(8), unread),
+            None
+        );
+        assert_eq!(
+            cached_in(&mut last, start + Duration::from_secs(13), reading),
+            reading()
+        );
+    }
 
     #[test]
     fn busctl_output_is_read_as_entries() {

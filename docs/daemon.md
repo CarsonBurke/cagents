@@ -60,11 +60,14 @@ terminal the daemon launches takes `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
 `XDG_SESSION_DESKTOP` and `DESKTOP_SESSION` from the user manager as they are
 at that moment. A variable the user manager doesn't have keeps the daemon's
 own value, and one a session's launch sets itself is never replaced. Terminals
-already running keep the environment they started with. So does every daemon
-that replaces it until the next boot, such as one an update starts, even when
-`cagents daemon stop` and a new `daemon start` come between;
+already running keep the environment they started with. Every daemon that
+replaces it does the same, such as one an update starts, even when
+`cagents daemon stop` and a new `daemon start` come between, until the user
+manager stops: the next boot with lingering, or your last logout without it.
 `cagents daemon boot disable` ends that for daemons started afterwards. A
-desktop that does not export these variables leaves terminals without them;
+daemon already running when you run `enable` keeps its own environment; the
+unit takes effect from the next boot. A desktop that does not export these
+variables leaves terminals without them;
 `systemctl --user import-environment DISPLAY WAYLAND_DISPLAY SSH_AUTH_SOCK` in
 its startup exports them.
 

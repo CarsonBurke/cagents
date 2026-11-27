@@ -3715,9 +3715,12 @@ fn current_uid() -> u32 {
 /// marker at startup so its terminals never inherit it.
 pub const DAEMON_AT_BOOT_ENV: &str = "CAGENTS_DAEMON_AT_BOOT";
 
-/// In the runtime directory, the record that the boot unit started a daemon
-/// since the user manager started. An update's replacement daemon is started
-/// by the updater, without the marker, and carries on from it.
+/// In the instance's runtime directory, beside its socket, the record that
+/// the boot unit started a daemon of this instance since the user manager
+/// started. An update's replacement daemon is started by the updater, without
+/// the marker, and carries on from it. The runtime directory lasts as long as
+/// the user manager: until the next boot with lingering, or the last logout
+/// without it.
 const DAEMON_STARTED_AT_BOOT_FILE: &str = "daemon-started-at-boot";
 
 static DAEMON_AT_BOOT_MARKER: AtomicBool = AtomicBool::new(false);
@@ -3735,64 +3738,86 @@ pub unsafe fn take_daemon_at_boot_marker() {
     }
 }
 
-/// Where this user's daemon records that the boot unit started it, beside
-/// its admission locks. The runtime directory lasts exactly as long as the
-/// user manager, so the record ends with the boot it describes.
-pub fn daemon_started_at_boot_record() -> io::Result<PathBuf> {
-    Ok(runtime_directory()?.join(format!(
-        "{}.{DAEMON_STARTED_AT_BOOT_FILE}",
-        runtime_subdirectory()
-    )))
+/// The instance runtime directory the record is in, as the daemon's
+/// `RuntimePaths` names it.
+pub fn daemon_started_at_boot_directory() -> io::Result<PathBuf> {
+    let base = runtime_base()?.ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "XDG_RUNTIME_DIR is not set to an absolute path",
+        )
+    })?;
+    Ok(base.join(runtime_subdirectory()))
 }
 
-/// Writes the record when the boot unit started this daemon. The daemon
-/// calls it once, as soon as it holds its admission, so a replacement finds
-/// it however soon it comes, and `cagents daemon boot disable` removing it
+/// The record in an instance runtime `directory`.
+pub fn daemon_started_at_boot_record(directory: &Path) -> PathBuf {
+    directory.join(DAEMON_STARTED_AT_BOOT_FILE)
+}
+
+/// Writes the record in `directory` when the boot unit started this daemon.
+/// The daemon calls it once it holds its lease and serves, so a start that
+/// fails leaves none behind, and `cagents daemon boot disable` removing it
 /// later stays removed.
-pub fn record_daemon_started_at_boot() {
+pub fn record_daemon_started_at_boot(directory: &Path) -> io::Result<bool> {
     if !DAEMON_AT_BOOT_MARKER.load(Ordering::Relaxed) {
-        return;
+        return Ok(false);
     }
-    match daemon_started_at_boot_record() {
-        Ok(record) => write_started_at_boot(&record),
-        Err(error) => {
-            tracing::warn!(%error, "the daemon could not record that it started at boot")
-        }
-    }
+    write_started_at_boot(&daemon_started_at_boot_record(directory))?;
+    Ok(true)
 }
 
-fn write_started_at_boot(record: &Path) {
-    if let Err(error) = OpenOptions::new()
+fn write_started_at_boot(record: &Path) -> io::Result<()> {
+    OpenOptions::new()
         .write(true)
         .create(true)
-        .truncate(true)
         .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(record)
-    {
-        tracing::warn!(%error, path = %record.display(), "the daemon could not record that it started at boot");
-    }
+        .map(drop)
 }
 
 /// Whether the boot unit started this daemon, or one it replaced in this
 /// boot.
 pub fn daemon_started_at_boot() -> bool {
     DAEMON_AT_BOOT_MARKER.load(Ordering::Relaxed)
-        || daemon_started_at_boot_record().is_ok_and(|record| record.is_file())
+        || daemon_started_at_boot_directory().is_ok_and(|directory| started_at_boot_in(&directory))
+}
+
+/// Whether `directory` holds the record, as a file rather than a link.
+fn started_at_boot_in(directory: &Path) -> bool {
+    fs::symlink_metadata(daemon_started_at_boot_record(directory))
+        .is_ok_and(|metadata| metadata.is_file())
 }
 
 #[cfg(test)]
 #[test]
 fn a_daemon_replacing_one_started_at_boot_carries_on() {
+    // Not the real runtime directory: a development daemon there would take
+    // the record for its own.
     let runtime = tempfile::tempdir().unwrap();
-    let record = runtime.path().join(DAEMON_STARTED_AT_BOOT_FILE);
-    assert!(!record.is_file());
-    // The daemon the unit started records it at startup...
-    write_started_at_boot(&record);
-    assert!(record.is_file());
+    let directory = runtime.path();
+    assert!(!started_at_boot_in(directory));
+    // Without the marker, a daemon records nothing.
+    assert!(!record_daemon_started_at_boot(directory).unwrap());
+    assert!(!started_at_boot_in(directory));
+    // The daemon the unit started records it once it serves...
+    DAEMON_AT_BOOT_MARKER.store(true, Ordering::Relaxed);
+    let recorded = record_daemon_started_at_boot(directory);
+    DAEMON_AT_BOOT_MARKER.store(false, Ordering::Relaxed);
+    assert!(recorded.unwrap());
     // ...for its replacement, started by an updater without the marker.
+    assert!(started_at_boot_in(directory));
     // `daemon boot disable` removes it, and nothing writes it again.
+    let record = daemon_started_at_boot_record(directory);
     fs::remove_file(&record).unwrap();
-    assert!(!record.is_file());
+    assert!(!started_at_boot_in(directory));
+    // A link there is not the record, and is not followed.
+    let elsewhere = directory.join("elsewhere");
+    std::os::unix::fs::symlink(&elsewhere, &record).unwrap();
+    assert!(!started_at_boot_in(directory));
+    assert!(write_started_at_boot(&record).is_err());
+    assert!(!elsewhere.exists());
 }
 
 // Source-tree debug builds are development instances by default. The explicit
