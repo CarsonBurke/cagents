@@ -18242,11 +18242,6 @@ impl Cagents {
                     ));
                     return ControlFlow::Break(Task::none());
                 }
-                Message::Sidebar(action) => {
-                    if let Some(route) = device_ui::sidebar_route(action) {
-                        return ControlFlow::Break(self.route_device_sidebar_action(route));
-                    }
-                }
                 _ => {}
             }
         }
@@ -18330,6 +18325,14 @@ impl Cagents {
         {
             self.deferred_navigation.push_back(message);
             return ControlFlow::Break(Task::none());
+        }
+        // After the gates above, so a device window holds a sidebar command
+        // back under a dialog or an update as a local window does.
+        if crate::device::is_remote()
+            && let Message::Sidebar(action) = &message
+            && let Some(route) = device_ui::sidebar_route(action)
+        {
+            return ControlFlow::Break(self.route_device_sidebar_action(route));
         }
         ControlFlow::Continue(message)
     }
