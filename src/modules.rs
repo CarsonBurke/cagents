@@ -49,6 +49,7 @@ pub mod descriptor_limit;
 pub mod design;
 pub mod device;
 pub mod device_service;
+pub mod device_stats;
 pub mod device_trust;
 pub mod diagnostics;
 #[cfg(feature = "ui")]

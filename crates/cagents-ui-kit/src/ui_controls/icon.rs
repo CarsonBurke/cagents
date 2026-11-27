@@ -139,6 +139,7 @@ icons! {
     Save => "save",
     Search => "search",
     Send => "send",
+    Server => "server",
     Settings => "settings",
     Sidebar => "sidebar",
     SplitPanel => "split-panel",

@@ -1758,8 +1758,9 @@ impl ChipTone {
         }
     }
 
-    /// The tone of a ring shown without the chip's text, which would
-    /// otherwise be what says a figure is out of date: muted when stale.
+    /// The tone of the chip's ring: muted when stale, so an out-of-date
+    /// figure never takes the accent of a live one, even where the ring is
+    /// shown without the chip's text.
     pub(super) fn ring_tone(self) -> Option<design::Tone> {
         match self {
             Self::Stale => Some(design::Tone::Themed(design::muted_color)),
@@ -6658,6 +6659,12 @@ impl Cagents {
                     .into(),
                 iced::widget::Space::new().width(Length::Fill).into(),
                 widget::row::with_children(vec![
+                    // Read-only, beside the device chooser it describes.
+                    self.device_load_status(compact),
+                    widget::container(design::vertical_rule())
+                        .height(12)
+                        .padding(Padding::from([0.0, space::XXS]))
+                        .into(),
                     self.phone_status_control(),
                     self.device_status_control(),
                 ])
@@ -6767,13 +6774,9 @@ impl Cagents {
                 .into(),
         ];
         for preview in previews {
-            let tone = preview.tone.color();
             if let Some(fraction) = preview.usage_fraction {
                 items.push(crate::interaction::tooltip(
-                    crate::ui_controls::budget_radial_toned(
-                        fraction,
-                        tone.map(design::Tone::Themed),
-                    ),
+                    crate::ui_controls::budget_radial_toned(fraction, preview.tone.ring_tone()),
                     preview.tooltip.clone(),
                 ));
             }
@@ -6869,7 +6872,7 @@ impl Cagents {
                 {
                     Some(fraction) => items.push(crate::ui_controls::budget_radial_toned(
                         fraction,
-                        summary.tone.color().map(design::Tone::Themed),
+                        summary.tone.ring_tone(),
                     )),
                     None => items.push(
                         iced::widget::Space::new()

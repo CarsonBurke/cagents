@@ -147,6 +147,7 @@ enum SlotKey {
     ChatActivity(TerminalId),
     Bell(TerminalId),
     WorkBoard,
+    DeviceStats,
     Mobile(crate::terminal_ipc::MobileWatch),
 }
 
@@ -161,6 +162,7 @@ fn coalescible(message: &ServerMessage) -> Option<SlotKey> {
             ..
         } => Some(SlotKey::Bell(*terminal_id)),
         ServerMessage::WorkBoard { .. } => Some(SlotKey::WorkBoard),
+        ServerMessage::DeviceStats { .. } => Some(SlotKey::DeviceStats),
         ServerMessage::MobileChanged { topic } => Some(SlotKey::Mobile(*topic)),
         _ => None,
     }
@@ -467,6 +469,20 @@ impl DeliveryQueue {
                         // These are complete snapshots. A later board may
                         // replace an earlier publication in place, but never
                         // a correlated reply or another daemon's proof.
+                        if revision >= queued {
+                            state.messages[index] = message;
+                        }
+                        return Ok(());
+                    }
+                }
+                // A complete reading, so a slow reader keeps only the newest.
+                ServerMessage::DeviceStats { revision, .. } => {
+                    let existing = &state.messages[index];
+                    if existing.proof == message.proof
+                        && let ServerMessage::DeviceStats {
+                            revision: queued, ..
+                        } = &existing.message
+                    {
                         if revision >= queued {
                             state.messages[index] = message;
                         }

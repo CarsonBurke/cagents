@@ -5,6 +5,12 @@ use crate::device_service::{GitOperation, Operation, Reply};
 use cosmic::widget::text_editor;
 use std::collections::BTreeMap;
 
+/// How a device is named to the person: this computer is "This device",
+/// a saved one goes by its own name.
+pub(super) fn device_label(name: &str) -> &str {
+    if name == "local" { "This device" } else { name }
+}
+
 pub(super) fn file_editor_id() -> widget::Id {
     widget::Id::new("device-file-editor")
 }
@@ -312,6 +318,10 @@ pub(super) struct State {
     worktree_branch: String,
     commit_message: String,
     busy: bool,
+    /// The device this window is switching to, until the switch settles.
+    switching: Option<String>,
+    /// How loaded this window's device is, for the status bar.
+    pub load: super::device_load_ui::DeviceLoad,
     generation: u64,
     pending: Option<Operation>,
     image: Option<ImageRequest>,
@@ -357,6 +367,8 @@ impl Default for State {
             worktree_branch: String::new(),
             commit_message: String::new(),
             busy: false,
+            switching: None,
+            load: Default::default(),
             generation: 0,
             pending: None,
             image: None,
@@ -753,6 +765,11 @@ impl Cagents {
                 replace,
             } => {
                 self.device_ui.busy = false;
+                // A completed switch keeps saying so while this window
+                // closes for the device's own.
+                if !(replace && result.is_ok()) {
+                    self.device_ui.switching = None;
+                }
                 match result {
                     Ok(()) if replace => return self.exit_after_language_servers(),
                     Ok(()) => {}
@@ -798,6 +815,9 @@ impl Cagents {
                 }
                 self.persist();
                 self.device_ui.busy = true;
+                if replace {
+                    self.device_ui.switching = Some(name.clone());
+                }
                 let device = name.clone();
                 return Task::perform(
                     async move {
@@ -1234,21 +1254,37 @@ impl Cagents {
         let selected = crate::device::selected()
             .map(|device| device.name.as_str())
             .unwrap_or("local");
-        let label = if selected == "local" {
-            "This device"
-        } else {
-            selected
-        };
+        let label = device_label(selected);
         let open = self.device_ui.menu_open && !self.modal_is_open();
+        // While this window moves to another device, the control says where
+        // it is going: the menu has closed, and nothing else shows the wait.
+        let (leading, label): (Option<Element<'_, Message>>, String) =
+            match &self.device_ui.switching {
+                Some(target) => (
+                    Some(crate::ui_controls::activity_spinner(
+                        12.0,
+                        design::accent_color,
+                    )),
+                    format!("Switching to {}…", device_label(target)),
+                ),
+                None => (None, label.to_owned()),
+            };
         let control = widget::button::custom(
-            widget::row::with_children(vec![
-                design::caption(label).into(),
-                widget::icon(Icon::ChevronUp.handle()).size(12).into(),
-            ])
+            widget::row::with_children(
+                leading
+                    .into_iter()
+                    .chain([
+                        design::caption(label.clone())
+                            .wrapping(cosmic::iced::widget::text::Wrapping::None)
+                            .into(),
+                        widget::icon(Icon::ChevronUp.handle()).size(12).into(),
+                    ])
+                    .collect::<Vec<_>>(),
+            )
             .spacing(space::XS)
             .align_y(Alignment::Center),
         )
-        .name(format!("Device: {label}. Open device connections"))
+        .name(format!("Device: {label}. Choose a device"))
         .selected(open)
         .class(crate::ui_controls::control_style(open, None))
         .height(20)
@@ -1256,130 +1292,111 @@ impl Cagents {
         .on_press(Message::Device(Action::Menu(!open)));
         let anchor = crate::interaction::tooltip(
             crate::interaction::hover(control),
-            "Open device connections",
+            "Choose the device this window works on",
         );
         crate::ui_controls::popover(
             anchor,
-            open.then(|| {
-                let enabled = !self.device_ui.busy;
-                let mut rows: Vec<Element<'_, Message>> = vec![
-                    widget::row::with_children(vec![
-                        design::heading("Devices").width(Length::Fill).into(),
-                        crate::ui_controls::icon_button(Icon::Plus, "Connect to a device")
-                            .on_press_maybe(enabled.then_some(Message::Device(Action::Configure)))
-                            .into(),
-                    ])
-                    .align_y(Alignment::Center)
-                    .padding(Padding::from([0.0, space::S]))
-                    .into(),
-                ];
-                let mut choices = Vec::new();
-                for (index, name) in self.device_ui.devices.iter().enumerate() {
-                    let label = if name == "local" {
-                        "This device"
-                    } else {
-                        name.as_str()
-                    };
-                    let current = name == selected;
-                    let detail = if name == "local" {
-                        "Local workspace"
-                    } else {
-                        self.device_ui
-                            .device_hosts
-                            .get(name)
-                            .map(String::as_str)
-                            .unwrap_or("SSH device")
-                    };
-                    let mut contents: Vec<Element<'_, Message>> = vec![
-                        widget::column::with_children(vec![
-                            design::body(label).into(),
-                            design::caption(detail).into(),
-                        ])
-                        .width(Length::Fill)
-                        .into(),
-                    ];
-                    if current {
-                        contents.push(design::caption("Current").into());
-                    }
-                    let switch = widget::button::custom(
-                        widget::row::with_children(contents)
-                            .spacing(space::S)
-                            .align_y(Alignment::Center),
-                    )
-                    .name(format!("Switch to {label}"))
-                    .selected(current)
-                    .class(crate::ui_controls::control_style(current, None))
-                    .width(Length::Fill)
-                    .padding(space::S)
-                    .on_press_maybe(enabled.then_some(Message::Device(Action::Device(index))));
-                    let open = crate::ui_controls::icon_button(
-                        Icon::PopOut,
-                        format!("Open {label} in another window"),
-                    )
-                    .on_press_maybe(
-                        enabled.then(|| Message::Device(Action::OpenDeviceWindow(index))),
-                    );
-                    choices.push(
-                        widget::row::with_children(vec![
-                            crate::interaction::tooltip(
-                                crate::interaction::hover(switch),
-                                if current {
-                                    format!("{label} is open in this window")
-                                } else {
-                                    format!("Switch this window to {label}")
-                                },
-                            ),
-                            open.into(),
-                        ])
-                        .align_y(Alignment::Center)
-                        .spacing(space::XS)
-                        .into(),
-                    );
-                }
-                rows.push(
-                    widget::container(crate::interaction::overflow_fade_y(
-                        widget::scrollable(
-                            widget::column::with_children(choices)
-                                .padding(design::with_vertical_rail(Padding::ZERO)),
-                        )
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Shrink),
-                        // The chooser is a popover, on the elevated surface.
-                        design::component_base,
-                    ))
-                    .max_height(280)
-                    .into(),
-                );
-                if crate::device::is_remote() {
-                    rows.push(design::horizontal_rule());
-                    rows.push(
-                        widget::button::custom(
-                            widget::row::with_children(vec![
-                                widget::icon(Icon::Folder.handle())
-                                    .size(design::ROW_ICON_SIZE)
-                                    .into(),
-                                design::body("Browse device files").into(),
-                            ])
-                            .spacing(space::S)
-                            .align_y(Alignment::Center),
-                        )
-                        .name("Browse device files")
-                        .class(crate::ui_controls::control_style(false, None))
-                        .width(Length::Fill)
-                        .padding(space::S)
-                        .on_press_maybe(enabled.then_some(Message::Device(Action::Open)))
-                        .into(),
-                    );
-                }
-                widget::container(widget::column::with_children(rows).spacing(space::XS))
-                    .width(304)
-                    .into()
-            }),
+            open.then(|| self.device_popover(selected)),
             widget::popover::Position::Top,
             Message::Device(Action::Menu(false)),
         )
+    }
+
+    /// The device chooser: every saved device as a row that switches this
+    /// window to it, with the open one checked, and the device actions
+    /// beneath the list.
+    fn device_popover(&self, selected: &str) -> Element<'_, Message> {
+        let enabled = !self.device_ui.busy;
+        let choices: Vec<Element<'_, Message>> = self
+            .device_ui
+            .devices
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                let label = device_label(name);
+                let current = name == selected;
+                let (icon, detail) = if name == "local" {
+                    (Icon::Display, "This computer")
+                } else {
+                    (
+                        Icon::Server,
+                        self.device_ui
+                            .device_hosts
+                            .get(name)
+                            .map_or("SSH device", String::as_str),
+                    )
+                };
+                let mut row = crate::ui_controls::list_row(Some(icon), label)
+                    .caption(detail)
+                    .selected(current)
+                    .name(if current {
+                        format!("{label}, open in this window")
+                    } else {
+                        format!("Switch this window to {label}")
+                    })
+                    // The open device is already this window's: pressing it
+                    // has nothing to do, so it is not offered.
+                    .on_press_maybe(
+                        (enabled && !current).then_some(Message::Device(Action::Device(index))),
+                    );
+                if current {
+                    row = row.trailing(
+                        widget::icon(Icon::Check.handle())
+                            .size(design::ROW_ICON_SIZE)
+                            .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
+                                cosmic::iced::widget::svg::Style {
+                                    color: Some(design::accent_color(theme)),
+                                }
+                            }))),
+                    );
+                }
+                let pop_out = crate::ui_controls::icon_button(
+                    Icon::PopOut,
+                    format!("Open {label} in a new window"),
+                )
+                .on_press_maybe(enabled.then(|| Message::Device(Action::OpenDeviceWindow(index))));
+                widget::row::with_children(vec![row.into(), pop_out.into()])
+                    .align_y(Alignment::Center)
+                    .spacing(space::XXS)
+                    .into()
+            })
+            .collect();
+        let mut rows: Vec<Element<'_, Message>> = vec![
+            widget::container(design::heading("Devices"))
+                .padding(Padding::from([space::XXS, design::list::INSET]))
+                .into(),
+            widget::container(crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::column::with_children(choices)
+                        .spacing(space::XXS)
+                        .padding(design::with_vertical_rail(Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink),
+                // The chooser is a popover, on the elevated surface.
+                design::component_base,
+            ))
+            .max_height(280)
+            .into(),
+            design::horizontal_rule(),
+            crate::ui_controls::list_row(Some(Icon::Plus), "Connect to a device…")
+                .dense()
+                .on_press_maybe(enabled.then_some(Message::Device(Action::Configure)))
+                .into(),
+        ];
+        if crate::device::is_remote() {
+            rows.push(
+                crate::ui_controls::list_row(Some(Icon::Folder), "Browse device files…")
+                    .dense()
+                    .on_press_maybe(enabled.then_some(Message::Device(Action::Open)))
+                    .into(),
+            );
+        }
+        widget::container(widget::column::with_children(rows).spacing(space::XS))
+            .width(304)
+            .into()
     }
 
     pub(super) fn device_dialog(&self) -> Element<'_, Message> {
