@@ -144,7 +144,13 @@ pub(super) fn finish_parked_ready(
             .collect::<Result<Vec<_>, String>>()?
     };
     if !recovered.is_empty() {
-        Store::discover()?.record_recovered(&recovered)?;
+        let store = Store::discover()?;
+        let reattached = recovered
+            .iter()
+            .map(|chat| chat.evidence.source.id)
+            .collect::<Vec<_>>();
+        store.record_recovered(&recovered)?;
+        store.record_unattached(&[], &reattached)?;
     }
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     publish_ready_effects(host, Some(capture))

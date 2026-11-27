@@ -388,12 +388,16 @@ fn select_parked_terminals(
     host: &SharedHost,
     admission: &crate::upgrade::recovery::ReadyAdmission,
     publication: crate::update::LocalPublication,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
 ) -> Result<(), String> {
-    let terminals = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .parked_update_inventory()?;
+    let (terminals, proof) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.parked_update_inventory()?, state.proof().clone())
+    };
     admission.verify_parked_terminals(&terminals)?;
+    if !state::parked_native_roster_matches(checkpoint, &proof)? {
+        return Err("An original retained conversation lost custody before selection".into());
+    }
     if daemon::termination_requested() {
         return Err("The daemon was stopped before selecting the installed update".into());
     }
@@ -1147,8 +1151,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         && let Some(parked) =
             update_recovery::park_installed_ready(&host, ready).map_err(io::Error::other)?
     {
-        select_parked_terminals(&host, ready, local_publication.take().unwrap())
-            .map_err(io::Error::other)?;
+        select_parked_terminals(
+            &host,
+            ready,
+            local_publication.take().unwrap(),
+            &parked.checkpoint,
+        )
+        .map_err(io::Error::other)?;
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .publishing_startup = true;
