@@ -74,29 +74,20 @@ pub(in crate::host) fn interactive(
         };
     // A conversation this daemon restarted may not have taken its agent over
     // when it started, as when the earlier process was not yet known to have
-    // ended. Adoption proves that again under the agent's gate, so try once
-    // before refusing; it changes nothing when the agent already follows.
-    let agent = match claims
-        .then(|| running_successor(host, &agent, id))
-        .flatten()
-    {
-        Some(successor) => match adopt_resumed(host, &successor) {
-            Ok(true) => registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .agent(agent.id)
-                .map_err(unavailable)?,
-            Ok(false) => agent,
-            Err(error) => {
-                tracing::warn!(chat = %id, %error, "the restarted conversation did not take over its agent");
-                agent
-            }
-        },
-        None => agent,
-    };
+    // ended. Adoption proves that again under the agent's gate, so a window
+    // attached to the restart tries once before being refused.
+    if claims && let Some(successor) = running_successor(host, client, &agent, id) {
+        follow_restart(host, &successor);
+    }
     let gate = agent_gate(host, agent.id);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     if claims {
+        // Read under the gate: an adoption may have moved the agent since.
+        let agent = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent(agent.id)
+            .map_err(unavailable)?;
         let refusal = match host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -139,13 +130,19 @@ pub(in crate::host) fn interactive(
     apply(request)
 }
 
-/// The process this daemon runs as conversation `id`, when `agent` is bound
-/// to an earlier one under the same ID.
-fn running_successor(host: &SharedHost, agent: &Agent, id: TerminalId) -> Option<chat::Session> {
+/// The process this daemon runs as conversation `id` for `client`, attached
+/// to it, when `agent` is bound to an earlier one under the same ID.
+fn running_successor(
+    host: &SharedHost,
+    client: super::super::state::ClientId,
+    agent: &Agent,
+    id: TerminalId,
+) -> Option<chat::Session> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     let record = state.chats.get(&id)?;
     let running = HostedSession::Chat(record.session.clone());
-    (record.session.proof.as_ref() == Some(state.proof())
+    (record.subscribers.contains_key(&client)
+        && record.session.proof.as_ref() == Some(state.proof())
         && !record.handle.is_completed()
         && agent
             .session

@@ -1553,6 +1553,29 @@ pub(in crate::host) fn given_work(host: &SharedHost, chat: TerminalId) {
         .remove(&chat);
 }
 
+/// Let the agent of `started`, a conversation this daemon just (re)started,
+/// follow it, as [`adopt_resumed`] allows. The provider already runs, so a
+/// refusal leaves the agent with its ended process (still closable) rather
+/// than failing anything; it is logged. Returns whether the agent moved.
+pub(in crate::host) fn follow_restart(host: &SharedHost, started: &chat::Session) -> bool {
+    match adopt_resumed(host, started) {
+        Ok(true) => {
+            // Until it is given work, ending it only reopens the agent's
+            // conversation.
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .idle_adoptions
+                .insert(started.id);
+            true
+        }
+        Ok(false) => false,
+        Err(error) => {
+            tracing::warn!(chat = %started.id, %error, "The restarted conversation did not take over its agent");
+            false
+        }
+    }
+}
+
 /// Bind the agent of a resumed conversation to `successor`, the process that
 /// just started under a new chat ID. The predecessor is found through the
 /// lineage the successor joined when its resume was prepared, so a retry after
@@ -1642,7 +1665,7 @@ pub(in crate::host) fn adopt_successor(
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .agent(agent.id)?;
-    if ended_with_its_daemon(host, &registry, &agent, predecessor)? {
+    if ended_with_its_daemon(host, &registry, &agent, predecessor, successor)? {
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1659,11 +1682,16 @@ pub(in crate::host) fn adopt_successor(
 }
 
 /// Whether `predecessor`, the agent's bound process, ended with the earlier
-/// daemon of this boot that ran it, so it can no longer act for the agent.
+/// daemon of this boot that ran it, so that `successor`, which the person
+/// restarted in its place, may take the agent over.
 ///
 /// Only one daemon runs at a time, and a provider that daemon ran itself was
 /// connected only through it: once that daemon is gone nothing can give the
 /// provider work, and recording the stop revokes any authority issued to it.
+/// The process itself is not proven to have exited, as an earlier boot would
+/// prove: it may still finish a step it had begun. The restart that runs
+/// `successor` beside it already accepted that, which is why a prompt alone
+/// never reopens such a conversation (`resume::Basis::Prompt`).
 /// That holds only for a provider nothing else kept: a live native holder, a
 /// retained provider, or a paired terminal or console may outlive the daemon,
 /// and those keep their own recovery. A pending launch or a closed agent is
@@ -1674,7 +1702,15 @@ fn ended_with_its_daemon(
     registry: &SharedRegistry,
     agent: &Agent,
     predecessor: &chat::Session,
+    successor: &chat::Session,
 ) -> Result<bool, String> {
+    // A successor the registry would refuse anyway must not leave a stop
+    // behind.
+    if successor.launch.provider != predecessor.launch.provider
+        || successor.launch.recipe.working_directory != predecessor.launch.recipe.working_directory
+    {
+        return Ok(false);
+    }
     if agent.closed
         || agent.console.is_some()
         || predecessor.terminal.is_some()

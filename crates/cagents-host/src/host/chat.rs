@@ -4902,18 +4902,7 @@ fn process_inner(
                 .get(&id)
                 .map(|record| record.session.clone());
             if let Some(started) = started {
-                match super::agent_execution::adopt_resumed(host, &started) {
-                    Ok(true) => {
-                        host.lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .idle_adoptions
-                            .insert(id);
-                    }
-                    Ok(false) => {}
-                    Err(error) => {
-                        tracing::warn!(chat=%id, %error, "The resumed conversation did not take over its agent");
-                    }
-                }
+                super::agent_execution::follow_restart(host, &started);
             }
             Ok(response)
         }

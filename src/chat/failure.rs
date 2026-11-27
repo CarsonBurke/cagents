@@ -770,8 +770,8 @@ delivery_outcomes! {
     /// A request to an agent whose conversation restarted when the agent
     /// could not safely move to the new one, as when nothing proved the
     /// earlier one had stopped.
-    refused conversation UNFOLLOWED_RESTART: "This conversation restarted, and its agent couldn't safely move to the new one, so this was not sent.",
-        "Close and reopen the conversation to continue.";
+    refused send UNFOLLOWED_RESTART: "This conversation restarted, and its agent couldn't safely move to the new one, so this was not sent.",
+        "Try again. If this keeps happening, close and reopen the conversation.";
     /// An input to a helper whose conversation is closing.
     refused conversation CLOSING_INPUT: "Claude's conversation is closing, so this was not sent.",
         "Reopen the conversation to continue.";
@@ -970,6 +970,7 @@ mod tests {
             DAMAGED_INPUT,
             UNSETTLEABLE_INPUT,
             DETACHED_REQUEST,
+            UNFOLLOWED_RESTART,
             ACCOUNT_SWITCH_BUSY,
             ACCOUNT_SWITCH_UNANSWERED,
             ACCOUNT_SWITCH_UNREACHED,
@@ -981,7 +982,6 @@ mod tests {
             UNSUPPORTED_INPUT,
             UNAVAILABLE_INPUT,
             UNRESOLVABLE_INPUT,
-            UNFOLLOWED_RESTART,
         ];
         // Every outcome is in exactly one of the two lists.
         assert_eq!(sends.len() + conversation.len(), ALL.len());
