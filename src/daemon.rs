@@ -53,7 +53,7 @@ use std::{
 };
 
 use serde::Deserialize;
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 use serde::Serialize;
 use thiserror::Error;
 
@@ -357,12 +357,22 @@ impl HostLease {
         proof: &HostSessionProof,
         inherited: Option<File>,
     ) -> Result<Self, PlatformError> {
+        Self::acquire_before_owner_write(paths, proof, inherited, |_, _| Ok(()))
+    }
+
+    #[cfg(feature = "host")]
+    pub(crate) fn acquire_before_owner_write(
+        paths: &RuntimePaths,
+        proof: &HostSessionProof,
+        inherited: Option<File>,
+        before_write: impl FnOnce(&File, &[u8]) -> io::Result<()>,
+    ) -> Result<Self, PlatformError> {
         prepare_runtime_directory(&paths.directory)?;
         // Sharing the inventory description must not let startup publish its
         // PID while the updater is reading or converting the stopped store.
         let _maintenance = store_maintenance_guard(paths)?;
         let shared_handoff = inherited.is_some();
-        let mut lock = if let Some(lock) = inherited {
+        let lock = if let Some(lock) = inherited {
             lease_handoff::validate_inherited(&lock, paths)?;
             lock
         } else {
@@ -371,7 +381,7 @@ impl HostLease {
                 .read(true)
                 .write(true)
                 // Do not erase a live daemon's metadata before the lock is acquired.
-                // `write_lock_metadata` truncates after exclusive ownership is proven.
+                // The writer truncates after exclusive ownership is proven.
                 .truncate(false)
                 .mode(PRIVATE_FILE_MODE)
                 .custom_flags(LOCK_OPEN_FLAGS)
@@ -392,7 +402,9 @@ impl HostLease {
         }
 
         recover_stale_socket(&paths.socket)?;
-        write_lock_metadata(&mut lock, proof)?;
+        let record = lock_owner_bytes(std::process::id(), proof)?;
+        before_write(&lock, &record)?;
+        write_lock_owner_bytes(&lock, &record)?;
         Ok(Self {
             socket_path: paths.socket.clone(),
             lock,
@@ -621,27 +633,29 @@ impl Drop for HostLease {
     }
 }
 
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "macos"))]
 #[derive(Serialize)]
 struct LockMetadata<'a> {
     pid: u32,
     proof: &'a HostSessionProof,
 }
 
-#[cfg(feature = "host")]
-fn write_lock_metadata(lock: &mut File, proof: &HostSessionProof) -> Result<(), PlatformError> {
+#[cfg(any(feature = "host", target_os = "macos"))]
+pub(crate) fn lock_owner_bytes(pid: u32, proof: &HostSessionProof) -> io::Result<Vec<u8>> {
+    let mut record = serde_json::to_vec(&LockMetadata { pid, proof })?;
+    record.push(b'\n');
+    Ok(record)
+}
+
+/// Keep the inode and the single JSON record legacy readers expect. If the
+/// writer dies after truncation, the file contains a prefix of these bytes.
+#[cfg(any(feature = "host", target_os = "macos"))]
+pub(crate) fn write_lock_owner_bytes(lock: &File, bytes: &[u8]) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+
     lock.set_len(0)?;
-    lock.seek(SeekFrom::Start(0))?;
-    serde_json::to_writer(
-        &mut *lock,
-        &LockMetadata {
-            pid: std::process::id(),
-            proof,
-        },
-    )?;
-    lock.write_all(b"\n")?;
-    lock.sync_data()?;
-    Ok(())
+    lock.write_all_at(bytes, 0)?;
+    lock.sync_data()
 }
 
 #[derive(Deserialize)]

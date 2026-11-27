@@ -41,7 +41,7 @@ fn reviewed(proof: &HostSessionProof, terminal: TerminalId) -> DaemonImpact {
     }
 }
 
-fn preparation(root: &Path) -> Preparation {
+pub(super) fn preparation(root: &Path) -> Preparation {
     let source = HostSessionProof {
         host_session_id: HostSessionId::new("acknowledged-source"),
         boot_id: BootId::new("boot"),
