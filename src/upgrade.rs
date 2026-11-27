@@ -1808,6 +1808,51 @@ pub mod handoff {
             });
         }
 
+        /// Use the issued descriptor of the exact first selected claimant.
+        /// The caller supplies the separately authenticated cutover census.
+        /// A completed lineage entry by itself grants no restart authority.
+        #[cfg(all(target_os = "macos", feature = "host"))]
+        pub(crate) fn reconnectable_codex(
+            &self,
+            originals: &[chat::Session],
+            claimant: &HostSessionProof,
+        ) -> Vec<Chat> {
+            self.entries
+                .iter()
+                .filter_map(|entry| {
+                    let current = &entry.replacement;
+                    if current.launch.provider != crate::agent::Provider::Codex
+                        || current.native_continuity != chat::NativeContinuity::ReconnectOnly
+                        || current.terminal.is_some()
+                        || !current.owns_codex_listener()
+                        || current
+                            .launch
+                            .session_id
+                            .as_deref()
+                            .is_none_or(str::is_empty)
+                    {
+                        return None;
+                    }
+                    let original = originals.iter().find(|source| source.id == current.id)?;
+                    if original.terminal.is_some()
+                        || original.owned_codex_listener != current.owned_codex_listener
+                        || original.launch.session_id.as_ref().is_some_and(|thread| {
+                            current.launch.session_id.as_ref() != Some(thread)
+                        })
+                        || entry.evidence.launch.session_id != current.launch.session_id
+                        || !self.proves(original, current, claimant)
+                    {
+                        return None;
+                    }
+                    Some(Chat {
+                        source: current.clone(),
+                        launch: entry.evidence.launch.clone(),
+                        previous_sources: entry.clone().issued_sources(),
+                    })
+                })
+                .collect()
+        }
+
         pub fn proves(
             &self,
             source: &chat::Session,
@@ -2955,6 +3000,64 @@ pub mod handoff {
                 replacement,
                 aliases: vec![],
             }
+        }
+
+        #[cfg(all(target_os = "macos", feature = "host"))]
+        #[test]
+        fn selected_codex_reconnect_requires_the_exact_claimants_owned_thread() {
+            let mut entry = recovered_fixture(crate::agent::Provider::Codex);
+            let socket = PathBuf::from(format!(
+                "/private/var/tmp/cagents-codex-{}/control.sock",
+                entry.replacement.id
+            ));
+            let owner = chat::OwnedCodexListener {
+                socket: socket.clone(),
+                allocator: entry.evidence.source.proof.clone().unwrap(),
+            };
+            entry.evidence.source.owned_codex_listener = Some(owner.clone());
+            entry.replacement.owned_codex_listener = Some(owner);
+            let args = vec!["--remote".into(), format!("unix://{}", socket.display())];
+            entry.evidence.source.launch.recipe.arguments = args.clone();
+            entry.replacement.launch.recipe.arguments = args.clone();
+            entry.evidence.launch.recipe.arguments = args;
+            let original = entry.evidence.source.clone();
+            let claimant = entry.replacement.proof.clone().unwrap();
+            let lineage = RecoveredChats {
+                entries: vec![entry.clone()],
+            };
+            let candidates =
+                lineage.reconnectable_codex(std::slice::from_ref(&original), &claimant);
+            assert_eq!(candidates.len(), 1);
+            let candidate = &candidates[0];
+            assert_eq!(candidate.source, entry.replacement);
+            assert!(
+                candidate
+                    .previous_sources
+                    .iter()
+                    .any(|alias| alias.source == original)
+            );
+            assert!(
+                lineage
+                    .reconnectable_codex(&[original.clone()], original.proof.as_ref().unwrap())
+                    .is_empty()
+            );
+
+            let mut lost = original.clone();
+            lost.launch
+                .recipe
+                .arguments
+                .push("--another-listener".into());
+            assert!(lineage.reconnectable_codex(&[lost], &claimant).is_empty());
+
+            entry.replacement.owned_codex_listener = None;
+            let unowned = RecoveredChats {
+                entries: vec![entry],
+            };
+            assert!(
+                unowned
+                    .reconnectable_codex(&[original], &claimant)
+                    .is_empty()
+            );
         }
 
         #[test]

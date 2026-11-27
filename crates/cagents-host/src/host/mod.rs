@@ -994,6 +994,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             #[cfg(not(target_os = "macos"))]
             let ordinary = update_recovery::restore_ordinary(&host);
             ordinary.map_err(io::Error::other)?;
+            #[cfg(target_os = "macos")]
+            if matches!(
+                cutover_checkpoint.as_ref(),
+                Some(crate::update::CutoverStartupCheckpoint::Absent)
+            ) {
+                update_recovery::reconnect_selected_codex(&host).map_err(io::Error::other)?;
+            }
             Ok(())
         })();
         // After restore has reattached every holder it could, and before
