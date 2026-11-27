@@ -12975,7 +12975,7 @@ impl Cagents {
                         && !self.pane_content_inputs_blocked(id),
                     move |payload| Message::TerminalDropped { card: id, payload },
                 );
-                let terminal = crate::ui_controls::popover(
+                let terminal = crate::ui_controls::popover_menu(
                     terminal,
                     self.terminal_menu(id),
                     widget::popover::Position::Point(
@@ -19777,6 +19777,15 @@ impl Cagents {
                 Task::none()
             }
             Message::OpenLink(card, url, gesture) => {
+                // The terminal's menu offers the link too, and closes once
+                // it opens, as its other rows do.
+                if self
+                    .terminal_context
+                    .as_ref()
+                    .is_some_and(|context| context.card == card)
+                {
+                    self.terminal_context = None;
+                }
                 if url.scheme() == "file" {
                     self.open_document_link(Some(card), url.as_str())
                 } else {
