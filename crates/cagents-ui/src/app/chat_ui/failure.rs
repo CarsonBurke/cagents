@@ -234,6 +234,16 @@ pub(super) struct Incident {
     pub active_recovery: bool,
 }
 
+impl Incident {
+    /// Whether the failure still holds: the conversation reports it now,
+    /// rather than only its transcript recording that it happened.
+    pub(super) fn current(&self) -> bool {
+        self.sources
+            .iter()
+            .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+    }
+}
+
 #[derive(Clone)]
 struct Metadata {
     key: String,
@@ -712,10 +722,7 @@ impl State {
                 matches!(
                     incident.kind,
                     Some(FailureKind::Authentication | FailureKind::NoAllowance)
-                ) && incident
-                    .sources
-                    .iter()
-                    .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+                ) && incident.current()
             })
             .map(|incident| (incident.key.clone(), None))
             .collect::<Vec<_>>();
@@ -724,11 +731,7 @@ impl State {
 
     pub(super) fn active_account_limit(&self) -> bool {
         self.incidents.iter().any(|incident| {
-            incident.kind == Some(FailureKind::AccountLimit)
-                && incident
-                    .sources
-                    .iter()
-                    .any(|source| matches!(source, Source::Snapshot | Source::Local(_)))
+            incident.kind == Some(FailureKind::AccountLimit) && incident.current()
         })
     }
 
@@ -1637,7 +1640,12 @@ impl Runtime {
         let blocked_start = self.start_blocked.filter(|_| current_local_error);
         let mut rows = vec![
             widget::row::with_children(vec![
-                heading_mark(incident.kind, cleared, blocked_start.is_some()).view(),
+                heading_mark(
+                    incident.kind,
+                    incident.current() && !cleared,
+                    blocked_start.is_some(),
+                )
+                .view(),
                 design::transcript(if let Some(reopen) = blocked_start {
                     if self.is_draft() {
                         reopen.draft_headline()
@@ -1809,9 +1817,9 @@ impl Runtime {
 
 /// The glyph at the head of a failure notice. A usage limit waits on a
 /// reset or another account rather than on a fix, so it takes the mark every
-/// other surface gives that state, in its tone; once the limit has cleared,
-/// or while the notice speaks for a blocked start instead, nothing is asked
-/// of the reader and the glyph is muted.
+/// other surface gives that state, in its tone, while it `holds`. One that
+/// has cleared or lapsed asks nothing of the reader and keeps the glyph
+/// muted; a notice speaking for a blocked start instead keeps the caution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeadingMark {
     State(crate::sidebar::AttentionState),
@@ -1827,13 +1835,13 @@ impl HeadingMark {
     }
 }
 
-fn heading_mark(kind: Option<FailureKind>, cleared: bool, blocked_start: bool) -> HeadingMark {
+fn heading_mark(kind: Option<FailureKind>, holds: bool, blocked_start: bool) -> HeadingMark {
     match kind {
         Some(FailureKind::AccountLimit) if !blocked_start => {
-            if cleared {
-                HeadingMark::Muted(Icon::UsageLimit)
-            } else {
+            if holds {
                 HeadingMark::State(crate::sidebar::AttentionState::Limited)
+            } else {
+                HeadingMark::Muted(Icon::UsageLimit)
             }
         }
         _ => HeadingMark::Muted(Icon::Warning),
@@ -1845,26 +1853,28 @@ mod tests {
     use super::*;
 
     /// A usage limit's notice carries the limit's own mark, as the status
-    /// line, sidebar and inspector do; other failures keep the caution.
+    /// line, sidebar and inspector do, in their tone only while it holds;
+    /// other failures keep the caution.
     #[test]
     fn a_usage_limit_notice_is_headed_by_the_limits_mark() {
         use crate::sidebar::AttentionState;
         assert_eq!(
-            heading_mark(Some(FailureKind::AccountLimit), false, false),
+            heading_mark(Some(FailureKind::AccountLimit), true, false),
             HeadingMark::State(AttentionState::Limited)
         );
         assert_eq!(AttentionState::Limited.glyph(), Some(Icon::UsageLimit));
+        // Cleared, or only recorded in the transcript, it asks nothing.
         assert_eq!(
-            heading_mark(Some(FailureKind::AccountLimit), true, false),
+            heading_mark(Some(FailureKind::AccountLimit), false, false),
             HeadingMark::Muted(Icon::UsageLimit)
         );
         assert_eq!(
-            heading_mark(Some(FailureKind::AccountLimit), false, true),
+            heading_mark(Some(FailureKind::AccountLimit), true, true),
             HeadingMark::Muted(Icon::Warning)
         );
         for kind in [None, Some(FailureKind::NoAllowance)] {
             assert_eq!(
-                heading_mark(kind, false, false),
+                heading_mark(kind, true, false),
                 HeadingMark::Muted(Icon::Warning)
             );
         }
