@@ -204,6 +204,8 @@ const UNRESPONSIVE_INFIX: &str = " was reached over SSH, but ";
 pub struct Unresponsive {
     pub device: String,
     pub host: String,
+    /// The device's cagents, as its saved entry names it.
+    pub executable: String,
     pub reached: Reached,
 }
 impl std::fmt::Display for Unresponsive {
@@ -211,17 +213,20 @@ impl std::fmt::Display for Unresponsive {
         let Self {
             device,
             host,
+            executable,
             reached,
         } = self;
         let wait = answer_wait();
         match reached {
             Reached::BridgeStarted => write!(
                 f,
-                "{device}{UNRESPONSIVE_INFIX}its cagents daemon did not answer within {wait}. It may be busy or stuck: try again, or check it with `ssh {host} cagents daemon status`."
+                "{device}{UNRESPONSIVE_INFIX}its cagents daemon did not answer within {wait}. It may be busy or stuck: try again, or check it with `ssh {host} {executable} daemon status`."
             ),
+            // An older cagents there never says it started, so this cannot
+            // tell a slow login from a daemon that hung.
             Reached::LoggedIn => write!(
                 f,
-                "{device}{UNRESPONSIVE_INFIX}cagents did not start there within {wait}. A slow login, such as a shell profile or home directory that hangs, can cause this: check that `ssh {host} true` returns quickly, then try again."
+                "{device}{UNRESPONSIVE_INFIX}nothing came back from cagents there within {wait}. A slow login, such as a shell profile or home directory that hangs, or a stuck cagents daemon can cause this: check that `ssh {host} true` returns quickly and that `ssh {host} {executable} daemon status` answers, then try again."
             ),
         }
     }
@@ -298,11 +303,15 @@ pub(crate) fn existing_daemon_missing() -> bool {
         })
         .unwrap_or(false)
 }
+// Best effort: `eprintln!` would panic, ending the bridge before it serves
+// anything, if SSH has already closed stderr.
 pub(crate) fn report_absent_bridge() {
-    eprintln!("{BRIDGE_ABSENT_MARKER}");
+    use io::Write as _;
+    let _ = writeln!(io::stderr().lock(), "{BRIDGE_ABSENT_MARKER}");
 }
 pub(crate) fn report_bridge_started() {
-    eprintln!("{BRIDGE_STARTED_MARKER}");
+    use io::Write as _;
+    let _ = writeln!(io::stderr().lock(), "{BRIDGE_STARTED_MARKER}");
 }
 /// How long a command or window waits for a device's first answer.
 fn answer_wait() -> String {
@@ -1708,6 +1717,7 @@ fn failed_request_error(
             Unresponsive {
                 device: device.name.clone(),
                 host: device.host.clone(),
+                executable: device.executable.clone(),
                 reached,
             },
         ),
@@ -2479,10 +2489,9 @@ mod tests {
             unresponsive(&login).map(|slow| slow.reached),
             Some(Reached::LoggedIn)
         );
-        assert!(
-            login
-                .to_string()
-                .contains("cagents did not start there within 30 seconds")
+        assert_eq!(
+            login.to_string(),
+            "build-host was reached over SSH, but nothing came back from cagents there within 30 seconds. A slow login, such as a shell profile or home directory that hangs, or a stuck cagents daemon can cause this: check that `ssh me@build-host true` returns quickly and that `ssh me@build-host cagents daemon status` answers, then try again."
         );
 
         let other = failed_request_error(

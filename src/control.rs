@@ -4916,6 +4916,15 @@ fn launch_error_on(device: Option<&crate::device::Device>, error: io::Error) -> 
     }
 }
 
+/// How long `cagents ui` waits for a device window to start. The window
+/// acknowledges only after reaching its device, which may take the whole
+/// remote handshake, and then starts as any window does. Giving up sooner
+/// would replace the window's own account of a slow or unreachable device
+/// with a bare timeout (#4486).
+fn remote_ui_launch_timeout() -> Duration {
+    REMOTE_HANDSHAKE_TIMEOUT + UI_LAUNCH_HANDSHAKE_TIMEOUT
+}
+
 pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
@@ -4923,7 +4932,7 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     // Remote windows attach to an already-running device daemon. Its handoff
     // budget is not stored on the client, whose repository filesystem is gated.
     let timeout = if crate::device::is_remote() {
-        UI_LAUNCH_HANDSHAKE_TIMEOUT
+        remote_ui_launch_timeout()
     } else {
         crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
             + UI_LAUNCH_HANDSHAKE_TIMEOUT
@@ -8375,10 +8384,15 @@ mod tests {
                 crate::device::Unresponsive {
                     device: "build-host".into(),
                     host: "me@build-host".into(),
+                    executable: "cagents".into(),
                     reached: crate::device::Reached::BridgeStarted,
                 },
             )
         };
+        // The window reaches its device before it acknowledges, so its
+        // launcher outwaits that handshake rather than reporting a timeout
+        // of its own over the window's reason.
+        assert!(remote_ui_launch_timeout() > REMOTE_HANDSHAKE_TIMEOUT);
         let error = device_app_error(slow());
         assert_eq!(error.kind, "device_unresponsive");
         assert_eq!(

@@ -132,6 +132,13 @@ error's kind is `device_unreachable`, with the device and its host in
 `details`, and SSH's reason too when a command, not a window, failed. cagents
 sets no `ConnectionAttempts`, so SSH's default single attempt applies unless
 your SSH configuration asks for more.
+A device that SSH reached but that said nothing within those 30 seconds is
+reported apart from one it could not reach: the message says whether cagents
+started there and its daemon did not answer, or nothing came back after the
+login, as with a shell profile or home directory that hangs. Its kind is
+`device_unresponsive`, and a command's `details` add `reached`, either
+`bridge_started` or `logged_in`. A window waits out that deadline before giving
+up, so it shows the device's reason rather than a timeout of its own.
 When the device runs another cagents version or none, the
 window says which side is older and offers **Update NAME** (or **Install on
 NAME**), which runs `cagents device update NAME --yes` with its progress shown

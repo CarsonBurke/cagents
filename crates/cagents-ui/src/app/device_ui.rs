@@ -2123,10 +2123,13 @@ fn diagnose_with(
             sentence,
         )
     };
-    // SSH could not connect at all: the checks below would each wait out
-    // the same connection, only to say nothing more.
-    // It starts with the device's name, kept as the person wrote it.
-    if let Some(reason) = reason.filter(|reason| crate::device::reads_as_unreachable(reason)) {
+    // SSH could not connect at all, or connected and then heard nothing back:
+    // the checks below would each wait out the same silence, only to say
+    // nothing more. It starts with the device's name, kept as the person
+    // wrote it.
+    if let Some(reason) = reason.filter(|reason| {
+        crate::device::reads_as_unreachable(reason) || crate::device::reads_as_unresponsive(reason)
+    }) {
         return OpenFailure::Other(reason.to_owned());
     }
     // The update's own inspection tells what the device lacks, a missing
@@ -2216,6 +2219,12 @@ mod tests {
             panic!("asked the device again: {arguments:?}")
         });
         assert!(matches!(failure, OpenFailure::Other(message) if message == reason));
+        // Nor is one SSH reached that then said nothing (#4486).
+        let slow = "build-host was reached over SSH, but its cagents daemon did not answer within 30 seconds. It may be busy or stuck: try again, or check it with `ssh build-host cagents daemon status`.";
+        let failure = diagnose_with("build-host", Some(slow), |arguments| {
+            panic!("asked the device again: {arguments:?}")
+        });
+        assert!(matches!(failure, OpenFailure::Other(message) if message == slow));
         // Any other failure is still looked into.
         let asked = std::cell::Cell::new(0);
         let _ = diagnose_with("build-host", Some("the daemon stopped"), |_| {
