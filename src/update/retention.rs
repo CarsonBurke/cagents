@@ -85,6 +85,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "recovery.json"
             | "settled.json"
             | "cutover.json"
+            | "cutover-start-failed.json"
             | "cutover-inventory.json"
             | "ready-claim.json"
             | "ready-effects.json"
@@ -189,6 +190,7 @@ mod tests {
             "census.json",
             "recovery.json",
             "cutover-inventory.json",
+            "cutover-start-failed.json",
             "cutover-inventory.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
             "ready-claim.json",
             "ready-effects.json",

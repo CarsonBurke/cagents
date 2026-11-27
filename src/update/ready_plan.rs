@@ -250,7 +250,6 @@ fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
 
 /// Recovery of an already selected attempt still needs the reservation's
 /// exact target and matched binaries. Older attempts may lack a reservation.
-#[cfg(feature = "host")]
 pub(super) fn selected_evidence(
     layout: &InstallLayout,
     state: &Path,
