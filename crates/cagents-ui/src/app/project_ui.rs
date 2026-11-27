@@ -1849,10 +1849,23 @@ impl Cagents {
             });
         }
         let store = self.session.as_ref().map(SessionRuntime::operation_store);
+        // A device's worktree goes through the device's own Git. Its main
+        // checkout, where `.worktrees/` is, is known only from its rows.
+        let device_main = crate::device::is_remote().then(|| {
+            self.sidebar_model
+                .project(target.project)
+                .map(super::worktree_ui::project_main_checkout)
+        });
         cosmic::task::future(async move {
             let request = target.clone();
             let result = tokio::task::spawn_blocking(move || {
-                let removed = delete_worktree(&request)?;
+                let removed = match device_main {
+                    Some(Some(main)) => delete_device_worktree(&request, &main).map(|()| None)?,
+                    Some(None) => {
+                        return Err("The project disappeared. Refresh before deleting.".into());
+                    }
+                    None => delete_worktree(&request)?,
+                };
                 if let Some(store) = store
                     && let Some(removed) = removed
                     && let Err(errors) =
@@ -1996,6 +2009,15 @@ impl Cagents {
         if worktree.locked {
             return Some("This worktree is locked. Unlock it explicitly in Git first.".into());
         }
+        if crate::device::is_remote()
+            && device_worktree_name(
+                &super::worktree_ui::project_main_checkout(project),
+                &target.path,
+            )
+            .is_none()
+        {
+            return Some(DEVICE_WORKTREE_OUTSIDE.into());
+        }
         if self.cards.values().any(|runtime| {
             matches!(runtime, CardRuntime::Repository(runtime)
             if runtime.descriptor.worktree.starts_with(&target.path) && runtime.is_saving())
@@ -2125,10 +2147,7 @@ impl Cagents {
             design::title("Delete worktree?").into(),
             super::notice_body(&target.label),
             super::notice_detail(target.path.display().to_string()),
-            super::notice_detail(
-                "Git will remove this worktree directory, including uncommitted, untracked and ignored files such as .env. \
-                 Terminals and chats running in it, including detached ones, are closed first.",
-            ),
+            super::notice_detail(worktree_deletion_note(false)),
         ];
         if let Some(branch) = self.worktree_retained_branch(target) {
             rows.push(super::notice_detail(branch));
@@ -2619,24 +2638,25 @@ pub(super) fn files_stay() -> String {
 }
 
 /// Whether `action` works in a device window, which refuses the rest of
-/// this computer's project and Git work. Removing a project reads and edits
-/// the device's registry, so its confirmation and results run there.
+/// this computer's project and Git work. Removing a project edits the
+/// device's registry and deleting a worktree runs the device's Git, so their
+/// confirmations and results run there.
 pub(super) fn runs_in_device_window(action: &Action) -> bool {
     match action {
         Action::ConfirmRemove
         | Action::RemovedProject { .. }
         | Action::AwaitClosedProject(..)
         | Action::ProjectSessionsClosed(..)
-        | Action::Dismiss => true,
-        // Deleting a worktree runs this computer's Git, as do opening an
-        // editor or file manager and inspecting a merged worktree.
-        Action::Command { .. }
-        | Action::EditorsLoaded(_)
         | Action::ConfirmDelete
         | Action::RetryDelete(_)
         | Action::AwaitSessions(..)
-        | Action::MergedWorktreeKept { .. }
         | Action::Deleted { .. }
+        | Action::Dismiss => true,
+        // Opening an editor or file manager and inspecting a merged
+        // worktree use this computer; commands arrive through the sidebar.
+        Action::Command { .. }
+        | Action::EditorsLoaded(_)
+        | Action::MergedWorktreeKept { .. }
         | Action::AvatarLoaded { .. }
         | Action::Finished(_) => false,
     }
@@ -2842,6 +2862,89 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     Ok(removed)
 }
 
+/// What a worktree's deletion removes, as its confirmation says it. A device
+/// removes only a clean worktree, so its window says that instead of
+/// promising to discard changes.
+pub(super) fn worktree_deletion_note(several: bool) -> String {
+    let (these, them) = if several {
+        ("these worktree directories", "them")
+    } else {
+        ("this worktree directory", "it")
+    };
+    match crate::device::selected() {
+        Some(device) => format!(
+            "Git on {} will remove {these}, including ignored files such as .env. A worktree \
+             with uncommitted or untracked changes is kept: commit or remove them first. \
+             Terminals and chats running in {them}, including detached ones, are closed first.",
+            device.name
+        ),
+        None => format!(
+            "Git will remove {these}, including uncommitted, untracked and ignored files such \
+             as .env. Terminals and chats running in {them}, including detached ones, are \
+             closed first."
+        ),
+    }
+}
+
+const DEVICE_WORKTREE_OUTSIDE: &str = "A device window can only delete worktrees in the \
+     project's .worktrees folder. Use git worktree remove in a terminal on the device.";
+
+/// The name a device knows a removable worktree by: its folder directly in
+/// the main checkout's `.worktrees`, the only place a device removes one.
+pub(super) fn device_worktree_name(main: &Path, path: &Path) -> Option<String> {
+    path.strip_prefix(main.join(".worktrees"))
+        .ok()
+        .filter(|name| name.components().count() == 1)
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+}
+
+/// Deletes a device's worktree as [`delete_worktree`] does a local one, with
+/// the device's Git. The device removes only a clean worktree, so that is
+/// checked before any session closes: a refusal leaves everything running.
+fn delete_device_worktree(target: &Target, main: &Path) -> Result<(), String> {
+    use crate::device_service::{GitOperation, Operation, Reply, request};
+    let name = device_worktree_name(main, &target.path).ok_or(DEVICE_WORKTREE_OUTSIDE)?;
+    let listed = |worktrees: &[PathBuf]| worktrees.contains(&target.path);
+    if !listed(&list_worktree_paths(&target.repository)?) {
+        return Err("Worktree changed or disappeared; refresh before deleting.".into());
+    }
+    let status = match request(Operation::Git {
+        root: target.path.clone(),
+        operation: GitOperation::Status,
+    })? {
+        Reply::Text(status) => status,
+        _ => return Err("Unexpected Git status reply".into()),
+    };
+    if device_status_has_changes(&status) {
+        return Err(
+            "It has uncommitted or untracked changes. Commit or remove them on the \
+             device first, or use git worktree remove --force in a terminal there."
+                .into(),
+        );
+    }
+    close_worktree_sessions(target)?;
+    if let Err(error) = request(Operation::Git {
+        root: main.to_path_buf(),
+        operation: GitOperation::RemoveWorktree { name },
+    }) {
+        // A lost reply may follow a removal. Reconcile before saying it
+        // failed, as a local deletion does.
+        if list_worktree_paths(&target.repository).is_ok_and(|worktrees| !listed(&worktrees)) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Whether `git status --short --branch` lists anything besides the branch.
+fn device_status_has_changes(status: &str) -> bool {
+    status
+        .lines()
+        .any(|line| !line.trim().is_empty() && !line.starts_with("## "))
+}
+
 fn worktree_removal_command(target: &Target) -> CommandSpec {
     CommandSpec::new("git")
         .cwd(&target.repository)
@@ -2859,6 +2962,29 @@ mod close_edit_regression;
 pub(in crate::app) mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    #[test]
+    fn a_device_worktree_is_named_by_its_folder_and_deleted_only_when_clean() {
+        let main = Path::new("/srv/device-only/demo");
+        assert_eq!(
+            device_worktree_name(main, &main.join(".worktrees/feature")).as_deref(),
+            Some("feature")
+        );
+        for outside in [
+            main.to_path_buf(),
+            main.join(".worktrees"),
+            main.join(".worktrees/nested/deeper"),
+            PathBuf::from("/srv/device-only/elsewhere"),
+        ] {
+            assert_eq!(device_worktree_name(main, &outside), None, "{outside:?}");
+        }
+        assert!(!device_status_has_changes("## feature\n"));
+        assert!(!device_status_has_changes(
+            "## feature...origin/feature [ahead 1]\n\n"
+        ));
+        assert!(device_status_has_changes("## feature\n M README.md\n"));
+        assert!(device_status_has_changes("## feature\n?? notes.txt\n"));
+    }
 
     fn removal_callback_test(case: impl FnOnce() + Send + 'static) {
         std::thread::Builder::new()
