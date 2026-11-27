@@ -1218,7 +1218,7 @@ mod tests {
             Err(failure) => failure,
             Ok(_) => panic!("a different thread must not display the captured page"),
         };
-        assert_eq!(failure.recovery, expected);
+        assert_eq!(failure.recovery, expected, "{}", failure.message);
         if provider_kind == crate::agent::Provider::Codex {
             assert!(failure.message.ends_with(
                 "This conversation was stopped for the update; its earlier provider is not attached"

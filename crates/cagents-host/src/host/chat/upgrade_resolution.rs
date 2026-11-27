@@ -177,6 +177,10 @@ pub(in crate::host) fn resolve(
         if let Err(native_error) = super::native_recovery::restore_for_start(host, 0, source) {
             if source.is_saved_claude_history() {
                 super::capacity::recover_saved_history(host, source)?;
+            } else if !native_error.retryable {
+                // A missing holder may permit reconnect. A permanent refusal,
+                // including an update fence, must survive Resolve unchanged.
+                return Err(native_error);
             } else {
                 match super::codex_reconnect::restore(host, source) {
                     Ok(true) => {}
