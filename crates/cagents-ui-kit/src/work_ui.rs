@@ -30,13 +30,18 @@ const COLUMN_MIN_WIDTH: f32 = 248.0;
 const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
+/// The most agents a card's menu lists to focus, most in need first, so a
+/// busy card's menu still fits the window.
+const MENU_AGENTS: usize = 4;
+/// The most sessions the agent mark's tooltip lists.
+const MARK_SESSIONS: usize = 6;
 /// The details of what the board could not read.
 const PROBLEMS_WIDTH: f32 = 440.0;
 const PROBLEMS_MAX_HEIGHT: f32 = 360.0;
 
-/// A board card's height before it has been measured: branch, title, facts
-/// and footer at the compact sizes.
-const CARD_ESTIMATE: f32 = 104.0;
+/// A board card's height before it has been measured: a one-line title, its
+/// caption and a line of marks at the compact sizes.
+const CARD_ESTIMATE: f32 = 84.0;
 /// A list row's height before it has been measured: title and facts lines.
 const ROW_ESTIMATE: f32 = 54.0;
 
@@ -898,16 +903,20 @@ impl State {
         }
     }
 
-    /// A board card: branch, pull request, then what is true of it now.
+    /// A board card: what the work is called, the names that place it, then
+    /// marks for what may need the user, its agents and how long ago it last
+    /// moved. It says what a list row says, stacked to the lane's width.
     fn card<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
         let card = CardRef::of(item);
         let mut top = vec![
             status_glyph(item),
-            crate::ui_controls::FadeText::heading(
-                item.branch.as_deref().unwrap_or("Detached HEAD"),
-            )
-            .width(Length::Fill)
-            .into(),
+            design::heading(title(item))
+                .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+                .ellipsize(iced::widget::text::Ellipsize::End(
+                    iced::advanced::text::EllipsizeHeightLimit::Lines(2),
+                ))
+                .width(Length::Fill)
+                .into(),
         ];
         if item.pinned {
             top.push(pinned_mark(item));
@@ -916,34 +925,29 @@ impl State {
         let mut lines = vec![
             widget::row::with_children(top)
                 .spacing(space::XS)
-                .align_y(Alignment::Center)
+                .align_y(Alignment::Start)
                 .into(),
         ];
-        if let Some(pull_request) = &item.pull_request {
-            lines.push(
-                crate::ui_controls::fade_text(format!(
-                    "#{} {}",
-                    pull_request.number, pull_request.title
-                ))
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .lines(2)
-                .width(Length::Fill)
-                .into(),
-            );
-        }
-        // Where it is and how far it has gone from its base, then the marks
-        // for what may need the user, as a list row has them.
-        let mut context = self.context(item);
-        context.extend(comparison_counts(item));
+        let names = self.names(item);
+        lines.push(
+            widget::row::with_children(vec![
+                with_tip(
+                    crate::ui_controls::FadeText::caption(names.join(" · "))
+                        .width(Length::Fill)
+                        .into(),
+                    details(item),
+                ),
+                self.age(item),
+            ])
+            .spacing(space::XS)
+            .align_y(Alignment::Center)
+            .into(),
+        );
         let marks = self.marks(item);
-        if !context.is_empty() || !marks.is_empty() {
-            let mut parts = vec![with_tip(
-                crate::ui_controls::FadeText::caption(context.join(" · "))
-                    .width(Length::Fill)
-                    .into(),
-                details(item),
-            )];
-            parts.extend(marks);
+        if !marks.is_empty() || !item.sessions.is_empty() {
+            let mut parts = marks;
+            parts.push(widget::Space::new().width(Length::Fill).into());
+            parts.extend(self.agents(item));
             lines.push(
                 widget::row::with_children(parts)
                     .spacing(space::XS)
@@ -951,15 +955,10 @@ impl State {
                     .into(),
             );
         }
-        lines.push(self.footer(item));
         let content = widget::column::with_children(lines).spacing(space::XS);
         let selected = self.menu.as_ref() == Some(&card);
         let button = widget::button::custom(content)
-            .name(format!(
-                "Open {}, {}",
-                spoken_label(item),
-                status_words(item).replace(" · ", ", ")
-            ))
+            .name(open_name(item))
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
@@ -976,16 +975,11 @@ impl State {
     /// age leave it unsaid.
     fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
         let card = CardRef::of(item);
-        let branch = item.branch.as_deref().unwrap_or("Detached HEAD");
         let mut title = vec![
             status_glyph(item),
-            crate::ui_controls::FadeText::heading(
-                item.pull_request
-                    .as_ref()
-                    .map_or(branch, |pull_request| pull_request.title.as_str()),
-            )
-            .width(Length::Fill)
-            .into(),
+            crate::ui_controls::FadeText::heading(title(item))
+                .width(Length::Fill)
+                .into(),
         ];
         title.extend(self.marks(item));
         if item.pinned {
@@ -1000,12 +994,7 @@ impl State {
         }
         title.push(self.age(item));
         title.push(self.card_menu(item, &card));
-        let mut names = Vec::with_capacity(4);
-        if let Some(pull_request) = &item.pull_request {
-            names.push(format!("#{}", pull_request.number));
-            names.push(branch.to_owned());
-        }
-        names.extend(self.context(item));
+        let names = self.names(item);
         let mut lines = vec![
             widget::row::with_children(title)
                 .spacing(space::S)
@@ -1032,11 +1021,7 @@ impl State {
         let selected = self.menu.as_ref() == Some(&card);
         let button =
             widget::button::custom(widget::column::with_children(lines).spacing(space::XXS))
-                .name(format!(
-                    "Open {}, {}",
-                    spoken_label(item),
-                    status_words(item).replace(" · ", ", ")
-                ))
+                .name(open_name(item))
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
@@ -1067,6 +1052,19 @@ impl State {
             ),
             None => age.into(),
         }
+    }
+
+    /// The quiet line beneath a card's title, in words: its pull request's
+    /// number and branch when the title is the pull request's, then its
+    /// project and Linear ticket. `#212 · feat/search · atlas · ENG-12`.
+    fn names(&self, item: &Item) -> Vec<String> {
+        let mut names = Vec::with_capacity(4);
+        if let Some(pull_request) = &item.pull_request {
+            names.push(format!("#{}", pull_request.number));
+            names.extend(item.branch.clone());
+        }
+        names.extend(self.context(item));
+        names
     }
 
     /// What places a card among the others in words: its project while every
@@ -1137,65 +1135,65 @@ impl State {
         marks
     }
 
-    /// Live sessions on the left, the last activity on the right.
-    fn footer<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
-        let mut parts = item
-            .sessions
+    /// The card's agents and terminals as the sidebar draws a channel's: the
+    /// mark of the one most worth seeing, with how many there are. It lists
+    /// them on hover and focuses the one most in need of the user when
+    /// pressed; the card's menu focuses any of them.
+    fn agents<'a>(&'a self, item: &'a Item) -> Option<Element<'a, Action>> {
+        let urgent = urgent_sessions(item);
+        let first = urgent.first()?;
+        let mut members = crate::sidebar::ChannelMembers::default();
+        for (index, session) in urgent.iter().enumerate() {
+            let state = crate::sidebar::ChannelMemberState::of(session.state, false);
+            let member = match session.provider {
+                Some(provider) => crate::sidebar::ChannelMember::Agent(provider, state),
+                None => crate::sidebar::ChannelMember::Terminal,
+            };
+            // The mark shows the session pressing it focuses.
+            if index == 0 {
+                members.add_lead(member);
+            } else {
+                members.add(member);
+            }
+        }
+        let mark = crate::sidebar::members_mark(
+            &members,
+            crate::sidebar::MembersGround::Row,
+            crate::sidebar::RowInk::Full,
+        )?;
+        let lead = format!(
+            "Focus {}, {}",
+            session_label(first),
+            session_state(first.state)
+        );
+        // Every session is a hover away, the most urgent first, within what
+        // a tooltip can show.
+        let mut tip = urgent
             .iter()
+            .take(MARK_SESSIONS)
             .map(|session| {
-                let working = matches!(session.state, ActivityState::Working);
-                let glyph: Element<'a, Action> = if working {
-                    crate::sidebar::attention_mark(crate::sidebar::AttentionState::Working, 12)
-                } else {
-                    match session.provider {
-                        Some(provider) => widget::icon(crate::ui_controls::provider_icon(provider))
-                            .size(design::COMPACT_ICON_SIZE)
-                            .into(),
-                        None => widget::icon(Icon::Terminal.handle())
-                            .size(design::COMPACT_ICON_SIZE)
-                            .into(),
-                    }
-                };
-                let label = session.title.clone().unwrap_or_else(|| {
-                    session.provider.map_or_else(
-                        || "Terminal".to_owned(),
-                        |provider| provider.label().to_owned(),
-                    )
-                });
-                let state = match session.state {
-                    ActivityState::Idle | ActivityState::Unknown => "idle",
-                    ActivityState::Waiting => "waiting for you",
-                    ActivityState::Approval => "waiting for your permission",
-                    ActivityState::Question => "waiting for your answer",
-                    ActivityState::Working => "working",
-                };
-                crate::interaction::tooltip(
-                    widget::button::custom(glyph)
-                        .name(format!("Focus {label}"))
-                        .class(crate::ui_controls::control_style(false, None))
-                        .padding(space::XXS)
-                        .on_press(Action::FocusSession(session.id)),
-                    format!("{label}, {state}"),
+                format!(
+                    "{}: {}",
+                    session_label(session),
+                    session_state(session.state)
                 )
             })
             .collect::<Vec<_>>();
-        parts.push(widget::Space::new().width(Length::Fill).into());
-        if let Some(activity) = &item.last_activity {
-            parts.push(crate::interaction::tooltip(
-                design::caption(format!(
-                    "{} {}",
-                    activity_label(activity.source),
-                    age(self.now_unix_ms, activity.at_unix_ms, true)
-                ))
-                .class(cosmic::theme::Text::Custom(design::muted_text))
-                .wrapping(iced::widget::text::Wrapping::None),
-                local_time(activity.at_unix_ms),
-            ));
+        if urgent.len() > MARK_SESSIONS {
+            tip.push(format!("and {} more", urgent.len() - MARK_SESSIONS));
         }
-        widget::row::with_children(parts)
-            .spacing(space::XXS)
-            .align_y(Alignment::Center)
-            .into()
+        let name = match urgent.len() {
+            1 => lead,
+            _ => format!("{lead}; {}", members.description()),
+        };
+        Some(crate::interaction::tooltip(
+            widget::button::custom(mark)
+                .name(name)
+                .class(crate::ui_controls::control_style(false, None))
+                .padding([space::XXS, space::XS])
+                .on_press(Action::FocusSession(first.id)),
+            tip.join("\n"),
+        ))
     }
 
     /// The card's actions: open what it names, and move it between columns.
@@ -1207,12 +1205,36 @@ impl State {
             .on_press(Action::Menu((!open).then(|| card.clone())));
         let content = open.then(|| {
             let mut items: Vec<Element<'a, Action>> = Vec::new();
+            // Getting to an agent that waits comes first.
+            let urgent = urgent_sessions(item);
+            for session in urgent.iter().take(MENU_AGENTS) {
+                let icon = session.provider.map_or_else(
+                    || Icon::Terminal.handle(),
+                    crate::ui_controls::provider_icon,
+                );
+                let label = format!("Focus {}", session_label(session));
+                let state = session_state(session.state);
+                items.push(
+                    popover_item(icon, label.clone(), state, Action::FocusSession(session.id))
+                        .name(format!("{label}, {state}"))
+                        .into(),
+                );
+            }
+            // The rest are in the worktree, the least urgent of them.
+            let more = urgent.len().saturating_sub(MENU_AGENTS);
             if let Some(worktree) = &item.worktree {
                 items.push(
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
-                        crate::ui_controls::display_path(&worktree.path),
+                        match more {
+                            0 => crate::ui_controls::display_path(&worktree.path).to_string(),
+                            more => format!(
+                                "{more} more {} there · {}",
+                                if more == 1 { "session" } else { "sessions" },
+                                crate::ui_controls::display_path(&worktree.path)
+                            ),
+                        },
                         Action::OpenWorktree(card.clone()),
                     )
                     .into(),
@@ -1341,7 +1363,10 @@ fn copy_branch_action(item: &Item) -> Option<Action> {
 /// match spans two of them.
 fn search_text(item: &Item) -> String {
     let mut fields = vec![item.project_name.clone()];
-    fields.extend(item.branch.clone());
+    match &item.branch {
+        Some(branch) => fields.push(branch.clone()),
+        None => fields.push("detached".to_owned()),
+    }
     fields.extend(
         item.worktree
             .as_ref()
@@ -1422,23 +1447,83 @@ enum Leading<'a> {
 }
 
 impl<'a> Leading<'a> {
+    /// An agent waiting on the user outranks one at work, as everywhere an
+    /// agent's state is summarised.
     fn of(item: &'a Item) -> Self {
-        let any = |state| item.sessions.iter().any(|session| session.state == state);
-        if any(ActivityState::Working) {
-            Self::Working
-        } else if let Some(wait) = item
+        let most_urgent = item
             .sessions
             .iter()
             .filter_map(|session| crate::sidebar::AttentionState::of_activity(session.state))
-            .filter(|state| state.waits_on_user())
-            .max()
-        {
-            Self::Waiting(wait)
+            .max();
+        if let Some(state) = most_urgent.filter(|state| state.waits_on_user()) {
+            Self::Waiting(state)
+        } else if most_urgent == Some(crate::sidebar::AttentionState::Working) {
+            Self::Working
         } else if let Some(pull_request) = &item.pull_request {
             Self::PullRequest(pull_request)
         } else {
             Self::Branch
         }
+    }
+}
+
+/// What a card is called: its pull request's title, else its branch, else
+/// the folder of a linked checkout whose HEAD is detached, which says more
+/// about what it is for than that it is detached; the glyph's tooltip and the
+/// card's accessible name say that. The primary checkout's folder is the
+/// project's own name, so a detached one there is said to be detached.
+fn title(item: &Item) -> &str {
+    if let Some(pull_request) = &item.pull_request {
+        return &pull_request.title;
+    }
+    if let Some(branch) = &item.branch {
+        return branch;
+    }
+    item.worktree
+        .as_ref()
+        .filter(|worktree| !worktree.primary)
+        .and_then(|worktree| worktree.path.file_name())
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or("Detached HEAD")
+}
+
+/// A card's accessible name: what pressing it opens, and its state and
+/// column, which no word on it draws.
+fn open_name(item: &Item) -> String {
+    format!(
+        "Open {}, {}",
+        spoken_label(item),
+        status_words(item).replace(" · ", ", ")
+    )
+}
+
+/// A card's sessions, the one most in need of the user first: waiting for
+/// permission, an answer or input, then working, then the rest, each kind in
+/// the board's order.
+fn urgent_sessions(item: &Item) -> Vec<&crate::work::Session> {
+    let mut sessions = item.sessions.iter().collect::<Vec<_>>();
+    sessions.sort_by_key(|session| {
+        std::cmp::Reverse(crate::sidebar::AttentionState::of_activity(session.state))
+    });
+    sessions
+}
+
+/// What names a session: its title, else its provider.
+fn session_label(session: &crate::work::Session) -> &str {
+    session.title.as_deref().unwrap_or_else(|| {
+        session
+            .provider
+            .map_or("Terminal", |provider| provider.label())
+    })
+}
+
+fn session_state(state: ActivityState) -> &'static str {
+    match state {
+        ActivityState::Idle | ActivityState::Unknown => "Idle",
+        ActivityState::Waiting => "Waiting for your input",
+        ActivityState::Approval => "Waiting for your permission",
+        ActivityState::Question => "Waiting for your answer",
+        ActivityState::Working => "Working",
     }
 }
 
@@ -1457,7 +1542,16 @@ fn spoken_label(item: &Item) -> String {
             pull_request.number,
             item.label()
         ),
-        None => item.label(),
+        // A detached checkout named by its folder says so when its glyph
+        // speaks of an agent instead.
+        None if item.branch.is_none()
+            && item.worktree.is_some()
+            && !matches!(Leading::of(item), Leading::Branch)
+            && title(item) != "Detached HEAD" =>
+        {
+            format!("{}, detached HEAD", title(item))
+        }
+        None => title(item).to_owned(),
     }
 }
 
@@ -1474,6 +1568,7 @@ fn status_words(item: &Item) -> String {
             "{} pull request",
             crate::sidebar::WorktreePullRequestState::from_work(pull_request).label()
         ),
+        Leading::Branch if item.branch.is_none() => "Detached worktree".to_owned(),
         Leading::Branch if item.worktree.is_some() => "Worktree".to_owned(),
         Leading::Branch => "Branch".to_owned(),
     };
@@ -1517,21 +1612,18 @@ fn quiet_column(column: Column) -> Option<&'static str> {
     matches!(column, Column::Landed | Column::Stale).then(|| column.label())
 }
 
-/// `↑6 ↓22`: commits ahead of and behind the project's base, when either.
-fn comparison_counts(item: &Item) -> Option<String> {
-    let comparison = item.comparison.as_ref()?;
-    match (comparison.ahead, comparison.behind) {
-        (0, 0) => None,
-        (ahead, 0) => Some(format!("↑{ahead}")),
-        (0, behind) => Some(format!("↓{behind}")),
-        (ahead, behind) => Some(format!("↑{ahead} ↓{behind}")),
-    }
-}
-
 /// What a card's naming line says on hover, one fact a line: its worktree's
 /// folder, its Linear ticket's title, and how far it has gone from its base.
 fn details(item: &Item) -> Option<String> {
-    let mut lines = Vec::with_capacity(3);
+    let mut lines = Vec::with_capacity(4);
+    if item.branch.is_none()
+        && let Some(head) = &item.head
+    {
+        lines.push(format!(
+            "Detached HEAD at {}",
+            head.oid.get(..7).unwrap_or(&head.oid)
+        ));
+    }
     if let Some(worktree) = &item.worktree {
         lines.push(crate::ui_controls::display_path(&worktree.path).into_owned());
     }
@@ -2572,6 +2664,15 @@ mod tests {
     /// The words a list row draws and the names its controls and marks
     /// publish, in tree order.
     fn row_words(state: &State, item: &Item) -> (Vec<String>, Vec<String>) {
+        words(state.row(item).map(|_| ()), 900.0)
+    }
+
+    /// The same of a board card, at a lane's width.
+    fn card_words(state: &State, item: &Item) -> (Vec<String>, Vec<String>) {
+        words(state.card(item).map(|_| ()), COLUMN_WIDTH)
+    }
+
+    fn words(mut element: Element<'_, ()>, width: f32) -> (Vec<String>, Vec<String>) {
         use cosmic::iced::advanced::{Layout, layout, mouse, widget::Tree};
         struct Texts<'a>(&'a mut Vec<String>);
         impl iced::advanced::widget::Operation for Texts<'_> {
@@ -2591,12 +2692,11 @@ mod tests {
             }
         }
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
-        let mut element: Element<'_, ()> = state.row(item).map(|_| ());
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
             &renderer,
-            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(900.0, 200.0)),
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 400.0)),
         );
         let mut texts = Vec::new();
         element.as_widget_mut().operate(
@@ -2691,6 +2791,173 @@ mod tests {
         state.update(Action::Scope(Some(landed.project.clone())));
         let (texts, _) = row_words(&state, &landed);
         assert_eq!(texts, ["fix/login", "Landed", "—"]);
+    }
+
+    fn terminal(id: u128) -> TerminalId {
+        TerminalId::from_uuid(uuid::Uuid::from_u128(id))
+    }
+
+    fn session(
+        id: u128,
+        provider: Option<crate::agent::Provider>,
+        state: ActivityState,
+    ) -> crate::work::Session {
+        crate::work::Session {
+            id: terminal(id),
+            provider,
+            title: None,
+            state,
+        }
+    }
+
+    /// A checkout whose HEAD is detached is called by its folder, which says
+    /// what it is for; that it is detached is said where its state is, on
+    /// its glyph and in its name, and its search finds it by either.
+    #[test]
+    fn a_detached_checkout_is_called_by_its_folder() {
+        let mut state = State::default();
+        let path = PathBuf::from("/repos/atlas/.worktrees/pr-207-review");
+        let mut card = item("unused", "atlas");
+        card.key = ItemKey::Worktree(path.clone());
+        card.branch = None;
+        card.head = Some(crate::work::Head {
+            oid: "4af0965aa1".into(),
+            committed_at_unix_ms: None,
+        });
+        card.worktree = Some(crate::work::Worktree {
+            path,
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        connected(&mut state, 1, board(vec![card.clone()]));
+
+        let (texts, names) = card_words(&state, &card);
+        assert_eq!(texts[0], "pr-207-review", "{texts:?}");
+        assert!(
+            !texts.iter().any(|text| text.contains("Detached")),
+            "{texts:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|name| name == "Open pr-207-review, Detached worktree, In progress"),
+            "{names:?}"
+        );
+        let (texts, _) = row_words(&state, &card);
+        assert_eq!(texts[0], "pr-207-review", "{texts:?}");
+        assert!(
+            details(&card)
+                .unwrap()
+                .starts_with("Detached HEAD at 4af0965\n")
+        );
+        state.update(Action::Query("detached".into()));
+        assert_eq!(state.visible().count(), 1);
+        state.update(Action::Query("207".into()));
+        assert_eq!(state.visible().count(), 1);
+        // With an agent at work its glyph says so, and its name still says
+        // it is detached.
+        card.sessions = vec![session(
+            1,
+            Some(crate::agent::Provider::Claude),
+            ActivityState::Working,
+        )];
+        assert_eq!(
+            open_name(&card),
+            "Open pr-207-review, detached HEAD, An agent is working, In progress"
+        );
+        card.sessions.clear();
+        // The primary checkout's folder is the project's name, which would
+        // read as the project rather than a detached checkout.
+        card.worktree.as_mut().unwrap().primary = true;
+        assert_eq!(title(&card), "Detached HEAD");
+    }
+
+    /// A card leads with its pull request's title, as its list row does, and
+    /// names its number, branch and project quietly beneath it, with its age.
+    #[test]
+    fn a_card_leads_with_its_pull_request_like_its_list_row() {
+        let mut state = State::default();
+        let mut card = item("feat/search", "atlas");
+        card.pull_request = Some(PullRequest {
+            number: 212,
+            title: "Rank search results by recency".into(),
+            url: "https://github.com/o/atlas/pull/212".into(),
+            state: PullRequestState::Open,
+            draft: true,
+            head_oid: "a".into(),
+            contains_local_head: true,
+            checks: None,
+            review: None,
+            updated_at: String::new(),
+        });
+        connected(&mut state, 1, board(vec![card.clone()]));
+        let (texts, _) = card_words(&state, &card);
+        assert_eq!(
+            texts,
+            [
+                "Rank search results by recency",
+                "#212 · feat/search · atlas",
+                "—"
+            ]
+        );
+        let (row, _) = row_words(&state, &card);
+        assert_eq!(row[0], texts[0]);
+    }
+
+    /// Several agents are one mark with their count, as a channel's are in
+    /// the sidebar. Pressing it focuses the one most in need of the user,
+    /// whose state the card's glyph says, and the menu focuses any of them.
+    #[test]
+    fn a_cards_agents_are_one_counted_mark_that_focuses_the_most_urgent() {
+        use crate::agent::Provider;
+        let mut state = State::default();
+        let mut card = item("feat/search", "atlas");
+        card.column = Column::Active;
+        card.sessions = vec![
+            session(1, Some(Provider::Claude), ActivityState::Working),
+            session(2, Some(Provider::Claude), ActivityState::Idle),
+            session(3, Some(Provider::Claude), ActivityState::Question),
+            session(4, Some(Provider::Claude), ActivityState::Approval),
+        ];
+        card.sessions[3].title = Some("Run the tests".into());
+        connected(&mut state, 1, board(vec![card.clone()]));
+
+        assert_eq!(
+            urgent_sessions(&card)
+                .iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>(),
+            [terminal(4), terminal(3), terminal(1), terminal(2)]
+        );
+        assert!(status_words(&card).starts_with("An agent needs your permission"));
+        let (texts, names) = card_words(&state, &card);
+        // One mark and its count, not a glyph per agent.
+        assert_eq!(
+            texts.iter().filter(|text| *text == "4").count(),
+            1,
+            "{texts:?}"
+        );
+        let focus = names
+            .iter()
+            .filter(|name| name.starts_with("Focus "))
+            .collect::<Vec<_>>();
+        assert_eq!(focus.len(), 1, "{names:?}");
+        assert!(
+            focus[0].starts_with("Focus Run the tests, Waiting for your permission; Claude"),
+            "{focus:?}"
+        );
+        // A second provider working does not take the mark from the agent
+        // pressing it focuses.
+        card.sessions[0].provider = Some(Provider::Codex);
+        connected(&mut state, 2, board(vec![card.clone()]));
+        let (_, names) = card_words(&state, &card);
+        assert!(
+            names
+                .iter()
+                .any(|name| name.starts_with("Focus Run the tests, Waiting for your permission; ")),
+            "{names:?}"
+        );
     }
 
     /// Frames of a Work board at a long-lived installation's scale, 600 cards

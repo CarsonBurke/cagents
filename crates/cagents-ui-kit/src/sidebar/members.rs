@@ -107,6 +107,9 @@ pub enum Member {
 pub struct Members {
     agents: [[u16; MemberState::ALL.len()]; Provider::ALL.len()],
     terminals: u16,
+    /// The member the mark stands for when the caller names one, as a Work
+    /// card names the agent its mark focuses.
+    led: Option<Member>,
 }
 
 impl Members {
@@ -117,6 +120,19 @@ impl Members {
             .expect("every state is listed");
         let slot = &mut self.agents[provider as usize][index];
         *slot = slot.saturating_add(1);
+    }
+
+    pub fn add(&mut self, member: Member) {
+        match member {
+            Member::Agent(provider, state) => self.add_agent(provider, state),
+            Member::Terminal => self.add_terminal(),
+        }
+    }
+
+    /// Adds a member and makes it the lead, whatever the display order.
+    pub fn add_lead(&mut self, member: Member) {
+        self.add(member);
+        self.led = Some(member);
     }
 
     pub fn add_terminal(&mut self) {
@@ -191,9 +207,10 @@ impl Members {
         parts.join("; ")
     }
 
-    /// The member the row's mark stands for: the first in display order.
+    /// The member the row's mark stands for: the one named with
+    /// [`Self::add_lead`], else the first in display order.
     pub fn lead(&self) -> Option<Member> {
-        self.iter().next()
+        self.led.or_else(|| self.iter().next())
     }
 
     /// A provider other than the lead's, the first in display order, which
@@ -645,6 +662,18 @@ mod tests {
         assert_eq!(terminals.lead(), Some(Member::Terminal));
         assert_eq!(terminals.peek(), None);
         assert_eq!(Members::default().lead(), None);
+    }
+
+    #[test]
+    fn a_named_lead_stands_for_the_members_whatever_their_order() {
+        let mut named = members(&[(Codex, MemberState::Working)], 0);
+        named.add_lead(Member::Agent(Claude, MemberState::Approval));
+        assert_eq!(
+            named.lead(),
+            Some(Member::Agent(Claude, MemberState::Approval))
+        );
+        assert_eq!(named.peek(), Some(Codex));
+        assert_eq!(named.len(), 2);
     }
 
     /// The bounds of each layer `members` draw on `ground`, bottom first,
