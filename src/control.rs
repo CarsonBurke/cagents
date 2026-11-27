@@ -4403,20 +4403,30 @@ where
         }
         // A mismatch names both protocols, so a caller can tell which side
         // to update without reading the sentence.
-        let details = crate::device::incompatible(&error).map(|mismatch| {
+        let mismatch = crate::device::incompatible(&error).map(|mismatch| {
             json!({
                 "device": mismatch.device,
                 "protocol": mismatch.actual,
                 "expected": crate::terminal_ipc::PROTOCOL_VERSION,
             })
         });
+        // SSH could not connect, so nothing else about the device is known.
+        let unreachable = crate::device::unreachable(&error).map(|unreachable| {
+            json!({
+                "device": unreachable.device,
+                "host": unreachable.host,
+            })
+        });
         let kind = if error.kind() == io::ErrorKind::PermissionDenied {
             "permission_denied"
-        } else if details.is_some() {
+        } else if mismatch.is_some() {
             "device_incompatible"
+        } else if unreachable.is_some() {
+            "device_unreachable"
         } else {
             "device"
         };
+        let details = mismatch.or(unreachable);
         emit_error(
             cli.global.json,
             &AppError {
