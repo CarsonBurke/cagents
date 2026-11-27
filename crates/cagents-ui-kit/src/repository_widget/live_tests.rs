@@ -1352,3 +1352,135 @@ fn a_place_keeps_pointing_at_its_text_through_a_replacement() {
         "inside past the new end clamps to it"
     );
 }
+
+fn git(root: &Path, args: &[&str]) -> String {
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "git {args:?}: {output:?}");
+    String::from_utf8(output.stdout).unwrap().trim().into()
+}
+
+fn commit(root: &Path, text: &str) -> crate::repository::Oid {
+    std::fs::write(root.join("notes.md"), text).unwrap();
+    git(root, &["commit", "-qam", text.trim()]);
+    crate::repository::Oid::parse(git(root, &["rev-parse", "HEAD"])).unwrap()
+}
+
+/// Last commit and Branch name the commits `HEAD` was at when chosen; each
+/// commit made since moves them along, including one made while they could
+/// not be named again, while a commit opened by name from History stays put.
+#[tokio::test]
+async fn a_commit_moves_the_chosen_committed_comparison_along() {
+    let root = tempfile::tempdir().unwrap();
+    let root = root.path();
+    git(root, &["init", "-q", "-b", "main"]);
+    git(root, &["config", "user.name", "Fixture"]);
+    git(root, &["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(root.join("notes.md"), "one\n").unwrap();
+    git(root, &["add", "notes.md"]);
+    git(root, &["commit", "-qm", "one"]);
+    git(root, &["branch", "base"]);
+    let base = crate::repository::Oid::parse(git(root, &["rev-parse", "HEAD"])).unwrap();
+    let two = commit(root, "two\n");
+
+    let card = CardId::new();
+    let mut runtime = RepositoryRuntime::new(RepositoryView {
+        project: crate::model::ProjectId::new(),
+        repository: root.join(".git"),
+        worktree: root.into(),
+        selected_file: None,
+    });
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    let task = runtime.open_file(card, "notes.md".into());
+    settle(&mut runtime, task).await;
+    let task = runtime.update(RepositoryAction::SelectCommittedBasis {
+        card,
+        choice: CommittedChoice::LastCommit,
+    });
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::CommitToParent {
+            oid: two.clone(),
+            parent: Some(base.clone()),
+        }
+    );
+
+    let three = commit(root, "three\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    let moved = DiffBasis::CommitToParent {
+        oid: three.clone(),
+        parent: Some(two),
+    };
+    assert_eq!(runtime.diff_basis, moved, "Last commit follows HEAD");
+    assert!(
+        matches!(runtime.diff_state(&moved), Some(DiffState::Ready(..))),
+        "and is read again"
+    );
+
+    // A move seen while another choice was in progress is caught on a later
+    // read, even one that finds nothing else changed.
+    let four = commit(root, "four\n");
+    runtime.basis_resolution = Some(BasisResolution::Resolving(CommittedChoice::Branch));
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.diff_basis, moved, "not replaced mid-choice");
+    runtime.basis_resolution = None;
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::CommitToParent {
+            oid: four.clone(),
+            parent: Some(three),
+        },
+        "the skipped move is caught"
+    );
+
+    // Branch keeps the base the reader chose.
+    let base_ref = ValidatedRefName::parse("refs/heads/base").unwrap();
+    let task = runtime.update(RepositoryAction::ApplyDiffBasis {
+        card,
+        basis: DiffBasis::MergeBaseToHead {
+            base_ref: base_ref.clone(),
+            head: four,
+            merge_base: base.clone(),
+        },
+    });
+    settle(&mut runtime, task).await;
+    let five = commit(root, "five\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(
+        runtime.diff_basis,
+        DiffBasis::MergeBaseToHead {
+            base_ref,
+            head: five.clone(),
+            merge_base: base.clone(),
+        },
+        "Branch follows HEAD from the same base"
+    );
+
+    // A commit opened from History is the one meant.
+    let opened = DiffBasis::CommitToParent {
+        oid: five,
+        parent: Some(base),
+    };
+    let task = runtime.update(RepositoryAction::OpenCommittedFile {
+        card,
+        path: crate::repository::RepoPath::parse("notes.md").unwrap(),
+        old_path: None,
+        basis: opened.clone(),
+    });
+    settle(&mut runtime, task).await;
+    commit(root, "six\n");
+    let task = runtime.refresh_visible(card);
+    settle(&mut runtime, task).await;
+    assert_eq!(runtime.diff_basis, opened, "an opened commit stays put");
+}

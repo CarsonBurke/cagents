@@ -2810,6 +2810,9 @@ pub struct RepositoryRuntime {
     /// commit comparison chosen against one `HEAD` is named again when it
     /// moves.
     list_head: Option<Option<String>>,
+    /// The last attempt to name the shown comparison again for a moved
+    /// `HEAD`, so a running or failed one is not repeated on every read.
+    head_refresh: Option<HeadRefresh>,
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
@@ -3043,6 +3046,7 @@ impl RepositoryRuntime {
             file_list_read: None,
             file_list_deposit: Arc::new(std::sync::Mutex::new(None)),
             list_head: None,
+            head_refresh: None,
             file_list_refresh_queued: false,
             background_file_refresh: false,
             mutation_refresh_pending: false,
@@ -6970,7 +6974,9 @@ impl RepositoryRuntime {
                 }
                 // Nothing in the worktree moved, so nothing here moves
                 // either: no rebuild, no assignment to `files`, no repaint.
-                Task::none()
+                // A comparison that could not be named again last time, for
+                // a save or a choice in progress, gets another chance.
+                self.refresh_head_basis(identity.card)
             }
             RepositoryAction::FilesLoaded { identity, result } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
@@ -7000,11 +7006,6 @@ impl RepositoryRuntime {
                         .is_some_and(|previous| previous != deposit.head),
                     None => false,
                 };
-                let rebase = if head_moved {
-                    self.refresh_head_basis(identity.card)
-                } else {
-                    Task::none()
-                };
                 let result = result.map(|files| self.merge_directory_listing(files));
                 let changed = match (&result, &self.selected) {
                     (Ok(after), Some(selected)) => {
@@ -7014,18 +7015,23 @@ impl RepositoryRuntime {
                         after
                             .iter()
                             .find(|file| file.path == selected.path)
-                            .map_or(selected.changed(), |file| file != selected)
+                            .map_or(selected.changed(), |file| status_moved(file, selected))
                     }
                     _ => false,
                 };
+                // A moved `HEAD` changes what the staged comparison is taken
+                // against even when the file's own status reads the same, and
+                // whichever read sees the move first is the only one that
+                // will.
                 let background_changed =
-                    std::mem::take(&mut self.background_file_refresh) && changed;
+                    (std::mem::take(&mut self.background_file_refresh) && changed) || head_moved;
                 if background_changed {
                     self.drop_mutable_diffs();
                 }
                 let refresh_selected =
                     (self.mutation_refresh_pending || background_changed) && result.is_ok();
                 self.files = result.map_or_else(FileListState::Failed, FileListState::Ready);
+                let rebase = self.refresh_head_basis(identity.card);
                 let relist = Task::batch([self.relist_expanded_directories(identity.card), rebase]);
                 if refresh_selected {
                     self.mutation_refresh_pending = false;
@@ -8283,6 +8289,31 @@ impl RepositoryRuntime {
                 previous,
                 result,
             } => {
+                // A comparison that cannot be named for this `HEAD` is
+                // remembered, so the next read does not ask again until
+                // `HEAD` moves; one waiting only on the reader, who moved on
+                // or started a save meanwhile, is forgotten so the next read
+                // tries again.
+                let unnamed = match &result {
+                    Ok(ResolvedBasis::Ready(basis)) => !matches!(
+                        self.diff_basis_refusal(basis),
+                        None | Some(DiffBasisRefusal::Saving)
+                    ),
+                    _ => true,
+                };
+                if self
+                    .head_refresh
+                    .as_ref()
+                    .is_some_and(|attempt| attempt.basis == previous)
+                {
+                    if unnamed {
+                        if let Some(attempt) = &mut self.head_refresh {
+                            attempt.running = false;
+                        }
+                    } else {
+                        self.head_refresh = None;
+                    }
+                }
                 // Only a comparison still on its old `HEAD`, with no choice
                 // in progress, is replaced; anything else has moved on.
                 if !self.accepts_selected(&identity)
@@ -8726,19 +8757,46 @@ impl RepositoryRuntime {
     /// be missing from the branch, and Last commit would name the one
     /// before. A commit opened from History, or a pull request, names its
     /// own commits and stays as it is.
+    ///
+    /// Each comparison names the commit it was taken at, so this compares
+    /// that with the `HEAD` the installed list last read rather than
+    /// remembering moves: one skipped while a save or a choice was in
+    /// progress is caught on the next read.
     fn refresh_head_basis(&mut self, card: CardId) -> Task<RepositoryAction> {
         let previous = self.diff_basis.clone();
+        let Some(Some(head)) = self.list_head.clone() else {
+            return Task::none();
+        };
+        let named = match &previous {
+            DiffBasis::MergeBaseToHead { head, .. }
+            | DiffBasis::CommitToParent { oid: head, .. } => head.as_str(),
+            _ => return Task::none(),
+        };
         let opened_directly = self
             .committed_selection
             .as_ref()
             .is_some_and(|(basis, _)| *basis == previous);
-        if opened_directly || self.basis_resolution.is_some() || self.is_saving() {
+        if named == head
+            || opened_directly
+            || self.basis_resolution.is_some()
+            || self.is_saving()
+            || self.head_refresh.as_ref().is_some_and(|attempt| {
+                attempt.head == head && (attempt.running || attempt.basis == previous)
+            })
+        {
             return Task::none();
         }
         let Some(selected) = self.selected.as_ref() else {
             return Task::none();
         };
         let identity = self.current_identity(card, selected.path.clone());
+        // Running, or failed for this `HEAD` and this comparison: either
+        // way not asked again until one of them changes.
+        self.head_refresh = Some(HeadRefresh {
+            head,
+            basis: previous.clone(),
+            running: true,
+        });
         let worktree = identity.worktree.clone();
         let resolve: Box<dyn FnOnce() -> Result<ResolvedBasis, String> + Send> = match &previous {
             // The base the reader chose, or the default one, stays the base.
@@ -10161,6 +10219,28 @@ fn read_repository_files(
             repository_files(&inventory.files, &inventory.status),
         )),
     }
+}
+
+/// One attempt at naming a comparison again for a moved `HEAD`.
+#[derive(Debug, Clone)]
+struct HeadRefresh {
+    head: String,
+    basis: DiffBasis,
+    running: bool,
+}
+
+/// Whether the selected file's row says something changed since it was
+/// read. An index object the selection never recorded, as after a save
+/// marked it modified, is no news: saving the worktree leaves the index as
+/// it was.
+fn status_moved(listed: &RepositoryFile, selected: &RepositoryFile) -> bool {
+    if selected.index_oid.is_none() {
+        return RepositoryFile {
+            index_oid: None,
+            ..listed.clone()
+        } != *selected;
+    }
+    listed != selected
 }
 
 /// The commit `HEAD` names, if the branch has one.
