@@ -16,6 +16,7 @@ use std::{
 
 #[cfg(test)]
 mod no_start_tests;
+pub mod provision;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -114,6 +115,60 @@ pub(crate) fn daemon_absent(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|error| error.is::<DaemonNotRunning>())
+}
+/// The selected device's daemon speaks another protocol than this computer's
+/// executables, so no window or command here can use it. Which side is older
+/// decides the fix: an older device is brought to this build with
+/// `cagents device update`; a newer one is never downgraded.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Incompatible {
+    pub device: String,
+    /// The protocol the device's daemon speaks.
+    pub actual: u16,
+}
+impl Incompatible {
+    /// Whether the device runs the older build, which this computer can update.
+    pub fn device_is_older(&self) -> bool {
+        self.actual < crate::terminal_ipc::PROTOCOL_VERSION
+    }
+}
+impl std::fmt::Display for Incompatible {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let Self { device, actual } = self;
+        let ours = crate::terminal_ipc::PROTOCOL_VERSION;
+        if self.device_is_older() {
+            write!(
+                f,
+                "{device} runs an older cagents (protocol {actual}) than this computer (protocol {ours}). Run `cagents device update {device}` to install this computer's version there; its terminals keep running."
+            )
+        } else {
+            write!(
+                f,
+                "{device} runs a newer cagents (protocol {actual}) than this computer (protocol {ours}). Update cagents on this computer, then connect again."
+            )
+        }
+    }
+}
+impl std::error::Error for Incompatible {}
+/// The protocol mismatch `error` reports, if it is one.
+pub fn incompatible(error: &io::Error) -> Option<&Incompatible> {
+    error.get_ref().and_then(|error| error.downcast_ref())
+}
+/// Whether the selected device's no-start bridge found no daemon running.
+pub(crate) fn existing_daemon_missing() -> bool {
+    SELECTED
+        .get()
+        .and_then(|context| {
+            context.bridges.lock().unwrap_or_else(|p| p.into_inner())[1]
+                .as_ref()
+                .map(|bridge| {
+                    bridge
+                        .transport
+                        .daemon_missing
+                        .load(std::sync::atomic::Ordering::Acquire)
+                })
+        })
+        .unwrap_or(false)
 }
 pub(crate) fn report_absent_bridge() {
     eprintln!("{BRIDGE_ABSENT_MARKER}");
@@ -1304,6 +1359,13 @@ pub fn prepare() -> io::Result<()> {
         Err(crate::device_service::Failure::Refused(message)) => {
             Err(io::Error::new(io::ErrorKind::PermissionDenied, message))
         }
+        Err(crate::device_service::Failure::Incompatible(actual)) => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            Incompatible {
+                device: selected().unwrap().name.clone(),
+                actual,
+            },
+        )),
         Err(crate::device_service::Failure::Failed(error)) => Err(io::Error::other(
             format!(
                 "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
