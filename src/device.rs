@@ -694,7 +694,7 @@ fn run_bridge_with(
                         if let Err(error) = forward(&owned, stream)
                             && !owned.cancelled.is_cancelled()
                         {
-                            tracing::warn!(device = owned.device.name, %error, "remote daemon connection ended; verify SSH access and matching cagents installation");
+                            tracing::warn!(device = owned.device.name, %error, "remote daemon connection ended; verify SSH access");
                         }
                     }) { workers.push(worker); }
             }
@@ -1368,7 +1368,7 @@ pub fn prepare() -> io::Result<()> {
         )),
         Err(crate::device_service::Failure::Failed(error)) => Err(io::Error::other(
             format!(
-                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start` and install matching cagents executables",
+                "could not connect to device {} (SSH host {}): {error}; verify `ssh {} cagents daemon start`",
                 selected().unwrap().name,
                 selected().unwrap().host,
                 selected().unwrap().host

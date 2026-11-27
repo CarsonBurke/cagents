@@ -120,8 +120,8 @@ cagents device update build-host
 ```
 
 The command sends this computer's installed cagents to the device over your SSH
-connection, verifies its checksum there, and installs it beside the device's
-current version with the same installer a release uses. The device's daemon then
+connection, checks there that it arrived intact, and installs it beside the
+device's current version with the same installer a release uses. The device's daemon then
 hands over to the new version the way `cagents daemon upgrade` does locally:
 terminals keep their processes, and work that cannot be carried waits or is
 listed for your decision. Run it from a terminal to answer those prompts; pass

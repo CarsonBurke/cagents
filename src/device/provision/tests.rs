@@ -134,15 +134,48 @@ fn a_device_without_cagents_gets_a_first_install() {
     bare.resolved = None;
     bare.installation = None;
     bare.protocol = None;
-    let plan = plan(&device("cagents"), &OURS, &bare, &Daemon::Stopped).unwrap();
+    let first = plan(&device("cagents"), &OURS, &bare, &Daemon::Stopped).unwrap();
     assert_eq!(
-        plan.action,
+        first.action,
         Action::Install {
             prefix: "/home/user/.local/share/cagents-install".into(),
             upgrade: false,
         }
     );
-    assert!(plan.note.unwrap().contains("/home/user/.local/bin/cagents"),);
+    assert!(
+        first
+            .note
+            .unwrap()
+            .contains("/home/user/.local/bin/cagents")
+    );
+    // A device already configured with the installer's link needs no note.
+    let linked = plan(
+        &device("/home/user/.local/bin/cagents"),
+        &OURS,
+        &bare,
+        &Daemon::Stopped,
+    )
+    .unwrap();
+    assert_eq!(linked.note, None);
+}
+
+#[test]
+fn a_mismatch_says_which_side_to_update() {
+    let message = |actual| {
+        crate::device::Incompatible {
+            device: "build-host".into(),
+            actual,
+        }
+        .to_string()
+    };
+    let older = message(PROTOCOL_VERSION - 1);
+    assert!(
+        older.contains("`cagents device update build-host`"),
+        "{older}"
+    );
+    let newer = message(PROTOCOL_VERSION + 1);
+    assert!(newer.contains("Update cagents on this computer"), "{newer}");
+    assert!(!newer.contains("device update"), "{newer}");
 }
 
 #[test]
@@ -152,7 +185,7 @@ fn what_the_device_cannot_run_or_should_not_get_is_refused_before_sending() {
         &installed("0.2.5"),
         &Daemon::Speaks(PROTOCOL_VERSION + 1),
     );
-    assert!(newer.contains("runs a newer cagents"), "{newer}");
+    assert!(newer.contains("has a newer cagents"), "{newer}");
     assert!(newer.contains("never downgraded"), "{newer}");
 
     let mut arm = installed("0.2.4+local.old");
@@ -180,6 +213,19 @@ fn what_the_device_cannot_run_or_should_not_get_is_refused_before_sending() {
         unmanaged.contains("(/usr/bin/cagents) was not installed with install.sh"),
         "{unmanaged}"
     );
+    // Neither a stopped daemon nor an unreachable one hides a newer build.
+    let mut newer_cli = installed("0.2.4+local.later");
+    newer_cli.protocol = Some(PROTOCOL_VERSION + 1);
+    for daemon in [
+        Daemon::Stopped,
+        Daemon::Unknown("reset".into()),
+        Daemon::Speaks(PROTOCOL_VERSION - 1),
+    ] {
+        assert!(
+            refusal(&OURS, &newer_cli, &daemon).contains("never downgraded"),
+            "{daemon:?}"
+        );
+    }
 }
 
 #[test]
@@ -262,7 +308,12 @@ fn the_device_shell_reports_its_installation() {
     let off_path = probe("cagents", system);
     assert!(off_path.off_path);
     assert_eq!(off_path.installation, remote.installation);
+    // So is a configured executable that is not there.
+    let moved = probe("/opt/cagents/bin/cagents", system);
+    assert!(moved.off_path);
+    assert_eq!(moved.installation, remote.installation);
     // Nothing installed at all.
+    fs::remove_file(prefix.join("current")).unwrap();
     let missing = probe("/nonexistent/cagents", system);
     assert_eq!((missing.resolved, missing.installation), (None, None));
 }
@@ -306,12 +357,12 @@ fn the_archive_is_the_installed_tree_in_release_layout_without_local_markers() {
         names,
         [
             "cagents-0.2.4/",
-            "cagents-0.2.4/bin",
+            "cagents-0.2.4/bin/",
             "cagents-0.2.4/bin/.cagents-ui-lease-v1",
             "cagents-0.2.4/bin/cagents",
-            "cagents-0.2.4/share",
-            "cagents-0.2.4/share/doc",
-            "cagents-0.2.4/share/doc/cagents",
+            "cagents-0.2.4/share/",
+            "cagents-0.2.4/share/doc/",
+            "cagents-0.2.4/share/doc/cagents/",
             "cagents-0.2.4/share/doc/cagents/LICENSE",
         ]
     );
@@ -330,6 +381,69 @@ fn the_archive_is_the_installed_tree_in_release_layout_without_local_markers() {
             .unwrap_err()
             .to_string()
             .contains("not a regular file")
+    );
+}
+
+/// The installer's own archive checks, taken from the install.sh this build
+/// sends, so a change on either side fails here rather than on a device.
+#[test]
+fn the_installer_accepts_the_archive() {
+    let root = tempfile::tempdir().unwrap();
+    for (path, mode) in [
+        ("bin/cagents", 0o755),
+        ("bin/cagents-ui", 0o755),
+        ("bin/cagentsd", 0o755),
+        ("bin/cagents-uninstall", 0o755),
+        ("bin/.cagents-ui-lease-v1", 0o644),
+        ("share/applications/dev.cagents.Cagents.desktop", 0o644),
+        ("share/autostart/dev.cagents.Cagents.Daemon.desktop", 0o644),
+        (
+            "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+            0o644,
+        ),
+        (
+            "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+            0o644,
+        ),
+        ("share/metainfo/dev.cagents.Cagents.metainfo.xml", 0o644),
+        ("share/doc/cagents/LICENSE", 0o644),
+        (STAGED_MARKER, 0o644),
+    ] {
+        let path = root.path().join(path);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "x").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(mode)).unwrap();
+    }
+    let top = "cagents-0.2.4+local.new";
+    let archive = root.path().join("cagents.tar.gz");
+    let mut packed = Vec::new();
+    // Packed before the archive exists, so the tree does not contain it.
+    pack(root.path(), top, &mut packed, &mut |_| ()).unwrap();
+    fs::write(&archive, packed).unwrap();
+
+    let between = |start: &str, end: &str| {
+        let from = INSTALLER.find(start).expect(start);
+        let to = from + INSTALLER[from..].find(end).expect(end) + end.len();
+        &INSTALLER[from..to]
+    };
+    let entry_types = between(
+        "awk '\n    {\n        type = substr($1, 1, 1)",
+        "' \"$ARCHIVE_VERBOSE\"",
+    );
+    let members = between("validate_version_members() {\n", "\n}\n");
+    let check = format!(
+        "set -e\nARCHIVE_VERBOSE=/dev/stdin\nPREPARED_MARKER=p LOCAL_CANDIDATE_MARKER={STAGED_MARKER} LOCAL_SOURCE_MARKER=s RETAINED_MARKER=r\n{members}\nLC_ALL=C tar -tvzf \"$1\" | {entry_types}\nLC_ALL=C tar -tzf \"$1\" | validate_version_members {top} 0\n",
+        entry_types = entry_types.trim_end_matches(" \"$ARCHIVE_VERBOSE\"")
+    );
+    let output = Command::new("sh")
+        .args(["-c", &check, "sh"])
+        .arg(&archive)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "install.sh would refuse the archive: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

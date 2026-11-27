@@ -1763,6 +1763,9 @@ fn ready_client() -> Result<crate::control::ControlClient, ReadyError> {
             crate::terminal::HostedTerminalStartError::Connect(
                 error @ crate::control::ControlError::UnsupportedVersion { .. },
             ) => ReadyError::Control(error),
+            crate::terminal::HostedTerminalStartError::HostIncompatible { actual } => {
+                ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual })
+            }
             error => ReadyError::Other(error.to_string()),
         })
 }

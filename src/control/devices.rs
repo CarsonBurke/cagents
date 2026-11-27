@@ -186,11 +186,18 @@ fn update(
         .map_err(|error| AppError::new("device", error))?;
     let protocol = crate::terminal_ipc::PROTOCOL_VERSION;
     let (state, sent, human) = match outcome {
-        Outcome::AlreadyCompatible => (
+        Outcome::AlreadyCompatible { running: true } => (
             "compatible",
             None,
             format!(
                 "{name} already runs a daemon this computer can use (protocol {protocol}). Nothing changed."
+            ),
+        ),
+        Outcome::AlreadyCompatible { running: false } => (
+            "compatible",
+            None,
+            format!(
+                "{name}'s cagents already uses protocol {protocol}; its daemon starts when you connect. Nothing changed."
             ),
         ),
         Outcome::Updated { sent } => (

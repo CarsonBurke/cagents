@@ -16,6 +16,7 @@
 use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Instant,
@@ -48,8 +49,9 @@ pub struct Options {
 /// What `update` did.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// The device's daemon already speaks this computer's protocol.
-    AlreadyCompatible,
+    /// The device's daemon already speaks this computer's protocol, or it is
+    /// stopped and its CLI would start one that does (`running` is false).
+    AlreadyCompatible { running: bool },
     /// The device now runs this computer's build. `sent` is the archive's
     /// size when it had to be uploaded.
     Updated { sent: Option<u64> },
@@ -122,7 +124,11 @@ pub fn update(
         )));
     }
     let sent = match &plan.action {
-        Action::Nothing => return Ok(Outcome::AlreadyCompatible),
+        Action::Nothing => {
+            return Ok(Outcome::AlreadyCompatible {
+                running: daemon == Daemon::Compatible,
+            });
+        }
         Action::Upgrade { .. } => None,
         Action::Install { prefix, .. } => {
             let sent = session.upload_and_stage(&local, prefix, progress)?;
@@ -269,7 +275,8 @@ struct Remote {
     home: String,
     /// The CLI the device's executable resolves to, symlinks followed.
     resolved: Option<String>,
-    /// The CLI was found only at the installer's default path, off PATH.
+    /// The device's executable was not found; the CLI is the one at the
+    /// installer's default path.
     off_path: bool,
     default_prefix: String,
     installation: Option<Installation>,
@@ -300,7 +307,7 @@ field home "$HOME"
 prefix=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
 field default_prefix "$prefix"
 path=$(command -v "$exe" 2>/dev/null) || path=
-if [ -z "$path" ] && [ "$exe" = cagents ] && [ -x "$prefix/current/bin/cagents" ]; then
+if [ -z "$path" ] && [ -x "$prefix/current/bin/cagents" ]; then
     path=$prefix/current/bin/cagents
     field off_path 1
 fi
@@ -435,11 +442,6 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
                 note: None,
             });
         }
-        Daemon::Speaks(actual) if *actual > PROTOCOL_VERSION => {
-            return refuse(format!(
-                "{name} runs a newer cagents (protocol {actual}) than this computer (protocol {PROTOCOL_VERSION}). A device is never downgraded; update cagents on this computer, then connect again."
-            ));
-        }
         Daemon::Stopped if remote.protocol == Some(PROTOCOL_VERSION) => {
             // Its daemon starts with the next connection, at this protocol.
             return Ok(Plan {
@@ -448,6 +450,23 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
             });
         }
         _ => {}
+    }
+    // The daemon or the installed CLI, whichever is newer: a stopped daemon
+    // or a deferred install must not hide a newer build.
+    let newest = [
+        match daemon {
+            Daemon::Speaks(actual) => Some(*actual),
+            _ => None,
+        },
+        remote.protocol,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    if let Some(actual) = newest.filter(|actual| *actual > PROTOCOL_VERSION) {
+        return refuse(format!(
+            "{name} has a newer cagents (protocol {actual}) than this computer (protocol {PROTOCOL_VERSION}). A device is never downgraded; update cagents on this computer, then connect again."
+        ));
     }
     if remote.os != "Linux" || remote.arch != "x86_64" {
         return refuse(format!(
@@ -469,12 +488,10 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
             display_version(theirs)
         ));
     }
-    let path_note = (remote.off_path && device.executable == "cagents").then(|| {
-        format!(
-            "cagents on {name} is not on the PATH SSH commands get. If connecting fails, set this device's executable to {}/.local/bin/cagents.",
-            remote.home
-        )
-    });
+    let installed_link = format!("{}/.local/bin/cagents", remote.home);
+    let path_note = remote
+        .off_path
+        .then(|| unreachable_note(device, &installed_link));
     let Some(resolved) = &remote.resolved else {
         // Nothing to hand over from: an ordinary first install.
         return Ok(Plan {
@@ -482,12 +499,8 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
                 prefix: remote.default_prefix.clone(),
                 upgrade: false,
             },
-            note: (device.executable == "cagents").then(|| {
-                format!(
-                    "If connecting to {name} then fails, set this device's executable to {}/.local/bin/cagents.",
-                    remote.home
-                )
-            }),
+            note: (device.executable != installed_link)
+                .then(|| unreachable_note(device, &installed_link)),
         });
     };
     let Some(installation) = remote.installation.as_ref().filter(|found| found.marked) else {
@@ -522,6 +535,22 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
     })
 }
 
+/// What to do when the device's configured executable does not lead to the
+/// CLI this command installs or found.
+fn unreachable_note(device: &Device, installed: &str) -> String {
+    let name = &device.name;
+    if device.executable == "cagents" {
+        format!(
+            "If connecting to {name} fails, cagents is not on the PATH SSH commands get there: set this device's executable to {installed}."
+        )
+    } else {
+        format!(
+            "This device's executable, {}, was not found on {name}. Set it to {installed}.",
+            device.executable
+        )
+    }
+}
+
 fn daemon_state() -> Daemon {
     let socket = match super::existing_socket_path() {
         Ok(Some(socket)) => socket,
@@ -536,8 +565,19 @@ fn daemon_state() -> Daemon {
     }
 }
 
-/// SSH to the device for the length of one update, over one authenticated
-/// connection, so a key that asks for a touch asks once.
+/// SSH to the device for the length of one update. Its commands share one
+/// authenticated connection; the daemon checks before and after go through
+/// the device bridge's own.
+/// Makes a private staging directory for one upload. An update interrupted
+/// mid-upload cannot remove its own, so this removes those left for hours.
+const PREPARE: &str = r#"umask 077
+base=${XDG_CACHE_HOME:-$HOME/.cache}/cagents
+mkdir -p "$base" || exit
+find "$base" -maxdepth 1 -name 'device-update.*' -type d -mmin +360 -exec rm -rf -- {} + 2>/dev/null
+staging=$(mktemp -d "$base/device-update.XXXXXXXX") || exit
+printf 'staging=%s\n' "$staging"
+"#;
+
 struct Session {
     host: String,
     name: String,
@@ -632,14 +672,17 @@ impl Session {
         prefix: &str,
         progress: &mut dyn FnMut(Step),
     ) -> io::Result<u64> {
-        let output = self.script(
-            "umask 077\nbase=${XDG_CACHE_HOME:-$HOME/.cache}/cagents\nmkdir -p \"$base\" && mktemp -d \"$base/device-update.XXXXXXXX\"\n",
-        )?;
+        let output = self.script(PREPARE)?;
         if !output.status.success() {
             return Err(self.failure("prepare", &output));
         }
-        let staging = String::from_utf8_lossy(&output.stdout).trim().to_owned();
-        if !staging.starts_with('/') || staging.contains('\n') {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let staging = stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("staging="))
+            .unwrap_or_default()
+            .to_owned();
+        if !staging.starts_with('/') {
             return Err(io::Error::other(format!(
                 "{} returned an unusable staging directory",
                 self.name
@@ -741,8 +784,10 @@ impl Session {
             // The review prompts on a terminal; give it the person's.
             command.arg("-t");
         } else {
-            command.stdin(Stdio::null()).stdout(io::stderr());
+            command.stdin(Stdio::null());
         }
+        // The review talks to the person; stdout is this command's result.
+        command.stdout(io::stderr());
         command.args(["--", &self.host, &remote]);
         let status = command.stderr(Stdio::inherit()).status()?;
         if !status.success() {
@@ -852,11 +897,7 @@ fn pack(root: &Path, top: &str, out: impl Write, read: &mut dyn FnMut(u64)) -> i
     ));
     archive.mode(tar::HeaderMode::Deterministic);
     archive.follow_symlinks(false);
-    let mut header = tar::Header::new_gnu();
-    header.set_entry_type(tar::EntryType::Directory);
-    header.set_mode(0o755);
-    header.set_size(0);
-    archive.append_data(&mut header, format!("{top}/"), io::empty())?;
+    append_directory(&mut archive, top, 0o755)?;
     let mut done = 0;
     for member in members(root)? {
         append(&mut archive, root, &member, top, &mut done, read)?;
@@ -876,7 +917,7 @@ fn append<W: Write>(
     let name = Path::new(top).join(relative);
     let metadata = fs::symlink_metadata(path)?;
     if metadata.is_dir() {
-        archive.append_dir(&name, path)?;
+        append_directory(archive, &name.to_string_lossy(), metadata.mode())?;
         let mut entries = fs::read_dir(path)?
             .map(|entry| entry.map(|entry| entry.path()))
             .collect::<io::Result<Vec<_>>>()?;
@@ -907,6 +948,20 @@ fn append<W: Write>(
     archive.append_data(&mut header, &name, &mut counting)?;
     *done = start + counting.read;
     Ok(())
+}
+
+/// install.sh accepts a directory entry only by a name ending in `/`.
+fn append_directory<W: Write>(
+    archive: &mut tar::Builder<W>,
+    name: &str,
+    mode: u32,
+) -> io::Result<()> {
+    let mut header = tar::Header::new_gnu();
+    header.set_entry_type(tar::EntryType::Directory);
+    // Deterministic mode, as for files: only the executable bits matter.
+    header.set_mode(if mode & 0o111 != 0 { 0o755 } else { 0o644 });
+    header.set_size(0);
+    archive.append_data(&mut header, format!("{name}/"), io::empty())
 }
 
 struct Counting<'a, R> {
