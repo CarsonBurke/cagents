@@ -635,11 +635,13 @@ fn mid_sentence_capitals(text: &str) -> impl Iterator<Item = &str> {
     text.lines().flat_map(|line| {
         let mut sentence_start = true;
         content(line).split_whitespace().filter_map(move |word| {
-            // Inline markers leave the boundary set by the surrounding prose.
-            if is_marker(word) {
+            let sentence_word = without_closing_punctuation(word);
+            // Inline markers and detached closing quotes leave the boundary
+            // set by the surrounding prose.
+            if sentence_word.is_empty() || is_marker(word) {
                 return None;
             }
-            let ends = ends_sentence(without_closing_punctuation(word));
+            let ends = ends_sentence(sentence_word);
             let starts = std::mem::replace(&mut sentence_start, ends);
             let core = bare(word);
             (!starts && !is_i(core) && core.chars().next().is_some_and(char::is_uppercase))
@@ -1799,6 +1801,13 @@ mod tests {
             fit_case("Then we left", "Did you mean Dr.?", |_| false),
             "Then we left"
         );
+    }
+
+    #[test]
+    fn a_detached_closing_quote_preserves_a_sentence_boundary() {
+        let names = mid_sentence_capitals("He said «\u{2009}Nora left.\u{2009}» Then we left")
+            .collect::<Vec<_>>();
+        assert_eq!(names, ["Nora"]);
     }
 
     /// In the draft, a continuation lands lowercased, and a name the
