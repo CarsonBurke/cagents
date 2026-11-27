@@ -329,7 +329,8 @@ private fun noticeIcon(notice: Notice) = when (notice.kind) {
         else -> Icons.Outlined.PanTool
     }
     NoticeKind.Succeeded -> Icons.Outlined.CheckCircle
-    NoticeKind.Failed, NoticeKind.AutomationBlocked -> Icons.Outlined.ErrorOutline
+    NoticeKind.Failed, NoticeKind.AutomationBlocked, NoticeKind.NotResumed ->
+        Icons.Outlined.ErrorOutline
     NoticeKind.MessageReceived -> Icons.Outlined.MarkChatUnread
     else -> Icons.Outlined.NotificationsActive
 }

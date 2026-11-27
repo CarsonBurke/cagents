@@ -32,6 +32,7 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         Kind::MessageReceived => "Messages waiting",
         Kind::AutomationPaused => "Automation pause recorded",
         Kind::AutomationBlocked => "Automation block recorded",
+        Kind::NotResumed => "Did not resume when this computer started",
     };
     let inbox = matches!(event.target, Target::SessionInbox(_));
     let context = if inbox {

@@ -1048,6 +1048,27 @@ session that cannot resume says why, and the command exits with status 4 once
 the others have been tried. A chat paired with its provider's terminal still
 resumes from its pane in the app.
 
+To have this happen by itself, turn on **Resume sessions when this computer
+starts** under **Settings → Terminal → Restarts**
+(`resume_sessions_after_reboot = true` in `settings.toml`). The first time the
+daemon runs after the computer starts, it resumes every stopped chat pane and
+agent that the earlier boot ran, as `cagents resume --all` would, without
+waiting for a window. This covers more than a window restores when it opens: a
+window shows a Claude conversation's saved history until you send it a message,
+while this starts its provider. A pane that a window has already opened
+is left to that window. One that cannot resume gets a **Did
+not resume when this computer started** notification naming the
+`cagents resume` command for it, and the ones it leaves untried, such as chats
+paired with their provider's terminal, share one notification. They follow
+your **Failure or cancellation** notification setting, and each can still be
+resumed from its pane in the app or, unless it is paired with a terminal, with
+`cagents resume`. On a computer no one logs in to, start the daemon at boot
+too, with `cagents daemon boot enable`. Once that resume has run, a daemon
+restarted within the same boot, as by an update or after a crash, resumes
+nothing by itself. If the first daemon was held back for recovery, or an update
+or shutdown interrupted its resume, the next daemon of that boot runs it, and
+it never reopens a conversation that boot already ran.
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline

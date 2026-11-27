@@ -1337,6 +1337,26 @@ const fn default_relaunch_agents_on_upgrade() -> bool {
     true
 }
 
+/// The `resume_sessions_after_reboot` preference from the settings file at
+/// `path`. Only that key is read, so the daemon needs none of the UI's
+/// settings model. A missing file or key is off; a file that exists but
+/// cannot be read is an error.
+pub fn resume_sessions_after_reboot(path: &std::path::Path) -> Result<bool, String> {
+    #[derive(Deserialize)]
+    struct Preference {
+        #[serde(default)]
+        resume_sessions_after_reboot: bool,
+    }
+    let document = match std::fs::read_to_string(path) {
+        Ok(document) => document,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    toml::from_str::<Preference>(&document)
+        .map(|preference| preference.resume_sessions_after_reboot)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
 const fn default_work_stale_after_days() -> u16 {
     crate::work::DEFAULT_STALE_AFTER_DAYS
 }
@@ -1690,6 +1710,12 @@ pub struct AppSettings {
     /// from this file too; see `crate::upgrade::relaunch_agents_by_default`.
     #[serde(default = "default_relaunch_agents_on_upgrade")]
     pub relaunch_agents_on_upgrade: bool,
+    /// Whether the first daemon after this computer starts resumes every
+    /// stopped conversation the earlier boot ran, without waiting for a
+    /// window. Off by default. The daemon reads it from this file too; see
+    /// [`resume_sessions_after_reboot`].
+    #[serde(default)]
+    pub resume_sessions_after_reboot: bool,
     /// Whether windows look for a new release on their own, at startup and
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
@@ -1820,6 +1846,7 @@ impl Default for AppSettings {
             inspector_show_activity: default_inspector_show_activity(),
             inspector_show_work: default_inspector_show_work(),
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
+            resume_sessions_after_reboot: false,
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
@@ -4880,6 +4907,23 @@ mod tests {
         assert!(decoded.focus_follows_mouse);
         assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
+    }
+
+    #[test]
+    fn the_daemon_reads_only_whether_to_resume_after_a_reboot() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        assert_eq!(resume_sessions_after_reboot(&path), Ok(false));
+        fs::write(&path, "terminal_font_size = 12.0\n").unwrap();
+        assert_eq!(resume_sessions_after_reboot(&path), Ok(false));
+        let settings = AppSettings {
+            resume_sessions_after_reboot: true,
+            ..AppSettings::default()
+        };
+        save(&path, &settings).unwrap();
+        assert_eq!(resume_sessions_after_reboot(&path), Ok(true));
+        fs::write(&path, "resume_sessions_after_reboot = \"yes\"\n").unwrap();
+        assert!(resume_sessions_after_reboot(&path).is_err());
     }
 
     #[test]

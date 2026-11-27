@@ -4,6 +4,7 @@ use super::*;
 use crate::{
     agent_execution::directory::Scope as Sessions,
     agent_execution::resume::{Resumed, Scope, StoppedSessions},
+    host::agent_execution::resume::{AfterBoot, Pass},
     model::{BootId, CardKind},
 };
 
@@ -41,17 +42,20 @@ fn run_and_stop(boot: BootId, shown: bool) -> (SharedHost, Accepted, String) {
     };
     crate::host::finish_chat_shutdown(&host).unwrap();
     drop(host);
+    (daemon_on(boot), accepted, conversation)
+}
+
+/// A new daemon on `boot` over the fixture's registry.
+fn daemon_on(boot: BootId) -> SharedHost {
+    let path = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap())
+        .join("registry.sqlite3");
     let mut state = HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new("restarted-resume-fixture"),
         boot_id: boot,
         host_incarnation: HostIncarnation::new("restarted-resume"),
     });
     state.install_model(Registry::at(&path).unwrap());
-    (
-        Arc::new(crate::host::state::HostLock::new(state)),
-        accepted,
-        conversation,
-    )
+    Arc::new(crate::host::state::HostLock::new(state))
 }
 
 /// Shows the agent's conversation in a channel's pane, saved with the
@@ -83,7 +87,6 @@ fn confirmed_conversation(
         .confirmed_session_id()
         .expect("the fixture provider confirmed its conversation");
     chat.launch.session_id = Some(confirmed.clone());
-    // The history Claude saved, which a resume reads before it starts.
     let sanitized: String = project
         .to_str()
         .unwrap()
@@ -545,4 +548,297 @@ fn a_message_to_a_stopped_session_names_resume_only_to_who_may_run_it() {
         "{agent}"
     );
     assert!(!agent.contains("Resume its conversation first"), "{agent}");
+}
+
+/// Whether the person asked for sessions to resume when this computer starts.
+fn opt_in(resume: bool) {
+    let path = crate::instance::settings_path().unwrap();
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, format!("resume_sessions_after_reboot = {resume}\n")).unwrap();
+}
+
+/// The daemon's own resume as it runs once the daemon serves.
+fn after_boot(host: &SharedHost) -> AfterBoot {
+    crate::host::agent_execution::resume::resume_after_boot(&Arc::downgrade(host))
+}
+
+fn ran(outcome: AfterBoot) -> Pass {
+    match outcome {
+        AfterBoot::Ran(pass) => pass,
+        other => panic!("the resume did not run: {other:?}"),
+    }
+}
+
+/// The boot whose resume ran to the end, as the daemon recorded it.
+fn handled_boot() -> Option<String> {
+    let path = crate::instance::project_dirs()
+        .unwrap()
+        .data_local_dir()
+        .join("resumed-boot");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|boot| boot.trim().to_owned())
+}
+
+fn stopped_ids(host: &SharedHost) -> Vec<crate::model::TerminalId> {
+    stopped_in(host, Scope::Sessions(Sessions::All))
+        .sessions
+        .iter()
+        .map(|stopped| stopped.id)
+        .collect()
+}
+
+/// The first daemon after a reboot reopens, by itself, what the earlier boot
+/// ran, as `cagents resume --all` would; the agent follows, and the boot is
+/// recorded as resumed.
+#[test]
+fn after_a_reboot_the_daemon_resumes_what_an_earlier_boot_ran() {
+    if in_child("after_a_reboot_the_daemon_resumes_what_an_earlier_boot_ran") {
+        return;
+    }
+    opt_in(true);
+    let (host, accepted, conversation) = stopped_agent(BootId::new("a-later-boot"));
+    let before = session_of(&host, accepted.agent.id);
+    let pass = ran(after_boot(&host));
+    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    assert!(!pass.interrupted);
+    assert_eq!(
+        pass.resumed
+            .iter()
+            .map(|resumed| resumed.stopped)
+            .collect::<Vec<_>>(),
+        [before.id]
+    );
+    let after = session_of(&host, accepted.agent.id);
+    assert_eq!(after.launch.session_id, Some(conversation));
+    assert_eq!(after.proof.as_ref(), Some(host.lock().unwrap().proof()));
+    assert!(stopped_ids(&host).is_empty());
+    assert_eq!(handled_boot().as_deref(), Some("a-later-boot"));
+}
+
+/// An agent started from a shell, which no pane shows, resumes too.
+#[test]
+fn after_a_reboot_an_agent_no_pane_shows_resumes_too() {
+    if in_child("after_a_reboot_an_agent_no_pane_shows_resumes_too") {
+        return;
+    }
+    opt_in(true);
+    let (host, accepted, _) = run_and_stop(BootId::new("a-later-boot"), false);
+    assert!(panes(&host).is_empty());
+    let before = session_of(&host, accepted.agent.id);
+    let pass = ran(after_boot(&host));
+    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    assert_eq!(
+        pass.resumed
+            .iter()
+            .map(|resumed| (resumed.stopped, resumed.agent))
+            .collect::<Vec<_>>(),
+        [(before.id, Some(accepted.agent.id))]
+    );
+    let after = session_of(&host, accepted.agent.id);
+    assert_eq!(after.proof.as_ref(), Some(host.lock().unwrap().proof()));
+}
+
+/// The first daemon of a boot cannot tell whether a conversation this boot
+/// ran still has a writer, so it leaves it for the person.
+#[test]
+fn a_conversation_this_boot_ran_is_not_resumed_by_itself() {
+    if in_child("a_conversation_this_boot_ran_is_not_resumed_by_itself") {
+        return;
+    }
+    opt_in(true);
+    let (host, accepted, _) = stopped_agent(crate::daemon::read_boot_id().unwrap());
+    let before = session_of(&host, accepted.agent.id);
+    let pass = ran(after_boot(&host));
+    assert!(
+        pass.resumed.is_empty() && pass.failed.is_empty() && pass.left.is_empty(),
+        "{pass:?}"
+    );
+    assert_eq!(stopped_ids(&host), [before.id]);
+}
+
+/// Once a boot's resume ran, here with the setting off, a daemon restarted
+/// within that boot resumes nothing by itself, even what an earlier boot ran
+/// and the setting now asks for. The next boot's first daemon does.
+#[test]
+fn a_daemon_restarted_within_one_boot_resumes_nothing_by_itself() {
+    if in_child("a_daemon_restarted_within_one_boot_resumes_nothing_by_itself") {
+        return;
+    }
+    opt_in(false);
+    let (host, accepted, _) = stopped_agent(BootId::new("a-later-boot"));
+    let before = session_of(&host, accepted.agent.id);
+    assert!(matches!(after_boot(&host), AfterBoot::Off));
+    assert_eq!(handled_boot().as_deref(), Some("a-later-boot"));
+    assert_eq!(stopped_ids(&host), [before.id]);
+
+    // Turned on within the boot, then the daemon restarts.
+    opt_in(true);
+    drop(host);
+    let host = daemon_on(BootId::new("a-later-boot"));
+    assert!(matches!(after_boot(&host), AfterBoot::AlreadyRan));
+    assert_eq!(stopped_ids(&host), [before.id]);
+
+    drop(host);
+    let host = daemon_on(BootId::new("the-boot-after"));
+    let pass = ran(after_boot(&host));
+    assert_eq!(
+        pass.resumed
+            .iter()
+            .map(|resumed| resumed.stopped)
+            .collect::<Vec<_>>(),
+        [before.id]
+    );
+    assert_eq!(handled_boot().as_deref(), Some("the-boot-after"));
+}
+
+/// A daemon that stops taking new work, as for an update or a shutdown,
+/// interrupts the resume without announcing anything, and leaves it for the
+/// next daemon of the boot.
+#[test]
+fn an_interrupted_resume_is_left_for_the_next_daemon_of_the_boot() {
+    if in_child("an_interrupted_resume_is_left_for_the_next_daemon_of_the_boot") {
+        return;
+    }
+    opt_in(true);
+    let (host, accepted, _) = stopped_agent(BootId::new("a-later-boot"));
+    let before = session_of(&host, accepted.agent.id);
+    host.lock().unwrap().shutting_down = true;
+    let pass = ran(after_boot(&host));
+    assert!(pass.interrupted, "{pass:?}");
+    assert!(
+        pass.resumed.is_empty() && pass.failed.is_empty(),
+        "{pass:?}"
+    );
+    assert_eq!(handled_boot(), None);
+    host.lock().unwrap().shutting_down = false;
+    assert_eq!(stopped_ids(&host), [before.id]);
+
+    drop(host);
+    let host = daemon_on(BootId::new("a-later-boot"));
+    let pass = ran(after_boot(&host));
+    assert_eq!(
+        pass.resumed
+            .iter()
+            .map(|resumed| resumed.stopped)
+            .collect::<Vec<_>>(),
+        [before.id]
+    );
+    assert_eq!(handled_boot().as_deref(), Some("a-later-boot"));
+}
+
+/// A session whose provider cannot start is reported with why, stays
+/// listed by `cagents resume`, and the resume still runs to the end.
+#[test]
+fn a_session_that_cannot_resume_is_reported_and_the_boot_still_counts_as_resumed() {
+    if in_child("a_session_that_cannot_resume_is_reported_and_the_boot_still_counts_as_resumed") {
+        return;
+    }
+    opt_in(true);
+    let (host, accepted, _) = stopped_agent(BootId::new("a-later-boot"));
+    let before = session_of(&host, accepted.agent.id);
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap());
+    std::fs::remove_file(root.join("bin/claude")).unwrap();
+    let pass = ran(after_boot(&host));
+    assert!(pass.resumed.is_empty() && !pass.interrupted, "{pass:?}");
+    assert_eq!(
+        pass.failed
+            .iter()
+            .map(|(stopped, _)| stopped.id)
+            .collect::<Vec<_>>(),
+        [before.id]
+    );
+    assert!(!pass.failed[0].1.is_empty());
+    assert_eq!(handled_boot().as_deref(), Some("a-later-boot"));
+    assert_eq!(stopped_ids(&host), [before.id]);
+}
+
+/// A window that opens while the daemon resumes restores its panes from what
+/// they saved before the reboot. Whether it reopens one in place or prepares
+/// a successor, the daemon starts no second writer of a conversation it
+/// already runs.
+#[test]
+fn a_window_restoring_its_panes_during_the_resume_starts_no_second_writer() {
+    if in_child("a_window_restoring_its_panes_during_the_resume_starts_no_second_writer") {
+        return;
+    }
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    const WINDOW: u64 = 7;
+    opt_in(true);
+    let (host, _, conversation) = stopped_agent(BootId::new("a-later-boot"));
+    let saved = panes(&host).pop().unwrap();
+    assert_eq!(ran(after_boot(&host)).resumed.len(), 1);
+
+    let start = |session: chat::Session| {
+        crate::host::chat::process(
+            &host,
+            WINDOW,
+            ClientRequest::ChatStart {
+                session,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+    };
+    assert!(start(saved.clone()).is_err(), "the pane's own restore");
+    if let Ok(ServerResponse::ChatResumePrepared { session: prepared }) = crate::host::chat::process(
+        &host,
+        WINDOW,
+        ClientRequest::ChatPrepareResume {
+            source: saved.clone(),
+        },
+    ) && prepared.id != saved.id
+    {
+        assert!(start(prepared).is_err(), "a successor the window prepared");
+    }
+    let state = host.lock().unwrap();
+    let writers: Vec<_> = state
+        .chats
+        .values()
+        .filter(|record| record.handle.owns_work() || !record.handle.is_completed())
+        .filter(|record| record.handle.session_id().as_deref() == Some(conversation.as_str()))
+        .map(|record| record.session.id)
+        .collect();
+    assert_eq!(writers, [saved.id], "one process runs the conversation");
+}
+
+/// A pane a window reopened before the resume reached it is left to that
+/// window: the resume starts nothing more and reports no failure.
+#[test]
+fn a_pane_a_window_reopened_first_is_left_to_it() {
+    if in_child("a_pane_a_window_reopened_first_is_left_to_it") {
+        return;
+    }
+    use crate::terminal_ipc::ClientRequest;
+    const WINDOW: u64 = 7;
+    opt_in(true);
+    let (host, _, conversation) = stopped_agent(BootId::new("a-later-boot"));
+    let mut saved = panes(&host).pop().unwrap();
+    // As the window's restore starts it, on the live daemon's proof.
+    saved.proof = Some(host.lock().unwrap().proof().clone());
+    crate::host::chat::process(
+        &host,
+        WINDOW,
+        ClientRequest::ChatStart {
+            session: saved.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
+    let pass = ran(after_boot(&host));
+    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    assert!(
+        pass.resumed.iter().all(|resumed| resumed.already_running),
+        "{pass:?}"
+    );
+    let state = host.lock().unwrap();
+    let writers = state
+        .chats
+        .values()
+        .filter(|record| record.handle.session_id().as_deref() == Some(conversation.as_str()))
+        .count();
+    assert_eq!(writers, 1);
 }
