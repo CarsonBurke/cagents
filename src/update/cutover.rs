@@ -148,7 +148,7 @@ pub(super) fn persist(
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) fn persist_ready_activation_claim(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
+pub(crate) fn persist_ready_evidence(path: &Path, bytes: &[u8]) -> Result<(), UpdateError> {
     let state = path
         .parent()
         .ok_or_else(|| invalid("Ready claim has no update directory"))?;

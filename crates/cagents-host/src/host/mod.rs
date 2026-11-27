@@ -51,11 +51,9 @@ use std::{
 };
 
 use thiserror::Error;
-use uuid::Uuid;
 
 use crate::{
     daemon::{self, HostLease, PlatformError, RuntimePaths},
-    model::{HostIncarnation, HostSessionId, HostSessionProof},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
         write_frame,
@@ -711,11 +709,6 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::process::pin_own_image() {
         tracing::warn!(%error, "terminal and chat holders cannot be started");
     }
-    let proof = HostSessionProof {
-        host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
-        boot_id: daemon::read_boot_id()?,
-        host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
-    };
     let paths = RuntimePaths::discover()?;
     let retirement_owned_by_updater = admission.retirement_owned_by_updater;
     let mut standby = admission.standby.take();
@@ -723,6 +716,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut ready_admission = standby
         .as_mut()
         .and_then(daemon::standby::Activated::take_ready_admission);
+    #[cfg(target_os = "macos")]
+    let proof = match &ready_admission {
+        Some(ready) => ready.successor().clone(),
+        None => daemon::new_host_session_proof()?,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let proof = daemon::new_host_session_proof()?;
     // The lock outlives every daemon but not the runtime directory, which a
     // reboot removes: without it no daemon of this instance ran this boot.
     let first_this_boot = fs::symlink_metadata(&paths.lock)
@@ -771,6 +771,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     };
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
+    #[cfg(target_os = "macos")]
+    if let Some(ready) = &ready_admission {
+        ready.begin_workspace_effects()?;
+    }
     // Before anything is launched, so the epoch precedes every launch.
     crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
     // Before anything is launched or adopted: sessions launched through this
@@ -1551,10 +1555,10 @@ mod tests {
     fn a_refused_client_reads_a_capacity_error_before_the_socket_closes() {
         let (mut client, server) = UnixStream::pair().unwrap();
         let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(
-            HostSessionProof {
-                host_session_id: HostSessionId::new("session"),
+            crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("session"),
                 boot_id: crate::model::BootId::new("boot"),
-                host_incarnation: HostIncarnation::new("incarnation"),
+                host_incarnation: crate::model::HostIncarnation::new("incarnation"),
             },
         )));
         let capacity = ClientCapacity::new(1);
