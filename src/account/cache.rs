@@ -349,7 +349,8 @@ impl Cache {
         }
     }
 
-    fn path(&self) -> PathBuf {
+    /// Path of the usage cache file.
+    pub fn path(&self) -> PathBuf {
         self.directory.join(FILE_NAME)
     }
 

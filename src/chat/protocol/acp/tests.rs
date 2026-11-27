@@ -1296,6 +1296,25 @@ fn a_stopped_turn_holds_its_queue_until_the_reader_starts_it() {
 }
 
 #[test]
+fn removing_what_a_stop_held_empties_the_queue_in_the_command_step() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let request = prompt(&mut acp, "hold");
+    let step = acp.command(send("one", PromptMode::Queue)).unwrap();
+    let held = queue_listing(&step).unwrap()[0].0.to_owned();
+    acp.command(Command::Interrupt).unwrap();
+    let step = acp
+        .receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    assert_eq!(statuses(&step), [(false, chat::TURN_INTERRUPTED)]);
+    // No provider frame follows, so the runtime must announce from this
+    // command step that the idle conversation now takes courier mail.
+    let step = acp.command(Command::RemoveQueued { id: held }).unwrap();
+    assert!(step.writes.is_empty());
+    assert_eq!(queue_listing(&step), Some(Vec::new()));
+}
+
+#[test]
 fn send_now_between_turns_starts_what_a_stop_held() {
     let mut acp = adapter(&[], None);
     ready(&mut acp);

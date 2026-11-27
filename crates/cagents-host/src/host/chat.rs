@@ -639,9 +639,12 @@ fn changed_for_instance(
         }
     }
     // A conversation that starts or settles may take the messages left for
-    // it, and may have hit a usage limit or left one behind.
-    if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
-        && let Some(courier) = &state.mailbox
+    // it, and may have hit a usage limit or left one behind. A failure, such
+    // as a usage limit, can arrive in a later frame than the settling.
+    if matches!(
+        &update,
+        Update::PromptAvailable | Update::Activity { .. } | Update::FailureChanged
+    ) && let Some(courier) = &state.mailbox
     {
         courier.wake();
     }
@@ -798,6 +801,11 @@ fn changed_for_instance(
         state.mobile_sessions_changed();
     }
     drop(state);
+    if completed {
+        // A completed conversation leaves the live mailbox directory even
+        // when its failed owner still holds work for recovery.
+        super::agent_execution::mailbox::wake(&host);
+    }
     if instance.is_some() && released {
         crate::daemon::wake();
     }

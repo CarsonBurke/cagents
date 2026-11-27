@@ -255,7 +255,9 @@ pub enum Update {
     },
     /// The provider began taking prompts, which leaves activity unchanged.
     Ready,
-    /// The parent can accept a new prompt, independently of running children.
+    /// The parent can accept a new prompt, independently of running children,
+    /// or one it already accepted is no longer held behind what the person
+    /// queued with the provider, so the courier may start a turn.
     PromptAvailable,
     /// The provider reported on the account the conversation runs on. It
     /// concerns every surface showing the account, whatever this
@@ -813,6 +815,7 @@ impl LocalHandle {
                     activity: ActivityState::Idle,
                     ready: false,
                     prompt_available: false,
+                    courier_available: false,
                     attention: TurnAttention::default(),
                     execution: execution::Tracker::default(),
                     attention_baselined: false,
@@ -2744,6 +2747,8 @@ struct Actor {
     /// Whether the provider was taking prompts when activity was last published.
     ready: bool,
     prompt_available: bool,
+    /// Whether the courier could start a turn when activity was last published.
+    courier_available: bool,
     attention: TurnAttention,
     execution: execution::Tracker,
     attention_baselined: bool,
@@ -4471,6 +4476,11 @@ impl Actor {
         let prompt_available = accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
+        // The person's queue can empty while the conversation stays idle,
+        // which changes neither activity nor prompt availability.
+        let courier_available = prompt_available && state.queued_messages.is_empty();
+        let courier_released = courier_available && !self.courier_available;
+        self.courier_available = courier_available;
         drop(state);
         let baselined = std::mem::replace(&mut self.attention_baselined, true);
         let activity_changed = activity != self.activity;
@@ -4502,6 +4512,8 @@ impl Actor {
             // leaves its geometric allocation resident for the lifetime of a
             // retained actor, one process per Claude conversation.
             self.reclaim_idle_frame_buffer();
+        }
+        if became_available || courier_released {
             (self.notify)(Update::PromptAvailable);
         }
         if let Some(previous) = &mut self.followed_generation

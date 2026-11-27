@@ -92,6 +92,9 @@ pub(crate) struct TerminalRecord {
     /// Actual OSC/display title, separate from provider conversation metadata.
     display_title: Option<String>,
     working_directory: Option<(u64, PathBuf)>,
+    /// The provider last reported running here, which decides whether the
+    /// courier can alert this terminal. Its working state does not matter.
+    agent_provider: Option<crate::agent::Provider>,
 }
 
 impl TerminalRecord {
@@ -532,6 +535,9 @@ impl HostState {
         if let Some(titles) = &self.channel_titles {
             titles.offer(super::workspace::titles::Target::Chat(id));
         }
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
     }
 
     pub(super) fn enable_holder_recovery(&mut self) {
@@ -894,6 +900,10 @@ impl HostState {
         self.exited_queue_archive
             .forget_resident(record.execution_instance);
         self.mobile_chat_ended(id);
+        // Its lineage may have no live conversation left for its messages.
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
         Some(record)
     }
 
@@ -1709,6 +1719,9 @@ impl HostState {
         if let Some(notifications) = &self.notifications {
             notifications.retire(terminal_id);
         }
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
         let clients: Vec<_> = self
             .subscriptions
             .by_terminal
@@ -2077,8 +2090,13 @@ impl HostState {
                 conversation_title: None,
                 display_title: None,
                 working_directory: None,
+                agent_provider: None,
             },
         );
+        // This is the live terminal even if saving its pane fails later.
+        if let Some(courier) = &self.mailbox {
+            courier.wake();
+        }
         let Some(client_id) = subscriber else {
             return self.descriptor_as(false, terminal_id);
         };
@@ -2703,6 +2721,11 @@ impl HostState {
         }
         // A late startup result cannot revoke already-owned ordinary exit.
         if !self.ordinary_exit_cleanup_pending {
+            if self.shutting_down
+                && let Some(courier) = &self.mailbox
+            {
+                courier.wake();
+            }
             self.shutting_down = false;
             self.shutdown_requested = false;
         }
@@ -5654,7 +5677,11 @@ fn start_terminal_view_owned_reserved(
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             if adopting {
                 state.settle_startup_custody(&terminal_id);
-                state.terminals.remove(&terminal_id);
+                if state.terminals.remove(&terminal_id).is_some()
+                    && let Some(courier) = &state.mailbox
+                {
+                    courier.wake();
+                }
             }
             drop(state);
             shared
@@ -6450,6 +6477,13 @@ fn record_event_from(
         if let WireTerminalEvent::WorkingDirectoryChanged { path } = &wire_event {
             record.working_directory = Some((sequence, path.clone()));
         }
+        let provider_changed = match &wire_event {
+            WireTerminalEvent::AgentActivityChanged { activity } => {
+                let provider = activity.as_ref().map(|activity| activity.provider);
+                std::mem::replace(&mut record.agent_provider, provider) != provider
+            }
+            _ => false,
+        };
         if let WireTerminalEvent::Exited {
             exit_code, signal, ..
         } = &wire_event
@@ -6499,6 +6533,13 @@ fn record_event_from(
             WireTerminalEvent::AgentActivityChanged { .. } | WireTerminalEvent::Exited { .. }
         ) {
             state.tally_updates.notify_one();
+        }
+        // The exact worker's provider can now receive inbox attention, or
+        // its departure can leave a single live member of a lineage.
+        if (provider_changed || matches!(wire_event, WireTerminalEvent::Completed { .. }))
+            && let Some(courier) = &state.mailbox
+        {
+            courier.wake();
         }
         (proof, sequence, deliveries, wake_exit)
     };
