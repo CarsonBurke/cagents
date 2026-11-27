@@ -24,11 +24,11 @@ use std::{
 use cagents::repository::{
     CancellationToken, ChangeArea, ChangeKind, CommandSpec, CommitOutcome, CommitRequest,
     ConflictKind, DiffBasis, DiffContent, DiffRequest, DiffSide, DiscardRequest, HeadState,
-    HistoryRequest, HistoryRevision, MutationFailure, MutationLocks, MutationOutcome, Oid,
-    PathSelection, ProcessExecutor, ProcessFailure, ProcessFailureKind, ProcessOutput, PushOutcome,
-    PushRequest, PushTarget, RemoteSideRef, RepoPath, RepositoryService, RepositorySnapshot,
-    StageRequest, SystemProcessExecutor, TrackingState, UnstageRequest, ValidatedBranchName,
-    ValidatedRefName,
+    HistoryRequest, HistoryRevision, IndexPatchRequest, MutationFailure, MutationLocks,
+    MutationOutcome, Oid, PathSelection, ProcessExecutor, ProcessFailure, ProcessFailureKind,
+    ProcessOutput, PushOutcome, PushRequest, PushTarget, RemoteSideRef, RepoPath,
+    RepositoryService, RepositorySnapshot, StageRequest, SystemProcessExecutor, TrackingState,
+    UnstageRequest, ValidatedBranchName, ValidatedRefName,
 };
 
 /// Applies configuration isolation and a fixed identity to every command,
@@ -1503,6 +1503,131 @@ fn staging_and_unstaging_keep_newline_and_non_utf8_names_exact() {
         MutationOutcome::Applied { .. }
     ));
     assert_eq!(fixture.text(&["ls-files"]), "base.txt");
+}
+
+/// A hunk patch names its file in a header the service writes, so it lands
+/// on exactly that index entry, however the name has to be spelled, and on
+/// nothing in the working tree. One the index no longer matches is refused
+/// whole.
+#[cfg(unix)]
+#[test]
+fn an_index_patch_changes_only_its_own_index_entry() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let names = [
+        b"plain.txt".as_slice(),
+        b"two words \"quoted\" back\\slash.txt",
+        b"line\nbreak",
+        b"non-utf8-\xff",
+        b"-leading",
+    ];
+    for name in names {
+        fs::write(fixture.work().join(OsStr::from_bytes(name)), b"one\ntwo\n").expect("write");
+    }
+    fixture.write("bystander.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    let service = fixture.service();
+    let apply = |name: &[u8]| {
+        service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: RepoPath::from_bytes(name).expect("path"),
+                    hunks: "@@ -1,2 +1,2 @@\n one\n-two\n+2\n".into(),
+                    from_worktree: false,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply")
+    };
+    for name in names {
+        assert!(
+            matches!(apply(name), MutationOutcome::Applied { .. }),
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+        let mut blob = b":".to_vec();
+        blob.extend_from_slice(name);
+        assert_eq!(
+            fixture.git_in_work(&[
+                OsStr::new("cat-file"),
+                OsStr::new("blob"),
+                OsStr::from_bytes(&blob)
+            ]),
+            b"one\n2\n"
+        );
+        assert_eq!(
+            fs::read(fixture.work().join(OsStr::from_bytes(name))).expect("read"),
+            b"one\ntwo\n"
+        );
+        // The index has moved past the comparison the hunk came from.
+        assert!(matches!(apply(name), MutationOutcome::NotApplied { .. }));
+    }
+    assert_eq!(
+        fixture
+            .git_in_work(&["diff", "--cached", "--name-only", "-z"])
+            .iter()
+            .filter(|byte| **byte == 0)
+            .count(),
+        names.len()
+    );
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--", "bystander.txt"]),
+        ""
+    );
+}
+
+/// Staging a hunk records the working file's bytes. Where Git's clean
+/// filters would record different ones, that is refused rather than
+/// bypassing them.
+#[test]
+fn staging_a_hunk_of_a_converted_file_is_refused() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write(".gitattributes", b"converted.txt text eol=crlf\n");
+    fixture.write("converted.txt", b"one\r\ntwo\r\n");
+    fixture.write("plain.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    fixture.write("converted.txt", b"one\r\n2\r\n");
+    fixture.write("plain.txt", b"one\n2\n");
+    let service = fixture.service();
+    let stage = |name: &str, hunks: &str| {
+        service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: path(name),
+                    hunks: hunks.into(),
+                    from_worktree: true,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply")
+    };
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage("converted.txt", "@@ -1,2 +1,2 @@\n one\r\n-two\r\n+2\r\n")
+    else {
+        panic!("a converted file's hunk must not be staged raw");
+    };
+    assert!(reason.contains("stage the whole file"), "{reason}");
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":converted.txt"]),
+        b"one\ntwo\n"
+    );
+    assert!(matches!(
+        stage("plain.txt", "@@ -1,2 +1,2 @@\n one\n-two\n+2\n"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        stage("plain.txt", "not a hunk\n"),
+        MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { .. }
+        }
+    ));
 }
 
 #[test]

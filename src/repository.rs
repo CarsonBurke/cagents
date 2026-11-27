@@ -1314,6 +1314,18 @@ pub struct UnstageRequest {
     pub selection: Vec<PathSelection>,
 }
 
+/// Hunks of one file's diff, for [`RepositoryService::apply_index_patch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPatchRequest {
+    pub worktree: PathBuf,
+    pub path: RepoPath,
+    /// The patch's `@@` sections, with no file header.
+    pub hunks: String,
+    /// Whether the lines the hunks add were read from the working tree, as
+    /// staging's are, rather than from the index or HEAD.
+    pub from_worktree: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscardRequest {
     pub worktree: PathBuf,
@@ -3057,6 +3069,30 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
 /// size comes from the same descriptor the bytes come from, and the read is
 /// bounded — so a classification and the read that acts on it cannot describe
 /// different objects.
+/// A patch file name as Git writes one: bare when it is plain printable
+/// ASCII, otherwise C-quoted, which `git apply` reads back exactly.
+fn quote_patch_name(name: &[u8]) -> Vec<u8> {
+    if name
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        return name.to_vec();
+    }
+    let mut quoted = vec![b'"'];
+    for &byte in name {
+        match byte {
+            b'"' | b'\\' => quoted.extend_from_slice(&[b'\\', byte]),
+            b'\t' => quoted.extend_from_slice(b"\\t"),
+            b'\n' => quoted.extend_from_slice(b"\\n"),
+            b' ' => quoted.push(b' '),
+            byte if byte.is_ascii_graphic() => quoted.push(byte),
+            byte => quoted.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+        }
+    }
+    quoted.push(b'"');
+    quoted
+}
+
 fn read_worktree_side(root: &fs_safety::Root, path: &RepoPath) -> DiffSide {
     let unreadable = |error: &dyn fmt::Display| DiffSide::Unreadable {
         reason: error.to_string(),
@@ -5561,6 +5597,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .stdin(pathspec_input(&indexed));
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
+    }
+
+    /// Applies hunks of one file's diff to its index entry, leaving the
+    /// working tree alone: staging or unstaging part of a file.
+    ///
+    /// The request carries only the `@@` sections; the header naming the
+    /// file is written here, from the validated path, so a patch can never
+    /// reach another one. `git apply` checks every context line against the
+    /// index and writes it once or not at all, so a hunk built from a
+    /// comparison the index has since moved past is refused, not misapplied.
+    pub fn apply_index_patch(
+        &self,
+        request: &IndexPatchRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let worktree = request.worktree.as_path();
+        let path = &request.path;
+        let rejected = |reason: String| {
+            Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            })
+        };
+        if !request.hunks.starts_with("@@ ") {
+            return rejected(format!("{path}: the patch has no hunks"));
+        }
+        if request.from_worktree {
+            // The new lines are the file's bytes as they are on disk. Where
+            // Git's clean filters would change those bytes on staging, as
+            // autocrlf, an eol attribute or LFS do, they are not what
+            // staging the file would record.
+            let hash = |filters: bool| {
+                let mut arguments = vec![OsString::from("hash-object")];
+                if !filters {
+                    arguments.push("--no-filters".into());
+                }
+                arguments.extend(["--".into(), path.as_os_str().to_owned()]);
+                self.run_checked(&self.git_literal_read(worktree, arguments), cancellation)
+                    .map(|output| output.stdout)
+            };
+            if hash(true)? != hash(false)? {
+                return rejected(format!(
+                    "{path}: Git converts this file when staging it, so stage the whole file"
+                ));
+            }
+        }
+        let name = |side: &[u8]| {
+            let mut name = side.to_vec();
+            name.extend_from_slice(path.as_bytes());
+            quote_patch_name(&name)
+        };
+        let (old, new) = (name(b"a/"), name(b"b/"));
+        let mut patch = b"diff --git ".to_vec();
+        for (part, separator) in [(&old, &b" "[..]), (&new, b"\n--- "), (&old, b"\n+++ ")] {
+            patch.extend_from_slice(part);
+            patch.extend_from_slice(separator);
+        }
+        patch.extend_from_slice(&new);
+        patch.push(b'\n');
+        patch.extend_from_slice(request.hunks.as_bytes());
+        let command = self
+            .git_mutation(worktree, ["apply", "--cached", "--whitespace=nowarn", "-"])
+            .stdin(patch);
+        Ok(self.run_mutation(
+            &command,
+            vec![path.clone()],
+            MutationScope::AllOrNothing,
+            cancellation,
+        ))
     }
 
     /// Whether `core.sparseCheckout` is on for this worktree.

@@ -40,10 +40,10 @@ use cosmic::{
 use crate::{
     design::space,
     diff_view::{
-        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffPalette, DiffRowKind,
-        DiffSyntax, InlineDiffRow, RenderedDiff, SplitDiffRow, SyntaxSpan, build_document_diff,
-        diff_fold_background, diff_gutter_text, diff_row_background, load_repository_diff,
-        styled_line_spans,
+        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffHunk, DiffMode, DiffModel, DiffPalette, DiffRowKind,
+        DiffSyntax, InlineDiffRow, PatchTarget, RenderedDiff, SplitDiffRow, SyntaxSpan,
+        build_document_diff, diff_fold_background, diff_gutter_text, diff_row_background,
+        load_repository_diff, styled_line_spans,
     },
     editor::{
         FileContent, FileIoError, LinkRefusal, LoadedFile, OversizeKind, ReadOnlyReason,
@@ -64,6 +64,23 @@ use crate::{
     },
     ui_controls::{Icon, icon_button},
 };
+
+/// What [`RepositoryAction::StageHunk`] asks of Git.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HunkStaging {
+    /// The hunk is the whole file: stage or unstage it as a file.
+    File(crate::repository::PathSelection),
+    /// Apply these hunks to the index.
+    Patch(crate::repository::IndexPatchRequest),
+}
+
+/// The hunk actions a comparison offers: staging (`Some(true)`), unstaging
+/// (`Some(false)`) or neither, and whether it can revert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct HunkOffers {
+    stage: Option<bool>,
+    revert: bool,
+}
 
 /// The other path Git paired with a changed file in one area.
 ///
@@ -736,6 +753,20 @@ pub enum RepositoryAction {
         card: CardId,
         stage: bool,
     },
+    /// Stages (`stage`) or unstages one hunk of the comparison on screen.
+    /// Git mutations belong to the host, as [`Self::StageSelected`]'s do;
+    /// [`RepositoryRuntime::hunk_staging`] says what to run.
+    StageHunk {
+        card: CardId,
+        hunk: DiffHunk,
+        stage: bool,
+    },
+    /// Gives one working-tree hunk back the index's lines, as one edit of
+    /// the buffer that Undo takes back.
+    RevertHunk {
+        card: CardId,
+        hunk: DiffHunk,
+    },
     ApplySourceSurface {
         card: CardId,
         diff: bool,
@@ -940,6 +971,8 @@ impl RepositoryAction {
             | Self::BackToFiles { card }
             | Self::OpenExternal { card, .. }
             | Self::StageSelected { card, .. }
+            | Self::StageHunk { card, .. }
+            | Self::RevertHunk { card, .. }
             | Self::ApplySourceSurface { card, .. }
             | Self::ApplyMarkdownMode { card, .. }
             | Self::ApplyDiffMode { card, .. }
@@ -5573,6 +5606,128 @@ impl RepositoryRuntime {
         })
     }
 
+    /// The comparison the surface would act on: the current one for the
+    /// selected basis, never one retained while it reloads.
+    fn current_diff_model(&self) -> Option<&DiffModel> {
+        match self.diff_state(&self.diff_basis) {
+            Some(DiffState::Ready(RenderedDiff::Text { model, .. }, _)) => Some(model),
+            _ => None,
+        }
+    }
+
+    /// Which hunk actions the comparison on screen offers, enabled or not.
+    fn hunk_offers(&self) -> HunkOffers {
+        if self.directory_only || self.reviews_pull_request() || self.basis_resolution.is_some() {
+            return HunkOffers::default();
+        }
+        match self.diff_basis {
+            DiffBasis::IndexToWorktree => HunkOffers {
+                stage: Some(true),
+                // Reverting edits the buffer, so it needs one, and one whose
+                // text this comparison was computed from.
+                revert: matches!(self.document, DocumentState::Editable(_))
+                    && self
+                        .current_diff_model()
+                        .is_some_and(|model| !model.changes_existence()),
+            },
+            DiffBasis::HeadToIndex => HunkOffers {
+                stage: Some(false),
+                revert: false,
+            },
+            _ => HunkOffers::default(),
+        }
+    }
+
+    /// Whether the comparison on screen describes the buffer as it is now.
+    /// A live comparison lags typing by its debounce; a hunk taken from a
+    /// superseded one would name lines that have since moved.
+    fn hunks_current(&self) -> bool {
+        self.current_diff_model().is_some()
+            && (!self.editable_working_diff() || self.working_annotations_current())
+    }
+
+    fn can_revert_hunks(&self) -> bool {
+        self.hunk_offers().revert && self.hunks_current() && !self.is_saving()
+    }
+
+    fn can_stage_hunks(&self) -> bool {
+        self.hunk_offers().stage.is_some()
+            && self.hunks_current()
+            && !self.mutation_refresh_pending
+            && !self.blocks_navigation()
+    }
+
+    /// What staging (`stage`) or unstaging `hunk` of the comparison on
+    /// screen asks Git to do, or `None` when it cannot be done now.
+    ///
+    /// A file that one side lacks is a single hunk that creates or deletes
+    /// it, which the whole-file action already records with the right mode
+    /// and filters; every other hunk is a patch applied to the index alone.
+    pub fn hunk_staging(&self, hunk: &DiffHunk, stage: bool) -> Option<HunkStaging> {
+        use crate::repository::{IndexPatchRequest, RepoPath};
+        if !self.can_stage_hunks() || self.hunk_offers().stage != Some(stage) {
+            return None;
+        }
+        let model = self.current_diff_model()?;
+        let index = model.hunks.iter().position(|candidate| candidate == hunk)?;
+        if model.changes_existence() {
+            return self
+                .selected_staging_selection(stage)
+                .map(HunkStaging::File);
+        }
+        let target = if stage {
+            PatchTarget::Before
+        } else {
+            PatchTarget::After
+        };
+        Some(HunkStaging::Patch(IndexPatchRequest {
+            worktree: self.descriptor.worktree.clone(),
+            path: RepoPath::parse(self.diff_pathspec()?.as_os_str()).ok()?,
+            hunks: model.hunk_patch(index, target)?,
+            from_worktree: stage,
+        }))
+    }
+
+    fn revert_hunk(&mut self, card: CardId, hunk: &DiffHunk) -> Task<RepositoryAction> {
+        if !self.can_revert_hunks() {
+            return Task::none();
+        }
+        let Some(model) = self.current_diff_model() else {
+            return Task::none();
+        };
+        let Some((span, restored)) = model
+            .hunks
+            .iter()
+            .position(|candidate| candidate == hunk)
+            .and_then(|index| model.hunk_reversal(index))
+        else {
+            return Task::none();
+        };
+        let restored = restored.to_owned();
+        let DocumentState::Editable(document) = &mut self.document else {
+            return Task::none();
+        };
+        // The comparison is current, so its new side is this buffer's text
+        // and the span addresses it.
+        let start = caret_for_offset(&document.content, span.start);
+        let end = caret_for_offset(&document.content, span.end);
+        self.language
+            .retire_completions(&mut self.completion_intent);
+        document.content.move_to(text_editor::Cursor {
+            position: end,
+            selection: ((start.line, start.column) != (end.line, end.column)).then_some(start),
+        });
+        let edit = if restored.is_empty() {
+            text_editor::Edit::Delete
+        } else {
+            text_editor::Edit::Paste(Arc::new(restored))
+        };
+        if let Applied::Changed(protocol) = document.apply(text_editor::Action::Edit(edit)) {
+            self.push_lsp_change(protocol);
+        }
+        Task::batch([self.markdown_task(card), self.working_diff_task(card)])
+    }
+
     /// Re-announces the open buffer to a replaced language-server manager.
     ///
     /// A manager's server set is fixed at construction, so a changed
@@ -6031,6 +6186,12 @@ impl RepositoryRuntime {
             match result {
                 Ok(Some(mut model)) => {
                     model.before = before;
+                    // The buffer exists; whether the index has the file is
+                    // the baseline's to say.
+                    model.absent = [
+                        self.diff_model().is_some_and(|baseline| baseline.absent[0]),
+                        false,
+                    ];
                     self.working_diff.additions = added_source_lines(&model);
                     if let DocumentState::Editable(document) = &self.document {
                         let lines = document.content.source_line_ranges();
@@ -6934,6 +7095,8 @@ impl RepositoryRuntime {
             RepositoryAction::Save { .. }
                 | RepositoryAction::DiscardEdits { .. }
                 | RepositoryAction::StageSelected { .. }
+                | RepositoryAction::StageHunk { .. }
+                | RepositoryAction::RevertHunk { .. }
                 | RepositoryAction::ApplySourceSurface { .. }
                 | RepositoryAction::ApplyMarkdownMode { .. }
                 | RepositoryAction::ApplyDiffMode { .. }
@@ -6966,7 +7129,10 @@ impl RepositoryRuntime {
             RepositoryAction::NewTerminal { .. }
             | RepositoryAction::DirectorySearchLoaded { .. } => Task::none(),
             RepositoryAction::Clipboard { card, op } => self.clipboard(card, op),
-            RepositoryAction::StageSelected { .. } => Task::none(),
+            RepositoryAction::StageSelected { .. } | RepositoryAction::StageHunk { .. } => {
+                Task::none()
+            }
+            RepositoryAction::RevertHunk { card, hunk } => self.revert_hunk(card, &hunk),
             RepositoryAction::FileListUnchanged { identity } => {
                 if !self.accepts_file_list(&identity) || identity.path != Path::new(".") {
                     return Task::none();
@@ -12514,6 +12680,15 @@ fn diff_model_view<'a>(
                         typography,
                     ),
                 };
+                let hunk = model
+                    .change_starts(runtime.diff_mode)
+                    .binary_search(&row)
+                    .ok()
+                    .and_then(|hunk| model.hunks.get(hunk));
+                let code = match hunk {
+                    Some(hunk) => hunk_controls(card, runtime, hunk, code, typography),
+                    None => code,
+                };
                 if let Some(ctx) =
                     context.filter(|ctx| ctx.review.has_annotation(ctx.path, old, new, false))
                 {
@@ -12597,6 +12772,81 @@ fn diff_model_view<'a>(
         .into()
     };
     rows
+}
+
+/// The first row of a hunk, with the hunk's own actions at the viewport's
+/// trailing edge, where they stay as the code scrolls beneath them.
+fn hunk_controls<'a>(
+    card: CardId,
+    runtime: &RepositoryRuntime,
+    hunk: &DiffHunk,
+    code: Element<'a, RepositoryAction>,
+    typography: DiffTypography,
+) -> Element<'a, RepositoryAction> {
+    let offers = runtime.hunk_offers();
+    let mut actions: Vec<Element<'a, RepositoryAction>> = Vec::new();
+    if offers.revert {
+        actions.push(
+            icon_button(
+                Icon::Undo,
+                "Revert this change in the file · Undo in the editor restores it",
+            )
+            .compact()
+            .on_press_maybe(
+                runtime
+                    .can_revert_hunks()
+                    .then(|| RepositoryAction::RevertHunk {
+                        card,
+                        hunk: hunk.clone(),
+                    }),
+            )
+            .into(),
+        );
+    }
+    if let Some(stage) = offers.stage {
+        let (icon, label) = if stage {
+            (Icon::Plus, "Stage this change")
+        } else {
+            (Icon::Minus, "Unstage this change")
+        };
+        actions.push(
+            icon_button(icon, label)
+                .compact()
+                .on_press_maybe(
+                    runtime
+                        .can_stage_hunks()
+                        .then(|| RepositoryAction::StageHunk {
+                            card,
+                            hunk: hunk.clone(),
+                            stage,
+                        }),
+                )
+                .into(),
+        );
+    }
+    if actions.is_empty() {
+        return code;
+    }
+    let pill = widget::container(widget::row::with_children(actions).spacing(space::XXS))
+        .padding([0.0, space::XXS])
+        .class(cosmic::theme::Container::custom(|theme| {
+            iced::widget::container::Style {
+                background: Some(iced::Background::Color(crate::design::raised(theme))),
+                border: iced::Border {
+                    radius: theme.cosmic().corner_radii.radius_s.into(),
+                    width: 1.0,
+                    color: crate::design::hairline(theme),
+                },
+                ..Default::default()
+            }
+        }));
+    let overlay = widget::container(pill)
+        .width(Length::Fill)
+        .height(typography.line_height)
+        .align_x(Alignment::End)
+        .align_y(Alignment::Center)
+        .padding([0.0, space::S]);
+    iced::widget::Stack::with_children([code, overlay.into()]).into()
 }
 
 #[derive(Clone, Copy)]

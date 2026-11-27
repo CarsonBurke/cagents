@@ -3975,6 +3975,9 @@ fn inspector_projection_tracks_loading_conflict_and_active_diff_facts() {
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: Vec::new(),
             split_rows: Vec::new(),
             inline_change_starts: vec![0, 2],
@@ -4982,6 +4985,9 @@ fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: vec![inline; 100_000],
             split_rows: vec![split; 100_000],
             inline_change_starts: vec![0, 50_000, 99_999],
@@ -5968,6 +5974,9 @@ fn change_navigation_realizes_far_rows_before_programmatic_scroll() {
         DiffState::ready(staged_text_diff(DiffModel {
             line_counts: [0; 2],
             before: Arc::from(""),
+            after: Arc::from(""),
+            hunks: Vec::new(),
+            absent: [false; 2],
             inline_rows: vec![
                 InlineDiffRow {
                     old_line: Some(1),
@@ -8596,6 +8605,9 @@ fn model_with(additions: u32) -> DiffModel {
     DiffModel {
         line_counts: [0; 2],
         before: Arc::from(""),
+        after: Arc::from(""),
+        hunks: Vec::new(),
+        absent: [false; 2],
         inline_rows: Vec::new(),
         split_rows: Vec::new(),
         inline_change_starts: Vec::new(),
@@ -12279,4 +12291,123 @@ fn a_committed_comparison_is_named_again_once_per_head() {
     };
     document.active_save = None;
     assert!(unchanged(&mut runtime) > 0, "asked again after the save");
+}
+
+/// Each hunk of the working comparison stages as its own patch against the
+/// index, built from the comparison on screen; a comparison the buffer has
+/// moved past offers nothing to stage.
+#[test]
+fn each_working_hunk_stages_as_its_own_index_patch() {
+    let card = CardId::new();
+    let before = "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\n";
+    let after = "a\nB\nc\nd\ne\nf\ng\nh\nI\nj\n";
+    let (mut runtime, _) = working_diff_runtime(card, before, after);
+    let model = runtime.current_diff_model().unwrap().clone();
+    assert_eq!(model.hunks.len(), 2);
+    assert_eq!(
+        runtime.hunk_offers(),
+        HunkOffers {
+            stage: Some(true),
+            revert: true
+        }
+    );
+    for (index, hunk) in model.hunks.iter().enumerate() {
+        let Some(HunkStaging::Patch(request)) = runtime.hunk_staging(hunk, true) else {
+            panic!("hunk {index} stages as a patch");
+        };
+        assert_eq!(
+            request.hunks,
+            model.hunk_patch(index, PatchTarget::Before).unwrap()
+        );
+        assert!(request.from_worktree);
+        assert_eq!(request.path.as_os_str(), "notes.txt");
+        // Staging is not unstaging.
+        assert_eq!(runtime.hunk_staging(hunk, false), None);
+    }
+    runtime.source_surface = SourceSurface::Editor;
+    drop(runtime.update(RepositoryAction::EditorAction {
+        card,
+        action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
+    }));
+    assert_ne!(buffer_text(&runtime), after);
+    assert_eq!(runtime.hunk_staging(&model.hunks[0], true), None);
+    assert!(!runtime.can_revert_hunks());
+}
+
+/// Reverting one hunk edits the buffer, CR and missing final newline
+/// included, and one Undo in the editor brings the change back.
+#[test]
+fn reverting_a_hunk_is_one_undoable_buffer_edit() {
+    let card = CardId::new();
+    for (before, after) in [
+        (
+            "one\r\ntwo\r\nthree\r\nfour\r\nfive\r\nsix\r\nseven\r\n",
+            "one\r\n2\r\nthree\r\nfour\r\nfive\r\nsix\r\n7\r\n",
+        ),
+        ("a\nb\nc\nd\ne\nf\ng\nh\n", "a\nb\nc\nd\ne\nf\ng\nh\ni"),
+        ("keep\nold\n", "keep\n"),
+    ] {
+        let (mut runtime, _) = working_diff_runtime(card, before, after);
+        let model = runtime.current_diff_model().unwrap().clone();
+        let last = model.hunks.len() - 1;
+        let hunk = model.hunks[last].clone();
+        drop(runtime.update(RepositoryAction::RevertHunk { card, hunk }));
+        let (span, restored) = model.hunk_reversal(last).unwrap();
+        let mut expected = after.to_owned();
+        expected.replace_range(span, restored);
+        assert_eq!(buffer_text(&runtime), expected, "{after:?}");
+        assert!(runtime.is_dirty());
+        // The comparison now lags the buffer, so nothing else can revert
+        // against it until it is rebuilt.
+        assert!(!runtime.can_revert_hunks());
+        // History steps belong to the editor, where the revert is undone.
+        runtime.source_surface = SourceSurface::Editor;
+        drop(runtime.update(RepositoryAction::Undo { card }));
+        assert_eq!(buffer_text(&runtime), after, "{after:?}");
+    }
+}
+
+/// The staged comparison unstages against the index, its new side, and has
+/// no buffer to revert; a created file is one hunk staged as the file.
+#[test]
+fn staged_hunks_unstage_and_a_new_file_stages_whole() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "a\nb\n", "a\nB\n");
+    let mut staged = crate::diff_view::build_diff("a\nb\n", "a\nB\n");
+    runtime.diff_basis = DiffBasis::HeadToIndex;
+    runtime.set_diff_state(
+        DiffBasis::HeadToIndex,
+        DiffState::ready(staged_text_diff(staged.clone())),
+    );
+    assert_eq!(
+        runtime.hunk_offers(),
+        HunkOffers {
+            stage: Some(false),
+            revert: false
+        }
+    );
+    let Some(HunkStaging::Patch(request)) = runtime.hunk_staging(&staged.hunks[0], false) else {
+        panic!("a staged hunk unstages as a patch");
+    };
+    assert_eq!(
+        request.hunks,
+        staged.hunk_patch(0, PatchTarget::After).unwrap()
+    );
+    assert!(!request.from_worktree);
+
+    staged.absent = [true, false];
+    runtime.selected = Some(RepositoryFile {
+        path: PathBuf::from("notes.txt"),
+        staged: true,
+        status: Some("A ".into()),
+        ..RepositoryFile::default()
+    });
+    runtime.set_diff_state(
+        DiffBasis::HeadToIndex,
+        DiffState::ready(staged_text_diff(staged.clone())),
+    );
+    assert!(matches!(
+        runtime.hunk_staging(&staged.hunks[0], false),
+        Some(HunkStaging::File(selection)) if selection.path.as_os_str() == "notes.txt"
+    ));
 }
