@@ -30,6 +30,7 @@ pub type Millis = u64;
 
 pub const STALE_AFTER: Millis = 5 * 60_000;
 pub const REFRESH_INTERVAL: Millis = 10 * 60_000;
+const CLAUDE_NEAR_LIMIT_REFRESH: Millis = 2 * 60_000;
 pub const MANUAL_DEBOUNCE: Millis = 60_000;
 /// Coalesce bursts of fresh limit incidents without polling the provider.
 pub const LIMIT_DEBOUNCE: Millis = 10_000;
@@ -50,6 +51,30 @@ pub const LOGIN_POLL: Millis = 45_000;
 pub const LOGIN_RETURN: Millis = 5_000;
 /// Well past a probe's own timeout: a probe still unanswered by then was lost.
 pub const IN_FLIGHT_LIMIT: Millis = 2 * 60_000;
+
+/// Shorten the full Claude read when stale quota could keep an account
+/// blocked after an external reset, including a model-scoped reset.
+pub fn refresh_interval(
+    provider: crate::agent::Provider,
+    snapshot: Option<&super::UsageSnapshot>,
+) -> Millis {
+    if provider == crate::agent::Provider::Claude
+        && snapshot
+            .is_some_and(|snapshot| snapshot.windows.iter().any(|window| window.used >= 0.95))
+    {
+        CLAUDE_NEAR_LIMIT_REFRESH
+    } else {
+        REFRESH_INTERVAL
+    }
+}
+
+pub fn periodic_threshold(trigger: Trigger, refresh_interval: Millis) -> Millis {
+    if trigger == Trigger::Focus {
+        STALE_AFTER.min(refresh_interval)
+    } else {
+        refresh_interval
+    }
+}
 
 /// What prompted a scheduling decision.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -81,7 +106,7 @@ pub struct Schedule {
 impl Schedule {
     /// Whether `trigger` at `now` should start a probe.
     pub fn should_probe(&self, trigger: Trigger, now: Millis, focused: bool) -> bool {
-        self.should_probe_observed(trigger, now, focused, self.observed_at)
+        self.should_probe_observed(trigger, now, focused, self.observed_at, REFRESH_INTERVAL)
     }
 
     /// Combined providers have full inventory readings distinct from partial
@@ -92,8 +117,9 @@ impl Schedule {
         now: Millis,
         focused: bool,
         observed_at: Millis,
+        refresh_interval: Millis,
     ) -> bool {
-        self.should_probe_observed(trigger, now, focused, Some(observed_at))
+        self.should_probe_observed(trigger, now, focused, Some(observed_at), refresh_interval)
     }
 
     fn should_probe_observed(
@@ -102,6 +128,7 @@ impl Schedule {
         now: Millis,
         focused: bool,
         observed_at: Option<Millis>,
+        refresh_interval: Millis,
     ) -> bool {
         if self.in_flight(now) {
             return false;
@@ -130,8 +157,7 @@ impl Schedule {
                 let threshold = match (trigger, awaiting) {
                     (Trigger::Focus, true) => LOGIN_RETURN,
                     (_, true) => LOGIN_POLL,
-                    (Trigger::Focus, false) => STALE_AFTER,
-                    _ => REFRESH_INTERVAL,
+                    (_, false) => periodic_threshold(trigger, refresh_interval),
                 };
                 focused && self.retry_at.is_none_or(|retry| now >= retry) && age >= threshold
             }
@@ -300,6 +326,37 @@ mod tests {
         assert!(schedule.should_probe(Trigger::Focus, T0 + 5 * MINUTE, true));
         assert!(!schedule.should_probe(Trigger::Tick, T0 + 9 * MINUTE, true));
         assert!(schedule.should_probe(Trigger::Tick, T0 + 10 * MINUTE, true));
+    }
+
+    #[test]
+    fn a_near_limit_claude_snapshot_uses_the_full_inventory_clock_and_a_shorter_interval() {
+        use crate::agent::Provider;
+        let mut snapshot = crate::account::claude::parse_usage(
+            &serde_json::json!({"rate_limits": {"five_hour": {"utilization": 80},
+                "seven_day": {"utilization": 99}}}),
+            T0,
+        );
+        let mut schedule = Schedule::default();
+        schedule.succeed(T0);
+        schedule.observe(T0 + MINUTE);
+        let interval = refresh_interval(Provider::Claude, Some(&snapshot));
+        assert_eq!(interval, 2 * MINUTE);
+        for trigger in [Trigger::Focus, Trigger::Tick] {
+            assert!(!schedule.should_probe_full(trigger, T0 + interval - 1, true, T0, interval));
+            assert!(!schedule.should_probe_full(trigger, T0 + interval, false, T0, interval));
+            assert!(schedule.should_probe_full(trigger, T0 + interval, true, T0, interval));
+        }
+        assert_eq!(
+            refresh_interval(Provider::Codex, Some(&snapshot)),
+            REFRESH_INTERVAL
+        );
+        for window in &mut snapshot.windows {
+            window.used = 0.94;
+        }
+        assert_eq!(
+            refresh_interval(Provider::Claude, Some(&snapshot)),
+            REFRESH_INTERVAL
+        );
     }
 
     /// A conversation reporting its limits live, or another window's probe

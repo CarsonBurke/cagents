@@ -1257,26 +1257,11 @@ async fn probe_claude_with_path(
     search_path: Option<&OsStr>,
     cache: Option<&Cache>,
 ) -> Result<Probed, String> {
-    let mut status = command_with_path(account, program, search_path);
-    status.args(["auth", "status", "--json"]);
-    let mut usage = command_with_path(account, program, search_path);
-    usage.args([
-        "-p",
-        "--input-format",
-        "stream-json",
-        "--output-format",
-        "stream-json",
-        "--verbose",
-        "--no-session-persistence",
-        "--strict-mcp-config",
-        "--setting-sources",
-        "",
-        "--disable-slash-commands",
-    ]);
-    let mut probed = join_claude(run_json(status), claude_usage(usage)).await?;
+    let read = || read_claude_cli(account, program, search_path);
+    let mut probed = read().await?;
     // Identity transitions must invalidate even when this login's adapter
     // cannot load. Otherwise A -> unavailable B -> A could reuse old A data.
-    if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
+    let previous = if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
         let identity = probed.identity.clone();
         let signed_out = probed.snapshot.status == UsageStatus::NeedsLogin;
         tokio::task::spawn_blocking(move || {
@@ -1284,8 +1269,10 @@ async fn probe_claude_with_path(
         })
         .await
         .map_err(|_| "Claude's profile cache could not be updated")?
-        .map_err(|_| "Claude's profile cache could not be updated")?;
-    }
+        .map_err(|_| "Claude's profile cache could not be updated")?
+    } else {
+        None
+    };
     if confirms_login(probed.identity.as_ref(), probed.snapshot.status) {
         match reset_transport::Client::load(account, program, search_path).await {
             Ok(client) => {
@@ -1306,6 +1293,30 @@ async fn probe_claude_with_path(
                     }
                 };
                 let (plan, inventory) = tokio::join!(plan, client.inventory());
+                if let (Ok(resets), Some(previous)) = (&inventory, previous)
+                    && super::resets::may_act_for(
+                        probed.identity.as_ref(),
+                        previous.identity.as_ref(),
+                    )
+                    && reset_inventory_decreased(&previous.snapshot.resets, resets)
+                {
+                    // The first usage answer predates the inventory read and
+                    // may be from before the reset. Do not publish the lower
+                    // counts with old usage even if the follow-up fails.
+                    let mut refreshed = read().await?;
+                    if refreshed.snapshot.status == UsageStatus::NeedsLogin {
+                        invalidate_claude_plan(account, cache).await?;
+                        return Ok(refreshed);
+                    }
+                    if !super::resets::may_act_for(
+                        refreshed.identity.as_ref(),
+                        probed.identity.as_ref(),
+                    ) {
+                        return Err("Claude's login changed during the usage refresh".into());
+                    }
+                    refreshed.catalog = refreshed.catalog.or(probed.catalog);
+                    probed = refreshed;
+                }
                 if let Some(metadata) = plan {
                     let plan = metadata.name();
                     if let Some(identity) = &mut probed.identity {
@@ -1324,13 +1335,8 @@ async fn probe_claude_with_path(
                 }
             }
             Err(_) => {
-                if reset_transport::login_was_removed(account).await
-                    && let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key())
-                {
-                    tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
-                        .await
-                        .map_err(|_| "Claude's profile cache could not be updated")?
-                        .map_err(|_| "Claude's profile cache could not be updated")?;
+                if reset_transport::login_was_removed(account).await {
+                    invalidate_claude_plan(account, cache).await?;
                 }
                 probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
             }
@@ -1339,32 +1345,81 @@ async fn probe_claude_with_path(
     Ok(probed)
 }
 
+// Compare by provider selection. Changes in availability or eligibility
+// alone (for example, moving off the limit) do not imply a reset was spent.
+fn reset_inventory_decreased(before: &[super::UsageReset], after: &[super::UsageReset]) -> bool {
+    before.iter().any(|prior| {
+        prior.available_count > 0
+            && after
+                .iter()
+                .find(|reset| reset.id == prior.id && reset.kind == prior.kind)
+                .map_or(0, |reset| reset.available_count)
+                < prior.available_count
+    })
+}
+
+async fn read_claude_cli(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+) -> Result<Probed, String> {
+    let mut status = command_with_path(account, program, search_path);
+    status.args(["auth", "status", "--json"]);
+    let mut usage = command_with_path(account, program, search_path);
+    usage.args([
+        "-p",
+        "--input-format",
+        "stream-json",
+        "--output-format",
+        "stream-json",
+        "--verbose",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--setting-sources",
+        "",
+        "--disable-slash-commands",
+    ]);
+    join_claude(run_json(status), claude_usage(usage)).await
+}
+
+async fn invalidate_claude_plan(account: &Account, cache: Option<&Cache>) -> Result<(), String> {
+    if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
+        tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
+            .await
+            .map_err(|_| "Claude's profile cache could not be updated")?
+            .map_err(|_| "Claude's profile cache could not be updated")?;
+    }
+    Ok(())
+}
+
 fn invalidate_changed_profile(
     cache: &Cache,
     key: &str,
     current: Option<&Identity>,
     signed_out: bool,
-) -> io::Result<()> {
+) -> io::Result<Option<Entry>> {
     let normalized = |text: Option<&str>| {
         text.map(str::trim)
             .filter(|text| !text.is_empty())
             .map(str::to_lowercase)
     };
-    let changed = cache.load(now_ms()).remove(key).is_some_and(|previous| {
-        match (previous.identity.as_ref(), current) {
-            (Some(previous), Some(current)) => {
-                normalized(previous.email.as_deref()) != normalized(current.email.as_deref())
-                    || normalized(previous.organization.as_deref())
-                        != normalized(current.organization.as_deref())
-            }
-            (None, None) => false,
-            _ => true,
-        }
-    });
+    let previous = cache.load(now_ms()).remove(key);
+    let changed =
+        previous
+            .as_ref()
+            .is_some_and(|previous| match (previous.identity.as_ref(), current) {
+                (Some(previous), Some(current)) => {
+                    normalized(previous.email.as_deref()) != normalized(current.email.as_deref())
+                        || normalized(previous.organization.as_deref())
+                            != normalized(current.organization.as_deref())
+                }
+                (None, None) => false,
+                _ => true,
+            });
     if signed_out || changed {
         cache.invalidate_plan(key)?;
     }
-    Ok(())
+    Ok(previous)
 }
 
 /// The home whose record of `account`'s login may disagree with the one its
