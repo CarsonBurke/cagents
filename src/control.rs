@@ -4765,7 +4765,12 @@ fn launch_ui(
     }
     // A screen already says why this device window did not open, and offers
     // to try again; another attempt beside it would only stack a second one.
-    if device.is_some() && slot.is_some_and(instance::device_reconnect_showing) {
+    // A caller that explains its own failure, such as the device menu, still
+    // tries: should the window open, that screen's Try again just raises it.
+    if device.is_some()
+        && !caller_reports_startup_failure
+        && slot.is_some_and(instance::device_reconnect_showing)
+    {
         return Ok(already_running_ui_output());
     }
     let executable = crate::companion::Product::Ui

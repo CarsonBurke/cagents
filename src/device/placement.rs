@@ -14,8 +14,10 @@ use std::{
 };
 
 /// The reader refuses a larger file, so the writer never produces one.
-const MAX_WINDOWS: usize = 1024;
-const MAX_BYTES: usize = 64 * 1024;
+/// Above the 1025 slots (`primary`, `window-2` to `window-1025`) windows
+/// open in, with room for windows named on the command line.
+const MAX_WINDOWS: usize = 2048;
+const MAX_BYTES: usize = 256 * 1024;
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -90,7 +92,7 @@ fn read(path: &Path) -> io::Result<Placements> {
         Err(error) => return Err(error),
     };
     if bytes.len() > MAX_BYTES {
-        return Err(io::Error::other("window-devices.json exceeds 64 KiB"));
+        return Err(io::Error::other("window-devices.json exceeds 256 KiB"));
     }
     let placements: Placements = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
     if placements.windows.len() > MAX_WINDOWS {
@@ -140,7 +142,7 @@ fn record_at(path: &Path, slot: &str, device: Option<&str>) -> io::Result<()> {
     }
     if placements.windows.len() > MAX_WINDOWS {
         return Err(io::Error::other(
-            "cagents remembers the device of at most 1024 windows",
+            "cagents remembers the device of at most 2048 windows",
         ));
     }
     let mut bytes = serde_json::to_vec_pretty(&placements).map_err(io::Error::other)?;
