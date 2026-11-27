@@ -95,7 +95,7 @@ impl TerminalChanges {
         Self::watch_directory(&directory)
     }
 
-    fn watch_directory(directory: &Path) -> Result<Self, UpdateError> {
+    pub(super) fn watch_directory(directory: &Path) -> Result<Self, UpdateError> {
         let (receiver, sender) = UnixDatagram::pair()?;
         receiver.set_nonblocking(true)?;
         sender.set_nonblocking(true)?;
@@ -249,7 +249,7 @@ fn watch_file(
     if let Some(path) = lease {
         let lease = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(path)?;
         validate_lock(&lease)?;
         // A crashed worker has no last snapshot. Wait for its inherited

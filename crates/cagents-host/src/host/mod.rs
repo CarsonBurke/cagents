@@ -340,8 +340,17 @@ impl DaemonAdmission {
 /// # Safety
 /// Call from the single-threaded entry point: this clears inherited authority
 /// markers so later terminal children cannot inherit a consumed descriptor.
-pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
-    let admission = crate::instance::DaemonAdmissionGuard::acquire()?;
+pub unsafe fn prepare_daemon_admission(
+    #[cfg(target_os = "macos")] standby: Option<&daemon::standby::Activated>,
+) -> Result<DaemonAdmission, HostError> {
+    use crate::instance::DaemonAdmissionGuard;
+    #[cfg(target_os = "macos")]
+    let admission = standby.map_or_else(
+        DaemonAdmissionGuard::acquire,
+        DaemonAdmissionGuard::acquire_for_standby,
+    )?;
+    #[cfg(not(target_os = "macos"))]
+    let admission = DaemonAdmissionGuard::acquire()?;
     // The authenticated inherited launch fence belongs to the updater until
     // it has reopened and verified every saved window. A plain cold start owns
     // its own post-Ready completion instead.
@@ -535,7 +544,10 @@ fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, 
     let _publication = if inherited.is_none() {
         crate::install_guard::admit_darwin_state_access().map_err(|error| error.to_string())?
     } else {
-        None
+        Some(
+            crate::install_guard::admit_darwin_inherited_state_access()
+                .map_err(|error| error.to_string())?,
+        )
     };
     let _lease =
         HostLease::acquire_for_store_maintenance(&paths, inherited).map_err(
@@ -583,14 +595,18 @@ fn save_abandoned_identities(host: &SharedHost) {
     let Ok(registry) = agent_execution::registry(host) else {
         return;
     };
-    let checkpoint = crate::upgrade::handoff::Store::existing()
-        .and_then(|store| store.map(|store| store.load_abandoned()).transpose())
-        .map(Option::flatten);
-    let checkpoint = match checkpoint {
-        Ok(Some(checkpoint)) => checkpoint,
+    let store = match crate::upgrade::handoff::Store::existing() {
+        Ok(Some(store)) => store,
         Ok(None) => return,
         Err(error) => {
-            tracing::warn!(%error, "cannot read the abandoned update's conversation IDs");
+            tracing::warn!(%error, "cannot read abandoned update evidence");
+            return;
+        }
+    };
+    let checkpoints = match store.abandoned_checkpoints() {
+        Ok(checkpoints) => checkpoints,
+        Err(error) => {
+            tracing::warn!(%error, "cannot list abandoned update archives");
             return;
         }
     };
@@ -604,33 +620,40 @@ fn save_abandoned_identities(host: &SharedHost) {
         .keys()
         .copied()
         .collect();
-    let unheld: Vec<_> = checkpoint
-        .chats
-        .iter()
-        .filter(|chat| !restored.contains(&chat.source.id))
-        .cloned()
-        .collect();
-    let saved = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .save_checkpoint_identities(&unheld);
-    if !saved.written.is_empty() {
-        tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
-    }
-    for chat in saved.unrecoverable {
-        let conversation = checkpoint
+    for checkpoint in checkpoints {
+        let checkpoint = match checkpoint {
+            Ok(checkpoint) => checkpoint,
+            Err(error) => {
+                tracing::warn!(%error, "cannot read an abandoned update's conversation IDs");
+                continue;
+            }
+        };
+        let unheld: Vec<_> = checkpoint
             .chats
-            .iter()
-            .find(|entry| entry.source.id == chat)
-            .and_then(|entry| entry.launch.session_id.as_deref());
-        tracing::warn!(
-            %chat,
-            conversation,
-            "the chat's pane or agent now shows another process; resume its conversation manually"
-        );
-    }
-    for (chat, error) in saved.failed {
-        tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; a later start tries again unless it is reopened first");
+            .into_iter()
+            .filter(|chat| !restored.contains(&chat.source.id))
+            .collect();
+        let saved = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .save_checkpoint_identities(&unheld);
+        if !saved.written.is_empty() {
+            tracing::info!(chats = ?saved.written, "saved conversation IDs only the abandoned update recorded");
+        }
+        for chat in saved.unrecoverable {
+            let conversation = unheld
+                .iter()
+                .find(|entry| entry.source.id == chat)
+                .and_then(|entry| entry.launch.session_id.as_deref());
+            tracing::warn!(
+                %chat,
+                conversation,
+                "the chat's pane or agent now shows another process; resume its conversation manually"
+            );
+        }
+        for (chat, error) in saved.failed {
+            tracing::warn!(%chat, %error, "cannot save the abandoned update's ID for this chat; a later start tries again unless it is reopened first");
+        }
     }
 }
 
@@ -716,6 +739,11 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     let mut ready_admission = standby
         .as_mut()
         .and_then(daemon::standby::Activated::take_ready_admission);
+    #[cfg(target_os = "macos")]
+    if ready_admission.is_none() {
+        crate::update::admit_darwin_saved_state(&crate::process::current_executable()?)
+            .map_err(io::Error::other)?;
+    }
     #[cfg(target_os = "macos")]
     let proof = match &ready_admission {
         Some(ready) => ready.successor().clone(),

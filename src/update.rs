@@ -33,6 +33,18 @@ mod pending_recovery;
 pub mod progress;
 #[cfg(target_os = "macos")]
 mod ready_plan;
+#[cfg(target_os = "macos")]
+pub(crate) use ready_plan::abandon_claimed as abandon_claimed_darwin_update;
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) use ready_plan::admit_ready as admit_shared_ready;
+#[cfg(target_os = "macos")]
+#[doc(hidden)]
+pub use ready_plan::admit_saved_state as admit_darwin_saved_state;
+#[cfg(target_os = "macos")]
+pub(crate) use ready_plan::resume_selected as resume_darwin_update;
+#[cfg(target_os = "macos")]
+pub(crate) use ready_plan::{begin_new_job as retire_completed_activation, require_no_activation};
+
 pub mod recovery;
 #[cfg(target_os = "macos")]
 mod release_stage;
@@ -1547,9 +1559,12 @@ fn start_job(
             error.into()
         }
     })?;
+
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
     let lock = acquire_lock(&state)?;
+    #[cfg(target_os = "macos")]
+    ready_plan::begin_new_job()?;
     #[cfg(target_os = "macos")]
     if let Some(previous) = cutover::read_job(&state)? {
         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
@@ -1576,16 +1591,41 @@ fn start_job(
     let request_file = private_create(&state.join(format!("{id}.request")))?;
     serde_json::to_writer(&request_file, request)?;
     request_file.sync_all()?;
-    let mut command = Command::new(
-        installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
-            .join("bin/cagents"),
-    );
+    let executable = installation
+        .prefix
+        .join("versions")
+        .join(&installation.version)
+        .join("bin/cagents");
+    match spawn_update_worker(&executable, &id, log, &lock) {
+        Ok(mut child) => {
+            // spawn confirmed exec; the worker now owns the inherited lease.
+            // Close our copy without unlocking its shared description.
+            drop(lock.into_file());
+            thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(job)
+        }
+        Err(error) => {
+            let mut failed = job;
+            failed.phase = UpdatePhase::Failed;
+            failed.message = format!("Could not start update helper: {error}");
+            write_job(&state, &failed)?;
+            Err(error.into())
+        }
+    }
+}
+
+fn spawn_update_worker(
+    executable: &Path,
+    job: &str,
+    log: File,
+    lock: &crate::instance::OwnedLock,
+) -> io::Result<std::process::Child> {
+    let mut command = Command::new(executable);
     command
         .arg("update-worker")
-        .arg(&id)
+        .arg(job)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log.try_clone()?))
         .stderr(Stdio::from(log));
@@ -1606,24 +1646,7 @@ fn start_job(
             Ok(())
         });
     }
-    match command.spawn() {
-        Ok(mut child) => {
-            // spawn confirmed exec; the worker now owns the inherited lease.
-            // Close our copy without unlocking its shared description.
-            drop(lock.into_file());
-            thread::spawn(move || {
-                let _ = child.wait();
-            });
-            Ok(job)
-        }
-        Err(error) => {
-            let mut failed = job;
-            failed.phase = UpdatePhase::Failed;
-            failed.message = format!("Could not start update helper: {error}");
-            write_job(&state, &failed)?;
-            Err(error.into())
-        }
-    }
+    command.spawn()
 }
 
 /// Returns the latest operation, including retained failure diagnostics.
@@ -1672,7 +1695,9 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
                     #[cfg(target_os = "macos")]
                     {
                         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
-                        if cutover::pending_selected(&layout, &state, &job)? {
+                        if cutover::pending_selected(&layout, &state, &job)?
+                            || ready_plan::reserves_job(&state, &job)?
+                        {
                             return Ok(Some(job));
                         }
                     }
@@ -2393,7 +2418,16 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
     #[cfg(target_os = "macos")]
     if job.id == job_id && matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
-        return ready_plan::recover_worker(&installation, &state, &mut job, &_lock);
+        let recovered = ready_plan::recover_worker(&installation, &state, &mut job, &_lock);
+        if let Err(error) = &recovered {
+            job.phase = UpdatePhase::Failed;
+            job.message = error.record_message();
+            job.refusal = error.refusal();
+            if let Err(write_error) = write_job(&state, &job) {
+                eprintln!("Could not record the interrupted update's result: {write_error}");
+            }
+        }
+        return recovered;
     }
     let resume_stage = cfg!(target_os = "macos") && job.phase == UpdatePhase::Verifying;
     if job.id != job_id || (job.phase != UpdatePhase::Starting && !resume_stage) {

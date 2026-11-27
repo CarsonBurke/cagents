@@ -220,7 +220,7 @@ pub(crate) fn reserve_darwin_publication() -> io::Result<File> {
 /// that has already removed the old worker lock's directory entry.
 #[cfg(target_os = "macos")]
 pub(crate) fn admit_darwin_update_start() -> io::Result<crate::instance::OwnedLock> {
-    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
+    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_EX | libc::LOCK_NB)
 }
 
 #[cfg(target_os = "macos")]
@@ -228,6 +228,22 @@ fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
     // inode beside the whole runtime tree so neither spelling can purge it.
     Ok(crate::instance::darwin_runtime_base()?.with_file_name("cagents.install-publication.lock"))
+}
+
+/// Inherited runtime leases exempt the staged target from the selected-image
+/// check. Their mutations still serialize with account publication.
+#[doc(hidden)]
+#[cfg(target_os = "macos")]
+pub fn admit_darwin_inherited_state_access() -> io::Result<crate::instance::OwnedLock> {
+    crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB).map_err(
+        |error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(error.kind(), crate::instance::UpdateInProgress)
+            } else {
+                error
+            }
+        },
+    )
 }
 
 /// Serialize ordinary access to production state with offline publication.
@@ -239,18 +255,13 @@ pub fn admit_darwin_state_access() -> io::Result<Option<crate::instance::OwnedLo
     let executable = crate::process::current_executable()?;
     let installed = installed_version_root(&executable).is_some()
         || std::env::current_exe().is_ok_and(|path| installed_version_root(&path).is_some());
-    if !installed && crate::instance::IS_DEVELOPMENT {
-        return Ok(None);
-    }
-    let lock =
-        crate::instance::owned_lock(&darwin_publication_path()?, libc::LOCK_SH | libc::LOCK_NB)
-            .map_err(|error| {
-                if error.kind() == io::ErrorKind::WouldBlock {
-                    io::Error::new(error.kind(), crate::instance::UpdateInProgress)
-                } else {
-                    error
-                }
-            })?;
+    let lock = admit_darwin_inherited_state_access()?;
+    crate::update::admit_darwin_saved_state(&executable).map_err(|error| match error {
+        crate::update::UpdateError::Busy => {
+            io::Error::new(io::ErrorKind::WouldBlock, crate::instance::UpdateInProgress)
+        }
+        error => io::Error::other(error),
+    })?;
     if !installed {
         return Ok(Some(lock));
     }
@@ -316,6 +327,7 @@ pub(crate) fn verify_publication() -> io::Result<()> {
         let _publication = inherited_darwin_publication()?
             .ok_or_else(|| io::Error::other("installer has no inherited publication fence"))?;
         crate::instance::state_claim::require_idle_for_installation()?;
+        crate::update::retire_completed_activation().map_err(io::Error::other)?;
     }
     Ok(())
 }
@@ -649,6 +661,13 @@ pub(crate) fn select_staged(
     expected_current: &Path,
 ) -> io::Result<()> {
     crate::instance::validate_stage_guard()?;
+    #[cfg(target_os = "macos")]
+    let _publication = match inherited_darwin_publication()? {
+        Some((file, _)) => file,
+        None => reserve_darwin_publication()?,
+    };
+    #[cfg(target_os = "macos")]
+    crate::update::retire_completed_activation().map_err(io::Error::other)?;
     let prefix = prefix.canonicalize()?;
     if std::fs::read_link(prefix.join("current"))? != expected_current {
         return Err(io::Error::other(
@@ -922,6 +941,17 @@ pub(crate) fn staged_owner_bin(
     // back through that stopped source would prevent the handoff itself.
     if crate::daemon::lease_handoff::has_inherited_lease()? {
         return Ok(None);
+    }
+    #[cfg(target_os = "macos")]
+    if recover
+        && std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_none()
+        && std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_none()
+        && crate::instance::window_launch_restore_policy()
+            != crate::instance::WindowRestorePolicy::ExistingOnly
+        && let Some(bin) =
+            crate::update::resume_darwin_update(executable).map_err(io::Error::other)?
+    {
+        return Ok(Some(bin));
     }
     let Some(version_root) = installed_version_root(executable) else {
         return Ok(None);

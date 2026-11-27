@@ -1,8 +1,9 @@
 //! Durable inputs for the installed updater's exact Ready activation.
 use super::*;
-use crate::upgrade::recovery::{ReadyPlanEvidence, Receipt, STANDBY_RECEIPT_LIMIT};
-
-const LIMIT: u64 = STANDBY_RECEIPT_LIMIT as u64 + JOB_STATE_LIMIT;
+use crate::upgrade::{
+    handoff::{INSTALLED_ACTIVATION_LIMIT as LIMIT, Store},
+    recovery::{ReadyPlanEvidence, Receipt},
+};
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -13,6 +14,293 @@ struct Plan<'a> {
     stamp: installed::Stamp,
     binaries: String,
     ready: ReadyPlanEvidence<'a>,
+}
+
+/// One activation owns the saved workspace even when it has no live updater
+/// or daemon. The record includes the entire plan so no second pathname is
+/// needed to resume an already published reservation.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Reservation<'a> {
+    job: String,
+    prefix: PathBuf,
+    plan: Plan<'a>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Phase {
+    AwaitingAdmission,
+    Claimed,
+    Selected,
+    Released,
+}
+
+impl Reservation<'_> {
+    fn state(&self) -> PathBuf {
+        self.prefix.join(".update")
+    }
+
+    fn selected_bin(&self) -> Option<PathBuf> {
+        self.prefix
+            .join("current")
+            .canonicalize()
+            .is_ok_and(|current| current == self.plan.target)
+            .then(|| self.plan.target.join("bin"))
+    }
+
+    fn phase(&self) -> Result<Phase, UpdateError> {
+        if !self.plan.ready.same_boot()? {
+            // Runtime custody expires at reboot. Keep the checkpoint for the
+            // ordinary saved-work restore.
+            return Ok(Phase::Released);
+        }
+        let state = self.state();
+        let job = cutover::read_job(&state)?
+            .ok_or_else(|| invalid("The reserved update job is missing"))?;
+        let layout = locate(&self.plan.target.join("bin/cagents"))?;
+        if job.id != self.job
+            || job.version != layout.version
+            || layout.prefix != self.prefix
+            || layout.version_root != self.plan.target
+            || !self.plan.ready.names_job(&state, &job.id)
+        {
+            return Err(invalid(
+                "The reservation names a different installed update",
+            ));
+        }
+        if served_version_root(&layout)? == layout.version_root {
+            let Some(selection) = cutover::recorded_selection(&layout, &state, &job)? else {
+                return Err(invalid(
+                    "The update selector has no matching completion evidence",
+                ));
+            };
+            return Ok(
+                if job.phase == UpdatePhase::Complete || selection == cutover::Stage::Deferred {
+                    Phase::Released
+                } else {
+                    Phase::Selected
+                },
+            );
+        }
+        if !self.plan.selection_is_untouched(&layout)? {
+            return Err(invalid(
+                "The installation changed while an update owns the saved work",
+            ));
+        }
+        if self.plan.ready.claim_exists().map_err(invalid)? {
+            Ok(Phase::Claimed)
+        } else {
+            Ok(Phase::AwaitingAdmission)
+        }
+    }
+}
+
+fn shared_reservation() -> Result<Option<Reservation<'static>>, UpdateError> {
+    let Some(store) = Store::observe_existing().map_err(invalid)? else {
+        return Ok(None);
+    };
+    let Some(bytes) = store.installed_activation().map_err(invalid)? else {
+        return Ok(None);
+    };
+    let reservation: Reservation<'static> = serde_json::from_slice(&bytes)?;
+    if reservation.plan.version != 1 || !reservation.prefix.is_absolute() {
+        return Err(invalid("Invalid saved-work update reservation"));
+    }
+    Ok(Some(reservation))
+}
+
+/// The account fence serializes this reservation check with publication.
+pub(crate) fn require_no_activation() -> Result<(), UpdateError> {
+    if let Some(reservation) = shared_reservation()?
+        && reservation.phase()? != Phase::Released
+    {
+        return Err(UpdateError::Busy);
+    }
+    Ok(())
+}
+
+pub(super) fn reserves_job(state: &Path, job: &UpdateJob) -> Result<bool, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(false);
+    };
+    Ok(reservation.job == job.id
+        && reservation.state() == state
+        && reservation.phase()? != Phase::Released)
+}
+
+pub(crate) fn begin_new_job() -> Result<(), UpdateError> {
+    if let Some(reservation) = shared_reservation()? {
+        if reservation.phase()? != Phase::Released {
+            return Err(UpdateError::Busy);
+        }
+        let store = Store::observe_existing()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The previous update's saved work disappeared"))?;
+        store.retire_installed_activation().map_err(invalid)?;
+    }
+    Ok(())
+}
+
+pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(());
+    };
+    match reservation.phase()? {
+        Phase::Released => Ok(()),
+        Phase::Selected => {
+            let layout = locate(executable)?;
+            if layout.prefix == reservation.prefix
+                && layout.version_root == reservation.plan.target
+                && reservation
+                    .plan
+                    .ready
+                    .names_current_runtime()
+                    .map_err(invalid)?
+            {
+                Ok(())
+            } else {
+                Err(UpdateError::Busy)
+            }
+        }
+        Phase::AwaitingAdmission | Phase::Claimed => Err(UpdateError::Busy),
+    }
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn admit_ready(
+    authority: &crate::upgrade::recovery::Authority,
+) -> Result<(), UpdateError> {
+    if let Some(reservation) = shared_reservation()?
+        && !reservation.plan.ready.same_authority(authority)
+    {
+        return Err(invalid("The saved work is reserved for a different update"));
+    }
+    Ok(())
+}
+
+/// A launch through the original selector can continue this exact approval.
+/// Use a directory/lease watcher while another coordinator still owns it.
+pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, UpdateError> {
+    let source = match locate(executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let Some(original) = shared_reservation()? else {
+        return Ok(None);
+    };
+    if source.prefix != original.prefix || source.version_root == original.plan.target {
+        return Ok(None);
+    }
+    let state = original.state();
+    let job_id = original.job;
+    let deadline = Instant::now() + crate::install_guard::daemon_start_timeout()?;
+    loop {
+        let reservation = shared_reservation()?
+            .filter(|entry| entry.job == job_id && entry.state() == state)
+            .ok_or_else(|| invalid("The update changed before the application could reopen"))?;
+        let bin = reservation.plan.target.join("bin");
+        let phase = reservation.phase()?;
+        if phase == Phase::Released {
+            return Ok(reservation.selected_bin());
+        }
+        if !reservation
+            .plan
+            .ready
+            .names_current_runtime()
+            .map_err(invalid)?
+        {
+            return Err(UpdateError::Busy);
+        }
+        if phase == Phase::Selected {
+            return Ok(Some(bin));
+        }
+        let lock = match acquire_lock(&state) {
+            Ok(lock) => lock,
+            Err(UpdateError::Busy) => {
+                let changes = progress::TerminalChanges::watch_directory(&state)?;
+                if changes.wait(deadline) == progress::TerminalWake::Changed {
+                    continue;
+                }
+                return Err(UpdateError::Busy);
+            }
+            Err(error) => return Err(error),
+        };
+        match reservation.phase()? {
+            Phase::Released => return Ok(reservation.selected_bin()),
+            Phase::Selected => return Ok(Some(bin)),
+            Phase::Claimed => {
+                return Err(invalid("The update already took custody of the saved work"));
+            }
+            Phase::AwaitingAdmission => (),
+        }
+        let Some(job) = cutover::read_job(&state)? else {
+            return Err(invalid("The reserved update job is missing"));
+        };
+        let target = reservation.plan.target_layout(&source.prefix, &job)?;
+        let log = OpenOptions::new()
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(state.join(format!("{}.log", job.id)))?;
+        validate_lock(&log)?;
+        let mut worker = spawn_update_worker(&bin.join("cagents"), &job.id, log, &lock)?;
+        drop(lock.into_file());
+        if !worker.wait()?.success() {
+            return Err(invalid(
+                "The approved update could not finish starting the staged build",
+            ));
+        }
+        installed::selected_candidate(&source.prefix, &target.version_root)?;
+        return Ok(Some(bin));
+    }
+}
+
+/// Keeps another updater from taking over while the user archives a failed
+/// attempt. The caller retains the exclusive account and runtime leases.
+pub(crate) struct Abandonment {
+    _worker: crate::instance::OwnedLock,
+    reservation: Reservation<'static>,
+}
+
+pub(crate) fn abandon_claimed() -> Result<Option<Abandonment>, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(None);
+    };
+    let phase = reservation.phase()?;
+    if phase == Phase::Released {
+        return Ok(None);
+    }
+    if phase == Phase::AwaitingAdmission
+        || !reservation
+            .plan
+            .ready
+            .names_current_runtime()
+            .map_err(invalid)?
+    {
+        return Err(UpdateError::Busy);
+    }
+    let _worker = acquire_lock(&reservation.state())?;
+    if !reservation
+        .plan
+        .ready
+        .claimed_process_exited()
+        .map_err(invalid)?
+    {
+        return Err(UpdateError::Busy);
+    }
+    Ok(Some(Abandonment {
+        _worker,
+        reservation,
+    }))
+}
+
+impl Abandonment {
+    pub(crate) fn archive(&self, store: &Store) -> Result<PathBuf, String> {
+        let path = store
+            .archive_claimed_update(&self.reservation.job, self.reservation.plan.ready.source())?;
+        store.retire_installed_activation()?;
+        Ok(path)
+    }
 }
 
 pub(super) struct Recorded {
@@ -37,21 +325,29 @@ pub(super) fn record(
     stamp: &installed::Stamp,
     binaries: &str,
 ) -> Result<Recorded, UpdateError> {
-    let bytes = serde_json::to_vec(&Plan {
-        version: 1,
-        target: target.to_owned(),
-        selection: selection.clone(),
-        stamp: stamp.clone(),
-        binaries: binaries.into(),
-        ready: receipt.ready_plan_evidence().map_err(invalid)?,
+    let prefix = state.parent().ok_or_else(unsupported_install)?;
+    let bytes = serde_json::to_vec(&Reservation {
+        job: job.id.clone(),
+        prefix: prefix.to_owned(),
+        plan: Plan {
+            version: 1,
+            target: target.to_owned(),
+            selection: selection.clone(),
+            stamp: stamp.clone(),
+            binaries: binaries.into(),
+            ready: receipt.ready_plan_evidence().map_err(invalid)?,
+        },
     })?;
     if bytes.len() as u64 > LIMIT {
         return Err(invalid("The Ready activation plan exceeds its size limit"));
     }
-    let path = path(state, &job.id)?;
-    cutover::persist(state, &path, &bytes, true)?;
+    let store = Store::observe_existing()
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("The acknowledged upgrade store disappeared"))?;
+    begin_new_job()?;
+    store.create_installed_activation(&bytes).map_err(invalid)?;
     Ok(Recorded {
-        path,
+        path: store.installed_activation_path(),
         digest: Sha256::digest(&bytes).into(),
     })
 }
@@ -96,6 +392,14 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>, UpdateError> {
 fn load(state: &Path, job: &UpdateJob) -> Result<Option<Plan<'static>>, UpdateError> {
     if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed) {
         return Ok(None);
+    }
+    if let Some(reservation) = shared_reservation()? {
+        if reservation.state() == state && reservation.job == job.id {
+            return Ok(Some(reservation.plan));
+        }
+        if reservation.phase()? != Phase::Released {
+            return Err(UpdateError::Busy);
+        }
     }
     let Some(bytes) = read(&path(state, &job.id)?)? else {
         return Ok(None);

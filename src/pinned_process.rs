@@ -660,7 +660,7 @@ pub(crate) fn wall_clock_start_of(pid: u32, ticks: u64) -> io::Result<std::time:
 /// # Errors
 ///
 /// Returns the underlying error when the process cannot be inspected.
-#[cfg(all(target_os = "macos", feature = "host"))]
+#[cfg(target_os = "macos")]
 pub(crate) fn exited_since(pid: u32, ticks: u64) -> io::Result<bool> {
     let still_started = || match imp::start_of(pid) {
         Ok(start) => Ok(start.ticks() == ticks),

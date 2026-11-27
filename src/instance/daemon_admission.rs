@@ -547,13 +547,36 @@ enum DaemonLaunch {
 #[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
     pub fn acquire() -> io::Result<Self> {
+        Self::acquire_with_publication(
+            #[cfg(target_os = "macos")]
+            false,
+        )
+    }
+
+    #[doc(hidden)]
+    #[cfg(all(target_os = "macos", feature = "host"))]
+    pub fn acquire_for_standby(standby: &crate::daemon::standby::Activated) -> io::Result<Self> {
+        Self::acquire_with_publication(standby.holds_darwin_publication())
+    }
+
+    fn acquire_with_publication(
+        #[cfg(target_os = "macos")] authenticated_publication: bool,
+    ) -> io::Result<Self> {
         let runtime = runtime_directory()?;
         let inherited = inherited_fence()?;
         #[cfg(target_os = "macos")]
-        let publication = if inherited.is_none() {
+        let publication = if authenticated_publication {
+            if inherited.is_none() {
+                return Err(io::Error::other(
+                    "The standby is missing its authenticated launch fence",
+                ));
+            }
+            // Activated retains the same exclusive account description.
+            None
+        } else if inherited.is_none() {
             crate::install_guard::admit_darwin_state_access()?
         } else {
-            None
+            Some(crate::install_guard::admit_darwin_inherited_state_access()?)
         };
         let launch = if let Some((file, descriptor)) = inherited {
             upgrade_fence(&file)?;

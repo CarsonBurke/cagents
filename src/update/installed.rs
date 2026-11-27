@@ -326,6 +326,11 @@ pub(super) fn perform(
             invalid(format!("The replacement terminal service could not start. Your current workspace is still open. {error}"))
         })?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[cfg(target_os = "macos")]
+    if standby.is_some() {
+        super::ready_plan::require_no_activation()?;
+    }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     if standby.is_some() && stamp(root)? != before {
         return Err(invalid(
             "The installed application changed before the replacement could start",

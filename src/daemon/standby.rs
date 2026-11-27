@@ -552,6 +552,11 @@ impl Activated {
     }
 
     #[cfg(target_os = "macos")]
+    pub(crate) fn holds_darwin_publication(&self) -> bool {
+        self._publication.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
     pub fn take_ready_admission(&mut self) -> Option<crate::upgrade::recovery::ReadyAdmission> {
         self.ready_admission.take()
     }

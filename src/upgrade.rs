@@ -1002,7 +1002,7 @@ pub mod handoff {
     use crate::terminal_ipc::TerminalSpawnOptions;
     use serde::{Deserialize, Serialize};
     use sha2::{Digest, Sha256};
-    #[cfg(any(feature = "host", test))]
+    #[cfg(any(feature = "host", test, target_os = "macos"))]
     use std::io::Write;
     use std::{ffi::OsStr, path::PathBuf};
 
@@ -1016,6 +1016,13 @@ pub mod handoff {
     pub(crate) const MAX_SESSIONS: usize = MAX_TERMINALS + MAX_CHATS;
     const FILE: &str = "daemon-upgrade.json";
     const ABANDONED_FILE: &str = "daemon-upgrade.abandoned.json";
+    #[cfg(target_os = "macos")]
+    const ABANDONED_JOB_PREFIX: &str = "daemon-upgrade.abandoned.";
+
+    #[cfg(target_os = "macos")]
+    fn canonical_job(job: &str) -> bool {
+        uuid::Uuid::parse_str(job).is_ok_and(|id| id.to_string() == job)
+    }
 
     /// Enforce the durable limit while serializing, before allocating a full
     /// report. Launch environments and recovery lineages are client supplied.
@@ -1930,6 +1937,13 @@ pub mod handoff {
         deserializer.deserialize_seq(Count)
     }
 
+    #[cfg(target_os = "macos")]
+    const INSTALLED_ACTIVATION: &str = "installed-activation.json";
+    #[cfg(target_os = "macos")]
+    pub(crate) const INSTALLED_ACTIVATION_LIMIT: u64 =
+        crate::upgrade::recovery::STANDBY_RECEIPT_LIMIT as u64
+            + crate::terminal_ipc::MAX_FRAME_BYTES as u64;
+
     pub struct Store {
         root: fs_safety::Root,
         pub path: PathBuf,
@@ -2049,10 +2063,14 @@ pub mod handoff {
             Ok(Some(file))
         }
 
-        fn read_evidence(mut file: std::fs::File) -> Result<Vec<u8>, String> {
+        fn read_evidence(file: std::fs::File) -> Result<Vec<u8>, String> {
+            Self::read_evidence_up_to(file, MAX_BYTES)
+        }
+
+        fn read_evidence_up_to(mut file: std::fs::File, limit: u64) -> Result<Vec<u8>, String> {
             let bytes =
-                fs_safety::read_bounded(&mut file, MAX_BYTES).map_err(|error| error.to_string())?;
-            if bytes.len() as u64 > MAX_BYTES {
+                fs_safety::read_bounded(&mut file, limit).map_err(|error| error.to_string())?;
+            if bytes.len() as u64 > limit {
                 return Err("Upgrade evidence exceeds durable byte limit".into());
             }
             Ok(bytes)
@@ -2142,6 +2160,33 @@ pub mod handoff {
                 .transpose()
         }
 
+        #[cfg(target_os = "macos")]
+        pub(crate) fn installed_activation_path(&self) -> PathBuf {
+            self.path.with_file_name(INSTALLED_ACTIVATION)
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn installed_activation(&self) -> Result<Option<Vec<u8>>, String> {
+            self.open_evidence(INSTALLED_ACTIVATION)?
+                .map(|file| Self::read_evidence_up_to(file, INSTALLED_ACTIVATION_LIMIT))
+                .transpose()
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn create_installed_activation(&self, bytes: &[u8]) -> Result<(), String> {
+            if bytes.len() as u64 > INSTALLED_ACTIVATION_LIMIT {
+                return Err("Installed activation exceeds durable byte limit".into());
+            }
+            self.publish_named(INSTALLED_ACTIVATION, bytes, fs_safety::rename_new_within)
+        }
+
+        #[cfg(target_os = "macos")]
+        pub(crate) fn retire_installed_activation(&self) -> Result<(), String> {
+            fs_safety::unlink_within(&self.root, OsStr::new(INSTALLED_ACTIVATION))
+                .map_err(|error| error.to_string())?;
+            fs_safety::sync_directory(&self.root).map_err(|error| error.to_string())
+        }
+
         /// Atomically and durably replaces `name` with `bytes`.
         #[cfg(any(feature = "host", test))]
         pub(super) fn write_named(&self, name: &str, bytes: &[u8]) -> Result<(), String> {
@@ -2154,7 +2199,7 @@ pub mod handoff {
             self.publish_named(name, bytes, fs_safety::rename_new_within)
         }
 
-        #[cfg(any(feature = "host", test))]
+        #[cfg(any(feature = "host", test, target_os = "macos"))]
         fn publish_named(
             &self,
             name: &str,
@@ -2549,6 +2594,40 @@ pub mod handoff {
             self.archive_as(ABANDONED_FILE)
         }
 
+        /// Keep the exact failed job separate from any earlier abandonment.
+        /// A retry can finish releasing its reservation after the archive moved.
+        #[cfg(target_os = "macos")]
+        pub(crate) fn archive_claimed_update(
+            &self,
+            job: &str,
+            source: &HostSessionProof,
+        ) -> Result<PathBuf, String> {
+            if !canonical_job(job) {
+                return Err("Invalid abandoned update job".into());
+            }
+            let name = format!("{ABANDONED_JOB_PREFIX}{job}.json");
+            let identifies_claim = |proof: &HostSessionProof, phase| {
+                proof == source && matches!(phase, Phase::Ready | Phase::Restoring)
+            };
+            match self.checkpoint_status()? {
+                Some(checkpoint) if identifies_claim(&checkpoint.proof, checkpoint.phase) => {
+                    self.archive_as(&name)
+                }
+                Some(_) => Err("The saved checkpoint belongs to a different update".into()),
+                None if self
+                    .read_named(&name)?
+                    .map(|bytes| decode_checkpoint(&bytes))
+                    .transpose()?
+                    .is_some_and(|checkpoint| {
+                        identifies_claim(&checkpoint.proof, checkpoint.phase)
+                    }) =>
+                {
+                    Ok(self.path.with_file_name(name))
+                }
+                None => Err("The update's exact checkpoint could not be found".into()),
+            }
+        }
+
         /// The conversation IDs a checkpoint holds that its chats' saved
         /// descriptors lack: providers named those threads after the update
         /// began, so the checkpoint is their only record. `None` when the
@@ -2576,13 +2655,38 @@ pub mod handoff {
             )
         }
 
-        /// The checkpoint an operator abandoned. It is never replayed, but the
-        /// daemon saves the conversation IDs that only it records.
-        #[cfg(feature = "host")]
-        pub fn load_abandoned(&self) -> Result<Option<Checkpoint>, String> {
-            self.read_named(ABANDONED_FILE)?
-                .map(|bytes| decode_checkpoint(&bytes))
-                .transpose()
+        /// An abandoned checkpoint supplies only saved conversation IDs. One
+        /// unreadable archive leaves the other archives available to the caller.
+        #[cfg(any(feature = "host", test))]
+        pub fn abandoned_checkpoints(
+            &self,
+        ) -> Result<impl Iterator<Item = Result<Checkpoint, String>> + '_, String> {
+            #[cfg(target_os = "macos")]
+            let jobs = {
+                let entries =
+                    fs_safety::directory_entries_beneath(&self.root, Path::new(""), 65_536)
+                        .map_err(|error| error.to_string())?;
+                let mut jobs: Vec<_> = entries
+                    .into_iter()
+                    .filter_map(|entry| entry.into_string().ok())
+                    .filter(|name| {
+                        name.strip_prefix(ABANDONED_JOB_PREFIX)
+                            .and_then(|job| job.strip_suffix(".json"))
+                            .is_some_and(canonical_job)
+                    })
+                    .collect();
+                jobs.sort_unstable();
+                jobs.into_iter()
+            };
+            #[cfg(not(target_os = "macos"))]
+            let jobs = std::iter::empty();
+            Ok(std::iter::once(ABANDONED_FILE.to_owned())
+                .chain(jobs)
+                .filter_map(|name| match self.read_named(&name) {
+                    Ok(Some(bytes)) => Some(decode_checkpoint(&bytes)),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error)),
+                }))
         }
 
         /// Preserve deferred setup evidence without leaving a replayable
@@ -3080,6 +3184,12 @@ pub mod handoff {
 /// Explicitly abandon automatic replay while retaining every source descriptor.
 /// Requires a stopped daemon and never replaces a previous abandoned archive.
 pub(crate) fn abandon() -> Result<Abandoned, String> {
+    #[cfg(target_os = "macos")]
+    let _publication =
+        crate::install_guard::reserve_darwin_publication().map_err(|error| error.to_string())?;
+    #[cfg(target_os = "macos")]
+    let reserved =
+        crate::update::abandon_claimed_darwin_update().map_err(|error| error.to_string())?;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     let _lease = crate::daemon::HostLease::acquire_for_maintenance(&paths)
         .map_err(|error| error.to_string())?;
@@ -3087,8 +3197,15 @@ pub(crate) fn abandon() -> Result<Abandoned, String> {
     // Read first: an unreadable checkpoint is still archived, as abandoning is
     // how an operator gets past one.
     let checkpoint_only = store.checkpoint_only_identities();
+    #[cfg(target_os = "macos")]
+    let archive = match reserved {
+        Some(reserved) => reserved.archive(&store)?,
+        None => store.archive()?,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let archive = store.archive()?;
     Ok(Abandoned {
-        archive: store.archive()?,
+        archive,
         checkpoint_only,
     })
 }
@@ -3174,11 +3291,69 @@ mod tests {
         );
         store.archive().unwrap();
         assert_eq!(store.checkpoint_only_identities(), None);
-        #[cfg(feature = "host")]
         assert_eq!(
-            store.load_abandoned().unwrap().unwrap().chats.len(),
+            store
+                .abandoned_checkpoints()
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .chats
+                .len(),
             3,
             "the daemon reads the archive it saves identities from"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn claimed_update_abandonment_keeps_prior_archives_and_retries_only_its_job() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        let checkpoint = |session| {
+            handoff::Checkpoint::new(
+                HostSessionProof {
+                    host_session_id: HostSessionId::new(session),
+                    boot_id: BootId::new("same-boot"),
+                    host_incarnation: HostIncarnation::new(session),
+                },
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        let prior = checkpoint("prior-source");
+        store.save(&prior).unwrap();
+        let prior_path = store.archive().unwrap();
+        let prior_bytes = fs::read(&prior_path).unwrap();
+
+        let mut current = checkpoint("current-source");
+        current.phase = Phase::Restoring;
+        store.save(&current).unwrap();
+        let current_bytes = fs::read(&store.path).unwrap();
+        let job = uuid::Uuid::new_v4().to_string();
+        let archive = store.archive_claimed_update(&job, &current.proof).unwrap();
+        assert_ne!(archive, prior_path);
+        assert_eq!(fs::read(&archive).unwrap(), current_bytes);
+        assert_eq!(fs::read(&prior_path).unwrap(), prior_bytes);
+        assert!(store.load().unwrap().is_none());
+        assert_eq!(
+            store.archive_claimed_update(&job, &current.proof).unwrap(),
+            archive
+        );
+        assert!(store.archive_claimed_update(&job, &prior.proof).is_err());
+        assert!(
+            store
+                .archive_claimed_update(&uuid::Uuid::new_v4().to_string(), &current.proof)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .abandoned_checkpoints()
+                .unwrap()
+                .map(|checkpoint| checkpoint.unwrap().proof)
+                .collect::<Vec<_>>(),
+            vec![prior.proof, current.proof],
         );
     }
 
