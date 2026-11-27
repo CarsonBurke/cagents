@@ -4629,14 +4629,21 @@ impl Worker {
     }
 
     fn encode_key(&mut self, mut input: KeyInput) {
-        if input.action == KeyAction::Tap {
-            self.encode_key_tap(input);
-            return;
-        }
-        if input.action == KeyAction::Repeat && !self.pending_input.has_key_owner(&input) {
-            // Its earlier unsent down may have been canceled at a priority
-            // boundary. A later accepted repeat establishes a fresh down.
-            input.action = KeyAction::Press;
+        match input.action {
+            KeyAction::Tap if self.pending_input.has_key_owner(&input) => {
+                // Keep the wheel repeat with the physical key's release obligation.
+                input.action = KeyAction::Repeat;
+            }
+            KeyAction::Tap => {
+                self.encode_key_tap(input);
+                return;
+            }
+            KeyAction::Repeat if !self.pending_input.has_key_owner(&input) => {
+                // Its earlier unsent down may have been canceled at a priority
+                // boundary. A later accepted repeat establishes a fresh down.
+                input.action = KeyAction::Press;
+            }
+            _ => {}
         }
         let mut release = input.clone();
         release.action = KeyAction::Release;
@@ -4678,21 +4685,15 @@ impl Worker {
     }
 
     fn encode_key_tap(&mut self, mut input: KeyInput) {
-        // A wheel tick during a physical hold can repeat that key, but must
-        // leave its release to the keyboard. Otherwise encode the entire tap
-        // in one packet so interruption cannot leave an escaped press behind.
-        let held = self.pending_input.has_key_owner(&input);
+        // Queue the entire tap in one packet so interruption cannot leave
+        // an escaped press behind.
         let mut release = input.clone();
         release.action = KeyAction::Release;
         release.text = None;
-        input.action = if held {
-            KeyAction::Repeat
-        } else {
-            KeyAction::Press
-        };
+        input.action = KeyAction::Press;
         let encoded = (|| -> Result<_, libghostty_vt::Error> {
             let mut bytes = encode_key_input(&self.terminal, &mut self.key_encoder, input)?;
-            if !held && !bytes.is_empty() {
+            if !bytes.is_empty() {
                 bytes.extend(encode_key_input(
                     &self.terminal,
                     &mut self.key_encoder,
