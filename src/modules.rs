@@ -133,6 +133,7 @@ pub mod transcript_cache;
 pub mod transcript_location;
 #[cfg(feature = "host")]
 pub mod tray;
+pub mod unified_diff;
 pub mod update;
 pub mod upgrade;
 pub mod work;

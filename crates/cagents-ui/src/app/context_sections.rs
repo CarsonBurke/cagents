@@ -826,8 +826,10 @@ impl Cagents {
     }
 
     fn workspace_body(&self, view: WorkspaceView, width: f32) -> Element<'_, Message> {
-        if crate::device::is_remote() {
-            return self.device_workspace_body(view);
+        // A device's changes are read through its own Git and drawn as a
+        // local worktree's are; its files are browsed in the device tools.
+        if crate::device::is_remote() && view == WorkspaceView::Files {
+            return self.device_files_body();
         }
         match view {
             WorkspaceView::Files => sidebar::file_panel(
@@ -846,15 +848,9 @@ impl Cagents {
         .map(Message::Sidebar)
     }
 
-    /// A remote device's worktree opens in its own window rather than being
-    /// read through this one.
-    fn device_workspace_body(&self, view: WorkspaceView) -> Element<'_, Message> {
-        let changes = view == WorkspaceView::SourceControl;
-        let panel = if changes {
-            device_ui::Panel::Changes
-        } else {
-            device_ui::Panel::Files
-        };
+    /// A remote device's files are browsed in the device tools rather than
+    /// read through this computer's file list.
+    fn device_files_body(&self) -> Element<'_, Message> {
         let path = self.active_workspace.as_ref();
         widget::container(
             widget::column::with_children(vec![
@@ -872,28 +868,16 @@ impl Cagents {
                                 .unwrap_or_default()
                         }),
                 ),
-                crate::ui_controls::button::secondary(if changes {
-                    "Open changes"
-                } else {
-                    "Open files"
-                })
-                .icon(if changes {
-                    Icon::Diff
-                } else {
-                    Icon::OpenFolder
-                })
-                .name(if changes {
-                    "Open device changes"
-                } else {
-                    "Open device files"
-                })
-                .on_press_maybe((!self.modal_is_open()).then_some(Message::Device(
-                    device_ui::Action::OpenIn {
-                        path: path.cloned(),
-                        panel,
-                    },
-                )))
-                .into(),
+                crate::ui_controls::button::secondary("Open files")
+                    .icon(Icon::OpenFolder)
+                    .name("Open device files")
+                    .on_press_maybe((!self.modal_is_open()).then_some(Message::Device(
+                        device_ui::Action::OpenIn {
+                            path: path.cloned(),
+                            panel: device_ui::Panel::Files,
+                        },
+                    )))
+                    .into(),
             ])
             .spacing(space::M),
         )

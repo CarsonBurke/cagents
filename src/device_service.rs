@@ -89,6 +89,13 @@ pub enum Operation {
     AccountProbeAfterLogin {
         account: crate::account::Account,
     },
+    /// A device window's source control: a
+    /// [`crate::repository::RepositoryRequest`] as JSON text, answered by the
+    /// device's Git with the service a local window uses. Its types keep
+    /// Serde forms Postcard cannot read, so it travels as JSON, and as text
+    /// so that every build, the CLI's too, has this variant and numbers any
+    /// appended after it alike. Appended wire tag.
+    Repository(String),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum GitOperation {
@@ -165,6 +172,9 @@ pub enum Reply {
     },
     Image(Vec<u8>),
     AccountReset(#[serde(with = "wire_json")] serde_json::Value),
+    /// A [`crate::repository::RepositoryReply`] as JSON text, encoded where
+    /// it was answered so its size is known before it is sent.
+    Repository(String),
 }
 
 /// Daemon-resolved directories used for workspace navigation. No displaying
@@ -267,6 +277,10 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::AccountLogin { account } => account_login(account),
         Operation::AccountProbe { account, force } => probe_account(account, force, false),
         Operation::AccountProbeAfterLogin { account } => probe_account(account, true, true),
+        Operation::Repository(request) => serde_json::from_str(&request)
+            .map_err(|error| format!("The device could not read this request: {error}"))
+            .and_then(repository)
+            .map(Reply::Repository),
         Operation::Home => {
             let path = std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -562,6 +576,45 @@ fn read(root: &crate::fs_safety::Root, path: &std::path::Path) -> Result<String,
     }
     String::from_utf8(bytes).map_err(|_| "file is not UTF-8 text".into())
 }
+/// The largest diff side a device sends. Two of them, escaped as JSON, stay
+/// well inside one IPC frame; a larger side is reported as too large to show,
+/// as one past the service's own limit is.
+#[cfg(feature = "host")]
+const MAX_REMOTE_DIFF_SIDE_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Answers a device window's source-control request, as JSON text.
+#[cfg(feature = "host")]
+fn repository(request: crate::repository::RepositoryRequest) -> Result<String, String> {
+    use crate::repository::{CancellationToken, RepositoryService};
+    let worktree = std::fs::canonicalize(request.worktree()).map_err(|error| error.to_string())?;
+    // A change waits for any other change to the same worktree, from this
+    // window or another, as Device files' Git operations do.
+    let too_large = match &request {
+        crate::repository::RepositoryRequest::Snapshot { .. } => {
+            "There are too many changes to send from the device. Collapse Untracked, or run git status in a terminal on the device."
+        }
+        crate::repository::RepositoryRequest::Diff(_) => {
+            "This comparison is too large to send from the device. Open the file on the device instead."
+        }
+        _ => {
+            "The device's answer is too large to send. Run git in a terminal on the device instead."
+        }
+    };
+    let lock = request.mutates().then(|| mutation_lock(worktree));
+    let _guard = lock
+        .as_ref()
+        .map(|lock| lock.lock().unwrap_or_else(|poison| poison.into_inner()));
+    let reply = request
+        .run(&RepositoryService::system("git"), &CancellationToken::new())
+        .map_err(|error| error.to_string())?
+        .bounded(MAX_REMOTE_DIFF_SIDE_BYTES);
+    let encoded = serde_json::to_string(&reply).map_err(|error| error.to_string())?;
+    if encoded.len() > MAX_DEVICE_IMAGE_BYTES {
+        return Err(too_large.into());
+    }
+    Ok(encoded)
+}
+
 #[cfg(feature = "host")]
 fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
     use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor};
@@ -834,6 +887,17 @@ fn unstage_command(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// Postcard numbers an enum's variants by position, so the CLI, a window
+    /// and a daemon of one protocol version agree on a variant only while
+    /// every build has every variant in the same place.
+    #[test]
+    fn a_repository_request_keeps_its_appended_wire_tag() {
+        assert_eq!(
+            postcard::to_allocvec(&Operation::Repository(String::new())).unwrap(),
+            [20, 0]
+        );
+    }
 
     /// A project chooser shows folders, and a link to one is a folder too.
     #[test]
@@ -1397,6 +1461,90 @@ mod tests {
     }
 
     #[test]
+    fn source_control_requests_are_answered_by_the_devices_git() {
+        use crate::repository::{
+            ChangeArea, DiffBasis, DiffContent, DiffRequest, DiffSide, MutationOutcome,
+            PathSelection, RepoPath, RepositoryReply, RepositoryRequest, SnapshotOptions,
+            SnapshotRead, StageRequest,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(directory.path()).unwrap();
+        for arguments in [
+            &["init", "-q"][..],
+            &["config", "user.name", "Test"],
+            &["config", "user.email", "test@example.invalid"],
+        ] {
+            git_output(&root, arguments);
+        }
+        std::fs::write(root.join("notes.txt"), "one\n").unwrap();
+        git_output(&root, &["add", "notes.txt"]);
+        git_output(&root, &["commit", "-qm", "first"]);
+        std::fs::write(root.join("notes.txt"), "one\ntwo\n").unwrap();
+        // Each request crosses the wire as a window sends it.
+        let answer = |request: RepositoryRequest| -> RepositoryReply {
+            let operation = Operation::Repository(serde_json::to_string(&request).unwrap());
+            let operation: Operation =
+                postcard::from_bytes(&postcard::to_allocvec(&operation).unwrap()).unwrap();
+            let reply = execute(operation).unwrap();
+            let reply: Reply =
+                postcard::from_bytes(&postcard::to_allocvec(&reply).unwrap()).unwrap();
+            let Reply::Repository(encoded) = reply else {
+                panic!("a repository request has a repository reply");
+            };
+            serde_json::from_str(&encoded).unwrap()
+        };
+        let snapshot = |answer: &dyn Fn(RepositoryRequest) -> RepositoryReply| {
+            let read = answer(RepositoryRequest::Snapshot {
+                worktree: root.clone(),
+                options: SnapshotOptions::default(),
+                previous: None,
+                files: false,
+            })
+            .into_snapshot()
+            .unwrap();
+            let SnapshotRead::Changed { snapshot, .. } = read else {
+                panic!("a read with no previous digest is a change");
+            };
+            snapshot
+        };
+        let before = snapshot(&answer);
+        assert!(
+            before.files.paths.is_empty(),
+            "the listing stays on the device"
+        );
+        assert_eq!(before.files.tracked_count, 1);
+        let [entry] = before.status.entries.as_slice() else {
+            panic!("one changed file: {:?}", before.status.entries);
+        };
+        assert_eq!(entry.area, ChangeArea::Unstaged);
+        let path = RepoPath::parse(std::path::Path::new("notes.txt")).unwrap();
+        let diff = answer(RepositoryRequest::Diff(DiffRequest {
+            worktree: root.clone(),
+            basis: DiffBasis::IndexToWorktree,
+            path: path.clone(),
+            old_path: None,
+        }))
+        .into_diff()
+        .unwrap();
+        assert!(matches!(
+            diff,
+            DiffContent::Comparison { new: DiffSide::Text { ref text, .. }, .. } if text == "one\ntwo\n"
+        ));
+        let staged = answer(RepositoryRequest::Stage(StageRequest {
+            worktree: root.clone(),
+            selection: vec![PathSelection::new(path)],
+        }))
+        .into_mutation()
+        .unwrap();
+        assert!(
+            matches!(staged, MutationOutcome::Applied { .. }),
+            "{staged:?}"
+        );
+        let after = snapshot(&answer);
+        assert_eq!(after.status.entries[0].area, ChangeArea::Staged);
+    }
+
+    #[test]
     fn git_operations_and_worktrees_target_the_daemon_directory() {
         if crate::repository::isolated_git_test(concat!(
             module_path!(),
@@ -1903,6 +2051,30 @@ pub fn request(operation: Operation) -> Result<Reply, String> {
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
         ready_client,
     )
+}
+
+/// Answers a source-control request where the window's worktrees are: on
+/// this computer with its own Git, or in a device window by the device's.
+/// `cancellation` stops a local answer; a device's runs to its end.
+#[cfg(feature = "ui")]
+pub fn answer_repository(
+    request: crate::repository::RepositoryRequest,
+    cancellation: &crate::repository::CancellationToken,
+) -> Result<crate::repository::RepositoryReply, String> {
+    if !crate::device::is_remote() {
+        return request
+            .run(
+                &crate::repository::RepositoryService::system("git"),
+                cancellation,
+            )
+            .map_err(|error| error.to_string());
+    }
+    let request = serde_json::to_string(&request).map_err(|error| error.to_string())?;
+    match request_for_reader(Operation::Repository(request))? {
+        Reply::Repository(encoded) => serde_json::from_str(&encoded)
+            .map_err(|error| format!("The device's answer could not be read: {error}")),
+        _ => Err("Unexpected device response".into()),
+    }
 }
 
 /// [`request`] for an operation whose refusal is shown to the person who

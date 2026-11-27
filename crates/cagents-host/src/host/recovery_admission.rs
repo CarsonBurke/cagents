@@ -302,7 +302,10 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
         | O::AccountDefault { .. }
         | O::ReadImage { .. }
         | O::ReadImageAsset { .. }
-        | O::AccountReset { .. } => Access::Open,
+        | O::AccountReset { .. }
+        // Source control reads and changes the index, as Git's Stage and
+        // Commit above do, and removes nothing a recovery holds.
+        | O::Repository(_) => Access::Open,
         O::Git { operation, .. } => match operation {
             GitOperation::RemoveWorktree { .. } => Access::Held,
             GitOperation::Status

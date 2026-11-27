@@ -490,24 +490,32 @@ impl Cagents {
                     worktree: key.canonical_path.clone(),
                     selection,
                 };
-                Self::mutation_task(key, operation, move |service, cancel| {
-                    (
-                        mutation_report(
-                            "Mark resolved",
-                            service.stage_with_conflict_markers(&request, cancel),
-                        ),
-                        false,
-                    )
-                })
+                Self::mutation_task(
+                    key,
+                    operation,
+                    RepositoryRequest::StageWithConflictMarkers(request),
+                    |reply| {
+                        (
+                            mutation_report(
+                                "Mark resolved",
+                                reply.and_then(RepositoryReply::into_mutation),
+                            ),
+                            false,
+                        )
+                    },
+                )
             }
             SidebarAction::ConfirmAbortOperation { key, kind } => {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Abort, None) else {
                     return ControlFlow::Break(Task::none());
                 };
-                let worktree = key.canonical_path.clone();
-                Self::mutation_task(key, operation, move |service, cancel| {
+                let request = RepositoryRequest::Abort {
+                    worktree: key.canonical_path.clone(),
+                    kind,
+                };
+                Self::mutation_task(key, operation, request, |reply| {
                     (
-                        mutation_report("Abort", service.abort_operation(&worktree, kind, cancel)),
+                        mutation_report("Abort", reply.and_then(RepositoryReply::into_mutation)),
                         false,
                     )
                 })
@@ -526,10 +534,13 @@ impl Cagents {
                 else {
                     return ControlFlow::Break(Task::none());
                 };
-                let worktree = key.canonical_path.clone();
-                Self::mutation_task(key, operation, move |service, cancel| {
-                    let outcome =
-                        service.continue_operation(&worktree, kind, message.as_deref(), cancel);
+                let request = RepositoryRequest::Continue {
+                    worktree: key.canonical_path.clone(),
+                    kind,
+                    message,
+                };
+                Self::mutation_task(key, operation, request, |reply| {
+                    let outcome = reply.and_then(RepositoryReply::into_mutation);
                     let applied = matches!(
                         outcome,
                         Ok(MutationOutcome::Applied { .. } | MutationOutcome::PartiallyApplied { .. })
@@ -548,9 +559,12 @@ impl Cagents {
                 else {
                     return ControlFlow::Break(Task::none());
                 };
-                let worktree = key.canonical_path.clone();
-                Self::mutation_task(key, operation, move |service, cancel| {
-                    let outcome = service.skip_operation(&worktree, kind, cancel);
+                let request = RepositoryRequest::Skip {
+                    worktree: key.canonical_path.clone(),
+                    kind,
+                };
+                Self::mutation_task(key, operation, request, |reply| {
+                    let outcome = reply.and_then(RepositoryReply::into_mutation);
                     let applied = matches!(
                         outcome,
                         Ok(MutationOutcome::Applied { .. } | MutationOutcome::PartiallyApplied { .. })
@@ -566,9 +580,9 @@ impl Cagents {
                     worktree: key.canonical_path.clone(),
                     selection,
                 };
-                Self::mutation_task(key, operation, move |service, cancel| {
+                Self::mutation_task(key, operation, RepositoryRequest::Unstage(request), |reply| {
                     (
-                        mutation_report("Unstage", service.unstage(&request, cancel)),
+                        mutation_report("Unstage", reply.and_then(RepositoryReply::into_mutation)),
                         false,
                     )
                 })
@@ -582,9 +596,9 @@ impl Cagents {
                 let Some(operation) = self.begin_mutation(&key, MutationKind::Discard, None) else {
                     return ControlFlow::Break(Task::none());
                 };
-                Self::mutation_task(key, operation, move |service, cancel| {
+                Self::mutation_task(key, operation, RepositoryRequest::Discard(request), |reply| {
                     (
-                        mutation_report("Discard", service.discard(&request, cancel)),
+                        mutation_report("Discard", reply.and_then(RepositoryReply::into_mutation)),
                         false,
                     )
                 })
@@ -598,8 +612,8 @@ impl Cagents {
                     worktree: key.canonical_path.clone(),
                     message,
                 };
-                Self::mutation_task(key, operation, move |service, cancel| {
-                    commit_report(service.commit_with_amend(&request, amend, cancel))
+                Self::mutation_task(key, operation, RepositoryRequest::Commit { request, amend }, |reply| {
+                    commit_report(reply.and_then(RepositoryReply::into_commit))
                 })
             }
             SidebarAction::Push {
@@ -615,8 +629,8 @@ impl Cagents {
                     branch,
                     target,
                 };
-                Self::mutation_task(key, operation, move |service, cancel| {
-                    (push_report(service.push(&request, cancel)), false)
+                Self::mutation_task(key, operation, RepositoryRequest::Push(request), |reply| {
+                    (push_report(reply.and_then(RepositoryReply::into_push)), false)
                 })
             }
             SidebarAction::OpenPublish { .. } => Task::none(),

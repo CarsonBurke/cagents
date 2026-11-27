@@ -261,7 +261,7 @@ enum BasisResolution {
 /// A committed comparison names its ref or its commit: the whole point of a
 /// fourth basis is that a user looking at one commit's diff must not see the
 /// same heading as a user looking at unstaged work.
-fn basis_label(basis: &DiffBasis) -> String {
+pub fn basis_label(basis: &DiffBasis) -> String {
     match basis {
         DiffBasis::IndexToWorktree => "Unstaged changes".into(),
         DiffBasis::HeadToIndex => "Staged changes".into(),
@@ -348,9 +348,9 @@ fn side_detail(side: &DiffSide) -> String {
         DiffSide::Text { bytes, .. } => format!("{bytes} bytes of text"),
         DiffSide::Binary { bytes } => format!("binary, {bytes} bytes"),
         DiffSide::InvalidUtf8 { bytes } => format!("not valid UTF-8, {bytes} bytes"),
-        DiffSide::Oversize { bytes } => {
-            format!("{bytes} bytes, over the {MAX_DIFF_SIDE_BYTES}-byte limit for one side")
-        }
+        // A device window's limit is lower than this computer's, so the
+        // limit is not named.
+        DiffSide::Oversize { bytes } => format!("{bytes} bytes, too large to compare"),
         DiffSide::Submodule { oid: Some(oid) } => {
             format!("a submodule recorded at {}", oid.short())
         }
@@ -12489,13 +12489,20 @@ fn no_text_view_height(
     content: &DiffContent,
     height: Length,
 ) -> Element<'static, RepositoryAction> {
+    let (title, detail) = no_text_summary(content);
+    information_state_height(title, detail, height)
+}
+
+/// What a comparison with no text rows is, as a heading and the account of
+/// each side that has none, one per line.
+pub fn no_text_summary(content: &DiffContent) -> (String, String) {
     match content {
         DiffContent::Comparison {
             old,
             new,
             old_label,
             new_label,
-        } => information_state_height(
+        } => (
             format!("No text diff between {old_label} and {new_label}"),
             [(old_label, old), (new_label, new)]
                 .into_iter()
@@ -12503,15 +12510,14 @@ fn no_text_view_height(
                 .map(|(label, side)| format!("{label}: {}", side_detail(side)))
                 .collect::<Vec<_>>()
                 .join("\n"),
-            height,
         ),
         DiffContent::Unmerged {
             base,
             ours,
             theirs,
             worktree,
-        } => information_state_height(
-            "This path is conflicted",
+        } => (
+            "This path is conflicted".into(),
             [
                 ("Common ancestor", base),
                 ("Ours", ours),
@@ -12522,7 +12528,6 @@ fn no_text_view_height(
             .map(|(label, side)| format!("{label}: {}", side_detail(side)))
             .collect::<Vec<_>>()
             .join("\n"),
-            height,
         ),
     }
 }

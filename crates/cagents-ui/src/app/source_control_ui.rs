@@ -4,6 +4,13 @@ use super::*;
 use crate::repository::SnapshotDigest;
 use std::ops::ControlFlow;
 
+/// How often a device window reads the Changes it shows while the window
+/// is focused, and while it is not.
+const DEVICE_SOURCE_READ_FOCUSED: Duration = Duration::from_secs(3);
+const DEVICE_SOURCE_READ_UNFOCUSED: Duration = Duration::from_secs(15);
+/// How often it tries again after a read failed.
+const DEVICE_SOURCE_READ_FAILED: Duration = Duration::from_secs(30);
+
 impl Cagents {
     pub(super) fn source_control_loaded(
         &mut self,
@@ -17,6 +24,7 @@ impl Cagents {
         // The current read is over whatever became of its binding; left set,
         // it would hold back every later read.
         self.refresh_ui.source_cancel = None;
+        self.device_diff_rows_read(request);
         let changed = !matches!(result, Ok(SourceControlRead::Unchanged { .. }));
         self.refresh_ui
             .source_reload
@@ -48,6 +56,11 @@ impl Cagents {
             Err(error) => {
                 self.replace_source_control(SourceControlModel::failed(key, error));
                 self.cancel_branch_changes();
+                // A device's Changes are only read on a timer, so a device
+                // that could not be read once is tried again later.
+                if crate::device::is_remote() {
+                    self.schedule_device_source_read();
+                }
                 return ControlFlow::Continue(Task::none());
             }
         };
@@ -76,6 +89,13 @@ impl Cagents {
     /// never left standing with nothing loading. A Files read always builds
     /// the tree, so this asks once.
     pub(super) fn load_deferred_files(&mut self) -> Task<Message> {
+        // A device window's Files is the device's own browser, so there is
+        // no tree to build here. With no watcher on the device's files, the
+        // shown Changes are read again on a timer instead.
+        if crate::device::is_remote() {
+            self.schedule_device_source_read();
+            return Task::none();
+        }
         if self.refresh_ui.source_cancel.is_some()
             || self.workspace_view_shown() != Some(context_sections::WorkspaceView::Files)
         {
@@ -91,6 +111,35 @@ impl Cagents {
         };
         let key = source.key.clone();
         self.reload_source_control(&key)
+    }
+
+    /// Owes the shown Changes of a device's checkout another read, unless a
+    /// read or a change is under way that reads it anyway. An agent working
+    /// on the device shows up within [`DEVICE_SOURCE_READ_FOCUSED`] while the
+    /// window is in use; a device that cannot be read is tried less often.
+    fn schedule_device_source_read(&mut self) {
+        if self.refresh_ui.source_cancel.is_some()
+            || self.refresh_ui.source_reload.due().is_some()
+            || self.workspace_view_shown() != Some(context_sections::WorkspaceView::SourceControl)
+        {
+            return;
+        }
+        let Some(source) = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| !source.busy())
+        else {
+            return;
+        };
+        let wait = if matches!(source.data_state, sidebar::SidebarDataState::Error(_)) {
+            DEVICE_SOURCE_READ_FAILED
+        } else if self.refresh_ui.focused {
+            DEVICE_SOURCE_READ_FOCUSED
+        } else {
+            DEVICE_SOURCE_READ_UNFOCUSED
+        };
+        self.refresh_ui.source_reload.poll(Instant::now() + wait);
     }
 
     /// Shows a read's status on the sidebar row of the worktree it read.
