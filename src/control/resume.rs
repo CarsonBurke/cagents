@@ -83,10 +83,10 @@ pub(super) fn resume(arguments: ResumeArgs) -> Result<CommandOutput, AppError> {
                 session,
                 reason: "Unexpected reply from the daemon".into(),
             },
-            Err(ControlError::Remote { message, .. }) => Outcome::Failed {
-                session,
-                reason: message,
-            },
+            Err(ControlError::Remote { mut message, .. }) => {
+                format::qualify_diagnostic(&mut message);
+                Outcome::Failed { session, reason: message }
+            }
             Err(error) => {
                 let error = protocol_error(error);
                 lost = Some(error.message.clone());

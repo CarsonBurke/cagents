@@ -6257,7 +6257,14 @@ fn protocol_error(error: ControlError) -> AppError {
     };
     AppError {
         kind,
-        message: error.to_string(),
+        message: match error {
+            ControlError::Remote {
+                code,
+                message,
+                retryable,
+            } => remote_display(code, &format::daemon_diagnostic(&message), retryable),
+            error => error.to_string(),
+        },
         details,
     }
 }

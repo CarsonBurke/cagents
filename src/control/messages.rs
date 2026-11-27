@@ -596,7 +596,17 @@ impl Mailbox {
             .agent(self.authority.clone(), Operation::Deliver(outgoing))
             .map_err(protocol_error)?
         {
-            Reply::Handed(handed) => Ok(handed),
+            Reply::Handed(mut handed) => {
+                if let Some(
+                    Handoff::Held { reason, .. }
+                    | Handoff::Ended { reason, .. }
+                    | Handoff::Unknown { reason, .. },
+                ) = &mut handed.agent
+                {
+                    format::qualify_diagnostic(reason);
+                }
+                Ok(handed)
+            }
             _ => Err(AppError::new("message", "Unexpected send response")),
         }
     }
