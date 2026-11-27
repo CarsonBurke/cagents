@@ -22,7 +22,8 @@ fn window(free: bool) -> Window {
             job: None,
         },
         follow: Follow::default(),
-        polling: false,
+        watch_attempt: 0,
+        watch_failed: false,
         working: false,
         details: false,
         notice: None,
@@ -172,6 +173,24 @@ fn actual_open_callback_still_refuses_held_lock_and_allows_only_one_inflight_req
     drop(state.update(Message::Open));
     assert!(state.working);
     // First task deliberately unpolled: rendered callback/state proof, no launcher.
+}
+
+#[test]
+fn watcher_failure_keeps_explicit_retry_and_rearms_only_on_an_action() {
+    let mut state = window(false);
+    drop(state.update(Message::WatchUnavailable(Snapshot::unavailable())));
+    assert!(state.watch_failed);
+    assert_eq!(state.watch_attempt, 0);
+    let (_, mut messages) = rendered(&state, 420.0, 340.0, Some("Open cagents"));
+    drop(state.update(messages.pop().unwrap()));
+    assert!(state.working);
+    drop(state.update(Message::Opened(Err("Fixture launch refusal"))));
+    assert!(!state.working && !state.watch_failed);
+    assert_eq!(state.watch_attempt, 1);
+    drop(state.update(Message::GainedFocus));
+    assert_eq!(state.watch_attempt, 1);
+    // The task is deliberately unpolled. The production Open action checks
+    // fresh ownership before trying to launch.
 }
 
 #[test]
@@ -347,8 +366,6 @@ fn first_leased_operation_observed_while_busy_returns_once_after_the_action_fini
         } else {
             Message::Focused(Ok(false))
         }));
-        assert!(!state.working && !state.follow.auto_opened());
-        drop(state.update(Message::Observed(observed_operation("original", true))));
         assert!(state.working && state.follow.auto_opened());
         drop(state.update(Message::Opened(Err("Fixture launch failure"))));
         drop(state.update(Message::Observed(observed_operation("original", true))));

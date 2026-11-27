@@ -1,13 +1,13 @@
-use crate::update::startup::{Follow, Snapshot};
+use crate::update::startup::{self, Follow, Snapshot};
 use crate::{
     design::{self, space},
     instance,
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced, widget};
+use iced::futures::SinkExt;
 use std::{
     os::unix::process::CommandExt,
     process::{Command, Stdio},
-    time::Duration,
 };
 
 /// Only public window/device arguments, never an update decision capability.
@@ -88,8 +88,9 @@ impl Request {
 
 #[derive(Clone, Debug)]
 enum Message {
-    Poll,
     Observed(Snapshot),
+    WatchUnavailable(Snapshot),
+    GainedFocus,
     Open,
     Opened(Result<(), &'static str>),
     Focus,
@@ -104,40 +105,87 @@ struct Window {
     request: Request,
     snapshot: Snapshot,
     follow: Follow,
-    polling: bool,
+    watch_attempt: u64,
+    watch_failed: bool,
     working: bool,
     details: bool,
     notice: Option<String>,
     context_ready: bool,
 }
 impl Window {
-    fn poll(&mut self) -> cosmic::app::Task<Message> {
-        if self.polling {
-            return cosmic::app::Task::none();
+    fn retry_watch(&mut self) {
+        if std::mem::take(&mut self.watch_failed) {
+            self.watch_attempt = self.watch_attempt.wrapping_add(1);
         }
-        self.polling = true;
-        cosmic::task::future(async {
-            let snapshot = tokio::task::spawn_blocking(crate::update::startup::observe)
-                .await
-                .unwrap_or_else(|_| Snapshot::unavailable());
-            Message::Observed(snapshot)
-        })
     }
-    fn open(&mut self) -> cosmic::app::Task<Message> {
-        if self.working || !self.context_ready || !self.snapshot.can_open() {
+
+    fn can_open(&self) -> bool {
+        !self.working && self.context_ready && (self.snapshot.can_open() || self.watch_failed)
+    }
+
+    fn follow_current(&mut self) -> cosmic::app::Task<Message> {
+        if self
+            .follow
+            .observe_when_ready(&self.snapshot, !self.working && self.context_ready)
+        {
+            let job = self.snapshot.job.as_ref().map(|job| job.id.clone());
+            self.open(job)
+        } else {
+            cosmic::app::Task::none()
+        }
+    }
+
+    fn open(&mut self, followed_job: Option<String>) -> cosmic::app::Task<Message> {
+        if !self.can_open() {
             return cosmic::app::Task::none();
         }
         self.working = true;
         self.follow.mark_opened();
         let request = self.request.clone();
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || reopen(&request))
-                .await
-                .unwrap_or(Err("cagents could not be opened. You can try again."));
+            let result =
+                tokio::task::spawn_blocking(move || reopen(&request, followed_job.as_deref()))
+                    .await
+                    .unwrap_or(Err("cagents could not be opened. You can try again."));
             Message::Opened(result)
         })
     }
 }
+
+fn watch_progress(_: &u64) -> impl iced::futures::Stream<Item = Message> + use<> {
+    iced::stream::channel(1, async |mut output| {
+        if let Ok(Ok(mut observer)) = tokio::task::spawn_blocking(startup::Observer::watch).await {
+            loop {
+                let sample = tokio::task::spawn_blocking(move || {
+                    let snapshot = observer.snapshot();
+                    (observer, snapshot)
+                })
+                .await;
+                let Ok((next, snapshot)) = sample else { break };
+                observer = next;
+                if output.send(Message::Observed(snapshot)).await.is_err() {
+                    return;
+                }
+                if !observer.changed().await {
+                    break;
+                }
+            }
+        }
+        let snapshot = tokio::task::spawn_blocking(startup::observe)
+            .await
+            .unwrap_or_else(|_| Snapshot::unavailable());
+        if output
+            .send(Message::WatchUnavailable(snapshot))
+            .await
+            .is_ok()
+        {
+            // Keep this subscription parked. Refocus or a manual action can
+            // register a new watcher if a temporary error has cleared.
+            std::future::pending::<()>().await;
+        }
+    })
+}
+
 impl cosmic::Application for Window {
     type Executor = cosmic::executor::Default;
     type Flags = (Request, bool);
@@ -147,9 +195,8 @@ impl cosmic::Application for Window {
         core: Core,
         (request, context_ready): (Request, bool),
     ) -> (Self, cosmic::app::Task<Message>) {
-        let mut window = Self { core, request, snapshot: Snapshot::unavailable(), follow: Follow::default(), polling: false, working: false, details: false, notice: (!context_ready).then(|| "The original device profile is no longer available. Close this screen and choose the device again in cagents.".into()), context_ready };
-        let task = window.poll();
-        (window, task)
+        let window = Self { core, request, snapshot: Snapshot::unavailable(), follow: Follow::default(), watch_attempt: 0, watch_failed: false, working: false, details: false, notice: (!context_ready).then(|| "The original device profile is no longer available. Close this screen and choose the device again in cagents.".into()), context_ready };
+        (window, cosmic::app::Task::none())
     }
     fn core(&self) -> &Core {
         &self.core
@@ -161,28 +208,35 @@ impl cosmic::Application for Window {
         Some(Message::Close)
     }
     fn subscription(&self) -> iced::Subscription<Message> {
-        iced::time::every(Duration::from_secs(1)).map(|_| Message::Poll)
+        iced::Subscription::batch([
+            iced::Subscription::run_with(self.watch_attempt, watch_progress),
+            iced::event::listen_with(|event, _, _| match event {
+                iced::Event::Window(iced::window::Event::Focused) => Some(Message::GainedFocus),
+                _ => None,
+            }),
+        ])
     }
     fn update(&mut self, message: Message) -> cosmic::app::Task<Message> {
         match message {
-            Message::Poll => self.poll(),
             Message::Observed(snapshot) => {
-                self.polling = false;
                 self.snapshot = snapshot;
-                if self
-                    .follow
-                    .observe_when_ready(&self.snapshot, !self.working)
-                {
-                    self.open()
-                } else {
-                    cosmic::app::Task::none()
-                }
+                self.follow_current()
             }
-            Message::Open => self.open(),
+            Message::WatchUnavailable(snapshot) => {
+                self.watch_failed = true;
+                self.snapshot = snapshot;
+                self.follow_current()
+            }
+            Message::GainedFocus => {
+                self.retry_watch();
+                cosmic::app::Task::none()
+            }
+            Message::Open => self.open(None),
             Message::Opened(Ok(())) => iced::exit().map(cosmic::Action::App),
             Message::Opened(Err(error)) => {
                 self.working = false;
                 self.notice = Some(error.into());
+                self.retry_watch();
                 cosmic::app::Task::none()
             }
             Message::Focus if !self.working && self.context_ready => {
@@ -199,7 +253,8 @@ impl cosmic::Application for Window {
             Message::Focused(result) => {
                 self.working = false;
                 self.notice = Some(match result { Ok(true) => "The existing window was activated. This window will keep following the update.", Ok(false) => "No existing window is ready to focus yet. This window will keep checking.", Err(error) => error }.into());
-                cosmic::app::Task::none()
+                self.retry_watch();
+                self.follow_current()
             }
             Message::Details => {
                 self.details = !self.details;
@@ -218,7 +273,8 @@ impl cosmic::Application for Window {
             Message::Diagnosed(summary) => {
                 self.working = false;
                 self.notice = Some(summary);
-                cosmic::app::Task::none()
+                self.retry_watch();
+                self.follow_current()
             }
             Message::Close => iced::exit().map(cosmic::Action::App),
             Message::Focus | Message::Diagnostics => cosmic::app::Task::none(),
@@ -235,11 +291,17 @@ impl cosmic::Application for Window {
             );
         }
         body.push(
-            design::body(self.snapshot.explanation())
-                .wrapping(wrap)
-                .into(),
+            design::body(if self.watch_failed {
+                "Live progress is unavailable. Try opening cagents again.".into()
+            } else {
+                self.snapshot.explanation()
+            })
+            .wrapping(wrap)
+            .into(),
         );
-        body.push(design::caption("This window follows the update without changing it. Close only dismisses this screen.").wrapping(wrap).into());
+        if !self.watch_failed {
+            body.push(design::caption("This window follows the update without changing it. Close only dismisses this screen.").wrapping(wrap).into());
+        }
         if let Some(notice) = &self.notice {
             body.push(design::body(notice).wrapping(wrap).into());
         }
@@ -258,7 +320,7 @@ impl cosmic::Application for Window {
         }
         let mut open = crate::ui_controls::button::primary("Open cagents")
             .instead("Please wait…", self.working);
-        if !self.working && self.context_ready && self.snapshot.can_open() {
+        if self.can_open() {
             open = open.on_press(Message::Open);
         }
         let mut focus = crate::ui_controls::button::secondary("Existing window");
@@ -339,12 +401,18 @@ fn diagnostic_summary(report: &crate::diagnostics::Report) -> String {
     lines.join("\n")
 }
 
-fn reopen(request: &Request) -> Result<(), &'static str> {
+fn reopen(request: &Request, followed_job: Option<&str>) -> Result<(), &'static str> {
     // Fresh status is still not admission: normal startup reacquires every
     // original fence. Never start an updater or installer from here; the
     // ordinary UI entry point owns daemon readiness.
-    if !crate::update::startup::observe().can_open() {
+    let snapshot = startup::observe();
+    if !snapshot.can_open() {
         return Err("The installation is still locked. Progress will keep updating here.");
+    }
+    if let Some(followed_job) = followed_job
+        && (!snapshot.finished() || snapshot.job.is_none_or(|job| job.id != followed_job))
+    {
+        return Err("The update changed. Open cagents when you are ready.");
     }
     if !request.new_window && request.focus().unwrap_or(false) {
         return Ok(());

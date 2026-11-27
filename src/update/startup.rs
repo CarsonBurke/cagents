@@ -1,11 +1,20 @@
 //! Read-only, capability-free projection for a window waiting on an update.
 //! Status is evidence, not admission: every reopen still uses normal UI fences.
-use super::{UpdateJob, UpdatePhase, impact::Disposition};
+use super::{
+    UpdateError, UpdateJob, UpdatePhase,
+    impact::Disposition,
+    progress::{self, Edge},
+};
+use notify::{RecursiveMode, Watcher};
 use std::{
     fs,
     io::{self, Read},
     os::unix::fs::{MetadataExt, OpenOptionsExt},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -234,8 +243,121 @@ impl Follow {
     }
 }
 
+/// Watch before reading the first snapshot so a phase change during that
+/// read is still delivered. A held lease needs its own release notification:
+/// the worker or launch coordinator can exit without writing another status.
+pub struct Observer {
+    files: notify::RecommendedWatcher,
+    state: Option<PathBuf>,
+    watched_state: Option<(u64, u64)>,
+    fence: PathBuf,
+    fence_waiting: Arc<AtomicBool>,
+    worker_waiting: Arc<AtomicBool>,
+    signal: async_channel::Sender<()>,
+    events: async_channel::Receiver<()>,
+}
+
+impl Observer {
+    pub fn watch() -> Result<Self, UpdateError> {
+        let fence = crate::instance::update_fence_path()?;
+        let state = crate::process::current_executable()
+            .ok()
+            .and_then(|executable| state_path(&executable));
+        Self::watch_at(fence, state)
+    }
+
+    fn watch_at(fence: PathBuf, state: Option<PathBuf>) -> Result<Self, UpdateError> {
+        let runtime = fence.parent().expect("fence has a parent").canonicalize()?;
+        let fence = runtime.join(fence.file_name().expect("fence has a name"));
+        let mut paths = vec![fence.clone()];
+        let mut directories = vec![runtime];
+        if let Some(state) = &state {
+            paths.extend([state.clone(), state.join("status.json"), state.join("lock")]);
+            directories.push(state.parent().expect("state has a parent").to_owned());
+        }
+        let (signal, events) = async_channel::bounded(1);
+        let callback = signal.clone();
+        let files = progress::watch_paths(paths, &directories, move |edge| wake(&callback, edge))?;
+        Ok(Self {
+            files,
+            state,
+            watched_state: None,
+            fence,
+            fence_waiting: Default::default(),
+            worker_waiting: Default::default(),
+            signal,
+            events,
+        })
+    }
+
+    pub fn snapshot(&mut self) -> Snapshot {
+        let state = self.state.as_deref().filter(|path| {
+            let current = private_directory(path);
+            if current != self.watched_state {
+                if self.watched_state.is_some() {
+                    let _ = self.files.unwatch(path);
+                }
+                if current.is_some() && self.files.watch(path, RecursiveMode::NonRecursive).is_err()
+                {
+                    self.signal.close();
+                }
+                self.watched_state = current;
+            }
+            current.is_some()
+        });
+        let installation_lock = crate::instance::private_lock_is_held(&self.fence).into();
+        let snapshot = observe_state(state, installation_lock);
+        self.watch_release(&self.fence, snapshot.installation_lock, &self.fence_waiting);
+        if let Some(state) = state {
+            self.watch_release(
+                &state.join("lock"),
+                snapshot.helper_lock,
+                &self.worker_waiting,
+            );
+        }
+        snapshot
+    }
+
+    fn watch_release(&self, path: &Path, state: LockState, waiting: &Arc<AtomicBool>) {
+        if state != LockState::Held
+            || self.signal.is_closed()
+            || waiting.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+        let reserved = waiting.clone();
+        let signal = self.signal.clone();
+        if progress::watch_lease(path, move |edge| {
+            reserved.store(false, Ordering::Release);
+            wake(&signal, edge);
+        })
+        .is_err()
+        {
+            waiting.store(false, Ordering::Release);
+            self.signal.close();
+        }
+    }
+
+    pub async fn changed(&self) -> bool {
+        self.events.recv().await.is_ok()
+    }
+}
+
+fn wake(signal: &async_channel::Sender<()>, edge: Edge) {
+    match edge {
+        Edge::Changed => {
+            let _ = signal.try_send(());
+        }
+        Edge::Unavailable => {
+            signal.close();
+        }
+    }
+}
+
 pub fn observe() -> Snapshot {
-    let installation_lock = crate::instance::update_fence_held().into();
+    let installation_lock = crate::instance::update_fence_path()
+        .and_then(|path| crate::instance::private_lock_is_held(&path))
+        .into();
     let Ok(executable) = crate::process::current_executable() else {
         return Snapshot {
             installation_lock,
@@ -245,23 +367,35 @@ pub fn observe() -> Snapshot {
     observe_installation(&executable, installation_lock)
 }
 fn observe_installation(executable: &Path, installation_lock: LockState) -> Snapshot {
+    let state = state_path(executable);
+    observe_state(
+        state
+            .as_deref()
+            .filter(|path| private_directory(path).is_some()),
+        installation_lock,
+    )
+}
+
+fn state_path(executable: &Path) -> Option<PathBuf> {
+    Some(super::locate(executable).ok()?.prefix.join(".update"))
+}
+
+fn private_directory(path: &Path) -> Option<(u64, u64)> {
+    let metadata = fs::symlink_metadata(path).ok()?;
+    (metadata.is_dir()
+        && metadata.uid() == unsafe { libc::geteuid() }
+        && metadata.mode() & 0o077 == 0)
+        .then(|| (metadata.dev(), metadata.ino()))
+}
+
+fn observe_state(state: Option<&Path>, installation_lock: LockState) -> Snapshot {
     let mut snapshot = Snapshot {
         installation_lock,
         ..Snapshot::unavailable()
     };
-    let Ok(layout) = super::locate(executable) else {
+    let Some(state) = state else {
         return snapshot;
     };
-    let state = layout.prefix.join(".update");
-    let Ok(metadata) = fs::symlink_metadata(&state) else {
-        return snapshot;
-    };
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return snapshot;
-    }
     snapshot.helper_lock = crate::instance::private_lock_is_held(&state.join("lock")).into();
     if let Ok(job) = read_job(&state.join("status.json")) {
         let valid_id = uuid::Uuid::parse_str(&job.id)

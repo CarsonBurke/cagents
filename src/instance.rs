@@ -439,8 +439,8 @@ pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
 }
 
 #[cfg(feature = "ui")]
-pub(crate) fn update_fence_held() -> io::Result<bool> {
-    private_lock_is_held(&runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
+pub(crate) fn update_fence_path() -> io::Result<PathBuf> {
+    Ok(daemon_admission::fence_path_in(&runtime_directory()?))
 }
 
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
