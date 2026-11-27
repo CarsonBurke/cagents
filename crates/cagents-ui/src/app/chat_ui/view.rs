@@ -2993,6 +2993,10 @@ impl Runtime {
                 .any(|agent| !agent.waiting && agent.is_running())
         {
             (Some(Icon::AgentWaiting), "Subagents waiting")
+        } else if snapshot.stopping() {
+            // Asked to stop, the agent is still winding down: its last
+            // activity would read as work going on regardless.
+            (Some(Icon::AgentWorking), chat::TURN_STOPPING)
         } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
             // The turn is open but the agent is idle until its background
             // commands finish, however long that takes; its last words

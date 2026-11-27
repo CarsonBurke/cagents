@@ -14219,6 +14219,10 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
         "Queued · 1 · waiting for the turn to stop"
     );
     assert_eq!(runtime.submit_modes(), [PromptMode::Queue]);
+    assert_eq!(
+        runtime.conversation_status_base(false).1,
+        chat::TURN_STOPPING
+    );
     Arc::make_mut(&mut runtime.snapshot).detail = "Working".into();
     assert!(runtime.can_send_now());
 
