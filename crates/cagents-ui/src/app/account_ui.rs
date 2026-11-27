@@ -251,6 +251,12 @@ impl State {
         }
     }
 
+    /// Marks what discovery found as waiting for the shell's `PATH`.
+    #[cfg(test)]
+    pub(in crate::app) fn set_provisional_for_test(&mut self) {
+        self.installed_provisional = true;
+    }
+
     #[cfg(test)]
     pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
         self.account(id)?.pending_probe.clone()
@@ -4021,6 +4027,7 @@ impl Cagents {
                     self.account_ui.take_catalog(provider, catalog, now);
                 }
                 self.refresh_chat_drafts();
+                let drafts = self.move_drafts_off_missing_providers();
                 let changed = owners_before != self.account_ui.discovery_owners();
                 let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
@@ -4031,7 +4038,7 @@ impl Cagents {
                 } else {
                     Task::none()
                 };
-                Task::batch([follow_up, migration])
+                Task::batch([follow_up, migration, drafts])
             }
             Action::Located {
                 generation,
@@ -4076,8 +4083,11 @@ impl Cagents {
                     }
                 }
                 self.account_ui.restore(restored);
+                // With presence settled, so a moved draft picks its account
+                // as a new one would.
+                let drafts = self.move_drafts_off_missing_providers();
                 let manual = std::mem::take(&mut self.account_ui.discovery_manual);
-                if manual.is_empty() {
+                let probes = if manual.is_empty() {
                     self.probe_accounts(Trigger::Focus)
                 } else {
                     let now = now_ms();
@@ -4096,7 +4106,8 @@ impl Cagents {
                             .iter()
                             .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
                     )
-                }
+                };
+                Task::batch([probes, drafts])
             }
             Action::Probed {
                 owner,
