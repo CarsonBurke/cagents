@@ -11240,7 +11240,7 @@ mod app_tests {
                 &json!({"rate_limits":{
                 "limits":[
                     {"kind":"weekly_all","percent":50},
-                    {"kind":"weekly_scoped","scope":"Fable 5.1","percent":0}
+                    {"kind":"weekly_scoped","scope":{"model":{"display_name":"Fable 5.1"}},"percent":0}
                 ],
                 "cedar_ember":{"eligible":true,"grants":[
                     {"id":"fable","resets_left":2,"clears":["seven_day_overage_included"],
