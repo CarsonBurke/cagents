@@ -30,15 +30,15 @@ enum Message {
     Shortcut,
     Paste,
 }
-struct Peer {
+pub(super) struct Peer {
     _directory: tempfile::TempDir,
-    handle: HostedTerminalHandle,
+    pub(super) handle: HostedTerminalHandle,
     requests: crossbeam_channel::Receiver<ClientRequest>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Peer {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("review.sock");
         let listener = crate::descriptor::bind(&socket).unwrap();
@@ -133,7 +133,7 @@ impl Peer {
             worker: Some(worker),
         }
     }
-    fn fence(&self) -> Vec<ClientRequest> {
+    pub(super) fn fence(&self) -> Vec<ClientRequest> {
         let marker = b"accessibility-test-fence".to_vec();
         self.handle.input(marker.clone()).unwrap();
         let mut requests = Vec::new();
@@ -159,7 +159,7 @@ impl Drop for Peer {
         }
     }
 }
-fn renderer() -> Renderer {
+pub(super) fn renderer() -> Renderer {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
