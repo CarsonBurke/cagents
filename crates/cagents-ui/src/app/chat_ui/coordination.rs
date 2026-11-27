@@ -1153,7 +1153,8 @@ struct Row {
     /// What follows the name and tells it apart, the number two agents of
     /// one name go by or a session's ID, which the row keeps whole.
     tag: String,
-    /// The start of what was said.
+    /// The start of what was said or the task a CLI agent was given, after
+    /// any destination, or the agents a step started.
     preview: String,
     /// A single started agent's type, where its name is not already it.
     agent_type: Option<AgentType>,
@@ -1800,7 +1801,11 @@ impl Runtime {
             match spawn.agents.as_slice() {
                 [agent] => {
                     let kind = agent.kind.trim();
-                    agent_type = (!kind.is_empty() && kind != label)
+                    // An agent named only by its type, numbered or not,
+                    // does not repeat it.
+                    let named_by_type = kind == label
+                        || listed.is_some_and(|agent| Self::native_child_name(agent) == kind);
+                    agent_type = (!kind.is_empty() && !named_by_type)
                         .then(|| AgentType::of(self.session.launch.provider, kind));
                     String::new()
                 }
@@ -2433,11 +2438,35 @@ mod identity_tests {
         assert_eq!(kind.drawn().as_deref(), Some("· Explore"));
         assert!(chosen.described().1.ends_with(" · Explore"));
 
-        for status in [ToolStatus::Running, ToolStatus::Failed] {
-            let default = row(
-                &mut runtime,
+        // Refused, the row reads "Couldn't start Review the change", with
+        // nothing run on after the name.
+        for (status, verb) in [
+            (ToolStatus::Running, "Started"),
+            (ToolStatus::Failed, "Couldn't start"),
+        ] {
+            let step = claude_step(
+                "Agent",
                 serde_json::json!({"description": "Review the change", "prompt": "Review it.", "subagent_type": "general-purpose"}),
+                "",
+            );
+            let Kind::Spawn(spawn) = step.reading.kind.clone() else {
+                panic!("an Agent call starts an agent");
+            };
+            std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+                id: "toolu_step".into(),
+                kind: String::new(),
+                description: "Review the change".into(),
                 status,
+                model: None,
+                waiting: false,
+                detail: String::new(),
+                background: true,
+                items: Vec::new(),
+            }];
+            let default = runtime.spawn_row(&step, &spawn, status, "");
+            assert_eq!(
+                (default.verb, default.shown.as_str()),
+                (verb, "Review the change")
             );
             assert_eq!(default.preview, "");
             assert_eq!(default.agent_type.as_ref().unwrap().drawn(), None);
