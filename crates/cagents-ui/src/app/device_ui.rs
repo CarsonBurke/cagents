@@ -644,7 +644,7 @@ impl Cagents {
                     _ => {
                         self.status = Some(TransientNotice::warning(
                             "A device window deletes one worktree at a time. Select a single \
-                             worktree, or only channels.",
+                             worktree, or only channels and projects.",
                         ));
                         Task::none()
                     }
@@ -3225,6 +3225,18 @@ mod tests {
         assert!(app.project_ui.modal_open());
         drop(app.update(Message::ProjectUi(project_ui::Action::Dismiss)));
         assert!(!app.project_ui.modal_open());
+
+        // Confirming starts the removal rather than being refused as local
+        // work; the device's answer arrives later.
+        drop(app.update(Message::Sidebar(SidebarAction::ProjectCommand {
+            project_id,
+            worktree_id: None,
+            command: sidebar::ProjectCommand::Remove,
+        })));
+        drop(app.update(Message::ProjectUi(project_ui::Action::ConfirmRemove)));
+        assert!(!app.project_ui.modal_open());
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(app.project_ui.removing.contains_key(&main.join(".git")));
 
         // Removing it compares the device's paths as the device reported
         // them, never resolving one on this computer's disk.
