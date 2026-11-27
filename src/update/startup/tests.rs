@@ -50,6 +50,42 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
     }
 }
 
+#[tokio::test]
+async fn observer_wakes_for_each_lease_release_without_a_status_write() {
+    let (_root, _, state) = installation();
+    let runtime = tempfile::tempdir().unwrap();
+    let fence_path = runtime.path().join("update.fence");
+    let fence = crate::instance::owned_lock(&fence_path, libc::LOCK_EX).unwrap();
+    let worker = super::super::acquire_lock(&state).unwrap();
+    write(&state, &job(UpdatePhase::Complete));
+    let mut observer = Observer::watch_at(fence_path, Some(state)).unwrap();
+
+    let snapshot = observer.snapshot();
+    assert_eq!(snapshot.installation_lock, LockState::Held);
+    assert_eq!(snapshot.helper_lock, LockState::Held);
+    assert!(!snapshot.finished() && observer.events.is_empty());
+
+    drop(worker);
+    let timeout = std::time::Duration::from_secs(5);
+    assert!(
+        tokio::time::timeout(timeout, observer.changed())
+            .await
+            .unwrap()
+    );
+    let snapshot = observer.snapshot();
+    assert_eq!(snapshot.helper_lock, LockState::Free);
+    assert!(!snapshot.can_open() && !snapshot.finished());
+
+    drop(fence);
+    assert!(
+        tokio::time::timeout(timeout, observer.changed())
+            .await
+            .unwrap()
+    );
+    let snapshot = observer.snapshot();
+    assert!(snapshot.can_open() && snapshot.finished() && observer.events.is_empty());
+}
+
 #[test]
 fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_repair() {
     let (_root, executable, state) = installation();
