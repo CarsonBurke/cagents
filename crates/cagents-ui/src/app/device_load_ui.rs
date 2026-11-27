@@ -102,6 +102,10 @@ fn size(bytes: u64) -> String {
 
 /// The hover text: what each figure measures, in full.
 pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
+    let device = match device {
+        "This device" => "this computer",
+        device => device,
+    };
     let stats = match load {
         DeviceLoad::Waiting => return format!("Reading {device}'s load…"),
         DeviceLoad::Unavailable(reason) => return reason.clone(),
@@ -110,7 +114,7 @@ pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
     let mut lines = Vec::with_capacity(4);
     lines.push(match stats.cpu {
         Some(cpu) => format!(
-            "CPU {}% · {} core{} · load {:.1}",
+            "CPU {}% · {} core{} · load average {:.1}",
             cpu.percent,
             cpu.cores,
             if cpu.cores == 1 { "" } else { "s" },
@@ -132,10 +136,7 @@ pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
         Some(disk) => format!("Home disk {} of {}", size(disk.used), size(disk.total)),
         None => "Home disk: unavailable".to_owned(),
     });
-    lines.push(match device {
-        "This device" => "On this computer".to_owned(),
-        device => format!("On {device}"),
-    });
+    lines.push(format!("On {device}"));
     lines.join("\n")
 }
 
@@ -218,8 +219,11 @@ fn watch_load() -> impl cosmic::iced::futures::Stream<Item = DeviceLoad> {
         let spawned = std::thread::Builder::new()
             .name("cagents-device-load".into())
             .spawn(move || {
+                let mut unavailable = false;
                 while !lock(&held).closed {
-                    let watched = watch(&sender, &held);
+                    let mut sent = Sent::Nothing;
+                    let watched = watch(&sender, &held, &mut sent);
+                    unavailable &= sent == Sent::Nothing;
                     // A connection given up on must not stay open through the
                     // retry delay, where the daemon would keep sampling for it.
                     {
@@ -231,10 +235,17 @@ fn watch_load() -> impl cosmic::iced::futures::Stream<Item = DeviceLoad> {
                             break;
                         }
                     }
-                    if let Err(error) = watched {
+                    if let Err(error) = &watched {
                         tracing::debug!(%error, "the device's load is not reporting");
+                    }
+                    // A watch that was reporting keeps its last reading through
+                    // one retry, so a daemon restart or update doesn't blank
+                    // the bar, and a failure already shown isn't sent again,
+                    // which would redraw the window for nothing.
+                    if watched.is_err() && sent != Sent::Reading && !unavailable {
+                        unavailable = true;
                         let device = crate::device::selected()
-                            .map_or("This device", |device| device.name.as_str());
+                            .map_or("This computer", |device| device.name.as_str());
                         if sender
                             .send_blocking(DeviceLoad::Unavailable(format!(
                                 "{device} isn't reporting its load. Retrying…"
@@ -278,7 +289,21 @@ fn lock(link: &Mutex<Link>) -> std::sync::MutexGuard<'_, Link> {
     link.lock().unwrap_or_else(|p| p.into_inner())
 }
 
-fn watch(sender: &async_channel::Sender<DeviceLoad>, link: &Mutex<Link>) -> Result<(), String> {
+/// What one connection has shown the window.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    Nothing,
+    Waiting,
+    Reading,
+}
+
+/// Watches until the connection ends, recording in `sent` what the window
+/// was shown.
+fn watch(
+    sender: &async_channel::Sender<DeviceLoad>,
+    link: &Mutex<Link>,
+    sent: &mut Sent,
+) -> Result<(), String> {
     // Never start a daemon merely to watch it; the window starts one when it
     // needs one, and this reconnects then.
     let socket =
@@ -299,6 +324,11 @@ fn watch(sender: &async_channel::Sender<DeviceLoad>, link: &Mutex<Link>) -> Resu
     sender
         .send_blocking(stats.map_or(DeviceLoad::Waiting, DeviceLoad::Live))
         .map_err(closed)?;
+    *sent = if stats.is_some() {
+        Sent::Reading
+    } else {
+        Sent::Waiting
+    };
     loop {
         let (next, stats) = client
             .next_device_stats(revision)
@@ -307,6 +337,7 @@ fn watch(sender: &async_channel::Sender<DeviceLoad>, link: &Mutex<Link>) -> Resu
         sender
             .send_blocking(DeviceLoad::Live(stats))
             .map_err(closed)?;
+        *sent = Sent::Reading;
     }
 }
 
@@ -390,8 +421,12 @@ mod tests {
         });
         assert_eq!(
             detail(&DeviceLoad::Live(stats), "This device"),
-            "CPU 12% · 16 cores · load 1.9\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
+            "CPU 12% · 16 cores · load average 1.9\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
              Home disk 238 GB of 1.98 TB\nOn this computer"
+        );
+        assert_eq!(
+            detail(&DeviceLoad::Waiting, "This device"),
+            "Reading this computer's load…"
         );
     }
 }
