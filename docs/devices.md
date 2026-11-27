@@ -79,6 +79,12 @@ watching, every two seconds, and sends a reading only when a shown figure
 changes.
 Named windows are scoped to their device; the internal `device-` namespace is reserved.
 
+Settings such as Appearance, Editor, and Keyboard are saved on this computer.
+Under **Settings → Accounts**, provider switches and usage display are also
+local preferences. Provider availability, default accounts, and sign-ins
+belong to the device named in the window. **Open Accounts** shows that device's
+accounts.
+
 **Browse device files…** in the same menu browses remote directories, edits UTF-8 text files up to 512 KiB,
 and runs Git status, unstaged/staged diff, stage, unstage, and commit on the device.
 It can also list worktrees, create a branch and worktree under `.worktrees/`, and

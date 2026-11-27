@@ -13204,10 +13204,11 @@ impl Cagents {
                     feedback: self.settings_feedback.as_ref(),
                     invalid: &self.settings_invalid,
                     pressed_key: self.palette.pressed_key_filter(),
+                    device: crate::device::selected().map(|device| device.name.as_str()),
                     accounts: self.default_account_choices(),
                     providers: crate::account::Account::REPORTED
                         .into_iter()
-                        .map(|provider| (provider, self.account_ui.provider_status(provider)))
+                        .map(|provider| (provider, self.account_ui.provider_settings_status(provider)))
                         .collect(),
                     updates: self.update_summary(),
                     testing_notification: self.notification_ui.testing,

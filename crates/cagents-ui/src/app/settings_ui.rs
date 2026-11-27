@@ -215,9 +215,10 @@ pub(super) struct SettingsContext<'a> {
     /// Refused values, by the field that refused them.
     pub invalid: &'a HashMap<SettingsField, String>,
     pub pressed_key: Option<&'a keyboard::Event>,
+    pub device: Option<&'a str>,
     pub accounts: Vec<(crate::agent::Provider, Vec<account_ui::DefaultChoice>)>,
     /// Every provider, in the order the app lists them, and how it stands.
-    pub providers: Vec<(crate::agent::Provider, &'static str)>,
+    pub providers: Vec<(crate::agent::Provider, Cow<'a, str>)>,
     pub updates: update_ui::UpdateSummary,
     pub testing_notification: bool,
     pub dictation: DictationSettings<'a>,
@@ -445,7 +446,7 @@ fn settings_category_controls<'a>(
                     let used = draft.providers.get(&provider).copied().unwrap_or(true);
                     crate::settings_widgets::toggle(
                         provider.label(),
-                        if used { *status } else { "Turned off" },
+                        if used { status.clone() } else { "Turned off".into() },
                         used,
                         move |used| Message::SettingsChanged {
                             field: SettingsField::UseProvider(provider),
@@ -1407,6 +1408,23 @@ fn settings_layout<'a>(
                 .into(),
         );
     }
+    if let Some(device) = context.device {
+        if !header.is_empty() {
+            header.push(
+                iced::widget::Space::new()
+                    .height(design::rhythm::TITLE_TO_DESCRIPTION)
+                    .into(),
+            );
+        }
+        let scope = if searching || category == SettingsCategory::Accounts {
+            format!(
+                "Preferences are saved on this computer. Default accounts and sign-ins are on {device}."
+            )
+        } else {
+            "Settings are saved on this computer.".into()
+        };
+        header.push(design::description(scope).into());
+    }
     if let Some(description) = page_description {
         if !header.is_empty() {
             header.push(
@@ -2071,13 +2089,15 @@ mod keyboard_table_tests {
     /// The focusable controls and the text runs of a settings page laid out
     /// at `width`.
     fn laid_out(category: SettingsCategory, width: f32) -> Focusables {
-        laid_out_with(category, width, None)
+        laid_out_with(category, width, None, "", None)
     }
 
     fn laid_out_with(
         category: SettingsCategory,
         width: f32,
         feedback: Option<&SettingsFeedback>,
+        query: &str,
+        device: Option<&str>,
     ) -> Focusables {
         use iced::advanced::{Layout, layout, widget::Tree};
         let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
@@ -2087,10 +2107,11 @@ mod keyboard_table_tests {
             feedback,
             invalid: &invalid,
             pressed_key: None,
+            device,
             accounts: Vec::new(),
             providers: crate::account::Account::REPORTED
                 .into_iter()
-                .map(|provider| (provider, "Account available"))
+                .map(|provider| (provider, "Account available".into()))
                 .collect(),
             updates: update_ui::UpdateSummary {
                 status: String::new(),
@@ -2104,7 +2125,7 @@ mod keyboard_table_tests {
             testing_notification: false,
             dictation: DictationSettings::default(),
         };
-        let mut element = settings_layout(category, &draft, "", &context, width);
+        let mut element = settings_layout(category, &draft, query, &context, width);
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
             &mut tree,
@@ -2118,15 +2139,47 @@ mod keyboard_table_tests {
         found
     }
 
+    #[test]
+    fn device_settings_label_local_preferences_and_remote_accounts() {
+        for width in [400.0, 900.0] {
+            for (category, query, expected) in [
+                (
+                    SettingsCategory::Appearance,
+                    "",
+                    "Settings are saved on this computer.",
+                ),
+                (
+                    SettingsCategory::Accounts,
+                    "",
+                    "Default accounts and sign-ins are on amd.",
+                ),
+                (
+                    SettingsCategory::Appearance,
+                    "default accounts",
+                    "Default accounts and sign-ins are on amd.",
+                ),
+            ] {
+                let scope_is_visible = |device| {
+                    laid_out_with(category, width, None, query, device)
+                        .1
+                        .iter()
+                        .any(|(text, _)| text.contains(expected))
+                };
+                assert!(scope_is_visible(Some("amd")), "{category:?} at {width}");
+                assert!(!scope_is_visible(None), "{category:?} at {width}");
+            }
+        }
+    }
+
     /// Reporting that a change was saved adds no row: the controls stay where
     /// they were, so a second click on a stepper lands on the same control.
     #[test]
     fn saving_does_not_move_the_settings_under_the_pointer() {
         for width in [400.0, 900.0] {
             let category = SettingsCategory::Appearance;
-            let unsaved = laid_out_with(category, width, None);
-            let saving = laid_out_with(category, width, Some(&SettingsFeedback::Pending));
-            let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved));
+            let unsaved = laid_out_with(category, width, None, "", None);
+            let saving = laid_out_with(category, width, Some(&SettingsFeedback::Pending), "", None);
+            let saved = laid_out_with(category, width, Some(&SettingsFeedback::Saved), "", None);
             assert_eq!(
                 unsaved.0, saving.0,
                 "controls moved while saving at {width}"
@@ -2167,6 +2220,8 @@ mod keyboard_table_tests {
                 SettingsCategory::Appearance,
                 width,
                 Some(&SettingsFeedback::Saved),
+                "",
+                None,
             )
             .1;
             let (_, report) = saved

@@ -283,6 +283,15 @@ impl State {
         account.present || account.account.registry_key().is_some()
     }
 
+    pub(super) fn provider_settings_status(&self, provider: Provider) -> Cow<'static, str> {
+        match crate::device::selected() {
+            Some(device) if self.installed.get(&provider) == Some(&false) => {
+                missing_device_cli(provider, &device.name).into()
+            }
+            _ => self.provider_status(provider).into(),
+        }
+    }
+
     pub(super) fn provider_status(&self, provider: Provider) -> &'static str {
         match self.installed.get(&provider) {
             None => "Checking provider…",
@@ -7246,6 +7255,10 @@ impl Cagents {
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
         table::view(self)
     }
+}
+
+fn missing_device_cli(provider: Provider, device: &str) -> String {
+    format!("{} isn’t installed on {device}", probe::cli_name(provider))
 }
 
 fn browser_login_available() -> Result<(), String> {
