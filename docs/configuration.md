@@ -110,7 +110,7 @@ relaunch_agents_on_upgrade = true
 resume_sessions_after_reboot = false
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 6
+shortcut_defaults_revision = 7
 preference_defaults_revision = 3
 
 [keyboard_shortcuts]
@@ -123,9 +123,9 @@ new_channel = ["Ctrl+Shift+G"]
 clone_pane = ["Ctrl+Shift+D"]
 close_focused_column = ["Ctrl+W"]
 search_projects = ["Ctrl+F"]
-previous_column = ["Ctrl+PageUp"]
-next_column = ["Ctrl+PageDown"]
-cycle_pane_width = ["Alt+R"]
+previous_column = ["Alt+Q", "Ctrl+PageUp"]
+next_column = ["Alt+R", "Ctrl+PageDown"]
+cycle_pane_width = ["Alt+Shift+R"]
 previous_workspace = ["Alt+Shift+Tab"]
 next_workspace = ["Alt+Tab"]
 review_toggle_viewed = ["Alt+V"]
@@ -201,7 +201,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |
 | `lsp_max_sessions` | integer | `8` | Global language-server limit (1–64); idle servers are evicted in least recently used order, active documents are preserved |
 | `language_servers` | array of tables | built-in list | See [Language servers](#language-servers). An empty list turns off language servers |
-| `shortcut_defaults_revision` | integer | `6` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
+| `shortcut_defaults_revision` | integer | `7` | The revision of the built-in shortcut defaults the file's `[keyboard_shortcuts]` has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `preference_defaults_revision` | integer | `3` | The revision of the built-in preference defaults the file has been upgraded to. Written by cagents; a file without it is treated as revision `1`. See [Upgrading older settings files](#upgrading-older-settings-files) |
 | `keyboard_shortcuts.*` | array of strings | shown above | See [Keyboard shortcuts](#keyboard-shortcuts) |
 | `notifications.enabled` | boolean | `true` | Enables desktop agent alerts |
@@ -228,7 +228,8 @@ modifiers, joined by `+`. Names are case-insensitive.
   cannot be bound. Versions with more modifiers, such as `Ctrl+Shift+C`, can
   be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
   with a letter or arrow, can be bound but then no longer reach a terminal.
-  The defaults bind **Ctrl+W** to close the focused pane, **Alt+R** to cycle
+  The defaults bind **Ctrl+W** to close the focused pane, **Alt+Q** and
+  **Alt+R** to move to the previous and next pane, **Alt+Shift+R** to cycle
   pane width, and **Ctrl+T** to create a native thread tab.
 - The `search_projects` chords reach terminal programs, except **Ctrl+F**,
   which opens terminal scrollback find. The same key finds in the focused
@@ -384,9 +385,9 @@ them back as version 3 the next time it saves.
   | `new_channel` | `Alt+G` | `Ctrl+Shift+G` |
   | `clone_pane` | `Alt+E` | `Ctrl+Shift+D` |
   | `close_focused_column` | `Ctrl+Shift+W` (revisions 2–3) | `Ctrl+W` |
-  | `previous_column` | `Alt+Q`, `Alt+Left` | `Ctrl+PageUp` |
-  | `next_column` | `Alt+W`, `Alt+Right` | `Ctrl+PageDown` |
-  | `cycle_pane_width` | `Ctrl+Shift+R` (revisions 2–3) | `Alt+R` |
+  | `previous_column` | `Alt+Q`, `Alt+Left`; `Ctrl+PageUp` (revisions 2–6) | `Alt+Q`, `Ctrl+PageUp` |
+  | `next_column` | `Alt+W`, `Alt+Right`; `Ctrl+PageDown` (revisions 2–6) | `Alt+R`, `Ctrl+PageDown` |
+  | `cycle_pane_width` | `Alt+R` (revisions 1 and 4–6), `Ctrl+Shift+R` (revisions 2–3) | `Alt+Shift+R` |
   | `new_native_thread` | `Ctrl+Shift+N` | `Ctrl+T`, `Ctrl+Shift+N` |
 
   An action the table leaves out counts as on its old default. A version-2
@@ -395,7 +396,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 6`, after which an old default you choose
+  `shortcut_defaults_revision = 7`, after which an old default you choose
   again is kept.
 - **New preference defaults:** a file at an older `preference_defaults_revision`
   (one without it is at revision 1) may hold a preference cagents wrote out
@@ -407,7 +408,7 @@ them back as version 3 the next time it saves.
   default chosen again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
-  `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+R),
+  `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+Shift+R),
   `previous_workspace` (Alt+Shift+Tab), `next_workspace` (Alt+Tab),
   `review_toggle_viewed` (Alt+V), `review_next_file` (Alt+Down),
   `review_previous_file` (Alt+Up), `review_next_unviewed` (Alt+Shift+Down),

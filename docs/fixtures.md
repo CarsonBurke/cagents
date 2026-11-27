@@ -1264,7 +1264,7 @@ scripts/native-evidence stop
 `wide` captures empty active, expanded and updated live reasoning, followed by
 expanded mixed tools and failed/running commands. `narrow` reuses that
 conversation, adds an unsent blank thread with Ctrl+T, focuses its native tabs,
-and uses Alt+R to select one-third width preferences (three cycles on the
+and uses Alt+Shift+R to select one-third width preferences (three cycles on the
 hosted chat, one on the draft). The panes share the docked workspace at roughly
 270px each. It captures reasoning and the expanded mixed tools at that width.
 The blank draft sends no prompt and starts no provider.
