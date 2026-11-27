@@ -113,7 +113,9 @@ window says which side is older and offers **Update NAME** (or **Install on
 NAME**), which runs `cagents device update NAME --yes` with its progress shown
 and reconnects when it finishes. A device window shows this in place of its
 connection banner; a switch or new window that failed shows it in the window you
-started from.
+started from, one device at a time. When this computer cannot update the
+device, such as one whose cagents was not installed with `install.sh`, the
+banner says why instead of offering to.
 
 ## Updating a device
 
@@ -133,7 +135,8 @@ terminals keep their processes, and work that cannot be carried waits or is
 listed for your decision. Run it from a terminal to answer those prompts; pass
 `--yes` to accept the handover without prompting, and `--interrupt` to also stop
 work that would otherwise block it. A device that is already compatible is left
-alone. `--check` reports what an update would do without changing anything.
+alone. `--check` reports what an update would do without changing anything,
+including a device executable SSH commands would not find.
 
 It needs only SSH: the device downloads nothing, and no credentials are copied.
 It refuses, without changing the device, when:

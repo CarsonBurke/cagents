@@ -277,10 +277,12 @@ const DEFAULT_EXECUTABLE: &str = "~/.local/bin/cagents";
 /// Why a device window did not open.
 #[derive(Debug, Clone)]
 pub enum OpenFailure {
-    /// It has a cagents of this protocol, not this computer's.
-    Incompatible(u16),
-    /// It has no cagents.
-    Missing,
+    /// Its cagents is not one this computer can use. `blocked` says why this
+    /// computer cannot send its own, when it cannot.
+    Needs {
+        need: device_update_ui::Need,
+        blocked: Option<String>,
+    },
     Other(String),
 }
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
@@ -779,17 +781,11 @@ impl Cagents {
                 match result {
                     Ok(()) if replace => return self.exit_after_language_servers(),
                     Ok(()) => {}
-                    Err(OpenFailure::Incompatible(actual)) => {
+                    Err(OpenFailure::Needs { need, blocked }) => {
                         return self.update_device_update(device_update_ui::Action::Offer {
                             device,
-                            actual: Some(actual),
-                            replace,
-                        });
-                    }
-                    Err(OpenFailure::Missing) => {
-                        return self.update_device_update(device_update_ui::Action::Offer {
-                            device,
-                            actual: None,
+                            need,
+                            blocked,
                             replace,
                         });
                     }
@@ -1851,30 +1847,55 @@ fn open_device_window(name: &str, source: Option<&str>) -> Result<(), OpenFailur
     if opened {
         return Ok(());
     }
-    // The update's own inspection knows a missing install too. A development
-    // build has no installed tree to inspect from, so it refuses at once, and
-    // the device's daemon status still tells a protocol mismatch.
-    let output_of = |arguments: &[&str]| {
-        json(arguments)
-            .map(|(_, output)| output)
-            .unwrap_or_default()
-    };
-    let reason = device_update_ui::checked(&output_of(&["device", "update", name, "--check"]))
-        .or_else(|| {
-            device_update_ui::mismatch(&output_of(&["--device", name, "daemon", "status"]))
-                .map(OpenFailure::Incompatible)
-        });
-    Err(reason.unwrap_or_else(|| {
-        OpenFailure::Other(device_update_ui::error_message(&output).map_or_else(
+    let failed = || {
+        device_update_ui::error_message(&output).map_or_else(
             || format!("Could not connect to {name}. Check its SSH connection and cagents daemon."),
-            |reason| {
-                let mut characters = reason.chars();
-                characters.next().map_or_else(String::new, |first| {
-                    first.to_uppercase().chain(characters).collect()
-                })
+            |reason| sentence(&reason),
+        )
+    };
+    // The update's own inspection tells what the device lacks, a missing
+    // install included, and what it would refuse.
+    let check = json(&["device", "update", name, "--check"]);
+    if let Ok((_, checked)) = &check
+        && let Some(checked) = device_update_ui::checked(checked)
+    {
+        return Err(match (checked.need, checked.note) {
+            (Some(need), _) => OpenFailure::Needs {
+                need,
+                blocked: None,
             },
-        ))
-    }))
+            // Compatible, so something else failed, such as an executable
+            // SSH commands cannot find.
+            (None, Some(note)) => OpenFailure::Other(format!("{} {note}", failed())),
+            (None, None) => OpenFailure::Other(failed()),
+        });
+    }
+    // It would not inspect, so it would not update either: say why, and,
+    // when the device's daemon tells, which side is older.
+    let refusal = check
+        .ok()
+        .and_then(|(_, output)| device_update_ui::error_message(&output))
+        .map(|reason| sentence(&reason));
+    let status = json(&["--device", name, "daemon", "status"])
+        .map(|(_, output)| output)
+        .unwrap_or_default();
+    Err(match device_update_ui::mismatch(&status) {
+        Some(actual) => OpenFailure::Needs {
+            need: device_update_ui::Need::of_protocol(actual),
+            blocked: Some(refusal.unwrap_or_else(|| {
+                format!("This computer cannot update {name}; update cagents there.")
+            })),
+        },
+        None => OpenFailure::Other(failed()),
+    })
+}
+
+/// `reason`, a CLI message, as a sentence that starts with a capital.
+fn sentence(reason: &str) -> String {
+    let mut characters = reason.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect()
+    })
 }
 #[cfg(test)]
 mod tests {

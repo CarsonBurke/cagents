@@ -103,16 +103,18 @@ pub enum Check {
     },
 }
 
-/// Like [`update`], `device` must be the selected device.
-pub fn check(device: &Device) -> io::Result<Check> {
+/// Like [`update`], `device` must be the selected device. Also returns the
+/// note [`update`] would give, such as an executable SSH commands cannot find.
+pub fn check(device: &Device) -> io::Result<(Check, Option<String>)> {
     let local = Local::current()?;
     let session = Session::open(device)?;
     let remote = Remote::probe(&session, device, &local.version)?;
     let daemon = daemon_state();
     if let Some(protocol) = newer(&remote, &daemon) {
-        return Ok(Check::Newer { protocol });
+        return Ok((Check::Newer { protocol }, None));
     }
-    Ok(match plan(device, &local, &remote, &daemon)?.action {
+    let plan = plan(device, &local, &remote, &daemon)?;
+    let check = match plan.action {
         Action::Nothing => Check::Compatible,
         Action::Install { upgrade: false, .. } => Check::Install,
         Action::Install { .. } | Action::Upgrade { .. } => Check::Update {
@@ -121,7 +123,8 @@ pub fn check(device: &Device) -> io::Result<Check> {
                 _ => remote.protocol,
             },
         },
-    })
+    };
+    Ok((check, plan.note))
 }
 
 /// Brings `device` to the build this executable belongs to. `device` must be

@@ -157,7 +157,7 @@ fn check_update(name: &str) -> Result<CommandOutput, AppError> {
     use crate::device::provision::Check;
     let device = saved(name)?;
     crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
-    let check =
+    let (check, note) =
         crate::device::provision::check(&device).map_err(|error| AppError::new("device", error))?;
     let ours = crate::terminal_ipc::PROTOCOL_VERSION;
     let (state, protocol, human) = match check {
@@ -196,8 +196,12 @@ fn check_update(name: &str) -> Result<CommandOutput, AppError> {
             "state": state,
             "protocol": protocol,
             "expected": ours,
+            "note": note,
         }),
-        human,
+        human: match &note {
+            Some(note) => format!("{human}\n{note}"),
+            None => human,
+        },
     })
 }
 
@@ -214,6 +218,7 @@ fn update(
     let terminal = io::stderr().is_terminal();
     // Without a terminal, such as under the app, each tenth is a line of its own.
     let mut reported_tenth = None;
+    let mut note = None;
     let mut progress = |step: Step| {
         let line = match step {
             Step::Inspecting => format!("Checking {name}…"),
@@ -229,10 +234,13 @@ fn update(
                 }
                 return;
             }
-            Step::Installing => format!("Installing it on {name}…"),
+            Step::Installing => format!("Unpacking cagents {version} on {name}…"),
             Step::Upgrading => format!("Handing {name}'s daemon over to cagents {version}…"),
             Step::Verifying => format!("Connecting to {name}…"),
-            Step::Note(note) => note.to_owned(),
+            Step::Note(text) => {
+                note = Some(text.to_owned());
+                text.to_owned()
+            }
         };
         eprintln!("{line}");
     };
@@ -271,6 +279,8 @@ fn update(
             "version": version,
             "protocol": protocol,
             "sent_bytes": sent,
+            // Already printed with the progress, for the app to keep.
+            "note": note,
         }),
         human,
     })
