@@ -473,7 +473,8 @@ fn leave(
             To::Session(handle) => (
                 Some(
                     resolve(&model.agents, &live, &lineage_of, handle).map_err(|error| {
-                        stopped(&listing, &origin, &model.agents, handle).unwrap_or(error)
+                        stopped(&listing, &registry, &origin, &model.agents, handle)
+                            .unwrap_or(error)
                     })?,
                 ),
                 None,
@@ -561,23 +562,29 @@ fn recipient(listing: &directory::Listing, lineage: Lineage) -> Option<Member> {
 }
 
 /// Why `handle` names no live session when it names one whose provider
-/// exited: such a session cannot take a message until it is resumed. The
-/// command is offered only to a sender `origin` that may resume it.
+/// exited: such a session cannot take a message until it is resumed. It
+/// names the session `cagents resume` would reopen for the same handle, and
+/// offers the command only to a sender `origin` that may resume it.
 fn stopped(
     listing: &directory::Listing,
+    registry: &crate::host::model::Registry,
     origin: &Origin,
     agents: &[crate::agent_execution::Agent],
     handle: &str,
 ) -> Option<String> {
-    let handle = handle.to_ascii_lowercase();
-    if handle.len() < MIN_HANDLE {
+    let mine = |id| super::resume::may_resume(origin, super::resume::open_agent(agents, id));
+    let super::resume::Resolved::Stopped(id, _) = super::resume::resolve(
+        listing.members(),
+        agents,
+        handle,
+        |lineage| registry.lineage_succession(lineage),
+        mine,
+    )
+    .ok()?
+    else {
         return None;
-    }
-    let member = listing.members().find(|member| {
-        member.exited
-            && (member.session.id.to_string().starts_with(&handle)
-                || member.session.lineage.to_string().starts_with(&handle))
-    })?;
+    };
+    let member = listing.members().find(|member| member.session.id == id)?;
     let mut reason = format!(
         "Session {} has stopped: its provider exited, so it cannot receive messages",
         member.session.id
@@ -585,8 +592,7 @@ fn stopped(
     if let Some(failure) = &member.failure {
         reason.push_str(&format!(" ({failure})"));
     }
-    let id = member.session.id;
-    if super::resume::may_resume(origin, super::resume::open_agent(agents, id)) {
+    if mine(id) {
         reason.push_str(&format!(
             ". Resume its conversation first with `cagents resume {id}`, or message another session from `cagents sessions --all`"
         ));

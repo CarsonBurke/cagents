@@ -7,14 +7,38 @@ use crate::{
     model::{BootId, CardKind},
 };
 
+/// Whether this test of this module ran in its own child process, which the
+/// test then leaves to report.
+fn in_child(test: &str) -> bool {
+    isolated(&format!("host::agent_execution::tests::resume::{test}")).is_some()
+}
+
 /// The fixture's agent, run once and stopped with its daemon, then a new
 /// daemon on `boot` over the same registry, as after a restart, and the
 /// conversation its window saved.
 fn stopped_agent(boot: BootId) -> (SharedHost, Accepted, String) {
+    run_and_stop(boot, true)
+}
+
+/// The same, with the conversation saved in a pane when `shown`, or else in
+/// the agent's own record, as for an agent no window ever showed.
+fn run_and_stop(boot: BootId, shown: bool) -> (SharedHost, Accepted, String) {
     let (host, request, path) = fixture();
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
-    let conversation = show_in_a_channel(&host, &path, &accepted);
+    let conversation = if shown {
+        show_in_a_channel(&host, &path, &accepted)
+    } else {
+        let (chat, confirmed) = confirmed_conversation(&host, &path, &accepted);
+        let saved = HostedSession::Chat(session_of(&host, accepted.agent.id));
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .bind_agent(accepted.agent.id, Some(&saved), HostedSession::Chat(chat))
+            .unwrap();
+        confirmed
+    };
     crate::host::finish_chat_shutdown(&host).unwrap();
     drop(host);
     let mut state = HostState::new(HostSessionProof {
@@ -33,7 +57,24 @@ fn stopped_agent(boot: BootId) -> (SharedHost, Accepted, String) {
 /// Shows the agent's conversation in a channel's pane, saved with the
 /// conversation its provider confirmed, as the window showing it saves it.
 fn show_in_a_channel(host: &SharedHost, path: &Path, accepted: &Accepted) -> String {
-    use crate::model::CardId;
+    let (chat, confirmed) = confirmed_conversation(host, path, accepted);
+    let project = path.parent().unwrap().join("project");
+    pane_in_a_new_channel(
+        host,
+        &project,
+        crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
+        chat,
+    );
+    confirmed
+}
+
+/// The agent's chat with the conversation its provider confirmed, whose
+/// history Claude saved, and that conversation.
+fn confirmed_conversation(
+    host: &SharedHost,
+    path: &Path,
+    accepted: &Accepted,
+) -> (chat::Session, String) {
     let root = path.parent().unwrap();
     let project = root.join("project");
     let mut chat = session_of(host, accepted.agent.id);
@@ -60,13 +101,7 @@ fn show_in_a_channel(host: &SharedHost, path: &Path, accepted: &Accepted) -> Str
         ),
     )
     .unwrap();
-    pane_in_a_new_channel(
-        host,
-        &project,
-        CardId::from_uuid(accepted.agent.id.as_uuid()),
-        chat,
-    );
-    confirmed
+    (chat, confirmed)
 }
 
 /// Shows `chat` in pane `card` of a new channel of `project`.
@@ -120,7 +155,7 @@ fn session_of(host: &SharedHost, agent: AgentId) -> chat::Session {
     }
 }
 
-fn stopped(host: &SharedHost, scope: Scope) -> StoppedSessions {
+fn stopped_in(host: &SharedHost, scope: Scope) -> StoppedSessions {
     match process(host, Authority::default(), Operation::Stopped(scope)).unwrap() {
         Reply::Stopped(stopped) => stopped,
         other => panic!("{other:?}"),
@@ -158,12 +193,12 @@ fn panes(host: &SharedHost) -> Vec<chat::Session> {
 /// start it a second time. Resuming again starts nothing.
 #[test]
 fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
-    if isolated("host::agent_execution::tests::resume::the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow").is_some() {
+    if in_child("the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow") {
         return;
     }
     let (host, accepted, conversation) = stopped_agent(crate::daemon::read_boot_id().unwrap());
     let before = session_of(&host, accepted.agent.id);
-    let found = stopped(&host, Scope::Sessions(Sessions::All));
+    let found = stopped_in(&host, Scope::Sessions(Sessions::All));
     assert_eq!(found.in_app_only, 0, "{found:?}");
     let listed = found.sessions;
     assert_eq!(
@@ -194,7 +229,7 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
         "{reason}"
     );
     assert_eq!(
-        stopped(&host, Scope::Sessions(Sessions::All))
+        stopped_in(&host, Scope::Sessions(Sessions::All))
             .sessions
             .len(),
         1
@@ -239,7 +274,7 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
     );
     assert_eq!(pane.launch.session_id, Some(conversation.clone()));
     assert!(
-        stopped(&host, Scope::Sessions(Sessions::All))
+        stopped_in(&host, Scope::Sessions(Sessions::All))
             .sessions
             .is_empty()
     );
@@ -266,11 +301,7 @@ fn the_person_resumes_a_stopped_agent_in_place_and_its_pane_and_agent_follow() {
 /// itself, whichever provider runs it: that boot's processes are all gone.
 #[test]
 fn a_prompt_reopens_a_conversation_an_earlier_boot_ran() {
-    if isolated(
-        "host::agent_execution::tests::resume::a_prompt_reopens_a_conversation_an_earlier_boot_ran",
-    )
-    .is_some()
-    {
+    if in_child("a_prompt_reopens_a_conversation_an_earlier_boot_ran") {
         return;
     }
     let (host, accepted, conversation) = stopped_agent(BootId::new("a-later-boot"));
@@ -298,9 +329,7 @@ fn a_prompt_reopens_a_conversation_an_earlier_boot_ran() {
 /// it cannot.
 #[test]
 fn resume_refuses_what_it_cannot_name_exactly() {
-    if isolated("host::agent_execution::tests::resume::resume_refuses_what_it_cannot_name_exactly")
-        .is_some()
-    {
+    if in_child("resume_refuses_what_it_cannot_name_exactly") {
         return;
     }
     let (host, _, _) = stopped_agent(crate::daemon::read_boot_id().unwrap());
@@ -330,7 +359,7 @@ fn unstarted_successor(of: &chat::Session) -> chat::Session {
 /// second writer.
 #[test]
 fn resume_starts_no_second_writer_for_a_successor_that_never_started() {
-    if isolated("host::agent_execution::tests::resume::resume_starts_no_second_writer_for_a_successor_that_never_started").is_some() {
+    if in_child("resume_starts_no_second_writer_for_a_successor_that_never_started") {
         return;
     }
     let (host, accepted, conversation) = stopped_agent(crate::daemon::read_boot_id().unwrap());
@@ -377,4 +406,143 @@ fn resume_starts_no_second_writer_for_a_successor_that_never_started() {
         1,
         "nothing else runs the conversation"
     );
+}
+
+/// An agent no pane shows is listed in the scope it was placed in, and only
+/// while its session is the one its lineage last continued.
+#[test]
+fn an_agent_no_pane_shows_is_listed_in_its_own_scope_while_it_is_latest() {
+    if in_child("an_agent_no_pane_shows_is_listed_in_its_own_scope_while_it_is_latest") {
+        return;
+    }
+    let (host, accepted, _) = run_and_stop(crate::daemon::read_boot_id().unwrap(), false);
+    let session = session_of(&host, accepted.agent.id);
+    let project = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap())
+        .join("project");
+    let ids = |scope| {
+        stopped_in(&host, scope)
+            .sessions
+            .iter()
+            .map(|stopped| stopped.id)
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(ids(Scope::Sessions(Sessions::All)), [session.id]);
+    assert_eq!(
+        ids(Scope::Sessions(Sessions::Project(project.clone()))),
+        [session.id]
+    );
+    let agent = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap();
+    if let crate::agent_execution::Placement::Channel(channel) = agent.placement {
+        assert_eq!(ids(Scope::Channel(Some(channel))), [session.id]);
+    }
+    // Another channel of the project is not where it was placed.
+    let elsewhere = crate::model::ChannelId::new();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .apply(&ModelEdit::CreateChannel {
+            id: elsewhere,
+            repository: project,
+            title: "Elsewhere".into(),
+            title_source: Default::default(),
+            checkout: None,
+        })
+        .unwrap();
+    assert!(ids(Scope::Channel(Some(elsewhere))).is_empty());
+
+    // A successor its agent did not take over continued the conversation
+    // since, so reopening the agent's session would be stale.
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .succeed(crate::model::TerminalId::new(), session.id, None, |_| false)
+        .unwrap();
+    assert!(ids(Scope::Sessions(Sessions::All)).is_empty());
+}
+
+/// A message to a stopped session names the command that resumes it to a
+/// sender that may run it, and otherwise says the person can.
+#[test]
+fn a_message_to_a_stopped_session_names_resume_only_to_who_may_run_it() {
+    use crate::agent_execution::mailbox::{Outgoing, To};
+    if in_child("a_message_to_a_stopped_session_names_resume_only_to_who_may_run_it") {
+        return;
+    }
+    let (host, accepted, conversation) = stopped_agent(crate::daemon::read_boot_id().unwrap());
+    let project = std::path::PathBuf::from(std::env::var_os("CAGENTS_EXECUTION_FIXTURE").unwrap())
+        .join("project");
+    // A chat only its pane holds, which no agent owns.
+    let mut paned = session_of(&host, accepted.agent.id);
+    paned.id = crate::model::TerminalId::new();
+    paned.launch.session_id = Some(conversation);
+    pane_in_a_new_channel(&host, &project, crate::model::CardId::new(), paned.clone());
+    let send = |authority: Authority| {
+        process(
+            &host,
+            authority,
+            Operation::SendMessage(Outgoing {
+                to: To::Session(paned.id.to_string()),
+                body: "Are you there?".into(),
+                wait_ms: None,
+            }),
+        )
+        .unwrap_err()
+    };
+    let person = send(Authority::default());
+    assert!(
+        person.contains(&format!(
+            "Resume its conversation first with `cagents resume {}`",
+            paned.id
+        )),
+        "{person}"
+    );
+
+    // A session that did not start it may not resume it.
+    let sender = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::New(Spec {
+                provider: Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: project.clone(),
+                    directory: project.clone(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            }),
+            prompt: "Read the owned fixture".into(),
+            idempotency_key: "sender".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, sender.run.id).state, State::Succeeded);
+    let sending = session_of(&host, sender.agent.id).id;
+    let authority = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .retained_agent_authority(sending)
+        .unwrap();
+    let agent = send(authority);
+    assert!(
+        agent.contains(&format!(
+            "The person can resume its conversation with `cagents resume {}`",
+            paned.id
+        )),
+        "{agent}"
+    );
+    assert!(!agent.contains("Resume its conversation first"), "{agent}");
 }
