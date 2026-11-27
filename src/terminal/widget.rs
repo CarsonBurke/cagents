@@ -2657,7 +2657,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                if state.selection.is_some() && is_escape(key) {
+                // A repeat is not a second Escape: the press it follows went
+                // to whatever closed before this, such as the context menu.
+                if state.selection.is_some() && is_escape(key) && !*repeat {
                     state.selection = None;
                     state.selecting = false;
                     state.selection_click = None;
@@ -2695,8 +2697,6 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 // an overlay that has since closed, as Escape closes the
                 // context menu, or a chord or a selection here, the child
                 // holds no press for it and would take the repeat as one.
-                // The lone release is still sent: the worker drops it, and
-                // knows better than this state which presses it wrote.
                 if *repeat && !state.child_keys.contains(physical_key) {
                     shell.capture_event();
                     return;
@@ -2729,6 +2729,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 ..
             }) if self.model_focused => {
                 state.modifiers = map_iced_modifiers(*modifiers);
+                // A release whose press never went to the child is still
+                // sent below: the worker drops it, and knows better than this
+                // state which presses it wrote.
                 state.child_keys.retain(|held| held != physical_key);
                 if self.read_only {
                     shell.capture_event();
