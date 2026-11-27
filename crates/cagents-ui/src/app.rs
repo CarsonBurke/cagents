@@ -14176,6 +14176,9 @@ impl Cagents {
         }
         if let Some(state) = self.lsp_contexts.get_mut(&card) {
             state.attachment.clear_results();
+            // Details unfolded for one file's server don't stay open over
+            // the next file's.
+            state.attachment.context.details_open = false;
             state.path = None;
             state.blocked_by_other_buffer = false;
         }

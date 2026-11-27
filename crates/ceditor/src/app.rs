@@ -921,6 +921,7 @@ fn language_server_failure(status: LspStatus) -> Option<String> {
         LspStatus::Failed {
             reason,
             stderr_tail,
+            ..
         } => {
             if stderr_tail.is_empty() {
                 Some(reason)
@@ -9141,6 +9142,7 @@ mod tests {
     #[test]
     fn language_server_failure_preserves_the_full_stderr_evidence() {
         let failure = language_server_failure(LspStatus::Failed {
+            server: "rust-analyzer".into(),
             reason: "initialize failed".into(),
             stderr_tail: vec![
                 "toolchain unavailable".into(),

@@ -416,10 +416,18 @@ pub struct LspInspectorContext {
 }
 
 impl LspInspectorContext {
-    /// Records the server's state; a settled one ends a restart.
+    /// Records the server's state; a settled one ends a restart, and a
+    /// different kind of state folds the details read about the last one.
     pub fn set_status(&mut self, status: LspStatus) {
         if !matches!(status, LspStatus::Starting) {
             self.restarting = false;
+        }
+        if self
+            .status
+            .as_ref()
+            .is_none_or(|old| std::mem::discriminant(old) != std::mem::discriminant(&status))
+        {
+            self.details_open = false;
         }
         self.status = Some(status);
     }
@@ -595,13 +603,18 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
     match &lsp.status {
         Some(LspStatus::Missing { server, program }) => {
             let name = crate::settings::language_server_name(server);
+            // Not "isn't installed": a server installed where only a login
+            // shell's PATH reaches is not found either, and a full path in
+            // its command, which the launcher takes as written, fixes that.
             let detail = vec![
                 Run::code(program),
-                Run::words(" wasn't found on PATH. Install it, then choose Retry."),
+                Run::words(" wasn't found on PATH. Install it, or set its full path in "),
+                Run::code("settings.toml"),
+                Run::words(", then choose Retry."),
             ];
             lines.push(StatusLine {
                 tone: StatusTone::Warning,
-                summary: format!("{name} isn't installed"),
+                summary: format!("{name} not found"),
                 reason: plain(&detail),
                 detail,
                 output: None,
@@ -631,22 +644,25 @@ pub fn status_lines(card: CardId, lsp: &LspInspectorContext) -> Vec<StatusLine> 
             });
         }
         Some(LspStatus::Failed {
+            server,
             reason,
             stderr_tail,
         }) => {
+            let name = crate::settings::language_server_name(server);
             let detail = code_runs(reason);
-            let summary = format!("Language server stopped: {}", plain(&detail));
             lines.push(StatusLine {
                 tone: StatusTone::Error,
-                reason: summary.clone(),
-                summary,
+                // Which server stopped fits a narrow line; why is the
+                // tooltip and the detail, rather than a fading tail.
+                summary: format!("{name} stopped"),
+                reason: sentence(&plain(&detail)),
                 detail,
                 // The tail is the only evidence of why the session died, so
                 // it stays a click away rather than being swallowed.
                 output: Some(stderr_tail.clone()),
                 action: restart_action(card, lsp).map(|message| StatusAction {
                     label: "Restart",
-                    name: "Restart language server".into(),
+                    name: format!("Restart {name}"),
                     message,
                 }),
             });
@@ -697,19 +713,59 @@ fn says_no_problems(lsp: &LspInspectorContext) -> bool {
         && !matches!(lsp.notice, Some(LspNotice::Progress(_)))
 }
 
-/// The height the Problems body needs when it holds only status lines, which
-/// is then all it takes; `None` when it lists diagnostics or unfolded
-/// details and takes a share of the panel to scroll in.
-pub fn problems_status_height(card: CardId, lsp: &LspInspectorContext) -> Option<f32> {
+/// The height the Problems body takes when it holds only status lines, in an
+/// inspector `width` wide; `None` when it lists diagnostics and takes a
+/// share of the panel to scroll in.
+///
+/// Unfolded details are estimated rather than measured, so unfolding a line
+/// grows the section by about what it reveals instead of flipping it to a
+/// share of the panel; the shell caps the result and the body scrolls past
+/// it.
+pub fn problems_status_height(card: CardId, lsp: &LspInspectorContext, width: f32) -> Option<f32> {
     if !lsp.diagnostics.is_empty() {
         return None;
     }
     let lines = status_lines(card, lsp);
-    if lsp.details_open && lines.iter().any(StatusLine::unfolds) {
-        return None;
-    }
     let rows = lines.len() + usize::from(says_no_problems(lsp));
-    Some(rows as f32 * design::DENSE_ROW_HEIGHT + 2.0 * space::XS)
+    let details: f32 = if lsp.details_open {
+        lines
+            .iter()
+            .filter(|line| line.unfolds())
+            .map(|line| details_height(line, width))
+            .sum()
+    } else {
+        0.0
+    };
+    Some(rows as f32 * design::DENSE_ROW_HEIGHT + details + 2.0 * space::XS)
+}
+
+/// About how tall `line`'s unfolded details stand in an inspector `width`
+/// wide: each paragraph's caption lines at an average glyph width, the gaps
+/// between them, and the space beneath.
+fn details_height(line: &StatusLine, width: f32) -> f32 {
+    /// A caption glyph's average advance, proportional or monospace.
+    const GLYPH_WIDTH: f32 = 0.55 * design::TEXT_CAPTION;
+    let columns = ((width - 2.0 * space::M - SUMMARY_INSET) / GLYPH_WIDTH)
+        .floor()
+        .max(1.0) as usize;
+    let wrapped = |text: &str| text.chars().count().div_ceil(columns).max(1);
+    let mut paragraphs = Vec::with_capacity(2);
+    if !line.detail.is_empty() {
+        paragraphs.push(wrapped(&plain(&line.detail)));
+    }
+    if let Some(output) = &line.output {
+        paragraphs.push(
+            output
+                .iter()
+                .map(|text| wrapped(text))
+                .sum::<usize>()
+                .max(1),
+        );
+    }
+    let lines: usize = paragraphs.iter().sum();
+    lines as f32 * design::LINE_CAPTION
+        + paragraphs.len().saturating_sub(1) as f32 * space::XS
+        + space::XS
 }
 
 /// The focused editor's diagnostics in file order, after a line for each
@@ -830,15 +886,27 @@ fn status_line_view(
         StatusTone::Error => toned_glyph(Icon::Error, design::destructive_color),
     };
     let unfolds = line.unfolds();
-    let lead = widget::row::with_children(vec![
+    let mut lead = vec![
         glyph,
         crate::ui_controls::FadeText::caption(line.summary.clone())
             .width(Length::Fill)
             .into(),
-    ])
-    .spacing(space::XS)
-    .align_y(cosmic::iced::Alignment::Center)
-    .width(Length::Fill);
+    ];
+    if unfolds {
+        // Says the line opens, rather than leaving it to a hover.
+        lead.push(toned_glyph(
+            if open {
+                Icon::ChevronDown
+            } else {
+                Icon::ChevronRight
+            },
+            design::muted_icon_color,
+        ));
+    }
+    let lead = widget::row::with_children(lead)
+        .spacing(space::XS)
+        .align_y(cosmic::iced::Alignment::Center)
+        .width(Length::Fill);
     let lead: Element<'static, InspectorAction> = if unfolds {
         let mut button = widget::button::custom(widget::container(lead).center_y(Length::Fill))
             .name(format!(
@@ -1537,6 +1605,7 @@ mod tests {
         }
         assert!(has_problems(&LspInspectorContext {
             status: Some(LspStatus::Failed {
+                server: "rust-analyzer".into(),
                 reason: "exited".into(),
                 stderr_tail: Vec::new(),
             }),
@@ -1644,13 +1713,16 @@ mod tests {
             panic!("one fact deserves one line: {lines:?}");
         };
         assert_eq!(line.tone, StatusTone::Warning);
-        assert_eq!(line.summary, "TypeScript language server isn't installed");
+        // Not "isn't installed": it may be, just not on the app's PATH.
+        assert_eq!(line.summary, "TypeScript language server not found");
         // The executable is code, never a pair of raw backticks.
         assert_eq!(
             line.detail,
             vec![
                 Run::code("typescript-language-server"),
-                Run::words(" wasn't found on PATH. Install it, then choose Retry."),
+                Run::words(" wasn't found on PATH. Install it, or set its full path in "),
+                Run::code("settings.toml"),
+                Run::words(", then choose Retry."),
             ]
         );
         assert!(!line.reason.contains('`'), "{}", line.reason);
@@ -1668,38 +1740,65 @@ mod tests {
             server: "zls".into(),
             program: "zls".into(),
         });
-        assert_eq!(
-            status_lines(card, &custom)[0].summary,
-            "zls isn't installed"
-        );
+        assert_eq!(status_lines(card, &custom)[0].summary, "zls not found");
     }
 
     #[test]
-    fn a_status_only_section_is_as_tall_as_its_lines_until_unfolded() {
+    fn a_status_only_section_is_as_tall_as_its_lines_and_what_they_unfold() {
+        const WIDTH: f32 = 360.0;
         let card = CardId::new();
         let mut lsp = typescript_missing();
         let one_line = design::DENSE_ROW_HEIGHT + 2.0 * space::XS;
-        assert_eq!(problems_status_height(card, &lsp), Some(one_line));
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), Some(one_line));
         // A failed request under it is a second line, not a second section.
         lsp.notice = Some(LspNotice::Failure("hover request failed".into()));
-        assert_eq!(
-            problems_status_height(card, &lsp),
-            Some(one_line + design::DENSE_ROW_HEIGHT)
-        );
-        // Unfolded details and diagnostics scroll in a share of the panel.
+        let two_lines = one_line + design::DENSE_ROW_HEIGHT;
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), Some(two_lines));
+        // Unfolding grows the section by about what it reveals, rather than
+        // flipping it to a share of the panel that moves everything above.
         lsp.details_open = true;
-        assert_eq!(problems_status_height(card, &lsp), None);
+        let open = problems_status_height(card, &lsp, WIDTH).expect("still fitted");
+        assert!(
+            open > two_lines + 2.0 * design::LINE_CAPTION
+                && open < two_lines + 8.0 * design::LINE_CAPTION,
+            "{open}"
+        );
+        // A narrower inspector wraps the same words onto more lines.
+        assert!(problems_status_height(card, &lsp, 240.0).unwrap() > open);
+        // Diagnostics scroll in a share of the panel.
         lsp.details_open = false;
         lsp.diagnostics = vec![diagnostic(0, LspSeverity::Error, "e")];
-        assert_eq!(problems_status_height(card, &lsp), None);
+        assert_eq!(problems_status_height(card, &lsp, WIDTH), None);
         let _view = problems_view(card, &lsp);
+    }
+
+    #[test]
+    fn unfolded_details_fold_when_the_server_changes_state() {
+        let mut lsp = typescript_missing();
+        lsp.details_open = true;
+        // The same kind of state, such as a fresh stderr tail, keeps them.
+        lsp.set_status(LspStatus::Missing {
+            server: "typescript-language-server".into(),
+            program: "typescript-language-server".into(),
+        });
+        assert!(lsp.details_open);
+        lsp.set_status(LspStatus::Ready);
+        assert!(!lsp.details_open);
+        lsp.details_open = true;
+        lsp.set_status(LspStatus::Failed {
+            server: "typescript-language-server".into(),
+            reason: "exited".into(),
+            stderr_tail: Vec::new(),
+        });
+        assert!(!lsp.details_open);
     }
 
     #[test]
     fn a_failed_server_is_one_line_with_restart_and_keeps_its_output() {
         let card = CardId::new();
         let lsp = with_status(LspStatus::Failed {
-            reason: "`tsserver` exited".into(),
+            server: "typescript-language-server".into(),
+            reason: "`tsserver` exited: initialize failed".into(),
             stderr_tail: vec!["thread panicked".into(), "at src/main.rs:1".into()],
         });
         let lines = status_lines(card, &lsp);
@@ -1707,10 +1806,16 @@ mod tests {
             panic!("{lines:?}");
         };
         assert_eq!(line.tone, StatusTone::Error);
-        assert_eq!(line.summary, "Language server stopped: tsserver exited");
+        // Which server stopped fits a narrow line; why is the tooltip and
+        // the detail, not a tail fading after a second colon.
+        assert_eq!(line.summary, "TypeScript language server stopped");
+        assert_eq!(line.reason, "Tsserver exited: initialize failed");
         assert_eq!(
             line.detail,
-            vec![Run::code("tsserver"), Run::words(" exited")]
+            vec![
+                Run::code("tsserver"),
+                Run::words(" exited: initialize failed")
+            ]
         );
         // The tail is the only evidence of why the session died.
         assert_eq!(

@@ -10708,7 +10708,7 @@ fn dismiss_and_restart_retire_native_completion_answers_with_the_inspector() {
 /// The Problems section's details fold and unfold on request, and a restart
 /// or dismissal folds them, so the next failure doesn't arrive unfolded.
 #[test]
-fn language_server_details_unfold_until_restart_or_dismissal() {
+fn language_server_details_unfold_until_restart_dismissal_or_another_file() {
     let mut app = lsp_test_app();
     let card = repository_card(&mut app, "/repo");
     lsp_state(&mut app, card).attachment.document = Some(LspDocumentId(1));
@@ -10734,6 +10734,13 @@ fn language_server_details_unfold_until_restart_or_dismissal() {
     let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
     let _ = app.update_lsp(InspectorAction::DismissLspResults(card));
     assert!(!details(&app), "a dismissal left the details unfolded");
+
+    let _ = app.update_lsp(InspectorAction::ToggleLanguageServerDetails(card));
+    app.close_lsp_document(card);
+    assert!(
+        !details(&app),
+        "the next file opened with the last one's details"
+    );
 }
 
 /// A superseded request is the ordinary result of typing while one is in

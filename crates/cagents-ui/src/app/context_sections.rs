@@ -127,9 +127,20 @@ enum Height {
     /// Its own content's height, up to this many pixels, past which it
     /// scrolls.
     Content { height: f32 },
-    /// Exactly this height: a few status lines, which never grow into the
-    /// room a list would.
+    /// Exactly this height, up to [`FIT_SHARE`] of the panel, past which it
+    /// scrolls: a few status lines, which never grow into the room a list
+    /// would.
     Fit { height: f32 },
+}
+
+/// The most of the panel a [`Height::Fit`] section takes, so unfolded
+/// details leave the lists above them room.
+const FIT_SHARE: f32 = 0.4;
+
+/// The height a [`Height::Fit`] section asking for `height` takes in a
+/// `panel` that tall.
+fn fit_height(height: f32, panel: f32) -> f32 {
+    height.min((FIT_SHARE * panel).max(design::DENSE_ROW_HEIGHT))
 }
 
 /// The rows the Work list keeps room for, whatever it holds and whether or
@@ -273,7 +284,7 @@ impl Cagents {
             panes.push(self.mentioned_pane(card, &work));
         }
         panes.push(self.workspace_pane(card, width, work.scope.clone()));
-        panes.extend(self.language_server_panes(card));
+        panes.extend(self.language_server_panes(card, width));
         panes
     }
 
@@ -326,10 +337,14 @@ impl Cagents {
                 _ => None,
             })
             .collect();
+        let panel = self
+            .context_sections_height
+            .unwrap_or_else(|| self.inspector_body_height())
+            - activity_height;
         let fitted: f32 = panes
             .iter()
             .filter_map(|pane| match (&pane.body, pane.height) {
-                (Some(_), Height::Fit { height }) => Some(height),
+                (Some(_), Height::Fit { height }) => Some(fit_height(height, panel)),
                 _ => None,
             })
             .sum();
@@ -338,9 +353,7 @@ impl Cagents {
         // rather than scrolling within a few rows above an empty panel.
         let mut lead = (!shared).then(|| {
             lead_list_height(
-                self.context_sections_height
-                    .unwrap_or_else(|| self.inspector_body_height())
-                    - activity_height,
+                panel,
                 panes.len(),
                 lists.first().copied().unwrap_or_default(),
                 lists.iter().skip(1).sum::<f32>() + fitted,
@@ -390,7 +403,7 @@ impl Cagents {
                         .into(),
                     Height::Fit { height } => widget::container(body)
                         .width(Length::Fill)
-                        .height(height)
+                        .height(fit_height(height, panel))
                         .into(),
                 });
             }
@@ -891,7 +904,7 @@ impl Cagents {
 
     /// An editor pane's Problems and its definition or references results,
     /// when it has them.
-    fn language_server_panes(&self, card: CardId) -> Vec<Pane<'_>> {
+    fn language_server_panes(&self, card: CardId, width: f32) -> Vec<Pane<'_>> {
         let Some(lsp) = matches!(self.cards.get(&card), Some(CardRuntime::Repository(_)))
             .then(|| self.lsp_context(card))
             .flatten()
@@ -930,9 +943,9 @@ impl Cagents {
                     .into_iter()
                     .collect(),
                 // A section that only says how the server is doing is a
-                // line or two, not a share of the panel; diagnostics and
-                // unfolded details scroll in a share.
-                height: inspector::problems_status_height(card, lsp)
+                // line or two, and its details about as tall as they read,
+                // not a share of the panel; diagnostics scroll in a share.
+                height: inspector::problems_status_height(card, lsp, width)
                     .map_or(Height::Share, |height| Height::Fit { height }),
                 body: open
                     .then(|| inspector::problems_view(card, lsp).map(Message::ContextInspector)),

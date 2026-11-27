@@ -205,6 +205,8 @@ pub enum LspStatus {
     /// The session initialised badly or died. `stderr_tail` is the last
     /// [`STDERR_TAIL_LINES`] lines the server wrote.
     Failed {
+        /// [`LanguageServerSettings::id`] of the server that stopped.
+        server: String,
         reason: String,
         stderr_tail: Vec<String>,
     },
@@ -2772,6 +2774,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             if let Some(reason) = commands.failure() {
                 fail_queued_requests(&commands, &context, reason).await;
                 context.set_status(LspStatus::Failed {
+                    server: context.key.server_id.to_string(),
                     reason: reason.to_owned(),
                     stderr_tail: context.stderr.snapshot(),
                 }).await;
@@ -2799,6 +2802,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             }
             context
                 .set_status(LspStatus::Failed {
+                    server: context.key.server_id.to_string(),
                     reason,
                     stderr_tail: context.stderr.snapshot(),
                 })
@@ -2852,6 +2856,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
                     .await;
                 context
                     .set_status(LspStatus::Failed {
+                        server: context.key.server_id.to_string(),
                         reason,
                         stderr_tail: context.stderr.snapshot(),
                     })
@@ -2909,6 +2914,7 @@ async fn run_session(context: SessionContext, mut commands: commands::Receiver) 
             .await;
         context
             .set_status(LspStatus::Failed {
+                server: context.key.server_id.to_string(),
                 reason: reason.to_owned(),
                 stderr_tail: context.stderr.snapshot(),
             })
