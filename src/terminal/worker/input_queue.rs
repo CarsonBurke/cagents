@@ -748,6 +748,19 @@ mod tests {
         assert!(queue.is_empty());
     }
     #[test]
+    fn a_release_with_no_owning_press_is_dropped() {
+        let mut queue = PendingInput::default();
+        assert!(queue.admit_key(&key(KeyAction::Release), b"UP", true, None, None));
+        assert!(queue.is_empty());
+        assert!(!queue.has_held_input());
+        assert!(queue.can_flush_kernel());
+        // A later press still starts its own pair.
+        assert!(queue.admit_key(&key(KeyAction::Press), b"DOWN", true, None, None));
+        assert!(queue.admit_key(&key(KeyAction::Release), b"UP", true, None, None));
+        assert_eq!(drain(&mut queue), b"DOWNUP");
+        assert!(!queue.has_held_input());
+    }
+    #[test]
     fn cancellation_finishes_a_partial_protocol_frame_before_release_and_interrupt() {
         let mut queue = PendingInput::default();
         assert!(queue.admit_key(&key(KeyAction::Press), b"\x1b[97;1:1u", true, None, None));

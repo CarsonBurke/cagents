@@ -853,6 +853,82 @@ fn reserved_cleanup_does_not_overtake_its_still_queued_press() {
     finish_captured_input_worker(worker, &handle, &mut root);
 }
 
+/// An overlay can take a key-down and be gone before its key-up, which then
+/// arrives here alone: Escape closing the terminal's context menu does. A
+/// child reading key releases must not see that up without its down.
+#[test]
+fn a_release_whose_press_never_arrived_writes_nothing_to_the_child() {
+    const NAME: &str = "a_release_whose_press_never_arrived_writes_nothing_to_the_child";
+    if isolated_input_case(NAME) {
+        return;
+    }
+    let escape_up = key_input(KeyAction::Release, TerminalKey::Escape, None, None);
+    let down = key_input(
+        KeyAction::Press,
+        TerminalKey::Character('a'),
+        Some("a"),
+        Some('a'),
+    );
+    // The child asks for key releases, so this up would be written if it were
+    // encoded at all.
+    let mut terminal = Terminal::new(TerminalOptions {
+        cols: 80,
+        rows: 24,
+        max_scrollback: 0,
+    })
+    .unwrap();
+    terminal.vt_write(b"\x1b[>3u");
+    let mut encoder = KeyEncoder::new().unwrap();
+    assert_eq!(
+        encode_key_input(&terminal, &mut encoder, escape_up.clone()).unwrap(),
+        b"\x1b[27;1:3u"
+    );
+    assert_eq!(
+        encode_key_input(&terminal, &mut encoder, down.clone()).unwrap(),
+        b"a"
+    );
+    // The child reports the first byte it reads.
+    let (mut worker, events) = capture_worker_for(
+        shell_session(
+            "stty raw -echo; printf '\\033[>3uready'; \
+             printf 'first:%s:end' \"$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \\n')\"; \
+             exec sleep 600",
+        )
+        .launch,
+    );
+    let mut root = InputRootGuard::new(&worker.published);
+    observe_worker_marker(&mut worker, b"ready");
+    let (commands, receiver) = command_channel(2);
+    worker.commands = receiver;
+    let handle = TerminalHandle {
+        inner: Arc::new(HandleInner {
+            commands,
+            events,
+            published: worker.published.clone(),
+            worker: joins::JoinOwner::empty(worker.published.clone()),
+        }),
+    };
+    handle.key(escape_up).unwrap();
+    assert!(
+        worker.published.take_cleanup_command(true).is_none(),
+        "an up with no admitted press holds no cleanup claim"
+    );
+    worker.handle_command(worker.commands.try_recv().unwrap());
+    assert!(worker.pending_input.is_empty());
+    assert!(!worker.pending_input.has_held_input());
+    let mut up = down.clone();
+    up.action = KeyAction::Release;
+    up.text = None;
+    handle.key(down).unwrap();
+    worker.handle_command(worker.commands.try_recv().unwrap());
+    observe_worker_marker(&mut worker, b"first:61:end");
+    handle.key(up).unwrap();
+    worker.handle_command(worker.published.take_cleanup_command(true).unwrap());
+    assert!(!worker.pending_input.has_held_input());
+    worker.published.request_shutdown();
+    finish_captured_input_worker(worker, &handle, &mut root);
+}
+
 #[test]
 fn aggregate_credits_bound_interrupt_stash_while_producers_try_to_refill() {
     if isolated_input_case("aggregate_credits_bound_interrupt_stash_while_producers_try_to_refill")
