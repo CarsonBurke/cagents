@@ -24,6 +24,7 @@ impl Cagents {
         // The current read is over whatever became of its binding; left set,
         // it would hold back every later read.
         self.refresh_ui.source_cancel = None;
+        self.device_diff_rows_read(request);
         let changed = !matches!(result, Ok(SourceControlRead::Unchanged { .. }));
         self.refresh_ui
             .source_reload
@@ -55,6 +56,11 @@ impl Cagents {
             Err(error) => {
                 self.replace_source_control(SourceControlModel::failed(key, error));
                 self.cancel_branch_changes();
+                // A device's Changes are only read on a timer, so a device
+                // that could not be read once is tried again later.
+                if crate::device::is_remote() {
+                    self.schedule_device_source_read();
+                }
                 return ControlFlow::Continue(Task::none());
             }
         };

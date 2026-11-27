@@ -35,6 +35,10 @@ pub(in crate::app) struct Diff {
     read: u64,
     content: Content,
     view: patch_view::ViewState,
+    /// The source-control read current when this dialog last staged or
+    /// unstaged a change. Until a later read lands, the rows it steps through
+    /// still list that change where it was, so it doesn't stage again.
+    settling: Option<u64>,
 }
 
 enum Content {
@@ -98,18 +102,35 @@ fn prepare(
     path: &Path,
     theme: crate::settings::EditorSyntaxTheme,
 ) -> Prepared {
-    if let DiffContent::Comparison { old, new, .. } = &content
+    if let DiffContent::Comparison {
+        old,
+        new,
+        old_label,
+        new_label,
+    } = &content
         && old.is_diffable()
         && new.is_diffable()
     {
-        let text = crate::unified_diff::unified(
+        let (before, after) = (
             old.text().unwrap_or_default(),
             new.text().unwrap_or_default(),
-            "",
-            COMPARED,
         );
+        let text = crate::unified_diff::unified(before, after, "", COMPARED);
         if text.is_empty() {
-            return Prepared::Same;
+            if before == after {
+                return Prepared::Same;
+            }
+            // The comparison reads a last line the same whether or not a
+            // newline ends it, so that is all that differs.
+            let unended = if before.ends_with('\n') {
+                new_label
+            } else {
+                old_label
+            };
+            return Prepared::Note {
+                title: "Only the final newline changed".into(),
+                detail: format!("{unended}: no newline at the end of the file"),
+            };
         }
         let text: Arc<str> = text.into();
         let theme = (text.len() <= HIGHLIGHT_LIMIT).then_some(theme);
@@ -143,9 +164,9 @@ impl Cagents {
         self.device_ui.choosing = false;
         self.device_ui.notice = None;
         // A step keeps showing as much of the next change as of the last.
-        let view = match &self.device_ui.diff {
-            Some(diff) if diff.key == key => diff.view.clone(),
-            _ => opened_view(),
+        let (view, settling) = match &self.device_ui.diff {
+            Some(diff) if diff.key == key => (diff.view.clone(), diff.settling),
+            _ => (opened_view(), None),
         };
         self.device_ui.diff = Some(Diff {
             key,
@@ -154,6 +175,7 @@ impl Cagents {
             read,
             content: Content::Loading,
             view,
+            settling,
         });
         let theme = self.settings.editor_syntax_theme;
         Task::perform(
@@ -218,6 +240,9 @@ impl Cagents {
                 self.open_device_diff(key, request, Some(area))
             }
             Action::Stage => {
+                if !self.device_diff_can_stage() {
+                    return Task::none();
+                }
                 let Some((key, area, rows, Some(index))) = self.device_diff_position() else {
                     return Task::none();
                 };
@@ -265,6 +290,10 @@ impl Cagents {
                     Some(request) => self.open_device_diff(key, request, Some(area)),
                     None => self.update_device(super::Action::Close),
                 };
+                let generation = self.refresh_ui.source_generation;
+                if let Some(diff) = self.device_ui.diff.as_mut() {
+                    diff.settling = Some(generation);
+                }
                 Task::batch([change, next])
             }
             Action::OpenFile => {
@@ -278,6 +307,32 @@ impl Cagents {
                 })
             }
         }
+    }
+
+    /// Notes that the source-control read `request` landed. One that began
+    /// after the dialog's last stage lists the change where it now is.
+    pub(in crate::app) fn device_diff_rows_read(&mut self, request: u64) {
+        if let Some(diff) = self.device_ui.diff.as_mut()
+            && diff.settling.is_some_and(|staged| staged != request)
+        {
+            diff.settling = None;
+        }
+    }
+
+    /// Whether the shown change can be staged or unstaged now: no change to
+    /// its worktree is running, and the rows show the last one's result.
+    fn device_diff_can_stage(&self) -> bool {
+        let busy = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .is_some_and(sidebar::SourceControlModel::busy);
+        !busy
+            && self
+                .device_ui
+                .diff
+                .as_ref()
+                .is_some_and(|diff| diff.settling.is_none())
     }
 
     /// The shown change's group, its rows, and where the change is among
@@ -335,11 +390,7 @@ impl Cagents {
             context.push(format!("+{added} −{removed}"));
         }
         let position = self.device_diff_position();
-        let busy = self
-            .sidebar_model
-            .source_control
-            .as_ref()
-            .is_some_and(sidebar::SourceControlModel::busy);
+        let can_stage = self.device_diff_can_stage();
         let mut header: Vec<Element<'_, Message>> = vec![
             widget::column::with_children(vec![
                 design::heading(name)
@@ -435,7 +486,7 @@ impl Cagents {
             };
             actions.push(
                 crate::ui_controls::button::primary(label)
-                    .on_press_maybe((!busy).then(|| action(Action::Stage)))
+                    .on_press_maybe(can_stage.then(|| action(Action::Stage)))
                     .into(),
             );
         }
@@ -526,6 +577,15 @@ mod tests {
         };
         assert_eq!(title, "No text diff between Index and Working tree");
         assert_eq!(detail, "Working tree: 3000000 bytes, too large to compare");
+        let Prepared::Note { title, detail } = prepare(
+            comparison(text("last\n"), text("last")),
+            Path::new("unended.txt"),
+            crate::settings::EditorSyntaxTheme::default(),
+        ) else {
+            panic!("a dropped final newline is a change");
+        };
+        assert_eq!(title, "Only the final newline changed");
+        assert_eq!(detail, "Working tree: no newline at the end of the file");
     }
 
     fn git(root: &Path, arguments: &[&str]) {
@@ -599,7 +659,7 @@ mod tests {
         })
         .unwrap();
         crate::device::select(Some("diff-test")).unwrap();
-        let mut app = super::super::super::tests::context_inspector_test_app(false);
+        let mut app = super::super::super::tests::context_inspector_test_app(true);
         let project_id = ProjectId::new();
         let worktree_id = crate::model::WorktreeId::new();
         *app.sidebar_model.projects = vec![SidebarProject::new(
@@ -687,8 +747,57 @@ mod tests {
             "staging moves on to the next change"
         );
 
+        // The stage finishes, but until the device is read again the rows
+        // still list a.txt as unstaged, where staging b.txt would move on to.
+        let staged_at = app.refresh_ui.source_generation;
+        app.source_control_mutations.clear();
+        app.sidebar_model
+            .source_control
+            .as_mut()
+            .unwrap()
+            .set_mutation(None);
+        assert!(!app.device_diff_can_stage(), "the rows predate the stage");
+        drop(app.update(Message::Device(super::super::Action::Diff(Action::Stage))));
+        assert!(
+            !app.sidebar_model.source_control.as_ref().unwrap().busy(),
+            "nothing is staged from rows that predate the last stage"
+        );
+        assert_eq!(shown(&app).as_deref(), Some("b.txt"));
+        app.device_diff_rows_read(staged_at);
+        assert!(!app.device_diff_can_stage(), "a read from before the stage");
+        app.device_diff_rows_read(staged_at.wrapping_add(1));
+        assert!(app.device_diff_can_stage(), "a read since the stage");
+
         drop(app.update(Message::Device(super::super::Action::Close)));
         assert!(app.device_ui.diff.is_none());
         assert!(!app.device_ui.open);
+
+        // A device that could not be read is read again later, not never.
+        {
+            use super::super::super::context_sections::{Section, WorkspaceView};
+            app.context_sections.workspace_view = WorkspaceView::SourceControl;
+            app.context_sections.set_open(Section::Workspace, true);
+            app.settle_pane_inspectors();
+            if app.pane_inspectors.source_control().is_none() {
+                let card = app.workspace.focused().expect("a focused card");
+                drop(app.update(Message::TogglePaneInspector(card)));
+                app.settle_pane_inspectors();
+            }
+            assert_eq!(
+                app.workspace_view_shown(),
+                Some(WorkspaceView::SourceControl)
+            );
+        }
+        app.cancel_source_read();
+        app.refresh_ui.source_reload = Default::default();
+        let started = Instant::now();
+        let request = app.refresh_ui.source_generation;
+        drop(app.source_control_loaded(key.clone(), request, Err("unreachable".into())));
+        let due = app
+            .refresh_ui
+            .source_reload
+            .due()
+            .expect("a failed device read is tried again");
+        assert!(due >= started + Duration::from_secs(20), "after a while");
     }
 }
