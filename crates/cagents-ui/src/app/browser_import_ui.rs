@@ -113,6 +113,7 @@ mod tests {
         let found = vec![Found {
             profile: Profile {
                 browser: cagents_browser_import::Browser::Firefox,
+                install: cagents_browser_import::Install::System,
                 name: "Fixture profile".into(),
                 database: PathBuf::from("/fixture/cookies.sqlite"),
             },
@@ -241,6 +242,7 @@ pub struct Transfer {
     cookies: Mutex<Option<Vec<cagents_browser_import::Cookie>>>,
     profiles: usize,
     skipped: usize,
+    undecryptable: usize,
     errors: Vec<String>,
 }
 
@@ -279,6 +281,7 @@ pub(super) struct State {
     found: Vec<Found>,
     profiles: usize,
     skipped: usize,
+    undecryptable: usize,
     errors: Vec<String>,
     query: String,
     page: usize,
@@ -286,6 +289,10 @@ pub(super) struct State {
 }
 
 const PAGE_ROWS: usize = 60;
+
+/// Names what was looked for, so someone whose browser is missing can tell
+/// whether it is unsupported or simply has no profile yet.
+const SUPPORTED_NONE_FOUND: &str = "No browser profiles with cookies were found. Import works with Chrome, Chromium, Edge, Brave, Vivaldi, Opera, Opera GX, Helium, Thorium, Firefox, LibreWolf, Floorp, Waterfox and Zen, including Flatpak and Snap installs.";
 
 #[derive(Clone, Copy)]
 enum SelectionRow {
@@ -298,13 +305,7 @@ fn selection_rows(found: &[Found], query: &str) -> Vec<SelectionRow> {
     let query = query.to_lowercase();
     let mut rows = Vec::new();
     for (index, profile) in found.iter().enumerate() {
-        let matches_profile = profile.profile.name.to_lowercase().contains(&query)
-            || profile
-                .profile
-                .browser
-                .label()
-                .to_lowercase()
-                .contains(&query);
+        let matches_profile = profile.profile.title().to_lowercase().contains(&query);
         let start = rows.len();
         rows.push(SelectionRow::Profile(index));
         if profile.error.is_some() && (query.is_empty() || matches_profile) {
@@ -516,6 +517,7 @@ impl Cagents {
                         let mut bytes = 0usize;
                         let mut profiles = 0;
                         let mut skipped = 0;
+                        let mut undecryptable = 0;
                         let mut errors = Vec::new();
                         let now = unix_millis() / 1000;
                         for found in selected {
@@ -532,6 +534,7 @@ impl Cagents {
                                 Ok(batch) => {
                                     profiles += 1;
                                     skipped += batch.skipped;
+                                    undecryptable += batch.undecryptable;
                                     for cookie in batch.cookies {
                                         // The jar replaces by name/domain/path,
                                         // including when host-only differs.
@@ -544,16 +547,15 @@ impl Cagents {
                                             bytes = bytes.saturating_add(cookie.value.len() + cookie.name.len() + cookie.path.len());
                                             if bytes > 64 * 1024 * 1024 || cookies.len() >= 80_000 {
                                                 errors.push("The selected profiles exceed the import size limit. Import fewer profiles at a time.".into());
-                                                return Transfer {cookies: Mutex::new(None), profiles: 0, skipped:0, errors};
+                                                return Transfer {cookies: Mutex::new(None), profiles: 0, skipped: 0, undecryptable: 0, errors};
                                             }
                                             cookies.push(cookie);
                                         }
                                     }
                                 }
                                 Err(error) => errors.push(format!(
-                                    "{} / {}: {error}",
-                                    found.profile.browser.label(),
-                                    found.profile.name
+                                    "{}: {error}",
+                                    found.profile.title()
                                 )),
                             }
                         }
@@ -561,6 +563,7 @@ impl Cagents {
                             cookies: Mutex::new(Some(cookies)),
                             profiles,
                             skipped,
+                            undecryptable,
                             errors,
                         }
                     })
@@ -569,6 +572,7 @@ impl Cagents {
                         cookies: Mutex::new(None),
                         profiles: 0,
                         skipped: 0,
+                        undecryptable: 0,
                         errors: vec![
                             "The local extraction worker stopped. Retry the import.".into(),
                         ],
@@ -581,6 +585,7 @@ impl Cagents {
             {
                 self.browser_import.profiles = transfer.profiles;
                 self.browser_import.skipped = transfer.skipped;
+                self.browser_import.undecryptable = transfer.undecryptable;
                 self.browser_import.errors = transfer.errors.clone();
                 let cookies = transfer
                     .cookies
@@ -633,7 +638,7 @@ impl Cagents {
                 self.browser_import.confirm_cancel = false;
                 self.browser_import.phase = Phase::Finished(match result {
                     Ok(report) => format!(
-                        "{}Imported {} cookies for {} sites from {} profiles. {} unsupported, partitioned, or expired cookies were skipped. Reload a tab to use its imported login.",
+                        "{}Imported {} cookies for {} sites from {} profiles. {} unsupported, partitioned, or expired cookies were skipped.{} Reload a tab to use its imported login.",
                         if report.cancelled {
                             "Stopped early. "
                         } else {
@@ -642,7 +647,12 @@ impl Cagents {
                         report.cookies,
                         report.sites,
                         self.browser_import.profiles,
-                        report.skipped + self.browser_import.skipped
+                        report.skipped + self.browser_import.skipped,
+                        match self.browser_import.undecryptable {
+                            0 => String::new(),
+                            1 => " 1 cookie couldn't be decrypted with the browser's current key and was skipped.".into(),
+                            n => format!(" {n} cookies couldn't be decrypted with the browser's current key and were skipped."),
+                        }
                     ),
                     Err(error) => error,
                 });
@@ -716,7 +726,7 @@ impl Cagents {
         } else {
             match &state.phase {
                 Phase::Intro => {
-                    content.push(notice_body("Read cookie databases from Chrome, Chromium, Brave, Firefox, and Zen profiles on this machine? You choose the sites before importing. Encrypted Chrome-family cookies may ask to unlock your desktop keyring."));
+                    content.push(notice_body("Read cookie databases from browser profiles on this machine? This covers Chrome, Edge, Brave, Vivaldi, Opera, Helium and other Chromium-based browsers, and Firefox, LibreWolf, Floorp, Waterfox and Zen. You choose the sites before importing. Chromium-based browsers may ask to unlock your desktop keyring."));
                     content.push(notice_body("Cookie values stay in this app's browser and are never sent to its terminal service. Source profiles are read-only. Imported logins apply to all in-app tabs for this app session; some sites may still require signing in."));
                     widget::row::with_children(vec![
                         button("Skip", Action::Cancel),
@@ -741,9 +751,7 @@ impl Cagents {
                 }
                 Phase::Selection => {
                     if state.found.is_empty() {
-                        content.push(notice_body(
-                            "No supported profiles with cookie databases were found.",
-                        ));
+                        content.push(notice_body(SUPPORTED_NONE_FOUND));
                     }
                     content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Only SameSite=None cookies are supported; restricted, container, and partitioned cookies are skipped. Some logins may still need signing in."));
                     content.push(
@@ -768,9 +776,8 @@ impl Cagents {
                                             && found.selected.len() == found.sites.len(),
                                     )
                                     .label(format!(
-                                        "{} / {} · {} selected",
-                                        found.profile.browser.label(),
-                                        found.profile.name,
+                                        "{} · {} selected",
+                                        found.profile.title(),
                                         found.selected.len()
                                     ))
                                     .on_toggle(move |selected| {
