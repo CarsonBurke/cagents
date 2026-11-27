@@ -155,6 +155,7 @@ pub fn snapshot() -> RepositorySnapshot {
             remote: "origin".into(),
             target: ref_name("refs/remotes/origin/main"),
         }],
+        operation: None,
     }
 }
 

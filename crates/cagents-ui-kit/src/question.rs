@@ -84,6 +84,9 @@ questions! {
     ResetSettings,
     /// Discarding uncommitted changes, which Git can't bring back.
     DiscardChanges,
+    /// Marking conflicted files resolved while they still hold conflict
+    /// markers, or abandoning a merge, rebase, cherry-pick or revert.
+    ConfirmGitCommand,
     /// Deleting several sidebar rows at once.
     DeleteSidebarSelection,
     /// Removing a project, its channels and their sessions.
@@ -153,6 +156,7 @@ impl Question {
             | Self::LeaveTerminalProcessesRunning
             | Self::ResetSettings
             | Self::DiscardChanges
+            | Self::ConfirmGitCommand
             | Self::DeleteSidebarSelection
             | Self::RemoveProject
             | Self::DeleteWorktree
@@ -191,6 +195,7 @@ impl Question {
             | Self::TerminalPaneKept
             | Self::ResetSettings
             | Self::DiscardChanges
+            | Self::ConfirmGitCommand
             | Self::DeleteSidebarSelection
             | Self::RemoveProject
             | Self::DeleteWorktree

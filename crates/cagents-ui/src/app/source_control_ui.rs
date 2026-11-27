@@ -50,6 +50,7 @@ impl Cagents {
         // A worktree's first read decides which Git view it opens on.
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             self.sidebar_state.settle_changes_tab(source);
+            self.sidebar_state.adopt_operation_message(source);
         }
         let branch = self.refresh_branch_changes(&snapshot);
         ControlFlow::Continue(Task::batch([branch, self.load_deferred_files()]))
@@ -147,6 +148,32 @@ impl Cagents {
             }
         }
         ControlFlow::Continue(Task::none())
+    }
+
+    /// [`Self::source_control_mutated`] for a mutation that may have
+    /// changed the index, first releasing the diff views of that worktree
+    /// that held their hunk actions while it ran.
+    pub(super) fn index_mutation_settled(
+        &mut self,
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        report: Option<String>,
+        committed: bool,
+    ) -> Handled {
+        if self
+            .source_control_mutations
+            .get(&key.canonical_path)
+            .is_some_and(|mutation| mutation.id == operation)
+        {
+            for runtime in self.cards.values_mut() {
+                if let CardRuntime::Repository(runtime) = runtime
+                    && runtime.descriptor.worktree == key.canonical_path
+                {
+                    runtime.index_mutation_finished();
+                }
+            }
+        }
+        self.source_control_mutated(key, operation, report, committed)
     }
 
     pub(super) fn source_control_mutated(
@@ -321,6 +348,7 @@ mod tests {
             local_refs: Vec::new(),
             remote_refs: Vec::new(),
             remote_heads: Vec::new(),
+            operation: None,
         }
     }
 
