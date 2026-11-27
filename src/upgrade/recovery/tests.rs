@@ -415,6 +415,40 @@ fn ready_retry_accepts_only_causal_pairs_of_exact_runtime_and_saved_owners() {
     assert!(observe(&intervening, 20, source, 10).is_err());
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn held_return_requires_the_exact_saved_pid_at_or_before_the_runtime_owner() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = preparation(directory.path()).authority.source;
+    let claimant = |id| HostSessionProof {
+        host_session_id: HostSessionId::new(id),
+        host_incarnation: HostIncarnation::new(id),
+        boot_id: source.boot_id.clone(),
+    };
+    let first = claimant("first");
+    let retry = claimant("retry");
+    let foreign = claimant("foreign");
+    let known = [(&source, 10), (&first, 20), (&retry, 30)];
+    for (runtime_index, (runtime, runtime_pid)) in known.iter().enumerate() {
+        for (saved_index, (saved, pid)) in known.iter().enumerate() {
+            let predecessor =
+                select_held_return_predecessor(known, runtime, *runtime_pid, |proof| {
+                    Ok((proof == *saved).then_some(*pid))
+                });
+            if saved_index <= runtime_index {
+                assert_eq!(predecessor.unwrap(), ((*saved).clone(), Some(*pid)));
+            } else {
+                assert!(predecessor.is_err());
+            }
+        }
+    }
+    let exact_saved = |proof: &HostSessionProof| Ok((proof == &source).then_some(10));
+    assert!(select_held_return_predecessor(known, &retry, 31, exact_saved).is_err());
+    assert!(select_held_return_predecessor(known, &foreign, 30, exact_saved).is_err());
+    assert!(select_held_return_predecessor(known, &retry, 30, |_| Ok(None)).is_err());
+    assert!(select_held_return_predecessor(known, &retry, 30, |_| Ok(Some(30))).is_err());
+}
+
 fn checkpoint(preparation: &Preparation, phase: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "version": 2, "phase": phase, "proof": preparation.authority.source,

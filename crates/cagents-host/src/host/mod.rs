@@ -1021,8 +1021,21 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             #[cfg(target_os = "macos")]
             if let Some(admission) = ready_admission.take() {
                 admission.begin_workspace_restore()?;
-                let restored = update_recovery::restore_installed_ready(&host, &admission)
+                let mut restored = update_recovery::restore_installed_ready(&host, &admission)
                     .map_err(io::Error::other)?;
+                if admission.is_held_return() {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    let terminals = state.list(0);
+                    let chats = chat::chat_list_inventory(&state);
+                    admission
+                        .verify_live_inventory(state.proof(), &terminals, &chats)
+                        .map_err(io::Error::other)?;
+                    restored
+                        .finish_locked(&mut state)
+                        .map_err(io::Error::other)?;
+                    admission.finish_held_return().map_err(io::Error::other)?;
+                    return Ok(());
+                }
                 installed_restoration = Some(InstalledRestoration::Ready {
                     admission,
                     restored,

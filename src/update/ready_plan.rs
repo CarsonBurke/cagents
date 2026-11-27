@@ -24,6 +24,21 @@ struct BoundSourceImage {
     image: SourceImage,
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct BoundSourceProcess {
+    reservation_digest: [u8; 32],
+    process: crate::daemon::holder_registry::Process,
+}
+
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct HeldSourceReturn {
+    version: u16,
+    job: String,
+    reservation_digest: [u8; 32],
+}
+
 /// Captured from the still-serving daemon and its privately owned matched set
 /// before sending its prepare request. A version path alone can be repaired
 /// in place while an updater is gone.
@@ -35,6 +50,8 @@ pub(super) struct SourceImage {
     proof: crate::model::HostSessionProof,
     stamp: installed::Stamp,
     binaries: String,
+    #[serde(skip)]
+    live_process: Option<crate::daemon::holder_registry::Process>,
 }
 
 impl SourceImage {
@@ -74,6 +91,7 @@ impl SourceImage {
             proof: source.proof.clone(),
             stamp,
             binaries,
+            live_process: Some(source.identity()),
         })
     }
 
@@ -152,6 +170,49 @@ impl Reservation<'_> {
             ));
         }
         Ok(Some(original.image))
+    }
+
+    fn original_process(&self) -> Result<crate::daemon::holder_registry::Process, UpdateError> {
+        let bytes = read(&source_process_path(&self.state(), &self.job))?.ok_or_else(|| {
+            invalid("The original daemon did not record an exact held-return identity")
+        })?;
+        let record: BoundSourceProcess = serde_json::from_slice(&bytes)?;
+        if record.reservation_digest != self.stored_digest
+            || record.process.pid <= 1
+            || record.process.start == 0
+        {
+            return Err(invalid(
+                "The original process evidence belongs to a different update",
+            ));
+        }
+        Ok(record.process)
+    }
+
+    fn held_source_return(&self) -> HeldSourceReturn {
+        HeldSourceReturn {
+            version: 1,
+            job: self.job.clone(),
+            reservation_digest: self.stored_digest,
+        }
+    }
+
+    fn return_intent_path(&self) -> PathBuf {
+        self.state()
+            .join(format!("{}.ready-return-intent.json", self.job))
+    }
+
+    fn verify_held_source_image(&self, source: &InstallLayout) -> Result<SourceImage, UpdateError> {
+        if source.prefix != self.prefix
+            || !self.plan.selection.source_is_unchanged(source)?
+            || served_version_root(source)? != source.version_root
+        {
+            return Err(invalid("The original source is no longer selected"));
+        }
+        let image = self
+            .original_image()?
+            .ok_or_else(|| invalid("The update did not seal its original build"))?;
+        image.verify_selected(source, self.plan.ready.source())?;
+        Ok(image)
     }
 
     fn verify_original_if_recorded(&self, source: &InstallLayout) -> Result<(), UpdateError> {
@@ -277,6 +338,130 @@ pub(super) fn selected_evidence(
     Ok(Some(reservation.plan.ready))
 }
 
+#[cfg(feature = "host")]
+pub(crate) fn admit_held_source_return(
+    request: HeldSourceReturn,
+    locks: [File; crate::upgrade::recovery::STANDBY_RECEIPT_DESCRIPTORS],
+    daemon: File,
+) -> Result<crate::upgrade::recovery::ReadyAdmission, UpdateError> {
+    let reservation = shared_reservation()?
+        .ok_or_else(|| invalid("A held source return requires the original Ready reservation"))?;
+    let intent = read(&reservation.return_intent_path())?
+        .ok_or_else(|| invalid("The held source return has no recorded decision"))?;
+    let recorded: HeldSourceReturn = serde_json::from_slice(&intent)?;
+    if request != reservation.held_source_return()
+        || recorded != request
+        || reservation.phase()? != Phase::Claimed
+    {
+        return Err(invalid("The held source return belongs to another update"));
+    }
+    let executable = crate::process::current_executable()?;
+    let layout = locate(&executable)?;
+    let source = reservation.verify_held_source_image(&layout)?;
+    let (dev, ino) = source.stamp.daemon_inode();
+    if executable != layout.version_root.join("bin/cagentsd")
+        || crate::process::mapped_region_identity(
+            std::process::id(),
+            crate::process::own_code_address(),
+        )? != (u64::from(dev as u32), ino)
+    {
+        return Err(invalid(
+            "The held return did not start the exact source daemon",
+        ));
+    }
+    let process = reservation.original_process()?;
+    reservation
+        .plan
+        .ready
+        .accept_held_return(&process, locks, daemon)
+        .map_err(invalid)
+}
+
+pub(super) fn try_held_source_return(
+    state: &Path,
+    job: &UpdateJob,
+    worker: &File,
+) -> Result<bool, UpdateError> {
+    let Some(reservation) = shared_reservation()? else {
+        return Ok(false);
+    };
+    if reservation.job != job.id
+        || reservation.state() != state
+        || reservation.phase()? != Phase::Claimed
+    {
+        return Ok(false);
+    }
+    let Some(source_identity) = read(&source_process_path(state, &job.id))? else {
+        return Ok(false);
+    };
+    let recorded: BoundSourceProcess = serde_json::from_slice(&source_identity)?;
+    if recorded.reservation_digest != reservation.stored_digest {
+        return Err(invalid("The held return points to another source daemon"));
+    }
+    let source = locate(&reservation.prefix.join("current/bin/cagents"))?;
+    if reservation
+        .plan
+        .ready
+        .verified_held_return_owner()
+        .map_err(invalid)?
+        .is_some()
+        && reservation.verify_held_return_daemon(&source)?
+    {
+        reservation.finish_held_source_return(&source)?;
+        return Ok(true);
+    }
+    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    let publication = crate::install_guard::reserve_darwin_publication()?;
+    let handoff = acquire_unserved_runtime()?;
+    if guard.has_running_windows()? {
+        return Err(invalid("A window reopened before the held return"));
+    }
+    let image = reservation.verify_held_source_image(&source)?;
+    let runtime = handoff.duplicate_for_recovery()?;
+    if reservation
+        .plan
+        .ready
+        .held_return_predecessor(&recorded.process, &runtime)
+        .is_err()
+    {
+        return Ok(false);
+    }
+
+    let daemon = source.version_root.join("bin/cagentsd");
+    let mut standby = crate::daemon::standby::Parked::launch_with_custody(
+        &daemon,
+        image.stamp.daemon_inode(),
+        &guard,
+        None,
+        publication,
+    )?;
+    if !standby.supports_held_source_return() {
+        return Ok(false);
+    }
+    let intent = reservation.held_source_return();
+    cutover::persist(
+        state,
+        &reservation.return_intent_path(),
+        &serde_json::to_vec(&intent)?,
+        true,
+    )?;
+    let timeout = crate::install_guard::daemon_start_timeout()?;
+    let started = standby.activate_held_source_return(&intent, worker, &guard, &handoff, timeout);
+    if standby.may_own_runtime() {
+        guard.leave_launch_fence_with_successor();
+    }
+    if let Err(error) = installed::confirm_daemon_ready(&daemon, Some(standby.pid()), timeout) {
+        started?;
+        return Err(error);
+    }
+    drop(runtime);
+    drop(handoff);
+    drop(standby);
+    drop(guard);
+    reservation.finish_held_source_return(&source)?;
+    Ok(true)
+}
+
 /// The account fence serializes this reservation check with publication.
 pub(crate) fn require_no_activation() -> Result<(), UpdateError> {
     if let Some(reservation) = shared_reservation()?
@@ -334,6 +519,14 @@ pub fn admit_saved_state(executable: &Path) -> Result<(), UpdateError> {
                 if phase == Phase::Returning {
                     reservation.verify_original_if_recorded(&layout)?;
                 }
+                Ok(())
+            } else {
+                Err(UpdateError::Busy)
+            }
+        }
+        Phase::Claimed if executable.file_name() == Some(std::ffi::OsStr::new("cagents-ui")) => {
+            let source = locate(executable)?;
+            if reservation.verify_held_return_daemon(&source)? {
                 Ok(())
             } else {
                 Err(UpdateError::Busy)
@@ -508,11 +701,14 @@ fn resume_reserved(
             Phase::Claimed
                 if !cutover::has_restored_checkpoint_receipt(&state, &reservation.job)? =>
             {
-                reservation
-                    .plan
-                    .ready
-                    .require_pre_effects_retry()
-                    .map_err(invalid)?;
+                if let Err(error) = reservation.plan.ready.require_pre_effects_retry() {
+                    let job = cutover::read_job(&state)?
+                        .ok_or_else(|| invalid("The reserved update job is missing"))?;
+                    if try_held_source_return(&state, &job, &lock)? {
+                        return Ok(None);
+                    }
+                    return Err(invalid(error));
+                }
             }
             Phase::Claimed | Phase::AwaitingAdmission => (),
         }
@@ -596,6 +792,67 @@ impl Reservation<'_> {
         eprintln!("The staged update could not be verified: {failure}");
         cutover::persist(state, &self.return_path(), &self.return_binding()?, true)?;
         Ok(None)
+    }
+
+    fn verify_held_return_daemon(&self, source: &InstallLayout) -> Result<bool, UpdateError> {
+        let Some((owner, process)) = self
+            .plan
+            .ready
+            .verified_held_return_owner()
+            .map_err(invalid)?
+        else {
+            return Ok(false);
+        };
+        self.verify_held_source_image(source)?;
+        let mut client =
+            source::Client::connect_matched(&crate::terminal_ipc::daemon_socket_path()?)
+                .map_err(|error| invalid(error.to_string()))?;
+        let executable = source.version_root.join("bin/cagentsd");
+        if client.peer_pid() != process.pid as u32
+            || !process.is_current()
+            || client.proof() != &owner
+            || client.serving_executable()? != executable
+            || client.startup_state()? != crate::terminal_ipc::StartupState::Ready
+        {
+            return Err(invalid(
+                "The original service did not confirm its held return",
+            ));
+        }
+        Ok(true)
+    }
+
+    fn finish_held_source_return(&self, source: &InstallLayout) -> Result<(), UpdateError> {
+        let slots = self.plan.ready.saved_windows();
+        let executable = source.version_root.join("bin/cagents-ui");
+        {
+            let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+            if !self.verify_held_return_daemon(source)? {
+                return Err(invalid("The source has not finished its held return"));
+            }
+            guard.set_recovery_restore_only();
+            guard.relaunch_missing_windows(slots, &executable)?;
+        }
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        let _publication = crate::install_guard::reserve_darwin_publication()?;
+        if self.phase()? != Phase::Claimed || !self.verify_held_return_daemon(source)? {
+            return Err(invalid(
+                "The returned source changed before its windows opened",
+            ));
+        }
+        guard.verify_cutover_windows(slots, &executable)?;
+        let store = Store::observe_existing()
+            .map_err(invalid)?
+            .ok_or_else(|| invalid("The held return has no saved-work reservation"))?;
+        let state = self.state();
+        let mut job = cutover::read_job(&state)?
+            .filter(|job| job.id == self.job)
+            .ok_or_else(|| invalid("The held return update is no longer current"))?;
+        job.phase = UpdatePhase::Failed;
+        job.message =
+            "The staged version could not start. Your work reopened in the current version.".into();
+        job.refusal = None;
+        write_job(&state, &job)?;
+        store.retire_installed_activation().map_err(invalid)
     }
 
     fn finish_return(&self, source: &InstallLayout) -> Result<(), UpdateError> {
@@ -811,6 +1068,10 @@ pub(super) fn record(
         .ok_or_else(|| invalid("The acknowledged upgrade store disappeared"))?;
     begin_new_job()?;
     let digest = Sha256::digest(&bytes).into();
+    let process = original
+        .live_process
+        .clone()
+        .ok_or_else(|| invalid("Missing original daemon process identity"))?;
     // Old installed launchers strictly decode the shared reservation. Publish
     // new evidence separately and make it durable before that reservation.
     cutover::persist(
@@ -822,11 +1083,24 @@ pub(super) fn record(
         })?,
         true,
     )?;
+    cutover::persist(
+        state,
+        &source_process_path(state, &job.id),
+        &serde_json::to_vec(&BoundSourceProcess {
+            reservation_digest: digest,
+            process,
+        })?,
+        true,
+    )?;
     store.create_installed_activation(&bytes).map_err(invalid)?;
     Ok(Recorded {
         path: store.installed_activation_path(),
         digest,
     })
+}
+
+fn source_process_path(state: &Path, job: &str) -> PathBuf {
+    state.join(format!("{job}.ready-source-process.json"))
 }
 
 fn source_path(state: &Path, job: &str) -> PathBuf {
@@ -1131,6 +1405,7 @@ mod tests {
             proof: proof.clone(),
             stamp: installed::stamp(&root).unwrap(),
             binaries: installed::Candidate::Local(&root).digest().unwrap(),
+            live_process: None,
         };
         let layout = InstallLayout {
             prefix: directory.path().to_owned(),
