@@ -492,8 +492,13 @@ impl Acp {
     }
 
     fn capabilities(&self) -> Event {
+        // A turn answering a correlated run takes no message into it, which
+        // would change the reply the run's caller waits for: what is written
+        // meanwhile is queued for the next turn.
+        let steers =
+            self.profile.steers && !self.turn.as_ref().is_some_and(|turn| turn.run.is_some());
         Event::Capabilities(Capabilities {
-            steer: self.profile.steers,
+            steer: steers,
             // A message queued during a turn waits here for the next one.
             queue: true,
             queue_remove: true,
@@ -502,7 +507,7 @@ impl Acp {
             queue_start: true,
             queue_holds: true,
             // Sending what is queued now steers it into the running turn.
-            send_queued_now: self.profile.steers,
+            send_queued_now: steers,
             interrupt_stops_background: self.profile.cancel_stops_background,
             attachments: true,
             compact: self.compacts(),
@@ -987,6 +992,8 @@ impl Acp {
                 run,
                 event: ProviderEvent::Finished { outcome: kind },
             });
+            // The run answered, the conversation takes steering again.
+            step.events.push(self.capabilities());
         }
         step.events.push(Event::TurnFinished {
             key: Some(turn.key),
@@ -1784,6 +1791,8 @@ impl Adapter for Acp {
                 },
             },
         );
+        // While it answers the run, the turn takes nothing steered into it.
+        step.events.push(self.capabilities());
         Ok(step)
     }
 
@@ -1913,7 +1922,7 @@ impl Adapter for Acp {
                 }
                 step.events.push(Event::Status {
                     busy: true,
-                    detail: "Stopping".into(),
+                    detail: chat::TURN_STOPPING.into(),
                 });
                 Ok(step)
             }

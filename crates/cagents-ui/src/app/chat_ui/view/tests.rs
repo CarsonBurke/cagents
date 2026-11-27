@@ -14091,6 +14091,26 @@ fn the_context_meter_falls_back_to_the_whole_window() {
     assert_eq!(ContextMeter::of(&crate::chat::Usage::default(), Left), None);
 }
 
+/// A message held for the reader after a stop or a refusal is marked apart
+/// from one waiting for the turn to end, on the row and not only on hover.
+#[test]
+fn a_held_queue_row_has_its_own_glyph() {
+    let glyph = |timing: QueueTiming| timing.mark().map(|(glyph, _)| glyph);
+    let timings = [
+        QueueTiming::NextStep,
+        QueueTiming::NextTurn,
+        QueueTiming::Held,
+        QueueTiming::Unconfirmed(false),
+    ];
+    for (index, timing) in timings.iter().enumerate() {
+        for other in &timings[index + 1..] {
+            assert_ne!(glyph(*timing), glyph(*other), "{timing:?} and {other:?}");
+        }
+    }
+    assert_eq!(glyph(QueueTiming::Held), Some(Icon::AgentWaiting));
+    assert_eq!(glyph(QueueTiming::Leaving), None);
+}
+
 #[test]
 fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
     let mut runtime = Runtime::draft(
@@ -14190,6 +14210,24 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
     runtime.disconnected = true;
     assert!(!runtime.can_send_now());
     runtime.disconnected = false;
+    // While the turn is being stopped it takes nothing: Send now stays,
+    // disabled, saying why, and what is written waits for the stop.
+    Arc::make_mut(&mut runtime.snapshot).capabilities.steer = true;
+    assert_eq!(runtime.submit_modes()[0], PromptMode::Steer);
+    Arc::make_mut(&mut runtime.snapshot).detail = chat::TURN_STOPPING.into();
+    assert!(!runtime.can_send_now());
+    assert!(runtime.send_now_control().is_some());
+    assert_eq!(
+        runtime.queue_title(1),
+        "Queued · 1 · waiting for the turn to stop"
+    );
+    assert_eq!(runtime.submit_modes(), [PromptMode::Queue]);
+    assert_eq!(
+        runtime.conversation_status_base(false).1,
+        chat::TURN_STOPPING
+    );
+    Arc::make_mut(&mut runtime.snapshot).detail = "Working".into();
+    assert!(runtime.can_send_now());
 
     // The control fits beside the heading at narrow and wide widths.
     let renderer = crate::app::tests::headless_renderer();

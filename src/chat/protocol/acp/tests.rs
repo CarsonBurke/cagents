@@ -2444,21 +2444,74 @@ fn a_correlated_run_never_takes_the_readers_held_queue() {
     assert_eq!(acp.queued.len(), 1);
 }
 
+/// Whether the conversation last said, in a step, that it takes steering
+/// and Send now.
+fn steering(step: &Step) -> Option<(bool, bool)> {
+    step.events.iter().rev().find_map(|event| match event {
+        Event::Capabilities(capabilities) => {
+            Some((capabilities.steer, capabilities.send_queued_now))
+        }
+        _ => None,
+    })
+}
+
 /// A run's caller waits for its turn's answer, which a message steered in
-/// would change: the message is queued for the next turn instead.
+/// would change: the message is queued for the next turn instead, and the
+/// conversation says it takes no steering until the run is answered, so the
+/// composer offers to queue rather than steer and no Send now.
 #[test]
 fn a_correlated_runs_turn_is_never_steered() {
     let mut acp = adapter(&[], None);
     ready(&mut acp);
     let run = crate::model::RunId::new();
-    acp.command_for_run(run, send("the run's", PromptMode::Send))
+    let started = acp
+        .command_for_run(run, send("the run's", PromptMode::Send))
         .unwrap();
+    assert_eq!(steering(&started), Some((false, false)));
+    let request = only_write(&started).clone();
     let step = acp.command(send("mine", PromptMode::Steer)).unwrap();
     assert!(step.writes.is_empty(), "{:?}", step.writes);
     let refused = acp.command(Command::SendQueuedNow).unwrap_err();
     assert!(refused.contains("when the turn ends"), "{refused}");
     assert_eq!(acp.queued.len(), 1);
     assert_eq!(acp.turn.as_ref().unwrap().requests.len(), 1);
+    // Answered, the run lets go: the queue starts the next turn, which
+    // takes steering again.
+    let ended = acp
+        .receive(reply(&request, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert_eq!(steering(&ended), Some((true, true)));
+    assert!(acp.turn.as_ref().is_some_and(|turn| turn.run.is_none()));
+}
+
+/// A run the reader stops lets go of the conversation as one it answers
+/// does: once the stopped turn ends, the conversation takes steering again,
+/// and what was queued meanwhile waits for the reader.
+#[test]
+fn a_stopped_correlated_run_gives_steering_back() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let started = acp
+        .command_for_run(
+            crate::model::RunId::new(),
+            send("the run's", PromptMode::Send),
+        )
+        .unwrap();
+    let request = only_write(&started).clone();
+    acp.command(send("mine", PromptMode::Steer)).unwrap();
+    let stopping = acp.command(Command::Interrupt).unwrap();
+    assert!(stopping.events.contains(&Event::Status {
+        busy: true,
+        detail: crate::chat::TURN_STOPPING.into(),
+    }));
+    // Still stopping, the turn answers the run and takes nothing steered.
+    assert_eq!(steering(&stopping), None);
+    let ended = acp
+        .receive(reply(&request, json!({"stopReason": "cancelled"})))
+        .unwrap();
+    assert_eq!(steering(&ended), Some((true, true)));
+    assert!(acp.turn.is_none());
+    assert_eq!(acp.queued.len(), 1);
 }
 
 #[test]
