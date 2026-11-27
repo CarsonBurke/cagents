@@ -610,7 +610,9 @@ impl RemoteActor {
             retained_runs: Vec::new(),
             outbox_ack: 0,
             outbox_latest: 0,
-            waiting_attention: None,
+            // A current helper's journal reports its waiting disposition from
+            // the start; `None` is only what a helper predating it reports.
+            waiting_attention: Some(super::journal::WaitingAttention::Unknown),
             legacy_waiting_settled: false,
             changed: 1,
         };
