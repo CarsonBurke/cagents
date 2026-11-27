@@ -755,6 +755,9 @@ pub enum Action {
     ModelPicker(Target, bool),
     PermissionPicker(Target, bool),
     ModelQuery(Target, String),
+    /// Lists one provider's models in the open model picker, without
+    /// choosing anything.
+    ModelRail(Target, Provider),
 }
 
 impl std::fmt::Debug for Action {
@@ -1149,6 +1152,7 @@ impl Action {
             Self::ModelPicker(..) => "ModelPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
             Self::ModelQuery(..) => "ModelQuery",
+            Self::ModelRail(..) => "ModelRail",
         }
     }
 
@@ -1288,7 +1292,8 @@ impl Action {
             | Self::Complete(target, _, _)
             | Self::Scrolled(target, _, _, _)
             | Self::ModelPicker(target, _)
-            | Self::ModelQuery(target, _) => Some(*target),
+            | Self::ModelQuery(target, _)
+            | Self::ModelRail(target, _) => Some(*target),
             _ => None,
         }
     }
@@ -3669,6 +3674,18 @@ struct HistoryStash {
     detached: Vec<draft_images::Detached>,
 }
 
+/// The open model picker. Each opening starts afresh: the query typed last
+/// time and the provider browsed then are not what the reader looks for now.
+#[derive(Debug, Default)]
+pub(super) struct ModelPicker {
+    /// The search. While it is empty the picker lists one provider's
+    /// models; otherwise it searches every provider's.
+    pub(super) query: String,
+    /// The provider picked on the rail, or `None` for the conversation's own.
+    /// Browsing another provider chooses nothing until one of its models is.
+    pub(super) provider: Option<Provider>,
+}
+
 pub(super) struct Runtime {
     /// The permission mode this draft's launch recipe previews.
     draft_permission: DraftPermissionPreview,
@@ -3945,8 +3962,8 @@ pub(super) struct Runtime {
     /// only thing that can arm the next one.
     earlier_asked: Option<f32>,
     later_asked: Option<f32>,
-    /// The model search's query while its popup is open, `None` when closed.
-    model_picker: Option<String>,
+    /// The model picker while its popup is open, `None` when closed.
+    model_picker: Option<ModelPicker>,
     /// The composer's completion list.
     completion: completion::State,
     suggestion_dismissed: Option<(Option<String>, u64)>,
@@ -18507,7 +18524,8 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                runtime.model_picker = None;
+                // The effort is a setting beside the model list, as fast mode
+                // is, so the picker stays open showing the level now chosen.
                 let Some(model) = runtime
                     .chosen_model()
                     .model(&runtime.snapshot)
@@ -18523,6 +18541,14 @@ impl Cagents {
                 }
                 let model = model.id.clone();
                 let provider = runtime.session.launch.provider;
+                // A pressed segment took the keyboard; it goes back to the
+                // search, which is where the open picker keeps it.
+                let refocus = if runtime.model_picker.is_some() {
+                    widget::text_input::focus(card_control_id(target.card, "chat-model-search"))
+                        .map(cosmic::Action::App)
+                } else {
+                    Task::none()
+                };
                 if runtime.is_draft() {
                     if !runtime.choosing() {
                         return Task::none();
@@ -18538,10 +18564,10 @@ impl Cagents {
                     let session = runtime.session.clone();
                     self.remember_chat_model(provider, Some(model), reasoning);
                     self.replace_chat_conversation(target.card, session);
-                    return self.save_snapshot_soon();
+                    return Task::batch([self.save_snapshot_soon(), refocus]);
                 }
                 let command = Command::SetModel { model, reasoning };
-                return self.chat_send(target, command, false);
+                return Task::batch([self.chat_send(target, command, false), refocus]);
             }
             Action::PermissionMode(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -18992,7 +19018,7 @@ impl Cagents {
                 runtime.picker_keyboard = false;
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
-                runtime.model_picker = open.then(String::new);
+                runtime.model_picker = open.then(ModelPicker::default);
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
                 if open {
@@ -19007,14 +19033,45 @@ impl Cagents {
             }
             Action::ModelQuery(target, query) => {
                 if let Some(runtime) = self.chat_runtime_mut(target)
-                    && let Some(current) = runtime.model_picker.as_mut()
+                    && let Some(picker) = runtime.model_picker.as_mut()
                 {
-                    *current = query;
+                    picker.query = query;
+                    // A new search's best match is at the top of the list.
+                    return model_list_to_top(target);
                 }
+            }
+            Action::ModelRail(target, provider) => {
+                let Some(picker) = self
+                    .chat_runtime_mut(target)
+                    .and_then(|runtime| runtime.model_picker.as_mut())
+                else {
+                    return Task::none();
+                };
+                // A provider picked on the rail is browsed, so a search that
+                // spanned every provider gives way to its list.
+                picker.query.clear();
+                picker.provider = Some(provider);
+                // The keyboard stays with the search, so naming a model
+                // still follows picking whose models to list, and the list
+                // starts at the top of that provider's models.
+                return Task::batch([
+                    widget::text_input::focus(card_control_id(target.card, "chat-model-search"))
+                        .map(cosmic::Action::App),
+                    model_list_to_top(target),
+                ]);
             }
         }
         Task::none()
     }
+}
+
+/// Scrolls the open model picker's list back to its first row.
+fn model_list_to_top(target: Target) -> Task<Message> {
+    iced::widget::operation::snap_to(
+        card_control_id(target.card, view::MODEL_LIST),
+        iced::widget::scrollable::RelativeOffset::START,
+    )
+    .map(cosmic::Action::App)
 }
 
 /// The permission mode draft `card` shows in its footer, and the launch its
