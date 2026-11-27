@@ -317,9 +317,10 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
             | GitOperation::Commit { .. }
             | GitOperation::CheckWorktreeRemoval { .. } => Access::Open,
         },
-        O::RemoveMergedWorktree { .. } | O::AccountLifecycle { .. } | O::AccountsUpdate { .. } => {
-            Access::Held
-        }
+        O::RemoveMergedWorktree { .. }
+        | O::AccountLifecycle { .. }
+        | O::AccountsUpdate { .. }
+        | O::CloseSessions(_) => Access::Held,
     }
 }
 

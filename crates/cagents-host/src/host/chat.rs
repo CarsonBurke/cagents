@@ -5506,6 +5506,21 @@ impl CloseTarget {
         Self::capture(state, record)
     }
 
+    pub(super) fn recover_for_close(
+        host: &SharedHost,
+        session: &Session,
+        instance: uuid::Uuid,
+    ) -> Result<Self, ProtocolError> {
+        retained_actor::recover_cleanup_attachment_for_start(host, session).map_err(setup_error)?;
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get(&session.id)
+            .filter(|record| record.execution_instance == instance)
+            .ok_or_else(|| unavailable("The conversation's cleanup owner changed"))?;
+        Self::for_execution(&state, record, session)
+    }
+
     fn matches(&self, record: &Record) -> bool {
         record.session == self.source
             && record.execution_instance == self.instance
