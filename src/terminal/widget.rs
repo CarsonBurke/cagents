@@ -1,6 +1,8 @@
 mod accessibility;
 #[cfg(test)]
 mod accessibility_tests;
+#[cfg(test)]
+mod key_repeat_tests;
 mod links;
 mod preview;
 pub use accessibility::ReviewInputBarrier;
@@ -1127,6 +1129,9 @@ struct WidgetState {
     /// Whether the last `Escape` press was spent clearing a selection, so that
     /// its release is withheld from the child too.
     escape_cleared: bool,
+    /// Keys still down whose press this widget sent the child, which are the
+    /// ones whose repeats are the child's too.
+    child_keys: Vec<keyboard::key::Physical>,
     /// The screen the selection was made against, so that switching to or from
     /// the alternate screen drops it.
     alternate_screen: bool,
@@ -2652,7 +2657,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                     shell.capture_event();
                     return;
                 }
-                if state.selection.is_some() && is_escape(key) {
+                // A repeat is not a second Escape: the press it follows went
+                // to whatever closed before this, such as the context menu.
+                if state.selection.is_some() && is_escape(key) && !*repeat {
                     state.selection = None;
                     state.selecting = false;
                     state.selection_click = None;
@@ -2686,6 +2693,14 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 if !reaches_the_child(*modifiers) {
                     return;
                 }
+                // A repeat belongs to whoever took its press. When that was
+                // an overlay that has since closed, as Escape closes the
+                // context menu, or a chord or a selection here, the child
+                // holds no press for it and would take the repeat as one.
+                if *repeat && !state.child_keys.contains(physical_key) {
+                    shell.capture_event();
+                    return;
+                }
                 let input = key_press(
                     key,
                     modified_key,
@@ -2696,6 +2711,9 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 );
                 match self.handle.key(input) {
                     Ok(()) => {
+                        if !state.child_keys.contains(physical_key) {
+                            state.child_keys.push(*physical_key);
+                        }
                         if state.restart_blink() {
                             shell.request_redraw();
                         }
@@ -2711,6 +2729,10 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for TerminalWidget<Message
                 ..
             }) if self.model_focused => {
                 state.modifiers = map_iced_modifiers(*modifiers);
+                // A release whose press never went to the child is still
+                // sent below: the worker drops it, and knows better than this
+                // state which presses it wrote.
+                state.child_keys.retain(|held| held != physical_key);
                 if self.read_only {
                     shell.capture_event();
                     return;
