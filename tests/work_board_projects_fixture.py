@@ -107,6 +107,11 @@ class WorkBoardProjects(unittest.TestCase):
         self.assertIn("X-Ratelimit-Resource: graphql\n", limited.stdout)
         self.assertIn('"type":"RATE_LIMITED"', limited.stdout)
         self.assertIn("API rate limit already exceeded", limited.stderr)
+        # gh's own commands read GraphQL too.
+        for command in (("repo", "view", "--json", "nameWithOwner,url"), ("pr", "list", "--json", "number")):
+            refused = self.gh(project, *command, check=False)
+            self.assertEqual((refused.returncode, refused.stdout), (1, ""), command)
+            self.assertIn("GraphQL: API rate limit already exceeded", refused.stderr)
         # REST is a quota of its own.
         rest = self.gh(project, "api", "repos/octo-org/api-gateway/issues?creator=fixture&per_page=20")
         self.assertEqual(json.loads(rest.stdout)[0]["number"], 100)

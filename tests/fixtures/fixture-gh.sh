@@ -107,9 +107,11 @@ headers() {
 
 # Opt-in spent GraphQL quota: home/.config/fixture-forge-rate-limited holds
 # the Unix time it resets, or nothing for an hour after it was written. Until
-# then every GraphQL request fails as GitHub's does, whatever it asks, and
-# the app's other reads, over REST, still answer. Read on every call.
+# then every GraphQL request fails as GitHub's does, whatever it asks,
+# including gh's own `repo view` and `pr` commands, which read GraphQL; the
+# app's other reads, over REST, still answer. Read on every call.
 rate_limit_file=$config/fixture-forge-rate-limited
+include=false
 graphql_rate_limited() {
     [ -e "$rate_limit_file" ] || return 0
     reset=$(head -n 1 -- "$rate_limit_file" 2>/dev/null || :)
@@ -123,10 +125,15 @@ graphql_rate_limited() {
     [ "$(date +%s)" -lt "$reset" ] || return 0
     trace "api graphql rate-limited"
     # GitHub answers a spent GraphQL quota with 200 and a RATE_LIMITED
-    # error; gh prints the error and fails.
-    ! "$include" || headers '200 OK' graphql 0 "$reset"
-    printf '%s\n' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded for user ID 1."}]}'
-    printf '%s\n' 'gh: GraphQL: API rate limit already exceeded for user ID 1.' >&2
+    # error; `gh api` prints the response and its own message, and gh's
+    # other commands only theirs.
+    if [ "${1:-}" = api ]; then
+        ! "$include" || headers '200 OK' graphql 0 "$reset"
+        printf '%s\n' '{"errors":[{"type":"RATE_LIMITED","message":"API rate limit already exceeded for user ID 1."}]}'
+        printf '%s\n' 'gh: API rate limit already exceeded for user ID 1.' >&2
+    else
+        printf '%s\n' 'GraphQL: API rate limit already exceeded for user ID 1.' >&2
+    fi
     exit 1
 }
 
@@ -403,7 +410,7 @@ api() {
     if [ -z "$method" ]; then
         if "$fields"; then method=POST; else method=GET; fi
     fi
-    [ "$endpoint" != graphql ] || graphql_rate_limited
+    [ "$endpoint" != graphql ] || graphql_rate_limited api
     if [ "$endpoint" = graphql ] && [ -n "$search_all" ]; then
         # The Work board's authored listing: both searches name the
         # repository as repo:OWNER/NAME and the viewer as @me.
@@ -587,9 +594,10 @@ case ${1:-} in
         [ "${1:-}" = view ] || unsupported repo "$@"
         shift
         trace "repo view"
+        graphql_rate_limited
         repo_view "$@"
         ;;
-    pr) shift; pr "$@" ;;
+    pr) shift; graphql_rate_limited; pr "$@" ;;
     api) shift; api "$@" ;;
     *) unsupported "$@" ;;
 esac

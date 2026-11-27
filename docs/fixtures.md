@@ -321,7 +321,8 @@ To spend the account's GraphQL quota, write the Unix time it resets to
 after it was written. Until then every `gh api graphql` fails as GitHub's
 does: `X-Ratelimit-Remaining: 0` and the reset in its headers, a
 `RATE_LIMITED` error in its body, and gh's message on stderr. REST, a quota of
-its own, still answers, as does `gh auth status`. Remove the file, or let the
+its own, still answers, as does `gh auth status`; `gh repo view` and `gh pr`,
+which read GraphQL, fail with gh's own rate-limit message. Remove the file, or let the
 time pass, to give it back.
 
 For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
