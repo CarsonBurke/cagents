@@ -175,6 +175,8 @@ impl Cagents {
                     return self.phone_probe(true);
                 }
                 self.phone_ui.removing = None;
+                // The next opening shows details again only if they matter.
+                self.phone_ui.details = None;
                 if self
                     .phone_ui
                     .pairing
@@ -558,11 +560,14 @@ impl Cagents {
                     );
                 }
                 if let Some(blocker) = blocker.clone() {
+                    // Still checking is no problem yet.
+                    let caption = design::caption(blocker);
                     rows.push(
-                        inset(
-                            design::caption(blocker)
-                                .class(cosmic::theme::Text::Custom(design::warning_text)),
-                        )
+                        inset(if status.network.is_some() {
+                            caption.class(cosmic::theme::Text::Custom(design::warning_text))
+                        } else {
+                            caption
+                        })
                         .into(),
                     );
                 }
@@ -570,7 +575,7 @@ impl Cagents {
         }
         if let Some(network) = &status.network {
             // Details are for when something is wrong, or for whoever asks.
-            let shown = state.details.unwrap_or(blocker.is_some());
+            let shown = state.details.unwrap_or_else(|| unreachable(network));
             rows.push(design::horizontal_rule());
             rows.push(
                 crate::ui_controls::list_row(
@@ -721,7 +726,8 @@ fn column(rows: Vec<Element<'_, Message>>) -> Element<'_, Message> {
         .into()
 }
 
-/// Content that isn't a list row, set on the rows' text column edge.
+/// Content that isn't a list row, inset from the popover's edge as far as
+/// the rows' icons.
 fn inset<'a>(
     content: impl Into<Element<'a, Message>>,
 ) -> widget::Container<'a, Message, cosmic::Theme> {
@@ -749,15 +755,22 @@ fn muted<'a>(text: impl Into<std::borrow::Cow<'a, str>> + 'a) -> Element<'a, Mes
 /// How a phone would reach this computer, in a word or two: the summary
 /// beside "Connection details".
 fn reach(network: &host::Network) -> Element<'static, Message> {
-    let tailscale = matches!(network.tailscale, host::Tailscale::Connected { .. });
-    match (network.listening, tailscale, network.lan.is_empty()) {
-        (false, ..) | (true, false, true) => design::caption("Unreachable")
+    if unreachable(network) {
+        return design::caption("Unreachable")
             .class(cosmic::theme::Text::Custom(design::warning_text))
-            .into(),
-        (true, true, true) => muted("Tailscale"),
-        (true, false, false) => muted("Local network"),
-        (true, true, false) => muted("Tailscale · local network"),
+            .into();
     }
+    let tailscale = network.hosts().len() > network.lan.len();
+    muted(match (tailscale, network.lan.is_empty()) {
+        (true, true) => "Tailscale",
+        (false, _) => "Local network",
+        (true, false) => "Tailscale · local network",
+    })
+}
+
+/// Whether something the connection details show keeps a phone out.
+fn unreachable(network: &host::Network) -> bool {
+    !network.listening || network.host_key.is_none() || network.hosts().is_empty()
 }
 
 fn route_label(route: host::Route) -> &'static str {
@@ -871,30 +884,27 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Vec<Element
         };
         // A paired phone is shown, not chosen: a list row without an action
         // would draw as disabled.
-        let row = inset(
-            widget::row::with_children(vec![
-                toned(Icon::Phone, design::muted_icon_color),
-                widget::column::with_children(vec![
-                    design::body(phone.name.as_str()).into(),
-                    caption,
-                ])
-                .width(Length::Fill)
-                .into(),
-            ])
-            .spacing(space::S)
-            .align_y(Alignment::Center),
-        );
         rows.push(
-            widget::row::with_children(vec![
-                row.into(),
-                crate::ui_controls::icon_button(Icon::Delete, format!("Remove {}", phone.name))
-                    .on_press_maybe(
-                        (!state.busy).then(|| Message::Phone(Action::Remove(fingerprint.clone()))),
-                    )
+            inset(
+                widget::row::with_children(vec![
+                    toned(Icon::Phone, design::muted_icon_color),
+                    widget::column::with_children(vec![
+                        design::body(phone.name.as_str()).into(),
+                        caption,
+                    ])
+                    .width(Length::Fill)
                     .into(),
-            ])
-            .spacing(space::XXS)
-            .align_y(Alignment::Center)
+                    crate::ui_controls::icon_button(Icon::Delete, format!("Remove {}", phone.name))
+                        .compact()
+                        .on_press_maybe(
+                            (!state.busy)
+                                .then(|| Message::Phone(Action::Remove(fingerprint.clone()))),
+                        )
+                        .into(),
+                ])
+                .spacing(space::S)
+                .align_y(Alignment::Center),
+            )
             .into(),
         );
     }
@@ -966,12 +976,17 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
                     .lan
                     .iter()
                     .map(|address| value(address.clone()))
-                    .chain(
-                        network
-                            .blocked
-                            .iter()
-                            .map(|address| muted(format!("{address} · firewall blocks SSH"))),
-                    )
+                    .chain(network.blocked.iter().map(|address| {
+                        let note = format!("{address} · firewall blocks SSH");
+                        // Only a note while another way in works.
+                        if network.hosts().is_empty() {
+                            design::caption(note)
+                                .class(cosmic::theme::Text::Custom(design::warning_text))
+                                .into()
+                        } else {
+                            muted(note)
+                        }
+                    }))
                     .collect(),
             )
         },
@@ -1002,6 +1017,13 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
             .align_y(Alignment::Center)
             .into(),
         ));
+    } else {
+        rows.push(fact(
+            "Host key",
+            design::caption("Couldn't read")
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .into(),
+        ));
     }
     if !matches!(network.tailscale, host::Tailscale::Connected { .. }) && !network.lan.is_empty() {
         rows.push(muted(
@@ -1011,4 +1033,49 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
     widget::column::with_children(rows)
         .spacing(space::XS)
         .into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn network() -> host::Network {
+        host::Network {
+            name: "workstation".into(),
+            user: "dev".into(),
+            port: 22,
+            listening: true,
+            host_key: Some("SHA256:key".into()),
+            tailscale: host::Tailscale::Connected {
+                name: Some("workstation.ts.net".into()),
+                addresses: vec!["100.1.2.3".into()],
+            },
+            lan: Vec::new(),
+            blocked: vec!["192.168.1.20".into()],
+            only_tailscale: true,
+        }
+    }
+
+    #[test]
+    fn details_open_by_themselves_only_for_what_they_show() {
+        // A firewall that allows SSH only over Tailscale keeps nobody out
+        // while Tailscale connects.
+        assert!(!unreachable(&network()));
+        let mut off = network();
+        off.tailscale = host::Tailscale::NotConnected;
+        assert!(unreachable(&off));
+        // Connected, yet with no name or address a phone could use.
+        let mut nameless = network();
+        nameless.tailscale = host::Tailscale::Connected {
+            name: None,
+            addresses: Vec::new(),
+        };
+        assert!(unreachable(&nameless));
+        let mut keyless = network();
+        keyless.host_key = None;
+        assert!(unreachable(&keyless));
+        let mut stopped = network();
+        stopped.listening = false;
+        assert!(unreachable(&stopped));
+    }
 }
