@@ -2,8 +2,8 @@ use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
     mailbox::{
-        Delivery, Handed, Handoff, Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State,
-        To, short,
+        Delivery, Handed, Handoff, Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Party, Reach, Sent,
+        State, To, short,
     },
 };
 #[cfg(feature = "ui")]
@@ -260,7 +260,7 @@ fn delivery_json(handed: &Handed) -> Value {
 /// says a live conversation takes a message once idle; a limited one is idle
 /// yet takes nothing, so the notice reads as a correction.
 fn delivery_lines(handed: &Handed) -> String {
-    let mut lines = vec![sent_line(&handed.delivery.sent, handed.agent.as_ref())];
+    let mut lines = vec![sent_line(&handed.delivery, handed.agent.as_ref())];
     if let Some(Handoff::Run { agent, run, start }) = &handed.agent {
         if matches!(start, crate::agent_execution::Start::Sent { resumed: true }) {
             lines.push(
@@ -414,17 +414,38 @@ impl Arrival {
     }
 }
 
-fn sent_line(sent: &Sent, agent: Option<&Handoff>) -> String {
+fn sent_line(delivery: &Delivery, agent: Option<&Handoff>) -> String {
+    let sent = &delivery.sent;
     let message = &sent.message;
+    // The pending message addresses a lineage. The listing names the live
+    // session at send time, before any session has received the message.
+    let recipient = delivery
+        .recipient
+        .as_ref()
+        .filter(|member| !member.exited && sent.reach != Reach::Offline)
+        .map_or_else(
+            || message.to.label(),
+            |member| {
+                Party {
+                    lineage: message.to.lineage,
+                    session: Some(member.session.id),
+                    title: member
+                        .session
+                        .title
+                        .clone()
+                        .or_else(|| message.to.title.clone()),
+                }
+                .label()
+            },
+        );
     let what = if message.reply_to.is_some() {
         "Replied"
     } else {
         "Sent"
     };
     format!(
-        "{what} {} to {}; {}",
+        "{what} {} to {recipient}; {}",
         short(message.id),
-        message.to.label(),
         arrival_phrase(Arrival::of(sent, agent))
     )
 }
@@ -770,9 +791,12 @@ mod tests {
             created_ms: 0,
         };
         let line = sent_line(
-            &Sent {
-                message: message.clone(),
-                reach: Reach::Conversation,
+            &Delivery {
+                sent: Sent {
+                    message: message.clone(),
+                    reach: Reach::Conversation,
+                },
+                recipient: None,
             },
             None,
         );
@@ -785,9 +809,12 @@ mod tests {
         to_user.to = crate::agent_execution::mailbox::Party::user();
         assert!(
             sent_line(
-                &Sent {
-                    message: to_user,
-                    reach: Reach::Inbox,
+                &Delivery {
+                    sent: Sent {
+                        message: to_user,
+                        reach: Reach::Inbox,
+                    },
+                    recipient: None,
                 },
                 None,
             )
@@ -796,18 +823,20 @@ mod tests {
     }
 
     #[test]
-    fn a_limited_recipient_is_named_beside_the_sent_line() {
+    fn a_live_successor_is_named_in_the_sent_line_and_the_limit_notice() {
         use crate::agent_execution::directory::{
             Entry, Member, Relation, SessionAccount, Surface, UsageLimit,
         };
-        let id = TerminalId::new();
+        let first_session: TerminalId = "7ced022f-0000-4000-8000-000000000000".parse().unwrap();
+        let id: TerminalId = "d7f07b0d-0000-4000-8000-000000000000".parse().unwrap();
+        let lineage = crate::agent_execution::Lineage(first_session);
         let message = Message {
             id: crate::model::MessageId::new(),
             from: crate::agent_execution::mailbox::Party::user(),
             to: crate::agent_execution::mailbox::Party {
-                lineage: Some(crate::agent_execution::Lineage(id)),
-                session: Some(id),
-                title: None,
+                lineage: Some(lineage),
+                session: None,
+                title: Some("Previous title".into()),
             },
             reply_to: None,
             body: "hi".into(),
@@ -819,7 +848,7 @@ mod tests {
             id,
             surface: Surface::Chat,
             provider: Some(crate::agent::Provider::Claude),
-            title: None,
+            title: Some("Fix login".into()),
             channel: None,
             view_scope: None,
             channel_repository: None,
@@ -831,7 +860,7 @@ mod tests {
             project_name: None,
             delegation: None,
             relation: Relation::Peer,
-            lineage: crate::agent_execution::Lineage(id),
+            lineage,
         };
         let mut handed = Handed {
             delivery: Delivery {
@@ -857,7 +886,13 @@ mod tests {
         };
         let lines = delivery_lines(&handed);
         let (first, notice) = lines.split_once('\n').unwrap();
-        assert_eq!(first, sent_line(&handed.delivery.sent, None));
+        assert_eq!(
+            first,
+            format!(
+                "Sent {} to session d7f07b0d \"Fix login\"; it arrives as soon as that conversation is idle",
+                short(handed.delivery.sent.message.id)
+            )
+        );
         assert_eq!(
             notice,
             format!(
@@ -866,6 +901,9 @@ mod tests {
             )
         );
         let value = delivery_json(&handed);
+        assert_eq!(value["recipient"]["id"], json!(id));
+        assert_eq!(value["message"]["to"]["lineage"], json!(lineage));
+        assert_eq!(value["message"]["to"]["session"], Value::Null);
         assert_eq!(value["recipient"]["state"], "Limited");
         let cache = crate::agent_execution::directory::PromptCache {
             requested_at: 0,
@@ -930,11 +968,14 @@ mod tests {
             "{notice}"
         );
         handed.delivery.recipient.as_mut().unwrap().account = None;
-        assert_eq!(
-            delivery_lines(&handed),
-            sent_line(&handed.delivery.sent, None)
-        );
+        assert_eq!(delivery_lines(&handed), sent_line(&handed.delivery, None));
         assert!(delivery_json(&handed)["notice"].is_null());
+
+        handed.delivery.sent.reach = Reach::Offline;
+        handed.delivery.sent.message.to.title = None;
+        handed.delivery.recipient.as_mut().unwrap().exited = true;
+        let line = delivery_lines(&handed);
+        assert!(line.contains("to session 7ced022f;"), "{line}");
     }
 
     #[test]
@@ -1161,9 +1202,13 @@ mod tests {
                 },
                 reach: Reach::Conversation,
             };
-            let receipt = read_sent_line(&sent_line(&sent, Some(&handoff))).unwrap();
+            let delivery = Delivery {
+                sent,
+                recipient: None,
+            };
+            let receipt = read_sent_line(&sent_line(&delivery, Some(&handoff))).unwrap();
             assert_eq!(receipt.arrival, arrival);
-            assert_eq!(receipt.message, short(sent.message.id));
+            assert_eq!(receipt.message, short(delivery.sent.message.id));
         }
     }
 
@@ -1191,9 +1236,12 @@ mod tests {
             (Reach::Offline, Arrival::NextSession),
         ] {
             let line = sent_line(
-                &Sent {
-                    message: message.clone(),
-                    reach,
+                &Delivery {
+                    sent: Sent {
+                        message: message.clone(),
+                        reach,
+                    },
+                    recipient: None,
                 },
                 None,
             );
