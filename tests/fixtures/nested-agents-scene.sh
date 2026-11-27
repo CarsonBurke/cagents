@@ -123,14 +123,21 @@ if [ "$mode" = strip ]; then
     "$ne" drive key Return >/dev/null 2>&1
     sleep 4
     shot strip-main"$layout"
+    # The lead's tab, named Conversation before it was Main, reads best
+    # while it is the one shown.
+    lead=$(lowest 'Main|Conversation')
     tab=$(lowest 'Audit ?retry')
     if [ -n "$tab" ]; then "$ne" drive click "$tab" >/dev/null 2>&1; else log "no Audit tab to open"; fi
     sleep 2
     shot strip-selected"$layout"
-    # The lead's tab, named Conversation before it was Main.
-    tab=$(lowest Main)
-    [ -n "$tab" ] || tab=$(lowest Conversation)
-    if [ -n "$tab" ]; then "$ne" drive click "$tab" >/dev/null 2>&1; else log "no lead tab to return to"; fi
+    # The strip moves up for the open agent's heading; the lead's tab is
+    # level with the agent's.
+    tab=$(lowest 'Audit ?retry')
+    if [ -n "$lead" ] && [ -n "$tab" ]; then
+        "$ne" drive click "${lead%,*},${tab#*,}" >/dev/null 2>&1
+    else
+        log "no lead tab to return to"
+    fi
     sleep 2
     # Scroll up over the transcript, then let the turn go on below.
     transcript=$(printf '%s' "$composer" | awk -F, '{printf "%d,%d", $1, $2 / 3}')
