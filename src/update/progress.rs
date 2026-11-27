@@ -284,6 +284,7 @@ fn a_follower_wakes_when_a_later_worker_releases_the_lease() {
     }
     changes.follow_lease();
     changes.follow_lease();
+    assert!(changes.following_lease.load(Ordering::Acquire));
     assert!(quiet(&changes), "nothing reports while the worker holds on");
     drop(worker);
     let started = Instant::now();
