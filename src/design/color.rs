@@ -205,8 +205,27 @@ pub fn sunken(theme: &Theme) -> Color {
 /// surface vanished into the pane, which left a small fill looking like a
 /// stray dot with nothing to measure it against.
 pub fn track(theme: &Theme) -> Color {
-    mix(base(theme), theme.current_container().on.into(), 0.18)
+    mix(
+        base(theme),
+        theme.current_container().on.into(),
+        TRACK_STRENGTH,
+    )
 }
+
+/// The [`track`] as translucent ink rather than a solid mix with the pane.
+///
+/// Over the pane it draws the same colour as [`track`]. An activity spinner
+/// sits on rows, tabs and badges whose fills differ from the pane, and a ring
+/// premixed with the pane would show there as a ring of the wrong surface;
+/// translucent ink stays the same faint tint over whatever is underneath.
+pub fn track_ink(theme: &Theme) -> Color {
+    let mut ink: Color = theme.current_container().on.into();
+    ink.a *= TRACK_STRENGTH;
+    ink
+}
+
+/// How far a gauge's unfilled ring leans from its surface toward the ink.
+const TRACK_STRENGTH: f32 = 0.18;
 
 /// The accent at reading strength: enough to claim a surface as the user's
 /// own without turning their message into a colored block.
