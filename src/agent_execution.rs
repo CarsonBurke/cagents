@@ -816,7 +816,7 @@ pub enum Reply {
     },
     Handed(mailbox::Handed),
     Context(directory::Context),
-    Stopped(Vec<resume::Stopped>),
+    Stopped(resume::StoppedSessions),
     Resumed(resume::Resumed),
 }
 

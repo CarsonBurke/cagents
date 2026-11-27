@@ -22,6 +22,18 @@ pub enum Scope {
     Channel(Option<ChannelId>),
 }
 
+/// What a [`super::Operation::Stopped`] read finds.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StoppedSessions {
+    /// The conversations [`super::Operation::Resume`] may reopen, one for
+    /// each lineage, the most recently active first.
+    pub sessions: Vec<Stopped>,
+    /// Stopped chats in scope that only their pane in the app can reopen,
+    /// such as one paired with a terminal or one whose conversation the
+    /// daemon never learned.
+    pub in_app_only: usize,
+}
+
 /// A session whose provider stopped, which [`super::Operation::Resume`] may
 /// reopen.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -31,6 +43,9 @@ pub struct Stopped {
     pub title: Option<String>,
     /// The open agent this conversation belongs to, if any.
     pub agent: Option<AgentId>,
+    /// The provider's last reported failure, such as a sign-in that needs
+    /// attention, in one line.
+    pub failure: Option<String>,
 }
 
 /// What became of one resume.
