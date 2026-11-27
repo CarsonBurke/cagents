@@ -12311,7 +12311,8 @@ fn each_working_hunk_stages_as_its_own_index_patch() {
             revert: true
         }
     );
-    for (index, hunk) in model.hunks.iter().enumerate() {
+    for index in 0..model.hunks.len() {
+        let hunk = &model.hunk_ref(index).unwrap();
         let Some(HunkStaging::Patch(request)) = runtime.hunk_staging(hunk, true) else {
             panic!("hunk {index} stages as a patch");
         };
@@ -12325,21 +12326,44 @@ fn each_working_hunk_stages_as_its_own_index_patch() {
         // Staging is not unstaging.
         assert_eq!(runtime.hunk_staging(hunk, false), None);
     }
+    // A hunk with the same lines from another comparison names nothing here.
+    let elsewhere = crate::diff_view::build_diff(before, after);
+    assert_eq!(elsewhere.hunks, model.hunks);
+    assert_eq!(
+        runtime.hunk_staging(&elsewhere.hunk_ref(0).unwrap(), true),
+        None
+    );
     // An admitted Git mutation retires every hunk action until the refresh
     // after it: reverting a hunk it is staging would split index and file.
     assert!(runtime.can_revert_hunks());
     runtime.index_mutation_started();
-    assert_eq!(runtime.hunk_staging(&model.hunks[0], true), None);
+    assert_eq!(
+        runtime.hunk_staging(&model.hunk_ref(0).unwrap(), true),
+        None
+    );
     assert!(!runtime.can_revert_hunks());
-    runtime.index_mutation_in_flight = false;
+    runtime.index_mutation_finished();
+    assert!(runtime.can_revert_hunks());
     runtime.source_surface = SourceSurface::Editor;
     drop(runtime.update(RepositoryAction::EditorAction {
         card,
         action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
     }));
     assert_ne!(buffer_text(&runtime), after);
-    assert_eq!(runtime.hunk_staging(&model.hunks[0], true), None);
+    assert_eq!(
+        runtime.hunk_staging(&model.hunk_ref(0).unwrap(), true),
+        None
+    );
     assert!(!runtime.can_revert_hunks());
+
+    // A refresh for any other reason, such as a save or Refresh, does not
+    // end a mutation; only the host's report of its completion does.
+    let (mut runtime, _) = working_diff_runtime(card, before, after);
+    runtime.index_mutation_started();
+    drop(runtime.refresh_after_mutation(card));
+    assert!(runtime.index_mutation_in_flight);
+    runtime.index_mutation_finished();
+    assert!(!runtime.index_mutation_in_flight);
 }
 
 /// Reverting one hunk edits the buffer, CR and missing final newline
@@ -12358,7 +12382,7 @@ fn reverting_a_hunk_is_one_undoable_buffer_edit() {
         let (mut runtime, _) = working_diff_runtime(card, before, after);
         let model = runtime.current_diff_model().unwrap().clone();
         let last = model.hunks.len() - 1;
-        let hunk = model.hunks[last].clone();
+        let hunk = model.hunk_ref(last).unwrap();
         drop(runtime.update(RepositoryAction::RevertHunk { card, hunk }));
         let (span, restored) = model.hunk_reversal(last).unwrap();
         let mut expected = after.to_owned();
@@ -12394,7 +12418,9 @@ fn staged_hunks_unstage_and_a_new_file_stages_whole() {
             revert: false
         }
     );
-    let Some(HunkStaging::Patch(request)) = runtime.hunk_staging(&staged.hunks[0], false) else {
+    let Some(HunkStaging::Patch(request)) =
+        runtime.hunk_staging(&staged.hunk_ref(0).unwrap(), false)
+    else {
         panic!("a staged hunk unstages as a patch");
     };
     assert_eq!(
@@ -12416,7 +12442,7 @@ fn staged_hunks_unstage_and_a_new_file_stages_whole() {
         DiffState::ready(staged_text_diff(staged.clone())),
     );
     assert!(matches!(
-        runtime.hunk_staging(&staged.hunks[0], false),
+        runtime.hunk_staging(&staged.hunk_ref(0).unwrap(), false),
         Some(HunkStaging::File(selection)) if selection.path.as_os_str() == "notes.txt"
     ));
 }

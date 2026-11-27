@@ -4,7 +4,7 @@ use std::{
     collections::HashMap,
     ops::Range,
     path::Path,
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Weak},
 };
 
 use imara_diff::{Algorithm, Diff, InternedInput};
@@ -56,6 +56,17 @@ pub struct SplitDiffRow {
 pub struct DiffHunk {
     pub before: Range<u32>,
     pub after: Range<u32>,
+}
+
+/// One hunk of one comparison, as an action drawn from it names it.
+///
+/// It holds the comparison's texts weakly, which keeps their allocations
+/// from being reused, so it never matches a later comparison that merely has
+/// a hunk with the same line ranges.
+#[derive(Debug, Clone)]
+pub struct HunkRef {
+    pub hunk: DiffHunk,
+    texts: [Weak<str>; 2],
 }
 
 /// The side of a comparison a hunk patch is checked against and changes.
@@ -911,6 +922,28 @@ fn measure_diff(
 impl DiffModel {
     pub fn is_empty(&self) -> bool {
         self.additions == 0 && self.deletions == 0
+    }
+
+    /// Names hunk `index` of this comparison for an action to carry.
+    pub fn hunk_ref(&self, index: usize) -> Option<HunkRef> {
+        Some(HunkRef {
+            hunk: self.hunks.get(index)?.clone(),
+            texts: [Arc::downgrade(&self.before), Arc::downgrade(&self.after)],
+        })
+    }
+
+    /// Which of this comparison's hunks `hunk` names, if it was drawn from
+    /// this comparison rather than an earlier one.
+    pub fn hunk_index(&self, hunk: &HunkRef) -> Option<usize> {
+        let [before, after] = &hunk.texts;
+        (std::ptr::addr_eq(before.as_ptr(), Arc::as_ptr(&self.before))
+            && std::ptr::addr_eq(after.as_ptr(), Arc::as_ptr(&self.after)))
+        .then(|| {
+            self.hunks
+                .iter()
+                .position(|candidate| *candidate == hunk.hunk)
+        })
+        .flatten()
     }
 
     /// Whether the comparison creates or deletes the file, so that its one

@@ -1672,6 +1672,9 @@ impl Editor {
         {
             navigation.restore_expanded_display_paths(paths);
         }
+        if mutation.is_some() {
+            runtime.index_mutation_started();
+        }
         let task = repository_task(runtime.initial_load(id));
         let mut review = pull_request_review::State::new(
             Arc::new(GitHubService::system("gh")),
@@ -2970,7 +2973,7 @@ impl Editor {
     fn stage_hunk(
         &mut self,
         id: CardId,
-        hunk: &cagents_ui_kit::diff_view::DiffHunk,
+        hunk: &cagents_ui_kit::diff_view::HunkRef,
         stage: bool,
     ) -> Task<Message> {
         let Some(staging) = self
@@ -3044,6 +3047,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
+                tab.runtime.index_mutation_finished();
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
                 }

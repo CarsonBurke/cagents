@@ -40,8 +40,8 @@ use cosmic::{
 use crate::{
     design::space,
     diff_view::{
-        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffHunk, DiffMode, DiffModel, DiffPalette, DiffRowKind,
-        DiffSyntax, InlineDiffRow, PatchTarget, RenderedDiff, SplitDiffRow, SyntaxSpan,
+        DIFF_FONT_SIZE, DIFF_LINE_HEIGHT, DiffMode, DiffModel, DiffPalette, DiffRowKind,
+        DiffSyntax, HunkRef, InlineDiffRow, PatchTarget, RenderedDiff, SplitDiffRow, SyntaxSpan,
         build_document_diff, diff_fold_background, diff_gutter_text, diff_row_background,
         load_repository_diff, styled_line_spans,
     },
@@ -758,14 +758,14 @@ pub enum RepositoryAction {
     /// [`RepositoryRuntime::hunk_staging`] says what to run.
     StageHunk {
         card: CardId,
-        hunk: DiffHunk,
+        hunk: HunkRef,
         stage: bool,
     },
     /// Gives one working-tree hunk back the index's lines, as one edit of
     /// the buffer that Undo takes back.
     RevertHunk {
         card: CardId,
-        hunk: DiffHunk,
+        hunk: HunkRef,
     },
     ApplySourceSurface {
         card: CardId,
@@ -2854,8 +2854,8 @@ pub struct RepositoryRuntime {
     file_list_refresh_queued: bool,
     background_file_refresh: bool,
     mutation_refresh_pending: bool,
-    /// A Git mutation of this worktree has been admitted and its refresh has
-    /// not begun, so the comparison on screen may already be out of date.
+    /// A Git mutation of this worktree has been admitted and has not
+    /// finished, so the comparison on screen may already be out of date.
     index_mutation_in_flight: bool,
     /// Last comparison stays readable while Git refreshes this file, or
     /// while it is rebuilt in a new presentation.
@@ -4020,6 +4020,9 @@ impl RepositoryRuntime {
         if self.descriptor.worktree != view.worktree {
             self.original_editor_root = None;
             self.original_read_attested = false;
+            // The host tracks mutations per worktree, and this pane has left
+            // the one it was told about.
+            self.index_mutation_in_flight = false;
         }
         self.descriptor = view;
         self.retained_viewports.clear();
@@ -4095,7 +4098,6 @@ impl RepositoryRuntime {
     /// Refreshes Git's status and mutable comparisons without replacing the
     /// open buffer or changing the identity of its loads and saves.
     pub fn refresh_after_mutation(&mut self, card: CardId) -> Task<RepositoryAction> {
-        self.index_mutation_in_flight = false;
         self.mutation_refresh_pending = true;
         if let Some(path) = self.selected.as_ref().map(|file| file.path.clone())
             && let Some(index) = self.diffs.iter().position(|(basis, state)| {
@@ -5647,11 +5649,17 @@ impl RepositoryRuntime {
     /// A live comparison lags typing by its debounce; a hunk taken from a
     /// superseded one would name lines that have since moved.
     /// Records that a Git mutation of this worktree was admitted. Hunk
-    /// actions stand down until [`Self::refresh_after_mutation`] re-reads
-    /// what it left behind: reverting a hunk the mutation is staging would
+    /// actions stand down until the host reports it finished and the refresh
+    /// after it lands: reverting a hunk the mutation is staging would
     /// otherwise leave the index and the file disagreeing.
     pub fn index_mutation_started(&mut self) {
         self.index_mutation_in_flight = true;
+    }
+
+    /// Records that the admitted Git mutation finished, whatever it did. The
+    /// host follows this with [`Self::refresh_after_mutation`].
+    pub fn index_mutation_finished(&mut self) {
+        self.index_mutation_in_flight = false;
     }
 
     fn hunks_current(&self) -> bool {
@@ -5675,13 +5683,13 @@ impl RepositoryRuntime {
     /// A file that one side lacks is a single hunk that creates or deletes
     /// it, which the whole-file action already records with the right mode
     /// and filters; every other hunk is a patch applied to the index alone.
-    pub fn hunk_staging(&self, hunk: &DiffHunk, stage: bool) -> Option<HunkStaging> {
+    pub fn hunk_staging(&self, hunk: &HunkRef, stage: bool) -> Option<HunkStaging> {
         use crate::repository::{IndexPatchRequest, RepoPath};
         if !self.can_stage_hunks() || self.hunk_offers().stage != Some(stage) {
             return None;
         }
         let model = self.current_diff_model()?;
-        let index = model.hunks.iter().position(|candidate| candidate == hunk)?;
+        let index = model.hunk_index(hunk)?;
         if model.changes_existence() {
             return self
                 .selected_staging_selection(stage)
@@ -5703,7 +5711,7 @@ impl RepositoryRuntime {
         }))
     }
 
-    fn revert_hunk(&mut self, card: CardId, hunk: &DiffHunk) -> Task<RepositoryAction> {
+    fn revert_hunk(&mut self, card: CardId, hunk: &HunkRef) -> Task<RepositoryAction> {
         if !self.can_revert_hunks() {
             return Task::none();
         }
@@ -5711,9 +5719,7 @@ impl RepositoryRuntime {
             return Task::none();
         };
         let Some((span, restored)) = model
-            .hunks
-            .iter()
-            .position(|candidate| candidate == hunk)
+            .hunk_index(hunk)
             .and_then(|index| model.hunk_reversal(index))
         else {
             return Task::none();
@@ -12699,7 +12705,7 @@ fn diff_model_view<'a>(
                     .change_starts(runtime.diff_mode)
                     .binary_search(&row)
                     .ok()
-                    .and_then(|hunk| model.hunks.get(hunk));
+                    .and_then(|hunk| model.hunk_ref(hunk));
                 let code = match hunk {
                     Some(hunk) => hunk_controls(card, runtime, hunk, code, typography),
                     None => code,
@@ -12794,7 +12800,7 @@ fn diff_model_view<'a>(
 fn hunk_controls<'a>(
     card: CardId,
     runtime: &RepositoryRuntime,
-    hunk: &DiffHunk,
+    hunk: HunkRef,
     code: Element<'a, RepositoryAction>,
     typography: DiffTypography,
 ) -> Element<'a, RepositoryAction> {

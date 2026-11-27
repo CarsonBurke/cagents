@@ -8540,6 +8540,12 @@ impl Cagents {
         {
             runtime.restore_navigation(navigation);
         }
+        if self
+            .source_control_mutations
+            .contains_key(&runtime.descriptor.worktree)
+        {
+            runtime.index_mutation_started();
+        }
         let load = repository_task(runtime.initial_load(card));
         self.cards
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
@@ -20743,7 +20749,22 @@ impl Cagents {
                 operation,
                 report,
                 committed,
-            } => handled!(self.source_control_mutated(key, operation, report, committed)),
+            } => {
+                if self
+                    .source_control_mutations
+                    .get(&key.canonical_path)
+                    .is_some_and(|mutation| mutation.id == operation)
+                {
+                    for runtime in self.cards.values_mut() {
+                        if let CardRuntime::Repository(runtime) = runtime
+                            && runtime.descriptor.worktree == key.canonical_path
+                        {
+                            runtime.index_mutation_finished();
+                        }
+                    }
+                }
+                handled!(self.source_control_mutated(key, operation, report, committed))
+            }
         };
         self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
         task
