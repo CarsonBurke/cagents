@@ -10222,6 +10222,15 @@ mod tests {
 
     #[test]
     fn a_slow_spawn_returns_its_original_descriptor_and_keeps_inventory_edges() {
+        check_spawn_replies(false);
+    }
+
+    #[test]
+    fn a_spawn_reads_queued_acknowledgement_and_replay_after_peer_shutdown() {
+        check_spawn_replies(true);
+    }
+
+    fn check_spawn_replies(close_after_reply: bool) {
         let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
@@ -10280,8 +10289,11 @@ mod tests {
                 }
             );
             assert_eq!(spawn.proof, Some(peer_proof.clone()));
-            // The holder can take longer than the ordinary RPC budget.
-            thread::sleep(ordinary_budget::QUICK + Duration::from_millis(100));
+            if !close_after_reply {
+                // The holder can take longer than the ordinary RPC budget.
+                thread::sleep(ordinary_budget::QUICK + Duration::from_millis(100));
+            }
+            let mut replies = Vec::new();
             for message in [
                 ServerMessage::TerminalCreated {
                     terminal: TerminalDescriptor::relaunchable(
@@ -10304,7 +10316,7 @@ mod tests {
                 let request_id =
                     matches!(message, ServerMessage::Response { .. }).then_some(spawn.request_id);
                 write_frame(
-                    &mut server_stream,
+                    &mut replies,
                     &ServerEnvelope {
                         version: PROTOCOL_VERSION,
                         request_id,
@@ -10314,11 +10326,19 @@ mod tests {
                 )
                 .unwrap();
             }
-            assert!(
-                read_frame::<ClientEnvelope>(&mut server_stream)
-                    .unwrap()
-                    .is_none()
-            );
+            // Queue the acknowledgement and replay in the same write before
+            // closing, as a daemon can do at the end of an exchange.
+            server_stream.write_all(&replies).unwrap();
+            if close_after_reply {
+                server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+                drop(server_stream);
+            } else {
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
+            }
         });
 
         let mut client = ControlClient::from_stream(client_stream).unwrap();
@@ -10332,14 +10352,21 @@ mod tests {
             client.next_created_terminal().unwrap().session.id,
             elsewhere
         );
-        assert_eq!(
-            client.stream.read_timeout().unwrap(),
-            Some(ordinary_budget::QUICK)
-        );
-        assert_eq!(
-            client.stream.write_timeout().unwrap(),
-            Some(ordinary_budget::QUICK)
-        );
+        if close_after_reply {
+            assert!(matches!(
+                client.read_envelope(),
+                Err(ControlError::ConnectionClosed)
+            ));
+        } else {
+            assert_eq!(
+                client.stream.read_timeout().unwrap(),
+                Some(ordinary_budget::QUICK)
+            );
+            assert_eq!(
+                client.stream.write_timeout().unwrap(),
+                Some(ordinary_budget::QUICK)
+            );
+        }
         drop(client);
         server.join().unwrap();
     }
