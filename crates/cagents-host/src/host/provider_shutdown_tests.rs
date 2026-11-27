@@ -7,7 +7,10 @@ use crate::{
         runtime::Handle,
     },
     daemon::holder_registry::{self as registry, Kind, Process},
-    model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+    model::{
+        HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, TerminalContinuity,
+        TerminalId, TerminalSession,
+    },
     terminal::{TerminalConfig, TerminalHandle},
 };
 use std::{
@@ -20,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
     time::{Duration, Instant},
 };
+use uuid::Uuid;
 
 const TEST: &str =
     "host::provider_shutdown_tests::cleanup_refusal_is_reported_and_healthy_owners_still_stop";
