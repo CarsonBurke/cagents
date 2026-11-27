@@ -25776,6 +25776,76 @@ fn a_new_thread_skips_a_turned_off_provider() {
     assert_eq!(app.preferred_chat_provider(), Provider::Antigravity);
 }
 
+/// A new conversation starts on a provider Accounts found installed where
+/// this window's conversations run, as a device window's device (#4377).
+#[test]
+fn a_new_thread_skips_a_provider_whose_cli_is_missing() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.account_ui.set_cli_for_test(Provider::Codex, false);
+    app.account_ui.set_cli_for_test(Provider::Claude, true);
+    assert_eq!(app.preferred_chat_provider(), Provider::Claude);
+    assert!(app.no_chat_provider_note().is_none());
+    // Nor does a conversation still open on the missing one choose it.
+    let _ = live_chat_for_provider(&mut app, Provider::Codex, Some(KNOWN_THREAD));
+    assert_eq!(app.available_chat_provider(), Some(Provider::Claude));
+    // Not knowing yet is not absence.
+    let mut unknown = crate::app::tests::context_inspector_test_app(false);
+    assert_eq!(unknown.available_chat_provider(), Some(Provider::Codex));
+    // With nothing installed, the start page says so.
+    for provider in Provider::ALL {
+        unknown.account_ui.set_cli_for_test(provider, false);
+    }
+    assert_eq!(unknown.available_chat_provider(), None);
+    assert_eq!(
+        unknown.no_chat_provider_note().as_deref(),
+        Some(
+            "No agent you use is installed on this computer. Install one there, such as Claude Code or Codex, then refresh Agent accounts."
+        )
+    );
+}
+
+/// The daemon's report of a missing provider CLI names, in a draft, where
+/// it is missing and the provider to choose instead (#4377).
+#[test]
+fn a_draft_whose_provider_is_missing_names_one_to_choose_instead() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.account_ui.set_cli_for_test(Provider::Codex, false);
+    app.account_ui.set_cli_for_test(Provider::Claude, true);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Codex);
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure::retry(
+            chat::failure::provider_not_installed("codex"),
+        )),
+    );
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.choosing());
+    assert_eq!(runtime.composer.text().trim(), "hello");
+    assert_eq!(
+        runtime.error.as_deref(),
+        Some(
+            "Codex isn't installed on this computer. Choose Claude Code in the model menu, or install Codex there."
+        )
+    );
+
+    // Where Accounts found the CLI, only the PATH agents start with lacks
+    // it, which the daemon's own words say.
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.account_ui.set_cli_for_test(Provider::Codex, true);
+    let (card, target) = starting_chat_for_provider(&mut app, Provider::Codex);
+    let report = chat::failure::provider_not_installed("codex");
+    answer_start(
+        &mut app,
+        target,
+        Err(chat::StartFailure::retry(report.clone())),
+    );
+    assert_eq!(
+        chat_runtime(&app, card).error.as_deref(),
+        Some(report.as_str())
+    );
+}
+
 /// An ACP conversation's current sign-in or no-allowance failure has the
 /// account's status chip read again, as a usage limit does for Claude and
 /// Codex; a notice from history alone does not.

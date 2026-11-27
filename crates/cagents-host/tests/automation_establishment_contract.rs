@@ -429,8 +429,7 @@ impl Fixture {
             .as_ref()
             .ok_or("startup failure lost its original diagnostic")?;
         require(
-            diagnostic
-                == "Provider executable claude is not executable in the preserved launch environment",
+            *diagnostic == cagents::chat::failure::provider_not_installed("claude"),
             format!("missing executable lost its launch-validation diagnostic: {diagnostic}"),
         )?;
         require(

@@ -2154,10 +2154,9 @@ fn preflight_inner(
                 && std::ffi::CString::new(path.as_os_str().as_bytes())
                     .is_ok_and(|path| unsafe { libc::access(path.as_ptr(), libc::X_OK) } == 0)
         }) {
-            return Err(SetupError::Unavailable(format!(
-                "Provider executable {} is not executable in the preserved launch environment",
-                spec.program
-            )));
+            return Err(SetupError::Unavailable(
+                crate::chat::failure::provider_not_installed(&spec.program),
+            ));
         }
     }
     let mut queued = 0usize;

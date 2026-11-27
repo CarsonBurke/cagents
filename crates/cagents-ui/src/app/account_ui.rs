@@ -236,6 +236,18 @@ impl State {
         (state.owner, state.start_probe(trigger, now))
     }
 
+    /// Records what discovery found for `provider`'s CLI, with its accounts
+    /// present or not to match.
+    #[cfg(test)]
+    pub(in crate::app) fn set_cli_for_test(&mut self, provider: Provider, installed: bool) {
+        self.installed.insert(provider, installed);
+        for state in self.accounts.iter_mut() {
+            if state.account.provider == provider {
+                state.present = installed;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
         self.account(id)?.pending_probe.clone()
@@ -784,10 +796,25 @@ impl State {
         self.catalogs.get(&provider)
     }
 
-    /// Whether a new conversation can be started on `provider`: it has
-    /// listed its models before, or one of its accounts has a CLI to run.
+    /// Whether the last discovery found no CLI for `provider` where this
+    /// window's conversations run: on its device, for a device window.
+    /// Unknown until discovery answers, which is not absence.
+    pub(super) fn cli_missing(&self, provider: Provider) -> bool {
+        self.cli_installed(provider) == Some(false)
+    }
+
+    /// Whether the last discovery found a CLI for `provider`, if it has
+    /// answered.
+    pub(super) fn cli_installed(&self, provider: Provider) -> Option<bool> {
+        self.installed.get(&provider).copied()
+    }
+
+    /// Whether a new conversation can be started on `provider`: its CLI is
+    /// not known to be missing, and it has listed its models before or one
+    /// of its accounts has a CLI to run.
     pub(super) fn offers(&self, provider: Provider) -> bool {
         self.uses(provider)
+            && !self.cli_missing(provider)
             && (self
                 .catalog(provider)
                 .is_some_and(|catalog| !catalog.models.is_empty())
