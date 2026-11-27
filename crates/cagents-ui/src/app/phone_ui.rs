@@ -863,13 +863,27 @@ fn phones_section<'a>(state: &'a State, status: &'a host::Status) -> Vec<Element
                 .as_ref()
                 .map(|path| format!("Runs {path}, which no longer exists. Pair it again."))
         };
-        let row = crate::ui_controls::list_row(Some(Icon::Phone), phone.name.as_str());
-        let row = match warning {
-            Some(warning) => row.caption_element(
-                design::caption(warning).class(cosmic::theme::Text::Custom(design::warning_text)),
-            ),
-            None => row.caption(short_fingerprint(&fingerprint)),
+        let caption: Element<'_, Message> = match warning {
+            Some(warning) => design::caption(warning)
+                .class(cosmic::theme::Text::Custom(design::warning_text))
+                .into(),
+            None => muted(short_fingerprint(&fingerprint)),
         };
+        // A paired phone is shown, not chosen: a list row without an action
+        // would draw as disabled.
+        let row = inset(
+            widget::row::with_children(vec![
+                toned(Icon::Phone, design::muted_icon_color),
+                widget::column::with_children(vec![
+                    design::body(phone.name.as_str()).into(),
+                    caption,
+                ])
+                .width(Length::Fill)
+                .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center),
+        );
         rows.push(
             widget::row::with_children(vec![
                 row.into(),
