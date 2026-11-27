@@ -472,8 +472,9 @@ fn leave(
         let (to, reply_to) = match &outgoing.to {
             To::Session(handle) => (
                 Some(
-                    resolve(&model.agents, &live, &lineage_of, handle)
-                        .map_err(|error| stopped(&listing, handle).unwrap_or(error))?,
+                    resolve(&model.agents, &live, &lineage_of, handle).map_err(|error| {
+                        stopped(&listing, &origin, &model.agents, handle).unwrap_or(error)
+                    })?,
                 ),
                 None,
             ),
@@ -560,8 +561,14 @@ fn recipient(listing: &directory::Listing, lineage: Lineage) -> Option<Member> {
 }
 
 /// Why `handle` names no live session when it names one whose provider
-/// exited: such a session cannot take a message until it is resumed.
-fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
+/// exited: such a session cannot take a message until it is resumed. The
+/// command is offered only to a sender `origin` that may resume it.
+fn stopped(
+    listing: &directory::Listing,
+    origin: &Origin,
+    agents: &[crate::agent_execution::Agent],
+    handle: &str,
+) -> Option<String> {
     let handle = handle.to_ascii_lowercase();
     if handle.len() < MIN_HANDLE {
         return None;
@@ -578,10 +585,16 @@ fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
     if let Some(failure) = &member.failure {
         reason.push_str(&format!(" ({failure})"));
     }
-    reason.push_str(&format!(
-        ". Resume its conversation first with `cagents resume {}`, or message another session from `cagents sessions --all`",
-        member.session.id
-    ));
+    let id = member.session.id;
+    if super::resume::may_resume(origin, super::resume::open_agent(agents, id)) {
+        reason.push_str(&format!(
+            ". Resume its conversation first with `cagents resume {id}`, or message another session from `cagents sessions --all`"
+        ));
+    } else {
+        reason.push_str(&format!(
+            ". The person can resume its conversation with `cagents resume {id}`; message another session from `cagents sessions --all` meanwhile"
+        ));
+    }
     Some(reason)
 }
 
