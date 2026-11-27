@@ -634,15 +634,58 @@ fn repository(request: crate::repository::RepositoryRequest) -> Result<String, S
     let _guard = lock
         .as_ref()
         .map(|lock| lock.lock().unwrap_or_else(|poison| poison.into_inner()));
-    let reply = request
-        .run(&RepositoryService::system("git"), &CancellationToken::new())
-        .map_err(|error| error.to_string())?
-        .bounded(MAX_REMOTE_DIFF_SIDE_BYTES);
+    let cancellation = CancellationToken::new();
+    let reply = if matches!(&request, crate::repository::RepositoryRequest::Push(_)) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let service =
+            RepositoryService::new("git", std::sync::Arc::new(DevicePushExecutor { deadline }));
+        request.run(&service, &cancellation)
+    } else {
+        request.run(&RepositoryService::system("git"), &cancellation)
+    }
+    .map_err(|error| error.to_string())?
+    .bounded(MAX_REMOTE_DIFF_SIDE_BYTES);
     let encoded = serde_json::to_string(&reply).map_err(|error| error.to_string())?;
     if encoded.len() > MAX_DEVICE_IMAGE_BYTES {
         return Err(too_large.into());
     }
     Ok(encoded)
+}
+
+/// Bound the device's mutation lock across the push and every reconciliation
+/// command, even those that deliberately use a fresh cancellation token.
+#[cfg(feature = "host")]
+struct DevicePushExecutor {
+    deadline: std::time::Instant,
+}
+
+#[cfg(feature = "host")]
+impl crate::process::ProcessExecutor for DevicePushExecutor {
+    fn execute(
+        &self,
+        command: &crate::process::CommandSpec,
+        cancellation: &crate::process::CancellationToken,
+    ) -> Result<crate::process::ProcessOutput, crate::process::ProcessFailure> {
+        use crate::process::{ProcessFailureKind, SystemProcessExecutor, process_failure};
+        let remaining = self
+            .deadline
+            .saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(process_failure(
+                command,
+                ProcessFailureKind::TimedOut,
+                "the device push exceeded its time limit",
+                false,
+            ));
+        }
+        // Cap each command at 30 seconds to leave room for a follow-up
+        // check within the overall budget if the push times out.
+        let limit = remaining.min(std::time::Duration::from_secs(30));
+        let command = command
+            .clone()
+            .timeout(command.timeout.map_or(limit, |timeout| timeout.min(limit)));
+        SystemProcessExecutor.execute(&command, cancellation)
+    }
 }
 
 #[cfg(feature = "host")]
@@ -984,6 +1027,19 @@ fn unstage_command(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    #[test]
+    fn an_expired_device_push_does_not_start_another_git_command() {
+        use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, ProcessFailureKind};
+        let executor = DevicePushExecutor {
+            deadline: std::time::Instant::now(),
+        };
+        let failure = executor
+            .execute(&CommandSpec::new("git"), &CancellationToken::new())
+            .unwrap_err();
+        assert_eq!(failure.kind, ProcessFailureKind::TimedOut);
+        assert!(!failure.started);
+    }
 
     /// Postcard numbers an enum's variants by position, so the CLI, a window
     /// and a daemon of one protocol version agree on a variant only while
