@@ -6719,6 +6719,7 @@ fn unavailable_presentation_disables_readiness_but_preserves_body_and_copy_autho
         ..Default::default()
     };
     let before = initial.clone();
+    let ended = source.clone();
     let worker = thread::spawn(move || {
         server
             .set_read_timeout(Some(Duration::from_secs(5)))
@@ -6750,6 +6751,26 @@ fn unavailable_presentation_disables_readiness_but_preserves_body_and_copy_autho
                 response: ServerResponse::Connected {
                     proof: proof.clone(),
                     resumed: vec![],
+                },
+            },
+        );
+        // A direct restart first reads any input the ended actor still held.
+        let queue: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+        assert_eq!(
+            queue.request,
+            ClientRequest::ChatReadExitedQueue {
+                source: ended,
+                execution: None,
+            }
+        );
+        respond(
+            &mut codec,
+            &mut server,
+            Some(queue.request_id),
+            ServerMessage::Response {
+                response: ServerResponse::ChatExitedQueue {
+                    source: source.id,
+                    queued: None,
                 },
             },
         );
