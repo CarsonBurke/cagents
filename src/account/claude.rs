@@ -845,9 +845,9 @@ pub fn parse_rate_limit_event(info: &Value) -> Option<LiveUpdate> {
 /// A live event reports only the account-wide windows and Fable's, so every
 /// window it does not mention - another model's weekly allowance, most of
 /// all - keeps its probed figure. Fable's window is the probe's, whatever
-/// version of the name Claude scoped it to. The binding mark is dropped
-/// because the event does not say which window binds; the fullest window
-/// stands in until the next probe.
+/// version of the name Claude scoped it to. A probe's binding mark survives
+/// while its window still agrees with the relative pressure in the merged
+/// figures. The event's rate-limit type describes which limit it reports.
 ///
 /// Returns whether the update renews account-wide evidence, as Codex's
 /// [`super::codex::merge_update`] does. A report about one model's allowance
@@ -875,11 +875,15 @@ pub fn merge_live(snapshot: &mut UsageSnapshot, update: LiveUpdate, observed_at:
                 existing.used = window.used;
                 existing.resets_at = window.resets_at.or(existing.resets_at);
             }
-            None => snapshot.windows.push(window),
+            None => snapshot.windows.push(UsageWindow {
+                binding: false,
+                ..window
+            }),
         }
     }
+    let tightest = super::tightest(&snapshot.windows).map(|window| (window.used, window.resets_at));
     for window in &mut snapshot.windows {
-        window.binding = false;
+        window.binding &= tightest == Some((window.used, window.resets_at));
     }
     if !account_wide {
         // A spent model allowance can warn without changing what the account
