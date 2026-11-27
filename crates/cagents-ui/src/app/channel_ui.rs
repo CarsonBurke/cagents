@@ -2287,6 +2287,11 @@ impl Cagents {
         {
             return false;
         }
+        // The registry drops a channel's view with the channel: another
+        // window deleted it, or removed its project, while this one closed
+        // its sessions. A captured shared pane then has no view to be
+        // retired from, and is gone with the channel.
+        let registry_dropped = self.workspace_model.channel(id).is_none();
         // A close can publish its managed pane tombstone before the worker's
         // receipt arrives. Only that exact source removal may shrink the
         // captured membership; additions, moves and replacements still fail.
@@ -2294,10 +2299,11 @@ impl Cagents {
             attempt.panes.iter().any(|(captured, before, was_shared)| {
                 *captured == card
                     && *was_shared
-                    && self.workspace_model.views.iter().any(|view| {
-                        view.scope == crate::workspace_model::views::Scope::Channel(id)
-                            && view.retired.contains(&card)
-                    })
+                    && (registry_dropped
+                        || self.workspace_model.views.iter().any(|view| {
+                            view.scope == crate::workspace_model::views::Scope::Channel(id)
+                                && view.retired.contains(&card)
+                        }))
                     && !self
                         .workspace_model
                         .views
@@ -4501,6 +4507,62 @@ pub(in crate::app) mod tests {
             app.project_ui.close_in_flight.contains(&project),
             "the project's close goes on"
         );
+    }
+
+    /// Another window can delete a channel, or remove its project, while
+    /// this window is already deleting it. The registry drops the channel's
+    /// shared view with it, after this window captured its panes as shared;
+    /// the deletion still finishes as this window's own (#4492).
+    #[test]
+    fn a_channel_the_registry_drops_mid_deletion_finishes_its_deletion() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::{
+            ModelEdit,
+            delta::{EditEffects, ViewChanges},
+            views::{Pane, Scope, View},
+        };
+        let (mut app, doomed, _survivor, conversation) = channel_with_a_conversation();
+        let card = app.card_state(conversation).unwrap().clone();
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(doomed),
+            revision: 1,
+            panes: vec![Pane::from_card(&card, Some("/repo".into())).unwrap()],
+            retired: Vec::new(),
+        });
+        drop(app.delete_channel(doomed));
+        assert!(app.channel_ui.closing_sessions(doomed));
+        let operation = app.channel_ui.close_operation(doomed);
+
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence,
+            edit: ModelEdit::DeleteChannel { id: doomed },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence,
+                    removed: vec![(Scope::Channel(doomed), 1)],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    removed_channels: vec![doomed],
+                    ..Default::default()
+                },
+            },
+        }));
+        assert!(channel_exists(&app, doomed) && app.channel_ui.is_deleting(doomed));
+        assert!(
+            !app.workspace_model
+                .views
+                .iter()
+                .any(|view| view.scope == Scope::Channel(doomed))
+        );
+
+        app.status = None;
+        drop(app.handle_channel_ui(Action::SessionsClosed(doomed, operation, Ok(()))));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(!channel_exists(&app, doomed));
+        assert!(!app.channel_ui.deletion_unsettled());
     }
 
     /// Should anything else retire a channel while its deletion closes its
