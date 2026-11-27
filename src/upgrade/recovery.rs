@@ -1853,6 +1853,37 @@ impl ReadyPlanEvidence<'_> {
         Ok(())
     }
 
+    pub(crate) fn matches_cutover_inventory(
+        &self,
+        terminals: &[crate::model::TerminalSession],
+        chats: &[crate::chat::Session],
+    ) -> bool {
+        self.authority.census.terminals == terminals && self.authority.census.chats == chats
+    }
+
+    /// The completed claimant published both owner records before it could
+    /// restore any work. Both must still name that exact exited process.
+    pub(crate) fn verify_completed_runtime_owner(
+        &self,
+        handoff: &LeaseHandoff,
+        successor: &HostSessionProof,
+        process: &crate::daemon::holder_registry::Process,
+    ) -> Result<(), String> {
+        let daemon = handoff
+            .duplicate_for_recovery()
+            .map_err(|error| error.to_string())?;
+        validate_lock(&daemon, &self.authority.daemon_path).map_err(|error| error.to_string())?;
+        let (runtime, pid) = crate::daemon::lease_handoff::recorded_owner(&daemon)
+            .map_err(|error| error.to_string())?;
+        let saved =
+            crate::instance::state_claim::last_daemon_pid(&self.authority.daemon_path, successor)
+                .map_err(|error| error.to_string())?;
+        if &runtime != successor || process.pid as u32 != pid || saved != Some(pid) {
+            return Err("The restored claimant no longer owns the saved workspace".into());
+        }
+        Ok(())
+    }
+
     pub(crate) fn require_pre_effects_retry(&self) -> Result<(), String> {
         self.retry_predecessor().map(drop)
     }

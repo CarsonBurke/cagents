@@ -224,6 +224,11 @@ pub(crate) fn admit_darwin_update_start() -> io::Result<crate::instance::OwnedLo
 }
 
 #[cfg(target_os = "macos")]
+pub(crate) fn verify_darwin_publication(file: &File) -> io::Result<()> {
+    crate::flock::verify_inherited_exclusive_at(file, &darwin_publication_path()?)
+}
+
+#[cfg(target_os = "macos")]
 fn darwin_publication_path() -> io::Result<std::path::PathBuf> {
     // XDG_RUNTIME_DIR may name the parent of the default runtime. Keep this
     // inode beside the whole runtime tree so neither spelling can purge it.
@@ -316,7 +321,7 @@ pub(crate) fn inherited_darwin_publication() -> io::Result<Option<(File, i32)>> 
         return Err(io::Error::last_os_error());
     }
     let file = File::from(unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?);
-    crate::flock::verify_inherited_exclusive_at(&file, &darwin_publication_path()?)?;
+    verify_darwin_publication(&file)?;
     Ok(Some((file, fd)))
 }
 
