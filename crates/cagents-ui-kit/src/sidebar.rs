@@ -2164,6 +2164,15 @@ impl ChangeGroup {
         &self.rows
     }
 
+    /// The group's changes in the order the panel lists them, in a list as
+    /// in a tree: each folder's files where the tree draws them.
+    pub fn listed(&self) -> impl Iterator<Item = &ChangeRow> {
+        self.tree
+            .iter()
+            .filter(|row| !row.directory)
+            .filter_map(|row| self.visible_path(&row.path))
+    }
+
     /// Complete group rows; the view mounts a bounded page of this model.
     pub fn visible(&self) -> &[ChangeRow] {
         &self.rows

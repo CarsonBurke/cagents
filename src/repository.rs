@@ -1671,8 +1671,11 @@ pub struct PushRequest {
 }
 
 /// Why a mutation failed or its result could not be confirmed, keeping the raw evidence.
+///
+/// Tagged `failure`, not `kind`: a process failure carries its own `kind`,
+/// which would otherwise be written twice and refused when read back.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "failure", rename_all = "snake_case")]
 pub enum MutationFailure {
     Process(ProcessFailure),
     /// A filesystem operation on one path failed, or the path failed its

@@ -317,4 +317,106 @@ mod tests {
             })
         );
     }
+
+    /// Every reply a device sends is read back as it was written.
+    #[test]
+    fn requests_and_replies_round_trip_as_json() {
+        let process = MutationFailure::Process(ProcessFailure {
+            kind: crate::process::ProcessFailureKind::Exit,
+            program: "git".into(),
+            exit_code: Some(1),
+            signal: None,
+            stdout: Vec::new(),
+            stderr: b"hook refused".to_vec(),
+            message: "exited with 1".into(),
+            started: true,
+        });
+        let path = RepoPath::parse("src/main.rs").unwrap();
+        let oid = Oid::parse("0123456789abcdef0123456789abcdef01234567").unwrap();
+        let branch = ValidatedBranchName::parse("main").unwrap();
+        let replies = [
+            RepositoryReply::Mutation(MutationOutcome::PartiallyApplied {
+                paths: vec![path.clone()],
+                failures: vec![
+                    process.clone(),
+                    MutationFailure::Path {
+                        path: path.clone(),
+                        reason: "busy".into(),
+                    },
+                    MutationFailure::ConflictMarkers {
+                        paths: vec![path.clone()],
+                    },
+                ],
+            }),
+            RepositoryReply::Mutation(MutationOutcome::OutcomeUnknown {
+                failure: MutationFailure::Reconciliation {
+                    reason: "unclear".into(),
+                },
+            }),
+            RepositoryReply::Commit(CommitOutcome::Created {
+                oid: oid.clone(),
+                warnings: vec![process.clone()],
+            }),
+            RepositoryReply::Commit(CommitOutcome::NotCreated {
+                failure: process.clone(),
+            }),
+            RepositoryReply::Push(PushOutcome::Pushed {
+                remote: "origin".into(),
+                remote_ref: RemoteSideRef::branch(&branch),
+                oid: oid.clone(),
+            }),
+            RepositoryReply::Push(PushOutcome::NotPushed { failure: process }),
+            RepositoryReply::Diff(DiffContent::Unmerged {
+                base: DiffSide::Absent,
+                ours: text(3),
+                theirs: DiffSide::Binary { bytes: 9 },
+                worktree: DiffSide::Oversize { bytes: 1 << 30 },
+            }),
+        ];
+        for reply in replies {
+            let json = serde_json::to_string(&reply).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RepositoryReply>(&json).unwrap(),
+                reply,
+                "{json}"
+            );
+        }
+        let requests = [
+            RepositoryRequest::Push(PushRequest {
+                worktree: "/srv/demo".into(),
+                branch: branch.clone(),
+                target: PushTarget::SetUpstream {
+                    remote: "origin".into(),
+                    remote_branch: branch.clone(),
+                },
+            }),
+            RepositoryRequest::Push(PushRequest {
+                worktree: "/srv/demo".into(),
+                branch,
+                target: PushTarget::Upstream {
+                    remote: "origin".into(),
+                    remote_ref: ValidatedRefName::parse("refs/remotes/origin/main").unwrap(),
+                },
+            }),
+            RepositoryRequest::Diff(DiffRequest {
+                worktree: "/srv/demo".into(),
+                basis: DiffBasis::CommitToParent { oid, parent: None },
+                path: path.clone(),
+                old_path: Some(path),
+            }),
+            RepositoryRequest::Continue {
+                worktree: "/srv/demo".into(),
+                kind: OperationKind::Rebase,
+                message: Some("resolved".into()),
+            },
+        ];
+        for request in requests {
+            let json = serde_json::to_string(&request).unwrap();
+            assert_eq!(
+                serde_json::from_str::<RepositoryRequest>(&json).unwrap(),
+                request,
+                "{json}"
+            );
+        }
+    }
 }

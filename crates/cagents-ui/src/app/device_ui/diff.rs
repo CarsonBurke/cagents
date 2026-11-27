@@ -288,7 +288,7 @@ impl Cagents {
     ) -> Option<(
         &ActiveWorktreeKey,
         ChangeArea,
-        &[sidebar::ChangeRow],
+        Vec<&sidebar::ChangeRow>,
         Option<usize>,
     )> {
         let diff = self.device_ui.diff.as_ref()?;
@@ -296,12 +296,14 @@ impl Cagents {
         if !self.source_control_is_bound(&diff.key) {
             return None;
         }
-        let rows = self
+        // Previous and Next follow the panel's own order.
+        let rows: Vec<_> = self
             .sidebar_model
             .source_control
             .as_ref()?
             .group(area)?
-            .rows();
+            .listed()
+            .collect();
         let index = rows
             .iter()
             .position(|row| row.entry.path == diff.request.path);
@@ -351,9 +353,10 @@ impl Cagents {
             .width(Length::Fill)
             .into(),
         ];
-        if let Some((_, _, rows, index)) = position
+        if let Some((_, _, rows, index)) = &position
             && rows.len() > usize::from(index.is_some())
         {
+            let index = *index;
             let previous = index.is_some_and(|index| index > 0);
             let next = index.map_or(!rows.is_empty(), |index| index + 1 < rows.len());
             header.push(
@@ -436,13 +439,26 @@ impl Cagents {
         }
         // The name, the way through the group and the actions stay in
         // place; only the change scrolls.
+        let height = (size.height - CHROME_HEIGHT).max(120.0);
         Some(dialog_ui::surface(
             widget::column::with_children(vec![
                 widget::row::with_children(header)
                     .spacing(space::XS)
                     .align_y(Alignment::Start)
                     .into(),
-                dialog_ui::scrolled_region(body, (size.height - CHROME_HEIGHT).max(120.0)),
+                // One height whatever the change, so stepping through a
+                // group leaves Previous, Next and Stage where they were.
+                widget::container(dialog_ui::scrolled_region(
+                    // Clear of the sideways scrollbar the patch draws over
+                    // its last line.
+                    widget::container(body).padding(Padding {
+                        bottom: space::M,
+                        ..Padding::ZERO
+                    }),
+                    height,
+                ))
+                .height(height)
+                .into(),
                 widget::row::with_children(actions)
                     .spacing(space::S)
                     .align_y(Alignment::Center)
