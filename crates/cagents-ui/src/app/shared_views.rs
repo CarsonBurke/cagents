@@ -4309,6 +4309,16 @@ impl Cagents {
                 continue;
             }
             if self.absence_closes_pane(id, view) {
+                // A new terminal closed this way disappears without a word
+                // (#4380, #4400); leave a trace of which view dropped it.
+                if self.durable.pending_terminal_creations.contains(&id) {
+                    tracing::warn!(
+                        card = %id,
+                        scope = ?view.scope,
+                        revision = view.revision,
+                        "closing a new terminal its shared view does not list"
+                    );
+                }
                 self.detach_shared_pane(id);
                 continue;
             }
