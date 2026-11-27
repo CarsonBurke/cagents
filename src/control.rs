@@ -4401,39 +4401,7 @@ where
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
         }
-        // A mismatch names both protocols, so a caller can tell which side
-        // to update without reading the sentence.
-        let mismatch = crate::device::incompatible(&error).map(|mismatch| {
-            json!({
-                "device": mismatch.device,
-                "protocol": mismatch.actual,
-                "expected": crate::terminal_ipc::PROTOCOL_VERSION,
-            })
-        });
-        // SSH could not connect, so nothing else about the device is known.
-        let unreachable = crate::device::unreachable(&error).map(|unreachable| {
-            json!({
-                "device": unreachable.device,
-                "host": unreachable.host,
-            })
-        });
-        let kind = if error.kind() == io::ErrorKind::PermissionDenied {
-            "permission_denied"
-        } else if mismatch.is_some() {
-            "device_incompatible"
-        } else if unreachable.is_some() {
-            "device_unreachable"
-        } else {
-            "device"
-        };
-        let details = mismatch.or(unreachable);
-        emit_error(
-            cli.global.json,
-            &AppError {
-                details,
-                ..AppError::new(kind, error)
-            },
-        );
+        emit_error(cli.global.json, &device_app_error(error));
         return ExitCode::FAILURE;
     }
     match execute_with_model_context(cli.command, project_channel_context, service_context) {
@@ -4809,7 +4777,7 @@ fn launch_ui(
             break;
         };
         if new_window || !handshake_reports_already_running(&error) {
-            return Err(AppError::new("launch", error));
+            return Err(launch_error(error));
         }
         if activate().map_err(|error| AppError::new("launch", error))? {
             return Ok(already_running_ui_output());
@@ -4848,6 +4816,55 @@ fn placed_device(slot: &str) -> Option<String> {
             "the device a window showed is no longer saved"
         );
         None
+    }
+}
+
+/// The error a command reports when the selected device could not be
+/// prepared, with what a caller needs to act on it without reading the
+/// sentence: both protocols for a mismatch, and the device for SSH that
+/// could not reach it.
+fn device_app_error(error: io::Error) -> AppError {
+    let mismatch = crate::device::incompatible(&error).map(|mismatch| {
+        json!({
+            "device": mismatch.device,
+            "protocol": mismatch.actual,
+            "expected": crate::terminal_ipc::PROTOCOL_VERSION,
+        })
+    });
+    let unreachable = crate::device::unreachable(&error).map(|unreachable| {
+        json!({
+            "device": unreachable.device,
+            "host": unreachable.host,
+            "reason": unreachable.reason,
+        })
+    });
+    let kind = if error.kind() == io::ErrorKind::PermissionDenied {
+        "permission_denied"
+    } else if mismatch.is_some() {
+        "device_incompatible"
+    } else if unreachable.is_some() {
+        "device_unreachable"
+    } else {
+        "device"
+    };
+    AppError {
+        details: mismatch.or(unreachable),
+        ..AppError::new(kind, error)
+    }
+}
+
+/// A window that did not start. One on a device that SSH could not reach
+/// says so in its message, the only thing it passes back; its kind says so
+/// too, as for any other command on that device.
+fn launch_error(error: io::Error) -> AppError {
+    let device = crate::device::selected()
+        .filter(|_| crate::device::reads_as_unreachable(&error.to_string()));
+    match device {
+        Some(device) => AppError {
+            details: Some(json!({ "device": device.name, "host": device.host })),
+            ..AppError::new("device_unreachable", error)
+        },
+        None => AppError::new("launch", error),
     }
 }
 
@@ -8271,6 +8288,29 @@ mod tests {
         ]);
         spawn_ui_process(&mut command).unwrap();
     }
+    #[test]
+    fn a_device_ssh_cannot_reach_is_reported_by_kind_with_what_ssh_said() {
+        let error = io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            crate::device::Unreachable {
+                device: "build-host".into(),
+                host: "me@build-host".into(),
+                reason: "connect to host build-host port 22: Connection timed out".into(),
+            },
+        );
+        let error = device_app_error(error);
+        assert_eq!(error.kind, "device_unreachable");
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "device": "build-host",
+                "host": "me@build-host",
+                "reason": "connect to host build-host port 22: Connection timed out",
+            }))
+        );
+        assert_eq!(device_app_error(io::Error::other("lost")).kind, "device");
+    }
+
     use std::{os::unix::net::UnixStream, thread};
 
     use clap::CommandFactory;

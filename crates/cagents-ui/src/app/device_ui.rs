@@ -2260,7 +2260,7 @@ mod tests {
 
     #[test]
     fn a_device_ssh_cannot_reach_is_reported_without_asking_it_more() {
-        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh build-host` connects, then try again.";
+        let reason = "build-host could not be reached over SSH: connect to host build-host port 22: Connection timed out. Check that `ssh build-host` connects without asking for a password, then try again.";
         // Each question would wait out another SSH connection timeout.
         let failure = diagnose_with("build-host", Some(reason), |arguments| {
             panic!("asked the device again: {arguments:?}")

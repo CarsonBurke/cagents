@@ -125,8 +125,13 @@ keepalives detect lost connections, and the normal terminal/chat reconnect paths
 establish new streams. Startup failures identify the selected device and include
 SSH diagnostics. When SSH itself cannot reach the device (no answer within its
 15-second connect timeout, a name that does not resolve, a refused login), the
-window or command says so after that one attempt, with SSH's reason; with
-`--json`, the error's kind is `device_unreachable`.
+window or command says so after that one attempt, with SSH's reason. A device
+still silent when the 30-second connection deadline passes, as behind a jump
+host or a slow name lookup, is reported the same way. With `--json`, the
+error's kind is `device_unreachable`, with the device and its host in
+`details`, and SSH's reason too when a command, not a window, failed. cagents
+sets no `ConnectionAttempts`, so SSH's default single attempt applies unless
+your SSH configuration asks for more.
 When the device runs another cagents version or none, the
 window says which side is older and offers **Update NAME** (or **Install on
 NAME**), which runs `cagents device update NAME --yes` with its progress shown
