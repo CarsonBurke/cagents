@@ -290,6 +290,24 @@ impl Cagents {
         })
     }
 
+    /// A new terminal whose start failed before anything ran stays in its
+    /// view with that start pending: a pane with no source to capture, which
+    /// the registry refuses to remove by source. Like a fenced pane, its
+    /// Close removes it by identity (#4400).
+    fn closes_unstarted_creation(&mut self, card: CardId) -> bool {
+        let held = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .any(|pane| pane.id == card && pane.pending_terminal_start);
+        if !held || !self.terminal_creation_failed(card) {
+            return false;
+        }
+        self.shared_views.fenced_closes.insert(card);
+        true
+    }
+
     fn shared_removal_refused(&mut self) {
         self.status = Some(TransientNotice::warning(PANE_KEPT));
     }
@@ -297,7 +315,7 @@ impl Cagents {
     pub(in crate::app) fn prepare_shared_removal(&mut self, card: CardId) -> bool {
         // A fenced pane's saved source is unconfirmed, so its close captures
         // none: publication removes the closed pane from its view by identity.
-        if self.shared_views.quarantined.contains(&card) {
+        if self.shared_views.quarantined.contains(&card) || self.closes_unstarted_creation(card) {
             return true;
         }
         if !self.shared_views.removals.contains_key(&card) && !self.capture_shared_removal(card) {

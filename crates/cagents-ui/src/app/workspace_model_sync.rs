@@ -688,10 +688,17 @@ fn publish_with_mirror(
                                 error: error.to_string(),
                             });
                         } else {
+                            tracing::debug!(%error, "the registry refused a view edit");
+                            // The registry's own sentence, which a refused
+                            // new terminal shows in its pane.
+                            let reason = match &error {
+                                ControlError::Remote { message, .. } => message.clone(),
+                                other => other.to_string(),
+                            };
                             let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                                 scope: scope.clone(),
                                 operation: *operation,
-                                error: error.to_string(),
+                                error: reason,
                             });
                         }
                     }
@@ -1985,10 +1992,14 @@ impl Cagents {
                             } => Some(before.id),
                             _ => None,
                         });
-                    self.refuse_shared_view_edit(&scope, operation);
+                    let refused_creation = self.refuse_shared_view_edit(&scope, operation, &error);
                     // The error is the registry's own wording, or a resend's
                     // deadline; the trace keeps it, and the person is told
-                    // what happened to the pane.
+                    // what happened to the pane. A new terminal's own pane
+                    // says why it didn't open.
+                    if refused_creation {
+                        return self.reconcile_shared_views();
+                    }
                     let Some(card) = closed else {
                         self.status = Some(TransientNotice::warning(
                             super::shared_views::PANE_CHANGE_NOT_SAVED,

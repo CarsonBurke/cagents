@@ -187,26 +187,80 @@ fn a_terminal_opened_in_a_blocked_channel_survives_the_block() {
     assert_eq!(inserts(&window.rx, card), 1);
 }
 
-#[test]
-fn a_new_terminal_its_view_refuses_still_closes() {
-    let mut window = window();
-    drain(&window.rx);
-    let card = new_terminal(&mut window);
-    drop(window.app.reconcile_shared_views());
-    assert_eq!(inserts(&window.rx, card), 1);
-
-    // Sent and refused, it has nothing to wait for: the view that does not
-    // list it closes it rather than inserting it again.
+fn refuse(window: &mut Window, card: CardId, error: &str) {
     drop(
         window
             .app
             .apply_workspace_model_update(ModelUpdate::ViewRefused {
                 scope: window.scope.clone(),
                 operation: card.as_uuid(),
-                error: "refused".into(),
+                error: error.into(),
             }),
     );
+}
+
+fn failure(window: &Window, card: CardId) -> Option<&str> {
+    match window.app.cards.get(&card) {
+        Some(CardRuntime::Failed(failure)) => Some(failure.message()),
+        _ => None,
+    }
+}
+
+#[test]
+fn a_new_terminal_its_view_refuses_says_why_until_retried() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    assert_eq!(inserts(&window.rx, card), 1);
+
+    // It never started, so its pane is the only place left to say so: it
+    // stays, with the registry's reason, rather than closing without a word
+    // (#4400).
+    refuse(&mut window, card, "the channel is no longer open");
+    assert_open(&window, card);
+    assert_eq!(
+        failure(&window, card),
+        Some("The channel is no longer open.")
+    );
+    assert!(window.app.terminal_starts.lock().unwrap().is_empty());
+    // No later view closes it or inserts it again on its own.
+    for _ in 0..2 {
+        drop(window.app.reconcile_shared_views());
+    }
+    assert_open(&window, card);
     assert_eq!(inserts(&window.rx, card), 0);
+    assert!(failure(&window, card).is_some());
+
+    // Retry asks the view again, and the pane waits for its answer.
+    drop(window.app.update(Message::RetryCard(card)));
+    assert!(matches!(
+        window.app.cards.get(&card),
+        Some(CardRuntime::Loading)
+    ));
+    assert_eq!(inserts(&window.rx, card), 1);
+    assert!(window.app.terminal_starts.lock().unwrap().is_empty());
+
+    // Refused again, it says so again.
+    refuse(&mut window, card, "the channel is no longer open");
+    assert_open(&window, card);
+    assert!(failure(&window, card).is_some());
+}
+
+#[test]
+fn a_refused_new_terminal_closes_when_asked() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    refuse(&mut window, card, "refused");
+    drain(&window.rx);
+
+    drop(window.app.update(Message::CloseCard(card)));
+    drop(window.app.update(Message::CommitClose(card)));
+    for _ in 0..2 {
+        drop(window.app.reconcile_shared_views());
+    }
     assert!(
         !window
             .app
@@ -220,5 +274,172 @@ fn a_new_terminal_its_view_refuses_still_closes() {
             .pending_terminal_creations
             .contains(&card)
     );
-    assert!(!window.app.shared_views.sent_creations.contains(&card));
+    assert!(
+        !window
+            .app
+            .shared_views
+            .refused_creations
+            .contains_key(&card)
+    );
+    // Nothing was ever shared, so there is nothing to remove.
+    assert!(
+        std::iter::from_fn(|| window.rx.try_recv().ok()).all(|edit| !matches!(
+            edit,
+            ModelEdit::ChangeView { change: Change::Remove { id }, .. } if id == card
+        ))
+    );
+}
+
+#[test]
+fn a_new_terminal_that_fails_to_start_says_it_did_not_open_and_why() {
+    let mut window = window();
+    let card = new_terminal(&mut window);
+    let CardKind::Terminal(session) = &window.app.card_state(card).unwrap().kind else {
+        unreachable!()
+    };
+    let terminal = session.id;
+    let reason = "terminal worker failed to start: pin terminal launch directory /repo: No such file or directory (os error 2)";
+    drop(window.app.update(Message::TerminalStarted {
+        card,
+        terminal,
+        result: Err(reason.into()),
+    }));
+
+    // Nothing ran, so it was never something to restore or reconnect: the
+    // pane says it didn't open, with the reason (#4400).
+    assert_open(&window, card);
+    assert!(window.app.terminal_creation_failed(card));
+    assert_eq!(
+        failure(&window, card),
+        Some(
+            "Terminal worker failed to start: pin terminal launch directory /repo: No such file or directory (os error 2)."
+        )
+    );
+    assert_eq!(
+        terminal_failure::creation_title(),
+        "Couldn't open this terminal"
+    );
+    assert!(window.app.notices.entries.iter().any(|entry| {
+        entry.notice.message == "Couldn't open this terminal"
+            && entry.notice.details.as_deref() == Some(reason)
+    }));
+}
+
+/// A saved terminal restored without its process, which never recorded an
+/// exit, is still one to restore when its start fails, not a new terminal
+/// that didn't open.
+#[test]
+fn a_restored_terminal_that_fails_still_reads_as_one_to_restore() {
+    let mut window = window();
+    let card = new_terminal(&mut window);
+    // Accepted long ago: no longer a creation, nor a pending start.
+    Arc::make_mut(&mut window.app.durable)
+        .pending_terminal_creations
+        .remove(&card);
+    let CardKind::Terminal(session) = &window.app.card_state(card).unwrap().kind else {
+        unreachable!()
+    };
+    let terminal = session.id;
+    assert!(!window.app.terminal_never_started(card));
+    drop(window.app.update(Message::TerminalStarted {
+        card,
+        terminal,
+        result: Err("the daemon closed the connection before responding".into()),
+    }));
+    assert!(!window.app.terminal_creation_failed(card));
+    assert!(matches!(
+        window.app.cards.get(&card),
+        Some(CardRuntime::Failed(terminal_failure::Failure::Terminal(_)))
+    ));
+}
+
+/// The registry accepts the window's Insert of `card`, holding its start.
+fn admit_insert(window: &mut Window, card: CardId) {
+    let scope = window.scope.clone();
+    let (operation, pane) = std::iter::from_fn(|| window.rx.try_recv().ok())
+        .find_map(|edit| match edit {
+            ModelEdit::ChangeView {
+                operation,
+                change: Change::Insert { pane, .. },
+                ..
+            } if pane.id == card => Some((operation, pane)),
+            _ => None,
+        })
+        .expect("the new terminal was published");
+    assert!(pane.pending_terminal_start);
+    let mut model = window.app.workspace_model.clone();
+    model.sequence += 1;
+    let view = model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == scope)
+        .unwrap();
+    view.revision += 1;
+    view.panes.push(pane);
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope,
+                operation: Some(operation),
+                model,
+            }),
+    );
+}
+
+/// A terminal whose start failed once its view held it has no source to
+/// close, so its Close removes it by identity instead of being kept with
+/// "couldn't be removed right now".
+#[test]
+fn an_admitted_new_terminal_that_failed_to_start_closes_when_asked() {
+    let mut window = window();
+    drain(&window.rx);
+    let card = new_terminal(&mut window);
+    drop(window.app.reconcile_shared_views());
+    admit_insert(&mut window, card);
+    assert!(
+        window
+            .app
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .any(|pane| pane.id == card && pane.pending_terminal_start)
+    );
+    let CardKind::Terminal(session) = &window.app.card_state(card).unwrap().kind else {
+        unreachable!()
+    };
+    let terminal = session.id;
+    drop(window.app.update(Message::TerminalStarted {
+        card,
+        terminal,
+        result: Err("terminal worker failed to start".into()),
+    }));
+    assert!(window.app.terminal_creation_failed(card));
+    drain(&window.rx);
+
+    drop(window.app.update(Message::CloseCard(card)));
+    drop(window.app.update(Message::CommitClose(card)));
+    drop(window.app.reconcile_shared_views());
+    assert!(
+        !window
+            .app
+            .card_state(card)
+            .is_some_and(|card| card.existence.is_open()),
+        "the failed terminal was kept"
+    );
+    assert!(
+        !window
+            .app
+            .notices
+            .entries
+            .iter()
+            .any(|entry| { entry.notice.message == crate::app::shared_views::PANE_KEPT })
+    );
+    let removals = std::iter::from_fn(|| window.rx.try_recv().ok())
+        .filter(|edit| {
+            matches!(edit, ModelEdit::ChangeView { change: Change::Remove { id }, .. } if *id == card)
+        })
+        .count();
+    assert_eq!(removals, 1);
 }
