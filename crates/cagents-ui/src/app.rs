@@ -13613,7 +13613,8 @@ impl Cagents {
             return Task::none();
         }
         if !changed {
-            return self.load_pending_history();
+            let history = self.load_pending_history();
+            return Task::batch([history, self.load_deferred_files()]);
         }
         self.cancel_source_read();
         self.cancel_branch_changes();
@@ -14801,25 +14802,14 @@ impl Cagents {
                         &cancellation,
                     )
                     .map_err(|error| error.to_string())?;
-                let (mut snapshot, digest) = match read {
-                    SnapshotRead::Changed { snapshot, digest } => (*snapshot, digest),
-                    SnapshotRead::Unchanged if !browse_files => {
-                        return Ok(SourceControlRead::Unchanged {
-                            digest: previous_digest,
-                        });
-                    }
-                    // Git's part stands, but ignored folders are listed from
-                    // the filesystem, which the digest does not cover.
-                    SnapshotRead::Unchanged => {
-                        let mut snapshot = previous
-                            .as_deref()
-                            .cloned()
-                            .ok_or("an unchanged read has no snapshot to keep")?;
-                        snapshot.files.ignored.clear();
-                        snapshot.files.ignored_directories.clear();
-                        snapshot.files.ignored_directory_errors.clear();
-                        (snapshot, previous_digest)
-                    }
+                let (mut snapshot, digest) = match source_control_ui::snapshot_to_build(
+                    read,
+                    previous.as_deref(),
+                    previous_digest,
+                    tree,
+                )? {
+                    ControlFlow::Continue(build) => build,
+                    ControlFlow::Break(kept) => return Ok(kept),
                 };
                 if browse_files {
                     let ignored = service

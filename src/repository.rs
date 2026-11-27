@@ -2723,6 +2723,10 @@ fn file_inventory_digest(files: &[u8], status: &[u8]) -> FileInventoryDigest {
 /// Not covered: configuration that changes line counts without changing
 /// status, such as `.git/info/attributes` or a `diff` driver. A read after
 /// any other change picks it up.
+///
+/// A path stamped in the future, as an archive or a skewed network
+/// filesystem can leave it, counts as racy until the clock passes it. Every
+/// read runs in full until then; none is ever wrongly reported unchanged.
 fn snapshot_digest(
     worktree: &Path,
     options: SnapshotOptions,

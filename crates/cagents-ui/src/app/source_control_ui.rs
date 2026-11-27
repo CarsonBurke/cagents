@@ -33,7 +33,8 @@ impl Cagents {
                 // The rows stand as built. The worktree row and the branch
                 // comparison are kept current exactly as a rebuild would.
                 self.apply_worktree_status(&key, &snapshot.status);
-                return ControlFlow::Continue(self.refresh_branch_changes(&snapshot));
+                let branch = self.refresh_branch_changes(&snapshot);
+                return ControlFlow::Continue(Task::batch([branch, self.load_deferred_files()]));
             }
             Err(error) => {
                 self.replace_source_control(SourceControlModel::failed(key, error));
@@ -50,7 +51,36 @@ impl Cagents {
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             self.sidebar_state.settle_changes_tab(source);
         }
-        ControlFlow::Continue(self.refresh_branch_changes(&snapshot))
+        let branch = self.refresh_branch_changes(&snapshot);
+        ControlFlow::Continue(Task::batch([branch, self.load_deferred_files()]))
+    }
+
+    /// Reads the bound worktree again when Files is shown over rows whose
+    /// Files tree a Changes-only read left unbuilt, and no read is running
+    /// that could build it.
+    ///
+    /// Files comes into view by more than its own controls: an inspector
+    /// opening or expanding, or a pane becoming the workspace's only one.
+    /// The projection's rebind and each landed read call this, so whichever
+    /// way Files appears, a read builds its tree and "Loading files…" is
+    /// never left standing with nothing loading. A Files read always builds
+    /// the tree, so this asks once.
+    pub(super) fn load_deferred_files(&mut self) -> Task<Message> {
+        if self.refresh_ui.source_cancel.is_some()
+            || self.workspace_view_shown() != Some(context_sections::WorkspaceView::Files)
+        {
+            return Task::none();
+        }
+        let Some(source) = self
+            .sidebar_model
+            .source_control
+            .as_ref()
+            .filter(|source| !source.files_built())
+        else {
+            return Task::none();
+        };
+        let key = source.key.clone();
+        self.reload_source_control(&key)
     }
 
     /// Shows a read's status on the sidebar row of the worktree it read.
@@ -194,6 +224,41 @@ pub(super) fn kept_source(
                 source.source_digest().copied(),
             )
         })
+}
+
+/// What the worker makes of Git's answer before any rows are built: the
+/// snapshot to build from with its digest, or, when nothing changed and
+/// the panel's rows can stand, the answer to send back as is.
+///
+/// With Files shown, an unchanged answer still rebuilds from the kept
+/// snapshot: Git's part stands, but the caller lists ignored folders again
+/// from the filesystem, which the digest does not cover, so the kept
+/// listing is cleared for it rather than carried over.
+pub(super) fn snapshot_to_build(
+    read: SnapshotRead,
+    previous: Option<&RepositorySnapshot>,
+    previous_digest: Option<SnapshotDigest>,
+    tree: FileTree,
+) -> Result<ControlFlow<SourceControlRead, (RepositorySnapshot, Option<SnapshotDigest>)>, String> {
+    match read {
+        SnapshotRead::Changed { snapshot, digest } => {
+            Ok(ControlFlow::Continue((*snapshot, digest)))
+        }
+        SnapshotRead::Unchanged if tree == FileTree::Deferred => {
+            Ok(ControlFlow::Break(SourceControlRead::Unchanged {
+                digest: previous_digest,
+            }))
+        }
+        SnapshotRead::Unchanged => {
+            let mut snapshot = previous
+                .cloned()
+                .ok_or("an unchanged read has no snapshot to keep")?;
+            snapshot.files.ignored.clear();
+            snapshot.files.ignored_directories.clear();
+            snapshot.files.ignored_directory_errors.clear();
+            Ok(ControlFlow::Continue((snapshot, previous_digest)))
+        }
+    }
 }
 
 /// Compares a finished read with the snapshot the panel was built from and,
@@ -508,5 +573,126 @@ mod tests {
         drop(app.source_control_loaded(key, request, Ok(read)));
         assert!(Arc::ptr_eq(source(&app).source_snapshot().unwrap(), &shown));
         assert_eq!(source(&app).source_digest(), touched.as_ref());
+    }
+
+    /// Files can come into view without its own controls: here an
+    /// inspector opens on a workspace section saved showing Files, over
+    /// rows a Changes-only read built. Showing it reads the worktree again
+    /// rather than leaving "Loading files…" with nothing loading, and a
+    /// Changes-only read landing while Files shows does the same.
+    #[test]
+    fn files_shown_over_a_deferred_tree_reads_the_worktree_for_it() {
+        use super::super::context_sections::{Section, WorkspaceView};
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().expect("fixture has a focused card");
+        app.sidebar_model = sidebar::test_support::panel_model();
+        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        app.context_sections.workspace_view = WorkspaceView::Files;
+        app.context_sections.set_open(Section::Workspace, true);
+        drop(app.rebind_source_control());
+        let key = app.sidebar_state.active_worktree().cloned().expect("bound");
+        app.cancel_source_read();
+        let deferred = |key: &ActiveWorktreeKey| {
+            let snapshot = Arc::new(snapshot());
+            SourceControlModel::build(key.clone(), &snapshot, FileTree::Deferred)
+                .built_from(snapshot, Some(SnapshotDigest::fixture(1)))
+        };
+        app.sidebar_model.source_control = Some(deferred(&key));
+        assert_eq!(app.workspace_view_shown(), None);
+        // Nothing reads for Files while it is out of view.
+        drop(app.rebind_source_control());
+        assert!(app.refresh_ui.source_cancel.is_none());
+
+        drop(app.update(Message::TogglePaneInspector(card)));
+        app.settle_pane_inspectors();
+        drop(app.rebind_source_control());
+        assert_eq!(app.workspace_view_shown(), Some(WorkspaceView::Files));
+        assert!(
+            app.refresh_ui.source_cancel.is_some(),
+            "showing Files reads"
+        );
+        // The rows stay up while the read builds the tree.
+        assert!(
+            source(&app).source_snapshot().is_some() && source(&app).progress_label().is_some()
+        );
+        let request = app.refresh_ui.source_generation;
+        drop(app.rebind_source_control());
+        assert_eq!(
+            app.refresh_ui.source_generation, request,
+            "a running read is not restarted"
+        );
+
+        // A Changes-only read that was already running lands deferred.
+        let read = source_control_read(key.clone(), None, snapshot(), None, FileTree::Deferred);
+        drop(app.source_control_loaded(key.clone(), request, Ok(read)));
+        assert!(
+            app.refresh_ui.source_cancel.is_some(),
+            "its landing reads for Files"
+        );
+        assert_ne!(app.refresh_ui.source_generation, request);
+
+        // Once a read builds the tree, nothing more is asked.
+        let request = app.refresh_ui.source_generation;
+        let read = source_control_read(key.clone(), None, snapshot(), None, FileTree::Built);
+        drop(app.source_control_loaded(key, request, Ok(read)));
+        assert!(source(&app).files_built());
+        assert!(app.refresh_ui.source_cancel.is_none());
+        drop(app.rebind_source_control());
+        assert!(app.refresh_ui.source_cancel.is_none());
+    }
+
+    /// An unchanged answer stands as is for Changes. For Files it rebuilds
+    /// from the kept snapshot with the ignored listing cleared, because the
+    /// worker lists ignored folders again and the digest never covered
+    /// them; a stale listing or error must not survive into the new rows.
+    #[test]
+    fn an_unchanged_answer_for_files_relists_ignored_folders() {
+        let kept = unreadable_build();
+        let digest = Some(SnapshotDigest::fixture(3));
+
+        match snapshot_to_build(
+            SnapshotRead::Unchanged,
+            Some(&kept),
+            digest,
+            FileTree::Deferred,
+        ) {
+            Ok(ControlFlow::Break(SourceControlRead::Unchanged { digest: answered })) => {
+                assert_eq!(answered, digest);
+            }
+            _ => panic!("an unchanged Changes read keeps the rows"),
+        }
+
+        let Ok(ControlFlow::Continue((rebuilt, answered))) = snapshot_to_build(
+            SnapshotRead::Unchanged,
+            Some(&kept),
+            digest,
+            FileTree::Built,
+        ) else {
+            panic!("an unchanged Files read rebuilds from the kept snapshot");
+        };
+        assert_eq!(answered, digest);
+        assert_eq!(rebuilt.status, kept.status);
+        assert_eq!(rebuilt.files.paths, kept.files.paths);
+        assert!(rebuilt.files.ignored.is_empty());
+        assert!(rebuilt.files.ignored_directories.is_empty());
+        assert!(rebuilt.files.ignored_directory_errors.is_empty());
+
+        assert!(snapshot_to_build(SnapshotRead::Unchanged, None, digest, FileTree::Built).is_err());
+
+        let changed = SnapshotRead::Changed {
+            snapshot: Box::new(snapshot()),
+            digest: Some(SnapshotDigest::fixture(4)),
+        };
+        let Ok(ControlFlow::Continue((read, answered))) =
+            snapshot_to_build(changed, Some(&kept), digest, FileTree::Deferred)
+        else {
+            panic!("a changed read builds");
+        };
+        assert_eq!(answered, Some(SnapshotDigest::fixture(4)));
+        assert_eq!(
+            read.files.ignored_directories,
+            snapshot().files.ignored_directories
+        );
     }
 }
