@@ -3930,7 +3930,18 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    run_from_with_staged_lookup(arguments, crate::install_guard::staged_owner_bin)
+    run_from_with_staged_lookup(arguments, |executable, recover| {
+        #[cfg(target_os = "macos")]
+        let mut progress = |message: &str| {
+            let _ = writeln!(io::stderr().lock(), "{message}");
+        };
+        crate::install_guard::staged_owner_bin(
+            executable,
+            recover,
+            #[cfg(target_os = "macos")]
+            Some(crate::install_guard::ReadyLaunch::Terminal(&mut progress)),
+        )
+    })
 }
 
 fn run_from_with_staged_lookup<I, T>(
@@ -4471,9 +4482,21 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
 
 /// Desktop launches need the same matched owner as CLI launches while a staged
 /// update is pending. Internal helpers and remote devices do not use this route.
-pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&crate::process::current_executable()?, true)
-        .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
+pub fn staged_ui_executable(
+    #[cfg(target_os = "macos")] show_progress: &mut dyn FnMut(),
+) -> io::Result<Option<PathBuf>> {
+    // A CLI launch authenticated its exact image over a close-on-exec socket.
+    // Its CLI already handles Ready recovery before selecting which app to open.
+    #[cfg(target_os = "macos")]
+    let ready_launch = (!crate::instance::ui_launch_handshake_requested())
+        .then_some(crate::install_guard::ReadyLaunch::Window(show_progress));
+    crate::install_guard::staged_owner_bin(
+        &crate::process::current_executable()?,
+        true,
+        #[cfg(target_os = "macos")]
+        ready_launch,
+    )
+    .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {

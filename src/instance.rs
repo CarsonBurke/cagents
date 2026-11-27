@@ -675,13 +675,26 @@ pub fn show_startup_wait_notice(
 /// opened, or startup has ended in another way that explains itself.
 #[cfg(feature = "ui")]
 pub fn dismiss_startup_wait_notice() {
-    let notice = STARTUP_WAIT_NOTICE
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .take();
-    if let Some((notice, _lock)) = notice {
+    if let Some((notice, _lock)) = take_startup_wait_notice() {
         close_startup_wait_notice(notice);
     }
+}
+
+/// Reap the notice before replacing the window process and its threads.
+#[cfg(all(target_os = "macos", feature = "ui"))]
+pub fn dismiss_startup_wait_notice_before_exec() {
+    if let Some((mut notice, _lock)) = take_startup_wait_notice() {
+        let _ = notice.kill();
+        let _ = notice.wait();
+    }
+}
+
+#[cfg(feature = "ui")]
+fn take_startup_wait_notice() -> Option<(process::Child, OwnedLock)> {
+    STARTUP_WAIT_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take()
 }
 
 #[cfg(feature = "ui")]

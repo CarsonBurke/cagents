@@ -1,5 +1,6 @@
 //! Durable inputs for the installed updater's exact Ready activation.
 use super::*;
+use crate::install_guard::ReadyLaunch;
 use crate::upgrade::{
     handoff::{INSTALLED_ACTIVATION_LIMIT as LIMIT, Store},
     recovery::{ReadyPlanEvidence, Receipt},
@@ -245,7 +246,10 @@ fn settled_bin(
 
 /// A launch through the original selector can continue this exact approval.
 /// Use a directory/lease watcher while another coordinator still owns it.
-pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, UpdateError> {
+pub(crate) fn resume_selected(
+    executable: &Path,
+    mut launch: ReadyLaunch<'_>,
+) -> Result<Option<PathBuf>, UpdateError> {
     let source = match locate(executable) {
         Ok(layout) => layout,
         Err(UpdateError::UnsupportedInstallation) => return Ok(None),
@@ -259,6 +263,8 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
     }
     let state = original.state();
     let deadline = Instant::now() + crate::install_guard::daemon_start_timeout()?;
+    let mut last = String::new();
+    let mut notice_shown = false;
     loop {
         let Some(reservation) = refreshed_reservation(&original)? else {
             return settled_bin(&original, &source);
@@ -282,11 +288,28 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
         let lock = match acquire_lock(&state) {
             Ok(lock) => lock,
             Err(UpdateError::Busy) => {
-                let changes = progress::TerminalChanges::watch_directory(&state)?;
-                if changes.wait(deadline) == progress::TerminalWake::Changed {
-                    continue;
+                // Register before reading progress. The lease also wakes us
+                // if the owner exits before publishing another snapshot.
+                let watcher = progress::TerminalChanges::watch_directory(&state)
+                    .map_err(|_| update_in_progress())?;
+                match &mut launch {
+                    ReadyLaunch::Terminal(report) => {
+                        if let Some(message) = installing_message(&state, &original.job) {
+                            report_progress(report, &mut last, &message);
+                        } else if last.is_empty() {
+                            report_progress(report, &mut last, FINISHING);
+                        }
+                    }
+                    ReadyLaunch::Window(show_progress) if !notice_shown => {
+                        show_progress();
+                        notice_shown = true;
+                    }
+                    ReadyLaunch::Window(_) => (),
                 }
-                return Err(UpdateError::Busy);
+                if watcher.wait(deadline) != progress::TerminalWake::Changed {
+                    return Err(update_in_progress());
+                }
+                continue;
             }
             Err(error) => return Err(error),
         };
@@ -297,6 +320,7 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
             Phase::Released => return Ok(reservation.selected_bin()),
             Phase::Selected => return Ok(Some(reservation.plan.target.join("bin"))),
             Phase::Returning => {
+                report_returning(&mut launch, notice_shown, &mut last);
                 reservation.finish_return(&source)?;
                 return Ok(None);
             }
@@ -314,6 +338,7 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
                 let Some(target) = reservation
                     .settle_unavailable_candidate(&source, &state, &job, &lock, &error)?
                 else {
+                    report_returning(&mut launch, notice_shown, &mut last);
                     reservation.finish_return(&source)?;
                     return Ok(None);
                 };
@@ -325,9 +350,24 @@ pub(crate) fn resume_selected(executable: &Path) -> Result<Option<PathBuf>, Upda
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(state.join(format!("{}.log", job.id)))?;
         validate_lock(&log)?;
+        let watcher = matches!(launch, ReadyLaunch::Terminal(_))
+            .then(|| progress::TerminalChanges::watch_directory(&state).ok())
+            .flatten();
         let mut worker = spawn_update_worker(&bin.join("cagents"), &job.id, log, &lock)?;
         drop(lock.into_file());
-        if !worker.wait()?.success() {
+        let exited = match launch {
+            ReadyLaunch::Terminal(report) => {
+                report_progress(report, &mut last, FINISHING);
+                observe_worker(worker, watcher, &state, &job, report, &mut last, deadline)?
+            }
+            ReadyLaunch::Window(show_progress) => {
+                if !notice_shown {
+                    show_progress();
+                }
+                worker.wait()?
+            }
+        };
+        if !exited.success() {
             return Err(invalid(
                 "The approved update could not finish starting the staged build",
             ));
@@ -347,7 +387,7 @@ impl Reservation<'_> {
         failure: &UpdateError,
     ) -> Result<Option<InstallLayout>, UpdateError> {
         let guard = crate::instance::UiUpdateGuard::acquire()?;
-        let publication = crate::install_guard::reserve_darwin_publication()?;
+        let _publication = crate::install_guard::reserve_darwin_publication()?;
         if let Ok(target) = self.plan.target_layout(&source.prefix, job) {
             return Ok(Some(target));
         }
@@ -406,6 +446,81 @@ impl Reservation<'_> {
         store.retire_installed_activation().map_err(invalid)?;
         Ok(())
     }
+}
+
+const FINISHING: &str = "Finishing the approved update";
+
+fn report_returning(launch: &mut ReadyLaunch<'_>, notice_shown: bool, last: &mut String) {
+    match launch {
+        ReadyLaunch::Terminal(report) => {
+            report_progress(report, last, "Reopening the current version")
+        }
+        ReadyLaunch::Window(show_progress) if !notice_shown => show_progress(),
+        ReadyLaunch::Window(_) => (),
+    }
+}
+
+fn update_in_progress() -> UpdateError {
+    io::Error::new(io::ErrorKind::WouldBlock, crate::instance::UpdateInProgress).into()
+}
+
+fn installing_message(state: &Path, job: &str) -> Option<String> {
+    let snapshot = cutover::read_job(state).ok()??;
+    (snapshot.id == job && snapshot.phase == UpdatePhase::Installing).then_some(snapshot.message)
+}
+
+fn report_progress(report: &mut dyn FnMut(&str), last: &mut String, message: &str) {
+    if last != message {
+        report(message);
+        last.clear();
+        last.push_str(message);
+    }
+}
+
+fn observe_worker(
+    mut worker: std::process::Child,
+    watcher: Option<progress::TerminalChanges>,
+    state: &Path,
+    original: &UpdateJob,
+    report: &mut dyn FnMut(&str),
+    last: &mut String,
+    deadline: Instant,
+) -> io::Result<std::process::ExitStatus> {
+    use std::os::unix::net::UnixStream;
+
+    let (Some(watcher), Ok((exited, wake))) = (watcher, UnixStream::pair()) else {
+        return worker.wait();
+    };
+    thread::scope(|scope| {
+        let wait = scope.spawn(move || {
+            let result = worker.wait();
+            drop(wake);
+            result
+        });
+        let mut before_worker = Some(original.message.as_str());
+        let mut observe = || {
+            if let Some(message) = installing_message(state, &original.id)
+                && before_worker != Some(message.as_str())
+            {
+                before_worker = None;
+                report_progress(report, last, &message);
+            }
+        };
+        loop {
+            observe();
+            if progress::TerminalChanges::wait_with_input(
+                Some(&watcher),
+                Some(exited.as_raw_fd()),
+                Some(deadline),
+            ) != progress::TerminalWake::Changed
+            {
+                break;
+            }
+        }
+        let result = wait.join().expect("waiting for the update worker panicked");
+        observe();
+        result
+    })
 }
 
 /// Keeps another updater from taking over while the user archives a failed
@@ -678,12 +793,7 @@ pub(super) fn recover_worker(
         plan.selection.previous_link(),
         publication,
     )?;
-    set_phase(
-        state,
-        job,
-        UpdatePhase::Installing,
-        "Finishing the approved update",
-    )?;
+    set_phase(state, job, UpdatePhase::Installing, FINISHING)?;
     let timeout = crate::install_guard::daemon_start_timeout()?;
     let started = standby.activate(&daemon, Some(&handoff), Some(&receipt), timeout, || {
         let _ = installed::report_overdue_startup(state, job);
@@ -721,6 +831,52 @@ fn acquire_unserved_runtime() -> Result<crate::daemon::lease_handoff::LeaseHando
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn terminal_progress_reads_the_exact_job_even_if_its_worker_exits_before_notification() {
+        let directory = tempfile::tempdir().unwrap();
+        let state = directory.path();
+        let _lease = acquire_lock(state).unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "0.2.4".into(),
+            phase: UpdatePhase::Installing,
+            message: "Starting the installed application".into(),
+            log_path: state.join("update.log"),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        let original = job.clone();
+        job.id = uuid::Uuid::new_v4().to_string();
+        write_job(state, &job).unwrap();
+        assert!(installing_message(state, &original.id).is_none());
+
+        let watcher = progress::TerminalChanges::watch_directory(state).unwrap();
+        job.id.clone_from(&original.id);
+        job.message = "Restoring sessions is taking longer".into();
+        let next = state.join("next");
+        serde_json::to_writer(private_create(&next).unwrap(), &job).unwrap();
+        let worker = Command::new("/bin/mv")
+            .arg(next)
+            .arg(state.join("status.json"))
+            .spawn()
+            .unwrap();
+        let mut messages = Vec::new();
+        let status = observe_worker(
+            worker,
+            Some(watcher),
+            state,
+            &original,
+            &mut |message| messages.push(message.to_owned()),
+            &mut FINISHING.to_owned(),
+            Instant::now() + Duration::from_secs(10),
+        )
+        .unwrap();
+        assert!(status.success());
+        assert_eq!(messages, [job.message]);
+    }
 
     #[test]
     fn retry_requires_the_original_private_plan_contents() {

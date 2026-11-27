@@ -23,6 +23,7 @@ const STILL_STARTING: &str = "--still-starting";
 /// A daemon admission this long is worth explaining. Shorter ones pass for
 /// ordinary startup, as when this window starts the daemon itself.
 const STARTUP_WAIT_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+const STARTUP_WAIT_UPDATE: &str = "--update";
 
 cagents::stamp_version!();
 
@@ -253,9 +254,8 @@ fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::R
         .map(|_| ())
 }
 
-/// Tells the user why no window has appeared yet while the daemon finishes
-/// starting. The waiting process closes it once its own window opens.
-fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
+/// Explain what needs to finish before the workspace can open.
+fn spawn_startup_wait_notice(kind: StartupWaitKind) -> std::io::Result<std::process::Child> {
     let parent = std::process::id();
     let mut command = std::process::Command::new(cagents::process::current_executable()?);
     command
@@ -266,6 +266,9 @@ fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .process_group(0);
+    if kind == StartupWaitKind::Update {
+        command.arg(STARTUP_WAIT_UPDATE);
+    }
     // SAFETY: the hook makes only async-signal-safe syscalls before exec.
     unsafe {
         command.pre_exec(move || {
@@ -397,12 +400,17 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     }
     if arguments.peek() == Some(&STARTUP_WAIT) {
         arguments.next();
+        let kind = if arguments.next_if_eq(&STARTUP_WAIT_UPDATE).is_some() {
+            StartupWaitKind::Update
+        } else {
+            StartupWaitKind::Daemon
+        };
         if arguments.next().is_some() {
             return Err("invalid startup wait arguments".into());
         }
         #[cfg(target_os = "macos")]
         end_with_parent()?;
-        return run_startup_wait_notice();
+        return run_startup_wait_notice(kind);
     }
     if arguments.peek() == Some(&CONFIRM_DAEMON_STOP) {
         arguments.next();
@@ -462,9 +470,14 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     cagents::device::select(device)?;
     cagents::device::prepare()?;
     if !cagents::device::is_remote()
-        && let Some(executable) = cagents::control::staged_ui_executable()?
+        && let Some(executable) = cagents::control::staged_ui_executable(
+            #[cfg(target_os = "macos")]
+            &mut || show_startup_wait_notice(StartupWaitKind::Update),
+        )?
     {
-        // exec preserves the launcher handshake pipe and window arguments.
+        #[cfg(target_os = "macos")]
+        cagents::instance::dismiss_startup_wait_notice_before_exec();
+        // Preserve the original window arguments and any inherited pipe.
         let mut command = std::process::Command::new(executable);
         command.args(std::env::args_os().skip(1));
         return Err(command.exec().into());
@@ -493,11 +506,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                     return;
                 }
                 notice_shown = true;
-                if let Err(error) =
-                    cagents::instance::show_startup_wait_notice(spawn_startup_wait_notice)
-                {
-                    tracing::warn!(%error, "could not show the daemon startup notice");
-                }
+                show_startup_wait_notice(StartupWaitKind::Daemon);
             })?;
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
@@ -716,11 +725,25 @@ impl cosmic::Application for StartupError {
     }
 }
 
-/// Explains a window that has not appeared yet because the daemon is still
-/// starting. It changes nothing: the waiting process opens the workspace by
-/// itself and closes this notice when it does, or when startup fails.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StartupWaitKind {
+    Daemon,
+    Update,
+}
+
+fn show_startup_wait_notice(kind: StartupWaitKind) {
+    if let Err(error) =
+        cagents::instance::show_startup_wait_notice(|| spawn_startup_wait_notice(kind))
+    {
+        tracing::warn!(%error, "could not show the startup notice");
+    }
+}
+
+/// The waiting process opens the workspace and closes this notice when it
+/// does, or when startup fails.
 struct StartupWait {
     core: Core,
+    kind: StartupWaitKind,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -730,14 +753,14 @@ enum StartupWaitMessage {
 
 impl cosmic::Application for StartupWait {
     type Executor = cosmic::executor::Default;
-    type Flags = ();
+    type Flags = StartupWaitKind;
     type Message = StartupWaitMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StartupWait";
 
-    fn init(core: Core, _: ()) -> (Self, cosmic::app::Task<StartupWaitMessage>) {
+    fn init(core: Core, kind: StartupWaitKind) -> (Self, cosmic::app::Task<StartupWaitMessage>) {
         // The spinner is the only thing on screen; let it turn at full rate.
         cagents_ui::ui_controls::animate_activity(true);
-        (Self { core }, cosmic::app::Task::none())
+        (Self { core, kind }, cosmic::app::Task::none())
     }
 
     fn core(&self) -> &Core {
@@ -759,23 +782,29 @@ impl cosmic::Application for StartupWait {
     }
 
     fn view(&self) -> cosmic::Element<'_, StartupWaitMessage> {
+        let (title, detail, note) = match self.kind {
+            StartupWaitKind::Daemon => (
+                "Starting cagents",
+                "The cagents daemon is still starting. Your workspace opens as soon as it is ready.",
+                "Starting can take longer while it restores your sessions. Hiding this message does not stop cagents from opening.",
+            ),
+            StartupWaitKind::Update => (
+                "Finishing the update",
+                "Your workspace will open after cagents restores your sessions.",
+                "The update continues if you hide this window.",
+            ),
+        };
         let heading = cosmic::widget::row::with_children(vec![
             cagents_ui::ui_controls::activity_spinner(20.0, cagents::design::accent_color),
-            cagents::design::title("Starting cagents").into(),
+            cagents::design::title(title).into(),
         ])
         .spacing(space::M)
         .align_y(iced::Alignment::Center);
         cosmic::widget::container(
             cosmic::widget::column::with_children(vec![
                 heading.into(),
-                cagents::design::body(
-                    "The cagents daemon is still starting. Your workspace opens as soon as it is ready.",
-                )
-                .into(),
-                cagents::design::caption(
-                    "Starting can take longer while it restores your sessions. Hiding this message does not stop cagents from opening.",
-                )
-                .into(),
+                cagents::design::body(detail).into(),
+                cagents::design::caption(note).into(),
                 cagents_ui::ui_controls::button::secondary("Hide")
                     .on_press(StartupWaitMessage::Hide)
                     .into(),
@@ -789,7 +818,7 @@ impl cosmic::Application for StartupWait {
     }
 }
 
-fn run_startup_wait_notice() -> Result<(), Box<dyn std::error::Error>> {
+fn run_startup_wait_notice(kind: StartupWaitKind) -> Result<(), Box<dyn std::error::Error>> {
     type Shell = Cosmic<StartupWait>;
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
     iced::daemon(
@@ -802,7 +831,7 @@ fn run_startup_wait_notice() -> Result<(), Box<dyn std::error::Error>> {
             });
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, task) = Shell::init((core, ()));
+            let (shell, task) = Shell::init((core, kind));
             (shell, iced::Task::batch([open.discard(), task]))
         },
         Shell::update,

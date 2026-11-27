@@ -928,6 +928,13 @@ impl Drop for CurrentExchange {
     }
 }
 
+/// A launch can print snapshots or show a notice while an approved update runs.
+#[cfg(target_os = "macos")]
+pub(crate) enum ReadyLaunch<'a> {
+    Terminal(&'a mut dyn FnMut(&str)),
+    Window(&'a mut dyn FnMut()),
+}
+
 /// A marker only selects a complete same-prefix tree while the kernel still
 /// identifies that exact daemon or matching live windows as the runtime owner.
 /// Recovery can restart only their matched daemon under the launch fence; the
@@ -935,6 +942,7 @@ impl Drop for CurrentExchange {
 pub(crate) fn staged_owner_bin(
     executable: &Path,
     recover: bool,
+    #[cfg(target_os = "macos")] ready_launch: Option<ReadyLaunch<'_>>,
 ) -> io::Result<Option<std::path::PathBuf>> {
     // This is the confirmed successor, holding the exact runtime lease. The
     // old PID in its metadata is expected until HostLease adopts it; routing
@@ -948,8 +956,14 @@ pub(crate) fn staged_owner_bin(
         && std::env::var_os(crate::instance::INSTALL_GUARD_ENV).is_none()
         && crate::instance::window_launch_restore_policy()
             != crate::instance::WindowRestorePolicy::ExistingOnly
+        && let Some(ready_launch) = ready_launch
         && let Some(bin) =
-            crate::update::resume_darwin_update(executable).map_err(io::Error::other)?
+            crate::update::resume_darwin_update(executable, ready_launch).map_err(|error| {
+                match error {
+                    crate::update::UpdateError::Io(error) => error,
+                    error => io::Error::other(error),
+                }
+            })?
     {
         return Ok(Some(bin));
     }
@@ -1780,7 +1794,13 @@ IFS= read -r released <&3
         std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
         for recover in [false, true] {
             assert_eq!(
-                staged_owner_bin(&bin.join("cagents"), recover).unwrap(),
+                staged_owner_bin(
+                    &bin.join("cagents"),
+                    recover,
+                    #[cfg(target_os = "macos")]
+                    None,
+                )
+                .unwrap(),
                 None
             );
         }
