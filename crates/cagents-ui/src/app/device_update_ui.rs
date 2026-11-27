@@ -172,7 +172,7 @@ impl Cagents {
                 if let Some(running) = running.as_ref().filter(|running| **running != device) {
                     // One update at a time; the strip keeps following it.
                     self.status = Some(TransientNotice::warning(format!(
-                        "{device} needs this computer's cagents too. Open it again once {running} has finished updating."
+                        "Couldn't open {device}. Try again once {running} has finished updating."
                     )));
                     return Task::none();
                 }
@@ -336,7 +336,7 @@ impl Cagents {
         };
         // What stops this computer sending its cagents replaces the advice to.
         let detail = match (run, subject.blocked) {
-            (None, Some(blocked)) => Some(blocked.to_owned()),
+            (None, Some(blocked)) if subject.need.sendable() => Some(blocked.to_owned()),
             _ => detail,
         };
         let mut text = vec![design::heading(heading).into()];
