@@ -149,15 +149,13 @@ impl Runtime {
                 }
                 controls.push(denial_control_id(card, &denial.tool_use_id, false));
             }
-            if !(self.session.launch.provider == Provider::Codex && self.snapshot.busy) {
-                controls.extend(
-                    self.snapshot
-                        .capabilities
-                        .permission_modes
-                        .iter()
-                        .map(|mode| card_control_id(card, &format!("chat-permission-mode-{mode}"))),
-                );
-            }
+            controls.extend(
+                self.snapshot
+                    .capabilities
+                    .permission_modes
+                    .iter()
+                    .map(|mode| card_control_id(card, &format!("chat-permission-mode-{mode}"))),
+            );
         }
         controls
     }
@@ -311,6 +309,13 @@ impl Runtime {
         }
         if !snapshot.capabilities.permission_modes.is_empty() {
             content.push(design::caption("Permission mode").into());
+            if let Some(note) = self.permission_change_note() {
+                content.push(
+                    design::caption(note)
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .into(),
+                );
+            }
             for mode in &snapshot.capabilities.permission_modes {
                 content.push(
                     widget::button::custom(
@@ -336,15 +341,32 @@ impl Runtime {
                         None,
                     ))
                     .on_press_maybe(
-                        (enabled
-                            && !(self.session.launch.provider == Provider::Codex && snapshot.busy))
-                            .then(|| action(Action::PermissionMode(target, mode.clone()))),
+                        enabled.then(|| action(Action::PermissionMode(target, mode.clone()))),
                     )
                     .into(),
                 );
             }
         }
         permissions_surface(content, width, target.card)
+    }
+
+    /// What a person changing the mode now should know: a Codex turn keeps
+    /// the mode it started with, so a change applies from the next one, and
+    /// a request it is waiting on still needs an answer.
+    pub(super) fn permission_change_note(&self) -> Option<&'static str> {
+        if self.session.launch.provider != Provider::Codex || !self.snapshot.busy {
+            return None;
+        }
+        let waiting = self
+            .snapshot
+            .requests
+            .iter()
+            .any(|request| request.kind == chat::RequestKind::Approval);
+        Some(if waiting {
+            "A change applies from the next turn. This turn still needs your answer to its approval request."
+        } else {
+            "A change applies from the next turn."
+        })
     }
 
     /// The subagent a block stopped, as its tab names it. The provider

@@ -280,6 +280,8 @@ class Scenario:
         self.home = None
         self.model = "fixture-mini"
         self.reasoning = None
+        # The approval policy and sandbox, as a thread's settings name them.
+        self.approval, self.sandbox = "on-request", "readOnly"
         self.name = "Offline tool rows"
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
         self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
@@ -305,6 +307,7 @@ class Scenario:
                                   "second": self.second, "second_latest": self.second_latest,
                                   "latest": self.latest, "child_latest": self.child_latest,
                                   "model": self.model, "reasoning": self.reasoning,
+                                  "approval": self.approval, "sandbox": self.sandbox,
                                   "interrupting": sorted(self.interrupting)})
 
     def restore(self, state):
@@ -321,6 +324,8 @@ class Scenario:
         self.child_latest = copy.deepcopy(state.get("child_latest"))
         self.model = state.get("model", "fixture-mini")
         self.reasoning = state.get("reasoning")
+        self.approval = state.get("approval", "on-request")
+        self.sandbox = state.get("sandbox", "readOnly")
         self.interrupting = set(map(tuple, state.get("interrupting", ())))
         self._generations.clear()
         for thread in self._threads():
@@ -697,9 +702,15 @@ class Scenario:
                 self.model = params.get("model") or self.config(codex_home).get("model") \
                     or default["model"]
                 self.reasoning = params.get("config", {}).get("model_reasoning_effort")
+                # The launch's own policy and sandbox, as an agent's spawn
+                # names them, else Codex's usual ones.
+                self.approval = params.get("approvalPolicy") or "on-request"
+                self.sandbox = {"read-only": "readOnly", "workspace-write": "workspaceWrite",
+                                "danger-full-access": "dangerFullAccess"}.get(
+                                    params.get("sandbox"), "readOnly")
             result = {"thread": self.metadata(thread), "model": self.model,
                       "reasoningEffort": self.reasoning,
-                      "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
+                      "approvalPolicy": self.approval, "sandbox": {"type": self.sandbox},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
             if (Path(codex_home) / "fixture-unconfirmed-model").is_file():
                 del result["model"]
@@ -866,6 +877,25 @@ class Scenario:
                 after = [{"method": "turn/completed", "params": {"threadId": thread, "turn": interrupted}},
                          {"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "idle"}}}]
             result = {}
+        elif method == "thread/settings/update":
+            # Like Codex, settings apply from the next turn, so they are
+            # accepted during one too, and confirmed by notification.
+            if params.get("threadId") != self.thread:
+                return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
+            if "approvalPolicy" in params:
+                self.approval = params["approvalPolicy"]
+            if "sandboxPolicy" in params:
+                self.sandbox = params["sandboxPolicy"]["type"]
+            if params.get("model"):
+                self.model = params["model"]
+            if "effort" in params:
+                self.reasoning = params["effort"]
+            result = {}
+            after = [{"method": "thread/settings/updated", "params": {
+                "threadId": self.thread,
+                "threadSettings": {"approvalPolicy": self.approval,
+                                   "sandboxPolicy": {"type": self.sandbox},
+                                   "model": self.model, "effort": self.reasoning}}}]
         elif method == "thread/unsubscribe":
             result = {}
         else:

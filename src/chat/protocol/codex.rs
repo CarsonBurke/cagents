@@ -2665,8 +2665,11 @@ impl Adapter for Codex {
                 })?;
             }
             Command::SetPermissionMode { mode } => {
-                if !self.direct_input || self.busy {
-                    return Err("Codex permissions can be changed only on an idle, writable thread".into());
+                // Codex applies thread settings from the next turn, so a
+                // running one, such as one waiting on an approval, keeps its
+                // own while the person still gets to change the rest.
+                if !self.direct_input {
+                    return Err("Codex permissions can be changed only on a writable thread".into());
                 }
                 let (approval, sandbox) = match mode.as_str() {
                     "yolo" => ("never", "dangerFullAccess"),

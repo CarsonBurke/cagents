@@ -6898,6 +6898,58 @@ fn send_appears_with_a_draft_left_of_a_stop_that_stays_put() {
     );
 }
 
+/// A Codex conversation in the middle of a turn, such as an agent stopped on
+/// an approval, still lets the person change its permission mode, and says
+/// that the change applies from the next turn.
+#[test]
+fn a_busy_codex_conversation_still_offers_its_permission_mode() {
+    let (mut runtime, _handle) = furnished_runtime();
+    runtime.session.launch.provider = Provider::Codex;
+    let modes = ["readOnly", "workspaceWrite", "yolo"];
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.capabilities.permission_modes = modes.map(String::from).to_vec();
+    snapshot.permission_mode = Some("workspaceWrite".into());
+    snapshot.busy = true;
+    let laid = lay_out(&runtime, 900.0, None, &["chat-permission-picker"]);
+    assert!(
+        laid.controls.contains_key("chat-permission-picker"),
+        "{:?}",
+        laid.footer_text
+    );
+    let controls = runtime.permission_controls(true);
+    for mode in modes {
+        let id = card_control_id(runtime.target.card, &format!("chat-permission-mode-{mode}"));
+        assert!(controls.contains(&id), "{mode}");
+    }
+    assert_eq!(
+        runtime.permission_change_note(),
+        Some("A change applies from the next turn.")
+    );
+    Arc::make_mut(&mut runtime.snapshot)
+        .requests
+        .push(chat::Request {
+            kind: crate::chat::RequestKind::Approval,
+            id: "approval".into(),
+            title: "Command approval".into(),
+            description: "gh issue view 4580".into(),
+            fields: Vec::new(),
+            actions: Vec::new(),
+        });
+    assert_eq!(
+        runtime.permission_change_note(),
+        Some(
+            "A change applies from the next turn. This turn still needs your answer to its approval request."
+        )
+    );
+    // Between turns, and for a provider that applies a change at once, there
+    // is nothing to add.
+    Arc::make_mut(&mut runtime.snapshot).busy = false;
+    assert_eq!(runtime.permission_change_note(), None);
+    Arc::make_mut(&mut runtime.snapshot).busy = true;
+    runtime.session.launch.provider = Provider::Claude;
+    assert_eq!(runtime.permission_change_note(), None);
+}
+
 #[test]
 fn narrow_footer_keeps_its_controls_on_one_line_without_an_overflow() {
     let roles = ["chat-model-picker", "chat-permission-picker"];

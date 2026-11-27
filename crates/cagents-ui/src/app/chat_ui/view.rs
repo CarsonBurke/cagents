@@ -5691,7 +5691,7 @@ impl Runtime {
             let modes = &snapshot.capabilities.permission_modes;
             let chosen = self.chosen_permission_mode();
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
-            if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
+            if transitioning {
                 controls.push(footer_cell(design::caption(
                     selected.map_or("Permissions", |index| {
                         permission_mode_label(self.session.launch.provider, &modes[index])

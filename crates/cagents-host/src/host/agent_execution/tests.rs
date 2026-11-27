@@ -4248,9 +4248,20 @@ fn an_agent_gives_its_children_no_more_permission_than_its_own() {
         "deny\n"
     );
 
-    // Another provider's child gets the strictest mode of the parent's tier.
+    // Another provider's child gets its equivalent of the parent's level.
     let codex = spawn(&agent, "codex", Provider::Codex, None, "work").unwrap();
     assert_eq!(mode(&codex).as_deref(), Some("untrusted/workspace-write"));
+    settled(&host, codex.run.id);
+
+    // A parent where nothing asks starts children where nothing asks, of
+    // its own provider and of another, rather than ones that stop on every
+    // command leaving a sandbox.
+    let bypass = agent_authority(&host, unrestricted.agent.id);
+    let same = spawn(&bypass, "bypass-claude", Provider::Claude, None, "work").unwrap();
+    assert_eq!(mode(&same).as_deref(), Some("bypassPermissions"));
+    settled(&host, same.run.id);
+    let codex = spawn(&bypass, "bypass-codex", Provider::Codex, None, "work").unwrap();
+    assert_eq!(mode(&codex).as_deref(), Some("never/danger-full-access"));
     settled(&host, codex.run.id);
 
     // A parent whose mode is not confirmed counts as asking for approval.
@@ -4384,6 +4395,110 @@ done
     assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
     let answered = std::fs::read_to_string(root.join("omp-answer")).unwrap();
     assert!(answered.contains(r#""cancelled":true"#), "{answered}");
+}
+
+/// The ceiling bounds agents, not the person: a person loosens a limited
+/// agent's child's mode in its pane, which the agent itself can't, and the
+/// child's own children then follow the child's new mode.
+#[test]
+fn a_person_loosens_a_limited_agent_s_child_and_its_children_follow() {
+    if isolated("a_person_loosens_a_limited_agent_s_child_and_its_children_follow").is_some() {
+        return;
+    }
+    let (host, request, _path) = fixture();
+    let spawn = |authority: &Authority, key: &str, provider, mode: Option<&str>| {
+        let mut request = request.clone();
+        let Destination::New(spec) = &mut request.destination else {
+            unreachable!()
+        };
+        spec.provider = provider;
+        spec.permission_mode = mode.map(str::to_owned);
+        request.idempotency_key = key.into();
+        submit(&host, authority, request).map_err(String::from)
+    };
+    let parent = spawn(
+        &Authority::default(),
+        "parent",
+        Provider::Claude,
+        Some("default"),
+    )
+    .unwrap();
+    assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
+    let lead = agent_authority(&host, parent.agent.id);
+    let child = spawn(&lead, "child", Provider::Claude, None).unwrap();
+    assert_eq!(child.agent.spec.permission_mode.as_deref(), Some("default"));
+    assert_eq!(settled(&host, child.run.id).state, State::Succeeded);
+    let delegate = agent_authority(&host, child.agent.id);
+    assert!(
+        spawn(
+            &delegate,
+            "refused",
+            Provider::Codex,
+            Some("never/danger-full-access")
+        )
+        .is_err()
+    );
+
+    // The person changes the child's mode in its pane.
+    let HostedSession::Chat(session) = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(child.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+    else {
+        unreachable!()
+    };
+    super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatAttach {
+            session: session.clone(),
+        },
+    )
+    .unwrap();
+    let changed = super::super::chat::process(
+        &host,
+        17,
+        ClientRequest::ChatCommand {
+            chat_id: session.id,
+            command: Command::SetPermissionMode {
+                mode: "bypassPermissions".into(),
+            },
+        },
+    );
+    assert!(
+        matches!(changed, Ok(ServerResponse::Accepted)),
+        "{changed:?}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while caller_ceiling(&host, &delegate)
+        .unwrap()
+        .is_none_or(|ceiling| ceiling.tier() != crate::agent_execution::permission::Tier::Full)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the child never confirmed bypassPermissions"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    // The child now starts what its new mode allows, and inherits it.
+    let grandchild = spawn(&delegate, "grandchild", Provider::Codex, None).unwrap();
+    assert_eq!(
+        grandchild.agent.spec.permission_mode.as_deref(),
+        Some("never/danger-full-access")
+    );
+    settled(&host, grandchild.run.id);
+    // Its lead's own ceiling is unchanged by the person's choice.
+    assert_eq!(
+        caller_ceiling(&host, &lead)
+            .unwrap()
+            .map(|ceiling| ceiling.tier()),
+        Some(crate::agent_execution::permission::Tier::Ask)
+    );
 }
 
 /// A person answers the tool request a limited agent was refused in its

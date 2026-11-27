@@ -5913,8 +5913,7 @@ impl Runtime {
                 self.plan_toggle().is_some(),
                 ComposerRow::Plan,
                 // The footer's mode control is offered on the same terms.
-                !transitioning
-                    && !(self.session.launch.provider == Provider::Codex && snapshot.busy),
+                !transitioning,
             ),
             (
                 !snapshot.capabilities.interrupt_modes.is_empty(),
