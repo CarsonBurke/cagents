@@ -289,7 +289,10 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                 let chats = update_recovery::live_chat_descriptors(&state);
                 record.verify_live_inventory(state.proof(), &terminals, &chats)
             }
-            InstalledRestoration::Ready { admission, .. } => {
+            InstalledRestoration::Ready {
+                admission,
+                restored,
+            } => {
                 let chats = chat::chat_list_inventory(&state);
                 if chats.iter().any(|session| {
                     state.chats.get(&session.id).is_none_or(|record| {
@@ -299,7 +302,7 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
                     return Err("An original conversation has not finished resuming".into());
                 }
                 admission.verify_live_inventory(state.proof(), &terminals, &chats)?;
-                admission.remember_cutover(state.proof())
+                admission.remember_cutover(state.proof(), restored.checkpoint_digest_for_removal())
             }
         }?;
         publication
@@ -1003,7 +1006,14 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
     #[cfg(target_os = "macos")]
-    let mut cutover_checkpoint = Some(crate::update::cutover_startup_checkpoint());
+    let mut cutover_checkpoint = {
+        if standby.is_none()
+            && let Err(error) = crate::update::retire_completed_cutover_checkpoint()
+        {
+            tracing::warn!(%error, "could not retire the selected daemon's verified checkpoint");
+        }
+        Some(crate::update::cutover_startup_checkpoint())
+    };
     let listener = listener_before_restore(&paths, reserved_listener, || {
         #[cfg(all(test, target_os = "linux"))]
         observe_fixture_startup("restore inherited recovery", None);

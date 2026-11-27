@@ -4134,12 +4134,22 @@ pub(super) struct RestoredUpgrade {
 struct RestoreFinalization {
     store: Arc<crate::upgrade::handoff::Store>,
     interrupted_setups: bool,
+    #[cfg(target_os = "macos")]
+    restoring_digest: String,
 }
 
 impl RestoredUpgrade {
     #[cfg(target_os = "macos")]
     pub(super) fn claimed_checkpoint(&self) -> bool {
         self.finalization.is_some()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn checkpoint_digest_for_removal(&self) -> Option<&str> {
+        self.finalization
+            .as_ref()
+            .filter(|finalization| !finalization.interrupted_setups)
+            .map(|finalization| finalization.restoring_digest.as_str())
     }
 
     pub(super) fn finish(&mut self, host: &SharedHost) -> Result<(), String> {
@@ -4272,6 +4282,9 @@ fn restore_upgrade_checkpoint(
     // must still use the exact Ready payload accepted at this boundary.
     let ready_checkpoint = (checkpoint.phase == Phase::Ready).then(|| checkpoint.clone());
     checkpoint.phase = Phase::Restoring;
+    #[cfg(target_os = "macos")]
+    let restoring_digest = store.save_with_digest(&checkpoint)?;
+    #[cfg(not(target_os = "macos"))]
     store.save(&checkpoint)?;
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -4548,6 +4561,8 @@ fn restore_upgrade_checkpoint(
         finalization: Some(RestoreFinalization {
             store,
             interrupted_setups,
+            #[cfg(target_os = "macos")]
+            restoring_digest,
         }),
     })
 }
