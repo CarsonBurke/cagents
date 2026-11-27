@@ -2307,7 +2307,7 @@ impl Cagents {
             {
                 channel.shared = true;
             }
-            let retired = self.retire_peer_channel(id);
+            let retired = self.retire_registry_removed_channel(id);
             Task::batch([retired, self.finish_channel_reopen(id)])
         });
         Task::batch([removed, retired, self.reconcile_workspace_model()])
@@ -2626,7 +2626,7 @@ impl Cagents {
             if !matches!(edit, ModelEdit::RetireEmptyChannel { .. }) {
                 self.forget_channel_revival(id);
             }
-            tasks.push(self.retire_peer_channel(id));
+            tasks.push(self.retire_registry_removed_channel(id));
             tasks.push(self.finish_channel_reopen(id));
         }
         if let ModelEdit::ReopenProject { repository, .. } = edit

@@ -899,6 +899,21 @@ impl Cagents {
             }
             let attempt = self.channel_ui.closing.remove(&id).unwrap();
             self.channel_ui.deleting.remove(&id);
+            // The registry can remove the channel while its sessions close:
+            // removing its project removes all the project's channels there,
+            // and this window retires each as a peer's deletion. The deletion
+            // is then done, not refused as changed; only a failed close of its
+            // sessions is still worth saying.
+            if self.channel_ui.was_deleted(id)
+                && !self.durable.channels.iter().any(|channel| channel.id == id)
+            {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(format!(
+                        "The channel was removed, but closing its sessions failed: {error}"
+                    )));
+                }
+                return Task::none();
+            }
             let result = result
                 .and_then(|()| {
                     self.channel_close_targets_current(id, &attempt).then_some(()).ok_or_else(|| {
@@ -2272,6 +2287,11 @@ impl Cagents {
         {
             return false;
         }
+        // The registry drops a channel's view with the channel: another
+        // window deleted it, or removed its project, while this one closed
+        // its sessions. A captured shared pane then has no view to be
+        // retired from, and is gone with the channel.
+        let registry_dropped = self.workspace_model.channel(id).is_none();
         // A close can publish its managed pane tombstone before the worker's
         // receipt arrives. Only that exact source removal may shrink the
         // captured membership; additions, moves and replacements still fail.
@@ -2279,10 +2299,11 @@ impl Cagents {
             attempt.panes.iter().any(|(captured, before, was_shared)| {
                 *captured == card
                     && *was_shared
-                    && self.workspace_model.views.iter().any(|view| {
-                        view.scope == crate::workspace_model::views::Scope::Channel(id)
-                            && view.retired.contains(&card)
-                    })
+                    && (registry_dropped
+                        || self.workspace_model.views.iter().any(|view| {
+                            view.scope == crate::workspace_model::views::Scope::Channel(id)
+                                && view.retired.contains(&card)
+                        }))
                     && !self
                         .workspace_model
                         .views
@@ -2344,6 +2365,18 @@ impl Cagents {
 
     pub(super) fn retire_peer_channel(&mut self, id: ChannelId) -> Task<Message> {
         self.retire_channel(id, true)
+    }
+
+    /// Retires channel `id`, which the registry removed, unless this window
+    /// is deleting it. Then the deletion finishes it, as this window's own:
+    /// removing a project removes its channels there while the window is
+    /// still closing their sessions, and retiring one as a peer's deletion
+    /// would keep its unsaved work and say another client deleted it.
+    pub(super) fn retire_registry_removed_channel(&mut self, id: ChannelId) -> Task<Message> {
+        if self.channel_ui.is_deleting(id) {
+            return Task::none();
+        }
+        self.retire_peer_channel(id)
     }
 
     fn retire_channel(&mut self, id: ChannelId, passive: bool) -> Task<Message> {
@@ -4425,6 +4458,140 @@ pub(in crate::app) mod tests {
             app.project_ui.close_in_flight.contains(&project),
             "the last channel's retirement resumes the project's close"
         );
+    }
+
+    /// Removing a project removes its channels from the registry while this
+    /// window is still closing their sessions. The window's own deletion
+    /// finishes each one, rather than retiring it as a peer's deletion and
+    /// then refusing its own receipt as changed (#4492).
+    #[test]
+    fn a_project_removal_finishes_its_channels_as_this_windows_deletion() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::{ModelEdit, delta::EditEffects};
+        let (mut app, channels, conversation) = project_of_channels(0);
+        let doomed = channels[0];
+        let project = app.sidebar_model.projects.last().unwrap().id;
+        let repository = PathBuf::from("/repo");
+        drop(app.close_shared_project(&repository));
+        assert!(app.channel_ui.closing_sessions(doomed));
+        let operation = app.channel_ui.close_operation(doomed);
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence,
+            edit: ModelEdit::CloseConfirmedProject {
+                repository: repository.clone(),
+                channels: channels.iter().copied().collect(),
+            },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                effects: EditEffects {
+                    removed_projects: vec![repository],
+                    removed_channels: channels.clone(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        }));
+        assert!(
+            channel_exists(&app, doomed) && app.channel_ui.is_deleting(doomed),
+            "the deletion under way owns the channel"
+        );
+
+        app.status = None;
+        drop(app.handle_channel_ui(Action::SessionsClosed(doomed, operation, Ok(()))));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(!channel_exists(&app, doomed));
+        assert!(!app.channel_ui.deletion_unsettled());
+        assert!(!app.card_state(conversation).unwrap().existence.is_open());
+        assert!(
+            app.project_ui.close_in_flight.contains(&project),
+            "the project's close goes on"
+        );
+    }
+
+    /// Another window can delete a channel, or remove its project, while
+    /// this window is already deleting it. The registry drops the channel's
+    /// shared view with it, after this window captured its panes as shared;
+    /// the deletion still finishes as this window's own (#4492).
+    #[test]
+    fn a_channel_the_registry_drops_mid_deletion_finishes_its_deletion() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::{
+            ModelEdit,
+            delta::{EditEffects, ViewChanges},
+            views::{Pane, Scope, View},
+        };
+        let (mut app, doomed, _survivor, conversation) = channel_with_a_conversation();
+        let card = app.card_state(conversation).unwrap().clone();
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(doomed),
+            revision: 1,
+            panes: vec![Pane::from_card(&card, Some("/repo".into())).unwrap()],
+            retired: Vec::new(),
+        });
+        drop(app.delete_channel(doomed));
+        assert!(app.channel_ui.closing_sessions(doomed));
+        let operation = app.channel_ui.close_operation(doomed);
+
+        let sequence = app.workspace_model.sequence + 1;
+        drop(app.apply_workspace_model_update(ModelUpdate::Changed {
+            sequence,
+            edit: ModelEdit::DeleteChannel { id: doomed },
+            changes: EdgeChanges {
+                identity: Some(app.workspace_model.identity),
+                views: ViewChanges {
+                    sequence,
+                    removed: vec![(Scope::Channel(doomed), 1)],
+                    ..Default::default()
+                },
+                effects: EditEffects {
+                    removed_channels: vec![doomed],
+                    ..Default::default()
+                },
+            },
+        }));
+        assert!(channel_exists(&app, doomed) && app.channel_ui.is_deleting(doomed));
+        assert!(
+            !app.workspace_model
+                .views
+                .iter()
+                .any(|view| view.scope == Scope::Channel(doomed))
+        );
+
+        app.status = None;
+        drop(app.handle_channel_ui(Action::SessionsClosed(doomed, operation, Ok(()))));
+        assert!(app.status.is_none(), "{:?}", app.status);
+        assert!(!channel_exists(&app, doomed));
+        assert!(!app.channel_ui.deletion_unsettled());
+    }
+
+    /// Should anything else retire a channel while its deletion closes its
+    /// sessions, the close's receipt finds the deletion done (#4492).
+    #[test]
+    fn a_channel_retired_while_its_sessions_close_is_not_refused_as_changed() {
+        let (mut app, channels, _) = project_of_channels(0);
+        let doomed = channels[0];
+        drop(app.close_shared_project(Path::new("/repo")));
+        let operation = app.channel_ui.close_operation(doomed);
+        drop(app.retire_peer_channel(doomed));
+        app.status = None;
+        drop(app.handle_channel_ui(Action::SessionsClosed(doomed, operation, Ok(()))));
+        assert!(app.status.is_none(), "{:?}", app.status);
+
+        // A close that failed still says so, though no channel is left to
+        // retry.
+        let (mut app, channels, _) = project_of_channels(0);
+        let doomed = channels[0];
+        drop(app.close_shared_project(Path::new("/repo")));
+        let operation = app.channel_ui.close_operation(doomed);
+        drop(app.retire_peer_channel(doomed));
+        drop(app.handle_channel_ui(Action::SessionsClosed(
+            doomed,
+            operation,
+            Err("the daemon refused".into()),
+        )));
+        let notice = app.status.as_ref().expect("the failed close is reported");
+        assert!(notice.message.contains("the daemon refused"), "{notice:?}");
     }
 
     /// Clicking down the channel list changes where this window is and
