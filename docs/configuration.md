@@ -32,6 +32,9 @@ cagents follows the XDG base-directory convention. Production paths are:
   browserless builds; protocol changes do not create a second owner)
 - Claims on the saved data, which keep a daemon or window from another runtime
   directory off it: `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/claims/`
+- The last boot whose resume of stopped sessions has run, so that a daemon
+  restarted later in that boot does not run it again (see
+  `resume_sessions_after_reboot`): `${XDG_DATA_HOME:-$HOME/.local/share}/cagents/resumed-boot`
 
 Development builds substitute `cagents-development` for the final `cagents`
 directory component. Program files installed by `install.sh` live separately
@@ -104,6 +107,7 @@ confirm_terminal_close = true
 chat_enter_sends = true
 show_status_bar = true
 relaunch_agents_on_upgrade = true
+resume_sessions_after_reboot = false
 check_for_updates = true
 work_stale_after_days = 7
 shortcut_defaults_revision = 6
@@ -191,6 +195,7 @@ Floating-point ranges include both ends. NaN and infinity are rejected.
 | `chat_enter_sends` | boolean | `true` | When on, Enter sends a chat message and Shift+Enter starts a new line. When off, Enter starts a new line and Ctrl+Enter sends |
 | `show_status_bar` | boolean | `true` | Shows the bottom status bar with the usage limits left on each signed-in provider account. Hiding it also stops the usage checks that feed it, unless the Accounts pane is open |
 | `relaunch_agents_on_upgrade` | boolean | `true` | When a daemon upgrade finds an agent whose conversation cannot be resumed exactly, relaunches it into its provider's resume picker (or a fresh conversation, when it had none yet) instead of refusing the upgrade. Other running jobs still block the upgrade. `cagents daemon prepare-upgrade` and `install.sh --restart-daemon` follow this unless told otherwise; see [Daemon and upgrades](daemon.md#full-daemon-upgrades) |
+| `resume_sessions_after_reboot` | boolean | `false` | After this computer restarts, the first daemon to run, at boot or the first time the app or a `cagents` command starts it, reopens every stopped chat and agent that an earlier boot ran, as `cagents resume --all` would, without waiting for a window; that includes ones already stopped before the restart. Each waits idle for its next message. One that cannot resume, such as one whose provider's sign-in needs attention, gets a **Did not resume when this computer started** notification naming `cagents resume ID`; the ones it leaves untried, such as chats paired with their provider's terminal, share one. Both follow the **Failure or cancellation** notification setting. `cagents resume` lists the ones still stopped, and counts those only the app can resume, which is how to see them on a computer with no window; the app resumes each. Once it has run, a daemon restarted within the same boot, as by an update, resumes nothing by itself; one held back for recovery, or interrupted, leaves it to the next daemon of that boot. Set it under **Settings → Terminal → Restarts** for the computer the window runs on, or with `cagents daemon boot enable --resume-sessions` (`--no-resume-sessions` turns it off) on the computer it applies to, for example over SSH; the daemon reads it from this file. See [Resume a saved conversation](user-guide.md#resume-a-saved-conversation) |
 | `work_stale_after_days` | integer | `7` | Days without a commit, file change or agent activity after which a [Work board](user-guide.md#work-board) card moves to **Stale**. Between 1 and 365; set it under **Settings → General → Work board**. The daemon reads it from this file too |
 | `check_for_updates` | boolean | `true` | Looks for a new release at startup and every six hours. A background check that cannot reach the release server is logged and retried with backoff rather than reported; **Settings → About → Check for updates** always runs and reports its result |
 | `lsp_idle_timeout_seconds` | integer | `600` | Idle language-server lifetime after its final document closes (1 second to 7 days) |

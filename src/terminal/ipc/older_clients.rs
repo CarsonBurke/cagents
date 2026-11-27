@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 212,
+    proven_at: 213,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -172,6 +172,10 @@ pub const PROJECT_ORDER: u16 = 211;
 pub fn before_project_order<T>(_: &T) -> bool {
     encoding_before(PROJECT_ORDER)
 }
+
+/// The first protocol whose notices say a session did not resume when the
+/// computer started. A client before it is never sent one.
+pub const NOT_RESUMED_NOTICES: u16 = 213;
 
 /// Reads a struct whose last `omitted` fields a source from before the
 /// protocol that added them never encoded. Postcard reads a struct as a tuple
@@ -357,6 +361,11 @@ const WITHHELD_VARIANTS: &[(&str, &str, u16)] = &[
         ANTIGRAVITY_AND_MUSE,
     ),
     ("cagents::agent::Provider", "Muse", ANTIGRAVITY_AND_MUSE),
+    (
+        "cagents::notifications::Kind",
+        "NotResumed",
+        NOT_RESUMED_NOTICES,
+    ),
 ];
 
 thread_local! {

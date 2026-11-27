@@ -1146,6 +1146,18 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         }
     };
 
+    // The first daemon of a boot, if the person opted in, resumes what an
+    // earlier boot ran beside the accept loop. A recovery-only daemon stays
+    // so for its life and leaves this to the next daemon of the boot.
+    if !recovery_only {
+        let resume_host = Arc::downgrade(&host);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-resume-after-boot".into())
+            .spawn(move || agent_execution::resume_after_boot(resume_host))
+        {
+            tracing::warn!(%error, "sessions will not be resumed now that this computer started");
+        }
+    }
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("startup services started", None);
     // Restoring a checkpoint above may hold the host for as long as its

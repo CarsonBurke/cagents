@@ -10,6 +10,11 @@
 //!
 //! The user manager runs at boot only for a user with lingering enabled, so
 //! `enable` says when it is not and how to turn it on.
+//!
+//! `enable --resume-sessions` also turns on this computer's
+//! `resume_sessions_after_reboot` setting, the daemon's own resume of what an
+//! earlier boot left stopped, which a window's Settings can only change on
+//! the computer the window runs on.
 use super::*;
 use std::{
     path::{Path, PathBuf},
@@ -22,7 +27,16 @@ const UNIT: &str = "dev.cagents.Cagents.Daemon.service";
 #[derive(Debug, Clone, Subcommand)]
 pub enum BootCommand {
     /// Install and enable the systemd user unit that starts the daemon at boot.
-    Enable,
+    Enable {
+        /// Also resume stopped chats and agents when this computer starts,
+        /// without waiting for a window, by turning on this computer's
+        /// `resume_sessions_after_reboot` setting.
+        #[arg(long, conflicts_with = "no_resume_sessions")]
+        resume_sessions: bool,
+        /// Turn that setting off. Without either flag it stays as it is.
+        #[arg(long)]
+        no_resume_sessions: bool,
+    },
     /// Disable and remove that unit; graphical-login autostart is unchanged.
     Disable,
     /// Report whether the daemon starts at boot, and what keeps it from doing so.
@@ -44,7 +58,13 @@ pub(super) fn execute(command: BootCommand) -> Result<CommandOutput, AppError> {
     }
     let unit = unit_path()?;
     match command {
-        BootCommand::Enable => enable(&unit),
+        BootCommand::Enable {
+            resume_sessions,
+            no_resume_sessions,
+        } => enable(
+            &unit,
+            (resume_sessions || no_resume_sessions).then_some(resume_sessions),
+        ),
         BootCommand::Disable => disable(&unit),
         BootCommand::Status => Ok(status_output(&unit, &read_status(&unit)?)),
     }
@@ -63,6 +83,14 @@ struct Status {
     linger: Option<bool>,
     /// The `cagents` the unit runs.
     program: Option<PathBuf>,
+    /// Whether this computer's settings resume stopped sessions when it
+    /// starts, or why that could not be read.
+    resume_sessions: Result<bool, String>,
+}
+
+fn settings_path() -> Result<PathBuf, AppError> {
+    crate::instance::settings_path()
+        .ok_or_else(|| AppError::new("settings", "No settings directory is available"))
 }
 
 /// The unit's first line, by which `disable` and the uninstallers know a unit
@@ -122,7 +150,9 @@ fn foreign(unit: &Path) -> AppError {
     )
 }
 
-fn enable(unit: &Path) -> Result<CommandOutput, AppError> {
+/// Installs and enables the unit, first setting whether sessions resume when
+/// this computer starts if `resume_sessions` says.
+fn enable(unit: &Path, resume_sessions: Option<bool>) -> Result<CommandOutput, AppError> {
     let previous = match unit_file(unit)? {
         UnitFile::Foreign => return Err(foreign(unit)),
         UnitFile::Ours(contents) => Some(contents),
@@ -130,7 +160,38 @@ fn enable(unit: &Path) -> Result<CommandOutput, AppError> {
     };
     let program = stable_program()?;
     let contents = render(&program)?;
-    write_unit(unit, &contents)?;
+    // Saved before the unit, so a settings file it cannot save leaves the
+    // unit as it was. The setting stands on its own, so a unit that then
+    // fails leaves it saved, as the error says.
+    if let Some(enabled) = resume_sessions {
+        let path = settings_path()?;
+        crate::settings::save_resume_sessions_after_reboot(&path, enabled).map_err(|error| {
+            AppError::new(
+                "settings",
+                format!("Cannot save {}: {error}", path.display()),
+            )
+        })?;
+    }
+    install(unit, previous, &contents).map_err(|mut error| {
+        if let Some(enabled) = resume_sessions {
+            error.message = format!(
+                "{}. Resuming sessions when this computer starts is {} all the same",
+                error.message,
+                if enabled { "on" } else { "off" }
+            );
+        }
+        error
+    })
+}
+
+/// Writes and enables the unit, restoring `previous` if the user manager
+/// would not read it.
+fn install(
+    unit: &Path,
+    previous: Option<String>,
+    contents: &str,
+) -> Result<CommandOutput, AppError> {
+    write_unit(unit, contents)?;
     if let Err(error) = systemctl(&["daemon-reload"]).and_then(|()| check_unit_is_read(unit)) {
         // Leave things as they were, rather than a unit nothing reads.
         match &previous {
@@ -283,6 +344,9 @@ fn read_status(unit: &Path) -> Result<Status, AppError> {
         foreign: file == UnitFile::Foreign,
         enabled,
         linger: linger(),
+        resume_sessions: settings_path()
+            .map_err(|error| error.message)
+            .and_then(|path| crate::settings::resume_sessions_after_reboot(&path)),
     })
 }
 
@@ -300,21 +364,34 @@ fn status_output(unit: &Path, status: &Status) -> CommandOutput {
             "enabled": status.enabled,
             "linger": status.linger,
             "program": status.program,
+            "resume_sessions": status.resume_sessions.as_ref().ok(),
+            "resume_sessions_error": status.resume_sessions.as_ref().err(),
         }),
         human: human(unit, status),
     }
 }
 
 fn human(unit: &Path, status: &Status) -> String {
+    let mut lines = starting(unit, status);
+    lines.push(match &status.resume_sessions {
+        Ok(true) => "Stopped chats and agents resume when this computer starts.".to_owned(),
+        Ok(false) => "Stopped chats and agents stay stopped when this computer starts; `cagents daemon boot enable --resume-sessions` resumes them.".to_owned(),
+        Err(error) => format!("Whether stopped sessions resume when this computer starts is unknown: {error}"),
+    });
+    lines.join("\n")
+}
+
+/// What decides whether the daemon starts at boot, line by line.
+fn starting(unit: &Path, status: &Status) -> Vec<String> {
     if status.foreign {
-        return format!(
+        return vec![format!(
             "A unit cagents did not write is at {}; cagents leaves it alone. The daemon starts at a graphical login.",
             unit.display()
-        );
+        )];
     }
     if !status.installed {
-        return "The daemon starts at a graphical login, not at boot. `cagents daemon boot enable` starts it at boot."
-            .to_owned();
+        return vec!["The daemon starts at a graphical login, not at boot. `cagents daemon boot enable` starts it at boot."
+            .to_owned()];
     }
     let mut lines = vec![match (status.enabled, status.linger) {
         (true, Some(true)) => "The daemon starts at boot, before anyone logs in.".to_owned(),
@@ -348,7 +425,7 @@ fn human(unit: &Path, status: &Status) -> String {
             program.display()
         ));
     }
-    lines.join("\n")
+    lines
 }
 
 /// The unit that runs `program daemon start` at boot.
@@ -665,7 +742,7 @@ mod tests {
         std::os::unix::fs::symlink(directory.path().join("elsewhere"), &unit).unwrap();
         // A link, as `systemctl --user link` makes, is someone else's.
         assert_eq!(unit_file(&unit).unwrap(), UnitFile::Foreign);
-        assert!(enable(&unit).is_err());
+        assert!(enable(&unit, Some(true)).is_err());
         assert!(disable(&unit).is_err());
         assert!(unit.is_symlink());
     }
@@ -745,6 +822,7 @@ mod tests {
             enabled: false,
             linger: Some(true),
             program: None,
+            resume_sessions: Ok(false),
         };
         assert!(human(&unit, &absent).contains("`cagents daemon boot enable`"));
         let foreign = Status {
@@ -758,6 +836,7 @@ mod tests {
             enabled: true,
             linger: Some(false),
             program: None,
+            resume_sessions: Ok(true),
         };
         let text = human(&unit, &lingerless);
         assert!(text.contains("starts only once you log in"), "{text}");
@@ -775,7 +854,82 @@ mod tests {
         };
         assert_eq!(
             human(&unit, &ready),
-            "The daemon starts at boot, before anyone logs in."
+            "The daemon starts at boot, before anyone logs in.\nStopped chats and agents resume when this computer starts."
+        );
+    }
+
+    #[test]
+    fn status_says_whether_sessions_resume_and_how_to_turn_it_on() {
+        let unit = Path::new("/home/u/.config/systemd/user").join(UNIT);
+        let off = Status {
+            installed: true,
+            foreign: false,
+            enabled: true,
+            linger: Some(true),
+            program: None,
+            resume_sessions: Ok(false),
+        };
+        let text = human(&unit, &off);
+        assert!(text.contains("stay stopped"), "{text}");
+        assert!(
+            text.contains("`cagents daemon boot enable --resume-sessions`"),
+            "{text}"
+        );
+        assert_eq!(
+            status_output(&unit, &off).data["resume_sessions"],
+            json!(false)
+        );
+        // Said even when the daemon does not start at boot: a daemon a
+        // window or a command starts still resumes them.
+        let foreign = Status {
+            foreign: true,
+            installed: false,
+            resume_sessions: Ok(true),
+            ..off.clone()
+        };
+        assert!(human(&unit, &foreign).ends_with("resume when this computer starts."));
+        assert_eq!(
+            status_output(&unit, &foreign).data["resume_sessions"],
+            json!(true)
+        );
+        let unreadable = Status {
+            resume_sessions: Err("cannot read settings.toml: bad".into()),
+            ..off
+        };
+        let text = human(&unit, &unreadable);
+        assert!(
+            text.contains("unknown: cannot read settings.toml: bad"),
+            "{text}"
+        );
+        assert!(status_output(&unit, &unreadable).data["resume_sessions"].is_null());
+    }
+
+    #[test]
+    fn enable_changes_whether_sessions_resume_only_when_told() {
+        let parse = |arguments: &[&str]| {
+            let mut words = vec!["cagents", "daemon", "boot", "enable"];
+            words.extend_from_slice(arguments);
+            match Cli::try_parse_from(words).map(|cli| cli.command) {
+                Ok(TopCommand::Daemon {
+                    command:
+                        DaemonCommand::Boot {
+                            command:
+                                BootCommand::Enable {
+                                    resume_sessions,
+                                    no_resume_sessions,
+                                },
+                        },
+                }) => Ok((resume_sessions, no_resume_sessions)),
+                Ok(other) => panic!("{other:?}"),
+                Err(error) => Err(error.kind()),
+            }
+        };
+        assert_eq!(parse(&[]), Ok((false, false)));
+        assert_eq!(parse(&["--resume-sessions"]), Ok((true, false)));
+        assert_eq!(parse(&["--no-resume-sessions"]), Ok((false, true)));
+        assert_eq!(
+            parse(&["--resume-sessions", "--no-resume-sessions"]),
+            Err(clap::error::ErrorKind::ArgumentConflict)
         );
     }
 

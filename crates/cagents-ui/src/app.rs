@@ -3643,6 +3643,7 @@ pub enum SettingsField {
     InspectorShowWork,
     InspectorWidth,
     RelaunchAgentsOnUpgrade,
+    ResumeSessionsAfterReboot,
     CheckForUpdates,
     EditorSyntaxTheme,
     Confirm(settings::Confirmation),
@@ -3819,6 +3820,7 @@ impl SettingsField {
             Self::InspectorWidth => "Inspector width",
             Self::AutoDeleteMergedWorktrees => "Notify about merged worktrees",
             Self::RelaunchAgentsOnUpgrade => "Unresumable agents",
+            Self::ResumeSessionsAfterReboot => "Resume sessions when this computer starts",
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::Confirm(settings::Confirmation::StopWorkingChat) => "Working chats",
@@ -3870,7 +3872,8 @@ impl SettingsField {
             | Self::TerminalFontFamily
             | Self::TerminalScrollbackMib
             | Self::ConfirmMultilinePaste
-            | Self::RelaunchAgentsOnUpgrade => SettingsCategory::Terminal,
+            | Self::RelaunchAgentsOnUpgrade
+            | Self::ResumeSessionsAfterReboot => SettingsCategory::Terminal,
             Self::MaxHotCards
             | Self::HibernationDelayMs
             | Self::WorkStaleAfterDays
@@ -4108,6 +4111,7 @@ struct SettingsDraft {
     inspector_show_work: bool,
     inspector_width: String,
     relaunch_agents_on_upgrade: bool,
+    resume_sessions_after_reboot: bool,
     check_for_updates: bool,
     focus_follows_mouse: bool,
     link_open_destination: LinkOpenDestination,
@@ -4188,6 +4192,7 @@ impl SettingsDraft {
             inspector_show_work: settings.inspector_show_work,
             inspector_width: settings.inspector_width.to_string(),
             relaunch_agents_on_upgrade: settings.relaunch_agents_on_upgrade,
+            resume_sessions_after_reboot: settings.resume_sessions_after_reboot,
             check_for_updates: settings.check_for_updates,
             editor_syntax_theme: settings.editor_syntax_theme,
             focus_follows_mouse: settings.focus_follows_mouse,
@@ -4281,6 +4286,9 @@ impl SettingsDraft {
             SettingsField::InspectorWidth => self.inspector_width = value,
             SettingsField::RelaunchAgentsOnUpgrade => {
                 self.relaunch_agents_on_upgrade = value == "true"
+            }
+            SettingsField::ResumeSessionsAfterReboot => {
+                self.resume_sessions_after_reboot = value == "true"
             }
             SettingsField::CheckForUpdates => self.check_for_updates = value == "true",
             SettingsField::EditorSyntaxTheme => {
@@ -4593,6 +4601,10 @@ fn settings_update(
             .parse::<bool>()
             .map(|enabled| next.relaunch_agents_on_upgrade = enabled)
             .map_err(|_| "Choose whether upgrades relaunch unresumable agents.".to_owned()),
+        SettingsField::ResumeSessionsAfterReboot => value
+            .parse::<bool>()
+            .map(|enabled| next.resume_sessions_after_reboot = enabled)
+            .map_err(|_| "Choose whether sessions resume when this computer starts.".to_owned()),
         SettingsField::CheckForUpdates => value
             .parse::<bool>()
             .map(|enabled| next.check_for_updates = enabled)

@@ -66,7 +66,7 @@ impl Destination {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
 pub enum Kind {
     Succeeded,
     Failed,
@@ -77,6 +77,38 @@ pub enum Kind {
     MessageReceived,
     AutomationPaused,
     AutomationBlocked,
+    /// A stopped session the daemon's own resume, when this computer
+    /// started, could not reopen or did not try.
+    NotResumed,
+}
+
+/// Encoded as the derived implementation would, except to a client from
+/// before the kind existed, which has no encoding for it: there it refuses to
+/// encode, and the daemon refuses or withholds the message holding it.
+impl Serialize for Kind {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let name = match self {
+            Self::Succeeded => "Succeeded",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+            Self::Waiting => "Waiting",
+            Self::ReviewRequested => "ReviewRequested",
+            Self::Interrupted => "Interrupted",
+            Self::MessageReceived => "MessageReceived",
+            Self::AutomationPaused => "AutomationPaused",
+            Self::AutomationBlocked => "AutomationBlocked",
+            Self::NotResumed => {
+                if crate::terminal_ipc::encoding_before(crate::terminal_ipc::NOT_RESUMED_NOTICES) {
+                    return Err(serde::ser::Error::custom(format!(
+                        "a client before protocol {} cannot read this notice",
+                        crate::terminal_ipc::NOT_RESUMED_NOTICES
+                    )));
+                }
+                "NotResumed"
+            }
+        };
+        serializer.serialize_unit_variant("Kind", *self as u32, name)
+    }
 }
 
 impl Kind {
@@ -87,7 +119,11 @@ impl Kind {
             | Self::MessageReceived
             | Self::AutomationPaused
             | Self::AutomationBlocked => true,
-            Self::Succeeded | Self::Failed | Self::Cancelled | Self::Interrupted => false,
+            Self::Succeeded
+            | Self::Failed
+            | Self::Cancelled
+            | Self::Interrupted
+            | Self::NotResumed => false,
         }
     }
 
@@ -102,6 +138,7 @@ impl Kind {
             Self::MessageReceived => "Session messages waiting",
             Self::AutomationPaused => "Automation pause recorded",
             Self::AutomationBlocked => "Automation block recorded",
+            Self::NotResumed => "Did not resume when this computer started",
         }
     }
 }
@@ -442,7 +479,7 @@ impl Preferences {
             && (!focused || self.while_focused)
             && match kind {
                 Kind::Succeeded => self.success,
-                Kind::Failed | Kind::Cancelled => self.failure,
+                Kind::Failed | Kind::Cancelled | Kind::NotResumed => self.failure,
                 Kind::Waiting
                 | Kind::Interrupted
                 | Kind::MessageReceived
@@ -851,6 +888,39 @@ mod tests {
         assert!(
             context(&current).is_empty(),
             "private context never falls outside Content"
+        );
+    }
+
+    /// Every kind encodes by its position and name, as the derived encoding
+    /// did, and one a client predates refuses to encode for that client, so
+    /// the daemon refuses or withholds the message holding it.
+    #[test]
+    fn a_kind_encodes_as_derived_and_not_for_a_client_that_predates_it() {
+        let kinds = [
+            Kind::Succeeded,
+            Kind::Failed,
+            Kind::Cancelled,
+            Kind::Waiting,
+            Kind::ReviewRequested,
+            Kind::Interrupted,
+            Kind::MessageReceived,
+            Kind::AutomationPaused,
+            Kind::AutomationBlocked,
+            Kind::NotResumed,
+        ];
+        for (index, kind) in kinds.into_iter().enumerate() {
+            assert_eq!(postcard::to_allocvec(&kind).unwrap(), [index as u8]);
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(serde_json::from_str::<Kind>(&json).unwrap(), kind);
+            let older = crate::terminal_ipc::encoding_for(
+                crate::terminal_ipc::NOT_RESUMED_NOTICES - 1,
+                || postcard::to_allocvec(&kind),
+            );
+            assert_eq!(older.is_ok(), kind != Kind::NotResumed, "{kind:?}");
+        }
+        assert_eq!(
+            serde_json::to_string(&Kind::NotResumed).unwrap(),
+            "\"NotResumed\""
         );
     }
 }

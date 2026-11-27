@@ -19,7 +19,7 @@ use crate::{
         resume::{Resumed, Scope, Stopped, StoppedSessions},
     },
     chat::{self, Session},
-    model::{ChannelId, TerminalId},
+    model::{BootId, ChannelId, TerminalId},
     terminal_ipc::{ClientRequest, ProtocolError, ServerResponse},
 };
 use std::{
@@ -44,6 +44,10 @@ pub(super) enum Basis {
     /// An agent's next prompt. Without an explicit request it reopens in place
     /// only when this daemon saw its provider exit, or an earlier boot ran it.
     Prompt,
+    /// The daemon's own resume when this computer starts, which the person
+    /// opted into. It reopens only what an earlier boot ran, whose processes
+    /// are all gone.
+    Boot,
 }
 
 /// The stopped sessions in `scope` that the caller may resume, one for each
@@ -54,6 +58,21 @@ pub(super) fn stopped(
     authority: &Authority,
     scope: Scope,
 ) -> Result<StoppedSessions, String> {
+    listed(host, authority, scope).map(|listing| listing.found)
+}
+
+/// What [`stopped`] found, with what it read on the way.
+struct Listing {
+    found: StoppedSessions,
+    /// The saved descriptor of each listed session.
+    sources: std::collections::HashMap<TerminalId, Session>,
+    /// Stopped chats with nothing saved to reopen, with why.
+    unreadable: Vec<(TerminalId, String)>,
+    /// The stopped chats `found` counts as reopened only from their panes.
+    in_app: Vec<Session>,
+}
+
+fn listed(host: &SharedHost, authority: &Authority, scope: Scope) -> Result<Listing, String> {
     let (origin, _) = caller(host, authority)?;
     let wanted = match scope {
         Scope::Sessions(scope) => directory::Wanted::Scope(scope),
@@ -105,6 +124,9 @@ pub(super) fn stopped(
             rank.get(&member.session.id).copied().unwrap_or(usize::MAX),
         )
     });
+    let mut sources = std::collections::HashMap::new();
+    let mut unreadable = Vec::new();
+    let mut in_app = Vec::new();
     let mut found = one_per_lineage(
         candidates,
         |member| member.session.lineage,
@@ -121,17 +143,23 @@ pub(super) fn stopped(
             if !may_resume(&origin, agent) {
                 return Candidate::NotTheirs;
             }
-            candidate(
-                member.session.id,
-                descriptor(host, &registry, member.session.id, agent),
-                || Stopped {
-                    id: member.session.id,
-                    provider,
-                    title: member.session.title.clone(),
-                    agent: agent.map(|agent| agent.id),
-                    failure: member.failure.clone(),
-                },
-            )
+            let read = descriptor(host, &registry, member.session.id, agent);
+            // What the boot pass needs of each one, read once here.
+            match &read {
+                Ok(Some(source)) if resumable(source) => {
+                    sources.insert(member.session.id, source.clone());
+                }
+                Ok(Some(source)) => in_app.push(source.clone()),
+                Err(error) => unreadable.push((member.session.id, error.clone())),
+                Ok(None) => {}
+            }
+            candidate(member.session.id, read, || Stopped {
+                id: member.session.id,
+                provider,
+                title: member.session.title.clone(),
+                agent: agent.map(|agent| agent.id),
+                failure: member.failure.clone(),
+            })
         },
     );
     // An agent no pane shows, such as one started from a shell on a machine
@@ -168,6 +196,7 @@ pub(super) fn stopped(
         {
             continue;
         }
+        sources.insert(session.id, session.clone());
         found.sessions.push(Stopped {
             id: session.id,
             provider: session.launch.provider,
@@ -176,7 +205,12 @@ pub(super) fn stopped(
             failure: None,
         });
     }
-    Ok(found)
+    Ok(Listing {
+        found,
+        sources,
+        unreadable,
+        in_app,
+    })
 }
 
 /// Each lineage's sessions, latest first, read once per listing.
@@ -330,6 +364,15 @@ pub(super) fn resume(
     authority: &Authority,
     handle: &str,
 ) -> Result<Resumed, String> {
+    resume_as(host, authority, handle, Basis::Explicit)
+}
+
+fn resume_as(
+    host: &SharedHost,
+    authority: &Authority,
+    handle: &str,
+    basis: Basis,
+) -> Result<Resumed, String> {
     let (origin, _) = caller(host, authority)?;
     let listing = directory::list(
         host,
@@ -412,7 +455,7 @@ pub(super) fn resume(
     // This request already holds the shared control admission; taking it
     // again could wait behind a queued exclusive request that waits on it.
     open_for_work(host)?;
-    let started = reopen(host, &source, Basis::Explicit)?;
+    let started = reopen(host, &source, basis)?;
     drop(starting_gate);
     let starting = settle(host, &started)?;
     let bound = registry
@@ -462,6 +505,11 @@ pub(super) fn reopen(host: &SharedHost, source: &Session, basis: Basis) -> Resul
                 && crate::agent_execution::same_chat_process(pane, source)
         });
     let source = learned.as_ref().unwrap_or(source);
+    if basis == Basis::Boot && !super::super::chat::from_earlier_boot(host, source) {
+        return Err(
+            "This boot already ran this conversation, so it is not resumed by itself".into(),
+        );
+    }
     let request = |request| {
         super::super::chat::process(host, EXECUTION_CLIENT, request)
             .map_err(|error: ProtocolError| error.message)
@@ -807,6 +855,399 @@ pub(super) fn resolve<'a>(
     }
 }
 
+/// Whether the person asked for sessions to resume when this computer starts:
+/// the `resume_sessions_after_reboot` preference, off unless it says otherwise.
+fn resumes_after_boot() -> bool {
+    let Some(path) = crate::instance::settings_path() else {
+        return false;
+    };
+    crate::settings::resume_sessions_after_reboot(&path).unwrap_or_else(|error| {
+        tracing::warn!(%error, "sessions are not resumed now that this computer started");
+        false
+    })
+}
+
+/// Names the last boot whose resume ran to the end, in the daemon's data
+/// directory, which a logout leaves in place. Only the first daemon of a boot
+/// resumes anything by itself: one restarted later in that boot, as by an
+/// update or after a crash, finds its boot here and leaves what is stopped
+/// for the person.
+const HANDLED_BOOT: &str = "resumed-boot";
+const HANDLED_BOOT_LIMIT: u64 = 256;
+
+fn handled_boot_directory() -> Option<std::path::PathBuf> {
+    crate::instance::project_dirs().map(|dirs| dirs.data_local_dir().to_path_buf())
+}
+
+/// The boot `directory` records as handled, if it records one.
+fn handled_boot(directory: &std::path::Path) -> Result<Option<BootId>, String> {
+    use std::io::Read;
+    let path = directory.join(HANDLED_BOOT);
+    let file = match crate::secure_file::open_existing_private_file_readonly(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let mut recorded = String::new();
+    file.take(HANDLED_BOOT_LIMIT)
+        .read_to_string(&mut recorded)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    let recorded = recorded.trim();
+    Ok((!recorded.is_empty()).then(|| BootId::new(recorded)))
+}
+
+/// Records `boot` as handled, replacing the file whole so a crash leaves
+/// either the earlier boot or this one.
+fn record_handled_boot(directory: &std::path::Path, boot: &BootId) -> Result<(), String> {
+    use crate::fs_safety;
+    use std::io::Write;
+    let failed = |error: &dyn std::fmt::Display| {
+        format!(
+            "cannot record {} as resumed: {error}",
+            directory.join(HANDLED_BOOT).display()
+        )
+    };
+    crate::secure_file::prepare_private_directory(directory).map_err(|e| failed(&e))?;
+    let root = fs_safety::Root::open(directory).map_err(|e| failed(&e))?;
+    let (mut file, temporary) =
+        fs_safety::create_temporary_in(&root, 0o600).map_err(|e| failed(&e))?;
+    let written = (|| {
+        file.write_all(format!("{boot}\n").as_bytes())?;
+        file.sync_all()?;
+        fs_safety::rename_within(&root, &temporary, HANDLED_BOOT.as_ref())
+            .map_err(std::io::Error::other)
+    })();
+    if let Err(error) = written {
+        let _ = fs_safety::unlink_within(&root, &temporary);
+        return Err(failed(&error));
+    }
+    if let Err(error) = fs_safety::sync_directory(&root) {
+        tracing::debug!(%error, "the resumed boot may not survive a crash");
+    }
+    Ok(())
+}
+
+/// What the daemon's own resume did when it started.
+#[derive(Debug)]
+pub(super) enum AfterBoot {
+    /// This boot's resume already ran, so this daemon was restarted within it.
+    AlreadyRan,
+    /// The person did not ask for it.
+    Off,
+    Ran(Pass),
+}
+
+/// One run of the resume over what an earlier boot left stopped.
+#[derive(Debug, Default)]
+pub(super) struct Pass {
+    pub(super) resumed: Vec<Resumed>,
+    /// Each session that could not resume, with why.
+    pub(super) failed: Vec<(Stopped, String)>,
+    /// Stopped sessions it did not try: ones only their pane in the app can
+    /// reopen, and ones whose saved record cannot prove their process ended.
+    /// `cagents resume` lists or counts them.
+    pub(super) left: Vec<Session>,
+    /// The daemon stopped taking new work, as for an update or a shutdown,
+    /// before the pass ended. The next daemon of this boot runs it again.
+    pub(super) interrupted: bool,
+}
+
+/// Once the daemon serves, resumes, if the person opted in and this is the
+/// first daemon of this boot to get this far, every stopped conversation an
+/// earlier boot ran, as `cagents resume --all` would. Each one that cannot
+/// resume is announced and stays listed by `cagents resume`.
+pub(in crate::host) fn resume_after_boot(host: std::sync::Weak<crate::host::state::HostLock>) {
+    if let AfterBoot::Ran(pass) = resume_once_per_boot(&host) {
+        tracing::info!(
+            resumed = pass.resumed.len(),
+            failed = pass.failed.len(),
+            left = pass.left.len(),
+            interrupted = pass.interrupted,
+            "resumed what an earlier boot ran"
+        );
+    }
+}
+
+/// [`resume_after_boot`]'s pass, unless this boot's already ran or the
+/// person did not ask for one.
+pub(super) fn resume_once_per_boot(
+    host: &std::sync::Weak<crate::host::state::HostLock>,
+) -> AfterBoot {
+    let Some(boot) = host.upgrade().map(|host| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .proof()
+            .boot_id
+            .clone()
+    }) else {
+        return AfterBoot::Ran(Pass {
+            interrupted: true,
+            ..Pass::default()
+        });
+    };
+    let Some(directory) = handled_boot_directory().filter(|_| !boot.as_str().is_empty()) else {
+        tracing::warn!(
+            "this daemon cannot tell which boot it serves, so it resumes nothing by itself"
+        );
+        return AfterBoot::Off;
+    };
+    match handled_boot(&directory) {
+        Ok(Some(handled)) if handled == boot => return AfterBoot::AlreadyRan,
+        Ok(_) => {}
+        // Each conversation's own proof still keeps one this boot ran.
+        Err(error) => tracing::warn!(%error, "the last resumed boot is unknown"),
+    }
+    let record = || {
+        if let Err(error) = record_handled_boot(&directory, &boot) {
+            tracing::warn!(%error, "a daemon restarted within this boot may resume again");
+        }
+    };
+    // Recorded even when off, so turning the setting on later in this boot
+    // waits for the next one.
+    if !resumes_after_boot() {
+        record();
+        return AfterBoot::Off;
+    }
+    let pass = pass(host);
+    if !pass.interrupted {
+        record();
+    }
+    AfterBoot::Ran(pass)
+}
+
+fn pass(host: &std::sync::Weak<crate::host::state::HostLock>) -> Pass {
+    let interrupted = || Pass {
+        interrupted: true,
+        ..Pass::default()
+    };
+    let person = Authority::default();
+    let Some(shared) = host.upgrade() else {
+        return interrupted();
+    };
+    let listing = match listed(&shared, &person, Scope::Sessions(Sessions::All)) {
+        Ok(listing) => listing,
+        Err(error) => {
+            tracing::warn!(%error, "the sessions to resume could not be listed");
+            return interrupted();
+        }
+    };
+    let Listing {
+        found,
+        mut sources,
+        unreadable,
+        mut in_app,
+    } = listing;
+    // As below: one this boot ran is no earlier boot's to report, as when an
+    // interrupted pass runs again.
+    in_app.retain(|session| !ran_this_boot(&shared, session));
+    drop(shared);
+    for (session, error) in unreadable {
+        tracing::info!(%session, %error, "not resumed: nothing saved to reopen");
+    }
+    for session in &in_app {
+        tracing::info!(session = %session.id, "not resumed: paired with its provider's terminal, it reopens from its pane");
+    }
+    let mut pass = Pass {
+        left: in_app,
+        ..Pass::default()
+    };
+    for stopped in found.sessions {
+        let Some(host) = host.upgrade() else {
+            pass.interrupted = true;
+            break;
+        };
+        let Some(source) = sources.remove(&stopped.id) else {
+            continue;
+        };
+        if source
+            .proof
+            .as_ref()
+            .is_none_or(|proof| !proof.is_complete())
+        {
+            tracing::info!(session = %stopped.id, "not resumed: its saved record cannot prove its process ended");
+            pass.left.push(source);
+            continue;
+        }
+        // Run by this boot already, as by a window that opened first.
+        if ran_this_boot(&host, &source) {
+            tracing::info!(session = %stopped.id, "not resumed: this boot already ran it");
+            continue;
+        }
+        // A window that opened meanwhile restores what it shows itself.
+        if window_holds(&host, stopped.id) {
+            tracing::info!(session = %stopped.id, "not resumed: a window is reopening it");
+            continue;
+        }
+        // Under the daemon's control admission, as every other start, so an
+        // update's checkpoint or a shutdown sees the provider it starts.
+        let Some(outcome) = mailbox::with_control(&host, || {
+            resume_as(&host, &person, &stopped.id.to_string(), Basis::Boot)
+        }) else {
+            pass.interrupted = true;
+            break;
+        };
+        match outcome {
+            Ok(resumed) => {
+                tracing::info!(session = %stopped.id, running = %resumed.session, "resumed now that this computer started");
+                pass.resumed.push(resumed);
+            }
+            // Not this session's failure: the next daemon of this boot
+            // tries again.
+            Err(_) if open_for_work(&host).is_err() => {
+                pass.interrupted = true;
+                break;
+            }
+            // A window started it first; the daemon refused a second writer.
+            Err(reason) if conversation_runs(&host, &source) => {
+                tracing::info!(session = %stopped.id, %reason, "not resumed: a window reopened it");
+            }
+            Err(reason) => {
+                tracing::warn!(session = %stopped.id, %reason, "could not resume now that this computer started");
+                announce_failure(&host, &source, &stopped, &reason);
+                pass.failed.push((stopped, reason));
+            }
+        }
+    }
+    if !pass.interrupted
+        && let Some(host) = host.upgrade()
+    {
+        announce_left(&host, &pass.left);
+    }
+    pass
+}
+
+/// Whether `session`'s complete saved record says this boot ran it. One
+/// whose record is incomplete may be an earlier boot's.
+fn ran_this_boot(host: &SharedHost, session: &Session) -> bool {
+    session
+        .proof
+        .as_ref()
+        .is_some_and(|proof| proof.is_complete())
+        && !super::super::chat::from_earlier_boot(host, session)
+}
+
+/// Whether a window is attached to the daemon's record of `id`, as to the
+/// history it shows, or anything is starting it.
+fn window_holds(host: &SharedHost, id: TerminalId) -> bool {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state.chat_spawning.contains_key(&id)
+        || state.chats.get(&id).is_some_and(|record| {
+            record
+                .subscribers
+                .keys()
+                .any(|client| *client != EXECUTION_CLIENT)
+        })
+}
+
+/// Whether some process of this daemon runs, or is starting, `source`'s
+/// conversation.
+fn conversation_runs(host: &SharedHost, source: &Session) -> bool {
+    let Some(conversation) = source.launch.session_id.as_deref() else {
+        return false;
+    };
+    let provider = source.launch.provider;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state.chats.values().any(|record| {
+        record.session.launch.provider == provider
+            && record.handle.session_id().as_deref() == Some(conversation)
+            && (record.handle.owns_work() || !record.handle.is_completed())
+    }) || state.chat_spawning.values().any(|pending| {
+        pending.launch.provider == provider
+            && pending.launch.session_id.as_deref() == Some(conversation)
+    })
+}
+
+/// A notice that `session` did not resume when this computer started, once
+/// for boot `boot`. Desktop alerts follow the person's failure notification
+/// setting; the title and text show where they allow previews.
+fn notice(
+    boot: &BootId,
+    session: &Session,
+    key: &str,
+    conversation: &str,
+    preview: &str,
+) -> crate::notifications::Event {
+    use crate::notifications::{self as notice, presentation};
+    let mut event = notice::Event::session(
+        session.id,
+        session.launch.provider,
+        session.launch.recipe.working_directory.clone(),
+        notice::Evidence {
+            key: format!("resume-after-boot:{boot}{key}"),
+            kind: notice::Kind::NotResumed,
+        },
+    );
+    event.content = Some(notice::Content {
+        conversation: presentation::title(conversation),
+        preview: presentation::plain_preview(preview),
+        request: None,
+    });
+    event
+}
+
+fn announce(host: &SharedHost, event: impl FnOnce(&BootId) -> Option<crate::notifications::Event>) {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(notifications) = &state.notifications
+        && let Some(event) = event(&state.proof().boot_id)
+    {
+        notifications.record(event);
+    }
+}
+
+/// Says that `stopped` did not come back, why, and how to resume it. A long
+/// reason is cut, never the command after it.
+fn failure_notice(
+    boot: &BootId,
+    source: &Session,
+    stopped: &Stopped,
+    reason: &str,
+) -> crate::notifications::Event {
+    let short = crate::agent_execution::mailbox::short(stopped.id);
+    let title = stopped
+        .title
+        .clone()
+        .unwrap_or_else(|| stopped.provider.chat_title().to_owned());
+    let reason = reason.trim();
+    let reason = if reason.is_empty() || reason.ends_with(['.', '!', '?', '…']) {
+        reason.to_owned()
+    } else {
+        format!("{reason}.")
+    };
+    notice(
+        boot,
+        source,
+        "",
+        &format!("{title} ({short})"),
+        &crate::notifications::presentation::plain_preview_ending_with(
+            &reason,
+            &format!("Then run `cagents resume {short}`."),
+        ),
+    )
+}
+
+fn announce_failure(host: &SharedHost, source: &Session, stopped: &Stopped, reason: &str) {
+    announce(host, |boot| {
+        Some(failure_notice(boot, source, stopped, reason))
+    });
+}
+
+/// One notice for every stopped session the resume left without trying,
+/// about the first of them, or none when it tried them all.
+fn left_notice(boot: &BootId, left: &[Session]) -> Option<crate::notifications::Event> {
+    let first = left.first()?;
+    let preview = match left.len() {
+        1 => "1 stopped session was not resumed. Resume it from the app; `cagents resume` shows what is still stopped.".to_owned(),
+        count => format!(
+            "{count} stopped sessions were not resumed. Resume them from the app; `cagents resume` shows what is still stopped."
+        ),
+    };
+    Some(notice(boot, first, ":left", "Stopped sessions", &preview))
+}
+
+fn announce_left(host: &SharedHost, left: &[Session]) {
+    announce(host, |boot| left_notice(boot, left));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -848,6 +1289,161 @@ mod tests {
         let mut retained = session(None);
         retained.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         assert!(resumable(&retained));
+    }
+
+    fn saved(title: Option<&str>) -> (Session, Stopped) {
+        let id = TerminalId::new();
+        let session = Session {
+            id,
+            launch: chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: "/project".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("conversation".into()),
+                draft_model: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let stopped = Stopped {
+            id,
+            provider: crate::agent::Provider::Claude,
+            title: title.map(str::to_owned),
+            agent: None,
+            failure: None,
+        };
+        (session, stopped)
+    }
+
+    /// A session that did not resume is announced once for the boot, by its
+    /// title and short ID, with the command that resumes it, and only as the
+    /// person's failure notifications and previews allow.
+    #[test]
+    fn a_session_that_did_not_resume_is_announced_with_how_to_resume_it() {
+        use crate::notifications::{Kind, Preferences, presentation};
+        let boot = BootId::new("boot");
+        let (source, stopped) = saved(Some("Fix the parser"));
+        let short = crate::agent_execution::mailbox::short(stopped.id);
+        let event = failure_notice(&boot, &source, &stopped, "Claude sign-in needs attention");
+        event.validate().unwrap();
+        assert_eq!(event.evidence.kind, Kind::NotResumed);
+        assert_eq!(event.evidence.key, "resume-after-boot:boot");
+        assert_eq!(event.source_session(), Some(stopped.id));
+        let content = event.content.as_ref().unwrap();
+        assert_eq!(content.conversation, format!("Fix the parser ({short})"));
+        assert_eq!(
+            content.preview,
+            format!("Claude sign-in needs attention. Then run `cagents resume {short}`.")
+        );
+        let shown = presentation::message(&event, true);
+        assert_eq!(shown.title, format!("Fix the parser ({short})"));
+        assert!(
+            shown.body.starts_with(&format!(
+                "Did not resume when this computer started: Claude sign-in needs attention. Then run `cagents resume {short}`."
+            )),
+            "{}",
+            shown.body
+        );
+        // A long reason is cut, never the command that resumes it.
+        let long = "The provider said no. ".repeat(40);
+        let event = failure_notice(&boot, &source, &stopped, &long);
+        let preview = &event.content.as_ref().unwrap().preview;
+        assert!(
+            preview.ends_with(&format!("… Then run `cagents resume {short}`.")),
+            "{preview}"
+        );
+        assert!(
+            presentation::message(&event, true)
+                .body
+                .contains(&format!("… Then run `cagents resume {short}`.")),
+        );
+        // Without previews, only what happened.
+        let private = presentation::message(&event, false);
+        assert!(!private.title.contains("Fix the parser"));
+        assert!(
+            private
+                .body
+                .starts_with("Did not resume when this computer started"),
+            "{}",
+            private.body
+        );
+        let mut preferences = Preferences::default();
+        assert!(preferences.allows(Kind::NotResumed, false));
+        preferences.failure = false;
+        assert!(!preferences.allows(Kind::NotResumed, false));
+
+        // A reason with nothing to add, or already cut, gains no period.
+        for (reason, preview) in [("", ""), ("Cut short…", "Cut short… ")] {
+            let event = failure_notice(&boot, &source, &stopped, reason);
+            assert_eq!(
+                event.content.unwrap().preview,
+                format!("{preview}Then run `cagents resume {short}`.")
+            );
+        }
+
+        // An untitled one is named by its provider.
+        let (source, stopped) = saved(None);
+        let event = failure_notice(&boot, &source, &stopped, "gone");
+        assert!(
+            event
+                .content
+                .unwrap()
+                .conversation
+                .starts_with(crate::agent::Provider::Claude.chat_title())
+        );
+    }
+
+    /// The sessions the resume did not try share one notice.
+    #[test]
+    fn the_sessions_left_untried_share_one_notice() {
+        let boot = BootId::new("boot");
+        assert!(left_notice(&boot, &[]).is_none());
+        let (one, _) = saved(None);
+        let (two, _) = saved(None);
+        let event = left_notice(&boot, std::slice::from_ref(&one)).unwrap();
+        event.validate().unwrap();
+        assert_eq!(
+            event.content.unwrap().preview,
+            "1 stopped session was not resumed. Resume it from the app; `cagents resume` shows what is still stopped."
+        );
+        let event = left_notice(&boot, &[one.clone(), two]).unwrap();
+        assert_eq!(event.evidence.key, "resume-after-boot:boot:left");
+        assert_eq!(event.source_session(), Some(one.id));
+        assert_eq!(
+            event.content.unwrap().preview,
+            "2 stopped sessions were not resumed. Resume them from the app; `cagents resume` shows what is still stopped."
+        );
+    }
+
+    /// The resumed boot is replaced whole, privately, and nothing else is
+    /// left beside it.
+    #[test]
+    fn the_resumed_boot_is_recorded_privately_and_replaced_whole() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("data");
+        assert_eq!(handled_boot(&path), Ok(None));
+        record_handled_boot(&path, &BootId::new("first")).unwrap();
+        assert_eq!(handled_boot(&path), Ok(Some(BootId::new("first"))));
+        record_handled_boot(&path, &BootId::new("second")).unwrap();
+        assert_eq!(handled_boot(&path), Ok(Some(BootId::new("second"))));
+        let file = path.join(HANDLED_BOOT);
+        assert_eq!(
+            std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::read_dir(&path).unwrap().count(),
+            1,
+            "no temporary file is left"
+        );
     }
 
     #[test]

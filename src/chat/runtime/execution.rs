@@ -187,7 +187,8 @@ impl Tracker {
             | Kind::ReviewRequested
             | Kind::MessageReceived
             | Kind::AutomationPaused
-            | Kind::AutomationBlocked => {
+            | Kind::AutomationBlocked
+            | Kind::NotResumed => {
                 return Err("Attention is not a confirmed provider outcome".into());
             }
         };

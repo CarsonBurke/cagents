@@ -412,6 +412,7 @@ fn notice(notice: &notifications::Notice) -> api::Notice {
             Kind::MessageReceived => api::NoticeKind::MessageReceived,
             Kind::AutomationPaused => api::NoticeKind::AutomationPaused,
             Kind::AutomationBlocked => api::NoticeKind::AutomationBlocked,
+            Kind::NotResumed => api::NoticeKind::NotResumed,
         },
         title: event.evidence.kind.label().into(),
         session: match &event.target {
