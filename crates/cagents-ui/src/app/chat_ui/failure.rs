@@ -730,9 +730,9 @@ impl State {
     }
 
     pub(super) fn active_account_limit(&self) -> bool {
-        self.incidents.iter().any(|incident| {
-            incident.kind == Some(FailureKind::AccountLimit) && incident.current()
-        })
+        self.incidents
+            .iter()
+            .any(|incident| incident.kind == Some(FailureKind::AccountLimit) && incident.current())
     }
 
     fn limit_carrier(&self, provider: Provider, source: &Source) -> Option<String> {
