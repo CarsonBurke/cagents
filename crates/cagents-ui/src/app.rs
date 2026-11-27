@@ -3151,6 +3151,7 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
             | RepositoryAction::DocumentReloaded { .. }
             | RepositoryAction::DiffLoaded { .. }
             | RepositoryAction::DiffBasisResolved { .. }
+            | RepositoryAction::DiffBasisRefreshed { .. }
             | RepositoryAction::SaveFinished { .. }
             | RepositoryAction::RetainedSaveFinished { .. }
             // A dropped page render leaves the viewer reading "Rendering

@@ -2303,6 +2303,7 @@ fn worktree_rename_uses_the_old_baseline_and_suppresses_the_source_row() {
             unstaged: true,
             status: Some(" R".into()),
             directory: false,
+            index_oid: None,
         }]
     );
 }
@@ -2336,6 +2337,7 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: true,
                 status: Some("??".into()),
                 directory: false,
+                index_oid: None,
             },
             RepositoryFile {
                 path: PathBuf::from("renamed.md"),
@@ -2345,6 +2347,8 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: false,
                 status: Some("R ".into()),
                 directory: false,
+                // The object Git stores for the staged contents.
+                index_oid: Some("4eea88a852fde1261c409090a7aae3f0d957e349".into()),
             },
             RepositoryFile {
                 path: PathBuf::from("tracked.md"),
@@ -2354,6 +2358,7 @@ fn real_git_fixture_lists_tracked_and_changed_files() {
                 unstaged: true,
                 status: Some(" M".into()),
                 directory: false,
+                index_oid: Some("9b0bc14618e153a36acf33348cda02d0082f4470".into()),
             },
         ]
     );
@@ -2450,6 +2455,7 @@ fn save_completion_keeps_edits_made_while_the_write_was_in_flight_dirty() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let mut document = EditorDocument::unlinked(
         path.clone(),
@@ -3140,6 +3146,7 @@ fn obsolete_save_completion_cannot_change_document_or_release_navigation_fence()
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let mut document = EditorDocument::unlinked(
         path.clone(),
@@ -3258,6 +3265,7 @@ fn active_save_rejects_open_reload_and_discard_transitions() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let identity = AsyncIdentity {
         card,
@@ -3471,6 +3479,7 @@ fn file_list_refresh_does_not_obsolete_a_pending_document_load() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.document = DocumentState::Loading { predecessor: None };
 
@@ -3508,6 +3517,7 @@ fn file_list_refresh_does_not_obsolete_a_pending_document_load() {
             unstaged: false,
             status: Some("M ".into()),
             directory: false,
+            index_oid: None,
         }]),
     });
 
@@ -3544,6 +3554,7 @@ fn file_list_refresh_does_not_obsolete_an_active_save() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     let identity = AsyncIdentity {
         card,
@@ -3942,6 +3953,7 @@ fn inspector_projection_tracks_loading_conflict_and_active_diff_facts() {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.files = FileListState::Ready(vec![file.clone()]);
     runtime.selected = Some(file);
@@ -4028,6 +4040,7 @@ fn direct_diff_basis_action_cannot_select_an_absent_basis() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.diff_basis = DiffBasis::IndexToWorktree;
     let card = CardId::new();
@@ -4059,6 +4072,7 @@ fn successful_save_invalidates_hidden_diff_then_loads_fresh_changes_on_demand() 
             unstaged: !tracked,
             status: (!tracked).then(|| "??".into()),
             directory: false,
+            index_oid: None,
         });
         let mut document = EditorDocument::unlinked(
             path.clone(),
@@ -4152,6 +4166,7 @@ fn diff_completions_are_fenced_per_basis_and_preserve_the_active_viewport() {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.diff_basis = DiffBasis::IndexToWorktree;
     runtime.diff_change = 2;
@@ -4227,6 +4242,7 @@ fn stale_file_completion_cannot_replace_current_selection() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.document = DocumentState::Loading { predecessor: None };
     let stale = AsyncIdentity {
@@ -4959,6 +4975,7 @@ fn actual_widget_trees_stay_bounded_at_top_middle_and_end_of_100k_rows() {
         unstaged: true,
         status: Some(" M".into()),
         directory: false,
+        index_oid: None,
     });
     runtime.set_diff_state(
         DiffBasis::IndexToWorktree,
@@ -8551,6 +8568,7 @@ fn diff_runtime(card: CardId) -> (RepositoryRuntime, AsyncIdentity) {
         unstaged: true,
         status: Some("MM".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.generation = 1;
     runtime.files = FileListState::Ready(vec![file.clone()]);
@@ -9064,6 +9082,7 @@ fn opening_an_image_reconciles_the_mounted_file_list_and_renders_pixels() {
         unstaged: true,
         status: Some("??".into()),
         directory: false,
+        index_oid: None,
     };
     runtime.files = FileListState::Ready(vec![file.clone()]);
     let mut tree = Tree::new(view(card, &runtime).as_widget());
@@ -9618,7 +9637,7 @@ fn an_unchanged_worktree_is_reported_without_rebuilding_the_file_list() {
     run_git(root.path(), ["add", "tracked.txt"]);
 
     let cancellation = CancellationToken::new();
-    let FileListRead::Listed(Some(digest), files) =
+    let FileListRead::Listed(Some((digest, _)), files) =
         read_repository_files(root.path(), None, &cancellation).unwrap()
     else {
         panic!("a read with nothing to compare against always lists");
@@ -12052,4 +12071,122 @@ fn a_one_page_document_draws_no_page_controls() {
             "{control}: {three:?}"
         );
     }
+}
+
+/// Staging new contents of a file that was already staged and modified
+/// leaves its `MM` as it was; only the index object says the comparisons
+/// against the index are out of date.
+#[test]
+fn restaging_a_file_under_the_same_status_refreshes_its_comparisons() {
+    let card = CardId::new();
+    let (mut runtime, _) = working_diff_runtime(card, "old\n", "new\n");
+    let selected = runtime.selected.clone().unwrap();
+    let FileListState::Ready(files) = &runtime.files else {
+        panic!("file list")
+    };
+    let mut files = files.clone();
+    let file = files
+        .iter_mut()
+        .find(|file| file.path == selected.path)
+        .unwrap();
+    file.index_oid = Some("1111111111111111111111111111111111111111".into());
+    assert_eq!(file.status, selected.status, "the same status code");
+    runtime.file_list_loading = true;
+    runtime.background_file_refresh = true;
+    let identity = AsyncIdentity {
+        card,
+        path: ".".into(),
+        worktree: runtime.descriptor.worktree.clone(),
+        generation: runtime.file_list_generation,
+    };
+    let task = runtime.update(RepositoryAction::FilesLoaded {
+        identity,
+        result: Ok(files),
+    });
+    assert!(task.units() > 0, "the selected file's status is read again");
+    assert!(
+        !matches!(
+            runtime.diff_state(&DiffBasis::IndexToWorktree),
+            Some(DiffState::Ready(..))
+        ),
+        "the comparison against the old index is not kept as current"
+    );
+}
+
+/// A digest of some real read; only the `HEAD` beside it matters here.
+fn any_inventory_digest() -> FileInventoryDigest {
+    let root = tempdir().unwrap();
+    git_fixture(root.path());
+    let FileListRead::Listed(Some((digest, _)), _) =
+        read_repository_files(root.path(), None, &CancellationToken::new()).unwrap()
+    else {
+        panic!("a first read lists");
+    };
+    digest
+}
+
+fn listed_with_head(runtime: &mut RepositoryRuntime, card: CardId, head: &str) -> usize {
+    let generation = runtime.file_list_generation;
+    *runtime.file_list_deposit.lock().unwrap() = Some(ListDeposit {
+        generation,
+        digest: any_inventory_digest(),
+        head: Some(head.into()),
+    });
+    let FileListState::Ready(files) = &runtime.files else {
+        panic!("file list")
+    };
+    let files = files.clone();
+    runtime.file_list_loading = true;
+    runtime.background_file_refresh = true;
+    let identity = AsyncIdentity {
+        card,
+        path: ".".into(),
+        worktree: runtime.descriptor.worktree.clone(),
+        generation,
+    };
+    runtime
+        .update(RepositoryAction::FilesLoaded {
+            identity,
+            result: Ok(files),
+        })
+        .units()
+}
+
+/// Last commit and Branch were named against one `HEAD`; a commit made
+/// since moves them, while a commit opened by name stays put.
+#[test]
+fn a_moved_head_names_the_chosen_committed_comparison_again() {
+    let card = CardId::new();
+    let (mut runtime, identity) = diff_runtime(card);
+    let last = DiffBasis::CommitToParent {
+        oid: fixture_oid(1),
+        parent: Some(fixture_oid(2)),
+    };
+    runtime.diff_basis = last.clone();
+    let quiet = listed_with_head(&mut runtime, card, &"1".repeat(40));
+    let moved = listed_with_head(&mut runtime, card, &"3".repeat(40));
+    assert!(moved > quiet, "a moved HEAD asks for the comparison again");
+
+    // A resolution for a comparison no longer shown is dropped.
+    let newer = DiffBasis::CommitToParent {
+        oid: fixture_oid(3),
+        parent: Some(fixture_oid(1)),
+    };
+    let _ = runtime.update(RepositoryAction::DiffBasisRefreshed {
+        identity: identity.clone(),
+        previous: DiffBasis::HeadToIndex,
+        result: Ok(ResolvedBasis::Ready(newer.clone())),
+    });
+    assert_eq!(runtime.diff_basis, last);
+    let _ = runtime.update(RepositoryAction::DiffBasisRefreshed {
+        identity,
+        previous: last.clone(),
+        result: Ok(ResolvedBasis::Ready(newer.clone())),
+    });
+    assert_eq!(runtime.diff_basis, newer);
+
+    // Opened from History: the commit named is the one meant.
+    runtime.committed_selection = Some((newer.clone(), None));
+    let after_open = listed_with_head(&mut runtime, card, &"4".repeat(40));
+    assert_eq!(after_open, quiet);
 }

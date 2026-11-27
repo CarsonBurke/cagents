@@ -604,6 +604,11 @@ pub struct ChangedPath {
     /// against absence; binary, conflicted, and unreadable paths stay unmeasured.
     pub added_lines: Option<u64>,
     pub removed_lines: Option<u64>,
+    /// The object the index holds for this path, on a tracked change. A
+    /// path staged again with different contents keeps its status code, and
+    /// this is what tells its staged and unstaged comparisons are out of date.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub index_oid: Option<String>,
 }
 
 /// One path in a committed comparison (branch or commit diff), which has no
@@ -1939,6 +1944,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
                     submodule,
                     added_lines: None,
                     removed_lines: None,
+                    index_oid: None,
                 });
             }
             b'?' => {
@@ -1953,6 +1959,7 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
                     submodule: false,
                     added_lines: None,
                     removed_lines: None,
+                    index_oid: None,
                 });
             }
             // Only reported with `--ignored`, which this service never passes;
@@ -2008,6 +2015,8 @@ pub fn parse_status(output: &[u8]) -> Result<StatusSnapshot, GitParseError> {
 struct ChangedRecord<'a> {
     xy: &'a [u8],
     submodule: bool,
+    /// `hI`, absent for a deletion staged from the index.
+    index_oid: Option<String>,
     path: &'a [u8],
 }
 
@@ -2025,9 +2034,15 @@ fn parse_changed_record<'a>(
             "XY status must contain two bytes",
         ));
     }
+    // A staged deletion has an all-zero `hI`: there is nothing in the index.
+    let index_oid = std::str::from_utf8(fields[7])
+        .ok()
+        .filter(|oid| is_hex_oid(oid) && oid.bytes().any(|byte| byte != b'0'))
+        .map(str::to_owned);
     Ok(ChangedRecord {
         xy,
         submodule: fields[2].first() == Some(&b'S'),
+        index_oid,
         path: fields[count - 1],
     })
 }
@@ -2079,6 +2094,7 @@ fn push_changed_entries(
             submodule: record.submodule,
             added_lines: None,
             removed_lines: None,
+            index_oid: record.index_oid.clone(),
         });
     }
     Ok(())
@@ -8001,6 +8017,37 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn a_tracked_change_names_what_the_index_holds() {
+        let staged = "1111111111111111111111111111111111111111";
+        let restaged = "2222222222222222222222222222222222222222";
+        let none = "0000000000000000000000000000000000000000";
+        let input = format!(
+            "# branch.oid {staged}\0# branch.head main\x001 MM N... 100644 100644 100644 {staged} {restaged} file\x001 D. N... 100644 000000 000000 {staged} {none} gone\0"
+        );
+        let status = parse_status(input.as_bytes()).unwrap();
+        let oids = status
+            .entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.path.as_path().to_str().unwrap(),
+                    entry.index_oid.as_deref(),
+                )
+            })
+            .collect::<Vec<_>>();
+        // Both halves of a staged and modified file compare against the same
+        // index object, and a staged deletion leaves none.
+        assert_eq!(
+            oids,
+            [
+                ("file", Some(restaged)),
+                ("file", Some(restaged)),
+                ("gone", None)
+            ]
+        );
     }
 
     #[test]
