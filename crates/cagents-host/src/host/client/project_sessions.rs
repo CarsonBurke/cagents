@@ -18,7 +18,7 @@ use std::{
 };
 
 enum ChatTarget {
-    Hosted(Result<chat::CloseTarget, ProtocolError>),
+    Hosted(Result<Box<chat::CloseTarget>, ProtocolError>),
     CleanupAttachment(uuid::Uuid),
     Starting,
 }
@@ -137,9 +137,9 @@ fn close_owned(
                     Some(record) if record.handle.is_close_only() => {
                         ChatTarget::CleanupAttachment(record.execution_instance)
                     }
-                    Some(record) => ChatTarget::Hosted(chat::CloseTarget::for_execution(
-                        &state, record, &session,
-                    )),
+                    Some(record) => ChatTarget::Hosted(
+                        chat::CloseTarget::for_execution(&state, record, &session).map(Box::new),
+                    ),
                     None => ChatTarget::Starting,
                 };
                 (session, target)
@@ -159,7 +159,7 @@ fn close_owned(
         let _shared = gate.shared();
         check()?;
         let target = match target {
-            ChatTarget::Hosted(target) => target?,
+            ChatTarget::Hosted(target) => *target?,
             ChatTarget::CleanupAttachment(instance) => {
                 let still_exact = host
                     .lock()
