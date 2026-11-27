@@ -2,7 +2,7 @@
 //! on a device whose daemon has just started, waits for that view instead of
 //! closing when the view first arrives without it (#4380).
 use super::*;
-use crate::app::workspace_model_sync::ModelUpdate;
+use crate::app::workspace_model_sync::{EdgeChanges, ModelUpdate};
 
 struct Window {
     app: Cagents,
@@ -586,7 +586,29 @@ fn an_unqueued_new_terminal_is_owed_reconciliation() {
     drop(window.app.reconcile_shared_views());
     assert!(window.app.holds_unqueued_creation());
     window.app.workspace_model_tx = open;
-    drop(window.app.reconcile_shared_views());
+    window.app.shared_views.reconciled_roots = window.app.worktree_roots_digest();
+    assert!(!window.app.holds_unpublished_local_chat());
+    let identity = window.app.workspace_model.identity;
+    let sequence = window.app.workspace_model.sequence;
+    // This edge installs no new state. Only the reconciliation owed to the
+    // terminal should retry publishing it.
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Changed {
+                sequence,
+                edit: ModelEdit::OpenProject {
+                    repository: "/repo".into(),
+                    name: "repo".into(),
+                    kind: ProjectKind::Git,
+                },
+                changes: EdgeChanges {
+                    identity: Some(identity),
+                    ..EdgeChanges::default()
+                },
+            }),
+    );
+    assert_eq!(inserts(&window.rx, card), 1);
     assert!(!window.app.holds_unqueued_creation());
     refuse(&mut window, card, "refused");
     assert!(!window.app.holds_unqueued_creation());

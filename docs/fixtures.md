@@ -1602,6 +1602,29 @@ again, every two seconds while it is open, so it can be changed while the
 session runs. Debug builds whose `HOME` is in a native-evidence task read it;
 other builds and homes ignore it.
 
+## A new terminal that cannot open
+
+In a native evidence session, open a project and wait for its shared workspace
+view to load. Create one of these empty files in the window's fixture home, then
+open a terminal in the project.
+
+| File in fixture home | What to check |
+| --- | --- |
+| `.cagents-fixture-terminal-insert-refused` | The workspace refuses the pane before the shell starts. The pane stays open with Copy details, no transcript, and Retry. Retry can then open the shell. |
+| `.cagents-fixture-terminal-insert-unqueued` | The first Insert goes unqueued. A later edge carrying no changed rows prompts the window to queue it again. The terminal starts once. Start the session with `--workspace-trace` to see the reconciliation. |
+| `.cagents-fixture-terminal-insert-fenced` | The view says another session already owns the terminal. The pane cannot start a duplicate. |
+
+For example, refuse the next terminal with the following command.
+
+```sh
+scripts/native-evidence env sh -c 'touch "$HOME/.cagents-fixture-terminal-insert-refused"'
+```
+
+The development window consumes each marker once. The last two cases deliver
+fixture workspace updates to that window. The daemon's stored workspace and
+other windows still use the real model. Production builds and homes outside a
+native evidence task ignore these files.
+
 ## An update restore in progress or held
 
 After an update, the new daemon restores the conversations the old one ran.
