@@ -9957,6 +9957,7 @@ fn cached_project_list_preserves_actual_accessibility_press_focus_and_overlay_st
     let renderer = headless_renderer();
     let mut folder = project().with_kind(ProjectKind::Folder);
     folder.worktrees.clear();
+    // Nothing is under this folder's heading, so pressing it opens the folder.
     let expected = SidebarAction::OpenRepository {
         project_id: folder.id,
         repository: folder.repository.clone(),
@@ -10476,10 +10477,7 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
     folder.worktrees.clear();
     let key = folder.folder_key().unwrap();
     let plain = format!("Open project {}", folder.name);
-    let open = SidebarAction::OpenRepository {
-        project_id: folder.id,
-        repository: folder.repository.clone(),
-    };
+    let toggle = SidebarAction::ToggleProject(folder.id);
     let terminal = compact_attention_terminal(CardId::new());
     let card = terminal.id;
     let durable = Arc::new(crate::model::WorkspaceState {
@@ -10633,8 +10631,8 @@ fn folder_root_attention_is_rendered_and_filtered_without_a_child_worktree() {
         ),
     );
     assert!(
-        actions.contains(&open),
-        "the unchanged actual Folder control still opens its exact destination"
+        actions.contains(&toggle),
+        "the unchanged actual Folder control folds it, as a repository's does"
     );
 }
 
@@ -10926,16 +10924,36 @@ fn folder_projects_remain_selectable_without_git_actions_in_both_sidebar_modes()
     let renderer = headless_renderer();
     let mut entry = project().with_kind(ProjectKind::Folder);
     entry.worktrees.clear();
+    entry.channels.clear();
+    entry.panes.clear();
     entry.revoke_github();
+    // A folder with nothing under its heading has nothing to fold, so its
+    // heading opens it; once it holds a channel, its heading folds it.
     let open = SidebarAction::OpenRepository {
         project_id: entry.id,
         repository: entry.repository.clone(),
     };
+    let toggle = SidebarAction::ToggleProject(entry.id);
+    let empty = SidebarModel::ready(SidebarMode::Expanded, vec![entry.clone()]);
+    entry.channels.push(SidebarChannel::new(
+        ChannelId::from_uuid(Uuid::from_u128(21)),
+        "Draft the notes".into(),
+        false,
+        None,
+        true,
+        1,
+        true,
+        1,
+    ));
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![entry]);
     let state = SidebarState::default();
     for compact in [false, true] {
+        let actions = frame_enter_presses(&renderer, body(&empty, &state, compact, false));
+        assert!(actions.contains(&open), "{actions:?}");
+        assert!(!actions.contains(&toggle), "{actions:?}");
         let actions = frame_enter_presses(&renderer, body(&model, &state, compact, false));
-        assert!(actions.contains(&open));
+        assert!(actions.contains(&toggle), "{actions:?}");
+        assert!(!actions.contains(&open), "{actions:?}");
         assert!(
             !actions
                 .iter()
