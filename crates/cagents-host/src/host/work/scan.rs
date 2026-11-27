@@ -87,9 +87,12 @@ pub(super) struct Local {
     pub branches: BTreeMap<String, Branch>,
     /// Every local branch name, for telling remote-only pull requests apart.
     pub branch_names: BTreeSet<String>,
-    /// Whether a pull request's head contains a local branch's commit: is
-    /// that commit or a descendant of it, by (local commit, pull request
-    /// head). A missing entry is no.
+    /// Whether a pull request holds a local branch's commit, by (local
+    /// commit, pull request head). Its head holds it when that head is the
+    /// commit or a descendant of it. When Git lacks an open pull request's
+    /// head, the evidence is the branch as a remote naming the pull
+    /// request's repository last fetched it: its remote-tracking ref holding
+    /// the commit. A missing entry is no.
     pub ancestry: BTreeMap<(String, String), bool>,
     /// Git's answers to whether one commit is the other or its ancestor,
     /// by (ancestor, descendant), which never change.
@@ -206,7 +209,16 @@ pub(super) fn scan(input: Input<'_>) -> Result<Local, String> {
             let base_ref = git
                 .default_branch_ref(repository, cancellation)
                 .map_err(text)?;
-            let tracking = tracking_refs(&git, repository, &tracked, cancellation);
+            // Which remotes name a repository moves only with the
+            // configuration.
+            let tracking = match previous {
+                Some(previous)
+                    if !listed && !change.configuration && previous.tracked == tracked =>
+                {
+                    previous.tracking.clone()
+                }
+                _ => tracking_refs(&git, repository, &tracked, cancellation),
+            };
             let mut patterns = vec!["refs/heads"];
             if let Some(base) = &base_ref {
                 patterns.push(base);
