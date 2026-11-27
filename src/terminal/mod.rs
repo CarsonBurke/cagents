@@ -22,8 +22,7 @@ pub use widget::{drop_faces_without_advances, monospace_font};
 mod worker;
 
 /// The holder may take this long to report a newly spawned process. Keep the
-/// UI's attachment wait longer than this bound.
-#[cfg(any(feature = "ui", feature = "host"))]
+/// CLI reply and window attachment waits longer than this bound.
 pub const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub use ipc::TerminalSpawnOptions;
 

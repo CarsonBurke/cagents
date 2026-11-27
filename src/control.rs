@@ -103,6 +103,10 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+// Match the window's attachment budget, which gives the daemon time to
+// publish and acknowledge a newly started holder.
+const TERMINAL_SPAWN_REPLY_TIMEOUT: Duration =
+    terminal::SPAWN_START_TIMEOUT.saturating_add(Duration::from_secs(10));
 // A live close may outlast a slow commit or shared request at the daemon's fence
 // before its own teardown. Timing out earlier would call that wait unresponsive.
 const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
@@ -2272,8 +2276,11 @@ impl ControlClient {
         options: TerminalSpawnOptions,
     ) -> Result<TerminalDescriptor, ControlError> {
         let expected = session.id;
-        let response =
-            self.request_attached(ClientRequest::Spawn { session, options }, expected)?;
+        let response = self.request_attached_with_deadline(
+            ClientRequest::Spawn { session, options },
+            expected,
+            Instant::now() + TERMINAL_SPAWN_REPLY_TIMEOUT,
+        )?;
         let terminal = match response {
             ServerResponse::Spawned { terminal } if terminal.session.id == expected => terminal,
             ServerResponse::Spawned { terminal } => {
@@ -3169,11 +3176,18 @@ impl ControlClient {
             request,
         };
         if let Some(deadline) = deadline {
+            // Only the holder's acknowledgement can need the longer spawn
+            // budget. Sending its request must still use normal I/O.
+            let write_deadline = if matches!(envelope.request, ClientRequest::Spawn { .. }) {
+                deadline.min(Instant::now() + io_timeout())
+            } else {
+                deadline
+            };
             write_frame_for(
                 self.protocol,
                 &mut DeadlineWriter {
                     stream: &mut self.stream,
-                    deadline,
+                    deadline: write_deadline,
                 },
                 &envelope,
             )?;
@@ -10206,11 +10220,18 @@ mod tests {
         }
     }
 
-    /// The CLI's spawn contract is the descriptor it returns. An inventory edge
-    /// can land between the request and its answer on a subscribed connection,
-    /// and neither the answer nor the edge may be lost.
     #[test]
-    fn a_spawn_returns_its_descriptor_while_an_interleaved_inventory_edge_survives() {
+    fn a_slow_spawn_returns_its_original_descriptor_and_keeps_inventory_edges() {
+        check_spawn_replies(false);
+    }
+
+    #[test]
+    fn a_spawn_reads_queued_acknowledgement_and_replay_after_peer_shutdown() {
+        check_spawn_replies(true);
+    }
+
+    fn check_spawn_replies(close_after_reply: bool) {
+        let _budget = ordinary_budget::quick();
         let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
         let pinned = proof("session", "boot", "incarnation");
         let recipe = LaunchRecipe {
@@ -10237,6 +10258,7 @@ mod tests {
         let elsewhere = TerminalId::new();
         let peer_proof = pinned.clone();
         let peer_recipe = recipe.clone();
+        let peer_session = session.clone();
         let server = thread::spawn(move || {
             let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
             write_frame(
@@ -10259,7 +10281,19 @@ mod tests {
             )
             .unwrap();
             let spawn: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
-            assert!(matches!(spawn.request, ClientRequest::Spawn { .. }));
+            assert_eq!(
+                spawn.request,
+                ClientRequest::Spawn {
+                    session: peer_session,
+                    options: TerminalSpawnOptions::default(),
+                }
+            );
+            assert_eq!(spawn.proof, Some(peer_proof.clone()));
+            if !close_after_reply {
+                // The holder can take longer than the ordinary RPC budget.
+                thread::sleep(ordinary_budget::QUICK + Duration::from_millis(100));
+            }
+            let mut replies = Vec::new();
             for message in [
                 ServerMessage::TerminalCreated {
                     terminal: TerminalDescriptor::relaunchable(
@@ -10282,7 +10316,7 @@ mod tests {
                 let request_id =
                     matches!(message, ServerMessage::Response { .. }).then_some(spawn.request_id);
                 write_frame(
-                    &mut server_stream,
+                    &mut replies,
                     &ServerEnvelope {
                         version: PROTOCOL_VERSION,
                         request_id,
@@ -10291,6 +10325,19 @@ mod tests {
                     },
                 )
                 .unwrap();
+            }
+            // Queue the acknowledgement and replay in the same write before
+            // closing, as a daemon can do at the end of an exchange.
+            server_stream.write_all(&replies).unwrap();
+            if close_after_reply {
+                server_stream.shutdown(std::net::Shutdown::Both).unwrap();
+                drop(server_stream);
+            } else {
+                assert!(
+                    read_frame::<ClientEnvelope>(&mut server_stream)
+                        .unwrap()
+                        .is_none()
+                );
             }
         });
 
@@ -10305,6 +10352,22 @@ mod tests {
             client.next_created_terminal().unwrap().session.id,
             elsewhere
         );
+        if close_after_reply {
+            assert!(matches!(
+                client.read_envelope(),
+                Err(ControlError::ConnectionClosed)
+            ));
+        } else {
+            assert_eq!(
+                client.stream.read_timeout().unwrap(),
+                Some(ordinary_budget::QUICK)
+            );
+            assert_eq!(
+                client.stream.write_timeout().unwrap(),
+                Some(ordinary_budget::QUICK)
+            );
+        }
+        drop(client);
         server.join().unwrap();
     }
     #[test]
