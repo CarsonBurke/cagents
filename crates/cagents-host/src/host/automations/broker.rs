@@ -148,7 +148,7 @@ fn warn_slot_retry(firing: Uuid, error: &str) {
         .flat_map(char::escape_default)
         .take(512)
         .collect();
-    tracing::warn!(%firing, error = %diagnostic, "cannot ask again for an automation firing's agent slot");
+    tracing::warn!(%firing, error = %diagnostic, "cannot start an automation firing that waits for an agent slot");
 }
 
 fn warn_history_maintenance(error: &str) {
@@ -884,16 +884,26 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .automation(firing.automation)?;
-        match service::validate_target(host, &automation.definition, &automation.target_identity) {
-            Ok(directory) => {
-                agent_execution::dispatch_accepted_in_directory(host, accepted, directory)
-            }
-            Err(error) => self
-                .0
+        let fail = |error: String, pause| {
+            self.0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(firing.id, error, now, true),
+                .fail_automation_start(firing.id, error, now, pause)
+        };
+        match service::validate_target(host, &automation.definition, &automation.target_identity) {
+            Ok(directory) => {
+                agent_execution::dispatch_accepted_in_directory(host, accepted, directory).or_else(
+                    |error| {
+                        // Without a launch claim nothing else starts or ends
+                        // the accepted run, which would hold its slot and its
+                        // automation. With one, the run is the execution
+                        // service's to settle.
+                        fail(error.clone(), false).or(Err(error))
+                    },
+                )
+            }
+            Err(error) => fail(error, true),
         }
     }
 

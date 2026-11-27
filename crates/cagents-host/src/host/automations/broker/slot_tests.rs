@@ -125,6 +125,16 @@ impl SlotFixture {
 
     /// Brings the firing's timer due.
     fn elapse(&self, firing: &Firing) {
+        self.set_timer(firing, Instant::now());
+    }
+
+    /// Puts the firing's timer out of the test's reach, so that only a wake
+    /// that finds something changed can act on it.
+    fn postpone(&self, firing: &Firing) {
+        self.set_timer(firing, Instant::now() + Duration::from_secs(3600));
+    }
+
+    fn set_timer(&self, firing: &Firing, retry: Instant) {
         self.handle
             .0
             .slots
@@ -132,7 +142,24 @@ impl SlotFixture {
             .unwrap()
             .get_mut(&firing.id)
             .unwrap()
-            .retry = Instant::now();
+            .retry = retry;
+    }
+
+    /// Waits for the run a started firing was given to end.
+    fn settled(&self, firing: &Firing) -> crate::agent_execution::Run {
+        let run = self
+            .saved(firing)
+            .run
+            .expect("the freed slot starts the waiting firing");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let run = self.registry.lock().unwrap().agent_run(run).unwrap();
+            if run.state.is_terminal() {
+                return run;
+            }
+            assert!(Instant::now() < deadline, "run never settled: {run:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// Ends the run holding the slot.
@@ -175,6 +202,9 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
     }
     let fixture = SlotFixture::new();
     let (_, firing) = fixture.waiting("Slot wait fixture");
+    // Firings are served oldest first, by the millisecond.
+    std::thread::sleep(Duration::from_millis(2));
+    let (_, later) = fixture.waiting("Later slot wait fixture");
     let tick = || fixture.handle.tick(&fixture.host).unwrap();
 
     // The wake after the refusal starts the firing's timer, and sleeps no
@@ -184,6 +214,7 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
     assert_eq!(fixture.backoff(&firing).unwrap().refusals, 1);
 
     // Other wakes while the slot is held find none free and leave the timer.
+    fixture.postpone(&firing);
     tick();
     assert_eq!(fixture.backoff(&firing).unwrap().refusals, 1);
 
@@ -195,27 +226,25 @@ fn scheduler_starts_a_waiting_firing_on_the_wake_that_finds_a_slot_free() {
     assert_eq!(fixture.saved(&firing), firing);
 
     // The slot frees. The next wake starts the run without waiting out the
-    // timer, and launches it.
+    // timer and launches it; the firing behind it waits for the slot again.
+    fixture.postpone(&firing);
+    fixture.postpone(&later);
     fixture.release();
     tick();
     assert!(fixture.backoff(&firing).is_none());
-    let started = fixture.saved(&firing);
-    let run = started
-        .run
-        .expect("the freed slot starts the waiting firing");
     assert_eq!(
-        started.diagnostic.as_deref(),
+        fixture.saved(&firing).diagnostic.as_deref(),
         Some("Waited for an agent slot before starting.")
     );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    let run = loop {
-        let run = fixture.registry.lock().unwrap().agent_run(run).unwrap();
-        if run.state.is_terminal() {
-            break run;
-        }
-        assert!(Instant::now() < deadline, "run never settled: {run:?}");
-        std::thread::sleep(Duration::from_millis(10));
-    };
+    assert!(awaits_agent_slot(&fixture.saved(&later)));
+    assert!(fixture.backoff(&later).is_some());
+    let run = fixture.settled(&firing);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+
+    // That run's end frees the slot for the next.
+    tick();
+    assert!(fixture.backoff(&later).is_none());
+    let run = fixture.settled(&later);
     assert_eq!(run.state, State::Succeeded, "{run:?}");
 }
 
@@ -234,7 +263,8 @@ fn scheduler_ends_a_wait_for_a_slot_on_the_wake_after_a_resume_or_a_cancel() {
     let (cancelled_owner, cancelled) = fixture.waiting("Cancelled while waiting");
     let tick = || fixture.handle.tick(&fixture.host).unwrap();
     tick();
-    assert!(fixture.backoff(&skipped).is_some() && fixture.backoff(&cancelled).is_some());
+    fixture.postpone(&skipped);
+    fixture.postpone(&cancelled);
 
     // Resuming the schedule supersedes the run asked for before it: the next
     // wake ends the wait, with the slot still held and the timer not yet due.

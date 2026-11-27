@@ -1692,10 +1692,10 @@ impl Registry {
     /// Whether asking again for a waiting firing's agent slot would change
     /// it: a slot is free for its automation, or the firing no longer waits
     /// or is no longer its automation's to start. It reads only, so the
-    /// scheduler can ask on every wake. A slot counts as taken here even when
-    /// the run would queue behind its reused agent's current one, and the
-    /// counts in the firing's details are not refreshed; asking again on the
-    /// scheduler's timer covers both.
+    /// scheduler can ask on every wake. It neither notices what would fail
+    /// the firing outright, such as a reused agent left with an interrupted
+    /// run, nor refreshes the counts in the firing's details; asking again
+    /// on the scheduler's timer does both.
     pub(crate) fn automation_slot_retry_due(&self, firing_id: Uuid) -> Result<bool, String> {
         let firing = read_firing(&self.db, firing_id)?;
         if !awaits_agent_slot(&firing) {
