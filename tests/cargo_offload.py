@@ -2345,16 +2345,84 @@ class RemoteRun(unittest.TestCase):
     """The build host's end of a command: it ends what it started when the
     connection to this host closes, outside any supervisor here."""
 
-    def agent(self, scope, *arguments, env=None, **options):
+    def agent(self, scope, *arguments, env=None, prelude="", **options):
         """Starts the build host's agent in `scope`, as ssh would there. Its
         temporary directories and build shares stay in the scope, apart
         from the host's own builds."""
         return scope.popen(
-            [sys.executable, "-c", offload.REMOTE_AGENT, *arguments],
+            [sys.executable, "-c", prelude + offload.REMOTE_AGENT, *arguments],
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof")),
                               "CAGENTS_BUILD_LOCK": str(Path(scope.name, "shares.lock")),
                               "CAGENTS_BUILD_SLOTS": "4", "CAGENTS_BUILD_SCOPE": "0"}
             | (env or {}), **options)
+
+    @staticmethod
+    def group_signal_guard(*, finishing):
+        # waitid fails once the supervisor has been reaped, even if its old
+        # group still exists. Check before sending any real group signal.
+        return f"finishing = {finishing!r}\n" + textwrap.dedent("""
+            import os, signal, sys, time
+
+            def fail(message):
+                print(message, file=sys.stderr, flush=True)
+                os._exit(99)
+
+            killpg = os.killpg
+            first_signal = True
+            def signal_owned_group(group, number):
+                global first_signal
+                try:
+                    exited = os.waitid(os.P_PID, group, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+                except ChildProcessError:
+                    fail("group leader was already reaped")
+                if finishing and exited is None:
+                    fail("cleanup started before the build exited")
+                if not finishing and first_signal and (exited is not None or number != signal.SIGINT):
+                    fail("cancellation did not interrupt the running supervisor")
+                first_signal = False
+                killpg(group, number)
+
+            def unexpected_sleep(seconds):
+                fail("post-build cleanup waited for its own group to disappear")
+
+            os.killpg = signal_owned_group
+            if finishing:
+                time.sleep = unexpected_sleep
+        """)
+
+    def test_build_cleanup_signals_before_reaping_and_preserves_status(self):
+        leftover = textwrap.dedent("""
+            import os, signal
+            reader, writer = os.pipe()
+            if os.fork() == 0:
+                os.close(reader)
+                os.close(2)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                print("descendant holds stdout", flush=True)
+                os.write(writer, b"1")
+                signal.pause()
+            os.close(writer)
+            assert os.read(reader, 1) == b"1"
+        """)
+        for status, host, output in (
+            (0, "", b""),
+            (37, leftover + "\nos._exit(37)", b"descendant holds stdout\n"),
+            (128 + signal.SIGTERM, "import os, signal; os.kill(os.getpid(), signal.SIGTERM)", b""),
+        ):
+            with self.subTest(status=status), FixtureDirectory() as scope:
+                slot = Path(scope.name, "slot-0")
+                (slot / "src").mkdir(parents=True)
+                agent = self.agent(scope, "run-client", str(slot), ".", "cargo", "check",
+                                   prelude=self.group_signal_guard(finishing=True), stdin=subprocess.PIPE,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                request = {"environment": {}, "tools": {"build-host": host}}
+                agent.stdin.write(json.dumps(request).encode() + b"\n")
+                agent.stdin.flush()
+                # Keep the request channel open so only normal completion
+                # can stop the descendant and close the output streams.
+                self.assertEqual(agent.wait(timeout=HANG_GUARD), status, agent.stderr.read().decode())
+                stdout, _ = agent.communicate(timeout=HANG_GUARD)
+                self.assertEqual(stdout, offload.RUN_READY + output)
 
     def test_a_build_repairs_interrupted_state_before_cargo_runs(self):
         with FixtureDirectory() as scope:
@@ -2794,7 +2862,7 @@ class RemoteRun(unittest.TestCase):
                 cargo.chmod(0o755)
                 command = [str(cargo), "test"]
             agent = self.agent(scope, "run", base, ".", *command,
-                               stdin=subprocess.PIPE, start_new_session=True)
+                               prelude=self.group_signal_guard(finishing=False), stdin=subprocess.PIPE)
             request = {"environment": {"CAGENTS_MEMORY_MAX": "128M", "CAGENTS_MEMORY_SWAP_MAX": "0"},
                        "tools": TOOLS}
             agent.stdin.write(json.dumps(request).encode() + b"\n")
@@ -2805,20 +2873,12 @@ class RemoteRun(unittest.TestCase):
                 time.sleep(0.05)
             sleeper = int(marker.read_text())
             agent.stdin.close()
-            # This runner adopts the sleeper; reaping it as it dies, as init
-            # would, lets the agent see the command's group end.
+            self.assertEqual(agent.wait(timeout=HANG_GUARD), 130)
             deadline = time.monotonic() + HANG_GUARD
-            while agent.poll() is None:
-                self.assertLess(time.monotonic(), deadline, "the agent outlived its connection")
-                with contextlib.suppress(ChildProcessError):
-                    os.waitpid(sleeper, os.WNOHANG)
-                time.sleep(0.05)
-            self.assertEqual(agent.returncode, 130)
-            deadline = time.monotonic() + HANG_GUARD
-            while Path(f"/proc/{sleeper}").exists() and Path(
-                    f"/proc/{sleeper}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
-                self.assertLess(time.monotonic(), deadline, "the command's child outlived it")
-                time.sleep(0.05)
+            with contextlib.suppress(FileNotFoundError):
+                while Path(f"/proc/{sleeper}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
+                    self.assertLess(time.monotonic(), deadline, "the command's child outlived it")
+                    time.sleep(0.05)
 
     def test_a_finished_command_keeps_its_status(self):
         with FixtureDirectory() as scope:

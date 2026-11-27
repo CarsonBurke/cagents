@@ -18731,8 +18731,12 @@ fn upgraded_identity_is_installed_only_after_its_exact_durable_receipt() {
             ..Snapshot::default()
         };
         let handle = Arc::new(if legacy_paired {
-            ClientHandle::fixture_upgrade_handshake(source.clone(), replacement.clone(), snapshot)
-                .unwrap()
+            ClientHandle::fixture_live_upgrade_handshake(
+                source.clone(),
+                replacement.clone(),
+                snapshot,
+            )
+            .unwrap()
         } else {
             ClientHandle::fixture_upgrade(source.clone(), replacement.clone(), snapshot)
         });
@@ -24281,7 +24285,7 @@ fn exercise_live_shared_recovery_fixture(mut f: LiveSharedRecovery, reconnect_fi
     };
     if let Some(old) = old_attempt {
         let stale = Arc::new(
-            ClientHandle::fixture_upgrade_handshake(
+            ClientHandle::fixture_live_upgrade_handshake(
                 f.source.clone(),
                 f.canonical.clone(),
                 snapshot.clone(),
@@ -24293,7 +24297,7 @@ fn exercise_live_shared_recovery_fixture(mut f: LiveSharedRecovery, reconnect_fi
         assert!(!f.app.chat_ui.attempt(f.card).unwrap().upgrade_committed);
     }
     let handle = Arc::new(
-        ClientHandle::fixture_upgrade_handshake(
+        ClientHandle::fixture_live_upgrade_handshake(
             f.source.clone(),
             f.canonical.clone(),
             snapshot.clone(),
@@ -24399,7 +24403,7 @@ fn assert_no_live_upgrade_checkpoint(task: Task<Message>) {
 
 fn live_shared_recovery_handle(f: &LiveSharedRecovery) -> Arc<ClientHandle> {
     Arc::new(
-        ClientHandle::fixture_upgrade_handshake(
+        ClientHandle::fixture_live_upgrade_handshake(
             f.source.clone(),
             f.canonical.clone(),
             Snapshot {
@@ -24937,7 +24941,7 @@ fn retained_claude_identity_is_installed_only_after_its_exact_durable_receipt() 
             );
         }
         let handle = Arc::new(
-            ClientHandle::fixture_upgrade_handshake(
+            ClientHandle::fixture_live_upgrade_handshake(
                 source.clone(),
                 replacement.clone(),
                 Snapshot {
@@ -26860,9 +26864,11 @@ fn refused_direct_queue_recovery_is_committed_before_an_immediate_close() {
     // coalesced lane even after every ordinary draft displaced its kept copy.
     drop(app.begin_chat_close(card));
     assert!(!app.card_state(card).unwrap().existence.is_open());
+    // Recoveries return in delivery order: the later actor's queue follows
+    // the first actor's recovered prefix.
     assert_eq!(
         app.durable.kept_chat_drafts[&card].text.trim(),
-        "A later actor's queue\nThen summarize the complete result",
+        "Then summarize the complete result\nA later actor's queue",
     );
     let drafts = &mut Arc::make_mut(&mut app.durable).kept_chat_drafts;
     for index in 0..=crate::model::KeptChatDraft::LIMIT {

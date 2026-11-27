@@ -545,7 +545,7 @@ fn settings_category_controls<'a>(
             );
             let sidebar_worktrees = settings_choice(
                 "Checkouts in sidebar",
-                "Show each project's checkouts after its channels, grouped or listed directly. Hidden hides every checkout, the repository's root checkout too, and lists each open pane under its project instead. Projects can override this default, except while it is Hidden.",
+                "Checkouts start Hidden: each open pane is listed under its project instead, and no checkout gets a row, the repository's root checkout included. Grouped or Expanded shows each project's checkouts after its channels. Projects can override this default once checkouts show.",
                 SettingsField::SidebarWorktrees,
                 settings::SidebarWorktrees::ALL
                     .map(|mode| (mode.label(), mode.key(), draft.sidebar_worktrees == mode)),
@@ -2822,10 +2822,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Grouped);
+        assert_eq!(first.sidebar_worktrees, settings::SidebarWorktrees::Hidden);
         let mut changed = initial;
         let project = ProjectId::new();
-        changed.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
+        changed.sidebar_worktrees = settings::SidebarWorktrees::Grouped;
         changed
             .sidebar_worktree_overrides
             .insert(project, settings::SidebarWorktrees::Expanded);
@@ -2836,7 +2836,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             observed.sidebar_worktrees,
-            settings::SidebarWorktrees::Hidden
+            settings::SidebarWorktrees::Grouped
         );
         assert_eq!(
             observed.sidebar_worktree_overrides.get(&project),

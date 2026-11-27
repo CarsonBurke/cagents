@@ -1752,25 +1752,28 @@ elif command in ("run", "run-client"):
     input_closed = select.poll()
     input_closed.register(sys.stdin, select.POLLHUP)
 
-    def end(process, sent_first):
-        """Exit the command's group, including children that ignore an interrupt."""
-        for sent in (sent_first, signal.SIGTERM, signal.SIGKILL):
-            try:
-                os.killpg(process.pid, sent)
-            except ProcessLookupError:
-                return
+    def signal_group(process, number):
+        try:
+            os.killpg(process.pid, number)
+        except ProcessLookupError:
+            pass
+
+    def interrupt(process):
+        """Give the supervisor time to shut down before killing its group."""
+        for number in (signal.SIGINT, signal.SIGTERM):
+            signal_group(process, number)
             for _ in range(50):
-                try:
-                    os.killpg(process.pid, 0)
-                except ProcessLookupError:
+                if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG):
+                    signal_group(process, signal.SIGKILL)
                     return
                 time.sleep(0.1)
+        signal_group(process, signal.SIGKILL)
 
     def cancel():
         cancelling.set()
         with launch_gate:
             if child is not None:
-                end(child, signal.SIGINT)
+                interrupt(child)
             os._exit(130)
 
     def start(arguments, **options):
@@ -1902,16 +1905,18 @@ elif command in ("run", "run-client"):
     # could alias a later same-size source update within one timestamp tick.
     arguments = [sys.executable, "-I", "-B", os.path.join(tools, "build-host"), "cargo",
                  *admission, "--", *arguments]
-    child = start(arguments, env=environment, stdin=subprocess.DEVNULL)
+    build = start(arguments, env=environment, stdin=subprocess.DEVNULL)
     if command != "run-client":
         until_closed(cancel)
-    status = child.wait()
-    if cancelling.is_set():
-        # Ending the group exits.
-        while True:
-            time.sleep(3600)
-    # What the command left running would keep the connection open.
-    end(child, signal.SIGTERM)
+    os.waitid(os.P_PID, build.pid, os.WEXITED | os.WNOWAIT)
+    with launch_gate:
+        # The exited supervisor still reserves its group number. End any
+        # leftovers holding SSH open before reaping it and clearing the
+        # cancellation watcher's reference. A group probe would see the
+        # unreaped leader even when nothing is left to terminate.
+        signal_group(build, signal.SIGKILL)
+        status = build.wait()
+        child = None
     remove_evicted([base])
     os._exit(status if status >= 0 else 128 - status)
 '''

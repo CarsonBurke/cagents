@@ -4,7 +4,10 @@
 use super::*;
 use crate::{
     daemon::{child_reaper, holder_registry::Process},
-    model::{LaunchRecipe, TerminalContinuity, TerminalId, TerminalSession},
+    model::{
+        HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, TerminalContinuity,
+        TerminalId, TerminalSession,
+    },
     terminal::TerminalSpawnOptions,
     terminal_ipc::{ClientEnvelope, ClientRequest, ServerResponse, read_frame},
     test_timing::EVENTUALLY,

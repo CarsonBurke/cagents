@@ -20,7 +20,7 @@ use std::{
 };
 
 #[derive(Clone, Copy)]
-enum Edge {
+pub(super) enum Edge {
     Changed,
     Unavailable,
 }
@@ -218,12 +218,23 @@ fn watch_file(
     report: impl Fn(Edge) + Clone + Send + 'static,
 ) -> Result<RecommendedWatcher, UpdateError> {
     let directory = snapshot.parent().expect("snapshot has a parent").to_owned();
-    let watched_directory = directory.clone();
-    let events = report.clone();
+    let watcher = watch_paths(vec![snapshot], &[directory], report.clone())?;
+    if let Some(path) = lease {
+        watch_lease(path, report)?;
+    }
+    Ok(watcher)
+}
+
+pub(super) fn watch_paths(
+    paths: Vec<PathBuf>,
+    directories: &[PathBuf],
+    report: impl Fn(Edge) + Send + 'static,
+) -> Result<RecommendedWatcher, UpdateError> {
+    let watched = directories.to_vec();
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<Event>| match event {
             Ok(event)
-                if event.paths.contains(&watched_directory)
+                if event.paths.iter().any(|path| watched.contains(path))
                     && matches!(
                         event.kind,
                         EventKind::Remove(_)
@@ -232,43 +243,50 @@ fn watch_file(
                             ))
                     ) =>
             {
-                events(Edge::Unavailable)
+                report(Edge::Unavailable)
             }
-            Ok(event) if event.need_rescan() || event.paths.contains(&snapshot) => {
-                events(Edge::Changed);
+            Ok(event)
+                if event.need_rescan() || event.paths.iter().any(|path| paths.contains(path)) =>
+            {
+                report(Edge::Changed);
             }
-            Err(_) => events(Edge::Unavailable),
+            Err(_) => report(Edge::Unavailable),
             _ => (),
         },
         Config::default().with_event_kinds(EventKindMask::CORE),
     )
     .map_err(|error| invalid(format!("Could not watch update progress: {error}")))?;
-    watcher
-        .watch(&directory, RecursiveMode::NonRecursive)
-        .map_err(|error| invalid(format!("Could not watch update progress: {error}")))?;
-    if let Some(path) = lease {
-        let lease = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(path)?;
-        validate_lock(&lease)?;
-        // A crashed worker has no last snapshot. Wait for its inherited
-        // lock to release, then wake the existing stale-job check. This
-        // thread is independent of the UI executor so the window can
-        // exit even while an update still holds the lease.
-        thread::Builder::new()
-            .name("update-lease-watch".into())
-            .spawn(
-                move || match crate::instance::owned_file_lock(lease, libc::LOCK_SH) {
-                    Ok(released) => {
-                        drop(released);
-                        report(Edge::Changed);
-                    }
-                    Err(_) => report(Edge::Unavailable),
-                },
-            )?;
+    for directory in directories {
+        watcher
+            .watch(directory, RecursiveMode::NonRecursive)
+            .map_err(|error| invalid(format!("Could not watch update progress: {error}")))?;
     }
     Ok(watcher)
+}
+
+pub(super) fn watch_lease(
+    path: &Path,
+    report: impl FnOnce(Edge) + Send + 'static,
+) -> Result<(), UpdateError> {
+    let lease = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    validate_lock(&lease)?;
+    // A crashed worker has no last snapshot. Wait for its inherited lease
+    // without tying up the caller or the UI executor.
+    thread::Builder::new()
+        .name("update-lease-watch".into())
+        .spawn(
+            move || match crate::instance::owned_file_lock(lease, libc::LOCK_SH) {
+                Ok(released) => {
+                    drop(released);
+                    report(Edge::Changed);
+                }
+                Err(_) => report(Edge::Unavailable),
+            },
+        )?;
+    Ok(())
 }
 
 #[cfg(all(test, feature = "ui"))]

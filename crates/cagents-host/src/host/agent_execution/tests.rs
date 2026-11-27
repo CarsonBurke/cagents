@@ -3743,7 +3743,7 @@ fn a_new_agent_works_only_in_a_directory_inside_its_project() {
         spec.target.directory = directory.clone();
         let error = submit(&host, &Authority::default(), outside).unwrap_err();
         assert!(
-            error.contains("is not in the project"),
+            error.to_string().contains("is not in the project"),
             "{key}: {directory:?} was not refused: {error}"
         );
     }

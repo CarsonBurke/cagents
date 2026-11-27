@@ -12178,9 +12178,15 @@ fn sidebar_preferences_observed_after_local_save_can_reset_external_override() {
     let mut app = context_inspector_test_app(false);
     app.settings_write_blocked = false;
     app.settings_path = Some(path.clone());
+    app.settings
+        .set_sidebar_worktrees(settings::SidebarWorktrees::Grouped);
     app.save_settings_now().unwrap();
     let project = ProjectId::new();
     let mut external = settings::load(&path).unwrap();
+    assert_eq!(
+        external.sidebar_worktrees,
+        settings::SidebarWorktrees::Grouped
+    );
     external.sidebar_worktrees = settings::SidebarWorktrees::Hidden;
     external
         .sidebar_worktree_overrides
@@ -15125,6 +15131,8 @@ fn shared_preferences_read_before_a_local_save_cannot_revert_it_after_acknowledg
     let mut app = context_inspector_test_app(false);
     app.settings_path = Some(path.clone());
     app.settings_write_blocked = false;
+    // Checkouts start hidden; show them so hiding them is a change.
+    app.settings.set_sidebar_worktrees(Grouped);
     app.save_settings_now().unwrap();
     let stale = Message::SharedPreferencesObserved {
         generation: app.settings_ack_generation,
@@ -16528,5 +16536,64 @@ fn the_header_leaves_the_window_controls_only_what_the_projects_pane_does_not() 
     assert!(
         app.window_controls()
             .is_some_and(|controls| controls.edge == WindowControlsEdge::Trailing)
+    );
+}
+
+/// A stage Git refused because a conflicted file still holds conflict
+/// markers ends the mutation without a failure report and asks instead;
+/// only the confirmation it raised may then run, and a stale one is refused.
+#[test]
+fn a_stage_refused_for_conflict_markers_asks_before_marking_resolved() {
+    let mut app = context_inspector_test_app(false);
+    app.sidebar_model = sidebar::test_support::panel_model();
+    app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+    let key = app.sidebar_state.active_worktree().unwrap().clone();
+    app.active_workspace = Some(key.canonical_path.clone());
+    drop(app.rebind_source_control());
+    let operation = app.begin_mutation(&key, MutationKind::Stage, None).unwrap();
+    let selection = vec![crate::repository::PathSelection::new(
+        crate::repository::RepoPath::parse("f.txt").unwrap(),
+    )];
+    drop(app.update(Message::StageNeedsConfirmation {
+        key: key.clone(),
+        operation,
+        selection: selection.clone(),
+        paths: vec![crate::repository::RepoPath::parse("f.txt").unwrap()],
+    }));
+    assert!(
+        !app.source_control_mutations
+            .contains_key(&key.canonical_path)
+    );
+    let source = app.sidebar_model.source_control.as_ref().unwrap();
+    assert!(source.mutation.is_none() && source.error.is_none());
+    assert!(app.modal_is_open(), "the question is asked over the window");
+    assert!(cosmic::Application::dialog(&app).is_some());
+
+    // A confirmation for a different selection than the one asked about
+    // runs nothing and leaves the question up.
+    drop(app.update(Message::Sidebar(
+        SidebarAction::ConfirmStageConflictMarkers {
+            key: key.clone(),
+            selection: Vec::new(),
+        },
+    )));
+    assert!(app.sidebar_state.pending_git_confirmation().is_some());
+    assert!(
+        !app.source_control_mutations
+            .contains_key(&key.canonical_path)
+    );
+
+    drop(app.update(Message::Sidebar(
+        SidebarAction::ConfirmStageConflictMarkers {
+            key: key.clone(),
+            selection,
+        },
+    )));
+    assert!(app.sidebar_state.pending_git_confirmation().is_none());
+    assert_eq!(
+        app.source_control_mutations
+            .get(&key.canonical_path)
+            .map(|mutation| mutation.kind),
+        Some(MutationKind::Stage)
     );
 }

@@ -165,9 +165,9 @@ use crate::{
     repository::{
         CancellationToken, ChangeArea, CommitOutcome, CommitRequest, CommitSummary,
         CreateWorktreeRequest, DiffBasis, HistoryRequest, HistoryRevision, MutationOutcome,
-        PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo, RepositoryService,
-        RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot, UnstageRequest,
-        WorktreeCreationOutcome, WorktreeRecord,
+        PathSelection, PushOutcome, PushRequest, RepoPath, RepositoryId, RepositoryInfo,
+        RepositoryService, RepositorySnapshot, SnapshotRead, StageRequest, StatusSnapshot,
+        UnstageRequest, WorktreeCreationOutcome, WorktreeRecord,
     },
     repository_widget::{self, HunkStaging, LspIntent, RepositoryAction, RepositoryRuntime},
     session::{
@@ -3181,7 +3181,11 @@ fn repository_action_allowed_while_modal(action: &RepositoryAction) -> bool {
 fn answers_discard_confirmation(action: &SidebarAction) -> bool {
     matches!(
         action,
-        SidebarAction::ConfirmDiscard { .. } | SidebarAction::CancelDiscard
+        SidebarAction::ConfirmDiscard { .. }
+            | SidebarAction::CancelDiscard
+            | SidebarAction::ConfirmStageConflictMarkers { .. }
+            | SidebarAction::ConfirmAbortOperation { .. }
+            | SidebarAction::CancelGitConfirmation
     )
 }
 
@@ -3372,6 +3376,9 @@ fn background_poll(message: &Message) -> bool {
                     | phone_ui::Action::Probed(_)
                     | phone_ui::Action::Progressed(_)
             )
+            // Starts a background read of the Changes panel and nothing
+            // else; the read's answer is projected when it lands.
+            | Message::RefreshUi(refresh_ui::Action::SourceReload)
     )
 }
 
@@ -5046,6 +5053,15 @@ pub enum Message {
         /// A commit that succeeded clears the message input; one that did not
         /// must keep it, because the text is the user's work.
         committed: bool,
+    },
+    /// A stage Git was not asked to run, because conflicted paths in it still
+    /// hold conflict markers. The mutation ends as if it reported nothing,
+    /// and the user is asked whether to mark them resolved regardless.
+    StageNeedsConfirmation {
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<PathSelection>,
+        paths: Vec<RepoPath>,
     },
     NewTerminal,
     TerminalFailure(terminal_failure::Action),
@@ -11216,6 +11232,12 @@ impl Cagents {
                     Projection::Full,
                 );
             }
+            if self.sidebar_state.pending_git_confirmation().is_some() {
+                return (
+                    self.dispatch(Message::Sidebar(SidebarAction::CancelGitConfirmation)),
+                    Projection::Full,
+                );
+            }
             if self.project_ui.modal_open() {
                 return (
                     self.handle_project_action(project_ui::Action::Dismiss),
@@ -14800,6 +14822,8 @@ impl Cagents {
             return Task::none();
         }
         self.cancel_source_read();
+        // This read begins after every change the watcher has reported.
+        self.refresh_ui.source_reload.read_started();
         let request = self.refresh_ui.source_generation;
         let cancellation = CancellationToken::default();
         self.refresh_ui.source_cancel = Some(cancellation.clone());
@@ -15004,6 +15028,51 @@ impl Cagents {
             }
         }
         Some(id)
+    }
+
+    /// A stage, which Git refuses for a conflicted path still holding
+    /// conflict markers. That refusal becomes a question rather than a
+    /// failure report; see [`Message::StageNeedsConfirmation`].
+    fn stage_task(
+        key: ActiveWorktreeKey,
+        operation: uuid::Uuid,
+        selection: Vec<PathSelection>,
+    ) -> Task<Message> {
+        cosmic::task::future(async move {
+            let request = StageRequest {
+                worktree: key.canonical_path.clone(),
+                selection,
+            };
+            let joined = tokio::task::spawn_blocking(move || {
+                let service = RepositoryService::system("git");
+                let outcome = service.stage(&request, &CancellationToken::default());
+                (request.selection, outcome)
+            })
+            .await;
+            let report = match joined {
+                Ok((
+                    selection,
+                    Ok(MutationOutcome::NotApplied {
+                        failure: crate::repository::MutationFailure::ConflictMarkers { paths },
+                    }),
+                )) => {
+                    return Message::StageNeedsConfirmation {
+                        key,
+                        operation,
+                        selection,
+                        paths,
+                    };
+                }
+                Ok((_, outcome)) => mutation_report("Stage", outcome),
+                Err(error) => Some(format!("Git worker failed: {error}")),
+            };
+            Message::SourceControlMutated {
+                key,
+                operation,
+                report,
+                committed: false,
+            }
+        })
     }
 
     /// The task one finished mutation turns into: report what Git did, then
@@ -15349,6 +15418,7 @@ impl Cagents {
             // destroy work becomes the one dialog the pane keeps its commands
             // live behind.
             || self.sidebar_state.pending_discard().is_some()
+            || self.sidebar_state.pending_git_confirmation().is_some()
     }
 
     fn open_sidebar_navigation_row(&mut self, row: sidebar::SelectionRow) -> Task<Message> {
@@ -15863,6 +15933,11 @@ impl Cagents {
                 dialog_ui::Question::DiscardChanges
                     .initial_focus(sidebar::discard_cancel_id(), sidebar::discard_confirm_id()),
             )
+        } else if self.sidebar_state.pending_git_confirmation().is_some() {
+            Some(dialog_ui::Question::ConfirmGitCommand.initial_focus(
+                sidebar::git_confirmation_cancel_id(),
+                sidebar::git_confirmation_confirm_id(),
+            ))
         } else if self.project_ui.modal_open() {
             Some(self.project_ui.focus_target())
         } else if self.channel_ui.modal_open() {
@@ -17580,6 +17655,18 @@ impl Application for Cagents {
                 )
                 .map(Message::Sidebar),
                 Some(Message::Sidebar(SidebarAction::CancelDiscard)),
+                1.0,
+            ));
+        }
+        if let Some(pending) = self.sidebar_state.pending_git_confirmation() {
+            return Some(dialog_ui::overlay(
+                sidebar::git_confirmation_dialog(
+                    pending,
+                    self.sidebar_model.source_control.as_ref(),
+                    dialog_ui::Question::ConfirmGitCommand.surface_id(),
+                )
+                .map(Message::Sidebar),
+                Some(Message::Sidebar(SidebarAction::CancelGitConfirmation)),
                 1.0,
             ));
         }
@@ -20525,6 +20612,13 @@ impl Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::WorktreesUi(action) => self.update_worktrees_ui(action),
+            Message::GitUi(git_ui::Action::Changed) => {
+                // Untracked paths alone only owe the Changes panel a read.
+                if !self.git_watch_changed() && !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
+                self.start_git_reads()
+            }
             Message::GitUi(action) => self.update_git(action),
             Message::NotificationUi(action) => self.update_notifications(action),
             Message::ReviewRequests(action) => self.update_review_requests(action),
@@ -20749,21 +20843,42 @@ impl Cagents {
                 operation,
                 report,
                 committed,
+            } => handled!(self.index_mutation_settled(key, operation, report, committed)),
+            Message::StageNeedsConfirmation {
+                key,
+                operation,
+                selection,
+                paths,
             } => {
-                if self
-                    .source_control_mutations
-                    .get(&key.canonical_path)
-                    .is_some_and(|mutation| mutation.id == operation)
-                {
-                    for runtime in self.cards.values_mut() {
-                        if let CardRuntime::Repository(runtime) = runtime
-                            && runtime.descriptor.worktree == key.canonical_path
-                        {
-                            runtime.index_mutation_finished();
-                        }
-                    }
+                // The question is asked only where it can be answered: in
+                // the worktree the panel still shows, with no other dialog
+                // over it. Otherwise the refusal is reported like any other,
+                // rather than vanishing with the question nobody saw. A stale
+                // answer, for a mutation the panel has moved on from, is
+                // neither.
+                let askable = !self.modal_is_open()
+                    && self.source_control_is_bound(&key)
+                    && self.sidebar_state.active_worktree() == Some(&key);
+                if askable {
+                    let settled =
+                        handled!(self.index_mutation_settled(key.clone(), operation, None, false));
+                    let ask = self.dispatch(Message::Sidebar(
+                        SidebarAction::RequestStageConflictMarkers {
+                            key,
+                            selection,
+                            paths,
+                        },
+                    ));
+                    Task::batch([settled, ask])
+                } else {
+                    let report = mutation_report(
+                        "Stage",
+                        Ok(MutationOutcome::NotApplied {
+                            failure: crate::repository::MutationFailure::ConflictMarkers { paths },
+                        }),
+                    );
+                    handled!(self.index_mutation_settled(key, operation, report, false))
                 }
-                handled!(self.source_control_mutated(key, operation, report, committed))
             }
         };
         self.owe_projection(OwedProjection { projection, camera_only, reconcile_row_selection, model_update, save_view: false });
