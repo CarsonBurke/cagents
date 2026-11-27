@@ -688,10 +688,17 @@ fn publish_with_mirror(
                                 error: error.to_string(),
                             });
                         } else {
+                            tracing::debug!(%error, "the registry refused a view edit");
+                            // The registry's own sentence, which a refused
+                            // new terminal shows in its pane.
+                            let reason = match &error {
+                                ControlError::Remote { message, .. } => message.clone(),
+                                other => other.to_string(),
+                            };
                             let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                                 scope: scope.clone(),
                                 operation: *operation,
-                                error: error.to_string(),
+                                error: reason,
                             });
                         }
                     }
@@ -799,6 +806,7 @@ fn send_with_mirror(
                 else {
                     return Err(error);
                 };
+                let previous = mirror.views().find(|view| &view.scope == scope).cloned();
                 let (view, read_sequence) = client.read_workspace_view(scope.clone())?;
                 mirror.install_at(scope.clone(), view.clone(), read_sequence);
                 let scoped = WorkspaceModel {
@@ -812,6 +820,9 @@ fn send_with_mirror(
                             crate::workspace_model::views::same_removal_source(before, pane)
                         }) && sources.next().is_none()
                     }),
+                    Change::Remove { id } => {
+                        started_meanwhile(previous.as_ref(), view.as_ref(), *id)
+                    }
                     _ => false,
                 };
                 if removal_changed || source_update_conflicts(&scoped, scope, change) {
@@ -875,6 +886,22 @@ fn send_with_mirror(
     };
     let _ = updates.send_blocking(update);
     Ok(())
+}
+
+/// Whether the terminal `card`, whose start was pending in `previous`, has
+/// started by `current`. An identity Remove is for a pane with no source:
+/// started meanwhile, by a peer say, it has one, which that Remove must not
+/// bypass, so the Remove is refused as a conflict rather than retried.
+fn started_meanwhile(
+    previous: Option<&crate::workspace_model::views::View>,
+    current: Option<&crate::workspace_model::views::View>,
+    card: CardId,
+) -> bool {
+    let pending = |view: Option<&crate::workspace_model::views::View>| {
+        view.and_then(|view| view.panes.iter().find(|pane| pane.id == card))
+            .map(|pane| pane.pending_terminal_start)
+    };
+    pending(previous) == Some(true) && pending(current) == Some(false)
 }
 
 pub(in crate::app) fn source_update_conflicts(
@@ -1985,10 +2012,14 @@ impl Cagents {
                             } => Some(before.id),
                             _ => None,
                         });
-                    self.refuse_shared_view_edit(&scope, operation);
+                    let refused_creation = self.refuse_shared_view_edit(&scope, operation, &error);
                     // The error is the registry's own wording, or a resend's
                     // deadline; the trace keeps it, and the person is told
-                    // what happened to the pane.
+                    // what happened to the pane. A new terminal's own pane
+                    // says why it didn't open.
+                    if refused_creation {
+                        return self.reconcile_shared_views();
+                    }
                     let Some(card) = closed else {
                         self.status = Some(TransientNotice::warning(
                             super::shared_views::PANE_CHANGE_NOT_SAVED,

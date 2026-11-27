@@ -444,6 +444,10 @@ pub(super) struct State {
     /// or drops them. Until then a view that does not list one has not yet
     /// been asked to.
     sent_creations: HashSet<CardId>,
+    /// New terminals whose Insert the registry refused, with its reason. Each
+    /// keeps its pane, showing that reason, until it is retried or closed;
+    /// nothing publishes it or closes it for being absent meanwhile.
+    pub(super) refused_creations: HashMap<CardId, String>,
     retained: HashSet<CardId>,
     /// Exact chat identity retired by an authoritative view, never inferred from EOF.
     pub closed_chats: HashMap<CardId, crate::chat::Session>,
@@ -506,7 +510,7 @@ impl State {
         };
         format!(
             "pending: {:?}\nblocked: {}\nquarantined: {}\nclosed: {}\nattached: {}\n\
-             sent creations: {}\nretained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
+             sent creations: {}\nrefused creations: {}\nretained: {}\nseeding: {}\nseed attempts: {}\nseed failures: {}\n\
              requested transfers: {}\ndefaults: {}\nstrip detached: {}\n\
              closed chats: {}\nobserved chats: {}\nobserved terminals: {}\n\
              adoptions: {:?}\nchat adoptions: {}\nrestorations: {:?}\n\
@@ -517,6 +521,7 @@ impl State {
             set(&mut self.closed.iter().map(|id| format!("{id:?}"))),
             set(&mut self.attached.iter().map(|id| format!("{id:?}"))),
             set(&mut self.sent_creations.iter().map(|id| format!("{id:?}"))),
+            sorted_entries(&self.refused_creations),
             set(&mut self.retained.iter().map(|id| format!("{id:?}"))),
             set(&mut self.seeding.iter().map(|scope| format!("{scope:?}"))),
             set(&mut self.seed_attempts.keys().map(|scope| format!("{scope:?}"))),
@@ -611,9 +616,10 @@ impl State {
             .retain(|card, terminal| open.get(card) == Some(terminal));
     }
 
-    /// Forgets sent Inserts for creations no longer pending.
-    pub(super) fn forget_sent_creations(&mut self, pending: &HashSet<CardId>) {
+    /// Forgets sent and refused Inserts for creations no longer pending.
+    pub(super) fn forget_settled_creations(&mut self, pending: &HashSet<CardId>) {
         self.sent_creations.retain(|id| pending.contains(id));
+        self.refused_creations.retain(|id, _| pending.contains(id));
     }
 
     /// A copy of everything a publication reads or writes, so a test can
@@ -662,6 +668,7 @@ impl State {
             requested_transfers,
             attached,
             sent_creations,
+            refused_creations,
             retained,
             closed_chats,
             observed_chats,
@@ -705,6 +712,7 @@ impl State {
             requested_transfers: requested_transfers.clone(),
             attached: attached.clone(),
             sent_creations: sent_creations.clone(),
+            refused_creations: refused_creations.clone(),
             retained: retained.clone(),
             closed_chats: closed_chats.clone(),
             observed_chats: observed_chats.clone(),
@@ -1021,18 +1029,39 @@ impl Cagents {
     /// Refusing publication does not retire an already accepted conversation.
     /// Capture the original scoped Insert before retiring its pending overlay;
     /// an unrelated callback cannot protect or republish a different pane.
-    pub(super) fn refuse_shared_view_edit(&mut self, scope: &Scope, operation: uuid::Uuid) {
+    ///
+    /// Returns whether the refused edit was a new terminal's Insert, whose
+    /// pane now says why it didn't open.
+    pub(super) fn refuse_shared_view_edit(
+        &mut self,
+        scope: &Scope,
+        operation: uuid::Uuid,
+        error: &str,
+    ) -> bool {
         let Some((_, owner, change)) = self
             .shared_views
             .pending
             .iter()
             .find(|(id, _, _)| *id == operation)
         else {
-            return;
+            return false;
         };
         if owner != scope {
-            return;
+            return false;
         }
+        let refused_creation = match change {
+            Change::Insert { pane, .. }
+                if matches!(pane.kind, CardKind::Terminal(_))
+                    && self.durable.pending_terminal_creations.contains(&pane.id)
+                    && self
+                        .card_state(pane.id)
+                        .is_some_and(|card| card.existence.is_open())
+                    && !self.listed_in_registry(pane.id) =>
+            {
+                Some(pane.id)
+            }
+            _ => None,
+        };
         if let Change::Insert { pane, .. } = change
             && matches!(pane.kind, CardKind::Chat(_))
         {
@@ -1048,6 +1077,54 @@ impl Cagents {
             }
         }
         self.shared_views.refused(operation);
+        if let Some(card) = refused_creation {
+            self.refuse_terminal_creation(scope, card, error);
+        }
+        refused_creation.is_some()
+    }
+
+    /// A new terminal waits for its view to accept it before it starts, so one
+    /// the registry refuses has started nothing and nothing else would say so.
+    /// It keeps its pane, which gives the registry's reason and a Retry that
+    /// asks again, rather than closing as a view that doesn't list it would
+    /// close it (#4400).
+    fn refuse_terminal_creation(&mut self, scope: &Scope, card: CardId, reason: &str) {
+        tracing::warn!(%card, %reason, "the registry refused a new terminal");
+        self.shared_views.sent_creations.remove(&card);
+        // The publication counted it as shared once its Insert went. The
+        // registry holds no such pane, so closing it removes nothing there;
+        // a later acceptance attaches it again.
+        self.shared_views.attached.remove(&card);
+        if let Some(baseline) = self.shared_views.baseline.get_mut(scope) {
+            baseline.retain(|pane| pane.id != card);
+        }
+        self.shared_views
+            .refused_creations
+            .insert(card, reason.to_owned());
+        self.fail_terminal_creation(card, reason);
+        // Said where it can be seen from anywhere too, as a failed start is.
+        self.status = Some(
+            TransientNotice::error(super::terminal_failure::creation_title())
+                .with_details(reason.to_owned())
+                .with_key(NoticeKey::TerminalStart(card)),
+        );
+    }
+
+    /// Asks the registry again for a new terminal it refused. The pane waits
+    /// for that answer as it waited for the first.
+    pub(super) fn retry_refused_terminal_creation(&mut self, card: CardId) -> Task<Message> {
+        self.shared_views.refused_creations.remove(&card);
+        self.shared_views.sent_creations.remove(&card);
+        self.cards.insert(card, CardRuntime::Loading);
+        let exposure = self.exposure(card);
+        self.register_presence(
+            card,
+            exposure,
+            Residency::Hydrating {
+                epoch: unix_millis().max(1) as u64,
+            },
+        );
+        self.reconcile_shared_views()
     }
 
     pub(super) fn retain_local_pane(&mut self, id: CardId) {
@@ -1671,6 +1748,7 @@ impl Cagents {
     ) -> Option<LocalPane<'a>> {
         let id = card.id;
         if self.shared_views.retained.contains(&id)
+            || self.shared_views.refused_creations.contains_key(&id)
             || self.chat_is_unused_default(id)
             || self.shared_views.defaults.contains_key(&id)
             // Published once it starts, under the identity it starts with.
@@ -2709,6 +2787,15 @@ impl Cagents {
             for view in &self.workspace_model.views {
                 for pane in &view.panes {
                     if !self.shared_views.fenced_closes.contains(&pane.id) {
+                        continue;
+                    }
+                    // A new terminal's Close removes it by identity only while
+                    // its start never ran. Once started, by a peer say, it
+                    // has a source, and an identity removal would bypass it.
+                    if matches!(pane.kind, CardKind::Terminal(_))
+                        && !pane.pending_terminal_start
+                        && !self.shared_views.quarantined.contains(&pane.id)
+                    {
                         continue;
                     }
                     held.insert(pane.id);
@@ -4290,7 +4377,12 @@ impl Cagents {
             {
                 continue;
             }
-            if self.awaits_first_publication(id, view) {
+            // A refused new terminal says so in its pane until it is
+            // retried or closed; no view was ever asked to list it.
+            if self.awaits_first_publication(id, view)
+                || (self.shared_views.refused_creations.contains_key(&id)
+                    && !view.retired.contains(&id))
+            {
                 continue;
             }
             // A refused first publication keeps its chat, started or not,

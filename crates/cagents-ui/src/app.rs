@@ -7324,6 +7324,17 @@ impl Cagents {
                     tasks.push(self.focus_pane_keyboard(card));
                 }
             }
+            Err(error) if self.terminal_never_started(card) => {
+                // Nothing ran, so there is nothing to restore or reconnect:
+                // the pane says the terminal didn't open, and why (#4400).
+                self.fail_terminal_creation(card, &error);
+                self.status = Some(
+                    TransientNotice::error(terminal_failure::creation_title())
+                        .with_details(error)
+                        .with_key(NoticeKey::TerminalStart(card)),
+                );
+                tasks.push(cosmic::task::message(Message::LifecycleSweep));
+            }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
                 let notice = self.missing_terminal_notice(card);
@@ -8898,7 +8909,7 @@ impl Cagents {
                 .retain(|id| open.contains(id));
         }
         self.shared_views
-            .forget_sent_creations(&self.durable.pending_terminal_creations);
+            .forget_settled_creations(&self.durable.pending_terminal_creations);
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let mut phase = WorkspaceProjectionTiming::new(true);
@@ -10426,6 +10437,51 @@ impl Cagents {
             .register(card, exposure, residency.clone(), Instant::now());
         self.set_residency(card, residency);
     }
+    /// Shows that a new terminal didn't open, with `reason`, in its pane. Its
+    /// start never ran, so there is no surface to retire.
+    pub(super) fn fail_terminal_creation(&mut self, card: CardId, reason: &str) {
+        // A sign-in's busy callback port keeps the fixed explanation the
+        // sign-in recovery recognizes.
+        let login_busy = matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Terminal(session)) if account::login::is_codex_browser(&session.launch)
+        ) && account::login::callback_failed(reason);
+        let reason = if login_busy {
+            account::login::PORT_BUSY.to_owned()
+        } else {
+            terminal_failure::creation_reason(reason)
+        };
+        self.sidebar_state.clear_agent_activity(card);
+        self.mark_runtime_failed(card, reason.clone());
+        self.cards.insert(
+            card,
+            CardRuntime::Failed(terminal_failure::Failure::Generic(reason)),
+        );
+    }
+
+    /// Whether `card` is a new terminal whose first start hasn't succeeded:
+    /// one its view hasn't accepted yet, or one its view holds with that
+    /// start still pending. A saved terminal being restored is neither, so a
+    /// failed restore still reads as one to restore.
+    pub(super) fn terminal_never_started(&self, card: CardId) -> bool {
+        self.durable.pending_terminal_creations.contains(&card)
+            || self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .any(|pane| pane.id == card && pane.pending_terminal_start)
+    }
+
+    /// Whether `card`'s pane says its terminal didn't open.
+    pub(super) fn terminal_creation_failed(&self, card: CardId) -> bool {
+        self.shared_views.refused_creations.contains_key(&card)
+            || (matches!(
+                self.cards.get(&card),
+                Some(CardRuntime::Failed(terminal_failure::Failure::Generic(_)))
+            ) && self.terminal_never_started(card))
+    }
+
     fn fail_runtime(&mut self, card: CardId, message: String) {
         let mut failure = self.terminal_failure_payload(card, message.clone());
         self.sidebar_state.clear_agent_activity(card);
@@ -10555,6 +10611,13 @@ impl Cagents {
         // service to prepare its conversation again.
         if self.reopen_failed(card) {
             return self.retry_reopening(card);
+        }
+        // A Close of the failed pane that didn't go through no longer removes
+        // what this retry starts.
+        self.shared_views.fenced_closes.remove(&card);
+        // Nor in a new terminal its view refused: it asks the view again.
+        if self.shared_views.refused_creations.contains_key(&card) {
+            return self.retry_refused_terminal_creation(card);
         }
         #[cfg(feature = "integrated-browser")]
         if matches!(
@@ -13166,9 +13229,11 @@ impl Cagents {
                                 .size(design::STATUS_ICON_SIZE)
                                 .into(),
                             design::title(if self.reopen_failed(id) {
-                                "Couldn't reopen this conversation"
+                                std::borrow::Cow::Borrowed("Couldn't reopen this conversation")
+                            } else if self.terminal_creation_failed(id) {
+                                terminal_failure::creation_title()
                             } else {
-                                labels.unavailable
+                                std::borrow::Cow::Borrowed(labels.unavailable)
                             })
                             .into(),
                         ])

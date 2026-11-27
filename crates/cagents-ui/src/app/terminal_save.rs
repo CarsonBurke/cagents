@@ -136,7 +136,9 @@ pub(super) fn complete(
                         return Ok((hosted, failure));
                     }
                 }
-                return Err(error.to_string());
+                // The daemon's own sentence, which a new terminal that
+                // didn't open shows in its pane.
+                return Err(error.reason());
             }
         }
     }

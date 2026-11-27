@@ -5754,7 +5754,7 @@ fn browserless_shared_browser_keeps_saved_descriptor_and_external_open_state() {
 }
 
 #[test]
-fn a_refused_terminal_creation_closes_instead_of_loading_forever() {
+fn a_refused_terminal_creation_fails_instead_of_loading_forever() {
     let (mut app, a, _, first) = fixture();
     app.active_workspace = Some(PathBuf::from("/repo"));
     Arc::make_mut(&mut app.durable).active_channel = Some(a);
@@ -5771,12 +5771,15 @@ fn a_refused_terminal_creation_closes_instead_of_loading_forever() {
     let id = app.workspace.focused().unwrap();
     assert!(app.durable.pending_terminal_creations.contains(&id));
 
-    app.refuse_shared_view_edit(&Scope::Channel(a), id.as_uuid());
+    assert!(app.refuse_shared_view_edit(&Scope::Channel(a), id.as_uuid(), "refused"));
     for _ in 0..2 {
         drop(app.reconcile_shared_views());
     }
 
-    assert!(!app.card_state(id).unwrap().existence.is_open());
+    // It says why instead of sitting on Loading, and stays out of every view
+    // until it is retried; it is not kept as a window-local terminal.
+    assert!(app.card_state(id).unwrap().existence.is_open());
+    assert!(matches!(app.cards.get(&id), Some(CardRuntime::Failed(_))));
     assert!(!app.shared_views.retained.contains(&id));
     assert!(!app.durable.local_only_cards.contains(&id));
     assert!(app.terminal_starts.lock().unwrap().is_empty());
@@ -7707,7 +7710,7 @@ fn refused_draft_publication_is_kept_without_claiming_another_client_closed_it()
             _ => None,
         })
         .unwrap();
-    app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+    app.refuse_shared_view_edit(&Scope::Channel(channel), operation, "refused");
     assert!(app.durable.local_only_cards.contains(&card));
     // Said at the composer: the pane staying here is not the conversation
     // failing.

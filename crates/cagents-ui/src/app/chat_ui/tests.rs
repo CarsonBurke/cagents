@@ -13258,7 +13258,7 @@ fn view_refuses_removal_showing(
         view.panes = vec![pane];
         view.revision += 1;
     }
-    app.refuse_shared_view_edit(&Scope::Channel(channel), operation);
+    app.refuse_shared_view_edit(&Scope::Channel(channel), operation, "refused");
     drop(app.reconcile_shared_views());
 }
 
