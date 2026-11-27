@@ -176,7 +176,7 @@ pub(super) fn list(
     if members {
         live.extend(exited_chats(host));
     }
-    let (model, delegations, lineages, succession, channel_history) = {
+    let (model, scopes, delegations, lineages, succession, channel_history) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
@@ -224,7 +224,36 @@ pub(super) fn list(
                 ),
             );
         }
-        (model, delegations, lineages, succession, channel_history)
+        let mut scopes = session_scopes(&model);
+        // A general listing can locate a live successor through an older
+        // pane. Member listings keep their exact rows for saved histories.
+        if !members {
+            for entry in &live {
+                if entry.surface != Surface::Chat || scopes.contains_key(&entry.id) {
+                    continue;
+                }
+                let panes = registry.predecessor_panes(entry.id)?;
+                if panes.is_empty() {
+                    continue;
+                }
+                let mut showing = model
+                    .views
+                    .iter()
+                    .filter(|view| view.panes.iter().any(|pane| panes.contains(&pane.id)));
+                if let Some(view) = showing.next() {
+                    let scope = showing.next().is_none().then(|| view.scope.clone());
+                    scopes.insert(entry.id, scope);
+                }
+            }
+        }
+        (
+            model,
+            scopes,
+            delegations,
+            lineages,
+            succession,
+            channel_history,
+        )
     };
     let lineage = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
     // A plain shell is listed only where it matters: as the caller, or as the
@@ -284,7 +313,6 @@ pub(super) fn list(
         }
     };
 
-    let scopes = session_scopes(&model);
     let view_scope = |id: TerminalId| {
         scopes
             .get(&id)

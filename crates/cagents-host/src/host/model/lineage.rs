@@ -446,15 +446,21 @@ impl Registry {
         &self,
         session: TerminalId,
     ) -> Result<std::collections::BTreeSet<TerminalId>, String> {
+        Self::predecessors_in(&self.db, session)
+    }
+
+    pub(super) fn predecessors_in(
+        db: &rusqlite::Connection,
+        session: TerminalId,
+    ) -> Result<std::collections::BTreeSet<TerminalId>, String> {
         let mut predecessors = std::collections::BTreeSet::new();
-        let Some(lineage) = self.session_lineage(session)? else {
+        let Some(lineage) = lineage_in(db, session)? else {
             return Ok(predecessors);
         };
         if session == lineage.0 {
             return Ok(predecessors);
         }
-        let mut direct = self
-            .db
+        let mut direct = db
             .prepare_cached(
                 "SELECT predecessor FROM session_lineage_predecessors WHERE successor=?1",
             )
@@ -473,9 +479,7 @@ impl Registry {
                 .map_err(|_| "Stored session predecessor is invalid".to_owned())?;
             if previous == session
                 || !predecessors.insert(previous)
-                || self
-                    .session_lineage(previous)?
-                    .is_some_and(|stored| stored != lineage)
+                || lineage_in(db, previous)?.is_some_and(|stored| stored != lineage)
             {
                 return Err("Stored session predecessor conflicts with its lineage".into());
             }

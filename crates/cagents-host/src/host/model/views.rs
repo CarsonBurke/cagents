@@ -958,6 +958,28 @@ impl Registry {
         Ok((view, sequence))
     }
 
+    pub(in crate::host) fn predecessor_panes(
+        &self,
+        session: crate::model::TerminalId,
+    ) -> Result<std::collections::BTreeSet<crate::model::CardId>, String> {
+        store::predecessor_panes(&self.db, session)
+    }
+
+    pub(in crate::host) fn guard_paneless_chat_insert(
+        db: &Connection,
+        session: crate::model::TerminalId,
+    ) -> Result<(), String> {
+        if store::terminal_pane_exists(db, session)?
+            || !store::predecessor_panes(db, session)?.is_empty()
+        {
+            return Err(Self::CHAT_PANE_ALREADY_SAVED.into());
+        }
+        Ok(())
+    }
+
+    pub(in crate::host) const CHAT_PANE_ALREADY_SAVED: &str =
+        "This conversation already has a saved pane. Move it from the window or name its pane ID.";
+
     pub(crate) fn view_revision(&self, scope: &Scope) -> Result<u64, String> {
         store::revision(&self.db, scope)
     }

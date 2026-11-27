@@ -590,12 +590,12 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
         .session
         .unwrap()
         .id();
-    let (plain, held) = (TerminalId::new(), TerminalId::new());
+    let (plain, held, successor) = (TerminalId::new(), TerminalId::new(), TerminalId::new());
     {
         let mut state = host.lock().unwrap();
         let record = &state.chats[&agent_chat];
         let (source, handle) = (record.session.clone(), record.handle.clone());
-        for (id, holder) in [(plain, None), (held, Some(USER))] {
+        for (id, holder) in [(plain, None), (held, Some(USER)), (successor, None)] {
             let mut session = source.clone();
             session.id = id;
             state.chats.insert(
@@ -736,6 +736,71 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     assert_eq!(again.pane.id, opened.pane.id);
     assert_eq!(again.from, Scope::Channel(other));
     assert_eq!(showing(plain).len(), 1);
+
+    // An account recovery can publish a successor before the window saves
+    // its new source. The old descriptor still occupies its original pane.
+    let mut descriptor = host.lock().unwrap().chats[&successor].current_session();
+    descriptor.id = TerminalId::new();
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .succeed(successor, descriptor.id, None, |_| false)
+        .unwrap();
+    let predecessor = pane(CardKind::Chat(descriptor));
+    let source = predecessor.clone();
+    let shared = host.clone();
+    let scope = Scope::Channel(other);
+    let source_scope = scope.clone();
+    crate::host::workspace::before_transfer(Some(Box::new(move || {
+        process_request(
+            &shared,
+            USER,
+            ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::SeedView {
+                    scope: source_scope.clone(),
+                    panes: vec![source.clone()],
+                    closed: vec![],
+                },
+            },
+        )
+        .unwrap();
+    })));
+    let destination = ChannelId::new();
+    let try_move = || {
+        request_as(ClientRequest::MovePane {
+            pane: Some(CardId::from_uuid(successor.as_uuid())),
+            destination: PaneDestination::NewChannel {
+                id: destination,
+                title: "Duplicate".into(),
+            },
+            operation: uuid::Uuid::new_v4(),
+        })
+    };
+    let raced = try_move();
+    crate::host::workspace::before_transfer(None);
+    for refused in [raced, try_move()] {
+        let error = refused.unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+        assert!(
+            error.message.contains("already has a saved pane"),
+            "{error:?}"
+        );
+    }
+    assert!(showing(successor).is_empty());
+    assert!(model().channel(destination).is_none());
+    let listing = super::super::directory::sessions(
+        &host,
+        &Authority::default(),
+        crate::agent_execution::directory::Scope::All,
+    )
+    .unwrap();
+    let listed = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == successor)
+        .unwrap();
+    assert_eq!(listed.session.view_scope, Some(scope));
 
     // Never a conversation a window still shows, nor an agent's.
     let message = refusal(held, other);

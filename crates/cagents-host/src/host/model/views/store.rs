@@ -13,7 +13,7 @@
 //! changed, not to the scope or the store.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     path::PathBuf,
 };
 
@@ -582,6 +582,62 @@ pub(in crate::host::model) fn resource_holder(
                 .map_err(|error| format!("saved pane id `{id}` is unreadable: {error}"))
         })
         .transpose()
+}
+
+/// Saved chat or terminal panes that present a previous allocation of `session`.
+pub(in crate::host::model) fn predecessor_panes(
+    db: &Connection,
+    session: crate::model::TerminalId,
+) -> Result<BTreeSet<CardId>, String> {
+    let current = session.to_string();
+    let mut panes = BTreeSet::new();
+    let mut bound = db
+        .prepare_cached(
+            "SELECT p.id FROM pane_chat_allocations live
+             JOIN pane_chat_starts b ON b.pane=live.pane AND b.current_allocation=live.allocation
+             JOIN panes p ON p.id=b.pane
+             JOIN pane_chat_allocations a ON a.pane=p.id AND a.allocation=p.resource
+             WHERE live.allocation=?1 AND p.resource<>?1 AND p.kind IN ('chat', 'terminal')",
+        )
+        .map_err(sql)?;
+    let mut saved = db
+        .prepare_cached(
+            "SELECT p.id FROM panes p WHERE p.resource=?1 AND p.kind IN ('chat', 'terminal')
+             AND NOT EXISTS (
+                 SELECT 1 FROM pane_chat_starts b
+                 JOIN pane_chat_allocations a ON a.pane=b.pane
+                 WHERE b.pane=p.id AND a.allocation=p.resource AND b.current_allocation<>?2
+             )",
+        )
+        .map_err(sql)?;
+    let parse = |row: &rusqlite::Row<'_>| row.get::<_, String>(0);
+    let card = |id: rusqlite::Result<String>| {
+        id.map_err(sql)?
+            .parse::<CardId>()
+            .map_err(|error| format!("Saved pane ID is unreadable: {error}"))
+    };
+    for id in bound.query_map([&current], parse).map_err(sql)? {
+        panes.insert(card(id)?);
+    }
+    for predecessor in super::Registry::predecessors_in(db, session)? {
+        for id in saved
+            .query_map(params![predecessor.to_string(), current], parse)
+            .map_err(sql)?
+        {
+            panes.insert(card(id)?);
+        }
+    }
+    Ok(panes)
+}
+
+/// A same-ID terminal can present a chat after a terminal handoff.
+pub(in crate::host::model) fn terminal_pane_exists(
+    db: &Connection,
+    session: crate::model::TerminalId,
+) -> Result<bool, String> {
+    db.prepare_cached("SELECT EXISTS(SELECT 1 FROM panes WHERE kind='terminal' AND resource=?1)")
+        .and_then(|mut statement| statement.query_row([session.to_string()], |row| row.get(0)))
+        .map_err(sql)
 }
 
 /// The pane presenting chat `id`, in any view.

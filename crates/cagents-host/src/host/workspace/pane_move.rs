@@ -10,7 +10,10 @@
 //! channel is deleted or a window's stop is refused. Naming its session
 //! gives it a new pane in the destination instead: the same conversation,
 //! with no provider started or replayed.
-use super::{super::agent_execution::terminals, edit_delta, edit_then, snapshot, unavailable};
+use super::{
+    super::agent_execution::terminals, Registry, edit_delta, edit_then, edit_then_guarded,
+    snapshot, unavailable,
+};
 use crate::{
     host::state::{ClientId, SharedHost},
     model::{CardId, CardKind, ChannelId, TerminalId},
@@ -131,6 +134,10 @@ fn attempt(
         same_project(channel, repository, suggest_new)?;
         let to = Scope::Channel(target);
         let opened = matches!(found, Found::Unshown { .. });
+        let opening = match &found.pane().kind {
+            CardKind::Chat(session) if opened => Some(session.id),
+            _ => None,
+        };
         let (id, from, edit) = match found {
             Found::Saved(view, found) if view.scope == to => {
                 return Ok(PaneMove {
@@ -184,9 +191,18 @@ fn attempt(
         // Read with the writer still held, so the reply describes this edit
         // and no later one. Once the transfer commits the move has happened:
         // nothing after it may fail the request or remove the channel.
-        let (receipt, after) = match edit_then(host, origin, edit, |registry| {
-            Ok(registry.model().ok())
-        }) {
+        let (receipt, after) = match edit_then_guarded(
+            host,
+            origin,
+            edit,
+            |seen, db| {
+                if !seen && let Some(session) = opening {
+                    Registry::guard_paneless_chat_insert(db, session)?;
+                }
+                Ok(())
+            },
+            |registry| Ok(registry.model().ok()),
+        ) {
             Err(error)
                 if error.code == ProtocolErrorCode::ViewConflict && conflicts + 1 < ATTEMPTS =>
             {
@@ -398,6 +414,18 @@ fn unshown(
         }
         (record.current_session(), record.handle.title())
     };
+    // Refuse a known predecessor before creating a provisional channel.
+    // The insertion also checks inside the registry's write transaction.
+    let registry = super::writer(host)?;
+    if !registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .predecessor_panes(session)
+        .map_err(unavailable)?
+        .is_empty()
+    {
+        return Err(refused(Registry::CHAT_PANE_ALREADY_SAVED));
+    }
     let directory = &source.launch.recipe.working_directory;
     let placement = crate::project_location::place(directory, model);
     let Some(repository) = placement.project else {

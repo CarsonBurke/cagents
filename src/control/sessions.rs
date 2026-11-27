@@ -237,6 +237,7 @@ fn unshown(client: &mut ControlClient, directory: &Sessions) -> BTreeSet<Termina
         .flat_map(|view| &view.panes)
         .filter_map(|pane| match &pane.kind {
             crate::model::CardKind::Chat(session) => Some(session.id),
+            crate::model::CardKind::Terminal(session) => Some(session.id),
             _ => None,
         })
         .collect();
