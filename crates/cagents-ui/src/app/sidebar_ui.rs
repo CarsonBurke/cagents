@@ -24,6 +24,26 @@ impl Cagents {
         if self.modal_is_open() && !answers_discard_confirmation(&action) {
             return ControlFlow::Break(Task::none());
         }
+        if matches!(
+            &action,
+            SidebarAction::OpenChange { key, .. }
+                | SidebarAction::OpenBranchFile { key, .. }
+                | SidebarAction::OpenCommit { key, .. }
+                | SidebarAction::OpenCommitFile { key, .. }
+                | SidebarAction::CloseCommit { key, .. }
+                | SidebarAction::ShowMoreCommitFiles { key, .. }
+                | SidebarAction::SetChangesTab { key, .. }
+                | SidebarAction::ToggleSection { key, .. }
+                | SidebarAction::SetChangeListMode { key, .. }
+                | SidebarAction::ToggleChangeDirectory { key, .. }
+                | SidebarAction::ChangePage { key, .. }
+                | SidebarAction::CommitMessageChanged { key, .. }
+                | SidebarAction::AmendChanged { key, .. }
+                | SidebarAction::ChangeGroup { key, .. }
+                if self.source_control_is_bound(key)
+        ) {
+            self.device_source_activity(false);
+        }
         // Folding takes the rows, and any keyboard focus on one, out
         // of the tree; ask the tree drawn now before it does.
         if action == SidebarAction::ToggleInProgress {
