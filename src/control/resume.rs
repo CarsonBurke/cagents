@@ -114,7 +114,10 @@ fn scope_flag(arguments: &ResumeArgs) -> String {
         };
     }
     match &arguments.project {
-        Some(project) => format!("--project {}", format::shell_word(&project.to_string_lossy())),
+        Some(project) => format!(
+            "--project {}",
+            format::shell_word(&project.to_string_lossy())
+        ),
         None => "--all".into(),
     }
 }
@@ -274,7 +277,7 @@ fn human(results: &[Outcome], program: &str) -> String {
                     format!("Already running: {name}")
                 } else if resumed.starting {
                     format!(
-                        "Resumed {name}; its provider is still starting, and `{program} ls --all` shows it once it is ready, or `{program} resume --list` why it stopped"
+                        "Resumed {name}; its provider is still starting, and `{program} ls --all` shows it once it is ready. Should it stop instead, `{program} resume --list` says why"
                     )
                 } else {
                     format!("Resumed {name}")
@@ -367,13 +370,22 @@ mod tests {
             "Antigravity sign-in needs attention"
         );
         let text = listed_human(&found, "--all", "cagents --device desktop");
-        assert!(text.starts_with("1 stopped session can be resumed:"), "{text}");
-        assert!(text.contains(&format!("{id}  Antigravity, Fix the build")), "{text}");
+        assert!(
+            text.starts_with("1 stopped session can be resumed:"),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("{id}  Antigravity, Fix the build")),
+            "{text}"
+        );
         assert!(
             text.contains("Stopped: Antigravity sign-in needs attention"),
             "{text}"
         );
-        assert!(text.contains("2 more can be resumed only from their panes"), "{text}");
+        assert!(
+            text.contains("2 more can be resumed only from their panes"),
+            "{text}"
+        );
         assert!(
             text.contains("`cagents --device desktop resume --all`"),
             "{text}"
