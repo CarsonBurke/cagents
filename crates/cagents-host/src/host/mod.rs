@@ -363,6 +363,8 @@ pub unsafe fn prepare_daemon_admission(
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
         crate::instance::take_daemon_at_boot_marker();
     }
+    // The runtime directory exists now that admission holds its locks.
+    crate::instance::record_daemon_started_at_boot();
     // SAFETY: this is still the single-threaded entry point.
     let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
     Ok(DaemonAdmission {
