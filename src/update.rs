@@ -4594,46 +4594,68 @@ mod tests {
 
     #[test]
     fn inherited_update_worker_lock_survives_worker_scope_exit() {
+        const NAME: &str = "update::tests::inherited_update_worker_lock_survives_worker_scope_exit";
         const STATE: &str = "CAGENTS_TEST_INHERITED_UPDATE_WORKER_STATE";
-        if let Some(state) = std::env::var_os(STATE) {
-            io::stdin().read_exact(&mut [0]).unwrap();
-            let state = Path::new(&state);
-            let worker = inherited_lock(state).unwrap();
-            let successor = worker.try_clone().unwrap();
-            drop(worker);
-            assert!(matches!(acquire_lock(state), Err(UpdateError::Busy)));
-            drop(successor);
-            assert!(acquire_lock(state).is_ok());
-            return;
-        }
-
-        let state = tempfile::tempdir().unwrap();
-        let lease = acquire_lock(state.path()).unwrap();
-        let fd = lease.as_raw_fd();
-        let mut command = Command::new(std::env::current_exe().unwrap());
-        command
-            .args([
-                "--exact",
-                "update::tests::inherited_update_worker_lock_survives_worker_scope_exit",
-            ])
-            .env(STATE, state.path())
-            .stdin(Stdio::piped());
-        // SAFETY: The caller keeps the descriptor alive through spawn and the
-        // hook only makes it available in the child's reserved slot.
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(fd, WORKER_LOCK_FD) == -1
-                    || libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, 0) == -1
-                {
-                    return Err(io::Error::last_os_error());
+        const ROLE: &str = "CAGENTS_TEST_INHERITED_UPDATE_WORKER_ROLE";
+        let rerun = |state: &Path, role: &str| {
+            let mut command = Command::new(std::env::current_exe().unwrap());
+            command
+                .args(["--exact", NAME])
+                .env(STATE, state)
+                .env(ROLE, role);
+            command
+        };
+        let state = std::env::var_os(STATE);
+        match (
+            std::env::var(ROLE).as_deref(),
+            state.as_deref().map(Path::new),
+        ) {
+            (Ok("worker"), Some(state)) => {
+                io::stdin().read_exact(&mut [0]).unwrap();
+                let worker = inherited_lock(state).unwrap();
+                let successor = worker.try_clone().unwrap();
+                drop(worker);
+                assert!(matches!(acquire_lock(state), Err(UpdateError::Busy)));
+                drop(successor);
+                assert!(acquire_lock(state).is_ok());
+            }
+            (Ok("updater"), Some(state)) => {
+                let lease = acquire_lock(state).unwrap();
+                let fd = lease.as_raw_fd();
+                let mut command = rerun(state, "worker");
+                command.stdin(Stdio::piped());
+                // SAFETY: The caller keeps the descriptor alive through spawn and the
+                // hook only makes it available in the child's reserved slot.
+                unsafe {
+                    command.pre_exec(move || {
+                        if libc::dup2(fd, WORKER_LOCK_FD) == -1
+                            || libc::fcntl(WORKER_LOCK_FD, libc::F_SETFD, 0) == -1
+                        {
+                            return Err(io::Error::last_os_error());
+                        }
+                        Ok(())
+                    });
                 }
-                Ok(())
-            });
+                let mut child = command.spawn().unwrap();
+                drop(lease.into_file());
+                child.stdin.take().unwrap().write_all(&[0]).unwrap();
+                assert!(child.wait().unwrap().success());
+            }
+            _ => {
+                // Every fork in this suite copies the lease until it execs,
+                // and any copy keeps the flock. Only a process running this
+                // test alone can observe exactly when the last copy closes.
+                let state = tempfile::tempdir().unwrap();
+                let output = rerun(state.path(), "updater").output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                // A filter matching no test would also exit successfully.
+                assert!(
+                    output.status.success() && stdout.contains("1 passed; 0 failed"),
+                    "{stdout}{}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
         }
-        let mut child = command.spawn().unwrap();
-        drop(lease.into_file());
-        child.stdin.take().unwrap().write_all(&[0]).unwrap();
-        assert!(child.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
