@@ -633,6 +633,63 @@ fn a_live_chat_no_pane_shows_gets_a_pane_in_the_named_channel() {
     );
     assert!(showing(plain).is_empty());
 
+    // A window saves the same conversation first. The skipped insertion
+    // must leave the window's pane in place and retire the channel it never filled.
+    let raced = ChannelId::new();
+    let winner = pane(CardKind::Chat(
+        host.lock().unwrap().chats[&plain].current_session(),
+    ));
+    let source = winner.clone();
+    let shared = host.clone();
+    crate::host::workspace::before_transfer(Some(Box::new(move || {
+        process_request(
+            &shared,
+            USER,
+            ClientRequest::EditWorkspaceModel {
+                edit: ModelEdit::SeedView {
+                    scope: Scope::Channel(other),
+                    panes: vec![source.clone()],
+                    closed: vec![],
+                },
+            },
+        )
+        .unwrap();
+    })));
+    let lost = request_as(ClientRequest::MovePane {
+        pane: Some(CardId::from_uuid(plain.as_uuid())),
+        destination: PaneDestination::NewChannel {
+            id: raced,
+            title: "Lost race".into(),
+        },
+        operation: uuid::Uuid::new_v4(),
+    });
+    crate::host::workspace::before_transfer(None);
+    assert!(
+        lost.unwrap_err()
+            .message
+            .contains("A window showed this session")
+    );
+    assert_eq!(
+        showing(plain),
+        vec![(Scope::Channel(other), winner.clone())]
+    );
+    assert!(
+        model().channel(raced).is_none(),
+        "the skipped insert left an empty channel"
+    );
+    let scope = Scope::Channel(other);
+    edit(ModelEdit::ChangeView {
+        expected_revision: model()
+            .views
+            .iter()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .revision,
+        scope,
+        operation: uuid::Uuid::new_v4(),
+        change: Change::Remove { id: winner.id },
+    });
+
     // Into its own project's: a new pane showing the same conversation.
     let canonical = std::fs::canonicalize(&project).unwrap();
     let opened = move_to(plain, other).unwrap();
