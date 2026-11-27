@@ -921,14 +921,24 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
             }
             let mut renderer = crate::app::tests::headless_renderer();
             let size = iced::Size::new(640.0, 800.0);
+            let mut ui =
+                UserInterface::build(view(&app, target), size, Cache::new(), &mut renderer);
+            let accessible = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            // The notice's line is named by what happened, and by what to do
+            // next while that holds.
             let name = if copy {
                 format!("Copy original diagnostics for {summary}")
             } else {
-                format!("Show technical details for {summary}")
+                accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .filter_map(|node| node.node().label())
+                    .find(|label| label.starts_with(summary.as_str()))
+                    .unwrap_or_else(|| panic!("a line named for {summary}"))
+                    .to_owned()
             };
-            let mut ui =
-                UserInterface::build(view(&app, target), size, Cache::new(), &mut renderer);
-            let bounds = control_bounds(&ui.a11y_nodes(iced::mouse::Cursor::Unavailable), &name);
+            let bounds = control_bounds(&accessible, &name);
             let pointer = bounds.center();
             let mut messages = Vec::new();
             for event in [
@@ -1383,11 +1393,24 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     )));
     let publication = runtime(&app, target).snapshot.clone();
     let (before, mut cache) = labels(&app, target, Cache::new());
-    // A notice's disclosure is an ordinary button; prose Copy is hover-only.
-    let copy_labels: Vec<_> = before
+    // A notice's disclosure is an ordinary button, named by what happened;
+    // prose Copy is hover-only.
+    let summaries: Vec<String> = runtime(&app, target)
+        .failure_ui
+        .incidents
         .iter()
-        .filter(|label| label.starts_with("Show technical details for "))
+        .map(|incident| incident.summary.clone())
         .collect();
+    // Its button and the summary it holds read the same.
+    let mut copy_labels: Vec<_> = before
+        .iter()
+        .filter(|label| {
+            summaries
+                .iter()
+                .any(|summary| label.starts_with(summary.as_str()))
+        })
+        .collect();
+    copy_labels.dedup();
     assert_eq!(copy_labels.len(), 1, "{before:?}");
     let diagnostic_copy = copy_labels[0].to_string();
     for action in [

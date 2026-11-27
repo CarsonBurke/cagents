@@ -1788,9 +1788,14 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
         ];
-        if !cleared && !incident.guidance.is_empty() {
+        // What to do next is advice for now. Once the conversation no longer
+        // reports the failure, the notice is a record of what happened, and
+        // advice such as "Try again in a moment" no longer holds.
+        let advice = (!cleared && incident.current() && !incident.guidance.is_empty())
+            .then_some(incident.guidance);
+        if let Some(advice) = advice {
             words.push(
-                design::caption(incident.guidance)
+                design::caption(advice)
                     .class(cosmic::theme::Text::Custom(design::muted_text))
                     .width(Length::Fill)
                     .into(),
@@ -1821,11 +1826,15 @@ impl Runtime {
         let header = if expandable {
             crate::interaction::a11y_target(
                 widget::button::custom(line)
-                    .name(format!(
-                        "{} technical details for {summary}",
-                        if open { "Hide" } else { "Show" },
-                    ))
-                    .description(if cleared { "" } else { incident.guidance })
+                    .name(match advice {
+                        Some(advice) => format!("{summary}. {advice}"),
+                        None => summary.clone(),
+                    })
+                    .description(if open {
+                        "Collapse details"
+                    } else {
+                        "Expand details"
+                    })
                     .class(crate::ui_controls::control_style(false, None))
                     .width(Length::Fill)
                     .padding(padding)
@@ -2572,6 +2581,65 @@ mod tests {
         );
         // The prompt and the steps come before it; the answer after.
         assert_eq!(notice_rows(&runtime), (vec![2], 3));
+    }
+
+    /// Selecting the conversation reads a notice where it is drawn. A
+    /// subagent's provider failure among the steps is drawn before the strip,
+    /// which starts at the first step that is not a notice, so its details
+    /// come between the prompt and the answer, ahead of the steps.
+    #[test]
+    fn selection_reads_a_notice_where_it_is_drawn() {
+        let provider = Provider::Claude;
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text("ask:0", chat::Role::User, "Build it"),
+                // A subagent whose provider failed: a step that is drawn
+                // as a notice.
+                {
+                    let mut failed = tool("failed-agent");
+                    failed.content = ItemContent::Tool {
+                        name: "Agent".into(),
+                        input: "{}".into(),
+                        output: "Agent terminated early due to an API error: You've hit your \
+                                 weekly limit · resets Nov 8, 8am (America/Vancouver)"
+                            .into(),
+                        status: chat::ToolStatus::Failed,
+                    };
+                    failed
+                },
+                tool("later-tool"),
+                text("answer", chat::Role::Assistant, "Built it."),
+            ],
+        );
+        // Selection reads what is prepared to be drawn.
+        runtime.show(true);
+        publish(&mut runtime, &handle, |next| next.generation += 1);
+        crate::app::chat_ui::preparation::drain_fixture(&mut runtime);
+        let key = runtime.failure_ui.incidents[0].key.clone();
+        runtime.failure_ui.expanded.edit().insert(key.clone());
+        runtime.refresh_failure_previews();
+        let turn = runtime.turns[0].key.clone();
+        runtime.opened.edit().insert(turn, true);
+        assert!(runtime.steps_shown(&runtime.turns[0]));
+        // Drawn after the prompt, ahead of the strip and the answer.
+        assert_eq!(notice_rows(&runtime), (vec![1], 3));
+
+        let catalog = runtime.selection_document().0;
+        let blocks = catalog.search_blocks();
+        let position = |needle: &str| {
+            blocks
+                .iter()
+                .position(|(_, text)| text.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} in {blocks:?}"))
+        };
+        let notice = catalog
+            .position(diagnostic_preview_identity(&key))
+            .expect("the open notice's details are selectable");
+        let prompt = position("Build it");
+        let answer = position("Built it.");
+        assert!(prompt < notice, "{blocks:?}");
+        assert!(notice < answer, "{blocks:?}");
     }
 
     /// An error the window reports itself, with no note to place it, stays

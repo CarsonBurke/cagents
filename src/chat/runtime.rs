@@ -2874,7 +2874,7 @@ fn command_stop_report(
         None => String::new(),
     };
     let mut report = format!(
-        "{} {by} ended {what}{processes}; the agent is still running.",
+        "{} {by} ended {what}{processes}; the agent carried on.",
         super::failure::COMMAND_OUT_OF_MEMORY
     );
     if earlier > 0 {
