@@ -18356,7 +18356,9 @@ impl Cagents {
                     return ControlFlow::Break(Task::none());
                 }
                 Message::OpenRepository => {
-                    return ControlFlow::Break(self.update_device(device_ui::Action::Open));
+                    return ControlFlow::Break(
+                        self.update_device(device_ui::Action::ChooseProject),
+                    );
                 }
                 Message::PreviewLocalFile(_) => {
                     return ControlFlow::Break(self.update_device(device_ui::Action::Open));

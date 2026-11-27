@@ -286,9 +286,11 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
                     .file_name()
                     .into_string()
                     .map_err(|_| "directory contains a non-UTF-8 name")?;
+                // A link to a folder is a folder to anyone choosing one.
+                let directory = kind.is_dir() || (kind.is_symlink() && entry.path().is_dir());
                 entries.push(Entry {
                     name,
-                    directory: kind.is_dir(),
+                    directory,
                     symlink: kind.is_symlink(),
                 });
             }
@@ -753,6 +755,33 @@ fn unstage_command(
 mod tests {
     use super::*;
     use std::path::Path;
+
+    /// A project chooser shows folders, and a link to one is a folder too.
+    #[test]
+    fn listing_counts_a_link_to_a_folder_as_a_folder() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("code")).unwrap();
+        std::fs::write(root.path().join("notes"), "").unwrap();
+        std::os::unix::fs::symlink(root.path().join("code"), root.path().join("linked")).unwrap();
+        std::os::unix::fs::symlink(root.path().join("notes"), root.path().join("note-link"))
+            .unwrap();
+        std::os::unix::fs::symlink(root.path().join("gone"), root.path().join("dangling")).unwrap();
+        let Reply::Directory { entries, .. } = execute(Operation::List {
+            path: root.path().to_owned(),
+        })
+        .unwrap() else {
+            panic!("a listing replies with a directory");
+        };
+        let kind = |name: &str| {
+            let entry = entries.iter().find(|entry| entry.name == name).unwrap();
+            (entry.directory, entry.symlink)
+        };
+        assert_eq!(kind("code"), (true, false));
+        assert_eq!(kind("linked"), (true, true));
+        assert_eq!(kind("notes"), (false, false));
+        assert_eq!(kind("note-link"), (false, true));
+        assert_eq!(kind("dangling"), (false, true));
+    }
 
     /// Another window saving the account list refuses a preference change,
     /// such as a rename, at once, in its own words and
