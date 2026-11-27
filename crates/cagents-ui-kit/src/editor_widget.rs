@@ -2223,7 +2223,8 @@ where
             // it would publish a message for every character the pointer
             // crosses.
             let popup_shown = self.popup.is_some() && self.popup_at.is_some();
-            let end_hover = |state: &mut State<Highlighter>, shell: &mut Shell<'_, Message>| {
+            let end_hover = |state: &mut State<Highlighter, Theme>,
+                             shell: &mut Shell<'_, Message>| {
                 if let Some((_, _, sent)) = state.hover.take()
                     && (sent || popup_shown)
                     && let Some(on_hover) = &self.on_hover
