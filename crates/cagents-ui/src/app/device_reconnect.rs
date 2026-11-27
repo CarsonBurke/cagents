@@ -67,6 +67,10 @@ struct Reconnect {
     phase: Phase,
     /// Why opening this computer's window failed.
     notice: Option<String>,
+    /// How often, and when last, the person tried again. A device that
+    /// refuses at once would otherwise look as though the button did nothing.
+    retries: u32,
+    last_retry: Option<std::time::SystemTime>,
 }
 
 impl Reconnect {
@@ -106,6 +110,28 @@ impl Reconnect {
                     ..
                 }
             )
+    }
+
+    fn failed_title(&self) -> String {
+        let device = &self.request.device;
+        if self.retries == 0 {
+            format!("Couldn't reconnect to {device}")
+        } else {
+            format!("Still couldn't reconnect to {device}")
+        }
+    }
+
+    /// When the last attempt was made, once the person has tried again.
+    fn tried_again(&self) -> Option<String> {
+        let at = super::daemon_health_ui::local_moment(
+            self.last_retry?,
+            std::time::SystemTime::now(),
+            &jiff::tz::TimeZone::system(),
+        );
+        Some(match self.retries {
+            1 => format!("Tried again at {at}."),
+            count => format!("Tried again {count} times, most recently at {at}."),
+        })
     }
 
     fn busy(&self) -> bool {
@@ -155,6 +181,8 @@ impl cosmic::Application for Reconnect {
             request,
             phase: Phase::Checking,
             notice: None,
+            retries: 0,
+            last_retry: None,
         };
         let task = screen.diagnose(reason);
         (screen, task)
@@ -190,6 +218,8 @@ impl cosmic::Application for Reconnect {
                     return Task::none();
                 }
                 self.notice = None;
+                self.retries += 1;
+                self.last_retry = Some(std::time::SystemTime::now());
                 self.connect()
             }
             ReconnectMessage::Connected(Ok(())) => iced::exit(),
@@ -294,7 +324,7 @@ impl cosmic::Application for Reconnect {
             }
             Phase::Failed(reason) => {
                 retry = true;
-                rows.push(design::title(format!("Couldn't reconnect to {device}")).into());
+                rows.push(design::title(self.failed_title()).into());
                 rows.push(design::body(reason.clone()).into());
             }
             Phase::Needs {
@@ -306,7 +336,7 @@ impl cosmic::Application for Reconnect {
                 // Without an update to offer here, the fix is made on the
                 // device or this computer, and then tried again.
                 retry = blocked.is_some() || matches!(need, Need::Newer(_));
-                rows.push(design::title(format!("Couldn't reconnect to {device}")).into());
+                rows.push(design::title(self.failed_title()).into());
                 rows.push(strip(
                     device,
                     need,
@@ -324,6 +354,11 @@ impl cosmic::Application for Reconnect {
                 ))
                 .into(),
             );
+        }
+        if matches!(self.phase, Phase::Failed(_) | Phase::Needs { .. })
+            && let Some(tried) = self.tried_again()
+        {
+            rows.push(design::caption(tried).into());
         }
         if let Some(notice) = &self.notice {
             rows.push(design::caption(notice.clone()).into());
@@ -376,6 +411,13 @@ pub fn run_device_reconnect(request: Request) -> Result<(), Box<dyn std::error::
                 min_size: Some(iced::Size::new(480.0, 300.0)),
                 exit_on_close_request: false,
                 icon: Some(application_window_icon()),
+                // It stands in for the window it reopens, under the same
+                // desktop entry.
+                #[cfg(target_os = "linux")]
+                platform_specific: window::PlatformSpecific {
+                    application_id: crate::instance::APPLICATION_ID.to_owned(),
+                    ..Default::default()
+                },
                 ..window::Settings::default()
             });
             let mut core = Core::default();
@@ -418,6 +460,8 @@ mod tests {
             },
             phase,
             notice: None,
+            retries: 0,
+            last_retry: None,
         }
     }
 
@@ -432,6 +476,8 @@ mod tests {
         )));
         assert!(matches!(&screen.phase, Phase::Failed(reason) if reason.contains("build-host")));
         assert!(!screen.busy());
+        assert_eq!(screen.failed_title(), "Couldn't reconnect to build-host");
+        assert_eq!(screen.tried_again(), None);
         let _ = screen.update(ReconnectMessage::Retry);
         assert!(matches!(screen.phase, Phase::Connecting));
         assert!(screen.committed());
@@ -440,6 +486,25 @@ mod tests {
         assert!(matches!(screen.phase, Phase::Connecting));
         let _ = screen.update(ReconnectMessage::Connected(Err("refused".into())));
         assert!(matches!(screen.phase, Phase::Checking));
+        // A device that refuses at once still shows the attempt was made.
+        let _ = screen.update(ReconnectMessage::Diagnosed(OpenFailure::Other(
+            "refused".into(),
+        )));
+        assert_eq!(
+            screen.failed_title(),
+            "Still couldn't reconnect to build-host"
+        );
+        assert!(
+            screen
+                .tried_again()
+                .is_some_and(|tried| tried.starts_with("Tried again at "))
+        );
+        let _ = screen.update(ReconnectMessage::Retry);
+        assert!(
+            screen
+                .tried_again()
+                .is_some_and(|tried| tried.starts_with("Tried again 2 times"))
+        );
     }
 
     #[test]
