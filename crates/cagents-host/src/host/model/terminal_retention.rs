@@ -817,12 +817,15 @@ mod tests {
                     rusqlite::types::Value::Integer(prior_sequence + 1);
                 migrated_binding = Some(bindings);
             }
-            // Schema 28 adds private pane chat ownership and schema 29 adds
-            // deletion history; neither backfills records for this fixture.
+            // Schema 28 adds private pane chat ownership, schema 29 deletion
+            // history, schema 32 automation attention resolution and schema
+            // 33 lineage predecessors; none backfills records for this fixture.
             for table in [
                 "pane_chat_starts",
                 "pane_chat_allocations",
                 "deleted_channels",
+                "automation_attention_resolution",
+                "session_lineage_predecessors",
             ] {
                 assert_eq!(after.remove(table).unwrap(), Vec::<Vec<_>>::new());
             }
