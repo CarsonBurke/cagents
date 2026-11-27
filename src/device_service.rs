@@ -1759,15 +1759,22 @@ pub fn request_unless_busy(operation: Operation) -> Result<Reply, crate::control
 fn ready_client() -> Result<crate::control::ControlClient, ReadyError> {
     crate::terminal::connect_ready_daemon()
         .map(|ready| ready.client)
-        .map_err(|error| match error {
-            crate::terminal::HostedTerminalStartError::Connect(
-                error @ crate::control::ControlError::UnsupportedVersion { .. },
-            ) => ReadyError::Control(error),
-            crate::terminal::HostedTerminalStartError::HostIncompatible { actual } => {
-                ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual })
-            }
-            error => ReadyError::Other(error.to_string()),
-        })
+        .map_err(|error| ready_error(error, crate::device::is_remote()))
+}
+
+/// A device's protocol refusal stays typed so it can say which side to
+/// update. This computer's own daemon keeps its rebuild guidance.
+fn ready_error(error: crate::terminal::HostedTerminalStartError, remote: bool) -> ReadyError {
+    use crate::terminal::HostedTerminalStartError;
+    match error {
+        HostedTerminalStartError::Connect(
+            error @ crate::control::ControlError::UnsupportedVersion { .. },
+        ) => ReadyError::Control(error),
+        HostedTerminalStartError::HostIncompatible { actual } if remote => {
+            ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual })
+        }
+        error => ReadyError::Other(error.to_string()),
+    }
 }
 
 /// Why no ready connection was made. A protocol mismatch keeps its type, so

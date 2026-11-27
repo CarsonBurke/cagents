@@ -578,9 +578,6 @@ fn daemon_state() -> Daemon {
     }
 }
 
-/// SSH to the device for the length of one update. Its commands share one
-/// authenticated connection; the daemon checks before and after go through
-/// the device bridge's own.
 /// Makes a private staging directory for one upload. An update interrupted
 /// mid-upload cannot remove its own, so this removes those left for hours.
 const PREPARE: &str = r#"umask 077
@@ -591,6 +588,9 @@ staging=$(mktemp -d "$base/device-update.XXXXXXXX") || exit
 printf 'staging=%s\n' "$staging"
 "#;
 
+/// SSH to the device for the length of one update. Its commands share one
+/// authenticated connection; the daemon checks before and after go through
+/// the device bridge's own.
 struct Session {
     host: String,
     name: String,

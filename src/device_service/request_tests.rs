@@ -486,3 +486,19 @@ fn a_device_daemon_of_another_protocol_is_reported_as_incompatible() {
         worker.join().unwrap();
     }
 }
+
+#[test]
+fn only_a_devices_daemon_refusal_is_retyped() {
+    use super::{ReadyError, ready_error};
+    use crate::terminal::HostedTerminalStartError;
+    let refusal = || HostedTerminalStartError::HostIncompatible { actual: 1 };
+    assert!(matches!(
+        ready_error(refusal(), true),
+        ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual: 1 })
+    ));
+    // This computer's own daemon keeps the guidance to rebuild it.
+    let ReadyError::Other(local) = ready_error(refusal(), false) else {
+        panic!("a local refusal was retyped");
+    };
+    assert_eq!(local, refusal().to_string());
+}
