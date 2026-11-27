@@ -715,6 +715,15 @@ uncertain result after daemon loss is recorded as interrupted and never resent
 automatically. Precheck supervision uses two short-lived helper processes per
 active precheck, with at most four prechecks at once.
 
+A run that reaches the limit on concurrent agent runs is not failed. It stays
+**Queued** and its details say how many runs hold the slots. It starts when
+another run ends and frees a slot, and within a minute when a slot frees some
+other way. Deadlines that pass meanwhile are skipped as overlapping, and only
+the automation's name can be edited while the run waits. Cancel the run to stop
+waiting; pausing or resuming the automation, or closing its project, skips it.
+A precheck that passed before the wait is not run again. Once started, the
+run's history notes that it waited, unless it ends with an error of its own.
+
 A fresh conversation closes the automation's idle provider after its result is
 durable. **Reuse this automation’s idle agent** keeps its own verified idle conversation for the
 next occurrence. A ready provider still finishing ordinary work retains the run’s
