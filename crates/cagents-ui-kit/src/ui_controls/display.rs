@@ -94,53 +94,139 @@ pub enum CountTone {
     /// On an accent-filled control, such as a primary button, whose fill it
     /// shades rather than adding a hue of its own.
     OnAccent,
+    /// News the user has not read yet, such as a sidebar row's unread
+    /// conversations: filled with the accent, the one count loud enough to
+    /// find in a column of names. The projects rail's unread pill wears the
+    /// same fill and ink.
+    Accent,
 }
 
-/// The height of a [`count_badge`], about as wide as a one-digit count.
+/// The ink of a count or figure drawn on the theme's accent fill.
+pub fn on_accent_color(theme: &Theme) -> iced::Color {
+    theme.cosmic().accent.on.into()
+}
+
+/// The height of a [`count_badge`], and the width of a one-figure one.
 pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
+/// A [`count_badge`]'s inset either side of its figures.
+const COUNT_BADGE_PADDING: f32 = 5.0;
+/// The widest a figure or `+` is drawn in a [`count_badge`] in the usual
+/// interface fonts, with room to spare: their bold figures are 0.55 to 0.7 em
+/// at its 10.5 px.
+const COUNT_BADGE_FIGURE_WIDTH: f32 = 7.5;
+
+/// About the most room a [`count_badge`] showing `count` takes, for a layout
+/// that must clear the badge before it is drawn, such as a hover-revealed
+/// control laid over it. An estimate from the usual interface fonts: an
+/// unusually wide one may draw a little past it.
+pub fn count_badge_width_bound(count: &str) -> f32 {
+    match count.chars().count() {
+        0 | 1 => COUNT_BADGE_HEIGHT,
+        figures => 2.0 * COUNT_BADGE_PADDING + figures as f32 * COUNT_BADGE_FIGURE_WIDTH,
+    }
+}
 
 /// How many items a section, tab or list holds, as a small rounded badge
 /// beside its name.
 ///
 /// A bare number after a heading reads as part of the heading, or as stray
 /// text; a filled pill reads at once as a count. Counts beside a name use
-/// this one shape, so a reader learns it once; the projects rail's and
-/// avatars' overlaid counts keep their own ringed pills. Callers say the
+/// this one shape, so a reader learns it once; the projects rail's overlaid
+/// counts are the same [`count_pill`], smaller and ringed. Callers say the
 /// count in the accessible name of the control it labels.
 ///
 /// Leave the badge out at zero when the body beneath already says it is
 /// empty, as an empty Work board lane does; show "0" when the zero is the
 /// news, as for a search that found nothing.
+///
+/// A single figure is a circle, whatever its glyph's width, so a column of
+/// one-digit counts lines up; longer counts grow into a pill.
 pub fn count_badge<'a, Message: 'a>(
     count: impl Into<Cow<'a, str>> + 'a,
     tone: CountTone,
 ) -> Element<'a, Message> {
+    count_pill(
+        count,
+        CountShape {
+            height: COUNT_BADGE_HEIGHT,
+            text_size: design::TEXT_CAPTION - 0.5,
+            font: cosmic::font::semibold(),
+            inset: COUNT_BADGE_PADDING,
+            ring: None,
+        },
+        move |theme| count_badge_paint(theme, tone),
+    )
+}
+
+/// The geometry of a [`count_pill`].
+#[derive(Debug, Clone, Copy)]
+pub struct CountShape {
+    /// The pill's height, ring included, and the width of a one-figure one.
+    pub height: f32,
+    pub text_size: f32,
+    pub font: iced::Font,
+    /// The room either side of two or more figures.
+    pub inset: f32,
+    /// A border of a surface's colour, `(width, colour)`, which cuts a pill
+    /// laid over a glyph out of it.
+    pub ring: Option<(f32, fn(&Theme) -> iced::Color)>,
+}
+
+/// A count in a rounded pill of `shape`, filled and inked by `paint`: the one
+/// shape behind [`count_badge`] and the projects rail's overlaid counts, so
+/// both draw a single figure as a circle and grow into a pill alike.
+pub fn count_pill<'a, Message: 'a>(
+    count: impl Into<Cow<'a, str>> + 'a,
+    shape: CountShape,
+    paint: impl Fn(&Theme) -> (iced::Color, Option<iced::Color>) + 'a,
+) -> Element<'a, Message> {
+    let count = count.into();
+    // A circle has no room for an inset: its figure is centred, whatever the
+    // font's figure width.
+    let (width, inset) = if count.chars().count() <= 1 {
+        (Length::Fixed(shape.height), 0.0)
+    } else {
+        (Length::Shrink, shape.inset)
+    };
+    let ring_width = shape.ring.map_or(0.0, |(width, _)| width);
     widget::container(
-        widget::text(count.into())
-            .size(design::TEXT_CAPTION - 0.5)
+        widget::text(count)
+            .size(shape.text_size)
             .line_height(iced::widget::text::LineHeight::Absolute(
-                COUNT_BADGE_HEIGHT.into(),
+                (shape.height - 2.0 * ring_width).into(),
             ))
-            .font(cosmic::font::semibold())
+            .font(shape.font)
             .wrapping(iced::widget::text::Wrapping::None),
     )
-    .padding([0.0, 5.0])
-    .center_y(Length::Fixed(COUNT_BADGE_HEIGHT))
+    .padding([0.0, ring_width + inset])
+    .center_y(Length::Fixed(shape.height))
     .align_x(Alignment::Center)
-    .width(Length::Shrink)
+    .width(width)
     .class(cosmic::theme::Container::custom(move |theme| {
-        count_badge_style(theme, tone)
+        let (fill, ink) = paint(theme);
+        widget::container::Style {
+            background: Some(iced::Background::Color(fill)),
+            text_color: ink,
+            border: iced::Border {
+                color: shape
+                    .ring
+                    .map_or(iced::Color::TRANSPARENT, |(_, ring)| ring(theme)),
+                width: ring_width,
+                radius: (shape.height / 2.0).into(),
+            },
+            ..Default::default()
+        }
     }))
     .into()
 }
 
-fn count_badge_style(theme: &Theme, tone: CountTone) -> widget::container::Style {
+fn count_badge_paint(theme: &Theme, tone: CountTone) -> (iced::Color, Option<iced::Color>) {
     let wash = |mut color: iced::Color, strength: f32| {
         color.a *= strength;
         color
     };
     let on: iced::Color = theme.current_container().on.into();
-    let (fill, ink) = match tone {
+    match tone {
         // A wash of the text colour, so the pill sits on any surface it is
         // drawn over, hovered and selected rows included, at either polarity.
         // Its figure is no louder than the muted name beside it.
@@ -156,15 +242,7 @@ fn count_badge_style(theme: &Theme, tone: CountTone) -> widget::container::Style
         }
         // The control's own label colour carries through.
         CountTone::OnAccent => (iced::Color::from_rgba(0.0, 0.0, 0.0, 0.2), None),
-    };
-    widget::container::Style {
-        background: Some(iced::Background::Color(fill)),
-        text_color: ink,
-        border: iced::Border {
-            radius: (COUNT_BADGE_HEIGHT / 2.0).into(),
-            ..Default::default()
-        },
-        ..Default::default()
+        CountTone::Accent => (design::accent_color(theme), Some(on_accent_color(theme))),
     }
 }
 

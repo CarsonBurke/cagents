@@ -207,7 +207,7 @@ PROFILES = {
         edge_cases=frozenset(),
         avatars=5,
         dirty_worktrees=6,
-        unread=(3, 12, 120),
+        unread=(3, 12, 120, 1, 9),
     ),
 }
 

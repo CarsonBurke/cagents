@@ -897,7 +897,10 @@ fn compact_project_identity_and_waiting_badge_are_deterministic() {
     let attention = compact_project_attention(&project, &state);
     let (activity, unread) = (attention.activity, attention.summary.unread != 0);
     assert_eq!(activity, Some(crate::agent::ActivityState::Waiting));
-    assert!(agent_indicator(activity, unread).is_some());
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(activity, unread, false))
+            .is_some()
+    );
     let renderer = headless_renderer();
     let names = accessible_names(
         &renderer,
@@ -1414,9 +1417,20 @@ fn search_navigation_and_escape_require_enabled_input_focus() {
 
 #[test]
 fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
-    assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
-    assert!(agent_indicator(None, true).is_some());
-    assert!(agent_indicator(None, false).is_none());
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(
+            Some(crate::agent::ActivityState::Waiting),
+            false,
+            false
+        ))
+        .is_some()
+    );
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(None, true, false)).is_some()
+    );
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(None, false, false)).is_none()
+    );
     let mut pr = project().pull_requests[0].clone();
     pr.needs_review = false;
     pr.draft = false;
@@ -3320,7 +3334,10 @@ fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
             accessible_names(&renderer, row(false)),
             "dirty status remains available to assistive technology"
         );
-        assert!(agent_indicator(None, true).is_some());
+        assert!(
+            attention_indicator::<SidebarAction>(AttentionSummary::card(None, true, false))
+                .is_some()
+        );
     }
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
     let mut state = SidebarState::default();
@@ -4373,6 +4390,196 @@ fn row_indicators_share_one_reserved_slot() {
             (slot.x, slot.width),
             (plain.x, plain.width),
             "{state} reflowed the label",
+        );
+    }
+}
+
+/// Unread news is one accent count badge. A more urgent state keeps its mark
+/// with the count badged beside it, on the same line: the count used to be a
+/// 9 px number stacked under a dot or the mark.
+#[test]
+fn an_unread_count_is_one_badge_beside_any_more_urgent_mark() {
+    let renderer = headless_renderer();
+    let states: [(&str, fn(&mut AttentionSummary)); 6] = [
+        ("unread", |_| {}),
+        ("working", |summary| summary.working = 1),
+        ("limited", |summary| summary.limited = 1),
+        ("failed", |summary| summary.failed = 1),
+        ("waiting", |summary| summary.waiting = 1),
+        ("approval", |summary| {
+            summary.waiting = 1;
+            summary.approval = 1;
+        }),
+    ];
+    for (name, urgent) in states {
+        for (unread, label) in [(1, "1"), (9, "9"), (10, "10"), (99, "99"), (120, "99+")] {
+            let mut summary = AttentionSummary {
+                unread,
+                ..AttentionSummary::default()
+            };
+            urgent(&mut summary);
+            let status: RowStatus<SidebarAction> =
+                attention_status(summary).expect("unread news has an indicator");
+            let width_bound = status.width_bound;
+            let mut element = status.element;
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(200.0, WORKTREE_ROW_HEIGHT)),
+            );
+            let mut collect = TextsAndControls::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
+            let texts: Vec<_> = collect
+                .texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(texts, [label], "{name} with {unread} unread");
+            let bounds = node.bounds();
+            assert!(
+                bounds.height <= crate::ui_controls::COUNT_BADGE_HEIGHT,
+                "{name} with {unread} unread stacks its count: {bounds:?}"
+            );
+            assert!(
+                bounds.width <= width_bound,
+                "{name} with {unread} unread is wider than the delete control covers: {bounds:?}"
+            );
+            if name == "unread" && unread < 10 {
+                assert_eq!(
+                    bounds.width,
+                    crate::ui_controls::COUNT_BADGE_HEIGHT,
+                    "a one-figure count is a circle"
+                );
+            }
+        }
+    }
+}
+
+/// A status wider than its slot widens the slot towards the title rather
+/// than drawing over it, and stays under the delete control's fill.
+#[test]
+fn a_wide_channel_status_gives_way_to_its_title_and_hides_under_delete() {
+    let mut channel = SidebarChannel::new(
+        ChannelId::new(),
+        "Investigate why switching channels stalls".into(),
+        false,
+        Some(crate::agent::ActivityState::Waiting),
+        true,
+        120,
+        true,
+        1,
+    );
+    channel.attention.unread = 120;
+    let cover = quick_delete_width(
+        channel_status(channel.attention, channel.chats)
+            .expect("the channel has news")
+            .width_bound,
+    );
+    assert!(
+        cover > ICON_CONTROL_SIZE,
+        "the fixture's status outgrows the delete button"
+    );
+    for width in (160..=360).step_by(20) {
+        let width = width as f32;
+        let row = channel_row_layout(&channel, width, false);
+        let (count, badge) = row.badge().expect("the row draws its unread count");
+        assert_eq!(count, "99+");
+        assert!(
+            row.title.x + row.title.width <= badge.x,
+            "at {width}px the title {:?} runs under the count {badge:?}",
+            row.title
+        );
+        // The figures sit inside the pill's 5 px inset.
+        assert!(
+            badge.x - 5.0 >= width - cover,
+            "at {width}px the count {badge:?} peeks past the delete fill, {cover}px wide"
+        );
+    }
+}
+
+#[test]
+fn a_merged_worktrees_wide_status_hides_under_its_delete() {
+    fn nodes(layout: Layout<'_>, out: &mut Vec<Rectangle>) {
+        out.push(layout.bounds());
+        for child in layout.children() {
+            nodes(child, out);
+        }
+    }
+    let renderer = headless_renderer();
+    let mut worktree = worktree(3, "feature", false);
+    let mut pr = project().pull_requests.remove(0);
+    pr.state = Some(WorktreePullRequestState::Merged);
+    worktree.set_pull_request(pr);
+    let mut row_state = WorktreeRowState::default();
+    row_state.attention.unread = 120;
+    row_state.attention.waiting = 1;
+    let bound = attention_status::<SidebarAction>(row_state.attention)
+        .expect("the worktree has news")
+        .width_bound;
+    for width in (200..=360).step_by(40) {
+        let width = width as f32;
+        let mut element = worktree_view(
+            project_id(1),
+            &worktree,
+            false,
+            None,
+            false,
+            true,
+            &[],
+            row_state,
+            false,
+            Some(1),
+            "",
+            false,
+        );
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, WORKTREE_ROW_HEIGHT)),
+        );
+        let mut collect = TextsAndControls::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
+        let badge = collect
+            .texts
+            .iter()
+            .find(|(text, _)| text == "99+")
+            .expect("the row draws its unread count")
+            .1;
+        let delete = collect
+            .controls
+            .iter()
+            .find(|(id, _)| *id == worktree.chrome.delete_id)
+            .expect("the row mounts its delete button")
+            .1;
+        // The fill behind the button: the narrowest box that ends with the
+        // button and spans the row's height, short of the whole row.
+        let mut boxes = Vec::new();
+        nodes(Layout::new(&node), &mut boxes);
+        let fill = boxes
+            .into_iter()
+            .filter(|bounds| {
+                (bounds.x + bounds.width - (delete.x + delete.width)).abs() < 0.5
+                    && bounds.x < delete.x
+                    && bounds.height >= WORKTREE_ROW_HEIGHT - 0.5
+                    && bounds.width < width - 0.5
+            })
+            .min_by(|a, b| a.width.total_cmp(&b.width))
+            .expect("the delete button has a fill wider than itself");
+        // The status ends with the waiting mark's column after the pill,
+        // whose figures sit inside its 5 px inset. A font drawing the status
+        // as wide as its bound must still be covered, so the fill reaches
+        // the bound back from that end, not just the figures drawn here.
+        let status_end = badge.x + badge.width + 5.0 + ATTENTION_COUNT_GAP + ROW_STATUS_WIDTH;
+        assert!(
+            status_end - bound >= fill.x - 0.5,
+            "at {width}px a status {bound}px wide ending at {status_end} peeks past the \
+             delete fill {fill:?}"
         );
     }
 }
@@ -8244,9 +8451,10 @@ fn in_progress_rows_say_where_they_are() {
         .find(|(text, _)| text == "2")
         .expect("the header's count")
         .1;
+    let label = grid[0].1[1];
     assert!(
-        status.contains(count.center()),
-        "the count sits in the indicator slot: {count:?} in {status:?}"
+        label.contains(count.center()) && count.x + count.width <= status.x,
+        "the count follows the label, as the Worktrees header's does: {count:?} in {label:?}"
     );
     for (_, slots) in &grid[1..] {
         assert_eq!(slots[2].x, status.x, "one indicator column");

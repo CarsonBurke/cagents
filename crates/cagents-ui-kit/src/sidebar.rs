@@ -103,9 +103,12 @@ const ROW_TEXT_LINE: f32 = 21.0;
 /// row width are derived from it and neither of those can ask a theme.
 const ROW_GUTTER: f32 = space::XS;
 /// The live-indicator slot, reserved whether or not the row has an indicator
-/// this frame. A spinner, an attention badge and a chat count all land here,
-/// so a label cannot reflow when an agent starts working or a chat opens.
+/// this frame. A spinner, a state's mark, and a one-figure unread or chat
+/// count all fit in it, so a label cannot reflow when an agent starts working
+/// or a chat opens. A count of ten or more, or an unread count beside a more
+/// urgent mark, widens the slot towards the label rather than drawing over it.
 const ROW_STATUS_WIDTH: f32 = design::ROW_ICON_SIZE as f32;
+const _: () = assert!(ROW_STATUS_WIDTH >= crate::ui_controls::COUNT_BADGE_HEIGHT);
 /// The status slot of a channel row, whose hover reveals a delete control
 /// over its end, where the slot is. The control is laid over the row
 /// without moving anything, so the slot is reserved at rest as wide as the
@@ -7325,16 +7328,11 @@ impl RowGrid {
             content = content.push(label);
         }
         if matches!(self.kind, RowKind::Child) {
-            let status = widget::container(slot(status))
-                .center_x(Length::Fixed(ROW_STATUS_WIDTH))
-                .center_y(Length::Fill);
-            content = content.push(if self.deletable {
-                widget::container(status)
-                    .align_right(Length::Fixed(ROW_DELETE_STATUS_WIDTH))
-                    .center_y(Length::Fill)
-            } else {
-                status
-            });
+            let mut status = at_least(slot(status), ROW_STATUS_WIDTH, Alignment::Center);
+            if self.deletable {
+                status = at_least(status, ROW_DELETE_STATUS_WIDTH, Alignment::End);
+            }
+            content = content.push(widget::container(status).center_y(Length::Fill));
         }
         content
     }
@@ -8062,18 +8060,25 @@ fn project_view<'a>(
         chrome.new_channel_id.clone(),
     );
     let mut identity = widget::row::with_children(vec![project_identity])
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .width(Length::Fill);
-    if let Some(indicator) = attention_indicator(header_attention) {
-        identity = identity.push(indicator);
-    }
+    // A folded project says how many rows it holds in the neutral badge
+    // every count beside a name wears, ahead of its news: a bare figure
+    // beside a spinner or an unread badge read as a count of either.
     if !expanded {
         let rows = if project.state.lists_panes(entity) {
             entity.panes.len()
         } else {
             entity.worktrees.len()
         };
-        identity = identity.push(design::caption((entity.channels.len() + rows).to_string()));
+        identity = identity.push(crate::ui_controls::count_badge(
+            (entity.channels.len() + rows).to_string(),
+            Default::default(),
+        ));
+    }
+    if let Some(indicator) = attention_indicator(header_attention) {
+        identity = identity.push(indicator);
     }
     let header = project_header_row(
         identity.into(),
@@ -8755,21 +8760,16 @@ fn worktree_glyph_tone(pull_request: Option<PullRequestTone>, ink: RowInk) -> Gl
 /// Attention outranks the chat count: a channel whose agent is working or
 /// waiting is the reason to look at the sidebar at all, and the count stays in
 /// the row's accessible name and tooltip either way.
-fn channel_indicator(
-    attention: AttentionSummary,
-    chats: usize,
-) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(attention)
-        .or_else(|| (chats > 1).then(|| design::caption(chats.to_string()).into()))
-}
-
-/// Waiting is a live state, independent of whether its notification was read.
-/// Channels and worktrees share the same vocabulary and priority.
-fn agent_indicator(
-    activity: Option<crate::agent::ActivityState>,
-    unread: bool,
-) -> Option<Element<'static, SidebarAction>> {
-    attention_indicator(AttentionSummary::card(activity, unread, false))
+fn channel_status(attention: AttentionSummary, chats: usize) -> Option<RowStatus<SidebarAction>> {
+    attention_status(attention).or_else(|| {
+        (chats > 1).then(|| {
+            let label = rail::count_label(chats);
+            RowStatus {
+                width_bound: crate::ui_controls::count_badge_width_bound(&label),
+                element: crate::ui_controls::count_badge(label, Default::default()),
+            }
+        })
+    })
 }
 
 /// A state's mark at `size`, in its tone: the one drawing of each state that
@@ -8834,23 +8834,74 @@ fn agent_wait_name(state: crate::agent::ActivityState) -> &'static str {
     }
 }
 
+/// A row's live state at its trailing end, or nothing when there is none.
+///
+/// Unread news on its own is an accent count badge, the same pill the
+/// projects rail pins to a glyph. A more urgent state keeps its own mark at
+/// the end, where every row's state sits, with the unread count badged beside
+/// it: the count stays the accent's, so a red or yellow mark never reads as
+/// a count of failures or waits. The tooltip says the whole summary.
 pub fn attention_indicator<Message: Clone + 'static>(
     summary: AttentionSummary,
 ) -> Option<Element<'static, Message>> {
-    let state = summary.state()?;
-    let indicator =
-        crate::interaction::tooltip(attention_mark(state, ROW_ICON_SIZE), state.look().label);
-    if summary.unread == 0 {
-        return Some(indicator);
-    }
-    let count: Element<'static, Message> = widget::text(rail::count_label(summary.unread))
-        .size(9)
-        .into();
-    let counted: Element<'static, Message> = widget::column::with_children(vec![indicator, count])
-        .align_x(Alignment::Center)
-        .into();
-    Some(crate::interaction::tooltip(counted, summary.description()))
+    attention_status(summary).map(|status| status.element)
 }
+
+/// What a row draws at its end, with the most room it can take there, for a
+/// control laid over the row's end that must cover it. The two come from one
+/// place so they cannot disagree.
+struct RowStatus<Message> {
+    element: Element<'static, Message>,
+    width_bound: f32,
+}
+
+impl<Message> RowStatus<Message> {
+    fn split(status: Option<Self>) -> (Option<Element<'static, Message>>, f32) {
+        status.map_or((None, 0.0), |status| {
+            (Some(status.element), status.width_bound)
+        })
+    }
+}
+
+fn attention_status<Message: Clone + 'static>(
+    summary: AttentionSummary,
+) -> Option<RowStatus<Message>> {
+    let state = summary.state()?;
+    if summary.unread == 0 {
+        return Some(RowStatus {
+            element: crate::interaction::tooltip(
+                attention_mark(state, ROW_ICON_SIZE),
+                state.look().label,
+            ),
+            width_bound: ROW_STATUS_WIDTH,
+        });
+    }
+    let label = rail::count_label(summary.unread);
+    let count_width = crate::ui_controls::count_badge_width_bound(&label);
+    let count = crate::ui_controls::count_badge(label, crate::ui_controls::CountTone::Accent);
+    let (indicator, width_bound) = if state == AttentionState::Unread {
+        (count, count_width)
+    } else {
+        // The mark keeps the slot's own width, so it lines up with the bare
+        // mark on the next row.
+        let mark = widget::container(attention_mark(state, ROW_ICON_SIZE))
+            .center_x(Length::Fixed(ROW_STATUS_WIDTH));
+        (
+            widget::row::with_children(vec![count, mark.into()])
+                .spacing(ATTENTION_COUNT_GAP)
+                .align_y(Alignment::Center)
+                .into(),
+            count_width + ATTENTION_COUNT_GAP + ROW_STATUS_WIDTH,
+        )
+    };
+    Some(RowStatus {
+        element: crate::interaction::tooltip(indicator, summary.description()),
+        width_bound,
+    })
+}
+
+/// Between an unread count and the more urgent mark it sits beside.
+const ATTENTION_COUNT_GAP: f32 = space::XS;
 
 /// A deletion under way takes the reserved slot: it is the one live thing
 /// about the row, and outranks whatever the row was doing before.
@@ -8983,6 +9034,7 @@ fn channel_view(
         )
         .into()
     });
+    let mut indicator_width = 0.0;
     let mut content = if compact {
         grid.rail(glyph, rail_deletion_badges(deletion, attention))
     } else {
@@ -8993,13 +9045,14 @@ fn channel_view(
             ink.text_class(),
             false,
         );
-        let indicator = match deletion {
-            Some(RowDeletion::Deleting) => Some(deleting_indicator()),
+        let (indicator, width) = match deletion {
+            Some(RowDeletion::Deleting) => (Some(deleting_indicator()), ROW_STATUS_WIDTH),
             // The mark and its badge show who is there, and the tooltip
             // lists them, so the row's end keeps to news.
-            _ if has_members => attention_indicator(attention),
-            _ => channel_indicator(attention, channel.chats),
+            _ if has_members => RowStatus::split(attention_status(attention)),
+            _ => RowStatus::split(channel_status(attention, channel.chats)),
         };
+        indicator_width = width;
         grid.content(glyph, Some(label), indicator)
     };
     if !compact {
@@ -9045,6 +9098,7 @@ fn channel_view(
         channel.delete_id.clone(),
         compact,
         channel.selected,
+        indicator_width,
     );
     crate::reorder::channel_target(
         grid.mount(with_deletion_retry(
@@ -9252,28 +9306,21 @@ fn in_progress_section(
     let content = if compact {
         grid.rail(glyph, rail::Badges::in_progress(agents, collapsed))
     } else {
-        // The count sits in the indicator slot, where every row's badge is.
-        // Folded, the spinner above it says the hidden rows are still at work,
-        // as a counted badge does on any other row.
-        let count = design::caption(agents.to_string());
-        let indicator: Element<'static, SidebarAction> = if collapsed {
-            widget::column::with_children(vec![
-                crate::ui_controls::activity_spinner(
-                    f32::from(ROW_ICON_SIZE),
-                    design::activity_color,
-                ),
-                count.size(9).into(),
-            ])
-            .align_x(Alignment::Center)
-            .into()
-        } else {
-            count.into()
-        };
-        grid.content(
-            glyph,
-            Some(design::body("In progress").width(Length::Fill).into()),
-            Some(indicator),
-        )
+        // The count follows the label, as the Worktrees header's does. Folded,
+        // a spinner in the indicator slot says the hidden rows are still at
+        // work.
+        let label = widget::row::with_children(vec![
+            design::body("In progress").into(),
+            crate::ui_controls::count_badge(agents.to_string(), Default::default()),
+            widget::Space::new().width(Length::Fill).into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .width(Length::Fill);
+        let indicator = collapsed.then(|| {
+            crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::activity_color)
+        });
+        grid.content(glyph, Some(label.into()), indicator)
     };
     let header = grid
         .control(content, false)
@@ -9372,6 +9419,11 @@ fn in_progress_row(
 /// selected row's. The content keeps its whole width either way, so nothing
 /// in the row moves when the pointer enters it. The rail has no room for the
 /// action at all.
+///
+/// The fill reaches `covers` in from the row's content edge where that is
+/// further than the button, so a status wider than its reserved slot, such
+/// as a long unread count, is hidden whole rather than peeking out beside
+/// the button.
 fn row_quick_delete(
     content: Element<'static, SidebarAction>,
     label: &str,
@@ -9379,6 +9431,7 @@ fn row_quick_delete(
     id: Id,
     compact: bool,
     selected: bool,
+    covers: f32,
 ) -> Element<'static, SidebarAction> {
     // A rail cell is one glyph wide: a hover-revealed delete would land on
     // the badges and next to the glyph a press means to open. The row's
@@ -9386,18 +9439,23 @@ fn row_quick_delete(
     if compact {
         return content;
     }
-    let width = ICON_CONTROL_SIZE;
-    let control = centered_icon_button(Icon::Delete, width, WORKTREE_ROW_HEIGHT)
+    let control = centered_icon_button(Icon::Delete, ICON_CONTROL_SIZE, WORKTREE_ROW_HEIGHT)
         .class(sidebar_button_style(false))
         .id(id)
         .name(label.to_owned())
         .on_press_maybe(action);
     let ground = widget::container(crate::interaction::tooltip(control, label.to_owned()))
-        .width(width)
+        .align_right(quick_delete_width(covers))
         .height(WORKTREE_ROW_HEIGHT)
         .class(hovered_row_end(selected));
     let controls = widget::container(ground).align_right(Length::Fill).into();
     RowInteraction::actions(content, controls, 0.0)
+}
+
+/// How far in from a row's end [`row_quick_delete`]'s fill reaches over a
+/// status `covers` wide at the end of the row's content.
+fn quick_delete_width(covers: f32) -> f32 {
+    ICON_CONTROL_SIZE.max(ROW_GUTTER + covers).ceil()
 }
 
 /// The opaque fill of a hovered row's trailing end: the row's hovered fill
@@ -9608,6 +9666,8 @@ fn worktree_view<'a>(
     let deletion = worktree.deletion.as_ref();
     let deleting = deletion == Some(&RowDeletion::Deleting);
     let ink = row_state.ink();
+    // How much of the row's end its status takes, while nothing follows it.
+    let mut status_width = 0.0;
     let mut content = if compact {
         // The rail is for live news only. Dirty changes and pending checks are
         // durable facts about the worktree, kept in its tooltip and accessible
@@ -9629,11 +9689,13 @@ fn worktree_view<'a>(
             deletion_ink(ink, deletion).text_class(),
             false,
         );
-        let indicator = match deletion {
-            Some(RowDeletion::Deleting) => Some(deleting_indicator()),
-            _ => attention_indicator(row_state.attention)
-                .or_else(|| agent_indicator(activity, agent_update)),
+        let (indicator, width) = match deletion {
+            Some(RowDeletion::Deleting) => (Some(deleting_indicator()), ROW_STATUS_WIDTH),
+            _ => RowStatus::split(attention_status(row_state.attention).or_else(|| {
+                attention_status(AttentionSummary::card(activity, agent_update, false))
+            })),
         };
+        status_width = width;
         let glyph = if deleting {
             worktree_glyph_muted(CHILD_ROW_ICON_SIZE).into()
         } else {
@@ -9654,6 +9716,8 @@ fn worktree_view<'a>(
     // worktree rather than live activity, so none of them moves while an agent
     // starts or stops working. The rail has no room for any of them, and a
     // worktree on its way out has no use for them.
+    // A badge after the slot ends the row instead, and the delete covers it
+    // as it always has.
     if !compact && !deleting {
         let indicators = worktree_indicators(worktree);
         if show_changes_icons && let Some(label) = indicators.dirty {
@@ -9662,6 +9726,17 @@ fn worktree_view<'a>(
                 label.to_owned(),
                 BadgeTone::Neutral,
             ));
+            status_width = 0.0;
+        }
+        if indicators
+            .pull_request
+            .is_some_and(SidebarPullRequest::review_requested)
+        {
+            status_width = 0.0;
+        } else {
+            // The review slot follows the status even when empty, so the
+            // status ends a gutter further in from the row's end.
+            status_width += ROW_GUTTER;
         }
         content = content.push(slot(indicators.pull_request.and_then(|pr| {
             pr.review_requested().then(|| {
@@ -9688,6 +9763,7 @@ fn worktree_view<'a>(
             )
         {
             content = content.push(check_indicator(checks));
+            status_width = 0.0;
         }
         if primary {
             content = content.push(status_icon(
@@ -9695,9 +9771,11 @@ fn worktree_view<'a>(
                 "Primary worktree",
                 BadgeTone::Neutral,
             ));
+            status_width = 0.0;
         }
         if worktree.detached {
             content = content.push(status_icon(Icon::Info, "Detached HEAD", BadgeTone::Neutral));
+            status_width = 0.0;
         }
         if worktree.locked {
             content = content.push(status_icon(
@@ -9705,6 +9783,7 @@ fn worktree_view<'a>(
                 "Locked worktree",
                 BadgeTone::Neutral,
             ));
+            status_width = 0.0;
         }
     }
 
@@ -9748,6 +9827,7 @@ fn worktree_view<'a>(
             chrome.delete_id.clone(),
             compact,
             selected,
+            status_width,
         )
     } else {
         action
@@ -13380,6 +13460,22 @@ fn slot<'a>(
     widget::column::with_children(children)
         .spacing(space::XS)
         .into()
+}
+
+/// `content`, at least `width` wide: narrower content sits at `align` inside
+/// that width, and wider content widens it towards the row's label, which
+/// gives way rather than being painted over.
+fn at_least<'a>(
+    content: Element<'a, SidebarAction>,
+    width: f32,
+    align: Alignment,
+) -> Element<'a, SidebarAction> {
+    widget::column::with_children(vec![
+        widget::Space::new().width(Length::Fixed(width)).into(),
+        content,
+    ])
+    .align_x(align)
+    .into()
 }
 
 /// `action`, or nothing at all while a dialog is on screen.

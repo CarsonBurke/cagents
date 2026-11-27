@@ -34,7 +34,7 @@ memory: `realistic` is about 170 MB and `huge` about 1.1 GB.
 | `small` | 3 projects, 6 channels, 33 cards, 24 Claude and 8 Codex conversations. No edge cases. For tests. | 0.1 s, 2 MB |
 | `realistic` | Measured from a long-lived installation: 18 projects, 76 channels, 1856 shared views (76 channel, 1780 worktree; 44 showing 83 panes), 45,970 recorded view edits with outliers of 36,608, 5,891 and 1,320, 1769 cards about 95% closed, a second window holding 1709 cards, 2400 Claude and 700 Codex conversations, every edge case `all` adds, and `large-record`. | 3.6 s, 170 MB |
 | `huge` | Stress: 24 projects, 150 channels, 3538 cards, 10,000 Claude and 2,000 Codex conversations, every edge case `all` adds, and `large-record`. | 21 s, 1.1 GB |
-| `sidebar` | The sidebar's resting states: 10 projects with avatars and initials, dirty worktrees, and unread counts of 3, 12 and 120. | 0.3 s, 6 MB |
+| `sidebar` | The sidebar's resting states: 10 projects with avatars and initials, dirty worktrees, and unread counts of 1, 3, 9, 12 and 120: one and two figures and the `99+` cap. | 0.3 s, 6 MB |
 
 Every seeded channel that holds no card is named, so the app keeps all of them
 on its first start, as a long-lived installation already has; a first start
