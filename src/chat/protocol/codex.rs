@@ -897,15 +897,19 @@ impl Drop for Codex {
     }
 }
 impl Codex {
-    /// The diff state of `turn`, kept for the few turns still running.
-    fn observe_turn_start(&mut self, id: &str, step: &mut Step) {
-        if self.observed_turn_start.as_deref() != Some(id) {
-            self.observed_turn_start = Some(id.to_owned());
-            step.events
-                .extend([Event::TurnStarted, Event::TurnStartConfirmed]);
+    /// Announces `id`'s start once, whichever of its notification or RPC
+    /// reply arrives first. Returns whether this step announced it.
+    fn observe_turn_start(&mut self, id: &str, step: &mut Step) -> bool {
+        if self.observed_turn_start.as_deref() == Some(id) {
+            return false;
         }
+        self.observed_turn_start = Some(id.to_owned());
+        step.events
+            .extend([Event::TurnStarted, Event::TurnStartConfirmed]);
+        true
     }
 
+    /// The diff state of `turn`, kept for the few turns still running.
     fn turn_diff(&mut self, turn: &str) -> &mut TurnDiff {
         if !self.turn_diffs.contains_key(turn) && self.turn_diffs.len() >= 16 {
             self.turn_diffs.pop_first();
@@ -3404,10 +3408,10 @@ impl Codex {
                     self.remember_turn_pricing(id, model, tier);
                     // Notifications can finish this turn or start another before
                     // its RPC reply. An acknowledgement only fills missing state.
-                    if owns_lifecycle {
+                    let announced_start = owns_lifecycle && {
                         self.notification_turn = Some(id.to_owned());
-                        self.observe_turn_start(id, &mut step);
-                    }
+                        self.observe_turn_start(id, &mut step)
+                    };
                     if revision == self.lifecycle_revision {
                         self.turn = Some(id.into());
                         self.busy = true;
@@ -3432,7 +3436,13 @@ impl Codex {
                     };
                     if let Some(early) = early_completion {
                         if !early.preview_transferred {
-                            step.notification_preview = Some(early.preview);
+                            // The start this reply announces belongs to the
+                            // context streamed before it; it must not reset it.
+                            step.notification_preview = Some(if announced_start {
+                                early.preview.at_observed_start()
+                            } else {
+                                early.preview
+                            });
                         }
                         if let Some(completed) = early.completed {
                             // Preserve the original final frame's context, rather
