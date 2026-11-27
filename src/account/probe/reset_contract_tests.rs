@@ -57,7 +57,12 @@ for line in sys.stdin:
   usage=stale if stale.exists() else home/'fixture-usage.json'
   result=json.loads(usage.read_text())
   stale.unlink(missing_ok=True)
- print(json.dumps({'type':'control_response','response':{'request_id':frame['request_id'],'subtype':'success','response':result}}),flush=True)
+ response={'request_id':frame['request_id']}
+ if 'fixture_error' in result:
+  response.update(subtype='error',error=result['fixture_error'])
+ else:
+  response.update(subtype='success',response=result)
+ print(json.dumps({'type':'control_response','response':response}),flush=True)
 "#).unwrap();
         std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o700)).unwrap();
         let codex = bin.join("codex");
@@ -164,7 +169,7 @@ for line in sys.stdin:
         4
     );
     let original = state(&root, "claude");
-    for disappears in [false, true] {
+    for (disappears, signs_out) in [(false, false), (true, false), (false, true)] {
         let stale = root.join("home/.claude/fixture-usage-once.json");
         std::fs::write(&stale, serde_json::to_vec(&original["usage"]).unwrap()).unwrap();
         change_state(&root, "claude", |state| {
@@ -177,20 +182,34 @@ for line in sys.stdin:
                 grants[1]["resets_left"] = 0.into();
             }
         });
+        if signs_out {
+            // Auth status can still name this login while get_usage rejects it.
+            std::fs::write(
+                root.join("home/.claude/fixture-usage.json"),
+                r#"{"fixture_error":"401 Unauthorized"}"#,
+            )
+            .unwrap();
+        }
         let outcome = run(claude.clone(), cache.clone(), true).await;
         let Outcome::Answered { snapshot, .. } = outcome else {
             panic!("external reset probe failed: {outcome:?}");
         };
-        assert_eq!(
-            snapshot
-                .windows
-                .iter()
-                .find(|window| window.key == "weekly_all")
-                .unwrap()
-                .used,
-            0.0,
-            "the grant change must cause a fresh usage read"
-        );
+        if signs_out {
+            assert_eq!(snapshot.status, UsageStatus::NeedsLogin);
+            assert!(snapshot.resets.is_empty());
+            assert!(snapshot.plan.is_none());
+        } else {
+            assert_eq!(
+                snapshot
+                    .windows
+                    .iter()
+                    .find(|window| window.key == "weekly_all")
+                    .unwrap()
+                    .used,
+                0.0,
+                "the grant change must cause a fresh usage read"
+            );
+        }
         assert_eq!(state(&root, "claude")["consume_count"], 0);
         let entry = cache
             .as_ref()

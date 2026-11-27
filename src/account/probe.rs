@@ -1299,13 +1299,18 @@ async fn probe_claude_with_path(
                     // The first usage answer predates the inventory read and
                     // may be from before the reset. Do not publish the lower
                     // counts with old usage even if the follow-up fails.
-                    let refreshed = read().await?;
+                    let mut refreshed = read().await?;
+                    if refreshed.snapshot.status == UsageStatus::NeedsLogin {
+                        invalidate_claude_plan(account, cache).await?;
+                        return Ok(refreshed);
+                    }
                     if !super::resets::may_act_for(
                         refreshed.identity.as_ref(),
                         probed.identity.as_ref(),
                     ) {
                         return Err("Claude's login changed during the usage refresh".into());
                     }
+                    refreshed.catalog = refreshed.catalog.or(probed.catalog);
                     probed = refreshed;
                 }
                 if let Some(metadata) = plan {
@@ -1326,13 +1331,8 @@ async fn probe_claude_with_path(
                 }
             }
             Err(_) => {
-                if reset_transport::login_was_removed(account).await
-                    && let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key())
-                {
-                    tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
-                        .await
-                        .map_err(|_| "Claude's profile cache could not be updated")?
-                        .map_err(|_| "Claude's profile cache could not be updated")?;
+                if reset_transport::login_was_removed(account).await {
+                    invalidate_claude_plan(account, cache).await?;
                 }
                 probed.snapshot.detail = Some("Reset availability could not be refreshed".into())
             }
@@ -1376,6 +1376,16 @@ async fn read_claude_cli(
         "--disable-slash-commands",
     ]);
     join_claude(run_json(status), claude_usage(usage)).await
+}
+
+async fn invalidate_claude_plan(account: &Account, cache: Option<&Cache>) -> Result<(), String> {
+    if let (Some(cache), Some(key)) = (cache.cloned(), account.cache_key()) {
+        tokio::task::spawn_blocking(move || cache.invalidate_plan(&key))
+            .await
+            .map_err(|_| "Claude's profile cache could not be updated")?
+            .map_err(|_| "Claude's profile cache could not be updated")?;
+    }
+    Ok(())
 }
 
 fn invalidate_changed_profile(
