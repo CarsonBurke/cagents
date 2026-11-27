@@ -7896,8 +7896,8 @@ fn a_skipped_edge_applies_a_held_channel_name_and_projects_its_chrome() {
 
 /// A channel named in window A, emptied by a move, and then given back its
 /// automatic name in window B retires when A leaves it (#3403). A's rename
-/// protects the name only until the registry echoes it: before the echo, a
-/// model from before the rename must not make A forget it; after it, a
+/// protects the name only until the registry answers it: before the receipt,
+/// a model from before the rename must not make A forget it; after it, a
 /// clear from B is the registry's word, as it would be had A cleared it.
 #[test]
 fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
@@ -7924,13 +7924,17 @@ fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
         window.workspace_model.views.push(View::empty(channel));
         drop(window.absorb_channel_title(channel).unwrap());
     };
-    let publish = |model: &mut WorkspaceModel, requests: &TestModelRequests| {
-        for edit in drain(requests) {
-            model.sequence += 1;
-            let sequence = model.sequence;
-            model.fold(sequence, &edit);
-        }
-    };
+    // The registry applies what `window` published, and answers its renames.
+    let publish =
+        |model: &mut WorkspaceModel, requests: &TestModelRequests, window: &mut Cagents| {
+            for edit in drain(requests) {
+                let rename = matches!(edit, ModelEdit::RetitleChannel { .. });
+                let (receipt, _) = commit(model, edit);
+                if rename {
+                    drop(window.apply_workspace_model_update(receipt));
+                }
+            }
+        };
 
     // A names the channel.
     drop(a.update_chrome(Chrome::RenameChannel(channel)));
@@ -7944,20 +7948,20 @@ fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
         "a model from before the rename does not undo it"
     );
     // The registry applies the rename, refusing any automatic name the
-    // stale model had A offer, and echoes it.
-    publish(&mut model, &a_requests);
+    // stale model had A offer, and answers it.
+    publish(&mut model, &a_requests, &mut a);
     assert_eq!(model.channels[0].title, "Named here");
     assert_eq!(model.channels[0].title_source, ChannelTitleSource::Manual);
     deliver(&model, &mut a);
     deliver(&model, &mut b);
-    assert!(a.channel_is_named(channel), "the echo keeps the name");
+    assert!(a.channel_is_named(channel), "the registry holds the name");
     assert!(b.channel_is_named(channel));
 
     // B gives the channel back its automatic name from its sidebar.
     drop(b.update_chrome(Chrome::RenameChannel(channel)));
     drop(b.update_chrome(Chrome::RenameChanged(String::new())));
     drop(b.update_chrome(Chrome::RenameSubmit));
-    publish(&mut model, &b_requests);
+    publish(&mut model, &b_requests, &mut b);
     assert!(model.channels[0].title.is_empty());
     deliver(&model, &mut a);
     assert!(a.durable.channels[0].title.is_empty());
@@ -7974,12 +7978,12 @@ fn a_name_cleared_in_another_window_lets_the_emptied_channel_retire() {
     );
 }
 
-/// When another window clears the name before this window sees its own
-/// rename in a model, the rename's receipt ends the wait instead (#3403):
+/// The rename's receipt ends the wait even when another window cleared the
+/// name first, so that no model ever showed this window its rename (#3403):
 /// the channel is left unnamed, and the older receipt does not bring the
 /// name back.
 #[test]
-fn a_rename_cleared_before_its_echo_ends_its_wait_at_the_receipt() {
+fn a_rename_cleared_in_another_window_first_ends_its_wait_at_the_receipt() {
     use super::super::chrome_ui::Action as Chrome;
     use crate::workspace_model::views::View;
 
@@ -8039,4 +8043,262 @@ fn a_rename_cleared_before_its_echo_ends_its_wait_at_the_receipt() {
         a.durable.channels[0].title.is_empty(),
         "the older receipt does not restore the cleared name"
     );
+}
+
+/// Has `app` rename `channel` to `title` from its sidebar; an empty title
+/// gives the channel back its automatic name.
+fn rename_channel(app: &mut Cagents, channel: ChannelId, title: &str) {
+    use super::super::chrome_ui::Action as Chrome;
+    drop(app.update_chrome(Chrome::RenameChannel(channel)));
+    drop(app.update_chrome(Chrome::RenameChanged(title.into())));
+    drop(app.update_chrome(Chrome::RenameSubmit));
+}
+
+/// A window holding `channel`, shared and unnamed, with the registry it
+/// joined and the queue its publishes go to.
+fn window_with_unnamed_channel() -> (Cagents, ChannelId, WorkspaceModel, TestModelRequests) {
+    let (mut app, project, repository) = app_with_project();
+    let channel = ChannelId::new();
+    let mut source = local(channel, project, "", 1);
+    source.shared = true;
+    Arc::make_mut(&mut app.durable).channels.push(source);
+    app.channel_ui.sweep = super::super::channel_ui::Sweep::Done;
+    let model = registry(vec![shared(channel, &repository, "", 1)]);
+    app.workspace_model = model.clone();
+    let requests = intercept_publishes(&mut app);
+    (app, channel, model, requests)
+}
+
+/// The registry applying `edit` to `model`: the receipt it answers the
+/// window that sent it, and the edge every window's observer delivers.
+fn commit(model: &mut WorkspaceModel, edit: ModelEdit) -> (ModelUpdate, ModelUpdate) {
+    model.sequence += 1;
+    let sequence = model.sequence;
+    model.fold(sequence, &edit);
+    let effects = EditEffects {
+        channels: model.channels.clone(),
+        ..Default::default()
+    };
+    let receipt = ModelUpdate::Committed {
+        receipt: EditReceipt {
+            identity: model.identity,
+            sequence,
+            effects: effects.clone(),
+        },
+        edit: edit.clone(),
+        views: Default::default(),
+    };
+    (
+        receipt,
+        changed_edge(model.identity, sequence, edit, effects, Vec::new()),
+    )
+}
+
+/// The changes of name `requests` holds, in the order the window made them.
+fn renames(requests: &TestModelRequests) -> Vec<ModelEdit> {
+    drain(requests)
+        .into_iter()
+        .filter(|edit| matches!(edit, ModelEdit::RetitleChannel { .. }))
+        .collect()
+}
+
+/// A window names a channel, clears the name, and gives it the same name
+/// again before the registry answers any of the three (#4330). Neither the
+/// first rename's receipt nor an edge showing it is the second's answer, for
+/// all that they carry the same name: the registry then holds the clear, and
+/// the channel still counts as named until the second rename is answered.
+/// The receipts and the observer's edges travel separately, so either may
+/// come first.
+#[test]
+fn an_earlier_rename_to_the_same_name_does_not_end_a_later_ones_wait() {
+    for edges_first in [false, true] {
+        let (mut app, channel, mut model, requests) = window_with_unnamed_channel();
+        rename_channel(&mut app, channel, "Roadmap");
+        rename_channel(&mut app, channel, "");
+        rename_channel(&mut app, channel, "Roadmap");
+        let sent: [ModelEdit; 3] = renames(&requests)
+            .try_into()
+            .expect("three changes of name");
+        assert!(app.channel_is_named(channel));
+
+        let [
+            (first, first_edge),
+            (clear, clear_edge),
+            (second, second_edge),
+        ] = sent.map(|edit| commit(&mut model, edit));
+        let answered = if edges_first {
+            [first_edge, clear_edge, first, clear]
+        } else {
+            [first, clear, first_edge, clear_edge]
+        };
+        for update in answered {
+            drop(app.apply_workspace_model_update(update));
+        }
+        assert_eq!(
+            channel_title(&app, channel),
+            Some(""),
+            "the registry holds no name between the two renames: {edges_first}"
+        );
+        assert!(
+            app.channel_is_named(channel),
+            "the second rename is still on its way: {edges_first}"
+        );
+
+        drop(app.apply_workspace_model_update(second));
+        drop(app.apply_workspace_model_update(second_edge));
+        assert_eq!(channel_title(&app, channel), Some("Roadmap"));
+        assert!(app.channel_is_named(channel));
+        // From here the registry's title decides: another window's clear
+        // leaves the channel unnamed.
+        let (_, cleared) = commit(
+            &mut model,
+            ModelEdit::RetitleChannel {
+                id: channel,
+                title: String::new(),
+            },
+        );
+        drop(app.apply_workspace_model_update(cleared));
+        assert_eq!(channel_title(&app, channel), Some(""));
+        assert!(
+            !app.channel_is_named(channel),
+            "the second rename's receipt ended the wait: {edges_first}"
+        );
+    }
+}
+
+/// A receipt from a registry the window has since left still answers the
+/// rename it was sent for (#4330). Nothing else will, so without it the
+/// channel would count as named for as long as the window lived, whatever
+/// the registry it joined holds.
+#[test]
+fn a_receipt_from_a_registry_the_window_left_ends_the_renames_wait() {
+    let (mut app, channel, model, requests) = window_with_unnamed_channel();
+    rename_channel(&mut app, channel, "Roadmap");
+    let [rename]: [ModelEdit; 1] = renames(&requests).try_into().expect("one rename");
+    let mut left = model;
+    left.identity = uuid::Uuid::new_v4();
+    let (receipt, _) = commit(&mut left, rename);
+    drop(app.apply_workspace_model_update(receipt));
+    assert_eq!(
+        channel_title(&app, channel),
+        Some("Roadmap"),
+        "another registry's rows are not this one's"
+    );
+    // The registry the window is in never took the rename.
+    drop(app.absorb_channel_title(channel).unwrap());
+    assert_eq!(channel_title(&app, channel), Some(""));
+    assert!(!app.channel_is_named(channel));
+}
+
+/// A rename the registry refuses has no receipt, so its refusal ends the
+/// wait (#4330): the channel goes back to the title the registry holds, an
+/// unnamed one may retire again, and the window says the rename failed. A
+/// later change of name still on its way keeps its own wait and the title it
+/// gave.
+#[test]
+fn a_refused_rename_gives_the_channel_back_the_registrys_title() {
+    let refusal = |channel| ModelUpdate::RetitleRefused {
+        channel,
+        error: "Fixture registry refused the name".into(),
+    };
+    let notice = Some(
+        TransientNotice::warning("Could not change the channel's name")
+            .with_details("Fixture registry refused the name"),
+    );
+    let (mut app, channel, _, _requests) = window_with_unnamed_channel();
+    rename_channel(&mut app, channel, "Roadmap");
+    assert!(app.channel_is_named(channel));
+    drop(app.apply_workspace_model_update(refusal(channel)));
+    assert_eq!(channel_title(&app, channel), Some(""));
+    assert!(!app.channel_is_named(channel));
+    assert_eq!(app.status, notice);
+
+    let (mut app, channel, _, _requests) = window_with_unnamed_channel();
+    rename_channel(&mut app, channel, "Roadmap");
+    rename_channel(&mut app, channel, "Parser cache");
+    drop(app.apply_workspace_model_update(refusal(channel)));
+    assert_eq!(channel_title(&app, channel), Some("Parser cache"));
+    assert!(app.channel_is_named(channel));
+    assert_eq!(app.status, notice);
+
+    // A refused return to the automatic name leaves the name the registry
+    // still holds.
+    let (mut app, channel, mut model, requests) = window_with_unnamed_channel();
+    rename_channel(&mut app, channel, "Roadmap");
+    let [rename]: [ModelEdit; 1] = renames(&requests).try_into().expect("one rename");
+    let (receipt, _) = commit(&mut model, rename);
+    drop(app.apply_workspace_model_update(receipt));
+    rename_channel(&mut app, channel, "");
+    assert_eq!(channel_title(&app, channel), Some(""));
+    assert!(!app.channel_is_named(channel));
+    drop(app.apply_workspace_model_update(refusal(channel)));
+    assert_eq!(channel_title(&app, channel), Some("Roadmap"));
+    assert!(app.channel_is_named(channel));
+}
+
+/// The publisher tells the window of a rename the registry refused, with the
+/// registry's reason. It is the rename's only answer.
+#[test]
+fn a_refused_rename_is_reported_to_the_window() {
+    let channel = ChannelId::new();
+    let rename = ModelEdit::RetitleChannel {
+        id: channel,
+        title: "Roadmap".into(),
+    };
+    let expected = rename.clone();
+    let (mut client, server) = publisher_connection(move |peer, proof| {
+        let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+        assert_eq!(
+            request.request,
+            ClientRequest::ApplyWorkspaceEdit { edit: expected }
+        );
+        publisher_reply(
+            peer,
+            proof,
+            request.request_id,
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::InvalidRequest,
+                "Fixture registry refused the name",
+                false,
+            )),
+        );
+    });
+    let (requests, receiver) = async_channel::unbounded();
+    requests.try_send(rename.into()).unwrap();
+    drop(requests);
+    let mut pending = None;
+    let (updates, received) = async_channel::unbounded();
+    let _ = publish_with_client(&updates, &receiver, &mut pending, &mut client);
+    drop(client);
+    server.join().unwrap();
+    assert!(pending.is_none(), "a refusal is not retried");
+    assert!(matches!(
+        received.try_recv().unwrap(),
+        ModelUpdate::RetitleRefused { channel: refused, error }
+            if refused == channel && error == "Fixture registry refused the name"
+    ));
+    assert!(
+        received.try_recv().is_err(),
+        "the refusal is the one answer"
+    );
+}
+
+/// A rename that could not be queued for the registry has no answer to wait
+/// for (#4330), so the registry's title still says whether the channel is
+/// named. Nor will an earlier rename be answered, once the queue is gone.
+#[test]
+fn a_rename_that_was_never_queued_leaves_the_registrys_title_deciding() {
+    for earlier in [false, true] {
+        let (mut app, channel, _, requests) = window_with_unnamed_channel();
+        if earlier {
+            rename_channel(&mut app, channel, "Parser cache");
+        }
+        // The publisher is gone, as when its thread could not start.
+        drop(requests);
+        rename_channel(&mut app, channel, "Roadmap");
+        assert_eq!(channel_title(&app, channel), Some("Roadmap"));
+        drop(app.absorb_channel_title(channel).unwrap());
+        assert_eq!(channel_title(&app, channel), Some(""));
+        assert!(!app.channel_is_named(channel), "{earlier}");
+    }
 }

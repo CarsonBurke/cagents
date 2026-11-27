@@ -1592,6 +1592,8 @@ fn leaving_a_named_channel_keeps_it() {
     let mut renamed = fixture();
     renamed.title_by_conversation();
     let channel = renamed.channel;
+    // The rename is queued for the registry, which is what it waits on.
+    let received = renamed.listen();
     for action in [
         Chrome::RenameChannel(channel),
         Chrome::RenameChanged("Release notes".into()),
@@ -1606,7 +1608,6 @@ fn leaving_a_named_channel_keeps_it() {
         renamed.active_channel().title_source,
         crate::model::ChannelTitleSource::Prompt
     );
-    let received = renamed.listen();
     renamed.enter_other_project();
     renamed.app.allow_empty_channel_sweep();
     assert!(retirements(&received).is_empty());
