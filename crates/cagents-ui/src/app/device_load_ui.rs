@@ -87,9 +87,17 @@ fn gauges(load: &DeviceLoad) -> [Gauge; 3] {
     ]
 }
 
-/// Bytes as gigabytes to a tenth, the precision the reading is sent at.
-fn gigabytes(bytes: u64) -> String {
-    format!("{:.1} GB", bytes as f64 / 1e9)
+/// A size as people read one: gigabytes to a tenth below a hundred, whole
+/// gigabytes below a thousand, and terabytes to a hundredth above.
+fn size(bytes: u64) -> String {
+    let gigabytes = bytes as f64 / 1e9;
+    if gigabytes < 100.0 {
+        format!("{gigabytes:.1} GB")
+    } else if gigabytes < 999.5 {
+        format!("{gigabytes:.0} GB")
+    } else {
+        format!("{:.2} TB", gigabytes / 1e3)
+    }
 }
 
 /// The hover text: what each figure measures, in full.
@@ -112,27 +120,22 @@ pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
     });
     lines.push(match stats.memory {
         Some(memory) => {
-            let mut line = format!(
-                "Memory {} of {}",
-                gigabytes(memory.used),
-                gigabytes(memory.total)
-            );
+            let mut line = format!("Memory {} of {}", size(memory.used), size(memory.total));
             if memory.swap_total > 0 {
-                line.push_str(&format!(" · swap {}", gigabytes(memory.swap_used)));
+                line.push_str(&format!(" · swap {}", size(memory.swap_used)));
             }
             line
         }
         None => "Memory: unavailable".to_owned(),
     });
     lines.push(match stats.disk {
-        Some(disk) => format!(
-            "Home disk {} of {}",
-            gigabytes(disk.used),
-            gigabytes(disk.total)
-        ),
+        Some(disk) => format!("Home disk {} of {}", size(disk.used), size(disk.total)),
         None => "Home disk: unavailable".to_owned(),
     });
-    lines.push(format!("On {device}"));
+    lines.push(match device {
+        "This device" => "On this computer".to_owned(),
+        device => format!("On {device}"),
+    });
     lines.join("\n")
 }
 
@@ -383,12 +386,12 @@ mod tests {
         });
         stats.disk = Some(Disk {
             used: 238_000_000_000,
-            total: 512_000_000_000,
+            total: 1_982_200_000_000,
         });
         assert_eq!(
             detail(&DeviceLoad::Live(stats), "This device"),
             "CPU 12% · 16 cores · load 1.9\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
-             Home disk 238.0 GB of 512.0 GB\nOn This device"
+             Home disk 238 GB of 1.98 TB\nOn this computer"
         );
     }
 }
