@@ -1238,6 +1238,16 @@ fn close_on_exec(descriptor: libc::c_int) -> io::Result<()> {
     Ok(())
 }
 
+#[doc(hidden)]
+#[cfg(feature = "host")]
+pub fn new_host_session_proof() -> io::Result<crate::model::HostSessionProof> {
+    Ok(crate::model::HostSessionProof {
+        host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+        boot_id: read_boot_id()?,
+        host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+    })
+}
+
 #[cfg(feature = "host")]
 pub fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
     crate::pinned_process::peer_uid(stream)

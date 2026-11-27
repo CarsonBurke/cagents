@@ -153,9 +153,12 @@ fn ready_activation_claim_prevents_a_recipe_retry_before_checkpoint_mutation() {
     assert!(receipt.ready_before_restore().unwrap());
     let claim = ready_claim_path(&receipt.authority).unwrap();
     let capture_digest = digest(b"test capture");
-    claim_ready_activation(&receipt.authority, &capture_digest).unwrap();
+    let successor = crate::daemon::new_host_session_proof().unwrap();
+    claim_ready_activation(&receipt.authority, &capture_digest, &successor).unwrap();
     let original = fs::read(&claim).unwrap();
-    assert!(claim_ready_activation(&receipt.authority, &digest(b"other capture")).is_err());
+    assert!(
+        claim_ready_activation(&receipt.authority, &digest(b"other capture"), &successor).is_err()
+    );
     assert_eq!(fs::read(&claim).unwrap(), original);
     let saved: serde_json::Value = serde_json::from_slice(&original).unwrap();
     assert_eq!(saved["job"], receipt.authority.job);
@@ -165,6 +168,9 @@ fn ready_activation_claim_prevents_a_recipe_retry_before_checkpoint_mutation() {
     );
     assert_eq!(saved["capture_digest"], capture_digest);
     assert_eq!(saved["successor"]["pid"], std::process::id());
+    let saved_proof: HostSessionProof =
+        serde_json::from_value(saved["successor_proof"].clone()).unwrap();
+    assert_eq!(saved_proof, successor);
     assert_eq!(fs::read(canonical).unwrap(), bytes);
     assert!(!receipt.ready_before_restore().unwrap());
 }

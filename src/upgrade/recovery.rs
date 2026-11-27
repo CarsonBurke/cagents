@@ -4521,12 +4521,28 @@ pub(crate) fn accept_standby_authority(
 pub struct ReadyAdmission {
     authority: Authority,
     custody: Inherited,
+    successor: HostSessionProof,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
 impl ReadyAdmission {
     pub fn source(&self) -> &HostSessionProof {
         &self.authority.source
+    }
+
+    pub fn successor(&self) -> &HostSessionProof {
+        &self.successor
+    }
+
+    /// The runtime and saved-data leases are installed. Every action on the
+    /// store, provider, or matching CLI now belongs to this exact proof.
+    pub fn begin_workspace_effects(&self) -> io::Result<()> {
+        let authority = &self.authority;
+        let path = ready_claim_path(authority)
+            .map_err(io::Error::other)?
+            .with_file_name(format!("{}.ready-effects.json", authority.job));
+        let evidence = serde_json::to_vec(&self.successor)?;
+        crate::update::persist_ready_evidence(&path, &evidence).map_err(io::Error::other)
     }
 
     pub fn checkpoint_digest(&self) -> &str {
@@ -4607,11 +4623,16 @@ struct ReadyClaim<'a> {
     source: &'a HostSessionProof,
     target: &'a Path,
     target_digest: &'a str,
+    successor_proof: &'a HostSessionProof,
     successor: crate::daemon::holder_registry::Process,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
-fn claim_ready_activation(authority: &Authority, capture_digest: &str) -> io::Result<()> {
+fn claim_ready_activation(
+    authority: &Authority,
+    capture_digest: &str,
+    successor: &HostSessionProof,
+) -> io::Result<()> {
     let path = ready_claim_path(authority).map_err(io::Error::other)?;
     let claim = ReadyClaim {
         version: 1,
@@ -4623,9 +4644,10 @@ fn claim_ready_activation(authority: &Authority, capture_digest: &str) -> io::Re
         source: &authority.source,
         target: &authority.target,
         target_digest: &authority.target_hash,
+        successor_proof: successor,
         successor: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
     };
-    crate::update::persist_ready_activation_claim(&path, &serde_json::to_vec(&claim)?)
+    crate::update::persist_ready_evidence(&path, &serde_json::to_vec(&claim)?)
         .map_err(io::Error::other)
 }
 
@@ -4655,8 +4677,18 @@ pub(crate) fn accept_ready_authority(
         .ok_or_else(|| io::Error::other("Installed Ready activation has no original capture"))?;
     // This precedes runtime publication, saved-state admission and every
     // startup path that can act on the original provider or its database.
-    claim_ready_activation(&authority, &capture_digest)?;
-    Ok(ReadyAdmission { authority, custody })
+    let successor = crate::daemon::new_host_session_proof()?;
+    if successor.boot_id != authority.source.boot_id {
+        return Err(io::Error::other(
+            "Ready activation belongs to a previous boot",
+        ));
+    }
+    claim_ready_activation(&authority, &capture_digest, &successor)?;
+    Ok(ReadyAdmission {
+        authority,
+        custody,
+        successor,
+    })
 }
 
 #[cfg(any(feature = "host", target_os = "macos"))]

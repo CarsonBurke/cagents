@@ -8,7 +8,7 @@ mod confirmation;
 #[cfg(target_os = "macos")]
 mod cutover;
 #[cfg(all(target_os = "macos", feature = "host"))]
-pub(crate) use cutover::persist_ready_activation_claim;
+pub(crate) use cutover::persist_ready_evidence;
 #[cfg(all(target_os = "macos", feature = "host"))]
 #[doc(hidden)]
 pub use cutover::{
