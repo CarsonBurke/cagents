@@ -94,8 +94,17 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "cancel-nonce"
             | "decisions.lock"
     ) || suffix
-        .split_once('.')
-        .is_some_and(|(nonce, kind)| matches!(kind, "decision" | "cancel") && canonical_id(nonce))
+        .strip_prefix("cutover-inventory.")
+        .and_then(|digest| digest.strip_suffix(".json"))
+        .is_some_and(|digest| {
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        })
+        || suffix.split_once('.').is_some_and(|(nonce, kind)| {
+            matches!(kind, "decision" | "cancel") && canonical_id(nonce)
+        })
     {
         Some(job)
     } else {
@@ -172,6 +181,8 @@ mod tests {
             "request",
             "census.json",
             "recovery.json",
+            "cutover-inventory.json",
+            "cutover-inventory.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.json",
             "ready-claim.json",
             "ready-effects.json",
             "ready-plan.json",
@@ -193,6 +204,8 @@ mod tests {
         private_create(&decision).unwrap();
         let unknown_file = state.join(format!("{old}.notes"));
         private_create(&unknown_file).unwrap();
+        let similarly_named = state.join(format!("{old}.cutover-inventory.note.json"));
+        private_create(&similarly_named).unwrap();
         let linked = state.join(format!("{old}.{nonce}.cancel"));
         std::os::unix::fs::symlink(&unknown_file, &linked).unwrap();
 
@@ -206,6 +219,7 @@ mod tests {
         assert!(!state.join(format!("{old}{COMPLETE}")).exists());
         assert!(!decision.exists());
         assert!(unknown_file.exists());
+        assert!(similarly_named.exists());
         assert!(linked.is_symlink());
         for artifact in artifacts {
             assert!(!state.join(format!("{old}.{artifact}")).exists());
