@@ -30,6 +30,9 @@ const COLUMN_MIN_WIDTH: f32 = 248.0;
 const COLUMN_WIDTH: f32 = 280.0;
 const SCOPE_MENU_WIDTH: f32 = 280.0;
 const CARD_MENU_WIDTH: f32 = 264.0;
+/// The details of what the board could not read.
+const PROBLEMS_WIDTH: f32 = 440.0;
+const PROBLEMS_MAX_HEIGHT: f32 = 360.0;
 
 /// A board card's height before it has been measured: branch, title, facts
 /// and footer at the compact sizes.
@@ -114,6 +117,8 @@ pub enum Action {
     /// The clock moved: relative times are redrawn.
     Tick,
     ScopeMenu(bool),
+    /// Opens or closes the details of what the board could not read.
+    Problems(bool),
     /// Shows one project, by repository, or all of them.
     Scope(Option<PathBuf>),
     Query(String),
@@ -181,6 +186,8 @@ pub struct State {
     lost: Option<String>,
     scope: Option<PathBuf>,
     scope_menu: bool,
+    /// Whether the details of what the board could not read are open.
+    problems_open: bool,
     query: String,
     layout: Layout,
     /// The board layout last shown, which the board returns to from
@@ -225,6 +232,7 @@ impl State {
         };
         self.menu = None;
         self.scope_menu = false;
+        self.problems_open = false;
     }
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
@@ -255,6 +263,11 @@ impl State {
                     {
                         self.menu = None;
                     }
+                    // Details that are no longer offered do not reopen by
+                    // themselves when they are again.
+                    if self.problems_open && problems(&board, self.scope.as_deref()).is_empty() {
+                        self.problems_open = false;
+                    }
                     self.confirmed = Some(board.clone());
                     self.board = Some(board);
                     self.lost = None;
@@ -269,13 +282,27 @@ impl State {
                 self.now_unix_ms = now_unix_ms();
                 None
             }
+            // One popover at a time, however it was opened.
             Action::ScopeMenu(open) => {
                 self.scope_menu = open;
+                if open {
+                    self.menu = None;
+                    self.problems_open = false;
+                }
+                None
+            }
+            Action::Problems(open) => {
+                self.problems_open = open;
+                if open {
+                    self.menu = None;
+                    self.scope_menu = false;
+                }
                 None
             }
             Action::Scope(scope) => {
                 self.scope = scope;
                 self.scope_menu = false;
+                self.problems_open = false;
                 None
             }
             Action::Query(query) => {
@@ -289,6 +316,7 @@ impl State {
                 }
                 self.menu = None;
                 self.scope_menu = false;
+                self.problems_open = false;
                 None
             }
             Action::Refresh => {
@@ -313,6 +341,10 @@ impl State {
                 }
             }
             Action::Menu(menu) => {
+                if menu.is_some() {
+                    self.scope_menu = false;
+                    self.problems_open = false;
+                }
                 self.menu = menu;
                 None
             }
@@ -558,6 +590,10 @@ impl State {
     }
 
     /// How many cards are shown, and what the board could not read.
+    ///
+    /// One line, however many projects share a problem: GitHub's rate limit
+    /// is the account's, so every project reports it at once. The projects
+    /// and their exact reasons are a click away.
     fn status(&self) -> Option<Element<'_, Action>> {
         let board = self.board.as_ref()?;
         // The daemon sends a board only when it changes, so its age says
@@ -565,54 +601,134 @@ impl State {
         let mut parts: Vec<Element<'_, Action>> = vec![
             design::caption(cards(self.visible().count()))
                 .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
                 .into(),
         ];
         if let Some(error) = &self.lost {
-            parts.push(warning(format!("Disconnected: {error}")));
+            // The whole board is as of the connection's loss. The word says
+            // so in any width; the transport's reason is for the curious.
+            parts.push(crate::interaction::tooltip(
+                widget::row::with_children(vec![
+                    warning_icon(),
+                    design::caption("Disconnected, retrying")
+                        .class(cosmic::theme::Text::Custom(design::warning_text))
+                        .wrapping(iced::widget::text::Wrapping::None)
+                        .into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+                error.clone(),
+            ));
         }
         if let Some(error) = &self.error {
-            parts.push(warning(error.clone()));
+            // A refresh or a pin the user asked for, which they may retry.
+            parts.push(
+                widget::container(notice(error.clone(), design::warning_text))
+                    .width(Length::FillPortion(1))
+                    .into(),
+            );
         }
-        let projects = board.projects.iter().filter(|project| {
-            self.scope
-                .as_ref()
-                .is_none_or(|scope| project.repository == *scope)
-        });
-        for project in projects {
-            if let Some(error) = &project.scan_error {
-                parts.push(warning(format!(
-                    "{} could not be read: {error}",
-                    project.name
-                )));
-            }
-            match &project.forge {
-                Forge::Unavailable { reason } => {
-                    parts.push(warning(format!(
-                        "{}: GitHub unavailable: {reason}",
-                        project.name
-                    )));
-                }
-                Forge::Synced {
-                    error: Some(error), ..
-                } => parts.push(warning(format!(
-                    "{}: pull requests may be out of date: {error}",
-                    project.name
-                ))),
-                _ => {}
-            }
-        }
-        if let Some(reason) = &board.linear_unavailable {
-            parts.push(warning(format!(
-                "Linear tickets could not be looked up: {reason}"
-            )));
+        let problems = problems(board, self.scope.as_deref());
+        if let Some(problems) = self.problems_view(problems) {
+            parts.push(
+                widget::container(problems)
+                    .width(Length::FillPortion(2))
+                    .into(),
+            );
         }
         Some(
             widget::row::with_children(parts)
                 .spacing(space::M)
                 .align_y(Alignment::Center)
-                .wrap()
                 .into(),
         )
+    }
+
+    /// The first of the board's problems, opening all of them with the
+    /// projects each affects. Its count and chevron keep their room; the
+    /// summary fades into what is left, and the details hold all of it.
+    fn problems_view<'a>(&'a self, problems: Vec<Problem<'a>>) -> Option<Element<'a, Action>> {
+        let first = problems.first()?;
+        let summary = first.summary();
+        let count = match problems.len() {
+            1 if first.projects.len() > 1 => Some(projects(first.projects.len())),
+            1 => None,
+            more => Some(format!("+{} more", more - 1)),
+        };
+        let open = self.problems_open;
+        let name = format!(
+            "{summary}{}. {} details",
+            count
+                .as_deref()
+                .map(|count| format!(", {count}"))
+                .unwrap_or_default(),
+            if open { "Hide" } else { "Show" },
+        );
+        let mut trail = Vec::with_capacity(2);
+        trail.extend(count.map(|count| {
+            design::caption(format!("· {count}"))
+                .class(cosmic::theme::Text::Custom(design::muted_text))
+                .wrapping(iced::widget::text::Wrapping::None)
+                .into()
+        }));
+        trail.push(
+            widget::icon(
+                if open {
+                    Icon::ChevronUp
+                } else {
+                    Icon::ChevronDown
+                }
+                .handle(),
+            )
+            .size(design::COMPACT_ICON_SIZE)
+            .into(),
+        );
+        // The count and chevron stay beside the summary, which fades where
+        // the header runs out of room. Quieter than the cards: only the icon
+        // is in the warning colour.
+        let line = vec![
+            warning_icon(),
+            crate::ui_controls::trailing(
+                crate::ui_controls::FadeText::caption(summary)
+                    .class(cosmic::theme::Text::Custom(design::muted_text)),
+                widget::row::with_children(trail)
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                space::XS,
+            ),
+        ];
+        let anchor = widget::button::custom(
+            widget::row::with_children(line)
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+        )
+        .name(name)
+        .class(crate::ui_controls::control_style(open, None))
+        .padding([space::XXS, space::XS])
+        .on_press(Action::Problems(!open));
+        let content = open.then(|| {
+            let mut sections = Vec::with_capacity(problems.len() * 2);
+            for (index, problem) in problems.iter().enumerate() {
+                if index > 0 {
+                    sections.push(design::horizontal_rule());
+                }
+                sections.push(problem_details(problem));
+            }
+            widget::container(crate::ui_controls::popover_scroll(
+                widget::column::with_children(sections).spacing(space::S),
+                widget::Id::new("work-problems"),
+                PROBLEMS_MAX_HEIGHT,
+                crate::ui_controls::SCROLLING_FRAME,
+            ))
+            .width(crate::ui_controls::scrolling_width(PROBLEMS_WIDTH))
+            .into()
+        });
+        Some(crate::ui_controls::scrolling_popover(
+            anchor,
+            content,
+            widget::popover::Position::Bottom,
+            Action::Problems(false),
+        ))
     }
 
     fn board_view(&self, width: f32) -> Element<'_, Action> {
@@ -1498,18 +1614,227 @@ fn sized_glyph<'a, Message: 'a>(icon: Icon, tone: Toned, size: u16) -> Element<'
         .into()
 }
 
-fn warning<'a>(text: String) -> Element<'a, Action> {
-    widget::row::with_children(vec![
-        widget::icon(Icon::Warning.handle())
-            .size(design::COMPACT_ICON_SIZE)
+/// What the board could not read, for one reason: GitHub's rate limit is
+/// the account's, so every project reports the same one at once.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Problem<'a> {
+    kind: ProblemKind,
+    /// The reason, exactly as reported; for a rate limit, the one that
+    /// resets last.
+    reason: &'a str,
+    /// The projects it affects, in board order; none for the board's own.
+    projects: Vec<&'a str>,
+    /// Those of them GitHub has not answered for since the daemon started,
+    /// whose cards have no pull requests yet.
+    unread: Vec<&'a str>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProblemKind {
+    /// Git could not read the projects.
+    Unreadable,
+    /// GitHub has not answered for any of the projects since the daemon
+    /// started, so their cards have no pull requests.
+    PullRequestsUnknown,
+    /// GitHub's last answer stands for some of them; reading it again
+    /// failed.
+    PullRequestsStale,
+    /// Linear could not be asked about the cards' tickets.
+    Tickets,
+}
+
+impl ProblemKind {
+    fn forge(self) -> bool {
+        matches!(self, Self::PullRequestsUnknown | Self::PullRequestsStale)
+    }
+}
+
+impl Problem<'_> {
+    /// What happened, without the reason or the projects.
+    fn headline(&self) -> String {
+        match (self.kind, self.projects.as_slice()) {
+            (ProblemKind::Unreadable, [project]) => format!("{project} could not be read"),
+            (ProblemKind::Unreadable, names) => {
+                format!("{} could not be read", projects(names.len()))
+            }
+            (ProblemKind::PullRequestsUnknown, [project]) => {
+                format!("Pull requests for {project} could not be read")
+            }
+            (ProblemKind::PullRequestsStale, [project]) => {
+                format!("Pull requests for {project} may be out of date")
+            }
+            (ProblemKind::PullRequestsUnknown, _) => "Pull requests could not be read".to_owned(),
+            (ProblemKind::PullRequestsStale, _) => "Pull requests may be out of date".to_owned(),
+            (ProblemKind::Tickets, _) => "Linear tickets could not be looked up".to_owned(),
+        }
+    }
+
+    /// One line: what happened and why.
+    fn summary(&self) -> String {
+        format!("{}: {}", self.headline(), self.reason)
+    }
+}
+
+/// When a rate limit's message says it resets, such as `18:42 UTC`; every
+/// project the limit stopped reports it, each as of its own last poll.
+fn rate_limit_reset(reason: &str) -> Option<&str> {
+    crate::github::polling::RateLimit::reset_named_by(reason)
+}
+
+/// Whether the rate limit reset at clock time `a`, such as `00:10 UTC`,
+/// comes after the one at `b`. A reset names no date, and every project's is
+/// within the hour a quota lasts, so the nearer way around the clock decides,
+/// past midnight too.
+fn resets_later(a: &str, b: &str) -> bool {
+    fn minute(time: &str) -> Option<i32> {
+        let (hours, minutes) = time.strip_suffix(" UTC")?.split_once(':')?;
+        Some(hours.parse::<i32>().ok()? * 60 + minutes.parse::<i32>().ok()?)
+    }
+    match (minute(a), minute(b)) {
+        (Some(a), Some(b)) => (1..12 * 60).contains(&(a - b).rem_euclid(24 * 60)),
+        _ => a > b,
+    }
+}
+
+/// What the board could not read about the projects in `scope`, one entry
+/// per reason, those affecting the most projects first. A forge reason
+/// shared by projects GitHub answered before and projects it never has is
+/// one problem: the account's, not theirs. So is a rate limit, whatever
+/// reset each project last heard.
+fn problems<'a>(board: &'a Board, scope: Option<&std::path::Path>) -> Vec<Problem<'a>> {
+    let mut problems: Vec<Problem<'a>> = Vec::new();
+    let mut add = |kind: ProblemKind, reason: &'a str, project: Option<&'a str>| {
+        let reset = rate_limit_reset(reason);
+        let same = |problem: &&mut Problem<'a>| {
+            let reason_matches = match (reset, rate_limit_reset(problem.reason)) {
+                (Some(_), Some(_)) => true,
+                _ => problem.reason == reason,
+            };
+            reason_matches && (problem.kind == kind || (problem.kind.forge() && kind.forge()))
+        };
+        let problem = match problems.iter_mut().find(same) {
+            Some(problem) => {
+                // Out of date somewhere says more than unknown everywhere.
+                if kind == ProblemKind::PullRequestsStale {
+                    problem.kind = kind;
+                }
+                // The reset still to come.
+                if let (Some(reset), Some(current)) = (reset, rate_limit_reset(problem.reason))
+                    && resets_later(reset, current)
+                {
+                    problem.reason = reason;
+                }
+                problem
+            }
+            None => {
+                problems.push(Problem {
+                    kind,
+                    reason,
+                    projects: Vec::new(),
+                    unread: Vec::new(),
+                });
+                problems.last_mut().expect("just pushed")
+            }
+        };
+        problem.projects.extend(project);
+        if kind == ProblemKind::PullRequestsUnknown {
+            problem.unread.extend(project);
+        }
+    };
+    for project in board
+        .projects
+        .iter()
+        .filter(|project| scope.is_none_or(|scope| project.repository == scope))
+    {
+        let name = Some(project.name.as_str());
+        if let Some(error) = &project.scan_error {
+            add(ProblemKind::Unreadable, error, name);
+        }
+        match &project.forge {
+            Forge::Unavailable { reason } => add(ProblemKind::PullRequestsUnknown, reason, name),
+            Forge::Synced {
+                error: Some(error), ..
+            } => add(ProblemKind::PullRequestsStale, error, name),
+            Forge::Pending | Forge::NotGitHub | Forge::Synced { error: None, .. } => {}
+        }
+    }
+    if let Some(reason) = &board.linear_unavailable {
+        add(ProblemKind::Tickets, reason, None);
+    }
+    // Stable: equally wide problems keep the board's order.
+    problems.sort_by_key(|problem| std::cmp::Reverse(problem.projects.len()));
+    problems
+}
+
+/// One problem in the details: what happened, its exact reason, and every
+/// project it affects, those with no pull requests yet apart.
+fn problem_details<'a>(problem: &Problem<'a>) -> Element<'a, Action> {
+    let list = |label: &str, names: &[&str]| -> Element<'a, Action> {
+        design::caption(format!("{label}{}", names.join(", ")))
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
+            .into()
+    };
+    let mut lines: Vec<Element<'a, Action>> = vec![
+        widget::row::with_children(vec![
+            warning_icon(),
+            design::body(problem.headline()).into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center)
+        .into(),
+        design::caption(problem.reason)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .into(),
-        design::caption(text)
-            .class(cosmic::theme::Text::Custom(design::warning_text))
-            .into(),
-    ])
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .into()
+    ];
+    // A lone project is named by its headline already.
+    if problem.projects.len() > 1 {
+        let read = problem
+            .projects
+            .iter()
+            .copied()
+            .filter(|name| !problem.unread.contains(name))
+            .collect::<Vec<_>>();
+        if problem.unread.is_empty() || read.is_empty() {
+            lines.push(list("", &problem.projects));
+        } else {
+            lines.push(list("Out of date: ", &read));
+            lines.push(list("No pull requests yet: ", &problem.unread));
+        }
+    }
+    widget::column::with_children(lines)
+        .spacing(space::XXS)
+        .width(Length::Fill)
+        .into()
+}
+
+fn warning_icon<'a>() -> Element<'a, Action> {
+    widget::icon(Icon::Warning.handle())
+        .size(design::COMPACT_ICON_SIZE)
+        .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(|theme| {
+            iced::widget::svg::Style {
+                color: Some(design::warning_color(theme)),
+            }
+        })))
+        .into()
+}
+
+/// One line of the status, its icon marking it as a problem and its text
+/// in `ink`; it fades where the header runs out of room, and its tooltip
+/// holds the whole of it.
+fn notice<'a>(text: String, ink: fn(&Theme) -> iced::widget::text::Style) -> Element<'a, Action> {
+    crate::interaction::tooltip(
+        widget::row::with_children(vec![
+            warning_icon(),
+            crate::ui_controls::FadeText::caption(text.clone())
+                .class(cosmic::theme::Text::Custom(ink))
+                .width(Length::Fill)
+                .into(),
+        ])
+        .spacing(space::XS)
+        .align_y(Alignment::Center),
+        text,
+    )
 }
 
 /// A raised card that lifts on hover and stays lifted while its menu is open.
@@ -1561,6 +1886,13 @@ fn activity_label(source: ActivitySource) -> &'static str {
         ActivitySource::Session => "Agent active",
         ActivitySource::Created => "Created",
         ActivitySource::PullRequest => "PR updated",
+    }
+}
+
+fn projects(count: usize) -> String {
+    match count {
+        1 => "1 project".to_owned(),
+        count => format!("{count} projects"),
     }
 }
 
@@ -1692,6 +2024,287 @@ mod tests {
             board,
             first: true,
         }));
+    }
+
+    const RATE_LIMIT: &str = "GitHub rate limit reached. Retrying at 18:42 UTC";
+
+    /// A board of `count` projects, each with a card, that GitHub's rate
+    /// limit stopped reading: the first three had never been read.
+    fn rate_limited(count: usize) -> Arc<Board> {
+        let mut board = board(
+            (0..count)
+                .map(|index| item("main", &format!("project-{index:02}")))
+                .collect(),
+        );
+        for (index, project) in Arc::make_mut(&mut board).projects.iter_mut().enumerate() {
+            project.forge = if index < 3 {
+                Forge::Unavailable {
+                    reason: RATE_LIMIT.into(),
+                }
+            } else {
+                Forge::Synced {
+                    at_unix_ms: 1_000,
+                    error: Some(RATE_LIMIT.into()),
+                }
+            };
+        }
+        board
+    }
+
+    /// What `element` draws as text, in order, each with its bounds, laid
+    /// out `width` wide.
+    fn laid_out(mut element: Element<'_, Action>, width: f32) -> Vec<(String, iced::Rectangle)> {
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        struct Texts<'a>(&'a mut Vec<(String, iced::Rectangle)>);
+        impl iced::advanced::widget::Operation for Texts<'_> {
+            fn traverse(
+                &mut self,
+                operate: &mut dyn FnMut(&mut dyn iced::advanced::widget::Operation<()>),
+            ) {
+                operate(self);
+            }
+            fn text(
+                &mut self,
+                _id: Option<&iced::advanced::widget::Id>,
+                bounds: iced::Rectangle,
+                text: &str,
+            ) {
+                self.0.push((text.to_owned(), bounds));
+            }
+        }
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let mut tree = Tree::new(element.as_widget());
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(iced::Size::ZERO, iced::Size::new(width, 40.0)),
+        );
+        let mut texts = Vec::new();
+        element.as_widget_mut().operate(
+            &mut tree,
+            Layout::new(&node),
+            &renderer,
+            &mut Texts(&mut texts),
+        );
+        texts
+    }
+
+    fn texts(element: Element<'_, Action>) -> Vec<String> {
+        laid_out(element, 1200.0)
+            .into_iter()
+            .map(|(text, _)| text)
+            .collect()
+    }
+
+    #[test]
+    fn one_rate_limit_reads_once_however_many_projects_it_stops() {
+        let mut state = State::default();
+        connected(&mut state, 1, rate_limited(16));
+        let problems = problems(state.board.as_ref().unwrap(), None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        // Out of date for most, unknown for three: the account's one problem.
+        assert_eq!(problems[0].kind, ProblemKind::PullRequestsStale);
+        assert_eq!(problems[0].projects.len(), 16);
+        assert_eq!(
+            problems[0].unread,
+            ["project-00", "project-01", "project-02"]
+        );
+        assert_eq!(
+            problems[0].summary(),
+            format!("Pull requests may be out of date: {RATE_LIMIT}")
+        );
+
+        let texts = texts(state.status().unwrap());
+        assert_eq!(
+            texts,
+            [
+                "16 cards".to_owned(),
+                format!("Pull requests may be out of date: {RATE_LIMIT}"),
+                "· 16 projects".to_owned(),
+            ],
+        );
+    }
+
+    #[test]
+    fn a_reset_past_midnight_comes_after_one_before_it() {
+        assert!(resets_later("00:10 UTC", "23:58 UTC"));
+        assert!(!resets_later("23:58 UTC", "00:10 UTC"));
+        assert!(resets_later("19:05 UTC", "17:59 UTC"));
+        assert!(!resets_later("18:42 UTC", "18:42 UTC"));
+    }
+
+    #[test]
+    fn projects_that_heard_different_resets_share_the_latest() {
+        let mut board = rate_limited(4);
+        let projects = &mut Arc::make_mut(&mut board).projects;
+        // Each project keeps the reset its own last poll heard.
+        projects[0].forge = Forge::Unavailable {
+            reason: "GitHub rate limit reached. Retrying at 17:59 UTC".into(),
+        };
+        projects[3].forge = Forge::Synced {
+            at_unix_ms: 1_000,
+            error: Some("GitHub rate limit reached. Retrying at 19:05 UTC".into()),
+        };
+        let problems = problems(&board, None);
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert_eq!(
+            problems[0].reason,
+            "GitHub rate limit reached. Retrying at 19:05 UTC"
+        );
+        assert_eq!(problems[0].projects.len(), 4);
+    }
+
+    #[test]
+    fn distinct_reasons_stay_distinct_and_the_widest_leads() {
+        let mut board = rate_limited(6);
+        let projects = &mut Arc::make_mut(&mut board).projects;
+        projects[1].forge = Forge::Unavailable {
+            reason: "gh is not signed in to github.example.com".into(),
+        };
+        projects[2].scan_error = Some("not a git repository".into());
+        projects[4].scan_error = Some("permission denied".into());
+        projects[5].scan_error = Some("permission denied".into());
+        Arc::make_mut(&mut board).linear_unavailable = Some("no Linear API key".into());
+        let problems = problems(&board, None);
+        let described = problems
+            .iter()
+            .map(|problem| (problem.summary(), problem.projects.clone()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            described,
+            [
+                (
+                    format!("Pull requests may be out of date: {RATE_LIMIT}"),
+                    vec![
+                        "project-00",
+                        "project-02",
+                        "project-03",
+                        "project-04",
+                        "project-05"
+                    ],
+                ),
+                (
+                    "2 projects could not be read: permission denied".to_owned(),
+                    vec!["project-04", "project-05"],
+                ),
+                (
+                    "Pull requests for project-01 could not be read: \
+                     gh is not signed in to github.example.com"
+                        .to_owned(),
+                    vec!["project-01"],
+                ),
+                (
+                    "project-02 could not be read: not a git repository".to_owned(),
+                    vec!["project-02"],
+                ),
+                (
+                    "Linear tickets could not be looked up: no Linear API key".to_owned(),
+                    vec![],
+                ),
+            ],
+        );
+        let mut state = State::default();
+        connected(&mut state, 1, board);
+        assert_eq!(
+            texts(state.status().unwrap())[1..],
+            [
+                format!("Pull requests may be out of date: {RATE_LIMIT}"),
+                "· +4 more".to_owned(),
+            ],
+        );
+        // Every problem, its reason and its projects, once each.
+        state.update(Action::Problems(true));
+        let details = problems_of(&state)
+            .iter()
+            .flat_map(|problem| texts(problem_details(problem)))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            details
+                .iter()
+                .filter(|text| text.contains("project-02"))
+                .count(),
+            2,
+            "{details:?}"
+        );
+        assert!(details.contains(&"Out of date: project-03, project-04, project-05".to_owned()));
+        assert!(details.contains(&"No pull requests yet: project-00, project-02".to_owned()));
+    }
+
+    fn problems_of(state: &State) -> Vec<Problem<'_>> {
+        problems(state.board.as_ref().unwrap(), state.scope.as_deref())
+    }
+
+    #[test]
+    fn a_lone_problem_names_its_project_and_a_scope_shows_only_its_own() {
+        let limited = rate_limited(3);
+        let scope = limited.projects[1].repository.clone();
+        let mut state = State::default();
+        connected(&mut state, 1, limited);
+        state.update(Action::Scope(Some(scope)));
+        // Still a button: its details hold the whole reason, however narrow.
+        assert_eq!(
+            texts(state.status().unwrap()),
+            [
+                "1 card".to_owned(),
+                format!("Pull requests for project-01 could not be read: {RATE_LIMIT}"),
+            ],
+        );
+    }
+
+    #[test]
+    fn in_a_narrow_window_the_count_keeps_its_room() {
+        let mut state = State::default();
+        connected(&mut state, 1, rate_limited(16));
+        state.update(Action::Watched(Watch::Lost(
+            "the daemon closed the socket".into(),
+        )));
+        state.update(Action::Refreshed(Err(
+            "GitHub did not answer the refresh".into()
+        )));
+        let laid_out = laid_out(state.status().unwrap(), 400.0);
+        let bounds = |wanted: &str| {
+            laid_out
+                .iter()
+                .find(|(text, _)| text == wanted)
+                .unwrap_or_else(|| panic!("{wanted} is drawn: {laid_out:?}"))
+                .1
+        };
+        for fixed in ["16 cards", "Disconnected, retrying", "· 16 projects"] {
+            let fixed = bounds(fixed);
+            assert!(
+                fixed.width > 0.0 && fixed.x + fixed.width <= 400.0,
+                "{fixed:?} in {laid_out:?}"
+            );
+        }
+        // The summary fades in what is left, and the error beside it too.
+        let summary = bounds(&format!("Pull requests may be out of date: {RATE_LIMIT}"));
+        assert!(summary.width > 0.0, "{laid_out:?}");
+        assert!(bounds("GitHub did not answer the refresh").width > 0.0);
+    }
+
+    #[test]
+    fn the_details_close_when_nothing_is_left_to_detail() {
+        let mut state = State::default();
+        connected(&mut state, 1, rate_limited(4));
+        state.update(Action::Problems(true));
+        // Still a problem: the open details follow the board.
+        watched(&mut state, 2, rate_limited(3));
+        assert!(state.problems_open);
+        // Read again: nothing to show, so nothing reopens by itself later.
+        watched(&mut state, 3, board(vec![item("main", "project-00")]));
+        assert!(!state.problems_open);
+        watched(&mut state, 4, rate_limited(4));
+        assert!(state.status().is_some());
+        assert!(!state.problems_open);
+        // Choosing a project, another layout or closing the pane closes them.
+        for leave in [Action::Scope(None), Action::Layout(Layout::List)] {
+            state.update(Action::Problems(true));
+            state.update(leave);
+            assert!(!state.problems_open);
+        }
+        state.update(Action::Problems(true));
+        state.reset();
+        assert!(!state.problems_open);
     }
 
     #[test]

@@ -1486,6 +1486,22 @@ pub struct UnstageRequest {
     pub selection: Vec<PathSelection>,
 }
 
+/// Hunks of one file's diff, for [`RepositoryService::apply_index_patch`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPatchRequest {
+    pub worktree: PathBuf,
+    pub path: RepoPath,
+    /// The index text the hunks were cut from. The patch applies only while
+    /// the index entry still holds exactly these bytes, so it never lands on
+    /// text the user was not shown.
+    pub index: String,
+    /// The patch's `@@` sections, with no file header.
+    pub hunks: String,
+    /// When staging, the working-tree text the added lines were read from;
+    /// `None` when they come from the index or HEAD, as unstaging's do.
+    pub worktree_text: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DiscardRequest {
     pub worktree: PathBuf,
@@ -3240,6 +3256,77 @@ fn classify_bytes(bytes: Vec<u8>) -> DiffSide {
         Ok(text) => DiffSide::Text { text, bytes: size },
         Err(_) => DiffSide::InvalidUtf8 { bytes: size },
     }
+}
+
+/// Checks that `body` is only `@@` sections whose lines match the counts in
+/// their headers, as [`RepositoryService::apply_index_patch`] needs: nothing
+/// after them may reach `git apply` as a further file's patch.
+fn validate_hunks(body: &str) -> Result<(), &'static str> {
+    fn counts(header: &str) -> Option<(u64, u64)> {
+        let (ranges, _) = header.strip_prefix("@@ -")?.split_once(" @@")?;
+        let (old, new) = ranges.split_once(" +")?;
+        let number = |digits: &str| {
+            digits
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+                .then(|| digits.parse::<u64>().ok())
+                .flatten()
+        };
+        let count = |range: &str| {
+            let (start, count) = range.split_once(',').unwrap_or((range, "1"));
+            number(start).and(number(count))
+        };
+        Some((count(old)?, count(new)?))
+    }
+    let mut lines = body.split_inclusive('\n').peekable();
+    if lines.peek().is_none() {
+        return Err("the patch has no hunks");
+    }
+    while let Some(header) = lines.next() {
+        let (mut old, mut new) = counts(header).ok_or("the patch has a malformed hunk header")?;
+        if old == 0 && new == 0 {
+            return Err("the patch has an empty hunk");
+        }
+        while old > 0 || new > 0 {
+            let line = lines
+                .next()
+                .filter(|line| line.ends_with('\n'))
+                .ok_or("a hunk is shorter than its header says")?;
+            match line.as_bytes()[0] {
+                b' ' if old > 0 && new > 0 => (old, new) = (old - 1, new - 1),
+                b'-' if old > 0 => old -= 1,
+                b'+' if new > 0 => new -= 1,
+                _ => return Err("a hunk line does not match its header"),
+            }
+            // The line before it has no final newline.
+            lines.next_if(|line| line.starts_with("\\ ") && line.ends_with('\n'));
+        }
+    }
+    Ok(())
+}
+
+/// A patch file name as Git writes one: bare when it is plain printable
+/// ASCII, otherwise C-quoted, which `git apply` reads back exactly.
+fn quote_patch_name(name: &[u8]) -> Vec<u8> {
+    if name
+        .iter()
+        .all(|byte| byte.is_ascii_graphic() && !matches!(byte, b'"' | b'\\'))
+    {
+        return name.to_vec();
+    }
+    let mut quoted = vec![b'"'];
+    for &byte in name {
+        match byte {
+            b'"' | b'\\' => quoted.extend_from_slice(&[b'\\', byte]),
+            b'\t' => quoted.extend_from_slice(b"\\t"),
+            b'\n' => quoted.extend_from_slice(b"\\n"),
+            b' ' => quoted.push(b' '),
+            byte if byte.is_ascii_graphic() => quoted.push(byte),
+            byte => quoted.extend_from_slice(format!("\\{byte:03o}").as_bytes()),
+        }
+    }
+    quoted.push(b'"');
+    quoted
 }
 
 /// Reads one comparison side from the worktree.
@@ -5801,6 +5888,91 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .stdin(pathspec_input(&indexed));
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
+    }
+
+    /// Applies hunks of one file's diff to its index entry, leaving the
+    /// working tree alone: staging or unstaging part of a file.
+    ///
+    /// The request carries only the `@@` sections; the header naming the
+    /// file is written here, from the validated path, so a patch can never
+    /// reach another one. `git apply` checks every context line against the
+    /// index and writes it once or not at all, so a hunk built from a
+    /// comparison the index has since moved past is refused, not misapplied.
+    pub fn apply_index_patch(
+        &self,
+        request: &IndexPatchRequest,
+        cancellation: &CancellationToken,
+    ) -> Result<MutationOutcome, RepositoryError> {
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let worktree = request.worktree.as_path();
+        let path = &request.path;
+        let rejected = |reason: String| {
+            Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            })
+        };
+        if let Err(problem) = validate_hunks(&request.hunks) {
+            return rejected(format!("{path}: {problem}"));
+        }
+        if let Some(text) = &request.worktree_text {
+            // The new lines are the working file's bytes, as shown. Where
+            // Git's clean filters would change those bytes on staging, as
+            // autocrlf, an eol attribute or LFS do, they are not what
+            // staging the file would record.
+            let hash = |filter: OsString| {
+                let arguments = [OsString::from("hash-object"), filter, "--stdin".into()];
+                self.run_checked(
+                    &self
+                        .git_literal_read(worktree, arguments)
+                        .stdin(text.as_bytes()),
+                    cancellation,
+                )
+                .map(|output| output.stdout)
+            };
+            let mut filtered = OsString::from("--path=");
+            filtered.push(path.as_os_str());
+            if hash(filtered)? != hash("--no-filters".into())? {
+                return rejected(format!(
+                    "{path}: Git converts this file when staging it, so stage the whole file"
+                ));
+            }
+        }
+        let mut entry = OsString::from(":0:");
+        entry.push(path.as_os_str());
+        let index = self.run(
+            &self.git_literal_read(worktree, [OsString::from("cat-file"), "blob".into(), entry]),
+            cancellation,
+        )?;
+        if !index.success || index.stdout != request.index.as_bytes() {
+            return rejected(format!(
+                "{path} changed in the index since this diff was read; try again once it refreshes"
+            ));
+        }
+        let name = |side: &[u8]| {
+            let mut name = side.to_vec();
+            name.extend_from_slice(path.as_bytes());
+            quote_patch_name(&name)
+        };
+        let (old, new) = (name(b"a/"), name(b"b/"));
+        let mut patch = b"diff --git ".to_vec();
+        for (part, separator) in [(&old, &b" "[..]), (&new, b"\n--- "), (&old, b"\n+++ ")] {
+            patch.extend_from_slice(part);
+            patch.extend_from_slice(separator);
+        }
+        patch.extend_from_slice(&new);
+        patch.push(b'\n');
+        patch.extend_from_slice(request.hunks.as_bytes());
+        let command = self
+            .git_mutation(worktree, ["apply", "--cached", "--whitespace=nowarn", "-"])
+            .stdin(patch);
+        Ok(self.run_mutation(
+            &command,
+            vec![path.clone()],
+            MutationScope::AllOrNothing,
+            cancellation,
+        ))
     }
 
     /// Whether `core.sparseCheckout` is on for this worktree.

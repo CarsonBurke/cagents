@@ -20,8 +20,8 @@ use cagents_ui_kit::{
     },
     pull_request_review::{self, ReviewSource},
     repository_widget::{
-        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, LspIntent, OldPath,
-        RepositoryAction, RepositoryFile, RepositoryRuntime,
+        self, ClipboardOp, CompletionTarget, EditorAction, EditorEdit, HunkStaging, LspIntent,
+        OldPath, RepositoryAction, RepositoryFile, RepositoryRuntime,
     },
     sidebar::{
         self, ActiveWorktreeKey, FileCommand, FileSearch, MutationKind, SidebarAction,
@@ -1683,6 +1683,9 @@ impl Editor {
         {
             navigation.restore_expanded_display_paths(paths);
         }
+        if mutation.is_some() {
+            runtime.index_mutation_started();
+        }
         let task = repository_task(runtime.initial_load(id));
         let mut review = pull_request_review::State::new(
             Arc::new(GitHubService::system("gh")),
@@ -2978,6 +2981,44 @@ impl Editor {
         self.stage_selection(id, stage, vec![selection])
     }
 
+    fn stage_hunk(
+        &mut self,
+        id: CardId,
+        hunk: &cagents_ui_kit::diff_view::HunkRef,
+        stage: bool,
+    ) -> Task<Message> {
+        let Some(staging) = self
+            .tab(id)
+            .and_then(|tab| tab.runtime.hunk_staging(hunk, stage))
+        else {
+            return Task::none();
+        };
+        let request = match staging {
+            HunkStaging::File(selection) => {
+                return self.stage_selection(id, stage, vec![selection]);
+            }
+            HunkStaging::Patch(request) => request,
+        };
+        let kind = if stage {
+            MutationKind::Stage
+        } else {
+            MutationKind::Unstage
+        };
+        if self.begin_mutation(id, kind).is_none() {
+            return Task::none();
+        }
+        cosmic::task::future(async move {
+            let result = tokio::task::spawn_blocking(move || {
+                RepositoryService::system("git")
+                    .apply_index_patch(&request, &CancellationToken::default())
+            })
+            .await
+            .map_err(|error| error.to_string())
+            .and_then(|result| result.map_err(|error| error.to_string()));
+            Message::Mutation(id, result)
+        })
+    }
+
     /// A worktree may have several file tabs. Guard and refresh all of them,
     /// including unsaved buffers that are not currently visible.
     fn begin_mutation(&mut self, id: CardId, kind: MutationKind) -> Option<PathBuf> {
@@ -2996,6 +3037,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = Some(kind);
+                tab.runtime.index_mutation_started();
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(Some(kind));
                 }
@@ -3016,6 +3058,7 @@ impl Editor {
         for tab in &mut self.tabs {
             if tab.runtime.descriptor.worktree == root {
                 tab.mutation = None;
+                tab.runtime.index_mutation_finished();
                 if let Some(source) = tab.sidebar.source_control.as_mut() {
                     source.set_mutation(None);
                 }
@@ -3911,6 +3954,9 @@ impl Application for Editor {
                     }
                     if let RepositoryAction::StageSelected { stage, .. } = action {
                         return self.stage(id, stage);
+                    }
+                    if let RepositoryAction::StageHunk { hunk, stage, .. } = &action {
+                        return self.stage_hunk(id, hunk, *stage);
                     }
                     if let RepositoryAction::RefreshFiles { .. } = action {
                         return self.refresh(id);

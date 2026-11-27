@@ -24,12 +24,12 @@ use std::{
 use cagents::repository::{
     CancellationToken, ChangeArea, ChangeKind, CommandSpec, CommitOutcome, CommitRequest,
     ConflictKind, DiffBasis, DiffContent, DiffRequest, DiffSide, DiscardRequest, HeadState,
-    HistoryRequest, HistoryRevision, InProgressOperation, MutationFailure, MutationLocks,
-    MutationOutcome, Oid, OperationKind, PathSelection, ProcessExecutor, ProcessFailure,
-    ProcessFailureKind, ProcessOutput, PushOutcome, PushRequest, PushTarget, RemoteSideRef,
-    RepoPath, RepositoryService, RepositorySnapshot, SnapshotDigest, SnapshotOptions, SnapshotRead,
-    StageRequest, SystemProcessExecutor, TrackingState, UnstageRequest, ValidatedBranchName,
-    ValidatedRefName,
+    HistoryRequest, HistoryRevision, InProgressOperation, IndexPatchRequest, MutationFailure,
+    MutationLocks, MutationOutcome, Oid, OperationKind, PathSelection, ProcessExecutor,
+    ProcessFailure, ProcessFailureKind, ProcessOutput, PushOutcome, PushRequest, PushTarget,
+    RemoteSideRef, RepoPath, RepositoryService, RepositorySnapshot, SnapshotDigest,
+    SnapshotOptions, SnapshotRead, StageRequest, SystemProcessExecutor, TrackingState,
+    UnstageRequest, ValidatedBranchName, ValidatedRefName,
 };
 
 /// Applies configuration isolation and a fixed identity to every command,
@@ -1504,6 +1504,215 @@ fn staging_and_unstaging_keep_newline_and_non_utf8_names_exact() {
         MutationOutcome::Applied { .. }
     ));
     assert_eq!(fixture.text(&["ls-files"]), "base.txt");
+}
+
+/// A hunk patch names its file in a header the service writes, so it lands
+/// on exactly that index entry, however the name has to be spelled, and on
+/// nothing in the working tree. One the index no longer matches is refused
+/// whole.
+#[cfg(unix)]
+#[test]
+fn an_index_patch_changes_only_its_own_index_entry() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let names = [
+        b"plain.txt".as_slice(),
+        b"two words \"quoted\" back\\slash.txt",
+        b"line\nbreak",
+        b"non-utf8-\xff",
+        b"-leading",
+    ];
+    for name in names {
+        fs::write(fixture.work().join(OsStr::from_bytes(name)), b"one\ntwo\n").expect("write");
+    }
+    fixture.write("bystander.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    let service = fixture.service();
+    let apply = |name: &[u8]| {
+        service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: RepoPath::from_bytes(name).expect("path"),
+                    index: "one\ntwo\n".into(),
+                    hunks: "@@ -1,2 +1,2 @@\n one\n-two\n+2\n".into(),
+                    worktree_text: None,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply")
+    };
+    for name in names {
+        assert!(
+            matches!(apply(name), MutationOutcome::Applied { .. }),
+            "{}",
+            String::from_utf8_lossy(name)
+        );
+        let mut blob = b":".to_vec();
+        blob.extend_from_slice(name);
+        assert_eq!(
+            fixture.git_in_work(&[
+                OsStr::new("cat-file"),
+                OsStr::new("blob"),
+                OsStr::from_bytes(&blob)
+            ]),
+            b"one\n2\n"
+        );
+        assert_eq!(
+            fs::read(fixture.work().join(OsStr::from_bytes(name))).expect("read"),
+            b"one\ntwo\n"
+        );
+        // The index has moved past the comparison the hunk came from.
+        assert!(matches!(apply(name), MutationOutcome::NotApplied { .. }));
+    }
+    assert_eq!(
+        fixture
+            .git_in_work(&["diff", "--cached", "--name-only", "-z"])
+            .iter()
+            .filter(|byte| **byte == 0)
+            .count(),
+        names.len()
+    );
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--", "bystander.txt"]),
+        ""
+    );
+}
+
+/// Staging a hunk records the working file's bytes. Where Git's clean
+/// filters would record different ones, that is refused rather than
+/// bypassing them.
+#[test]
+fn staging_a_hunk_of_a_converted_file_is_refused() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write(".gitattributes", b"converted.txt text eol=crlf\n");
+    fixture.write("converted.txt", b"one\r\ntwo\r\n");
+    fixture.write("plain.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    fixture.write("converted.txt", b"one\r\n2\r\n");
+    fixture.write("plain.txt", b"one\n2\n");
+    let service = fixture.service();
+    let stage = |name: &str, hunks: &str| {
+        let shown = fs::read_to_string(fixture.work().join(name)).expect("read");
+        service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: path(name),
+                    index: "one\ntwo\n".into(),
+                    hunks: hunks.into(),
+                    worktree_text: Some(shown),
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply")
+    };
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage("converted.txt", "@@ -1,2 +1,2 @@\n one\r\n-two\r\n+2\r\n")
+    else {
+        panic!("a converted file's hunk must not be staged raw");
+    };
+    assert!(reason.contains("stage the whole file"), "{reason}");
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":converted.txt"]),
+        b"one\ntwo\n"
+    );
+    assert!(matches!(
+        stage("plain.txt", "@@ -1,2 +1,2 @@\n one\n-two\n+2\n"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert!(matches!(
+        stage("plain.txt", "not a hunk\n"),
+        MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { .. }
+        }
+    ));
+}
+
+/// A hunk applies only to the exact index text it was cut from, and its
+/// body can carry nothing but that file's hunks: a stale comparison or a
+/// second file's section smuggled after the hunks changes no index entry.
+#[test]
+fn an_index_patch_applies_only_to_what_it_was_cut_from() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let shown = "1\n2\n3\n4\n5\n6\n7\n8\n9\n";
+    fixture.write("numbers.txt", shown.as_bytes());
+    fixture.write("bystander.txt", b"one\ntwo\n");
+    fixture.commit_all("initial");
+    let service = fixture.service();
+    let apply = |name: &str, index: &str, hunks: &str| {
+        let outcome = service
+            .apply_index_patch(
+                &IndexPatchRequest {
+                    worktree: fixture.work(),
+                    path: path(name),
+                    index: index.into(),
+                    hunks: hunks.into(),
+                    worktree_text: None,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("apply");
+        match outcome {
+            MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected { reason },
+            } => Some(reason),
+            MutationOutcome::Applied { .. } => None,
+            other => panic!("{other:?}"),
+        }
+    };
+    let second = "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n 3\n";
+    // Line 9 changed in the index after the comparison was read. `git apply`
+    // alone would still place this hunk, since its context is untouched.
+    fixture.write("numbers.txt", b"1\n2\n3\n4\n5\n6\n7\n8\nnine\n");
+    fixture.git_in_work(&["add", "numbers.txt"]);
+    let reason = apply("numbers.txt", shown, second).expect("a stale hunk is refused");
+    assert!(reason.contains("changed in the index"), "{reason}");
+    assert_eq!(
+        fixture.text(&["show", ":numbers.txt"]),
+        "1\n2\n3\n4\n5\n6\n7\n8\nnine"
+    );
+
+    let current = "1\n2\n3\n4\n5\n6\n7\n8\nnine\n";
+    for smuggled in [
+        format!(
+            "{second}diff --git a/bystander.txt b/bystander.txt\n--- a/bystander.txt\n\
+             +++ b/bystander.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+2\n"
+        ),
+        format!("{second}+extra\n"),
+        "@@ -1,3 +1,3 @@\n 1\n-2\n+two\n".into(),
+        "@@ -1,1 +1,1 @@\n-1\n+one".into(),
+        "@@ -1 +1 @@ \n-1\n+one\n\\ No newline\n-2\n".into(),
+        String::new(),
+    ] {
+        assert!(
+            apply("numbers.txt", current, &smuggled).is_some(),
+            "accepted {smuggled:?}"
+        );
+    }
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--", "bystander.txt"]),
+        ""
+    );
+    assert_eq!(fixture.text(&["show", ":numbers.txt"]), current.trim_end());
+
+    // The same hunk against the current index applies, and only there.
+    assert_eq!(apply("numbers.txt", current, second), None);
+    assert_eq!(
+        fixture.text(&["show", ":numbers.txt"]),
+        "1\ntwo\n3\n4\n5\n6\n7\n8\nnine"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.work().join("numbers.txt")).expect("read"),
+        current
+    );
 }
 
 #[test]
