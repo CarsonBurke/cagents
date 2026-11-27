@@ -1612,8 +1612,9 @@ impl Cagents {
                         }
                         DeviceRemoval::Unasked(error) => {
                             dialog.unchecked = Some(format!(
-                                "Couldn't check the worktree on {device}: {error}. Deleting \
-                                 asks {device} again before anything closes."
+                                "Couldn't check the worktree on {device}: {}. Deleting \
+                                 asks {device} again before anything closes.",
+                                error.trim_end_matches('.')
                             ));
                         }
                     }

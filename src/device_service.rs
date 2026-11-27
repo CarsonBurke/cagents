@@ -721,10 +721,13 @@ fn removable_worktree(root: &std::path::Path, name: &str) -> Result<PathBuf, Str
         .index_paths(&destination, &cancellation)
         .map_err(|error| error.to_string())?;
     if index.gitlinks
-        && index
-            .paths
-            .iter()
-            .any(|path| destination.join(path.as_os_str()).join(".git").exists())
+        && index.paths.iter().any(|path| {
+            // A tracked symlink is a file entry, even when it points at
+            // a directory holding a `.git`.
+            let entry = destination.join(path.as_os_str());
+            std::fs::symlink_metadata(&entry).is_ok_and(|metadata| metadata.is_dir())
+                && entry.join(".git").exists()
+        })
     {
         return Err(
             "it has checked-out submodules, which Git removes only with --force. Use \
