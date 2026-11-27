@@ -6023,18 +6023,20 @@ impl Runtime {
         )
     }
 
-    /// The search field and list, pinned above the status line the picker
-    /// sits on, or nothing while the picker is closed.
+    /// The provider rail, search field and list, pinned above the status line
+    /// the picker sits on, or nothing while the picker is closed.
     ///
-    /// A started conversation lists its own provider's models. A draft lists
-    /// every provider it could start on, in one list under a heading for
-    /// each, because which agent to talk to is part of choosing the model
-    /// rather than a mode the list is in.
+    /// A started conversation lists its own provider's models. A draft can
+    /// start on any provider, so its rail holds one icon for each and the
+    /// list beside it shows the provider picked there, opening on the
+    /// conversation's own. A search looks across every provider at once,
+    /// grouped under each, so nothing hides behind the rail.
     ///
     /// The shared popover anchors this above its control without changing the
     /// transcript's height or scroll position.
     fn model_search<'a>(&'a self, offers: Vec<Offer<'a>>) -> Option<Element<'a, Message>> {
-        let query = self.model_picker.as_deref()?;
+        let picker = self.model_picker.as_ref()?;
+        let query = picker.query.as_str();
         let provider = self.session.launch.provider;
         let draft = self.choosing();
         let catalog = offers
@@ -6050,7 +6052,15 @@ impl Runtime {
                 catalog,
             }]
         };
-        let models = model_list(
+        let offered =
+            |candidate: &Provider| offers.iter().any(|offer| offer.provider == *candidate);
+        let browsing = picker
+            .provider
+            .filter(offered)
+            .or_else(|| offered(&provider).then_some(provider))
+            .or_else(|| offers.first().map(|offer| offer.provider))
+            .unwrap_or(provider);
+        let (models, matches) = model_list(
             self.target,
             &offers,
             draft,
@@ -6062,95 +6072,95 @@ impl Runtime {
                     .or(self.chosen_model().id),
             ),
             query,
+            browsing,
         );
-        let mut sections = vec![models];
+        let searching = !query.trim().is_empty();
+        let rail = model_rail(
+            self.target,
+            &offers,
+            browsing,
+            searching.then_some(matches.as_slice()),
+        );
+        let mut settings: Vec<Element<'a, Message>> = Vec::new();
         if self.snapshot.capabilities.reasoning_selection
             && let Some(model) = self.chosen_model().model(&self.snapshot)
             && !model.reasoning.is_empty()
         {
             let default_effort = reasoning_default(&self.snapshot, model, catalog);
-            let mut choices = vec![picker_section_header(
-                widget::row::with_children(vec![
-                    iced::widget::Space::new()
-                        .width(f32::from(design::COMPACT_ICON_SIZE))
-                        .into(),
+            settings.push(
+                widget::container(
                     design::caption("Reasoning effort")
-                        .class(cosmic::theme::Text::Custom(design::muted_text))
-                        .into(),
-                ])
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center)
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
+                )
+                .padding([0.0, step::GAP_S])
                 .into(),
-                step::GAP_XS,
-            )];
-            choices.extend(
-                reasoning_rows(model, default_effort)
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, (effort, title))| {
-                        picker_choice_row(
-                            title.clone(),
-                            None,
-                            title,
-                            card_control_id(
-                                self.target.card,
-                                &match effort {
-                                    None => "chat-reasoning-choice-default".into(),
-                                    Some(_) => format!("chat-reasoning-choice-{}", index - 1),
-                                },
-                            ),
-                            effort == self.chosen_model().reasoning,
-                            action(Action::Reasoning(
-                                self.target,
-                                model.id.clone(),
-                                effort.map(str::to_owned),
-                            )),
-                        )
-                    }),
             );
-            sections.push(
-                widget::column::with_children(choices)
+            settings.push(reasoning_control(
+                self.target,
+                model,
+                default_effort,
+                self.chosen_model().reasoning,
+            ));
+        }
+        if let Some(mode) = &self.snapshot.fast_mode {
+            let available = !self.disconnected
+                && !self.snapshot.exited
+                && self.queued.is_none()
+                && self.snapshot.ready
+                && self.snapshot.capabilities.fast_mode
+                && self.snapshot.read_only_reason.is_none()
+                && mode.changeable();
+            let target = self.target;
+            let enabled = mode.enabled();
+            let label = match mode.state {
+                crate::chat::FastModeState::Cooldown => "Fast mode · cooling down",
+                _ => "Fast mode",
+            };
+            settings.push(crate::interaction::tooltip(
+                widget::container(
+                    crate::ui_controls::field::toggle(enabled)
+                        .label(label.to_owned())
+                        .text_size(design::TEXT_CAPTION)
+                        .width(Length::Fill)
+                        .id(card_control_id(target.card, "chat-fast-mode"))
+                        .on_toggle_maybe(available.then_some(move |enabled| {
+                            action(Action::Command(target, Command::SetFastMode { enabled }))
+                        })),
+                )
+                .padding([space::XXS, step::GAP_S]),
+                fast_mode_tooltip(mode),
+            ));
+        }
+        let mut pane = vec![models];
+        if !settings.is_empty() {
+            pane.push(design::horizontal_rule());
+            pane.push(
+                widget::column::with_children(settings)
+                    .spacing(step::GAP_XS)
+                    // The effort's edges line up with the model rows above,
+                    // which leave room for the list's scrollbar.
                     .padding(design::with_vertical_rail(iced::Padding::ZERO))
                     .into(),
             );
         }
-        let Some(mode) = &self.snapshot.fast_mode else {
-            return Some(
-                widget::column::with_children(sections)
-                    .width(design::MODEL_POPUP_WIDTH)
-                    .spacing(step::GAP_S)
-                    .into(),
-            );
-        };
-        let available = !self.disconnected
-            && !self.snapshot.exited
-            && self.queued.is_none()
-            && self.snapshot.ready
-            && self.snapshot.capabilities.fast_mode
-            && self.snapshot.read_only_reason.is_none()
-            && mode.changeable();
-        let label = match mode.state {
-            crate::chat::FastModeState::Off => "Fast mode: off",
-            crate::chat::FastModeState::On => "Fast mode: on",
-            crate::chat::FastModeState::Cooldown => "Fast mode: cooldown",
-        };
-        let control = crate::interaction::tooltip(
-            crate::ui_controls::button::quiet(label).on_press_maybe(available.then(|| {
-                action(Action::Command(
-                    self.target,
-                    Command::SetFastMode {
-                        enabled: !mode.enabled(),
-                    },
-                ))
-            })),
-            fast_mode_tooltip(mode),
-        );
-        sections.push(control);
         Some(
-            widget::column::with_children(sections)
-                .width(design::MODEL_POPUP_WIDTH)
-                .spacing(step::GAP_XS)
-                .into(),
+            widget::row::with_children(vec![
+                rail,
+                design::vertical_rule(),
+                widget::column::with_children(pane)
+                    .spacing(step::GAP_S)
+                    // The width is stated rather than left to the content:
+                    // without it the panel spanned the pane and the list
+                    // became a wall of slugs, and a panel that hugged its
+                    // widest row would change width with every keystroke.
+                    .width(design::MODEL_POPUP_WIDTH)
+                    .into(),
+            ])
+            .spacing(step::GAP_XS)
+            // The rule takes the height of the rail or the pane, whichever
+            // is taller, rather than every pixel the popover could have.
+            .height(Length::Shrink)
+            .into(),
         )
     }
 
@@ -9162,8 +9172,228 @@ fn picker_choice_row<'a>(
     }
 }
 
+/// How wide a provider's tile on the model picker's rail is, and tall.
+const MODEL_RAIL_TILE: f32 = design::ROW_HEIGHT;
+/// The mark beside the provider the rail shows.
+const MODEL_RAIL_BAR: f32 = 3.0;
+/// The dot on a provider with models matching a search.
+const MODEL_RAIL_DOT: f32 = 6.0;
+/// How far a provider without matches recedes while searching.
+const MODEL_RAIL_DIMMED: f32 = 0.35;
+
+/// The model picker's provider rail: one icon per provider in `offers`,
+/// `browsing` marked as the one listed.
+///
+/// While searching, `matches` names the providers with models that match:
+/// each carries a dot and the rest recede, and none is marked, because the
+/// list beside the rail then holds every provider's matches.
+fn model_rail<'a>(
+    target: Target,
+    offers: &[Offer<'a>],
+    browsing: Provider,
+    matches: Option<&[Provider]>,
+) -> Element<'a, Message> {
+    let tiles = offers.iter().map(|offer| {
+        let provider = offer.provider;
+        let selected = matches.is_none() && provider == browsing;
+        let found = matches.map(|matches| matches.contains(&provider));
+        let label = family_label(provider);
+        let glyph: Element<'a, Message> = widget::container(
+            widget::icon(crate::ui_controls::provider_icon(provider))
+                .size(design::ROW_ICON_SIZE)
+                .opacity(if found == Some(false) {
+                    MODEL_RAIL_DIMMED
+                } else {
+                    1.0
+                }),
+        )
+        .center(Length::Fill)
+        .into();
+        // The dot is part of the tile, so the tile stays one control that
+        // assistive technology names and the pointer hovers as a whole.
+        let glyph = if found == Some(true) {
+            iced::widget::stack![
+                glyph,
+                widget::container(
+                    widget::container(
+                        iced::widget::Space::new()
+                            .width(MODEL_RAIL_DOT)
+                            .height(MODEL_RAIL_DOT)
+                    )
+                    .class(cosmic::theme::Container::custom(|theme| {
+                        widget::container::Style {
+                            background: Some(iced::Background::Color(design::accent_color(theme))),
+                            border: iced::Border {
+                                radius: (MODEL_RAIL_DOT / 2.0).into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    }))
+                )
+                .align_right(Length::Fill)
+                .align_bottom(Length::Fill)
+                .padding(space::XS),
+            ]
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .into()
+        } else {
+            glyph
+        };
+        let tile = widget::button::custom(glyph)
+            .name(label)
+            .id(card_control_id(
+                target.card,
+                &format!("chat-model-rail-{provider:?}"),
+            ))
+            .selected(selected)
+            .class(crate::ui_controls::control_style(selected, None))
+            .padding(0)
+            .width(MODEL_RAIL_TILE)
+            .height(MODEL_RAIL_TILE)
+            .on_press(action(Action::ModelRail(target, provider)));
+        let tile = match found {
+            Some(true) => tile.description("Has matching models"),
+            Some(false) => tile.description("No matching models"),
+            None if selected => tile.description("Selected"),
+            None => tile,
+        };
+        let bar = widget::container(
+            iced::widget::Space::new()
+                .width(MODEL_RAIL_BAR)
+                .height(space::L),
+        )
+        .class(cosmic::theme::Container::custom(move |theme| {
+            widget::container::Style {
+                background: selected.then(|| iced::Background::Color(design::accent_color(theme))),
+                border: iced::Border {
+                    radius: (MODEL_RAIL_BAR / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }));
+        widget::row::with_children(vec![
+            bar.into(),
+            crate::interaction::tooltip_beside(tile, label),
+        ])
+        .spacing(space::XXS)
+        .align_y(Alignment::Center)
+        .into()
+    });
+    widget::column::with_children(tiles.collect::<Vec<_>>())
+        .spacing(space::XS)
+        .into()
+}
+
+/// What a level of reasoning effort is called on its segment, where six of
+/// them share the picker's width. Its full name is [`effort_label`].
+fn effort_segment_label(effort: &str) -> Cow<'_, str> {
+    match effort {
+        "minimal" => "Min".into(),
+        "low" => "Low".into(),
+        "medium" => "Med".into(),
+        "high" => "High".into(),
+        "xhigh" => "XHigh".into(),
+        "max" => "Max".into(),
+        _ => effort.into(),
+    }
+}
+
+/// The reasoning effort `model` offers, as one row of segments: the
+/// provider's default, then each level. `chosen` is selected.
+fn reasoning_control<'a>(
+    target: Target,
+    model: &'a chat::Model,
+    default: Option<&str>,
+    chosen: Option<&str>,
+) -> Element<'a, Message> {
+    let segments = reasoning_rows(model, default)
+        .into_iter()
+        .enumerate()
+        .map(|(index, (effort, title))| {
+            let selected = effort == chosen;
+            let label = effort.map_or(Cow::Borrowed("Default"), effort_segment_label);
+            let segment = widget::button::custom(
+                widget::container(
+                    design::caption(label)
+                        .class(if selected {
+                            cosmic::theme::Text::Custom(|theme| iced::widget::text::Style {
+                                color: Some(crate::ui_controls::on_accent_color(theme)),
+                                ..Default::default()
+                            })
+                        } else {
+                            cosmic::theme::Text::Default
+                        })
+                        .wrapping(iced::widget::text::Wrapping::None),
+                )
+                .center_x(Length::Fill),
+            )
+            .name(title.clone())
+            .id(card_control_id(
+                target.card,
+                &match effort {
+                    None => "chat-reasoning-choice-default".into(),
+                    Some(_) => format!("chat-reasoning-choice-{}", index - 1),
+                },
+            ))
+            .selected(selected)
+            .class(if selected {
+                effort_selected_style()
+            } else {
+                crate::ui_controls::control_style(false, None)
+            })
+            .padding([space::XS, 0.0])
+            .width(Length::Fill)
+            .on_press(action(Action::Reasoning(
+                target,
+                model.id.clone(),
+                effort.map(str::to_owned),
+            )));
+            let segment = if selected {
+                segment.description("Selected")
+            } else {
+                segment
+            };
+            // The default's segment is too narrow to say which level it is.
+            match (effort, default) {
+                (None, Some(_)) => crate::interaction::tooltip(segment, title),
+                _ => segment.into(),
+            }
+        })
+        .collect();
+    crate::ui_controls::segmented_controls(segments)
+}
+
+/// The chosen effort's segment: filled with the accent, so the level the
+/// next turn runs at reads at a glance among its peers.
+fn effort_selected_style() -> cosmic::theme::Button {
+    let appearance = |focused: bool, theme: &cosmic::Theme| {
+        crate::ui_controls::focus_ring(
+            widget::button::Style {
+                background: Some(iced::Background::Color(design::accent_color(theme))),
+                text_color: Some(crate::ui_controls::on_accent_color(theme)),
+                ..design::button_style()
+            },
+            focused,
+            theme,
+        )
+    };
+    cosmic::theme::Button::Custom {
+        active: Box::new(appearance),
+        disabled: Box::new(move |theme| appearance(false, theme)),
+        hovered: Box::new(appearance),
+        pressed: Box::new(appearance),
+    }
+}
+
 /// The search field and the models `query` names among `offers`, under a
-/// heading for each provider where there is more than one to choose from.
+/// heading for each provider where there is more than one to choose from,
+/// and the providers with a match.
+///
+/// An empty query lists `browsing`'s models alone, as the rail picked them;
+/// a search spans every provider.
 ///
 /// `current` is the provider and model the conversation is on. It stays in
 /// the list and stays marked, because the first thing a reader opening this
@@ -9174,14 +9404,25 @@ fn model_list<'a>(
     draft: bool,
     current: (Provider, Option<&str>),
     query: &'a str,
-) -> Element<'a, Message> {
-    let groups = model_rows(offers, query, draft);
+    browsing: Provider,
+) -> (Element<'a, Message>, Vec<Provider>) {
+    let searching = !query.trim().is_empty();
+    let listed_offers = if searching {
+        offers
+    } else {
+        offers
+            .iter()
+            .position(|offer| offer.provider == browsing)
+            .map_or(offers, |index| &offers[index..=index])
+    };
+    let groups = model_rows(listed_offers, query, draft);
+    let matches = groups.iter().map(|(provider, _)| *provider).collect();
     // Only a search has a best match; Enter on an empty one would move the
     // conversation to whatever happens to be listed first.
     let top = groups
         .first()
         .and_then(|(_, rows)| rows.first())
-        .filter(|_| !query.trim().is_empty())
+        .filter(|_| searching)
         .map(|row| row.choose(target, draft));
     let headed = draft && offers.len() > 1;
     let mut rows: Vec<Element<'a, Message>> = Vec::new();
@@ -9267,10 +9508,10 @@ fn model_list<'a>(
             ));
         }
     }
-    widget::column::with_children(vec![
+    let list = widget::column::with_children(vec![
         crate::ui_controls::field::search(
             if headed {
-                "Search models and providers"
+                "Search all models"
             } else {
                 "Search models"
             },
@@ -9302,11 +9543,9 @@ fn model_list<'a>(
         .into(),
     ])
     .spacing(step::GAP_XS)
-    // The width is stated rather than left to the content: without it the
-    // panel spanned the pane and the list became the wall of slugs this
-    // replaces.
-    .width(design::MODEL_POPUP_WIDTH)
-    .into()
+    .width(Length::Fill)
+    .into();
+    (list, matches)
 }
 
 #[cfg(test)]
