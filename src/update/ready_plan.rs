@@ -783,6 +783,9 @@ fn resume_reserved(
             }
         };
         if !exited.success() {
+            if refreshed_reservation(&original)?.is_none() {
+                return settled_bin(&original, &source);
+            }
             return Err(invalid(
                 "The approved update could not finish starting the staged build",
             ));
@@ -872,6 +875,11 @@ impl Reservation<'_> {
             ));
         }
         guard.verify_cutover_windows(slots, &executable)?;
+        if !self.verify_held_return_daemon(source)? {
+            return Err(invalid(
+                "The original service stopped before its return settled",
+            ));
+        }
         let store = Store::observe_existing()
             .map_err(invalid)?
             .ok_or_else(|| invalid("The held return has no saved-work reservation"))?;
