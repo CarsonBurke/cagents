@@ -2080,6 +2080,15 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     ),
 ];
 
+/// The new-tab menu's choices. A device window leaves out Resume
+/// conversation, which searches this computer's saved conversations (#688).
+pub(super) fn new_tab_choices()
+-> impl Iterator<Item = (&'static str, &'static str, NewTab, &'static str)> {
+    NEW_TAB_CHOICES
+        .into_iter()
+        .filter(|(_, _, kind, _)| !matches!(kind, NewTab::Resume) || super::resume_ui::available())
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     HoverTab(Option<CardId>),
@@ -2421,9 +2430,8 @@ impl Cagents {
     /// popup always has its close control.
     fn popup_focus_ring(&self, popup: Popup) -> Vec<Cow<'static, str>> {
         match popup {
-            Popup::NewTab => NEW_TAB_CHOICES
-                .iter()
-                .map(|(_, _, _, id)| Cow::Borrowed(*id))
+            Popup::NewTab => new_tab_choices()
+                .map(|(_, _, _, id)| Cow::Borrowed(id))
                 .collect(),
             Popup::Attention => {
                 let mut ring = vec![Cow::Borrowed("attention.close")];
@@ -2935,37 +2943,35 @@ impl Cagents {
             enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
         );
         let content = (self.chrome_ui.popup == Some(Popup::NewTab) && enabled).then(|| {
-            let items = NEW_TAB_CHOICES
-                .into_iter()
-                .map(|(label, description, kind, id)| {
-                    let icon = match kind {
-                        NewTab::Terminal => Icon::Terminal.handle(),
-                        NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
-                        NewTab::Browser => Icon::Browser.handle(),
-                    };
-                    let tooltip = match kind {
-                        NewTab::Thread => workspace_widget::shortcut_tooltip(
-                            workspace_widget::GlobalShortcut::NewThread,
-                            &self.settings.keyboard_shortcuts,
-                        ),
-                        NewTab::Terminal => workspace_widget::shortcut_tooltip(
-                            workspace_widget::GlobalShortcut::NewTerminal,
-                            &self.settings.keyboard_shortcuts,
-                        ),
-                        NewTab::Browser | NewTab::Resume => description.to_owned(),
-                    };
-                    crate::interaction::tooltip(
-                        crate::ui_controls::popover_item(
-                            icon,
-                            label,
-                            description,
-                            Message::ChromeUi(Action::Launch(kind)),
-                        )
-                        .id(widget::Id::new(id))
-                        .name(format!("New {label} tab")),
-                        tooltip,
+            let items = new_tab_choices().map(|(label, description, kind, id)| {
+                let icon = match kind {
+                    NewTab::Terminal => Icon::Terminal.handle(),
+                    NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
+                    NewTab::Browser => Icon::Browser.handle(),
+                };
+                let tooltip = match kind {
+                    NewTab::Thread => workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewThread,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                    NewTab::Terminal => workspace_widget::shortcut_tooltip(
+                        workspace_widget::GlobalShortcut::NewTerminal,
+                        &self.settings.keyboard_shortcuts,
+                    ),
+                    NewTab::Browser | NewTab::Resume => description.to_owned(),
+                };
+                crate::interaction::tooltip(
+                    crate::ui_controls::popover_item(
+                        icon,
+                        label,
+                        description,
+                        Message::ChromeUi(Action::Launch(kind)),
                     )
-                });
+                    .id(widget::Id::new(id))
+                    .name(format!("New {label} tab")),
+                    tooltip,
+                )
+            });
             widget::column::with_children(vec![
                 widget::container(design::heading("New tab"))
                     .padding([6.0, space::S])

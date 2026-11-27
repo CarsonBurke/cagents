@@ -62,6 +62,14 @@ fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
     .unwrap();
     // Selection is configuration-only: no SSH or provider is started.
     crate::device::select(Some("fixture")).unwrap();
+    // The composer doesn't offer /resume where it would only be refused.
+    let caret = text_editor::Position { line: 0, column: 5 };
+    let token = super::completion::Token::at("/resu", caret, &['/'], || true).unwrap();
+    assert!(
+        super::completion::candidates(&chat_runtime(&app, card).snapshot, &token)
+            .iter()
+            .all(|candidate| candidate.name != super::RESUME_COMMAND)
+    );
 
     drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
     assert!(!app.resume_ui.open);
@@ -70,7 +78,7 @@ fn remote_resume_command_preserves_draft_without_opening_desktop_history() {
     assert!(chat_runtime(&app, card).handle().is_none());
     assert_eq!(
         app.notices.recent().next().unwrap().notice.message,
-        "Conversation history is not available on remote devices yet"
+        super::super::resume_ui::unavailable_message()
     );
 
     // The picker entry itself also refuses callers that bypass update.

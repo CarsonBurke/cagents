@@ -1070,7 +1070,7 @@ impl Cagents {
 
     /// The results the query matches, best first, built afresh from the
     /// workspace rather than read from what the palette keeps.
-    fn palette_entries(&self) -> Vec<(String, String, Message)> {
+    pub(super) fn palette_entries(&self) -> Vec<(String, String, Message)> {
         self.filter_palette_entries(self.palette_candidates())
     }
 
@@ -1116,11 +1116,13 @@ impl Cagents {
                 ));
             }
         }
-        entries.push((
-            "Resume conversation".into(),
-            "Search saved native chats".into(),
-            Message::ResumeConversation(resume_ui::Action::Open),
-        ));
+        if resume_ui::available() {
+            entries.push((
+                "Resume conversation".into(),
+                "Search saved native chats".into(),
+                Message::ResumeConversation(resume_ui::Action::Open),
+            ));
+        }
         entries.push((
             "Open Work board".into(),
             "Every worktree and branch in progress".into(),

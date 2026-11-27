@@ -14,6 +14,23 @@ mod catalog;
 mod scan;
 pub(super) use scan::{HEAD_BYTES, first_prompt};
 
+/// Why a device window can't resume a conversation, naming the device.
+pub(super) fn unavailable_message() -> String {
+    let device = crate::device::selected()
+        .map(|device| device.name.clone())
+        .unwrap_or_else(|| "this device".into());
+    format!(
+        "Resuming an earlier conversation isn't available for {device} yet. Start a new \
+         conversation, or resume it in cagents on {device}."
+    )
+}
+
+/// Whether this window can search for saved conversations. The search reads
+/// this computer's provider histories, so a device window has none (#688).
+pub(super) fn available() -> bool {
+    !crate::device::is_remote()
+}
+
 /// Conversations read before the first found ones are listed, so the newest
 /// appear at once, and between later listings.
 const FIRST_BATCH: usize = 64;
@@ -892,10 +909,8 @@ fn resume_selection_offset(selected: usize, viewport: f32, content: f32, current
 
 impl Cagents {
     fn resume_history_is_available(&mut self) -> bool {
-        if crate::device::is_remote() {
-            self.status = Some(TransientNotice::warning(
-                "Conversation history is not available on remote devices yet",
-            ));
+        if !available() {
+            self.status = Some(TransientNotice::warning(unavailable_message()));
             return false;
         }
         true
