@@ -953,6 +953,35 @@ class ReleaseCut(unittest.TestCase):
         refused = self.release("cut", "--actions", "--macos-host", "mac")
         self.assertIn("builds no macOS release", refused.stderr)
 
+    def test_dry_run_checks_both_platforms_without_touching_tags_or_an_existing_cut(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        macos = self.commit("feat(release): build the macOS release")
+        self.git("push", "-q", "origin", "main")
+        self.git("update-ref", "refs/tags/remote-only", macos, cwd=self.origin)
+        self.bundle(macos)
+        bundle = self.root / "bundles/0.2.4"
+        bundle.mkdir(parents=True)
+        signature = bundle / "release-metadata.json.sig"
+        signature.write_text("existing signature")
+        tags = self.git("show-ref", "--tags")
+        remote_tags = self.git("show-ref", "--tags", cwd=self.origin)
+        self.env["CAGENTS_RELEASE_SIGNING_KEY"] = "fixture-key"
+        args = ("cut", "--commit", macos, "--macos-host", "mac", "--dry-run")
+
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(f"Dry run verified v0.2.4 from {macos}", result.stdout)
+        self.assertTrue(any(line.startswith("package-macos ") for line in self.log("calls.log")))
+        (self.root / "macos-damaged").touch()
+        result = self.release(*args)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not match its checksums", result.stderr)
+        self.assertEqual(self.git("show-ref", "--tags"), tags)
+        self.assertEqual(self.git("show-ref", "--tags", cwd=self.origin), remote_tags)
+        self.assertEqual(signature.read_text(), "existing signature")
+        self.assertEqual(list(bundle.parent.glob(".dry-run-*")), [])
+        self.assertFalse(any(line.startswith(("sign ", "publish ")) for line in self.log("calls.log")))
+
     def test_cut_reuses_only_the_prepared_mac_bundle_for_the_selected_commit(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
         prepared = self.commit("feat(release): build the macOS release")

@@ -33,7 +33,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/release COMMAND [VERSION] [OPTIONS]
 
-  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY] [--build-host HOST] [--macos-host MAC]
+  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY | --dry-run] [--build-host HOST] [--macos-host MAC]
                    Release a bundle HOST already built: the newest bundle of
                    main whose tests passed, or SHA's. Says how far it is
                    behind main and offers to wait for a prebuild of the tip
@@ -49,6 +49,9 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    --macos-host (default CAGENTS_RELEASE_MACOS_HOST), MAC
                    reuses the commit's prepared Apple Silicon bundle, or
                    builds, signs it ad hoc and smoke-tests it if needed.
+                   --dry-run assembles and verifies the bundle in a
+                   temporary directory without changing tags or signing
+                   release metadata.
   prepare-macos [--commit SHA] [--macos-host MAC]
                    Build and smoke-test the Apple Silicon assets for SHA
                    (default: main's tip) before cutting. The cache is keyed
@@ -129,6 +132,7 @@ FROM_DRAFT=false
 ACTIONS=false
 YES=false
 MACOS_FLAG=false
+DRY_RUN=false
 while (($#)); do
     case $1 in
         --notes|--build-host|--macos-host|--feed|--commit|--key)
@@ -141,6 +145,7 @@ while (($#)); do
             shift 2
             ;;
         --wait) WAIT=true; shift ;;
+        --dry-run) DRY_RUN=true; shift ;;
         --staged) STAGED=true; shift ;;
         --from-draft) FROM_DRAFT=true; shift ;;
         --actions) ACTIONS=true; shift ;;
@@ -155,6 +160,8 @@ done
 [[ $ACTIONS == false || $COMMAND == cut || $COMMAND == publish ]] || fail '--actions is for cut and publish'
 [[ $YES == false || $COMMAND == publish ]] || fail '--yes is for publish'
 [[ $ACTIONS == false || -z $KEY ]] || fail '--actions signs in GitHub Actions; drop --key'
+[[ $DRY_RUN == false || ( $COMMAND == cut && $ACTIONS == false && -z $KEY ) ]] \
+    || fail '--dry-run is for local cuts without --key'
 [[ $MACOS_FLAG == false || $ACTIONS == false ]] || fail 'GitHub Actions builds no macOS release yet; cut it here with --macos-host'
 [[ $MACOS_FLAG == false || $COMMAND == cut || $COMMAND == build || $COMMAND == prepare-macos ]] \
     || fail '--macos-host is for cut, build and prepare-macos'
@@ -632,6 +639,7 @@ HOST
 NOTES_FILE=
 TIP_PREBUILD_PID=
 CUT_LINUX_ARCHIVE=
+CUT_DRY_RUN_DIR=
 cut_cleanup() {
     if [[ -n $TIP_PREBUILD_PID ]]; then
         # This is the only background job cut starts. Use the job table so a
@@ -640,6 +648,7 @@ cut_cleanup() {
         wait "$TIP_PREBUILD_PID" || :
     fi
     [[ -z $CUT_LINUX_ARCHIVE ]] || rm -f -- "$CUT_LINUX_ARCHIVE"
+    [[ -z $CUT_DRY_RUN_DIR ]] || rm -rf -- "$CUT_DRY_RUN_DIR"
     [[ -z $NOTES_FILE ]] || rm -f -- "$NOTES_FILE"
     unpin_bundle
 }
@@ -648,11 +657,13 @@ cut_cleanup() {
 cut_release() {
     local status released selected sha behind tip answer bundle protocol previous key building
     local prebuild_status=0 tip_version
+    local -a fetch_options=()
     trap cut_cleanup EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    repository_git fetch --quiet origin main
+    [[ $DRY_RUN == false ]] || fetch_options+=(--no-tags)
+    repository_git fetch --quiet "${fetch_options[@]}" origin main
     MAIN=$(repository_git rev-parse --verify origin/main)
     tip=$MAIN
     status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
@@ -725,7 +736,9 @@ cut_release() {
         pushed=$(repository_git ls-remote --tags origin "refs/tags/$TAG" "refs/tags/$TAG^{}" | sort -k2 | tail -n1 | awk '{print $1}')
         [[ $pushed == "$sha" && $ACTIONS == false ]] \
             || fail "$TAG is on origin at ${pushed:-an unknown commit} but not published; finish it with scripts/release publish $VERSION$([[ $ACTIONS == true ]] && printf ' --actions'), or cut that commit here: scripts/release cut --commit $pushed --key KEY"
-        repository_git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG" || fail "cannot fetch $TAG from origin"
+        if [[ $DRY_RUN == false ]]; then
+            repository_git fetch --quiet --force origin "refs/tags/$TAG:refs/tags/$TAG" || fail "cannot fetch $TAG from origin"
+        fi
         printf '%s is on origin but not published; cutting it here, from the same tag.\n' "$TAG"
     fi
     if [[ $ACTIONS == true ]]; then
@@ -747,6 +760,10 @@ cut_release() {
         return
     fi
     bundle=$BUNDLES/$VERSION
+    if [[ $DRY_RUN == true ]]; then
+        CUT_DRY_RUN_DIR=$(mktemp -d "$BUNDLES/.dry-run-$VERSION.XXXXXXXXXX")
+        bundle=$CUT_DRY_RUN_DIR/$VERSION
+    fi
     # Not on origin, so an earlier cut of this version was never published:
     # this one replaces it once it is copied and checked.
     if [[ -e $bundle/release-metadata.json.sig ]]; then
@@ -786,6 +803,13 @@ cut_release() {
     rm -- "$bundle.partial/release-metadata.json"
     "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$sha" --protocol "$protocol" --notes "$NOTES" >/dev/null
+    if [[ $DRY_RUN == true ]]; then
+        "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
+            --source-commit "$sha" >/dev/null
+        printf 'Dry run verified %s from %s. Its notes:\n\n' "$TAG" "$sha"
+        jq -r .notes "$bundle.partial/release-metadata.json" | sed 's/^/  /'
+        return
+    fi
     if [[ -e $bundle ]]; then
         printf 'Replacing the unpublished cut of %s.\n' "$TAG"
         rm -rf -- "$bundle"
