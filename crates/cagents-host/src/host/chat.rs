@@ -3205,6 +3205,21 @@ fn start_publishing(
             )
         }
         .map_err(|message| {
+            // A start in an agent's directory owns its launch as an agent's
+            // run does: a provider it left starting is ended here, since no
+            // run holds it to end later.
+            let message = match (&agent_directory, &execution) {
+                (Some(_), Some(context)) if !remote => match context.reconcile_cleanup() {
+                    Ok(
+                        chat::protocol::LaunchOutcome::NoProvider
+                        | chat::protocol::LaunchOutcome::TeardownProved,
+                    ) => message,
+                    cleanup => format!(
+                        "{message}. The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
+                    ),
+                },
+                _ => message,
+            };
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| retryable_unavailable(message))

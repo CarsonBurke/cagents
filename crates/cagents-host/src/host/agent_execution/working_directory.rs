@@ -208,14 +208,6 @@ pub(in crate::host) fn open_for_start(
     })
 }
 
-/// [`open_for_start`] for an agent no provider serves: the directory is
-/// recorded at once, since nothing runs anywhere else.
-pub(super) fn for_start(registry: &SharedRegistry, agent: &Agent) -> Result<Arc<File>, String> {
-    let opened = open_for_start(registry, agent)?;
-    opened.started(registry)?;
-    Ok(opened.directory)
-}
-
 /// Opens the directory of the open agent whose conversation `session` starts
 /// or reopens, when it is an agent's. A window, an update or an account switch
 /// may start that conversation as the agent service does, and the provider

@@ -1013,6 +1013,9 @@ fn dispatch(
         .validate_agent_dispatch(accepted)
         .map_err(before)?;
     let path = &accepted.agent.spec.target.directory;
+    // A directory judged for this run's start, recorded once the provider
+    // runs in it.
+    let mut judged = None;
     let directory = match directory {
         // Opened and checked by the caller: a new agent's acceptance, or an
         // automation's firing. An agent keeps the directory it began with.
@@ -1034,7 +1037,11 @@ fn dispatch(
                 .map_err(before)?;
             if !matches!(accepted.agent.session, Some(HostedSession::Chat(_))) {
                 // This run starts the agent's provider.
-                Some(working_directory::for_start(&registry, &accepted.agent).map_err(before)?)
+                let opened = working_directory::open_for_start(&registry, &accepted.agent)
+                    .map_err(before)?;
+                let directory = opened.directory.clone();
+                judged = Some(opened);
+                Some(directory)
             } else {
                 // A provider serves the agent already, in the recorded
                 // directory: its path must still name that one. One started
@@ -1151,6 +1158,11 @@ fn dispatch(
                 "Provider start returned an unexpected response".into(),
             ));
         };
+        if let Some(opened) = &judged
+            && let Err(error) = opened.started(&registry)
+        {
+            tracing::warn!(agent=%accepted.agent.id, %error, "The agent's directory was not recorded");
+        }
         let handle = host
             .lock()
             .unwrap_or_else(|p| p.into_inner())

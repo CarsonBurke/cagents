@@ -3968,9 +3968,13 @@ fn a_start_judges_a_directory_that_is_not_the_recorded_one() {
     };
     let recorded = || registry.lock().unwrap().agent_directory(agent.id).unwrap();
     let at = |path: &Path| DirectoryIdentity::from_metadata(&std::fs::metadata(path).unwrap());
+    // A start: the directory is opened and judged, a provider runs in it,
+    // and it is recorded.
     let start = |agent: &Agent| {
-        super::working_directory::for_start(&registry, agent)
-            .map(|directory| DirectoryIdentity::from_metadata(&directory.metadata().unwrap()))
+        super::working_directory::open_for_start(&registry, agent).map(|opened| {
+            opened.started(&registry).unwrap();
+            DirectoryIdentity::from_metadata(&opened.directory.metadata().unwrap())
+        })
     };
     let first = at(&nested);
     assert_eq!(recorded(), None);
