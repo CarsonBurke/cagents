@@ -1900,9 +1900,9 @@ impl ReadyPlanEvidence<'_> {
         if claim.successor_proof.is_none() || !claim.exited()? {
             return Err("The update's first successor could not be confirmed stopped before workspace changes".into());
         }
-        // Observe absence after exit so the first claimant cannot publish
-        // effects between this read and the process check.
-        require_no_ready_effects_or_retry(&self.authority)?;
+        // Observe the boundary after exit so the first claimant cannot
+        // start restoring between this read and the process check.
+        verify_ready_workspace_retry(&self.authority, &claim)?;
         Ok((claim, fingerprint))
     }
 
@@ -4743,6 +4743,7 @@ pub struct ReadyAdmission {
     successor: HostSessionProof,
     saved_predecessor: ReadyStatePredecessor,
     runtime_claim: Option<String>,
+    requires_durable_workspace: bool,
     retry_predecessor: Option<(HostSessionProof, crate::daemon::holder_registry::Process)>,
 }
 
@@ -4786,9 +4787,39 @@ impl ReadyAdmission {
     /// The runtime and saved-data leases are installed. Every action on the
     /// store, provider, or matching CLI now belongs to this exact proof.
     pub fn begin_workspace_effects(&self) -> io::Result<()> {
-        let authority = &self.authority;
-        let path = ready_evidence_path(authority, "effects").map_err(io::Error::other)?;
-        let evidence = serde_json::to_vec(&self.successor)?;
+        let stage = if self.retry_predecessor.is_some() {
+            "retry-effects"
+        } else {
+            "effects"
+        };
+        self.record_workspace_stage(stage)
+    }
+
+    pub fn begin_workspace_initialization(&self) -> io::Result<()> {
+        if self.retry_predecessor.is_none() {
+            self.record_workspace_stage("init-start")?;
+        }
+        Ok(())
+    }
+
+    pub fn finish_workspace_initialization(&self) -> io::Result<()> {
+        if self.retry_predecessor.is_none() {
+            self.record_workspace_stage("init-complete")?;
+        }
+        Ok(())
+    }
+
+    pub fn begin_workspace_restore(&self) -> io::Result<()> {
+        self.record_workspace_stage("restore")
+    }
+
+    pub fn requires_durable_workspace(&self) -> bool {
+        self.requires_durable_workspace
+    }
+
+    fn record_workspace_stage(&self, stage: &str) -> io::Result<()> {
+        let path = ready_evidence_path(&self.authority, stage).map_err(io::Error::other)?;
+        let evidence = serde_json::to_vec(&ReadyWorkspaceStage::new(stage, &self.successor))?;
         crate::update::persist_ready_evidence(&path, &evidence).map_err(io::Error::other)
     }
 
@@ -4872,12 +4903,76 @@ fn ready_evidence_exists(authority: &Authority, name: &str) -> Result<bool, Stri
 
 #[cfg(target_os = "macos")]
 fn require_no_ready_effects_or_retry(authority: &Authority) -> Result<(), String> {
-    if ready_evidence_exists(authority, "effects")?
-        || ready_evidence_exists(authority, "retry-claim")?
+    for marker in [
+        "effects",
+        "retry-claim",
+        "retry-effects",
+        "init-start",
+        "init-complete",
+        "restore",
+    ] {
+        if ready_evidence_exists(authority, marker)? {
+            return Err(
+                "The installed update began changing saved work or already used its retry".into(),
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Versioned receipts distinguish startup with a fenced restoration boundary
+/// from older successors that could enter restoration at any point after effects.
+#[cfg(target_os = "macos")]
+#[derive(Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ReadyWorkspaceStage {
+    version: u16,
+    stage: String,
+    claimant: HostSessionProof,
+}
+
+#[cfg(target_os = "macos")]
+impl ReadyWorkspaceStage {
+    fn new(stage: &str, claimant: &HostSessionProof) -> Self {
+        Self {
+            version: 1,
+            stage: stage.into(),
+            claimant: claimant.clone(),
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn verify_ready_workspace_retry(authority: &Authority, claim: &ReadyClaim) -> Result<(), String> {
+    if ready_evidence_exists(authority, "retry-claim")?
+        || ready_evidence_exists(authority, "retry-effects")?
+        || ready_evidence_exists(authority, "restore")?
     {
-        return Err(
-            "The installed update began changing saved work or already used its retry".into(),
-        );
+        return Err("The installed successor began restoring or already used its retry".into());
+    }
+    let claimant = claim
+        .successor_proof
+        .as_ref()
+        .ok_or("The Ready retry predecessor has no successor proof")?;
+    let read = |name| {
+        let Some(bytes) = read_checkpoint(&ready_evidence_path(authority, name)?)? else {
+            return Ok::<_, String>(false);
+        };
+        let expected = ReadyWorkspaceStage::new(name, claimant);
+        if serde_json::from_slice::<ReadyWorkspaceStage>(&bytes)
+            .ok()
+            .as_ref()
+            != Some(&expected)
+        {
+            return Err("The installed successor has unverifiable workspace changes".into());
+        }
+        Ok(true)
+    };
+    let effects = read("effects")?;
+    let start = read("init-start")?;
+    let complete = read("init-complete")?;
+    if start != complete || (!effects && start) {
+        return Err("The installed successor did not finish workspace initialization".into());
     }
     Ok(())
 }
@@ -5056,6 +5151,8 @@ pub(crate) fn accept_ready_authority(
         ));
     }
     let (retry_predecessor, retry_of) = retry.unzip();
+    let requires_durable_workspace = retry_of.is_some()
+        && ready_evidence_exists(&authority, "effects").map_err(io::Error::other)?;
     let record_runtime = record_runtime && retry_of.is_none();
     let claim = claim_ready_activation(&authority, &capture_digest, &successor, retry_of)?;
     Ok(ReadyAdmission {
@@ -5064,6 +5161,7 @@ pub(crate) fn accept_ready_authority(
         successor,
         saved_predecessor,
         runtime_claim: record_runtime.then_some(claim),
+        requires_durable_workspace,
         retry_predecessor,
     })
 }

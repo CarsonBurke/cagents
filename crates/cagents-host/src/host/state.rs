@@ -698,7 +698,7 @@ impl HostState {
     /// The daemon's entry point opens the store, not [`HostState::new`]: a host
     /// constructed for a test must not reach into the user's data directory, and
     /// a daemon that cannot open the store still has terminals to host.
-    pub(crate) fn install_model(&mut self, registry: super::model::Registry) {
+    pub(crate) fn install_model(&mut self, registry: super::model::Registry) -> bool {
         self.mailbox_seal = match registry.mailbox_key() {
             Ok(key) => Some(Arc::new(crate::agent_execution::mailbox::Seal::new(key))),
             Err(error) => {
@@ -721,6 +721,9 @@ impl HostState {
             }
         };
         self.model = Some(registry);
+        self.mailbox_seal.is_some()
+            && self.execution_registry.is_some()
+            && self.workspace_registry.is_some()
     }
 
     /// Another connection to the shared-model store, for work that must not
