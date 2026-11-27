@@ -21,6 +21,7 @@ for its next poll, to see it. `rate-limit off` gives the quota back.
 Running it again keeps the projects and rewrites their seeds, keeping any
 other repository's. Nothing here reaches the network or a real provider home.
 """
+import datetime
 import json
 import os
 from pathlib import Path
@@ -52,7 +53,12 @@ def fail(message):
     raise SystemExit(2)
 
 
-def git(directory, *arguments, date="2026-11-17T09:00:00Z"):
+# Yesterday, so the cards are a day old wherever the fixture runs and stay in
+# In progress and In review rather than ageing into Stale.
+DAY = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)).date().isoformat()
+
+
+def git(directory, *arguments, date=f"{DAY}T09:00:00Z"):
     environment = {**os.environ, **GIT_ENVIRONMENT, "GIT_AUTHOR_DATE": date, "GIT_COMMITTER_DATE": date}
     return subprocess.run(["git", "-C", str(directory), *arguments], env=environment, check=True,
                           stdout=subprocess.PIPE, text=True).stdout.strip()
@@ -82,7 +88,7 @@ def prepare(root, index, name):
         git(worktree, "add", "NOTES.md")
         # Spread over a morning, so the cards have distinct ages.
         git(worktree, "commit", "--quiet", "--message", branch.split("/", 1)[1].replace("-", " ").capitalize(),
-            date=f"2026-11-17T{10 + index // 2:02}:{(index % 2) * 30:02}:00Z")
+            date=f"{DAY}T{10 + index // 2:02}:{(index % 2) * 30:02}:00Z")
         oid = git(project, "rev-parse", branch)
         git(project, "config", f"branch.{branch}.remote", "origin")
         git(project, "config", f"branch.{branch}.merge", f"refs/heads/{branch}")
@@ -94,7 +100,7 @@ def seed(index, name, branch, oid):
     """The viewer's open pull request for the branch, in `gh pr list --json`'s
     shape (see fixture-gh.sh), its checks passed."""
     number = 100 + index
-    updated = f"2026-11-17T{10 + index // 2:02}:{(index % 2) * 30 + 5:02}:00Z"
+    updated = f"{DAY}T{10 + index // 2:02}:{(index % 2) * 30 + 5:02}:00Z"
     remote = f"https://github.com/{OWNER}/{name}"
     return {
         "id": f"PR_fixture{name}", "number": number,

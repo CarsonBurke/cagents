@@ -666,7 +666,7 @@ impl State {
         );
         let mut trail = Vec::with_capacity(2);
         trail.extend(count.map(|count| {
-            design::caption(count)
+            design::caption(format!("· {count}"))
                 .class(cosmic::theme::Text::Custom(design::muted_text))
                 .wrapping(iced::widget::text::Wrapping::None)
                 .into()
@@ -2120,7 +2120,7 @@ mod tests {
             [
                 "16 cards".to_owned(),
                 format!("Pull requests may be out of date: {RATE_LIMIT}"),
-                "16 projects".to_owned(),
+                "· 16 projects".to_owned(),
             ],
         );
     }
@@ -2209,7 +2209,7 @@ mod tests {
             texts(state.status().unwrap())[1..],
             [
                 format!("Pull requests may be out of date: {RATE_LIMIT}"),
-                "+4 more".to_owned(),
+                "· +4 more".to_owned(),
             ],
         );
         // Every problem, its reason and its projects, once each.
@@ -2269,7 +2269,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("{wanted} is drawn: {laid_out:?}"))
                 .1
         };
-        for fixed in ["16 cards", "Disconnected, retrying", "16 projects"] {
+        for fixed in ["16 cards", "Disconnected, retrying", "· 16 projects"] {
             let fixed = bounds(fixed);
             assert!(
                 fixed.width > 0.0 && fixed.x + fixed.width <= 400.0,
