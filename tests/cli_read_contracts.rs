@@ -245,6 +245,184 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
 }
 
 #[test]
+fn daemon_recovery_hints_keep_the_callers_device() {
+    use cagents::{
+        agent_execution::Operation,
+        device_service,
+        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+        terminal_ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            SOCKET_FILE_NAME, ServerEnvelope, ServerMessage, ServerResponse, read_frame,
+            write_frame,
+        },
+    };
+    use std::{io, os::unix::net::UnixListener, sync::mpsc, thread, time::Instant};
+
+    if !user_fixture::enter() {
+        return;
+    }
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let directory = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&directory).unwrap();
+    let listener = UnixListener::bind(directory.join(SOCKET_FILE_NAME)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let (finished, stop) = mpsc::channel();
+    let peer = thread::spawn(move || {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("hint-peer"),
+            boot_id: BootId::new("private-boot"),
+            host_incarnation: HostIncarnation::new("private-incarnation"),
+        };
+        let deadline = Instant::now() + Duration::from_secs(55);
+        while Instant::now() < deadline {
+            let mut stream = match listener.accept() {
+                Ok((stream, _)) => stream,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    match stop.recv_timeout(Duration::from_millis(5)) {
+                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                        _ => return,
+                    }
+                }
+                Err(error) => panic!("private hint peer: {error}"),
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                let message = match request.request {
+                    ClientRequest::Connect { .. } => ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                    ClientRequest::Authenticate { authority } => {
+                        assert!(authority.token().is_none());
+                        ServerMessage::Response {
+                            response: ServerResponse::Accepted,
+                        }
+                    }
+                    ClientRequest::DeviceOperation {
+                        operation: device_service::Operation::Home,
+                    } => ServerMessage::Response {
+                        response: ServerResponse::DeviceOperation {
+                            reply: device_service::Reply::Home {
+                                path: "/fixture".into(),
+                                shell: "/bin/sh".into(),
+                                environment: Default::default(),
+                            },
+                        },
+                    },
+                    ClientRequest::Agent {
+                        operation: Operation::Deliver(_),
+                        ..
+                    } => ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        format!(
+                            "Session {SESSION} has stopped: its provider exited, so it cannot receive messages (provider said `cagents sessions --all`). Resume its conversation first with `cagents resume {SESSION}`, or message another session from `cagents sessions --all`"
+                        ),
+                        false,
+                    )),
+                    ClientRequest::Agent {
+                        operation: Operation::Resume(handle),
+                        ..
+                    } if handle == SESSION => ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "No room for another chat: 16 chats are open, and the limit is 16.\n\nClose a chat you have finished with, then try again; `cagents chat capacity` lists the open ones. None of them could be stopped to make room: only a finished Claude chat that no window shows and that has nothing left running can be. Chats that only show saved history don't count. To allow more at once, run `cagents chat capacity set 48`.",
+                        false,
+                    )),
+                    ClientRequest::Agent {
+                        operation: Operation::Resume(handle),
+                        ..
+                    } => {
+                        assert_eq!(handle, "abcd");
+                        ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::InvalidRequest,
+                            "No session or agent matches abcd; `cagents resume` lists the stopped sessions you can resume",
+                            false,
+                        ))
+                    }
+                    request => panic!("unexpected hint peer request: {request:?}"),
+                };
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+        }
+        panic!("private hint peer timed out");
+    });
+
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    for (device, target) in [
+        (None, "cagents"),
+        (Some("local"), "cagents --device local"),
+        (Some("fixture"), "cagents --device fixture"),
+    ] {
+        let mut arguments = vec!["--no-start"];
+        if let Some(device) = device {
+            arguments.extend(["--device", device]);
+        }
+        let mut command = fixture.command(&arguments).env("PATH", &path);
+        let send = command.clone().args(["send", SESSION, "hello"]);
+        let output = fixture.run(send);
+        assert_eq!(output.exit_code, Some(1), "{output:?}");
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert_eq!(error["error"]["kind"], "protocol");
+        assert_eq!(
+            error["error"]["details"],
+            serde_json::json!({"code": "invalid_request", "retryable": false})
+        );
+        let message = error["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains("(provider said `cagents sessions --all`)"),
+            "{message}"
+        );
+        assert!(message.ends_with(&format!("`{target} resume {SESSION}`, or message another session from `{target} sessions --all`")), "{message}");
+        if device == Some("fixture") {
+            command.arguments.remove(0); // The fixture defaults to --json.
+            let output = fixture.run(command.args(["resume", "abcd", SESSION]));
+            assert_eq!(output.exit_code, Some(4), "{output:?}");
+            let message = String::from_utf8(output.stdout).unwrap();
+            assert!(
+                message.contains(
+                    "`cagents --device fixture resume` lists the stopped sessions you can resume"
+                ),
+                "{message}"
+            );
+            assert!(
+                message.contains("`cagents --device fixture chat capacity` lists the open ones"),
+                "{message}"
+            );
+            assert!(
+                message.contains("`cagents --device fixture chat capacity set 48`"),
+                "{message}"
+            );
+        }
+    }
+    finished.send(()).unwrap();
+    peer.join().unwrap();
+}
+
+#[test]
 fn protocol_version_is_local_before_device_selection_or_service_preparation() {
     if !user_fixture::enter() {
         return;

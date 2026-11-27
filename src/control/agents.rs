@@ -2104,11 +2104,12 @@ fn submitted(
     let (reply, retried) = session
         .submit(request, operation)
         .map_err(|error| with_retry_key(limit_holders(session, error), &key))?;
-    let (accepted, start) = match reply {
+    let (mut accepted, start) = match reply {
         Reply::Accepted(accepted) => (accepted, None),
         Reply::Prompted { accepted, start } => (accepted, Some(start)),
         _ => return Err(AppError::new(command, "Unexpected submit response")),
     };
+    qualify_run_diagnostic(&mut accepted.run);
     let handles = session.handles(&[accepted.agent.id.to_string(), accepted.run.id.to_string()]);
     let program = super::format::program();
     let mut human = format!(
@@ -2390,8 +2391,17 @@ fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &s
 
 fn status_reply(reply: Reply) -> Result<(Agent, Run), AppError> {
     match reply {
-        Reply::Status { agent, run } => Ok((agent, run)),
+        Reply::Status { agent, mut run } => {
+            qualify_run_diagnostic(&mut run);
+            Ok((agent, run))
+        }
         _ => Err(AppError::new("agent.status", "Unexpected status response")),
+    }
+}
+
+fn qualify_run_diagnostic(run: &mut Run) {
+    if let Some(diagnostic) = &mut run.result.diagnostic {
+        super::format::qualify_diagnostic(diagnostic);
     }
 }
 
@@ -5543,7 +5553,7 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     if let Some(outcome) = console_run_outcome(&view.run) {
                         println!("\n{outcome}");
                         if let Some(diagnostic) = &view.run.result.diagnostic {
-                            println!("{diagnostic}");
+                            println!("{}", super::format::daemon_diagnostic(diagnostic));
                         }
                     }
                     last_run = Some((view.run.id, view.run.revision));
@@ -5769,7 +5779,9 @@ fn console_request(request: &crate::chat::Request) -> String {
 /// Why the daemon refused what was typed, without the protocol's framing.
 fn console_refusal(error: &ControlError) -> String {
     match error {
-        ControlError::Remote { message, .. } => message.clone(),
+        ControlError::Remote { message, .. } => {
+            super::format::daemon_diagnostic(message).into_owned()
+        }
         error => error.to_string(),
     }
 }

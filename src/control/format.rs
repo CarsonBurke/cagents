@@ -1,5 +1,5 @@
 //! Plain tables for interactive CLI output; JSON uses explicit command DTOs.
-use std::path::Path;
+use std::{borrow::Cow, path::Path};
 
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -228,9 +228,106 @@ pub(super) fn hint<S: AsRef<str>>(steps: &[(S, &str)]) -> String {
 /// against, so a suggested command reaches the same daemon.
 pub(super) fn program() -> String {
     match crate::device::selected() {
-        Some(device) => format!("cagents --device {}", shell_word(&device.name)),
+        Some(device) => device_program(&device.name),
+        None if crate::device::local_chosen() => device_program("local"),
         None => "cagents".into(),
     }
+}
+
+fn device_program(device: &str) -> String {
+    // A name beginning with '-' needs '=' so clap does not see another flag.
+    let separator = if device.starts_with('-') { '=' } else { ' ' };
+    format!("cagents --device{separator}{}", shell_word(device))
+}
+
+/// Qualify commands in the daemon's own recovery instructions. The wire
+/// carries these as prose, which can also contain a provider failure or an
+/// echoed handle. Only change the known instruction at the end of the reason.
+pub(super) fn daemon_diagnostic(message: &str) -> Cow<'_, str> {
+    if !crate::device::is_remote() && !crate::device::local_chosen() {
+        return Cow::Borrowed(message);
+    }
+    qualify_daemon_hint(message, program)
+}
+
+pub(super) fn qualify_diagnostic(message: &mut String) {
+    if let Cow::Owned(rendered) = daemon_diagnostic(message) {
+        *message = rendered;
+    }
+}
+
+fn qualify_daemon_hint(message: &str, program: impl FnOnce() -> String) -> Cow<'_, str> {
+    let Some(start) = daemon_hint_start(message) else {
+        return Cow::Borrowed(message);
+    };
+    let (reason, hint) = message.split_at(start);
+    Cow::Owned(format!(
+        "{reason}{}",
+        hint.replace("`cagents ", &format!("`{} ", program()))
+    ))
+}
+
+fn daemon_hint_start(message: &str) -> Option<usize> {
+    const LIST_HINTS: &[&str] = &[
+        "; list them with `cagents sessions --all`",
+        "; `cagents resume` lists the stopped sessions you can resume",
+        "; list them with `cagents ls --channel` or `cagents ls --all`",
+        "; list them with `cagents channel list`",
+        ", from `cagents channel list`",
+    ];
+    if let Some(reason) = LIST_HINTS
+        .iter()
+        .find_map(|hint| message.strip_suffix(hint))
+    {
+        return Some(reason.len());
+    }
+
+    // A follow-up may report the same refusal while it explains why an
+    // earlier message could not be handed to this agent yet.
+    let message = message
+        .strip_suffix(". Send this once it has")
+        .unwrap_or(message);
+    if let Some(start) = capacity_hint_start(message) {
+        return Some(start);
+    }
+
+    let (reason, tail) = message.rsplit_once(" with `cagents resume ")?;
+    let (session, rest) = tail.split_once('`')?;
+    session.parse::<crate::model::TerminalId>().ok()?;
+    let is_recovery = match rest {
+        ", or message another session from `cagents sessions --all`" => {
+            reason.ends_with(". Resume its conversation first")
+        }
+        "; message another session from `cagents sessions --all` meanwhile" => {
+            reason.ends_with(". The person can resume its conversation")
+        }
+        "" => reason.ends_with(
+            "The daemon restarted since its provider last ran, so it cannot tell whether that process still writes the conversation. Once it has ended, resume it",
+        ),
+        _ => false,
+    };
+    is_recovery.then_some(reason.len())
+}
+
+fn capacity_hint_start(message: &str) -> Option<usize> {
+    const INSPECT: &str =
+        "\n\nClose a chat you have finished with, then try again; `cagents chat capacity` lists ";
+    const SET: &str = " To allow more at once, run `cagents chat capacity set ";
+    let (heading, tail) = message.rsplit_once(INSPECT)?;
+    if !heading
+        .lines()
+        .last()?
+        .contains("No room for another chat: ")
+    {
+        return None;
+    }
+    let detail = if let Some((detail, limit)) = tail.split_once(SET) {
+        limit.strip_suffix("`.")?.parse::<u32>().ok()?;
+        detail
+    } else {
+        tail
+    };
+    (!detail.contains('`') && detail.ends_with("don't count.")).then_some(heading.len())
 }
 
 /// `word` quoted for a POSIX shell when it needs to be.
@@ -303,6 +400,48 @@ pub(super) fn relative_time(at_ms: u64, now_ms: u64) -> String {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn daemon_hints_only_qualify_recognized_instructions() {
+        fn qualify(message: &str) -> Cow<'_, str> {
+            qualify_daemon_hint(message, || device_program("-desk"))
+        }
+
+        let session = "00000000-0000-4000-8000-000000000001";
+        let before = format!(
+            "Cannot reopen the agent's conversation: The daemon restarted since its provider last ran, so it cannot tell whether that process still writes the conversation. Once it has ended, resume it with `cagents resume {session}`"
+        );
+        for message in [
+            before.clone(),
+            format!("Not sent: Earlier message: {before}. Send this once it has"),
+        ] {
+            assert_eq!(
+                qualify(&message),
+                message.replace("`cagents resume", "`cagents --device=-desk resume")
+            );
+        }
+        let before = "No session or agent matches `cagents sessions --all`; list them with `cagents sessions --all`";
+        assert_eq!(
+            qualify(before),
+            "No session or agent matches `cagents sessions --all`; list them with `cagents --device=-desk sessions --all`"
+        );
+        let at_maximum = "No room for another chat: the limit is reached.\n\nClose a chat you have finished with, then try again; `cagents chat capacity` lists the open ones. Chats that only show saved history don't count.";
+        assert_eq!(
+            qualify(at_maximum),
+            at_maximum.replace(
+                "`cagents chat capacity`",
+                "`cagents --device=-desk chat capacity`"
+            )
+        );
+        for untouched in [
+            "The provider said `cagents resume`",
+            "Already qualified; list them with `cagents --device=-desk sessions --all`",
+            "Link it again with `cagents device link`",
+            "Session stopped. Resume its conversation first with `cagents resume $(command)`, or message another session from `cagents sessions --all`",
+        ] {
+            assert_eq!(qualify(untouched), untouched);
+        }
+    }
 
     #[test]
     fn a_listing_runs_only_the_requested_renderer() {
