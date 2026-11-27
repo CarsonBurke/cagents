@@ -229,7 +229,13 @@ pub(super) struct Incident {
     reset_sources: std::collections::BTreeSet<u64>,
     /// The chronological first transcript source owns the visible notice.
     pub first_item: Option<String>,
+    /// The key of the exchange the notice is drawn in.
     pub anchor: Option<String>,
+    /// The transcript item, by index, the notice happened at or after,
+    /// within [`Self::anchor`]'s exchange: the notice is drawn after the row
+    /// that item is drawn in, in order with the rest of the exchange.
+    /// `None` draws it after the whole exchange.
+    pub at: Option<usize>,
     pub child_scope: Option<String>,
     pub active_recovery: bool,
 }
@@ -270,6 +276,11 @@ pub(super) struct State {
     pub(super) limit_occurrence: u64,
     limit_markers: std::collections::BTreeMap<String, LimitMarker>,
     pub local_error: Option<Arc<str>>,
+    /// The item that closed the transcript when the local error was first
+    /// reported, with that error: where a local error that no note places
+    /// happened. Kept while the error stands, so later work is drawn after
+    /// it rather than the notice following the end of the conversation.
+    local_after: Option<(Arc<str>, Option<String>)>,
     pub find_expanded: HashSet<String>,
     /// Written only through [`State::store_preview`] and
     /// [`State::prune_previews`], which keep `previews_stamp` current.
@@ -455,23 +466,23 @@ fn prompt_scope(provider: Provider, id: &str) -> String {
     }
 }
 
-/// Where a retained note is drawn: after the group containing the item it
-/// was recorded after, while that item is visible. Otherwise a visible part
+/// Where a retained note is drawn: after the item it was recorded after, in
+/// that item's group, while that item is visible. Otherwise a visible part
 /// of the note's message stands in, and the note goes after the last visible
 /// group before the reader's next prompt. `None` when neither is visible, so
 /// the note never borrows another exchange.
 fn note_destination<'a>(
     runtime: &'a Runtime,
     note: &Note,
-    item_groups: &HashMap<&str, &'a str>,
+    item_groups: &HashMap<&str, (&'a str, usize)>,
     user_carriers: &HashMap<&str, String>,
-) -> Option<&'a str> {
-    if let Some(group) = note
+) -> Option<(&'a str, Option<usize>)> {
+    if let Some(&(group, index)) = note
         .after
         .as_deref()
         .and_then(|after| item_groups.get(after))
     {
-        return Some(group);
+        return Some((group, Some(index)));
     }
     let anchor = note.message.as_deref()?;
     let provider = runtime.session.launch.provider;
@@ -489,7 +500,7 @@ fn note_destination<'a>(
         .iter()
         .take_while(|turn| typed_prompt(runtime, turn).next().is_none())
         .count();
-    Some(runtime.turns[start + replies].key.as_str())
+    Some((runtime.turns[start + replies].key.as_str(), None))
 }
 
 impl State {
@@ -537,10 +548,12 @@ impl State {
             } else if known_only {
                 return None;
             } else {
+                // Nothing is known about what to do next, so the notice says
+                // only what happened; its details hold the rest.
                 (
                     diagnostic_key(text),
                     fallback_summary(text),
-                    "Review the details before trying again.",
+                    "",
                     None,
                     None,
                     false,
@@ -611,6 +624,7 @@ impl State {
                 reset_sources: Default::default(),
                 first_item,
                 anchor: None,
+                at: None,
                 child_scope: None,
                 active_recovery: false,
             });
@@ -694,7 +708,9 @@ impl State {
         let occurrence = self.limit_occurrence;
         let expanded = std::mem::take(&mut self.expanded);
         let find_expanded = std::mem::take(&mut self.find_expanded);
+        let local_after = self.local_after.take();
         *self = Self::default();
+        self.local_after = local_after;
         self.limit_markers = markers;
         self.limit_occurrence = occurrence;
         self.expanded = expanded;
@@ -885,26 +901,45 @@ impl State {
             }
         }
 
-        let item_groups: HashMap<&str, &str> = if runtime.failures.is_empty() {
-            HashMap::new()
-        } else {
+        // A local error that no note places happened where the transcript
+        // ended when it was first reported.
+        let local_after =
             runtime
-                .turns
-                .iter()
-                .flat_map(|turn| {
-                    turn.prompt
-                        .iter()
-                        .chain(
-                            turn.steps
-                                .iter()
-                                .chain(&turn.prose)
-                                .map(|placed| &placed.index),
-                        )
-                        .filter_map(|index| runtime.snapshot.items.get(*index))
-                        .map(|item| (item.id.as_str(), turn.key.as_str()))
-                })
-                .collect()
-        };
+                .error
+                .as_deref()
+                .map(|error| match &runtime.failure_ui.local_after {
+                    Some((pinned, after)) if **pinned == *error => (pinned.clone(), after.clone()),
+                    _ => (
+                        Arc::<str>::from(error),
+                        closing_item(&runtime.snapshot, &runtime.turns).map(str::to_owned),
+                    ),
+                });
+        let item_groups: HashMap<&str, (&str, usize)> =
+            if runtime.failures.is_empty() && local_after.is_none() {
+                HashMap::new()
+            } else {
+                runtime
+                    .turns
+                    .iter()
+                    .flat_map(|turn| {
+                        turn.prompt
+                            .iter()
+                            .chain(
+                                turn.steps
+                                    .iter()
+                                    .chain(&turn.prose)
+                                    .map(|placed| &placed.index),
+                            )
+                            .filter_map(|index| {
+                                runtime
+                                    .snapshot
+                                    .items
+                                    .get(*index)
+                                    .map(|item| (item.id.as_str(), (turn.key.as_str(), *index)))
+                            })
+                    })
+                    .collect()
+            };
         // A note keeps its message's scope after paging removes the message,
         // so its incident identity, and an expanded notice, stay put.
         let note_contexts: Vec<String> = runtime
@@ -1012,31 +1047,28 @@ impl State {
                     _ => None,
                 });
             }
-            incident.anchor = incident
+            let (anchor, at) = incident
                 .first_item
                 .as_ref()
                 .and_then(|id| {
-                    runtime
-                        .turns
-                        .iter()
-                        .find(|turn| {
-                            turn.prompt
-                                .iter()
-                                .chain(
-                                    turn.steps
-                                        .iter()
-                                        .chain(&turn.prose)
-                                        .map(|placed| &placed.index),
-                                )
-                                .any(|index| {
-                                    runtime
-                                        .snapshot
-                                        .items
-                                        .get(*index)
-                                        .is_some_and(|item| &item.id == id)
-                                })
-                        })
-                        .map(|turn| turn.key.clone())
+                    runtime.turns.iter().find_map(|turn| {
+                        turn.prompt
+                            .iter()
+                            .chain(
+                                turn.steps
+                                    .iter()
+                                    .chain(&turn.prose)
+                                    .map(|placed| &placed.index),
+                            )
+                            .find(|index| {
+                                runtime
+                                    .snapshot
+                                    .items
+                                    .get(**index)
+                                    .is_some_and(|item| &item.id == id)
+                            })
+                            .map(|index| (Some(turn.key.clone()), Some(*index)))
+                    })
                 })
                 .or_else(|| {
                     // The latest note places the incident: a cause recurring
@@ -1054,13 +1086,33 @@ impl State {
                             // An unresolved note keeps a key no visible
                             // group has, which hides it; only a note with
                             // no placement at all leads the transcript.
-                            note_destination(runtime, note, &item_groups, &user_carriers)
-                                .or(note.after.as_deref())
-                                .or(note.message.as_deref())
-                                .map(str::to_owned)
+                            match note_destination(runtime, note, &item_groups, &user_carriers) {
+                                Some((group, at)) => (Some(group.to_owned()), at),
+                                None => (
+                                    note.after
+                                        .as_deref()
+                                        .or(note.message.as_deref())
+                                        .map(str::to_owned),
+                                    None,
+                                ),
+                            }
                         })
-                        .unwrap_or_else(|| runtime.turns.last().map(|turn| turn.key.clone()))
-                });
+                })
+                .or_else(|| {
+                    // A local error no note records stays where the
+                    // transcript ended when it was reported.
+                    incident
+                        .sources
+                        .iter()
+                        .any(|source| matches!(source, Source::Local(_)))
+                        .then_some(local_after.as_ref())
+                        .flatten()
+                        .and_then(|(_, after)| item_groups.get(after.as_deref()?))
+                        .map(|&(group, index)| (Some(group.to_owned()), Some(index)))
+                })
+                .unwrap_or_else(|| (runtime.turns.last().map(|turn| turn.key.clone()), None));
+            incident.anchor = anchor;
+            incident.at = at;
         }
         state.limit_markers = state
             .incidents
@@ -1154,6 +1206,7 @@ impl State {
                 &incident.sources,
                 &incident.first_item,
                 &incident.anchor,
+                &incident.at,
                 &incident.active_recovery,
                 &incident.child_scope,
             )
@@ -1167,6 +1220,7 @@ impl State {
             }
         }
         state.revision = hash.finish();
+        state.local_after = local_after;
         if state.revision == runtime.failure_ui.revision {
             state.previews = runtime.failure_ui.previews.clone();
             state.previews_stamp = runtime.failure_ui.previews_stamp;
@@ -1584,7 +1638,7 @@ impl Runtime {
 
     #[cfg(test)]
     pub(super) fn failure_view(&self, incident: &Incident) -> Element<'static, Message> {
-        self.failure_view_with_reset(incident, None)
+        self.failure_notice(incident, None).0
     }
 
     /// A source may disappear after a successful continuation; a new source or
@@ -1614,11 +1668,13 @@ impl Runtime {
         evidence
     }
 
-    pub(super) fn failure_view_with_reset(
+    /// An incident's notice, and whether it is drawn as a card set apart
+    /// from the timeline rather than as one of its lines.
+    pub(super) fn failure_notice(
         &self,
         incident: &Incident,
         reset_controls: Option<&crate::app::account_ui::resets::Controls>,
-    ) -> Element<'static, Message> {
+    ) -> (Element<'static, Message>, bool) {
         let reset_controls = reset_controls
             .map(|controls| controls.for_incident(&self.reset_incident_evidence(incident)));
         let cleared = incident.kind == Some(FailureKind::AccountLimit)
@@ -1638,6 +1694,9 @@ impl Runtime {
             matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
         });
         let blocked_start = self.start_blocked.filter(|_| current_local_error);
+        if !notice_blocks(incident, cleared, blocked_start.is_some()) {
+            return (self.notice_line(incident, summary, cleared), false);
+        }
         let mut rows = vec![
             widget::row::with_children(vec![
                 heading_mark(
@@ -1667,14 +1726,13 @@ impl Runtime {
             rows.push(design::caption(reason.clone()).width(Length::Fill).into());
         }
         if !cleared && blocked_start.is_none() {
-            rows.push(
-                design::caption(reset_controls.as_ref().map_or_else(
-                    || incident.guidance.to_owned(),
-                    |controls| controls.limit_guidance(&incident.summary, incident.guidance),
-                ))
-                .width(Length::Fill)
-                .into(),
+            let guidance = reset_controls.as_ref().map_or_else(
+                || incident.guidance.to_owned(),
+                |controls| controls.limit_guidance(&incident.summary, incident.guidance),
             );
+            if !guidance.is_empty() {
+                rows.push(design::caption(guidance).width(Length::Fill).into());
+            }
         }
         if incident.kind == Some(FailureKind::NoAllowance) && blocked_start.is_none() {
             rows.push(
@@ -1697,7 +1755,7 @@ impl Runtime {
         if !incident.explained {
             rows.push(self.failure_diagnostics(incident, design::sunken));
         }
-        widget::container(
+        let card = widget::container(
             widget::column::with_children(rows)
                 .spacing(space::S)
                 .width(Length::Fill),
@@ -1710,7 +1768,213 @@ impl Runtime {
         .padding([space::S, space::M])
         .width(Length::Fill)
         .max_width(design::READABLE_MEASURE)
-        .into()
+        .into();
+        (card, true)
+    }
+
+    /// A notice as a line of the timeline, read in order with the work
+    /// around it: its mark, what happened and, where there is something to
+    /// do, what. Pressing it shows the details it has.
+    fn notice_line(
+        &self,
+        incident: &Incident,
+        summary: String,
+        cleared: bool,
+    ) -> Element<'static, Message> {
+        let open = self.failure_ui.expanded.contains(&incident.key);
+        let expandable = !incident.explained;
+        let mut words: Vec<Element<'static, Message>> = vec![
+            design::transcript(summary.clone())
+                .width(Length::Fill)
+                .into(),
+        ];
+        if !cleared && !incident.guidance.is_empty() {
+            words.push(
+                design::caption(incident.guidance)
+                    .class(cosmic::theme::Text::Custom(design::muted_text))
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
+        let mut cells = vec![
+            heading_mark(incident.kind, incident.current() && !cleared, false).view(),
+            widget::column::with_children(words)
+                .spacing(space::XXS)
+                .width(Length::Fill)
+                .into(),
+        ];
+        if expandable {
+            cells.push(crate::ui_controls::passive_icon(
+                if open {
+                    Icon::ChevronDown
+                } else {
+                    Icon::ChevronRight
+                },
+                design::COMPACT_ICON_SIZE,
+            ));
+        }
+        let line = widget::row::with_children(cells)
+            .width(Length::Fill)
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Start);
+        let padding = [step::GAP_XS as u16, step::GAP_S as u16];
+        let header = if expandable {
+            crate::interaction::a11y_target(
+                widget::button::custom(line)
+                    .name(format!(
+                        "{} technical details for {summary}",
+                        if open { "Hide" } else { "Show" },
+                    ))
+                    .description(if cleared { "" } else { incident.guidance })
+                    .class(crate::ui_controls::control_style(false, None))
+                    .width(Length::Fill)
+                    .padding(padding)
+                    .on_press(action(Action::ToggleFailure(
+                        self.target,
+                        incident.key.clone(),
+                    ))),
+            )
+        } else {
+            widget::container(line)
+                .width(Length::Fill)
+                .padding(padding)
+                .into()
+        };
+        let mut rows = vec![header];
+        if open {
+            let mut details = Vec::new();
+            if let Some(reason) = &incident.reason {
+                details.push(design::caption(reason.clone()).width(Length::Fill).into());
+            }
+            details.push(self.details_copy(incident));
+            if let Some(preview) = self.diagnostic_preview(incident, design::sunken) {
+                details.push(
+                    widget::container(
+                        widget::column::with_children(preview)
+                            .spacing(space::S)
+                            .width(Length::Fill),
+                    )
+                    .class(design::surface(
+                        Some(design::sunken),
+                        [design::RADIUS_M; 4],
+                        false,
+                    ))
+                    .padding([space::S, space::M])
+                    .width(Length::Fill)
+                    .into(),
+                );
+            }
+            // Beneath the notice's words, past its mark.
+            let indent = step::GAP_S + f32::from(design::LEADING_ICON_SIZE) + step::GAP_S;
+            rows.push(
+                widget::container(
+                    widget::column::with_children(details)
+                        .spacing(space::S)
+                        .width(Length::Fill),
+                )
+                .padding(iced::Padding {
+                    left: indent,
+                    right: step::GAP_S,
+                    bottom: step::GAP_XS,
+                    top: 0.0,
+                })
+                .width(Length::Fill)
+                .into(),
+            );
+        }
+        let body = widget::column::with_children(rows)
+            .width(Length::Fill)
+            .into();
+        crate::interaction::keyed_list_rows(vec![(self.failure_controls_owner(incident), body)])
+    }
+
+    /// The identity a notice's controls are kept under. Detail-only child
+    /// failures have no named transcript item around these buttons. A
+    /// replacement incident must not inherit a held press and release it into
+    /// the replacement's Details or Copy callback.
+    fn failure_controls_owner(&self, incident: &Incident) -> [u8; 32] {
+        use sha2::Digest;
+        let mut owner = sha2::Sha256::new();
+        owner.update(b"chat-failure-controls\0");
+        owner.update(self.target.card.to_string().as_bytes());
+        owner.update(self.target.generation.to_le_bytes());
+        owner.update(incident.key.as_bytes());
+        owner.finalize().into()
+    }
+
+    /// An incident's Copy details action, with what its last copy said.
+    fn details_copy(&self, incident: &Incident) -> Element<'static, Message> {
+        let copy = crate::ui_controls::button::quiet("Copy details")
+            .name(format!(
+                "Copy original diagnostics for {}",
+                incident.summary
+            ))
+            .on_press(action(Action::CopyFailure(
+                self.target,
+                incident.key.clone(),
+            )));
+        // What its last copy said, beside it: a copy is the reader's own
+        // action, not part of the failure it copies.
+        match self.details_copy_state(&incident.key).said() {
+            Some(said) => widget::row::with_children(vec![copy.into(), said])
+                .spacing(space::S)
+                .align_y(Alignment::Center)
+                .into(),
+            None => copy.into(),
+        }
+    }
+
+    /// An open incident's diagnostic preview and what it leaves out.
+    /// `surface` is the fill it is drawn on, which the scrolling preview
+    /// fades into.
+    fn diagnostic_preview(
+        &self,
+        incident: &Incident,
+        surface: fn(&cosmic::Theme) -> iced::Color,
+    ) -> Option<Vec<Element<'static, Message>>> {
+        // Full bytes are resolved only on expansion/copy. The collapsed
+        // surface never clones or shapes a provider's request dump.
+        let (preview, omitted) = self.failure_preview(&incident.key)?;
+        let target = self.target;
+        // The preview scrolls between the disclosure's controls and its
+        // caption: what passes an edge fades into the surface.
+        let mut rows = vec![
+            widget::container(crate::interaction::overflow_fade_y(
+                widget::scrollable(
+                    widget::container(selectable_prose::logical_text(
+                        vec![iced::widget::text::Span::new(preview.to_owned())].into(),
+                        design::TEXT_CAPTION.into(),
+                        iced::Font::MONOSPACE,
+                        target,
+                        None,
+                        selectable_prose::Logical {
+                            identity: diagnostic_preview_identity(&incident.key),
+                            start: 0,
+                        },
+                    ))
+                    .padding(design::with_vertical_rail(iced::Padding::ZERO)),
+                )
+                .direction(iced::widget::scrollable::Direction::Vertical(
+                    design::scrollbar(),
+                ))
+                .height(Length::Shrink),
+                surface,
+            ))
+            .max_height(240)
+            .into(),
+        ];
+        let retained = self.failure_originals_retained(&incident.key);
+        if let Some(available) = retained {
+            let caption = if !available {
+                "Shortened preview. The full diagnostic is no longer available to copy."
+            } else {
+                "Shortened preview. Copy details copies the full diagnostic."
+            };
+            rows.push(design::caption(caption).width(Length::Fill).into());
+        } else if omitted {
+            rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
+        }
+        Some(rows)
     }
 
     /// An incident's disclosure, copy action and, when expanded, its
@@ -1739,80 +2003,32 @@ impl Runtime {
             Some(open),
             Some(Action::ToggleFailure(target, incident.key.clone())),
         ));
-        let copy = crate::ui_controls::button::quiet("Copy details")
-            .name(format!(
-                "Copy original diagnostics for {}",
-                incident.summary
-            ))
-            .on_press(action(Action::CopyFailure(target, incident.key.clone())));
-        // What its last copy said, beside it: a copy is the reader's own
-        // action, not part of the failure it copies.
-        rows.push(match self.details_copy_state(&incident.key).said() {
-            Some(said) => widget::row::with_children(vec![copy.into(), said])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into(),
-            None => copy.into(),
-        });
-        if open {
-            // Full bytes are resolved only on expansion/copy. The collapsed
-            // surface never clones or shapes a provider's request dump.
-            if let Some((preview, omitted)) = self.failure_preview(&incident.key) {
-                // The preview scrolls between the disclosure's controls and
-                // its caption: what passes an edge fades into the surface.
-                rows.push(
-                    widget::container(crate::interaction::overflow_fade_y(
-                        widget::scrollable(
-                            widget::container(selectable_prose::logical_text(
-                                vec![iced::widget::text::Span::new(preview.to_owned())].into(),
-                                design::TEXT_CAPTION.into(),
-                                iced::Font::MONOSPACE,
-                                target,
-                                None,
-                                selectable_prose::Logical {
-                                    identity: diagnostic_preview_identity(&incident.key),
-                                    start: 0,
-                                },
-                            ))
-                            .padding(design::with_vertical_rail(iced::Padding::ZERO)),
-                        )
-                        .direction(iced::widget::scrollable::Direction::Vertical(
-                            design::scrollbar(),
-                        ))
-                        .height(Length::Shrink),
-                        surface,
-                    ))
-                    .max_height(240)
-                    .into(),
-                );
-                let retained = self.failure_originals_retained(&incident.key);
-                if let Some(available) = retained {
-                    let caption = if !available {
-                        "Shortened preview. The full diagnostic is no longer available to copy."
-                    } else {
-                        "Shortened preview. Copy details copies the full diagnostic."
-                    };
-                    rows.push(design::caption(caption).width(Length::Fill).into());
-                } else if omitted {
-                    rows.push(design::caption("Diagnostic preview is limited to 8 KiB. Copy details includes the complete originals.").width(Length::Fill).into());
-                }
-            }
+        rows.push(self.details_copy(incident));
+        if open && let Some(preview) = self.diagnostic_preview(incident, surface) {
+            rows.extend(preview);
         }
         let body: Element<'static, Message> = widget::column::with_children(rows)
             .spacing(space::S)
             .width(Length::Fill)
             .into();
-        // Detail-only child failures have no named transcript item around
-        // these buttons. A replacement incident must not inherit a held press
-        // and release it into the replacement's Details or Copy callback.
-        use sha2::Digest;
-        let mut owner = sha2::Sha256::new();
-        owner.update(b"chat-failure-controls\0");
-        owner.update(target.card.to_string().as_bytes());
-        owner.update(target.generation.to_le_bytes());
-        owner.update(incident.key.as_bytes());
-        crate::interaction::keyed_list_rows(vec![(owner.finalize().into(), body)])
+        crate::interaction::keyed_list_rows(vec![(self.failure_controls_owner(incident), body)])
     }
+}
+
+/// Whether a notice is drawn as a card, set apart from the timeline, rather
+/// than as one of its lines: only while what it reports blocks the reader
+/// and the notice holds what they can do about it, such as a usage limit's
+/// resets or an account to open. Everything else happened in the
+/// conversation and reads in order with it; the composer keeps its own
+/// controls, such as Retry, Resume or Sign in.
+fn notice_blocks(incident: &Incident, cleared: bool, blocked_start: bool) -> bool {
+    blocked_start
+        || (incident.current()
+            && !cleared
+            && matches!(
+                incident.kind,
+                Some(FailureKind::NoAllowance | FailureKind::AccountLimit)
+            ))
 }
 
 /// The glyph at the head of a failure notice. A usage limit waits on a
@@ -1980,7 +2196,9 @@ mod tests {
         // Other unrecognised failures keep the general guidance and their
         // details, and a filter for known failures still drops them.
         let other = State::metadata(Provider::Claude, "Something else broke", false, "").unwrap();
-        assert_eq!(other.guidance, "Review the details before trying again.");
+        // Nothing is known about what to do, so the notice says only what
+        // happened.
+        assert_eq!(other.guidance, "");
         assert!(!other.explained);
         // An outcome quoted inside a longer report is not the outcome, so the
         // report keeps its details.
@@ -2192,7 +2410,7 @@ mod tests {
         let incident = Incident {
             key: "fixture-failure".into(),
             summary: "The command failed".into(),
-            guidance: "Review the details before trying again.",
+            guidance: "",
             kind: None,
             reason: None,
             explained: false,
@@ -2200,6 +2418,7 @@ mod tests {
             reset_sources: Default::default(),
             first_item: None,
             anchor: None,
+            at: None,
             child_scope: None,
             active_recovery: false,
         };
@@ -2297,6 +2516,98 @@ mod tests {
             runtime.refresh();
             assert_eq!(runtime.failure_ui.revision, revision);
         }
+    }
+
+    /// The rows of `runtime`'s only exchange each notice follows, and how
+    /// many rows the exchange draws.
+    fn notice_rows(runtime: &Runtime) -> (Vec<usize>, usize) {
+        assert_eq!(runtime.turns.len(), 1);
+        let turn = &runtime.turns[0];
+        let rows = runtime.turn_row_count(turn);
+        let placed = runtime
+            .placed_turn_notices(turn)
+            .into_iter()
+            .map(|(before, _)| before)
+            .collect();
+        (placed, rows)
+    }
+
+    /// A command the system stops while the agent works on is reported where
+    /// it happened: the work and the answer that follow are drawn after the
+    /// notice, rather than the notice trailing the exchange above the
+    /// composer.
+    #[test]
+    fn a_notice_mid_exchange_stays_where_it_happened() {
+        let provider = Provider::Claude;
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text("ask:0", chat::Role::User, "Build it"),
+                tool("first-tool"),
+            ],
+        );
+        let report = format!(
+            "{} systemd-oomd ended it; the agent is still running.",
+            chat::failure::COMMAND_OUT_OF_MEMORY
+        );
+        publish_error(&mut runtime, &handle, &report);
+        publish(&mut runtime, &handle, |next| {
+            next.items.push(Arc::new(tool("second-tool")));
+            next.items.push(Arc::new(text(
+                "answer",
+                chat::Role::Assistant,
+                "Built it on the second try.",
+            )));
+        });
+        assert_eq!(runtime.failure_ui.incidents.len(), 1);
+        let incident = &runtime.failure_ui.incidents[0];
+        assert_eq!(
+            incident.anchor.as_deref(),
+            Some(runtime.turns[0].key.as_str())
+        );
+        assert_eq!(incident.at, Some(1), "at the command that was running");
+        assert_eq!(
+            incident.summary,
+            "A command failed because the computer ran out of memory"
+        );
+        // The prompt and the steps come before it; the answer after.
+        assert_eq!(notice_rows(&runtime), (vec![2], 3));
+    }
+
+    /// An error the window reports itself, with no note to place it, stays
+    /// where the conversation ended when it was reported.
+    #[test]
+    fn a_local_error_stays_where_it_was_reported() {
+        let provider = Provider::Claude;
+        let (mut runtime, handle) = live_fixture(
+            provider,
+            vec![
+                text("ask:0", chat::Role::User, "First"),
+                text("reply", chat::Role::Assistant, "Done."),
+            ],
+        );
+        let error = "The exact agent session is no longer attached";
+        runtime.error = Some(error.into());
+        runtime.refresh_failure_ui();
+        let first = runtime.turns[0].key.clone();
+        publish(&mut runtime, &handle, |next| {
+            next.items
+                .push(Arc::new(text("ask-2:0", chat::Role::User, "Again")));
+            next.items.push(Arc::new(text(
+                "reply-2",
+                chat::Role::Assistant,
+                "Done again.",
+            )));
+        });
+        assert_eq!(runtime.error.as_deref(), Some(error));
+        assert_eq!(runtime.turns.len(), 2);
+        let incident = &runtime.failure_ui.incidents[0];
+        assert_eq!(incident.summary, error);
+        // Nothing is known of what to do, so the notice says only what
+        // happened.
+        assert_eq!(incident.guidance, "");
+        assert_eq!(incident.anchor.as_deref(), Some(first.as_str()));
+        assert_eq!(incident.at, Some(1));
     }
 
     #[test]

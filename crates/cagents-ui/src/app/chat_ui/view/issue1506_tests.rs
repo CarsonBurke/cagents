@@ -915,6 +915,10 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                 Some(original.as_str())
             );
 
+            // A notice offers Copy details once it is open.
+            if copy {
+                drop(app.handle_chat_ui(Action::ToggleFailure(target, original_key.clone())));
+            }
             let mut renderer = crate::app::tests::headless_renderer();
             let size = iced::Size::new(640.0, 800.0);
             let name = if copy {
@@ -967,7 +971,18 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
             assert_eq!(live.failure_ui.incidents.len(), 1);
             let current_key = live.failure_ui.incidents[0].key.clone();
             assert_eq!(original_key == current_key, !replace_incident);
-            assert!(!live.failure_ui.expanded.contains(&current_key));
+            assert_eq!(
+                live.failure_ui.expanded.contains(&current_key),
+                copy && !replace_incident
+            );
+            if copy && replace_incident {
+                // The replacement is open too, so a same-shaped Copy sits
+                // under the held press.
+                let live = app.chat_runtime_mut(target).unwrap();
+                live.failure_ui.expanded.edit().insert(current_key.clone());
+                live.refresh_failure_previews();
+            }
+            let live = runtime(&app, target);
             assert_eq!(
                 live.failure_details(&current_key).as_deref(),
                 Some(if change_details {
@@ -1008,11 +1023,12 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                     actions.is_empty(),
                     "a held press must not invoke a replacement owner, copy={copy}, scenario={scenario}"
                 );
-                assert!(
-                    !runtime(&app, target)
+                assert_eq!(
+                    runtime(&app, target)
                         .failure_ui
                         .expanded
-                        .contains(&current_key)
+                        .contains(&current_key),
+                    copy
                 );
                 if replace_runtime {
                     // Also reject an already-queued action from the old
@@ -1026,11 +1042,12 @@ fn held_child_diagnostic_controls_do_not_retarget_a_replacement_incident() {
                             0,
                             "an old runtime must not publish a clipboard effect"
                         );
-                        assert!(
-                            !runtime(&app, target)
+                        assert_eq!(
+                            runtime(&app, target)
                                 .failure_ui
                                 .expanded
-                                .contains(&current_key)
+                                .contains(&current_key),
+                            copy
                         );
                     }
                 }
@@ -1366,10 +1383,10 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     )));
     let publication = runtime(&app, target).snapshot.clone();
     let (before, mut cache) = labels(&app, target, Cache::new());
-    // Diagnostic controls are ordinary buttons; prose Copy is hover-only.
+    // A notice's disclosure is an ordinary button; prose Copy is hover-only.
     let copy_labels: Vec<_> = before
         .iter()
-        .filter(|label| label.starts_with("Copy original diagnostics for "))
+        .filter(|label| label.starts_with("Show technical details for "))
         .collect();
     assert_eq!(copy_labels.len(), 1, "{before:?}");
     let diagnostic_copy = copy_labels[0].to_string();

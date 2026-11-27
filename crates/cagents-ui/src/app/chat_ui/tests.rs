@@ -20398,19 +20398,39 @@ fn failed_resume_retains_history_and_refusal_when_a_stale_connected_handle_canno
         assert_eq!(runtime.error.as_deref(), Some(reason));
         let incident = runtime.failure_ui.incidents.last().unwrap();
         let labels = recovery_labels(runtime.failure_view(incident));
+        if recovery == chat::Recovery::Blocked {
+            // A start that can't be repeated blocks the pane: its card
+            // offers its details at once.
+            assert!(
+                labels.iter().any(|label| label.contains("Details")),
+                "{labels:?}"
+            );
+            assert!(
+                labels.iter().any(|label| label.contains("Copy")),
+                "{labels:?}"
+            );
+        } else {
+            // One the pane's Try again answers reads as a line of the
+            // conversation, which opens to its details.
+            assert!(labels.iter().any(|label| label == reason), "{labels:?}");
+            runtime
+                .failure_ui
+                .expanded
+                .edit()
+                .insert(incident.key.clone());
+            runtime.refresh_failure_previews();
+            let incident = runtime.failure_ui.incidents.last().unwrap();
+            let labels = recovery_labels(runtime.failure_view(incident));
+            assert!(
+                labels.iter().any(|label| label.contains("Copy")),
+                "{labels:?}"
+            );
+        }
+        // Nothing is known of what to do, so the notice doesn't say.
         assert!(
-            labels.iter().any(|label| label.contains("Details")),
-            "{labels:?}"
-        );
-        assert!(
-            labels.iter().any(|label| label.contains("Copy")),
-            "{labels:?}"
-        );
-        assert_eq!(
-            labels
+            !labels
                 .iter()
                 .any(|label| label.contains("before trying again")),
-            recovery == chat::Recovery::Retry,
             "{labels:?}",
         );
     }
