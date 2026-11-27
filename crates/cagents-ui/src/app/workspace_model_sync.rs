@@ -2972,7 +2972,7 @@ impl Cagents {
         let mut republished = Vec::new();
         let retired = channels_absent_from_model(&self.durable.channels, &model.channels);
         for (id, shared) in retired {
-            if self.channel_ui.is_deleting(id) {
+            if self.keeps_registry_removed_channel(id) {
                 continue;
             }
             if shared {
