@@ -303,6 +303,57 @@ fn ready_pre_effects_retry_requires_a_dead_exact_first_attempt_and_one_unused_sl
 
 #[cfg(target_os = "macos")]
 #[test]
+fn ready_retry_requires_exact_receipts_before_any_restoration() {
+    let directory = tempfile::tempdir().unwrap();
+    let preparation = preparation(directory.path());
+    let authority = &preparation.authority;
+    let mut proof = authority.source.clone();
+    proof.host_incarnation = HostIncarnation::new("first Ready attempt");
+    let claim = ready_claim_record(
+        authority,
+        "capture",
+        &proof,
+        crate::daemon::holder_registry::Process { pid: 20, start: 1 },
+        None,
+    );
+    let path = |name| ready_evidence_path(authority, name).unwrap();
+    let receipt = |stage| serde_json::to_vec(&ReadyWorkspaceStage::new(stage, &proof)).unwrap();
+    let accepts = || verify_ready_workspace_retry(authority, &claim).is_ok();
+    assert!(accepts());
+
+    save(&path("effects"), &serde_json::to_vec(&proof).unwrap());
+    assert!(
+        !accepts(),
+        "legacy effects do not identify a restore barrier"
+    );
+    save(&path("effects"), &receipt("effects"));
+    assert!(accepts(), "no initialization has started");
+
+    save(&path("init-start"), &receipt("init-start"));
+    assert!(!accepts(), "initialization might be partial");
+    save(
+        &path("init-complete"),
+        &serde_json::to_vec(&ReadyWorkspaceStage::new(
+            "init-complete",
+            &authority.source,
+        ))
+        .unwrap(),
+    );
+    assert!(!accepts(), "the receipt belongs to another writer");
+    save(&path("init-complete"), &receipt("init-start"));
+    assert!(!accepts(), "the receipt belongs to another stage");
+    save(&path("init-complete"), &receipt("init-complete"));
+    assert!(
+        accepts(),
+        "initialization finished before restoration began"
+    );
+
+    std::os::unix::fs::symlink("missing", path("restore")).unwrap();
+    assert!(!accepts(), "any restoration marker closes this retry");
+}
+
+#[cfg(target_os = "macos")]
+#[test]
 fn ordinary_ready_return_requires_no_successor_evidence() {
     let directory = tempfile::tempdir().unwrap();
     let preparation = preparation(directory.path());

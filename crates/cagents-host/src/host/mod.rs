@@ -690,11 +690,18 @@ fn save_agent_pane_identities(host: &SharedHost) {
     }
 }
 
-fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
+fn open_chat_deliveries(
+    require_durable_workspace: bool,
+) -> io::Result<(Option<Arc<crate::chat::runtime::Deliveries>>, bool)> {
     use crate::chat::runtime::Deliveries;
 
     match Deliveries::open() {
-        Ok(deliveries) => return Some(Arc::new(deliveries)),
+        Ok(deliveries) => return Ok((Some(Arc::new(deliveries)), true)),
+        Err(error) if require_durable_workspace => {
+            return Err(io::Error::other(format!(
+                "Cannot reopen the message delivery ledger: {error}"
+            )));
+        }
         Err(error) => {
             tracing::warn!(%error, "cannot open the message delivery ledger; using memory")
         }
@@ -703,7 +710,7 @@ fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
         Ok(deliveries) => Arc::new(deliveries),
         Err(error) => {
             tracing::error!(%error, "cannot open an in-memory message delivery ledger");
-            return None;
+            return Ok((None, false));
         }
     };
     let fallback = Arc::downgrade(&deliveries);
@@ -730,7 +737,7 @@ fn open_chat_deliveries() -> Option<Arc<crate::chat::runtime::Deliveries>> {
     }) {
         tracing::error!(%error, "cannot schedule reopening the message delivery ledger");
     }
-    Some(deliveries)
+    Ok((Some(deliveries), false))
 }
 
 /// Initialize the serving daemon under its runtime and saved-data leases.
@@ -739,7 +746,8 @@ fn initialize_serving_host(
     host: &SharedHost,
     paths: &RuntimePaths,
     first_this_boot: bool,
-) -> Result<(Option<notifications::Broker>, activity::Monitor), HostError> {
+    require_durable_workspace: bool,
+) -> Result<(Option<notifications::Broker>, activity::Monitor, bool), HostError> {
     // Before anything is launched, so the epoch precedes every launch.
     let proof = host
         .lock()
@@ -768,7 +776,7 @@ fn initialize_serving_host(
     }
     let codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     let native_chat_capacity = crate::native_chat_capacity::load()? as usize;
-    let chat_deliveries = open_chat_deliveries();
+    let (chat_deliveries, durable_deliveries) = open_chat_deliveries(require_durable_workspace)?;
     let prompt_cache = Arc::new(agent_execution::prompt_cache::Calibration::installation());
     {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -784,7 +792,7 @@ fn initialize_serving_host(
     // and donating its state over and over.
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("opening workspace model", None);
-    match model::Registry::open() {
+    let durable_model = match model::Registry::open() {
         Ok(mut registry) => {
             match crate::agent_execution::concurrency::Setting::configured() {
                 Ok(setting) => registry.use_concurrency(setting),
@@ -795,28 +803,53 @@ fn initialize_serving_host(
             }
             // Before any client reads the model: a window must never see a
             // worktree's panes outside its checkout's channel.
-            match registry.adopt_worktree_views() {
-                Ok(adopted) if adopted.strips > 0 => tracing::info!(
-                    strips = adopted.strips,
-                    panes = adopted.panes,
-                    channels = adopted.created_channels,
-                    kept = adopted.kept,
-                    failed = adopted.failed,
-                    "moved worktree strips into their checkouts' channels"
-                ),
-                Ok(_) => {}
-                Err(error) => tracing::error!(%error, "worktree strips were not moved into \
-                                                     channels; they still open as strips"),
+            let adopted = match registry.adopt_worktree_views() {
+                Ok(adopted) => {
+                    if adopted.strips > 0 {
+                        tracing::info!(
+                            strips = adopted.strips,
+                            panes = adopted.panes,
+                            channels = adopted.created_channels,
+                            kept = adopted.kept,
+                            failed = adopted.failed,
+                            "moved worktree strips into their checkouts' channels"
+                        );
+                    }
+                    adopted.failed == 0
+                }
+                Err(error) if require_durable_workspace => {
+                    return Err(io::Error::other(format!(
+                        "Cannot reopen saved workspace views: {error}"
+                    ))
+                    .into());
+                }
+                Err(error) => {
+                    tracing::error!(%error, "worktree strips were not moved into their checkouts; they still open as strips");
+                    false
+                }
+            };
+            let writers_available = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .install_model(registry);
+            if require_durable_workspace && !(adopted && writers_available) {
+                return Err(
+                    io::Error::other("Cannot reopen every required workspace writer").into(),
+                );
             }
-            host.lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .install_model(registry)
+            adopted && writers_available
+        }
+        Err(error) if require_durable_workspace => {
+            return Err(io::Error::other(format!(
+                "Cannot reopen the shared workspace model: {error}"
+            ))
+            .into());
         }
         Err(error) => {
-            tracing::error!(%error, "the shared workspace model is unavailable; channels will \
-                                    not be shared between windows")
+            tracing::error!(%error, "the shared workspace model is unavailable; channels will not be shared between windows");
+            false
         }
-    }
+    };
     workspace::titles::install(host);
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("workspace model opened", None);
@@ -853,7 +886,11 @@ fn initialize_serving_host(
     let agent_activity = activity::Monitor::start(host)?;
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("activity monitor started", None);
-    Ok((notification_broker, agent_activity))
+    Ok((
+        notification_broker,
+        agent_activity,
+        durable_deliveries && durable_model,
+    ))
 }
 
 pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
@@ -946,8 +983,22 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(not(target_os = "macos"))]
     let reserved_listener = None;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
-    let (_notification_broker, _agent_activity) =
-        initialize_serving_host(&host, &paths, first_this_boot)?;
+    #[cfg(target_os = "macos")]
+    let require_durable_workspace = match &ready_admission {
+        Some(ready) => {
+            ready.begin_workspace_initialization()?;
+            ready.requires_durable_workspace()
+        }
+        None => false,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let require_durable_workspace = false;
+    let (_notification_broker, _agent_activity, _durable_workspace) =
+        initialize_serving_host(&host, &paths, first_this_boot, require_durable_workspace)?;
+    #[cfg(target_os = "macos")]
+    if _durable_workspace && let Some(ready) = &ready_admission {
+        ready.finish_workspace_initialization()?;
+    }
     let mut recovered_prepared = false;
     #[cfg(target_os = "macos")]
     let mut installed_restoration = None;
@@ -959,6 +1010,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         let restored = (|| -> io::Result<()> {
             #[cfg(target_os = "macos")]
             if let Some(admission) = ready_admission.take() {
+                admission.begin_workspace_restore()?;
                 let restored = update_recovery::restore_installed_ready(&host, &admission)
                     .map_err(io::Error::other)?;
                 installed_restoration = Some(InstalledRestoration::Ready {
