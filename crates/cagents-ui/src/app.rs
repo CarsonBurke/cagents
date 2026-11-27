@@ -18033,6 +18033,9 @@ impl Application for Cagents {
                 ),
                 actions.into(),
             ];
+            if let Some(note) = self.no_chat_provider_note() {
+                content.push(design::caption(note).into());
+            }
             if !scoped {
                 content.push(
                     // The providers whose accounts the Accounts pane shows.

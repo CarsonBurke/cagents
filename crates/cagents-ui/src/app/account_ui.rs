@@ -107,6 +107,9 @@ const COMPACT_WIDTH: f32 = design::OVERLAY_DOCK_BREAKPOINT;
 pub(super) struct State {
     accounts: Vec<AccountState>,
     installed: BTreeMap<Provider, bool>,
+    /// Whether `installed` was judged on this process's own `PATH` before the
+    /// shell's was read, so that a CLI only the shell finds reads as absent.
+    installed_provisional: bool,
     /// Local metadata reads are superseded independently of usage probes.
     discovery_generation: u64,
     /// Explicit refresh intent survives coalesced discovery; the owner still
@@ -236,6 +239,18 @@ impl State {
         (state.owner, state.start_probe(trigger, now))
     }
 
+    /// Records what discovery found for `provider`'s CLI, with its accounts
+    /// present or not to match.
+    #[cfg(test)]
+    pub(in crate::app) fn set_cli_for_test(&mut self, provider: Provider, installed: bool) {
+        self.installed.insert(provider, installed);
+        for state in self.accounts.iter_mut() {
+            if state.account.provider == provider {
+                state.present = installed;
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(super) fn pending_probe_for_test(&self, id: &AccountId) -> Option<ProbeTicket> {
         self.account(id)?.pending_probe.clone()
@@ -319,6 +334,7 @@ impl State {
         let mut state = Self {
             accounts: Vec::new(),
             installed: BTreeMap::new(),
+            installed_provisional: false,
             discovery_generation: 0,
             discovery_manual: BTreeMap::new(),
             registry,
@@ -784,10 +800,26 @@ impl State {
         self.catalogs.get(&provider)
     }
 
-    /// Whether a new conversation can be started on `provider`: it has
-    /// listed its models before, or one of its accounts has a CLI to run.
+    /// Whether the last discovery found no CLI for `provider` where this
+    /// window's conversations run: on its device, for a device window.
+    /// Unknown until discovery answers on the shell's `PATH`, which is not
+    /// absence.
+    pub(super) fn cli_missing(&self, provider: Provider) -> bool {
+        !self.installed_provisional && self.cli_installed(provider) == Some(false)
+    }
+
+    /// Whether the last discovery found a CLI for `provider`, if it has
+    /// answered.
+    pub(super) fn cli_installed(&self, provider: Provider) -> Option<bool> {
+        self.installed.get(&provider).copied()
+    }
+
+    /// Whether a new conversation can be started on `provider`: its CLI is
+    /// not known to be missing, and it has listed its models before or one
+    /// of its accounts has a CLI to run.
     pub(super) fn offers(&self, provider: Provider) -> bool {
         self.uses(provider)
+            && !self.cli_missing(provider)
             && (self
                 .catalog(provider)
                 .is_some_and(|catalog| !catalog.models.is_empty())
@@ -2965,6 +2997,12 @@ impl Cagents {
     }
 
     fn locate_accounts_for(&mut self, manual: Option<(AccountId, u64)>) -> Task<Message> {
+        // A device window learns which CLIs exist from its device's accounts
+        // snapshot; this computer's PATH would describe the wrong machine.
+        // What follows a discovery, checking the accounts, still does.
+        if crate::device::is_remote() {
+            return self.probe_accounts(Trigger::Focus);
+        }
         if let Some((id, owner)) = manual {
             self.account_ui.discovery_manual.insert(id, owner);
         }
@@ -3948,6 +3986,7 @@ impl Cagents {
                 let current_discovery = loaded.generation == self.account_ui.discovery_generation;
                 if current_discovery {
                     self.account_ui.installed = loaded.installed;
+                    self.account_ui.installed_provisional = loaded.provisional;
                 }
                 let owners_before = self.account_ui.discovery_owners();
                 let was_ready = self.account_ui.registry_ready;
@@ -4011,6 +4050,7 @@ impl Cagents {
                     return self.locate_accounts();
                 }
                 self.account_ui.installed = installed;
+                self.account_ui.installed_provisional = false;
                 // Fresh detection owns current presence, independently of an
                 // older usage snapshot which remains useful history.
                 let installed = self.account_ui.installed.clone();
@@ -12842,6 +12882,31 @@ mod app_tests {
             app.account_ui.account(&codex).unwrap().snapshot.as_ref(),
             Some(&probed)
         );
+    }
+
+    /// A CLI this process's own `PATH` misses may still be on the shell's, so
+    /// it isn't missing until the shell's `PATH` answers (#4377).
+    #[test]
+    fn a_cli_is_missing_only_once_the_shells_path_answers() {
+        let mut app = context_inspector_test_app(false);
+        let absent = BTreeMap::from([(Provider::Codex, false)]);
+        let _ = app.update(Message::AccountUi(Action::Loaded(Loaded {
+            generation: app.account_ui.discovery_generation,
+            registry: Ok(Registry::default()),
+            restored: Vec::new(),
+            catalogs: BTreeMap::new(),
+            installed: absent.clone(),
+            provisional: true,
+        })));
+        assert!(!app.account_ui.cli_missing(Provider::Codex));
+        let _ = app.update(Message::AccountUi(Action::Located {
+            generation: app.account_ui.discovery_generation,
+            owners: app.account_ui.discovery_owners(),
+            restored: Vec::new(),
+            installed: absent,
+        }));
+        assert!(app.account_ui.cli_missing(Provider::Codex));
+        assert!(!app.account_ui.cli_missing(Provider::Claude));
     }
 
     /// A CLI the interface's own `PATH` found but the shell's does not is

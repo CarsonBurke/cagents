@@ -8309,6 +8309,13 @@ impl DraftPermissionPreview {
     }
 }
 
+/// Where this window's conversations run, as a sentence names it: its
+/// device, or this computer.
+fn conversation_place() -> String {
+    crate::device::selected()
+        .map_or_else(|| "this computer".to_owned(), |device| device.name.clone())
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -9940,6 +9947,17 @@ impl Cagents {
     }
 
     fn preferred_chat_provider(&self) -> Provider {
+        self.available_chat_provider().unwrap_or(Provider::Codex)
+    }
+
+    /// The provider a new conversation starts on: the focused or latest open
+    /// conversation's, else Codex, else the first other provider with native
+    /// chat. Each must be turned on, and not known to lack its CLI where this
+    /// window's conversations run, as Accounts reports: a device window
+    /// skips a provider its device doesn't have. `None` when none qualifies.
+    pub(super) fn available_chat_provider(&self) -> Option<Provider> {
+        let available =
+            |provider| self.account_ui.uses(provider) && !self.account_ui.cli_missing(provider);
         self.workspace
             .focused()
             .and_then(|card| self.card_state(card))
@@ -9952,19 +9970,77 @@ impl Cagents {
                     .filter(|card| card.existence.is_open()),
             )
             .find_map(|card| match &card.kind {
-                CardKind::Chat(session) if self.account_ui.uses(session.launch.provider) => {
+                CardKind::Chat(session) if available(session.launch.provider) => {
                     Some(session.launch.provider)
                 }
                 _ => None,
             })
-            // Codex, unless it is turned off: then the first provider in use
-            // that has native chat.
             .or_else(|| {
                 std::iter::once(Provider::Codex)
                     .chain(crate::account::Account::REPORTED)
-                    .find(|provider| provider.has_native_chat() && self.account_ui.uses(*provider))
+                    .find(|provider| provider.has_native_chat() && available(*provider))
             })
-            .unwrap_or(Provider::Codex)
+    }
+
+    /// What the start page says when no provider can start a conversation:
+    /// each one is turned off or, as Accounts found, missing on this
+    /// window's device.
+    pub(super) fn no_chat_provider_note(&self) -> Option<String> {
+        if self.available_chat_provider().is_some() {
+            return None;
+        }
+        if !Provider::ALL
+            .into_iter()
+            .any(|provider| provider.has_native_chat() && self.account_ui.uses(provider))
+        {
+            return Some(
+                "Every agent is turned off. Turn one on in Settings to start a conversation."
+                    .into(),
+            );
+        }
+        Some(format!(
+            "No agent you use is installed on {}. Install one there, such as Claude Code or Codex, then open Accounts to check again.",
+            conversation_place()
+        ))
+    }
+
+    /// A start the daemon refused because its provider isn't installed, in
+    /// the reader's words: the device it is missing on, and for a draft the
+    /// provider the model menu can start instead. Where Accounts found the
+    /// CLI, the daemon's report follows, since it names what differs: the
+    /// PATH agents start with.
+    fn explain_missing_provider(
+        &self,
+        card: CardId,
+        mut failure: chat::StartFailure,
+    ) -> chat::StartFailure {
+        let Some(provider) = chat::failure::not_installed_provider(&failure.message) else {
+            return failure;
+        };
+        let name = provider.label();
+        let place = conversation_place();
+        if self.account_ui.cli_installed(provider) == Some(true) {
+            return failure;
+        }
+        let draft = matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Chat(runtime)) if runtime.is_draft()
+        );
+        let instead = draft
+            .then(|| {
+                view::MODEL_FAMILIES.into_iter().find(|other| {
+                    *other != provider && other.has_native_chat() && self.account_ui.offers(*other)
+                })
+            })
+            .flatten();
+        failure.message = match instead {
+            Some(other) => format!(
+                "{name} isn't installed on {place}. Choose a model under {} in the model menu, or install {name} there.",
+                view::family_label(other)
+            ),
+            None => format!("{name} isn't installed on {place}. Install it there, then try again."),
+        };
+        failure
     }
 
     pub(super) fn add_default_pane(
@@ -14757,6 +14833,8 @@ impl Cagents {
                     self.persist();
                     return self.start_chat(target.card, named, attempt.intent, None, false);
                 }
+                let result =
+                    result.map_err(|failure| self.explain_missing_provider(target.card, failure));
                 match result {
                     Ok(handle) => {
                         if attempt.upgrade_admission.as_ref().is_some_and(|canonical| {

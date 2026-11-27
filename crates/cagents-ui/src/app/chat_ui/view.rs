@@ -1816,7 +1816,7 @@ fn reasoning_elapsed(
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
 /// A provider without native chat is never offered.
-const MODEL_FAMILIES: [Provider; 5] = [
+pub(super) const MODEL_FAMILIES: [Provider; 5] = [
     Provider::Codex,
     Provider::Claude,
     Provider::Antigravity,
@@ -1834,7 +1834,7 @@ struct Offer<'a> {
 }
 
 /// What a provider is called where its models are listed.
-fn family_label(provider: Provider) -> &'static str {
+pub(super) fn family_label(provider: Provider) -> &'static str {
     match provider {
         Provider::Codex => "ChatGPT",
         Provider::Claude => "Claude",
