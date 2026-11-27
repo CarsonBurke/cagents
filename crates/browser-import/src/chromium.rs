@@ -62,7 +62,7 @@ impl Decryptor {
                 match stored {
                     Ok(stored) if !stored.is_empty() => Err(Error::Decryption),
                     // Nothing to try: the keyring holds no key for this browser.
-                    Ok(_) => Err(Error::KeyringDenied),
+                    Ok(_) => Err(Error::KeyMissing),
                     Err(error) => Err(*error),
                 }
             }
@@ -219,7 +219,7 @@ pub(crate) mod tests {
             Decryptor::new(Keyring::Brave)
                 .decrypt(&bytes, "example.test", 24, &mut Fixture(Vec::new(), 0))
                 .err(),
-            Some(Error::KeyringDenied)
+            Some(Error::KeyMissing)
         );
     }
 }

@@ -56,7 +56,9 @@ Secret Service item has the `application` attribute `chrome`, `chromium` or
 "Chrome Safe Storage" entry in the "Chrome Keys" folder of the network wallet.
 The table's Keyring entry column gives each browser's name. The importer asks
 the Secret Service first, or KWallet first on KDE. It asks KWallet only when
-KWallet is already running. Unlocking may prompt. A denial is reported for that
+KWallet is already running. Items that are already unlocked are read first, and
+locked items are unlocked only if none of those has a key. Unlocking may prompt.
+A denial, or a keyring with no entry for the browser, is reported for that
 profile, and other profiles can still import.
 
 Profiles can be scanned and imported while their browser is running. A running

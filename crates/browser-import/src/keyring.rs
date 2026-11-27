@@ -65,13 +65,21 @@ fn secret_service(keyring: Keyring) -> Result<Passwords, Error> {
     let items = service
         .search_items(HashMap::from([("application", keyring.application())]))
         .map_err(|_| Error::KeyringDenied)?;
-    let mut passwords = Vec::new();
-    for item in items.unlocked.into_iter().chain(items.locked) {
-        // Unlocking may show the keyring's prompt; dismissing it is a denial.
-        item.unlock().map_err(|_| Error::KeyringDenied)?;
-        let secret = Zeroizing::new(item.get_secret().map_err(|_| Error::KeyringDenied)?);
-        if !secret.is_empty() {
-            passwords.push(secret);
+    // Items already unlocked need no prompt. Locked ones are unlocked only
+    // when none of those held a key, so a stale locked copy never costs a
+    // prompt or turns a working key into a denial.
+    let read = |item: &secret_service::blocking::Item<'_>| {
+        item.get_secret()
+            .ok()
+            .map(Zeroizing::new)
+            .filter(|secret| !secret.is_empty())
+    };
+    let mut passwords: Passwords = items.unlocked.iter().filter_map(read).collect();
+    if passwords.is_empty() {
+        for item in &items.locked {
+            // Unlocking may show the keyring's prompt; dismissing it is a denial.
+            item.unlock().map_err(|_| Error::KeyringDenied)?;
+            passwords.extend(read(item));
         }
     }
     Ok(passwords)

@@ -202,6 +202,8 @@ pub enum Error {
     UnsupportedEncryption,
     TooLarge,
     KeyringDenied,
+    /// The keyring has no entry under the browser's name.
+    KeyMissing,
     Decryption,
     Cancelled,
 }
@@ -215,9 +217,10 @@ impl std::fmt::Display for Error {
             Self::Busy => "The browser kept changing its cookies while they were read. Wait a moment or close the browser, then retry.",
             Self::UnsupportedSchema => "This profile stores cookies in a format this app doesn't recognize yet, possibly from a newer browser version. No cookies were imported from it.",
             Self::UnsupportedEncryption => "This browser encrypts its cookies in a way this app can't read yet. No cookies were imported from it.",
-            Self::TooLarge => "This profile has more cookies than one import can take. Select fewer sites, then retry.",
-            Self::KeyringDenied => "Your desktop keyring didn't provide this browser's cookie key. Unlock the keyring and allow access when asked, then retry.",
-            Self::Decryption => "The key in your desktop keyring doesn't decrypt this profile's cookies, so none were imported. Sign in again in that browser, then retry.",
+            Self::TooLarge => "This profile has more cookies than this app can import. Import a smaller profile, or select fewer sites if that applies.",
+            Self::KeyringDenied => "Your desktop keyring didn't allow access to this browser's cookie key. Unlock the keyring and allow access when asked, then retry.",
+            Self::KeyMissing => "Your desktop keyring has no cookie key for this browser. Open the browser once so it can save its key, then retry.",
+            Self::Decryption => "This profile's cookies were saved with a key your desktop keyring no longer has, so none were imported.",
             Self::Cancelled => "The import was cancelled.",
         })
     }
@@ -380,6 +383,7 @@ mod tests {
             UnsupportedEncryption,
             TooLarge,
             KeyringDenied,
+            KeyMissing,
             Decryption,
             Cancelled,
         ] {

@@ -211,8 +211,12 @@ const FIREFOX: &[Root] = &[
     root(Firefox, Snap, Home, "snap/firefox/common/.mozilla/firefox"),
 ];
 
-/// Small metadata files only; a larger one is not a browser's.
-const MAX_METADATA: u64 = 16 * 1024 * 1024;
+/// Metadata size limits; a larger file is not a browser's. `Local State`
+/// carries much more than profile names, so it gets more room.
+const MAX_LOCAL_STATE: u64 = 16 * 1024 * 1024;
+const MAX_PROFILES_INI: u64 = 256 * 1024;
+/// As many profiles as one browser root may list.
+const MAX_PROFILES: usize = 256;
 
 /// Discovery opens profile metadata only after the caller's consent step.
 /// Explicit roots also make tests independent of a developer's real profiles.
@@ -246,11 +250,17 @@ pub fn discover(home: &Path, config: &Path) -> Vec<Profile> {
     profiles
 }
 
-fn read_small(path: &Path) -> Option<Vec<u8>> {
-    let metadata = fs::metadata(path).ok()?;
-    (metadata.is_file() && metadata.len() <= MAX_METADATA)
-        .then(|| fs::read(path).ok())
-        .flatten()
+/// A regular file's contents, if it is no larger than `limit`, even when it
+/// grows while it is read.
+fn read_small(path: &Path, limit: u64) -> Option<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut contents = Vec::new();
+    file.take(limit + 1).read_to_end(&mut contents).ok()?;
+    (contents.len() as u64 <= limit).then_some(contents)
 }
 
 /// A Chromium profile keeps cookies in `Network/Cookies`, or in `Cookies`
@@ -303,11 +313,15 @@ fn chromium(root: &Root, directory: &Path, profiles: &mut Vec<Profile>) {
 /// `Local State`'s `profile.info_cache`. Profiles can be named anything,
 /// and folders on disk can outlive a deleted profile.
 fn local_state(directory: &Path) -> Option<Vec<(String, String)>> {
-    let state: serde_json::Value =
-        serde_json::from_slice(&read_small(&directory.join("Local State"))?).ok()?;
+    let state: serde_json::Value = serde_json::from_slice(&read_small(
+        &directory.join("Local State"),
+        MAX_LOCAL_STATE,
+    )?)
+    .ok()?;
     let cache = state.get("profile")?.get("info_cache")?.as_object()?;
     let profiles: Vec<_> = cache
         .iter()
+        .take(MAX_PROFILES)
         .filter(|(folder, _)| {
             let mut components = Path::new(folder.as_str()).components();
             matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
@@ -331,7 +345,7 @@ fn scanned(directory: &Path) -> Vec<(String, String)> {
         return Vec::new();
     };
     entries
-        .take(256)
+        .take(MAX_PROFILES)
         .flatten()
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name == "Default" || name.starts_with("Profile "))
@@ -340,7 +354,7 @@ fn scanned(directory: &Path) -> Vec<(String, String)> {
 }
 
 fn firefox(root: &Root, directory: &Path, profiles: &mut Vec<Profile>) {
-    let Some(contents) = read_small(&directory.join("profiles.ini"))
+    let Some(contents) = read_small(&directory.join("profiles.ini"), MAX_PROFILES_INI)
         .and_then(|contents| String::from_utf8(contents).ok())
     else {
         return;
@@ -364,7 +378,13 @@ fn firefox(root: &Root, directory: &Path, profiles: &mut Vec<Profile>) {
             profiles.push(Profile {
                 browser: root.browser,
                 install: root.install,
-                name: fields.get("Name").copied().unwrap_or(path).to_owned(),
+                name: fields
+                    .get("Name")
+                    .copied()
+                    .unwrap_or(path)
+                    .chars()
+                    .take(128)
+                    .collect(),
                 database,
             });
         }

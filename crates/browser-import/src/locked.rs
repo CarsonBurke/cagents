@@ -42,10 +42,14 @@ pub(crate) fn image(
         if before.journal_hot {
             continue;
         }
-        let Some(mut image) = read(path, limit)? else {
+        // A file that shrank while it was read changed; read both again.
+        let (image, wal) = match (read(path, limit), read(&wal_path, limit)) {
+            (Err(Error::Busy), _) | (_, Err(Error::Busy)) => continue,
+            (image, wal) => (image?, wal?),
+        };
+        let Some(mut image) = image else {
             return Err(Error::Unreadable);
         };
-        let wal = read(&wal_path, limit)?;
         // The log is read after the database: a checkpoint copying log pages
         // into the database meanwhile is harmless, since replaying the log
         // rewrites those pages. Only a restarted log or a changed file
@@ -84,7 +88,9 @@ fn sibling(path: &Path, suffix: &str) -> PathBuf {
 
 #[derive(PartialEq, Eq)]
 struct Files {
-    database: (u64, Option<SystemTime>),
+    /// Length, modification time, and the header's change counter, which a
+    /// rollback-journal commit always increments even within one clock tick.
+    database: (u64, Option<SystemTime>, Option<Vec<u8>>),
     wal_header: Option<Vec<u8>>,
     journal_hot: bool,
 }
@@ -93,7 +99,11 @@ impl Files {
     fn observe(database: &Path, wal: &Path, journal: &Path) -> Result<Self, Error> {
         let metadata = std::fs::metadata(database).map_err(|_| Error::Unreadable)?;
         Ok(Self {
-            database: (metadata.len(), metadata.modified().ok()),
+            database: (
+                metadata.len(),
+                metadata.modified().ok(),
+                prefix(database, 28).map(|header| header[24..].to_vec()),
+            ),
             wal_header: prefix(wal, WAL_HEADER),
             journal_hot: prefix(journal, JOURNAL_MAGIC.len())
                 .is_some_and(|start| start == JOURNAL_MAGIC),
@@ -121,8 +131,8 @@ fn read(path: &Path, limit: u64) -> Result<Option<Zeroizing<Vec<u8>>>, Error> {
         return Err(Error::TooLarge);
     }
     let mut bytes = Zeroizing::new(vec![0; length as usize]);
-    // A file that shrank fails here and one that grew changes its
-    // observed length; either way the caller reads again.
+    // A file that shrank fails here, reported as busy so the caller reads
+    // again; one that grew changes its observed length.
     file.read_exact(&mut bytes).map_err(|_| Error::Busy)?;
     Ok(Some(bytes))
 }
@@ -162,7 +172,8 @@ fn replay(image: &mut Zeroizing<Vec<u8>>, wal: &[u8], limit: u64) -> Result<(), 
         _ => return Ok(()),
     };
     let page_size = be32(&header[8..]) as usize;
-    if !(512..=65536).contains(&page_size)
+    if be32(&header[4..]) != 3_007_000
+        || !(512..=65536).contains(&page_size)
         || !page_size.is_power_of_two()
         || checksum(big_endian, &header[..24], (0, 0)) != (be32(&header[24..]), be32(&header[28..]))
     {
@@ -177,9 +188,13 @@ fn replay(image: &mut Zeroizing<Vec<u8>>, wal: &[u8], limit: u64) -> Result<(), 
             return Err(Error::Unreadable);
         }
     }
+    // First find the committed frames and the final size, so the image is
+    // allocated once: growing it in place would leave unerased copies of
+    // cookie data behind in freed memory.
     let salt = &header[16..24];
     let mut sums = (be32(&header[24..]), be32(&header[28..]));
-    let mut pending = Vec::new();
+    let mut frames = Vec::new();
+    let mut committed = (0, None);
     for frame in wal[WAL_HEADER..].chunks_exact(FRAME_HEADER + page_size) {
         let (frame_header, page) = frame.split_at(FRAME_HEADER);
         if &frame_header[8..16] != salt {
@@ -194,27 +209,31 @@ fn replay(image: &mut Zeroizing<Vec<u8>>, wal: &[u8], limit: u64) -> Result<(), 
         if page_number == 0 {
             break;
         }
-        pending.push((page_number, page));
-        let committed_pages = be32(&frame_header[4..]) as usize;
-        if committed_pages == 0 {
-            continue;
+        frames.push((page_number, page));
+        let pages = be32(&frame_header[4..]) as usize;
+        if pages != 0 {
+            let end = pages
+                .checked_mul(page_size)
+                .filter(|&end| end as u64 <= limit)
+                .ok_or(Error::TooLarge)?;
+            committed = (frames.len(), Some(end));
         }
-        let end = committed_pages
-            .checked_mul(page_size)
-            .filter(|&end| end as u64 <= limit)
-            .ok_or(Error::TooLarge)?;
-        for (page_number, page) in pending.drain(..) {
-            let start = (page_number - 1) * page_size;
-            if start + page_size > end {
-                continue;
-            }
-            if image.len() < start + page_size {
-                image.resize(start + page_size, 0);
-            }
-            image[start..start + page_size].copy_from_slice(page);
-        }
-        image.resize(end, 0);
     }
+    let (count, Some(end)) = committed else {
+        return Ok(());
+    };
+    let mut replayed = Zeroizing::new(Vec::with_capacity(end));
+    replayed.extend_from_slice(&image[..image.len().min(end)]);
+    replayed.resize(end, 0);
+    for &(page_number, page) in &frames[..count] {
+        // A page beyond the committed size was truncated by a later commit.
+        if let Some(start) = (page_number - 1).checked_mul(page_size)
+            && start + page_size <= end
+        {
+            replayed[start..start + page_size].copy_from_slice(page);
+        }
+    }
+    *image = replayed;
     Ok(())
 }
 

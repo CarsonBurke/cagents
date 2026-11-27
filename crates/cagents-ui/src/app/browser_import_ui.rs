@@ -650,8 +650,8 @@ impl Cagents {
                         report.skipped + self.browser_import.skipped,
                         match self.browser_import.undecryptable {
                             0 => String::new(),
-                            1 => " 1 cookie couldn't be decrypted with the browser's current key and was skipped.".into(),
-                            n => format!(" {n} cookies couldn't be decrypted with the browser's current key and were skipped."),
+                            1 => " 1 cookie couldn't be read and was skipped.".into(),
+                            n => format!(" {n} cookies couldn't be read and were skipped."),
                         }
                     ),
                     Err(error) => error,
