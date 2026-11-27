@@ -361,8 +361,9 @@ def main(arguments: list[str]) -> int:
                   "and publish again", file=sys.stderr)
         return 1
     if options.command == "scan":
-        for image in images:
-            print(f"{image}: no identity found")
+        if not warn:
+            for image in images:
+                print(f"{image}: no identity found")
         return 0
     try:
         return publish(images, options)

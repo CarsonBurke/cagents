@@ -3319,16 +3319,22 @@ class RemoteEvidence(unittest.TestCase):
         for fetch in (("shot", "other"), ("fetch",), ("stop",), ("fetch",)):
             result = self.run_tool(*fetch)
             self.assertEqual(local.read_text(), "masked", fetch)
-        self.assertIn(f"kept {local}, which changed after it was delivered", result.stderr)
+            # Nothing new came for it, so there is nothing to say.
+            self.assertNotIn("kept", result.stderr)
         self.assertEqual((self.task / "shots" / "after-other.webp").read_text(), "webp")
         # Retaken, the path printed holds the edited shot, which its status says.
+        self.run_tool("start", "after")
+        (self.remote_task / "shots" / "after-home.webp").unlink()
         retake = self.run_tool("shot", "home", check=False)
         self.assertEqual(retake.returncode, 4, retake.stderr)
         self.assertEqual(retake.stdout.strip(), str(local))
         self.assertEqual(local.read_text(), "masked")
+        self.run_tool("stop")
         # A retake on the host waits in raw/ beside the edited shot.
         (self.remote_task / "shots" / "after-home.webp").write_text("retaken")
-        self.run_tool("fetch")
+        result = self.run_tool("fetch")
+        self.assertIn(f"kept {local}, which changed after it was delivered; the new capture is "
+                      f"{self.task}/raw/after-home.webp", result.stderr)
         self.assertEqual(local.read_text(), "masked")
         self.assertEqual((self.task / "raw" / "after-home.webp").read_text(), "retaken")
         # One left as it was delivered follows its retake, as does the manifest.

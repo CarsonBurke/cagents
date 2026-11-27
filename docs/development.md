@@ -2528,10 +2528,11 @@ harness, it provides:
   and a capture replaces a shot in `shots/` only while that shot is missing or
   still exactly the last capture. A shot you changed, such as one with an
   address masked out, is never overwritten by a retake or, through `--remote`,
-  by a later `shot`, `fetch` or `pair` bringing the host's copies back: the
-  tool says it kept it and leaves the new capture in `raw/`. Copy that over
-  the shot to use it. `raw/` holds the unedited originals, so never publish
-  from it.
+  by a later `shot`, `fetch` or `pair` bringing the host's copies back. When a
+  new capture arrives for it, the tool says it kept the shot and leaves the
+  capture in `raw/`; copy that over the shot to use it. A `shot` whose own
+  name was kept prints the shot's path as usual and exits 4. `raw/` holds the
+  unedited originals, so never publish from it.
 - **Identities at shot time.** Fixture accounts use addresses such as
   `fixture@example.test` that can never be real. Where the host has
   tesseract with English data, `shot` reads the capture's text and warns when
@@ -2787,17 +2788,21 @@ image's text by OCR and refuses:
 - an email address, unless its domain ends in `.test`, `.invalid`, `.example`
   or `.localhost`, which fixtures use because they can never receive mail.
   `--allow ADDRESS_OR_DOMAIN` accepts one that belongs in the image;
-- the repository's Git email;
+- the address of every account cagents knows here, read with `cagents
+  account list`, and the repository's Git email;
 - each line of `~/.config/cagents/private-identities` (under
   `XDG_CONFIG_HOME`), a private list of names, logins and addresses that must
-  never appear in a public image. It never leaves this machine. `--identity
-  TEXT` adds one for a single run.
+  never appear in a public image. `--identity TEXT` adds one for a single run.
 
-The report masks what it found. OCR needs tesseract with English data. Where
-this machine lacks it, the images, but not the identities, go to the host in
-`--ocr-host`, `CAGENTS_SCREENSHOT_OCR_HOST` or `CAGENTS_EVIDENCE_REMOTE` over
-SSH, so from a cagents session the check reads text on fw16. With no OCR at
-all, nothing is published.
+For each of those addresses, the part before the `@` counts on its own when
+it has five or more characters, so an address OCR misread or the UI cut off
+is still found. Matching ignores case and spaces and reads the symbols OCR
+mistakes `@` for, such as `©`, as `@`. The report masks what it found.
+
+OCR needs tesseract with English data. Where this machine lacks it, the
+images, but never the identities, go over SSH to `--ocr-host`,
+`CAGENTS_SCREENSHOT_OCR_HOST`, `CAGENTS_EVIDENCE_REMOTE` or else fw16, which
+has it. When no OCR can run, nothing is published.
 
 To mask an identity, edit the copy in `shots/` and publish that; the tool's
 original stays in `raw/`, which `publish` refuses. OCR misses tiny, faint or

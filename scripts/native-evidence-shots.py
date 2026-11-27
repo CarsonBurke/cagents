@@ -7,9 +7,9 @@ Each file under INCOMING is a capture: a new `shot`, or one brought back from
 the build host. The tool's own copy of every capture goes to TASK/raw/, and
 TASK/shots/ is the person's: a capture replaces a shot there only while that
 shot is missing or still exactly what the tool last delivered. A shot changed
-since, such as one with an address masked out, is kept, and the new capture
-waits in raw/ beside it. Content decides, not modification times, which a
-copy or archive can carry along unchanged.
+since, such as one with an address masked out, is kept, and a new capture
+waits in raw/ beside it, which is reported once. Content decides, not
+modification times, which a copy or archive can carry along unchanged.
 
 Exit status 0 even when a shot was kept, which is reported on standard error;
 1 when a file could not be written.
@@ -48,14 +48,12 @@ def deliver(task: Path, incoming: Path) -> list[str]:
     for capture in sorted(path for path in incoming.rglob("*") if path.is_file() and not path.is_symlink()):
         relative = capture.relative_to(incoming)
         original, shot = task / "raw" / relative, task / "shots" / relative
-        if shot.is_symlink() or (shot.exists() and not shot.is_file()):
-            kept.append(str(relative))
-        elif not shot.exists() or same(shot, original) or same(shot, capture):
+        if not shot.is_symlink() and (not shot.exists() or same(shot, original) or same(shot, capture)):
             install(capture, shot)
-        else:
+        elif not same(capture, original):
             # Changed after it was delivered, or present before the tool kept
             # originals and unlike this capture: either way it isn't the
-            # tool's to replace.
+            # tool's to replace. Only a new capture is worth saying so.
             kept.append(str(relative))
         install(capture, original)
     return kept
