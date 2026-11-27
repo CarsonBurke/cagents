@@ -57,11 +57,18 @@ log() { printf '== %s %s\n' "$(date +%T)" "$*"; }
 # The centre of the lowest place the screen shows a match of the extended
 # regular expression PATTERN, such as a tab in the strip above the composer
 # rather than a transcript row of the same name. The screen is read by OCR,
-# which can run words together.
+# which can run words together or miss a word on one reading, so it reads
+# the screen up to three times.
 lowest() {
-    "$ne" drive observe 2>/dev/null | grep -E -- "$1" |
-        sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
-        sort -k2 -n | tail -1 | awk 'NF == 4 {printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}'
+    local at try
+    for try in 1 2 3; do
+        at=$("$ne" drive observe 2>/dev/null | grep -E -- "$1" |
+            sed -E 's/^ *\[t[0-9]+\] +([0-9]+), +([0-9]+) +([0-9]+)x([0-9]+).*/\1 \2 \3 \4/' |
+            sort -k2 -n | tail -1 | awk 'NF == 4 {printf "%d,%d", $1 + $3 / 2, $2 + $4 / 2}')
+        [ -n "$at" ] && break
+        sleep 1
+    done
+    printf '%s' "$at"
 }
 shot() {
     "$ne" drive hover 1,1 >/dev/null 2>&1
@@ -126,13 +133,13 @@ if [ "$mode" = strip ]; then
     # The lead's tab, named Conversation before it was Main, reads best
     # while it is the one shown.
     lead=$(lowest 'Main|Conversation')
-    tab=$(lowest 'Audit ?retry')
+    tab=$(lowest 'Audit')
     if [ -n "$tab" ]; then "$ne" drive click "$tab" >/dev/null 2>&1; else log "no Audit tab to open"; fi
     sleep 2
     shot strip-selected"$layout"
     # The strip moves up for the open agent's heading; the lead's tab is
     # level with the agent's.
-    tab=$(lowest 'Audit ?retry')
+    tab=$(lowest 'Audit')
     if [ -n "$lead" ] && [ -n "$tab" ]; then
         "$ne" drive click "${lead%,*},${tab#*,}" >/dev/null 2>&1
     else
