@@ -976,11 +976,21 @@ fn dispatch(
         Some(directory) => {
             let identity = working_directory::identity(&directory).map_err(before)?;
             working_directory::reopen(path, identity).map_err(before)?;
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .pin_agent_directory(accepted.agent.id, identity)
-                .map_err(before)?;
+            if matches!(accepted.agent.origin, Origin::Automation { .. }) {
+                let identity = super::automations::target::Identity::capture(&directory)
+                    .map_err(|error| before(error.to_string()))?;
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pin_automation_agent_directory(accepted.agent.id, &identity)
+                    .map_err(before)?;
+            } else {
+                registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .pin_agent_directory(accepted.agent.id, identity)
+                    .map_err(before)?;
+            }
             Some(directory)
         }
         None => {

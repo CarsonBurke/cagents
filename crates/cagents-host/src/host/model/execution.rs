@@ -621,6 +621,29 @@ impl Registry {
         tx.commit().map_err(|error| error.to_string())
     }
 
+    pub(crate) fn pin_automation_agent_directory(
+        &mut self,
+        id: AgentId,
+        identity: &crate::host::automations::target::Identity,
+    ) -> Result<(), String> {
+        use crate::host::automations::target::Identity;
+
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        if agent_directory_record(&tx, id)?
+            .as_deref()
+            .map(decode::<Identity>)
+            .transpose()?
+            .is_some_and(|previous| !previous.matches(identity))
+        {
+            return Err("The agent's approved directory identity cannot change".into());
+        }
+        write_agent_directory(&tx, id, identity)?;
+        tx.commit().map_err(|error| error.to_string())
+    }
+
     /// Records the directory `id`'s project admitted for its next provider,
     /// in place of one that no longer sits at the agent's path.
     pub(crate) fn record_agent_directory(
@@ -628,31 +651,35 @@ impl Registry {
         id: AgentId,
         identity: crate::agent_execution::DirectoryIdentity,
     ) -> Result<(), String> {
-        self.db
-            .execute(
-                "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
-                ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
-                params![id.to_string(), encode(&identity)?],
-            )
-            .map(drop)
-            .map_err(|error| error.to_string())
+        write_agent_directory(&self.db, id, &identity)
     }
 
     pub(crate) fn agent_directory(
         &self,
         id: AgentId,
     ) -> Result<Option<crate::agent_execution::DirectoryIdentity>, String> {
-        self.db
-            .query_row(
-                "SELECT directory FROM agent_policies WHERE agent = ?1",
-                [id.to_string()],
-                |row| row.get::<_, Option<String>>(0),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?
-            .flatten()
-            .map(|value| decode(&value))
+        agent_directory_record(&self.db, id)?
+            .as_deref()
+            .map(decode)
             .transpose()
+    }
+
+    pub(crate) fn automation_agent_directory(
+        &self,
+        id: AgentId,
+    ) -> Result<Option<crate::host::automations::target::Identity>, String> {
+        agent_directory_record(&self.db, id)?
+            .as_deref()
+            .map(decode)
+            .transpose()
+    }
+
+    pub(crate) fn record_automation_agent_directory(
+        &mut self,
+        id: AgentId,
+        identity: &crate::host::automations::target::Identity,
+    ) -> Result<(), String> {
+        write_agent_directory(&self.db, id, identity)
     }
 
     pub(crate) fn agent_for_session(
@@ -3007,15 +3034,7 @@ fn pin_agent_directory_in(
     id: AgentId,
     identity: crate::agent_execution::DirectoryIdentity,
 ) -> Result<(), String> {
-    let previous: Option<String> = tx
-        .query_row(
-            "SELECT directory FROM agent_policies WHERE agent = ?1",
-            [id.to_string()],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .map_err(|error| error.to_string())?
-        .flatten();
+    let previous = agent_directory_record(tx, id)?;
     if previous
         .as_deref()
         .map(decode::<crate::agent_execution::DirectoryIdentity>)
@@ -3024,13 +3043,54 @@ fn pin_agent_directory_in(
     {
         return Err("The agent's approved directory identity cannot change".into());
     }
-    tx.execute(
-        "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
-        ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
-        params![id.to_string(), encode(&identity)?],
-    )
-    .map_err(|error| error.to_string())?;
+    if previous.is_none() {
+        write_agent_directory(tx, id, &identity)?;
+    }
     Ok(())
+}
+
+/// A saved automation can add evidence to a legacy reuse pin only while
+/// its exact device and inode still match the pin.
+pub(super) fn enrich_legacy_agent_directory(
+    db: &Connection,
+    id: AgentId,
+    identity: &crate::host::automations::target::Identity,
+) -> Result<(), String> {
+    use crate::host::automations::target::Identity;
+    if agent_directory_record(db, id)?
+        .as_deref()
+        .map(decode::<Identity>)
+        .transpose()?
+        .is_some_and(|previous| !previous.has_fingerprint() && previous.raw() == identity.raw())
+    {
+        write_agent_directory(db, id, identity)?;
+    }
+    Ok(())
+}
+
+fn agent_directory_record(db: &Connection, id: AgentId) -> Result<Option<String>, String> {
+    db.query_row(
+        "SELECT directory FROM agent_policies WHERE agent = ?1",
+        [id.to_string()],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(|error| error.to_string())
+    .map(Option::flatten)
+}
+
+fn write_agent_directory(
+    db: &Connection,
+    id: AgentId,
+    identity: &impl serde::Serialize,
+) -> Result<(), String> {
+    db.execute(
+        "INSERT INTO agent_policies(agent, directory) VALUES (?1, ?2)
+         ON CONFLICT(agent) DO UPDATE SET directory = excluded.directory",
+        params![id.to_string(), encode(identity)?],
+    )
+    .map(drop)
+    .map_err(|error| error.to_string())
 }
 
 /// Whether a daemon stop recorded that this open agent's bound process ended.
