@@ -7,7 +7,7 @@ use std::{
 use crate::upgrade::ensure_no_surviving_process;
 use crate::{
     control::ControlClient,
-    model::{HostSessionProof, TerminalSession},
+    model::{HostSessionProof, TerminalSession, agent_recovery::reopens_unconfirmed_conversation},
     terminal::{ReadyDaemon, connect_ready_daemon, ipc::TerminalDescriptor},
     upgrade::{ScanError, UnreadableProcess, exact_conversation},
 };
@@ -27,10 +27,17 @@ pub(super) struct RecoveredTerminal {
 
 /// Match the work represented by two terminal records within one proven
 /// recovery lineage. An agent needs an exact conversation; a plain terminal
-/// needs the same launch recipe. Conflicting direct and hinted agent IDs are
-/// never evidence for attachment.
+/// needs the same launch recipe. Recognition-only evidence can invalidate the
+/// launch's conversation, and conflicting exact IDs prevent attachment.
 pub(super) fn same_recovery_content(saved: &TerminalSession, hosted: &TerminalSession) -> bool {
     let identity = |session: &TerminalSession| {
+        if session
+            .resume_hint
+            .as_deref()
+            .is_some_and(|hint| reopens_unconfirmed_conversation(hint, &session.launch))
+        {
+            return Ok(None);
+        }
         let direct = exact_conversation(&session.launch);
         let resume = session
             .agent_resume_recipe()
@@ -1598,6 +1605,38 @@ mod tests {
         server.join().unwrap();
         assert_eq!(recovered.session, descendant);
         assert_eq!(recovered.expected_host, Some(owner));
+    }
+
+    #[test]
+    fn recognition_only_hint_on_either_side_blocks_stale_resume_lineage() {
+        let directory = tempfile::tempdir().unwrap();
+        let old = proof("old");
+        let current = proof("current");
+        let mut saved = session(directory.path(), &old);
+        saved.launch.program = "claude".into();
+        let observed = saved.launch.clone();
+        let hint = crate::model::agent_recovery::observed_hint_from_launch(&observed).unwrap();
+        saved.launch.arguments = vec![
+            "--resume".into(),
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+        ];
+        let mut descendant = session(directory.path(), &current);
+        descendant.recovery_origin = Some(saved.id);
+        descendant.launch = saved.launch.clone();
+
+        for (saved_hint, hosted_hint) in [(true, false), (false, true)] {
+            saved.resume_hint = saved_hint.then(|| hint.clone());
+            descendant.resume_hint = hosted_hint.then(|| hint.clone());
+            let mut descriptor =
+                TerminalDescriptor::relaunchable(descendant.id, descendant.launch.clone(), None);
+            descriptor.session = descendant.clone();
+            let result =
+                adoptable_lineage(&saved, &old, &current, std::slice::from_ref(&descriptor));
+            assert!(
+                matches!(result, Err(detail) if detail.contains("shares this recovery lineage")),
+                "the unconfirmed conversation must preserve the live descendant: {result:?}"
+            );
+        }
     }
 
     #[test]

@@ -573,6 +573,15 @@ os.execl("/bin/sleep", "sleep", "60")
 
 #[test]
 fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit() {
+    assert_cleanup_obligation_retained(false);
+}
+
+#[test]
+fn natural_eof_retains_the_cleanup_obligation_for_a_job_without_pty_descriptors() {
+    assert_cleanup_obligation_retained(true);
+}
+
+fn assert_cleanup_obligation_retained(redirect_job_io: bool) {
     let proof = crate::model::HostSessionProof {
         host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
         boot_id: crate::daemon::read_boot_id().unwrap(),
@@ -598,7 +607,15 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     let owner = shell.terminal.holder_identity().unwrap().clone();
     assert!(owner.holder.is_current());
     let registered_holder = pin_shutdown_process(owner.holder.pid);
-    let child = shutdown_background_job(&shell);
+    let child = if redirect_job_io {
+        shutdown_job(
+            &shell,
+            b"sh -c 'trap \"\" HUP; echo $$ > child.pid; exec sleep 60' </dev/null >/dev/null 2>&1 &\n",
+            "sleep",
+        )
+    } else {
+        shutdown_background_job(&shell)
+    };
     let budget = ShutdownBudget {
         join: ShutdownBudget::PATIENT.join,
         ..ShutdownBudget::PRODUCT
@@ -619,13 +636,19 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
     });
     assert!(!child.0.wait_for_exit(Duration::ZERO).unwrap());
     let mut events = Vec::new();
-    #[cfg(target_os = "macos")]
-    shell.wait_for("the natural PTY EOF cleanup decision", || {
-        events.extend(shell.terminal.events().try_iter());
-        events.iter().any(|event| {
-            matches!(event, TerminalEvent::Completed { .. }) || unconfirmed_child_cleanup(event)
-        })
-    });
+    if redirect_job_io || cfg!(target_os = "macos") {
+        // Wait for the natural decision before requesting any shutdown.
+        shell.wait_for("the natural PTY EOF cleanup decision", || {
+            events.extend(shell.terminal.events().try_iter());
+            events.iter().any(|event| {
+                matches!(event, TerminalEvent::Completed { .. }) || unconfirmed_child_cleanup(event)
+            })
+        });
+        assert!(
+            events.iter().any(unconfirmed_child_cleanup),
+            "PTY EOF must leave cleanup unconfirmed while the job lives: {events:?}"
+        );
+    }
     let unpublished = reaper.reserve().unwrap();
     let drain = reaper.begin_exit_drain();
     let started = Instant::now();
@@ -640,14 +663,13 @@ fn ordinary_shutdown_retains_the_cleanup_obligation_after_observing_shell_exit()
         started.elapsed(),
         census_cost()
     );
-    #[cfg(target_os = "macos")]
+    // SAFETY: Query the session of the pinned fixture job without signalling it.
     assert_eq!(
-        crate::process::table::record(child.0.pid() as libc::pid_t)
-            .unwrap()
-            .session,
-        Some(owner.root.pid),
-        "the same-session job outlived Darwin's controlling tty"
+        unsafe { libc::getsid(child.0.pid() as libc::pid_t) },
+        owner.root.pid,
+        "cleanup must leave the same-session job running"
     );
+    assert!(!registered_holder.0.wait_for_exit(Duration::ZERO).unwrap());
     assert!(
         !events
             .iter()

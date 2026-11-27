@@ -3948,10 +3948,9 @@ impl Worker {
             // Nothing will end a synchronized update the child left open.
             self.capture_when_ready(false);
         }
-        // Darwin revokes the controlling tty when its session leader exits.
-        // EOF can arrive while other processes in that session are still live.
-        let natural_census = cfg!(target_os = "macos")
-            && !shutting_down
+        // Other session members can survive PTY EOF, whether they closed their
+        // own slave descriptors or the kernel revoked the controlling tty.
+        let natural_census = !shutting_down
             && self.pty_eof
             && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
         let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
