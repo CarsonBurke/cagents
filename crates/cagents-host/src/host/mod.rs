@@ -419,7 +419,15 @@ fn activate_parked_terminals(
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .grant_parked_update()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let wait_budget = std::time::Duration::from_secs(10);
+    let mut await_receipt = |deadline| {
+        if daemon::termination_requested() || std::time::Instant::now() >= deadline {
+            return Err("Original terminal promotion or final screen remains unconfirmed".into());
+        }
+        // Promotion and completed-screen receipts wake the daemon.
+        serve_status(deadline).map_err(|error| error.to_string())
+    };
+    let deadline = std::time::Instant::now() + wait_budget;
     loop {
         let settled = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -429,21 +437,22 @@ fn activate_parked_terminals(
         if settled {
             break;
         }
-        if daemon::termination_requested() || std::time::Instant::now() >= deadline {
-            return Err("Original terminal promotion or final screen remains unconfirmed".into());
-        }
-        // Promotion and completed-screen receipts wake the daemon.
-        serve_status(deadline).map_err(|error| error.to_string())?;
+        await_receipt(deadline)?;
     }
     update_recovery::finish_parked_ready(host, installed.capture)?;
     save_abandoned_identities(host);
     workspace::adopt_foreign_panes(host);
     save_agent_pane_identities(host);
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let terminals = state.list(0);
-    let completed = state
-        .parked_terminal_results()?
-        .ok_or("An original terminal is still preserving its final screen")?;
+    let deadline = std::time::Instant::now() + wait_budget;
+    let (mut state, terminals, completed) = loop {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let terminals = state.list(0);
+        if let Some(completed) = state.parked_terminal_results()? {
+            break (state, terminals, completed);
+        }
+        drop(state);
+        await_receipt(deadline)?;
+    };
     if let Some(admission) = admission {
         admission.verify_live_inventory(state.proof(), &terminals, &[], &completed)?;
     } else {
