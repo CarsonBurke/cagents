@@ -138,6 +138,9 @@ const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const UI_LAUNCH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a handshake with a device's daemon waits for its first answer,
+/// which crosses SSH and may start the daemon.
+pub(crate) const REMOTE_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `cagents ui` waits for a window that has closed, and so refuses
 /// activations, to finish exiting and release its lease. An exiting UI waits
 /// for its language servers (bounded at 5s) and its window's removal (2s),
@@ -1212,7 +1215,7 @@ impl ControlClient {
 
     fn handshake_timeout() -> Duration {
         if crate::device::is_remote() {
-            Duration::from_secs(30)
+            REMOTE_HANDSHAKE_TIMEOUT
         } else {
             io_timeout()
         }
@@ -4388,6 +4391,9 @@ where
         let served = if mobile {
             crate::mobile::serve_bridge()
         } else {
+            // Before anything that can wait on the daemon, so the computer
+            // that started this knows SSH got this far.
+            crate::device::report_bridge_started();
             crate::device::serve_stdio()
         };
         return match served {
@@ -4857,34 +4863,66 @@ fn device_app_error(error: io::Error) -> AppError {
             "reason": unreachable.reason,
         })
     });
+    let unresponsive = crate::device::unresponsive(&error).map(|unresponsive| {
+        json!({
+            "device": unresponsive.device,
+            "host": unresponsive.host,
+            "reached": match unresponsive.reached {
+                crate::device::Reached::LoggedIn => "logged_in",
+                crate::device::Reached::BridgeStarted => "bridge_started",
+            },
+        })
+    });
     let kind = if error.kind() == io::ErrorKind::PermissionDenied {
         "permission_denied"
     } else if mismatch.is_some() {
         "device_incompatible"
     } else if unreachable.is_some() {
         "device_unreachable"
+    } else if unresponsive.is_some() {
+        "device_unresponsive"
     } else {
         "device"
     };
     AppError {
-        details: mismatch.or(unreachable),
+        details: mismatch.or(unreachable).or(unresponsive),
         ..AppError::new(kind, error)
     }
 }
 
-/// A window that did not start. One on a device that SSH could not reach
-/// says so in its message, the only thing it passes back; its kind says so
-/// too, as for any other command on that device.
+/// A window that did not start. One on a device that SSH could not reach,
+/// or reached without an answer, says so in its message, the only thing it
+/// passes back; its kind says so too, as for any other command on that
+/// device.
 fn launch_error(error: io::Error) -> AppError {
-    let device = crate::device::selected()
-        .filter(|_| crate::device::reads_as_unreachable(&error.to_string()));
-    match device {
+    launch_error_on(crate::device::selected(), error)
+}
+
+fn launch_error_on(device: Option<&crate::device::Device>, error: io::Error) -> AppError {
+    let message = error.to_string();
+    let kind = if crate::device::reads_as_unreachable(&message) {
+        "device_unreachable"
+    } else if crate::device::reads_as_unresponsive(&message) {
+        "device_unresponsive"
+    } else {
+        "launch"
+    };
+    match device.filter(|_| kind != "launch") {
         Some(device) => AppError {
             details: Some(json!({ "device": device.name, "host": device.host })),
-            ..AppError::new("device_unreachable", error)
+            ..AppError::new(kind, error)
         },
         None => AppError::new("launch", error),
     }
+}
+
+/// How long `cagents ui` waits for a device window to start. The window
+/// acknowledges only after reaching its device, which may take the whole
+/// remote handshake, and then starts as any window does. Giving up sooner
+/// would replace the window's own account of a slow or unreachable device
+/// with a bare timeout (#4486).
+fn remote_ui_launch_timeout() -> Duration {
+    REMOTE_HANDSHAKE_TIMEOUT + UI_LAUNCH_HANDSHAKE_TIMEOUT
 }
 
 pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
@@ -4894,7 +4932,7 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     // Remote windows attach to an already-running device daemon. Its handoff
     // budget is not stored on the client, whose repository filesystem is gated.
     let timeout = if crate::device::is_remote() {
-        UI_LAUNCH_HANDSHAKE_TIMEOUT
+        remote_ui_launch_timeout()
     } else {
         crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
             + UI_LAUNCH_HANDSHAKE_TIMEOUT
@@ -8333,6 +8371,68 @@ mod tests {
             }))
         );
         assert_eq!(device_app_error(io::Error::other("lost")).kind, "device");
+    }
+
+    /// A device SSH reached that said nothing in time is reported as slow,
+    /// not unreachable, by a command and by a window that didn't start
+    /// (#4486).
+    #[test]
+    fn a_slow_device_is_reported_apart_from_an_unreachable_one() {
+        let slow = || {
+            io::Error::new(
+                io::ErrorKind::TimedOut,
+                crate::device::Unresponsive {
+                    device: "build-host".into(),
+                    host: "me@build-host".into(),
+                    executable: "cagents".into(),
+                    reached: crate::device::Reached::BridgeStarted,
+                },
+            )
+        };
+        // The window reaches its device before it acknowledges, so its
+        // launcher outwaits that handshake rather than reporting a timeout
+        // of its own over the window's reason.
+        assert!(remote_ui_launch_timeout() > REMOTE_HANDSHAKE_TIMEOUT);
+        let error = device_app_error(slow());
+        assert_eq!(error.kind, "device_unresponsive");
+        assert_eq!(
+            error.details,
+            Some(json!({
+                "device": "build-host",
+                "host": "me@build-host",
+                "reached": "bridge_started",
+            }))
+        );
+        let device = crate::device::Device {
+            name: "build-host".into(),
+            host: "me@build-host".into(),
+            executable: "cagents".into(),
+        };
+        // A window passes its failure back as text.
+        let window = |error: &io::Error| io::Error::other(format!("cagents: {error}"));
+        assert_eq!(
+            launch_error_on(Some(&device), window(&slow())).kind,
+            "device_unresponsive"
+        );
+        let unreachable = io::Error::new(
+            io::ErrorKind::HostUnreachable,
+            crate::device::Unreachable {
+                device: "build-host".into(),
+                host: "me@build-host".into(),
+                reason: "it did not answer within 30 seconds".into(),
+            },
+        );
+        let launched = launch_error_on(Some(&device), window(&unreachable));
+        assert_eq!(launched.kind, "device_unreachable");
+        assert_eq!(
+            launched.details,
+            Some(json!({ "device": "build-host", "host": "me@build-host" }))
+        );
+        assert_eq!(launch_error_on(None, window(&unreachable)).kind, "launch");
+        assert_eq!(
+            launch_error_on(Some(&device), io::Error::other("no display")).kind,
+            "launch"
+        );
     }
 
     use std::{os::unix::net::UnixStream, thread};
