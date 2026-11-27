@@ -376,8 +376,13 @@ impl Destination {
     }
 }
 
-/// Everything in the data directory but the ledger, relative to it. Symbolic
-/// links are recorded, never followed.
+/// Everything in the data directory but the ledger and the saved-data claims,
+/// relative to it. Symbolic links are recorded, never followed.
+///
+/// A claim records which daemon or window holds the saved data now, and a
+/// window seeder claims the window it seeds by taking its lease. Claims are
+/// not saved data: a used instance is still told apart by the stores it
+/// changed.
 fn entries(data: &Path) -> Result<BTreeMap<PathBuf, Entry>, String> {
     fn walk(
         data: &Path,
@@ -394,7 +399,9 @@ fn entries(data: &Path) -> Result<BTreeMap<PathBuf, Entry>, String> {
             let item =
                 item.map_err(|error| format!("Cannot read {}: {error}", directory.display()))?;
             let path = relative.join(item.file_name());
-            if path == Path::new(LEDGER) {
+            if path == Path::new(LEDGER)
+                || path == Path::new(crate::instance::state_claim::CLAIMS_DIRECTORY)
+            {
                 continue;
             }
             let full = data.join(&path);
@@ -569,6 +576,24 @@ mod tests {
         std::fs::create_dir_all(dirs.data.join("daemon-upgrade/attempts")).unwrap();
         let error = seed(&plan, window("window-2"), &dirs).unwrap_err();
         assert!(error.contains("daemon-upgrade/attempts"), "{error}");
+    }
+
+    /// A seeder takes the lease of the window it seeds, which claims that
+    /// window's saved data; the claim is not state a seed must refuse.
+    #[test]
+    fn a_seeders_own_window_claim_is_not_used_state() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let dirs = directories(&plan.root, None);
+        seed(&plan, Part::Daemon, &dirs).unwrap();
+        let claims = dirs
+            .data
+            .join(crate::instance::state_claim::CLAIMS_DIRECTORY);
+        std::fs::create_dir_all(&claims).unwrap();
+        std::fs::write(claims.join("window.primary.lock"), b"{}").unwrap();
+        seed(&plan, window("primary"), &dirs).unwrap();
+        std::fs::write(claims.join("window.window-2.lock"), b"{}").unwrap();
+        seed(&plan, window("window-2"), &dirs).unwrap();
     }
 
     /// A used instance has state no seed recorded: another window's store,

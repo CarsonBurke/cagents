@@ -71,7 +71,8 @@ const HANDOFF: Duration = Duration::from_millis(250);
 const DAEMON_PATIENCE: Duration = Duration::from_secs(5);
 /// The same, for a window that relaunches in its own runtime directory.
 const WINDOW_PATIENCE: Duration = Duration::from_secs(2);
-const CLAIMS_DIRECTORY: &str = "claims";
+/// Under the data directory: who holds the saved data now, not saved data.
+pub(crate) const CLAIMS_DIRECTORY: &str = "claims";
 const DAEMON_CLAIM: &str = "daemon.lock";
 
 /// What wants a claim.
