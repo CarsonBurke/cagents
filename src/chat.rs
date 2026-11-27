@@ -3066,6 +3066,10 @@ pub const TURN_INTERRUPTED: &str = "Turn interrupted";
 /// The status detail of a turn the provider has been asked to stop and has
 /// not yet ended. It takes no message meanwhile: what is queued waits for
 /// the turn to stop.
+///
+/// Clients read it from a snapshot's `detail` to tell a stopping turn from a
+/// working one, so it is part of the wire contract: changing it leaves an
+/// older client offering Send now to a turn that cannot take it.
 pub const TURN_STOPPING: &str = "Stopping";
 
 /// Where the person stopped a turn: a quiet marker in the timeline, in place
