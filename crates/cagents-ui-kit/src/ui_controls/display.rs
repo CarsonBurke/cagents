@@ -110,13 +110,15 @@ pub fn on_accent_color(theme: &Theme) -> iced::Color {
 pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
 /// A [`count_badge`]'s inset either side of its figures.
 const COUNT_BADGE_PADDING: f32 = 5.0;
-/// The widest any figure or `+` is drawn in a [`count_badge`], with room to
-/// spare: the font's figures are about 0.6 em at its 10.5 px.
+/// The widest a figure or `+` is drawn in a [`count_badge`] in the usual
+/// interface fonts, with room to spare: their bold figures are 0.55 to 0.7 em
+/// at its 10.5 px.
 const COUNT_BADGE_FIGURE_WIDTH: f32 = 7.5;
 
-/// The most room a [`count_badge`] showing `count` takes, for a layout that
-/// must clear the badge before it is drawn, such as a hover-revealed control
-/// laid over it.
+/// About the most room a [`count_badge`] showing `count` takes, for a layout
+/// that must clear the badge before it is drawn, such as a hover-revealed
+/// control laid over it. An estimate from the usual interface fonts: an
+/// unusually wide one may draw a little past it.
 pub fn count_badge_width_bound(count: &str) -> f32 {
     match count.chars().count() {
         0 | 1 => COUNT_BADGE_HEIGHT,
@@ -144,10 +146,12 @@ pub fn count_badge<'a, Message: 'a>(
     tone: CountTone,
 ) -> Element<'a, Message> {
     let count = count.into();
-    let width = if count.chars().count() <= 1 {
-        Length::Fixed(COUNT_BADGE_HEIGHT)
+    // A circle has no room for an inset: its figure is centred, whatever the
+    // font's figure width.
+    let (width, padding) = if count.chars().count() <= 1 {
+        (Length::Fixed(COUNT_BADGE_HEIGHT), 0.0)
     } else {
-        Length::Shrink
+        (Length::Shrink, COUNT_BADGE_PADDING)
     };
     widget::container(
         widget::text(count)
@@ -158,7 +162,7 @@ pub fn count_badge<'a, Message: 'a>(
             .font(cosmic::font::semibold())
             .wrapping(iced::widget::text::Wrapping::None),
     )
-    .padding([0.0, COUNT_BADGE_PADDING])
+    .padding([0.0, padding])
     .center_y(Length::Fixed(COUNT_BADGE_HEIGHT))
     .align_x(Alignment::Center)
     .width(width)

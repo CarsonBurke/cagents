@@ -897,7 +897,10 @@ fn compact_project_identity_and_waiting_badge_are_deterministic() {
     let attention = compact_project_attention(&project, &state);
     let (activity, unread) = (attention.activity, attention.summary.unread != 0);
     assert_eq!(activity, Some(crate::agent::ActivityState::Waiting));
-    assert!(agent_indicator(activity, unread).is_some());
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(activity, unread, false))
+            .is_some()
+    );
     let renderer = headless_renderer();
     let names = accessible_names(
         &renderer,
@@ -1414,9 +1417,20 @@ fn search_navigation_and_escape_require_enabled_input_focus() {
 
 #[test]
 fn waiting_indicator_survives_read_acknowledgement_and_ci_does_not_recolor_pr_state() {
-    assert!(agent_indicator(Some(crate::agent::ActivityState::Waiting), false).is_some());
-    assert!(agent_indicator(None, true).is_some());
-    assert!(agent_indicator(None, false).is_none());
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(
+            Some(crate::agent::ActivityState::Waiting),
+            false,
+            false
+        ))
+        .is_some()
+    );
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(None, true, false)).is_some()
+    );
+    assert!(
+        attention_indicator::<SidebarAction>(AttentionSummary::card(None, false, false)).is_none()
+    );
     let mut pr = project().pull_requests[0].clone();
     pr.needs_review = false;
     pr.draft = false;
@@ -3320,7 +3334,10 @@ fn worktree_changes_icons_can_be_hidden_without_hiding_activity() {
             accessible_names(&renderer, row(false)),
             "dirty status remains available to assistive technology"
         );
-        assert!(agent_indicator(None, true).is_some());
+        assert!(
+            attention_indicator::<SidebarAction>(AttentionSummary::card(None, true, false))
+                .is_some()
+        );
     }
     let model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
     let mut state = SidebarState::default();
@@ -4383,11 +4400,16 @@ fn row_indicators_share_one_reserved_slot() {
 #[test]
 fn an_unread_count_is_one_badge_beside_any_more_urgent_mark() {
     let renderer = headless_renderer();
-    let states: [(&str, fn(&mut AttentionSummary)); 4] = [
+    let states: [(&str, fn(&mut AttentionSummary)); 6] = [
         ("unread", |_| {}),
         ("working", |summary| summary.working = 1),
+        ("limited", |summary| summary.limited = 1),
         ("failed", |summary| summary.failed = 1),
         ("waiting", |summary| summary.waiting = 1),
+        ("approval", |summary| {
+            summary.waiting = 1;
+            summary.approval = 1;
+        }),
     ];
     for (name, urgent) in states {
         for (unread, label) in [(1, "1"), (9, "9"), (10, "10"), (99, "99"), (120, "99+")] {
@@ -4396,8 +4418,10 @@ fn an_unread_count_is_one_badge_beside_any_more_urgent_mark() {
                 ..AttentionSummary::default()
             };
             urgent(&mut summary);
-            let mut element: Element<'_, SidebarAction> =
-                attention_indicator(summary).expect("unread news has an indicator");
+            let status: RowStatus<SidebarAction> =
+                attention_status(summary).expect("unread news has an indicator");
+            let width_bound = status.width_bound;
+            let mut element = status.element;
             let mut tree = Tree::new(&element);
             let node = element.as_widget_mut().layout(
                 &mut tree,
@@ -4420,12 +4444,13 @@ fn an_unread_count_is_one_badge_beside_any_more_urgent_mark() {
                 "{name} with {unread} unread stacks its count: {bounds:?}"
             );
             assert!(
-                bounds.width <= attention_indicator_width_bound(summary),
+                bounds.width <= width_bound,
                 "{name} with {unread} unread is wider than the delete control covers: {bounds:?}"
             );
             if name == "unread" && unread < 10 {
                 assert_eq!(
-                    bounds.width, ROW_STATUS_WIDTH,
+                    bounds.width,
+                    crate::ui_controls::COUNT_BADGE_HEIGHT,
                     "a one-figure count is a circle"
                 );
             }
@@ -4448,8 +4473,11 @@ fn a_wide_channel_status_gives_way_to_its_title_and_hides_under_delete() {
         1,
     );
     channel.attention.unread = 120;
-    let cover = ICON_CONTROL_SIZE
-        .max(ROW_GUTTER + channel_indicator_width_bound(channel.attention, channel.chats));
+    let cover = quick_delete_width(
+        channel_status(channel.attention, channel.chats)
+            .expect("the channel has news")
+            .width_bound,
+    );
     assert!(
         cover > ICON_CONTROL_SIZE,
         "the fixture's status outgrows the delete button"
@@ -8339,9 +8367,10 @@ fn in_progress_rows_say_where_they_are() {
         .find(|(text, _)| text == "2")
         .expect("the header's count")
         .1;
+    let label = grid[0].1[1];
     assert!(
-        status.contains(count.center()),
-        "the count sits in the indicator slot: {count:?} in {status:?}"
+        label.contains(count.center()) && count.x + count.width <= status.x,
+        "the count follows the label, as the Worktrees header's does: {count:?} in {label:?}"
     );
     for (_, slots) in &grid[1..] {
         assert_eq!(slots[2].x, status.x, "one indicator column");
