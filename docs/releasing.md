@@ -298,6 +298,12 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    - signs the metadata with KEY (or `CAGENTS_RELEASE_SIGNING_KEY`); touch the
      security key when it asks. Without a key, it prints the signing command
      (see [Signing](#signing)).
+
+   To check a Linux and macOS cut before creating a tag, run
+   `mise run release -- cut --dry-run --commit SHA --macos-host macbook`.
+   This requires the same passing Linux bundle and verifies the assembled
+   metadata. The temporary bundle is removed afterward.
+
 2. `mise run release -- rehearse VERSION` rehearses installed cagents updating
    from the newest published release to the signed cut, on the build host,
    the way a person updates in the app. It uses the released commit's
