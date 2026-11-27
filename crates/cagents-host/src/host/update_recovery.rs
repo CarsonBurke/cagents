@@ -117,6 +117,10 @@ fn restore_ordinary_with(
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore upgrade checkpoint", None);
     let mut restored = state::restore_upgrade_with_digest(host, processes, observed_digest)?;
+    #[cfg(target_os = "macos")]
+    if matches!(admission, Admission::InstalledReady(_)) && !restored.claimed_checkpoint() {
+        return Err("The installed successor stopped before claiming its Ready checkpoint".into());
+    }
     #[cfg(all(test, target_os = "linux"))]
     super::observe_fixture_startup("ordinary: restore terminal holders", None);
     state::restore_orphaned_holders(host)?;
