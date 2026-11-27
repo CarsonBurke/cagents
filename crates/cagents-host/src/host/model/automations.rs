@@ -1677,7 +1677,11 @@ impl Registry {
     /// the firing outright, such as a reused agent left with an interrupted
     /// run, nor refreshes the counts in the firing's details; asking again
     /// on the scheduler's timer does both.
-    pub(crate) fn automation_slot_retry_due(&self, firing_id: Uuid) -> Result<bool, String> {
+    pub(crate) fn automation_slot_retry_due(
+        &self,
+        firing_id: Uuid,
+        check_capacity: bool,
+    ) -> Result<bool, String> {
         let firing = read_firing(&self.db, firing_id)?;
         if !awaits_agent_slot(&firing) {
             return Ok(true);
@@ -1687,11 +1691,8 @@ impl Registry {
             return Ok(true);
         }
         let origin = crate::agent_execution::Origin::Automation { id: automation.id };
-        Ok(!super::execution::limit_reached(
-            &self.db,
-            &origin,
-            self.concurrency(),
-        )?)
+        Ok(check_capacity
+            && !super::execution::limit_reached(&self.db, &origin, self.concurrency())?)
     }
 
     /// Asks again for the agent slot a waiting firing was refused. The firing

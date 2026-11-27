@@ -94,6 +94,7 @@ struct Inner {
 struct SlotBackoff {
     refusals: u32,
     retry: Instant,
+    failed: bool,
 }
 
 impl SlotBackoff {
@@ -101,10 +102,11 @@ impl SlotBackoff {
     const LONGEST: Duration = Duration::from_secs(60);
 
     fn refused(previous: Option<Self>, now: Instant) -> Self {
-        let refusals = previous.map_or(0, |backoff| backoff.refusals) + 1;
+        let refusals = previous.map_or(1, |backoff| backoff.refusals.saturating_add(1));
         Self {
             refusals,
             retry: now + Self::delay(refusals),
+            failed: false,
         }
     }
 
@@ -391,7 +393,14 @@ impl Handle {
             }
         };
         if let Some(accepted) = claim.accepted {
-            agent_execution::dispatch_accepted_in_directory(host, accepted, directory)?;
+            let result = agent_execution::dispatch_accepted_in_directory(host, accepted, directory);
+            if result.is_err() {
+                self.settle_dispatch(
+                    claim.firing.id,
+                    result,
+                    service::now().unwrap_or(claim.firing.created_ms),
+                )?;
+            }
         } else if let Some(precheck) = claim.definition.precheck {
             let request = Request {
                 firing: claim.firing.id,
@@ -810,30 +819,33 @@ impl Handle {
         // Only this thread schedules retries, so its map is not held over
         // the registry or a launch.
         let previous = std::mem::take(&mut *self.0.slots.lock().unwrap_or_else(|p| p.into_inner()));
-        let instant = Instant::now();
         let mut slots = BTreeMap::new();
         for firing in waiting {
             let backoff = previous.get(&firing.id).copied();
-            let timed = backoff.is_none_or(|backoff| backoff.retry <= instant);
-            // One firing's failure must not keep the others from their slots.
-            // It stays active and asks again on its timer.
-            let still_waiting =
-                self.retry_slot(host, &firing, timed, now)
-                    .unwrap_or_else(|error| {
-                        warn_slot_retry(firing.id, &error);
-                        true
-                    });
-            if still_waiting {
-                let backoff = match backoff {
-                    Some(backoff) if !timed => backoff,
-                    // The first delay follows the refusal that left the
-                    // firing waiting: at its claim, after its precheck, or
-                    // before a restart.
-                    previous => SlotBackoff::refused(previous, instant),
-                };
-                slots.insert(firing.id, backoff);
+            let timed = backoff.is_none_or(|backoff| backoff.retry <= Instant::now());
+            // Capacity wakes bypass capacity backoff. A failed retry must
+            // wait for its timer so a free slot cannot cause a warning loop.
+            let backing_off_error = backoff.is_some_and(|backoff| backoff.failed && !timed);
+            match self.retry_slot(host, &firing, timed, !backing_off_error, now) {
+                Ok(true) => {
+                    let backoff = backoff
+                        .filter(|_| !timed)
+                        .unwrap_or_else(|| SlotBackoff::refused(backoff, Instant::now()));
+                    slots.insert(firing.id, backoff);
+                }
+                Ok(false) => {}
+                Err(_) if backing_off_error => {
+                    slots.extend(backoff.map(|backoff| (firing.id, backoff)));
+                }
+                Err(error) => {
+                    warn_slot_retry(firing.id, &error);
+                    let mut backoff = SlotBackoff::refused(backoff, Instant::now());
+                    backoff.failed = true;
+                    slots.insert(firing.id, backoff);
+                }
             }
         }
+        let instant = Instant::now();
         let next = slots
             .values()
             .map(|backoff| backoff.retry.saturating_duration_since(instant))
@@ -850,11 +862,12 @@ impl Handle {
         host: &SharedHost,
         firing: &Firing,
         timed: bool,
+        check_capacity: bool,
         now: u64,
     ) -> Result<bool, String> {
         let retry = {
             let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
-            if !timed && !registry.automation_slot_retry_due(firing.id)? {
+            if !timed && !registry.automation_slot_retry_due(firing.id, check_capacity)? {
                 return Ok(true);
             }
             registry.retry_automation_slot(firing.id, now)?
@@ -884,27 +897,37 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .automation(firing.automation)?;
-        let fail = |error: String, pause| {
+        match service::validate_target(host, &automation.definition, &automation.target_identity) {
+            Ok(directory) => self.settle_dispatch(
+                firing.id,
+                agent_execution::dispatch_accepted_in_directory(host, accepted, directory),
+                now,
+            ),
+            Err(error) => self
+                .0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .fail_automation_start(firing.id, error, now, true),
+        }
+    }
+
+    fn settle_dispatch(
+        &self,
+        firing: Uuid,
+        result: Result<(), String>,
+        now: u64,
+    ) -> Result<(), String> {
+        result.or_else(|error| {
+            // The registry only settles runs with no launch claim. Once
+            // claimed, the execution service owns the run and its outcome.
             self.0
                 .registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .fail_automation_start(firing.id, error, now, pause)
-        };
-        match service::validate_target(host, &automation.definition, &automation.target_identity) {
-            Ok(directory) => {
-                agent_execution::dispatch_accepted_in_directory(host, accepted, directory).or_else(
-                    |error| {
-                        // Without a launch claim nothing else starts or ends
-                        // the accepted run, which would hold its slot and its
-                        // automation. With one, the run is the execution
-                        // service's to settle.
-                        fail(error.clone(), false).or(Err(error))
-                    },
-                )
-            }
-            Err(error) => fail(error, true),
-        }
+                .fail_automation_start(firing, error.clone(), now, false)
+                .or(Err(error))
+        })
     }
 
     fn release_run(&self, host: &SharedHost, firing: &Firing, now: u64) -> Result<bool, String> {

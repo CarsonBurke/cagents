@@ -148,6 +148,11 @@ pub(crate) struct Registry {
 }
 
 impl Registry {
+    #[cfg(test)]
+    pub(super) fn fixture_connection(&self) -> &Connection {
+        &self.db
+    }
+
     /// A confirmed close refused because the project's channels are no longer
     /// the ones the user confirmed.
     pub(crate) const PROJECT_CHANNELS_CONFLICT: &'static str =
