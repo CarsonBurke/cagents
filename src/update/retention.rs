@@ -88,6 +88,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "cutover-inventory.json"
             | "ready-claim.json"
             | "ready-effects.json"
+            | "ready-retry-claim.json"
             | "ready-plan.json"
             | "ready-return.json"
             | "release-stage.json"
@@ -174,6 +175,7 @@ mod tests {
             "recovery.json",
             "ready-claim.json",
             "ready-effects.json",
+            "ready-retry-claim.json",
             "ready-plan.json",
             "ready-return.json",
             "cancel-nonce",

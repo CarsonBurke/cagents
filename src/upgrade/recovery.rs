@@ -433,7 +433,7 @@ impl Census {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub(crate) struct Authority {
     version: u16,
     #[serde(default)]
@@ -1734,21 +1734,11 @@ impl ReadyPlanEvidence<'_> {
 
     #[cfg(feature = "host")]
     pub(crate) fn same_authority(&self, authority: &Authority) -> bool {
-        let original = self.authority.as_ref();
-        original.job == authority.job
-            && original.checkpoint_hash == authority.checkpoint_hash
-            && original.job_request_hash == authority.job_request_hash
-            && original.target == authority.target
-            && original.target_hash == authority.target_hash
-            && original.source == authority.source
+        self.authority.as_ref() == authority
     }
 
     pub(crate) fn claim_exists(&self) -> Result<bool, String> {
-        match fs::symlink_metadata(ready_claim_path(&self.authority)?) {
-            Ok(_) => Ok(true),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error.to_string()),
-        }
+        ready_evidence_exists(&self.authority, "claim")
     }
 
     pub(crate) fn source(&self) -> &HostSessionProof {
@@ -1791,26 +1781,12 @@ impl ReadyPlanEvidence<'_> {
         }
         validate_lock_mode(&legacy, &authority.legacy_path, "READ")
             .map_err(|error| error.to_string())?;
-        if !handoff
-            .recorded_source_is(&authority.source)
-            .map_err(|error| error.to_string())?
-            || !crate::instance::state_claim::last_daemon_was(
-                &authority.daemon_path,
-                &authority.source,
-            )
-            .map_err(|error| error.to_string())?
-        {
-            return Err("A different daemon has used the saved work".into());
-        }
+        require_no_ready_effects_or_retry(authority)?;
+        ready_state_predecessor(authority, &daemon, None)?;
         validate_received_checkpoint(authority, Phase::Ready)?;
-        let original = open_checkpoint(&authority.checkpoint_path)?
-            .ok_or("The approved Ready checkpoint disappeared")?;
-        let metadata = original.metadata().map_err(|error| error.to_string())?;
-        if (metadata.dev(), metadata.ino()) != self.checkpoint
-            || digest(&read_checkpoint_input(&original)?) != authority.checkpoint_hash
-            || validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest)
-        {
-            return Err("The original Ready checkpoint or inventory changed".into());
+        self.exact_checkpoint()?;
+        if validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest) {
+            return Err("The original Ready inventory changed".into());
         }
         let state = authority
             .worker_path
@@ -1826,37 +1802,83 @@ impl ReadyPlanEvidence<'_> {
     }
 
     pub(crate) fn claimed_process_exited(&self) -> Result<bool, String> {
-        #[derive(Deserialize)]
-        struct Claim {
-            version: u16,
-            job: String,
-            request_digest: String,
-            checkpoint_digest: String,
-            capture_digest: String,
-            source: HostSessionProof,
-            target: PathBuf,
-            successor: crate::daemon::holder_registry::Process,
+        let (first, first_digest) = self.first_claim()?;
+        if ready_evidence_exists(&self.authority, "retry-claim")? {
+            let (retry, _) = self.read_claim("retry-claim")?;
+            if retry.retry_of.as_deref() != Some(first_digest.as_str())
+                || retry.successor_proof.is_none()
+                || !first.exited()?
+            {
+                return Err("The installed update has no exact retry claimant to settle".into());
+            }
+            return retry.exited();
         }
+        first.exited()
+    }
 
+    pub(crate) fn require_pre_effects_retry(&self) -> Result<(), String> {
+        self.retry_predecessor().map(drop)
+    }
+
+    fn read_claim(&self, name: &str) -> Result<(ReadyClaim, String), String> {
         let authority = &self.authority;
-        let path = ready_claim_path(authority)?;
-        let bytes = read_checkpoint(&path)?.ok_or("The update's Ready claim is missing")?;
-        let claim: Claim = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
+        let bytes = read_checkpoint(&ready_evidence_path(authority, name)?)?
+            .ok_or("The update's Ready claim is missing")?;
+        let claim: ReadyClaim =
+            serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
         if claim.version != 1
             || claim.job != authority.job
             || claim.request_digest != authority.job_request_hash
+            || claim.reviewed_digest != authority.request_identity
             || claim.checkpoint_digest != authority.checkpoint_hash
             || claim.capture_digest != self.capture_digest
             || claim.source != authority.source
             || claim.target != authority.target
+            || claim.target_digest != authority.target_hash
             || claim.successor.pid <= 1
             || claim.successor.start == 0
+            || claim.successor_proof.as_ref().is_some_and(|proof| {
+                !proof.is_complete()
+                    || proof == &claim.source
+                    || proof.boot_id != claim.source.boot_id
+            })
             || !self.same_boot().map_err(|error| error.to_string())?
         {
             return Err("The installed update has no exact claimant to settle".into());
         }
-        crate::pinned_process::exited_since(claim.successor.pid as u32, claim.successor.start)
-            .map_err(|error| error.to_string())
+        Ok((claim, digest(&bytes)))
+    }
+
+    fn first_claim(&self) -> Result<(ReadyClaim, String), String> {
+        let (claim, fingerprint) = self.read_claim("claim")?;
+        if claim.retry_of.is_some() {
+            return Err("The original Ready claim names an unexpected predecessor".into());
+        }
+        Ok((claim, fingerprint))
+    }
+
+    fn retry_predecessor(&self) -> Result<(ReadyClaim, String), String> {
+        let (claim, fingerprint) = self.first_claim()?;
+        if claim.successor_proof.is_none() || !claim.exited()? {
+            return Err("The update's first successor could not be confirmed stopped before workspace changes".into());
+        }
+        // Observe absence after exit so the first claimant cannot publish
+        // effects between this read and the process check.
+        require_no_ready_effects_or_retry(&self.authority)?;
+        Ok((claim, fingerprint))
+    }
+
+    fn exact_checkpoint(&self) -> Result<File, String> {
+        let original = open_checkpoint(&self.authority.checkpoint_path)?
+            .ok_or("The approved Ready checkpoint disappeared")?;
+        let metadata = original.metadata().map_err(|error| error.to_string())?;
+        if (metadata.dev(), metadata.ino()) != self.checkpoint {
+            return Err("The original Ready checkpoint was replaced".into());
+        }
+        if digest(&read_checkpoint_input(&original)?) != self.authority.checkpoint_hash {
+            return Err("The original Ready checkpoint changed".into());
+        }
+        Ok(original)
     }
 
     /// Rebind an untouched approval to the newly held locks. No generic
@@ -1867,9 +1889,10 @@ impl ReadyPlanEvidence<'_> {
         worker: &File,
         guard: &UiUpdateGuard,
         handoff: &LeaseHandoff,
+        reserved: bool,
     ) -> Result<Receipt, String> {
-        let authority = self.authority.into_owned();
-        validate_host_context(&authority)?;
+        let authority = self.authority.as_ref();
+        validate_host_context(authority)?;
         if authority.version != 1
             || !matches!(authority.origin, Origin::AcknowledgedPrepare)
             || authority.source.boot_id
@@ -1877,9 +1900,9 @@ impl ReadyPlanEvidence<'_> {
         {
             return Err("The Ready plan does not belong to this boot's acknowledged update".into());
         }
-        validate_authority_target(target, &authority).map_err(|error| error.to_string())?;
-        validate_received_checkpoint(&authority, Phase::Ready)?;
-        if validate_acknowledged_capture(&authority)?.as_deref() != Some(&self.capture_digest) {
+        validate_authority_target(target, authority).map_err(|error| error.to_string())?;
+        validate_received_checkpoint(authority, Phase::Ready)?;
+        if validate_acknowledged_capture(authority)?.as_deref() != Some(&self.capture_digest) {
             return Err("The original Ready inventory capture changed".into());
         }
 
@@ -1898,38 +1921,25 @@ impl ReadyPlanEvidence<'_> {
         }
         validate_lock_mode(&legacy, &authority.legacy_path, "READ")
             .map_err(|error| error.to_string())?;
-        if !handoff
-            .recorded_source_is(&authority.source)
-            .map_err(|error| error.to_string())?
-            || !crate::instance::state_claim::last_daemon_was(
-                &authority.daemon_path,
-                &authority.source,
-            )
-            .map_err(|error| error.to_string())?
-        {
-            return Err(
-                "Another daemon has used the saved work since this update stopped its source"
-                    .into(),
-            );
-        }
-        let original = open_checkpoint(&authority.checkpoint_path)?
-            .ok_or("The approved Ready checkpoint disappeared")?;
-        let metadata = original.metadata().map_err(|error| error.to_string())?;
-        if (metadata.dev(), metadata.ino()) != self.checkpoint {
-            return Err("The original Ready checkpoint was replaced".into());
-        }
-        let receipt = Receipt {
+        let prior = if self.claim_exists()? {
+            if !reserved {
+                return Err("An earlier Ready claimant has no shared update reservation".into());
+            }
+            Some(self.retry_predecessor()?.0)
+        } else {
+            require_no_ready_effects_or_retry(authority)?;
+            None
+        };
+        ready_state_predecessor(authority, &daemon, prior.as_ref())?;
+        let original = self.exact_checkpoint()?;
+        Ok(Receipt {
             checkpoint: StandbyCheckpoint::Ready(original),
             worker: worker.try_clone().map_err(|error| error.to_string())?,
             fence,
             legacy,
             daemon: Some(daemon),
-            authority,
-        };
-        if !receipt.ready_before_restore()? {
-            return Err("The Ready checkpoint has already been claimed or changed".into());
-        }
-        Ok(receipt)
+            authority: self.authority.into_owned(),
+        })
     }
 }
 
@@ -1981,10 +1991,11 @@ impl Receipt {
         // The successor can open or migrate the saved store before changing
         // Ready to Restoring. Untouched checkpoint bytes alone cannot prove
         // that no successor started using the store.
-        match fs::symlink_metadata(ready_claim_path(&self.authority)?) {
-            Ok(_) => return Ok(false),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.to_string()),
+        if ready_evidence_exists(&self.authority, "claim")?
+            || ready_evidence_exists(&self.authority, "effects")?
+            || ready_evidence_exists(&self.authority, "retry-claim")?
+        {
+            return Ok(false);
         }
         let Some(current) = open_checkpoint(&self.authority.checkpoint_path)? else {
             return Ok(false);
@@ -2004,12 +2015,35 @@ impl Receipt {
     /// permission to use the saved store.
     #[cfg(target_os = "macos")]
     pub(crate) fn ready_plan_evidence(&self) -> Result<ReadyPlanEvidence<'_>, String> {
-        let StandbyCheckpoint::Ready(checkpoint) = &self.checkpoint else {
-            return Err("Only an acknowledged Ready checkpoint can authorize this plan".into());
-        };
         if !self.ready_before_restore()? {
             return Err("The exact Ready checkpoint is no longer unclaimed".into());
         }
+        self.acknowledged_ready_plan()
+    }
+
+    /// The continuing worker already holds the original publication and
+    /// runtime fences. Apply the same one-retry proof as a restarted worker.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn can_retry_standby(&self) -> Result<bool, String> {
+        if !ready_evidence_exists(&self.authority, "claim")? {
+            return self.ready_before_restore();
+        }
+        let plan = self.acknowledged_ready_plan()?;
+        let (prior, _) = plan.retry_predecessor()?;
+        plan.exact_checkpoint()?;
+        let daemon = self
+            .daemon
+            .as_ref()
+            .ok_or("The runtime lease was released")?;
+        ready_state_predecessor(&self.authority, daemon, Some(&prior))?;
+        Ok(true)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn acknowledged_ready_plan(&self) -> Result<ReadyPlanEvidence<'_>, String> {
+        let StandbyCheckpoint::Ready(checkpoint) = &self.checkpoint else {
+            return Err("Only an acknowledged Ready checkpoint can authorize this plan".into());
+        };
         let metadata = checkpoint.metadata().map_err(|error| error.to_string())?;
         Ok(ReadyPlanEvidence {
             authority: std::borrow::Cow::Borrowed(&self.authority),
@@ -4665,12 +4699,22 @@ pub struct ReadyAdmission {
     authority: Authority,
     custody: Inherited,
     successor: HostSessionProof,
+    saved_predecessor: ReadyStatePredecessor,
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
 impl ReadyAdmission {
-    pub fn source(&self) -> &HostSessionProof {
-        &self.authority.source
+    pub fn claim_saved_state(
+        &self,
+        lock: &Path,
+    ) -> io::Result<crate::instance::state_claim::StateClaim> {
+        let (proof, pid) = &self.saved_predecessor;
+        crate::instance::state_claim::claim_daemon_state_from(
+            lock,
+            self.successor.host_session_id.as_str(),
+            proof,
+            *pid,
+        )
     }
 
     pub fn successor(&self) -> &HostSessionProof {
@@ -4681,9 +4725,7 @@ impl ReadyAdmission {
     /// store, provider, or matching CLI now belongs to this exact proof.
     pub fn begin_workspace_effects(&self) -> io::Result<()> {
         let authority = &self.authority;
-        let path = ready_claim_path(authority)
-            .map_err(io::Error::other)?
-            .with_file_name(format!("{}.ready-effects.json", authority.job));
+        let path = ready_evidence_path(authority, "effects").map_err(io::Error::other)?;
         let evidence = serde_json::to_vec(&self.successor)?;
         crate::update::persist_ready_evidence(&path, &evidence).map_err(io::Error::other)
     }
@@ -4740,7 +4782,7 @@ impl ReadyAdmission {
 }
 
 #[cfg(target_os = "macos")]
-fn ready_claim_path(authority: &Authority) -> Result<PathBuf, String> {
+fn ready_evidence_path(authority: &Authority, name: &str) -> Result<PathBuf, String> {
     let job = uuid::Uuid::parse_str(&authority.job).map_err(|error| error.to_string())?;
     if job.to_string() != authority.job {
         return Err("Invalid installed Ready activation job".into());
@@ -4749,25 +4791,102 @@ fn ready_claim_path(authority: &Authority) -> Result<PathBuf, String> {
         .worker_path
         .parent()
         .ok_or("Installed Ready activation has no update directory")?;
-    Ok(state.join(format!("{job}.ready-claim.json")))
+    Ok(state.join(format!("{job}.ready-{name}.json")))
 }
 
-/// Exact evidence that an installed standby obtained admission to modify the
-/// saved store. A process may never clear or replace it to replay recipes.
-#[cfg(all(target_os = "macos", feature = "host"))]
-#[derive(Serialize)]
-struct ReadyClaim<'a> {
+#[cfg(target_os = "macos")]
+fn ready_evidence_exists(authority: &Authority, name: &str) -> Result<bool, String> {
+    match fs::symlink_metadata(ready_evidence_path(authority, name)?) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn require_no_ready_effects_or_retry(authority: &Authority) -> Result<(), String> {
+    if ready_evidence_exists(authority, "effects")?
+        || ready_evidence_exists(authority, "retry-claim")?
+    {
+        return Err(
+            "The installed update began changing saved work or already used its retry".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Both attempts leave an immutable record before taking workspace ownership.
+#[cfg(target_os = "macos")]
+#[derive(Serialize, Deserialize)]
+struct ReadyClaim {
     version: u16,
-    job: &'a str,
-    request_digest: &'a str,
-    reviewed_digest: &'a str,
-    checkpoint_digest: &'a str,
-    capture_digest: &'a str,
-    source: &'a HostSessionProof,
-    target: &'a Path,
-    target_digest: &'a str,
-    successor_proof: &'a HostSessionProof,
+    job: String,
+    request_digest: String,
+    reviewed_digest: String,
+    checkpoint_digest: String,
+    capture_digest: String,
+    source: HostSessionProof,
+    target: PathBuf,
+    target_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    successor_proof: Option<HostSessionProof>,
     successor: crate::daemon::holder_registry::Process,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retry_of: Option<String>,
+}
+
+#[cfg(target_os = "macos")]
+impl ReadyClaim {
+    fn exited(&self) -> Result<bool, String> {
+        crate::pinned_process::exited_since(self.successor.pid as u32, self.successor.start)
+            .map_err(|error| error.to_string())
+    }
+}
+
+#[cfg(target_os = "macos")]
+type ReadyStatePredecessor = (HostSessionProof, Option<u32>);
+
+/// HostLease publishes runtime ownership before the saved-data CAS. A crash
+/// may split the pair in that direction only. Keep the exact saved predecessor
+/// for a second comparison inside the saved-data lock.
+#[cfg(target_os = "macos")]
+fn ready_state_predecessor(
+    authority: &Authority,
+    daemon: &File,
+    prior: Option<&ReadyClaim>,
+) -> Result<ReadyStatePredecessor, String> {
+    let (runtime, runtime_pid) =
+        crate::daemon::lease_handoff::recorded_owner(daemon).map_err(|error| error.to_string())?;
+    select_ready_state_predecessor(&authority.source, runtime, runtime_pid, prior, |proof| {
+        crate::instance::state_claim::last_daemon_pid(&authority.daemon_path, proof)
+            .map_err(|error| error.to_string())
+    })
+}
+
+#[cfg(target_os = "macos")]
+fn select_ready_state_predecessor(
+    source: &HostSessionProof,
+    runtime: HostSessionProof,
+    runtime_pid: u32,
+    prior: Option<&ReadyClaim>,
+    saved_pid: impl Fn(&HostSessionProof) -> Result<Option<u32>, String>,
+) -> Result<ReadyStatePredecessor, String> {
+    if &runtime == source && runtime_pid > 1 {
+        if saved_pid(source)? == Some(runtime_pid) {
+            return Ok((runtime, Some(runtime_pid)));
+        }
+    } else if let Some(prior) = prior
+        && prior.successor_proof.as_ref() == Some(&runtime)
+        && prior.successor.pid as u32 == runtime_pid
+    {
+        if saved_pid(&runtime)? == Some(runtime_pid) {
+            return Ok((runtime, Some(runtime_pid)));
+        }
+        if let Some(pid) = saved_pid(source)?.filter(|pid| *pid > 1) {
+            return Ok((source.clone(), Some(pid)));
+        }
+    }
+    Err("Another daemon has used the saved work since this update stopped its source".into())
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
@@ -4775,23 +4894,42 @@ fn claim_ready_activation(
     authority: &Authority,
     capture_digest: &str,
     successor: &HostSessionProof,
+    retry_of: Option<String>,
 ) -> io::Result<()> {
-    let path = ready_claim_path(authority).map_err(io::Error::other)?;
-    let claim = ReadyClaim {
-        version: 1,
-        job: &authority.job,
-        request_digest: &authority.job_request_hash,
-        reviewed_digest: &authority.request_identity,
-        checkpoint_digest: &authority.checkpoint_hash,
-        capture_digest,
-        source: &authority.source,
-        target: &authority.target,
-        target_digest: &authority.target_hash,
-        successor_proof: successor,
-        successor: crate::daemon::holder_registry::Process::read(std::process::id() as i32)?,
+    let name = if retry_of.is_some() {
+        "retry-claim"
+    } else {
+        "claim"
     };
+    let path = ready_evidence_path(authority, name).map_err(io::Error::other)?;
+    let process = crate::daemon::holder_registry::Process::read(std::process::id() as i32)?;
+    let claim = ready_claim_record(authority, capture_digest, successor, process, retry_of);
     crate::update::persist_ready_evidence(&path, &serde_json::to_vec(&claim)?)
         .map_err(io::Error::other)
+}
+
+#[cfg(all(target_os = "macos", any(feature = "host", test)))]
+fn ready_claim_record(
+    authority: &Authority,
+    capture_digest: &str,
+    successor_proof: &HostSessionProof,
+    successor: crate::daemon::holder_registry::Process,
+    retry_of: Option<String>,
+) -> ReadyClaim {
+    ReadyClaim {
+        version: 1,
+        job: authority.job.clone(),
+        request_digest: authority.job_request_hash.clone(),
+        reviewed_digest: authority.request_identity.clone(),
+        checkpoint_digest: authority.checkpoint_hash.clone(),
+        capture_digest: capture_digest.into(),
+        source: authority.source.clone(),
+        target: authority.target.clone(),
+        target_digest: authority.target_hash.clone(),
+        successor_proof: Some(successor_proof.clone()),
+        successor,
+        retry_of,
+    }
 }
 
 #[cfg(all(target_os = "macos", feature = "host"))]
@@ -4820,18 +4958,37 @@ pub(crate) fn accept_ready_authority(
         .ok_or_else(|| io::Error::other("Installed Ready activation has no original capture"))?;
     // This precedes runtime publication, saved-state admission and every
     // startup path that can act on the original provider or its database.
-    crate::update::admit_shared_ready(&authority).map_err(io::Error::other)?;
+    let reserved = crate::update::admit_shared_ready(&authority).map_err(io::Error::other)?;
+    let (saved_predecessor, retry_of) =
+        if ready_evidence_exists(&authority, "claim").map_err(io::Error::other)? {
+            let original = reserved
+                .ok_or_else(|| io::Error::other("The Ready claim has no shared reservation"))?;
+            if original.capture_digest != capture_digest {
+                return Err(io::Error::other(
+                    "The original Ready inventory capture changed",
+                ));
+            }
+            original.exact_checkpoint().map_err(io::Error::other)?;
+            let (claim, fingerprint) = original.retry_predecessor().map_err(io::Error::other)?;
+            let predecessor = ready_state_predecessor(&authority, &custody.daemon, Some(&claim))
+                .map_err(io::Error::other)?;
+            (predecessor, Some(fingerprint))
+        } else {
+            require_no_ready_effects_or_retry(&authority).map_err(io::Error::other)?;
+            ((authority.source.clone(), None), None)
+        };
     let successor = crate::daemon::new_host_session_proof()?;
     if successor.boot_id != authority.source.boot_id {
         return Err(io::Error::other(
             "Ready activation belongs to a previous boot",
         ));
     }
-    claim_ready_activation(&authority, &capture_digest, &successor)?;
+    claim_ready_activation(&authority, &capture_digest, &successor, retry_of)?;
     Ok(ReadyAdmission {
         authority,
         custody,
         successor,
+        saved_predecessor,
     })
 }
 

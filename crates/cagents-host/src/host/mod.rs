@@ -771,13 +771,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         )
     };
     #[cfg(target_os = "macos")]
-    let state = ready_admission.as_ref().map_or_else(claim_state, |ready| {
-        crate::instance::state_claim::claim_daemon_state_from(
-            &paths.lock,
-            proof.host_session_id.as_str(),
-            ready.source(),
-        )
-    });
+    let state = ready_admission
+        .as_ref()
+        .map_or_else(claim_state, |ready| ready.claim_saved_state(&paths.lock));
     #[cfg(not(target_os = "macos"))]
     let state = claim_state();
     let _state = match state {
