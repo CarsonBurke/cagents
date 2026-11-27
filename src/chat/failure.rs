@@ -189,8 +189,10 @@ pub fn account_switch_refusal_reason(message: &str) -> Option<&str> {
         .filter(|reason| !reason.is_empty())
 }
 
-/// How [`provider_not_installed`] ends, after the program it names.
+/// How [`provider_not_installed`] ends, after the program it names: looked
+/// for on the launch's `PATH`, or at the path it is named by.
 const NOT_ON_LAUNCH_PATH: &str = "was found on the PATH cagents starts agents with.";
+const NOT_AT_PATH: &str = "exists.";
 
 /// What a start reports when the daemon finds no executable `program` to
 /// launch, in the provider's name where it is one of cagents' providers.
@@ -198,7 +200,12 @@ const NOT_ON_LAUNCH_PATH: &str = "was found on the PATH cagents starts agents wi
 /// provider is missing and which one it can start instead.
 pub fn provider_not_installed(program: &str) -> String {
     let name = Provider::from_program(program).map_or(program, |provider| provider.label());
-    format!("{name} isn't installed: no executable `{program}` {NOT_ON_LAUNCH_PATH}")
+    let looked = if program.contains('/') {
+        NOT_AT_PATH
+    } else {
+        NOT_ON_LAUNCH_PATH
+    };
+    format!("{name} couldn't start: no executable `{program}` {looked}")
 }
 
 /// The provider a [`provider_not_installed`] report names, when `message`
@@ -206,8 +213,11 @@ pub fn provider_not_installed(program: &str) -> String {
 pub fn not_installed_provider(message: &str) -> Option<Provider> {
     let (name, rest) = message
         .trim()
-        .split_once(" isn't installed: no executable `")?;
-    let program = rest.strip_suffix(NOT_ON_LAUNCH_PATH)?.strip_suffix("` ")?;
+        .split_once(" couldn't start: no executable `")?;
+    let program = rest
+        .strip_suffix(NOT_ON_LAUNCH_PATH)
+        .or_else(|| rest.strip_suffix(NOT_AT_PATH))?
+        .strip_suffix("` ")?;
     Provider::from_program(program).filter(|provider| provider.label() == name)
 }
 
@@ -866,29 +876,35 @@ mod tests {
         );
     }
 
-    /// A refused switch's report keeps the daemon's reason after its summary,
-    /// is a notice rather than the conversation's error, and is recognised
-    /// only when it opens the text.
+    /// A missing provider's report names it and how it was looked for, and
+    /// is recognised only as the whole text.
     #[test]
     fn a_missing_provider_report_names_the_provider_and_is_recognized() {
         let report = provider_not_installed("codex");
         assert_eq!(
             report,
-            "Codex isn't installed: no executable `codex` was found on the PATH cagents starts agents with."
+            "Codex couldn't start: no executable `codex` was found on the PATH cagents starts agents with."
         );
         assert_eq!(not_installed_provider(&report), Some(Provider::Codex));
+        // A program named by its path is looked for there, not on PATH.
         let claude = provider_not_installed("/opt/bin/claude");
-        assert!(claude.starts_with("Claude Code isn't installed:"));
+        assert_eq!(
+            claude,
+            "Claude Code couldn't start: no executable `/opt/bin/claude` exists."
+        );
         assert_eq!(not_installed_provider(&claude), Some(Provider::Claude));
         // A program cagents doesn't know is named as it is, and names no provider.
         let other = provider_not_installed("wrapper");
-        assert!(other.starts_with("wrapper isn't installed:"));
+        assert!(other.starts_with("wrapper couldn't start:"));
         assert_eq!(not_installed_provider(&other), None);
         // Text quoting the report is not one.
         assert_eq!(not_installed_provider(&format!("Earlier: {report}")), None);
         assert!(!is_notice(&report));
     }
 
+    /// A refused switch's report keeps the daemon's reason after its summary,
+    /// is a notice rather than the conversation's error, and is recognised
+    /// only when it opens the text.
     #[test]
     fn a_refused_switch_report_keeps_its_reason_after_the_summary() {
         let reason = "The original conversation changed or has another live owner; account switching was paused";

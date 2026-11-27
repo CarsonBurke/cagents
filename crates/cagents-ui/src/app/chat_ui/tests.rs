@@ -25799,8 +25799,18 @@ fn a_new_thread_skips_a_provider_whose_cli_is_missing() {
     assert_eq!(
         unknown.no_chat_provider_note().as_deref(),
         Some(
-            "No agent you use is installed on this computer. Install one there, such as Claude Code or Codex, then refresh Agent accounts."
+            "No agent you use is installed on this computer. Install one there, such as Claude Code or Codex, then open Agent accounts to check again."
         )
+    );
+    // Turned off rather than missing, they are turned on in Settings.
+    let mut off = crate::app::tests::context_inspector_test_app(false);
+    for provider in Provider::ALL {
+        off.settings.set_uses_provider(provider, false);
+    }
+    off.account_ui.set_turned_off(&off.settings);
+    assert_eq!(
+        off.no_chat_provider_note().as_deref(),
+        Some("Every agent is turned off. Turn one on in Settings to start a conversation.")
     );
 }
 

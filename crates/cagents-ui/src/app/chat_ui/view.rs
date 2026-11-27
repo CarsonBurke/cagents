@@ -1816,7 +1816,7 @@ fn reasoning_elapsed(
 /// The providers a draft offers, in the order its picker lists them after
 /// its own.
 /// A provider without native chat is never offered.
-const MODEL_FAMILIES: [Provider; 5] = [
+pub(super) const MODEL_FAMILIES: [Provider; 5] = [
     Provider::Codex,
     Provider::Claude,
     Provider::Antigravity,

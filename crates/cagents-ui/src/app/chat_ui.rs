@@ -8309,6 +8309,13 @@ impl DraftPermissionPreview {
     }
 }
 
+/// Where this window's conversations run, as a sentence names it: its
+/// device, or this computer.
+fn conversation_place() -> String {
+    crate::device::selected()
+        .map_or_else(|| "this computer".to_owned(), |device| device.name.clone())
+}
+
 fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let arguments = &recipe.arguments;
     match provider {
@@ -9982,17 +9989,25 @@ impl Cagents {
         if self.available_chat_provider().is_some() {
             return None;
         }
-        let place = crate::device::selected()
-            .map_or_else(|| "this computer".to_owned(), |device| device.name.clone());
+        if !Provider::ALL
+            .into_iter()
+            .any(|provider| provider.has_native_chat() && self.account_ui.uses(provider))
+        {
+            return Some(
+                "Every agent is turned off. Turn one on in Settings to start a conversation."
+                    .into(),
+            );
+        }
         Some(format!(
-            "No agent you use is installed on {place}. Install one there, such as Claude Code or Codex, then refresh Agent accounts."
+            "No agent you use is installed on {}. Install one there, such as Claude Code or Codex, then open Agent accounts to check again.",
+            conversation_place()
         ))
     }
 
     /// A start the daemon refused because its provider isn't installed, in
     /// the reader's words: the device it is missing on, and for a draft the
-    /// provider that window can start instead. Where Accounts found the CLI,
-    /// the daemon's own report stands, since that names what differs: the
+    /// provider the model menu can start instead. Where Accounts found the
+    /// CLI, the daemon's report follows, since it names what differs: the
     /// PATH agents start with.
     fn explain_missing_provider(
         &self,
@@ -10002,27 +10017,22 @@ impl Cagents {
         let Some(provider) = chat::failure::not_installed_provider(&failure.message) else {
             return failure;
         };
+        let name = provider.label();
+        let place = conversation_place();
         if self.account_ui.cli_installed(provider) == Some(true) {
             return failure;
         }
-        let place = crate::device::selected()
-            .map_or_else(|| "this computer".to_owned(), |device| device.name.clone());
         let draft = matches!(
             self.cards.get(&card),
             Some(CardRuntime::Chat(runtime)) if runtime.is_draft()
         );
         let instead = draft
             .then(|| {
-                std::iter::once(Provider::Codex)
-                    .chain(crate::account::Account::REPORTED)
-                    .find(|other| {
-                        *other != provider
-                            && other.has_native_chat()
-                            && self.account_ui.offers(*other)
-                    })
+                view::MODEL_FAMILIES.into_iter().find(|other| {
+                    *other != provider && other.has_native_chat() && self.account_ui.offers(*other)
+                })
             })
             .flatten();
-        let name = provider.label();
         failure.message = match instead {
             Some(other) => format!(
                 "{name} isn't installed on {place}. Choose {} in the model menu, or install {name} there.",
