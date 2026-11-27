@@ -8060,18 +8060,25 @@ fn project_view<'a>(
         chrome.new_channel_id.clone(),
     );
     let mut identity = widget::row::with_children(vec![project_identity])
+        .spacing(space::XS)
         .align_y(Alignment::Center)
         .width(Length::Fill);
-    if let Some(indicator) = attention_indicator(header_attention) {
-        identity = identity.push(indicator);
-    }
+    // A folded project says how many rows it holds in the neutral badge
+    // every count beside a name wears, ahead of its news: a bare figure
+    // beside a spinner or an unread badge read as a count of either.
     if !expanded {
         let rows = if project.state.lists_panes(entity) {
             entity.panes.len()
         } else {
             entity.worktrees.len()
         };
-        identity = identity.push(design::caption((entity.channels.len() + rows).to_string()));
+        identity = identity.push(crate::ui_controls::count_badge(
+            (entity.channels.len() + rows).to_string(),
+            Default::default(),
+        ));
+    }
+    if let Some(indicator) = attention_indicator(header_attention) {
+        identity = identity.push(indicator);
     }
     let header = project_header_row(
         identity.into(),
