@@ -192,9 +192,11 @@ fn ring(theme: &cosmic::Theme) -> Color {
 
 fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
     match news {
-        News::Unread(Some(count)) => count_pill(count, design::accent_color, |theme| {
-            theme.cosmic().accent.on.into()
-        }),
+        News::Unread(Some(count)) => count_pill(
+            count,
+            design::accent_color,
+            crate::ui_controls::on_accent_color,
+        ),
         News::Count(count) => count_pill(count, design::muted_icon_color, design::rail_tray),
         News::Unread(None) => widget::container(cosmic::iced::widget::Space::new())
             .width(Length::Fixed(DOT))

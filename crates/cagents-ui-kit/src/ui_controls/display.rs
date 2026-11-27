@@ -94,10 +94,35 @@ pub enum CountTone {
     /// On an accent-filled control, such as a primary button, whose fill it
     /// shades rather than adding a hue of its own.
     OnAccent,
+    /// News the user has not read yet, such as a sidebar row's unread
+    /// conversations: filled with the accent, the one count loud enough to
+    /// find in a column of names. The projects rail's unread pill wears the
+    /// same fill and ink.
+    Accent,
 }
 
-/// The height of a [`count_badge`], about as wide as a one-digit count.
+/// The ink of a count or figure drawn on the theme's accent fill.
+pub fn on_accent_color(theme: &Theme) -> iced::Color {
+    theme.cosmic().accent.on.into()
+}
+
+/// The height of a [`count_badge`], and the width of a one-figure one.
 pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
+/// A [`count_badge`]'s inset either side of its figures.
+const COUNT_BADGE_PADDING: f32 = 5.0;
+/// The widest any figure or `+` is drawn in a [`count_badge`], with room to
+/// spare: the font's figures are about 0.6 em at its 10.5 px.
+const COUNT_BADGE_FIGURE_WIDTH: f32 = 7.5;
+
+/// The most room a [`count_badge`] showing `count` takes, for a layout that
+/// must clear the badge before it is drawn, such as a hover-revealed control
+/// laid over it.
+pub fn count_badge_width_bound(count: &str) -> f32 {
+    match count.chars().count() {
+        0 | 1 => COUNT_BADGE_HEIGHT,
+        figures => 2.0 * COUNT_BADGE_PADDING + figures as f32 * COUNT_BADGE_FIGURE_WIDTH,
+    }
+}
 
 /// How many items a section, tab or list holds, as a small rounded badge
 /// beside its name.
@@ -111,12 +136,21 @@ pub const COUNT_BADGE_HEIGHT: f32 = 16.0;
 /// Leave the badge out at zero when the body beneath already says it is
 /// empty, as an empty Work board lane does; show "0" when the zero is the
 /// news, as for a search that found nothing.
+///
+/// A single figure is a circle, whatever its glyph's width, so a column of
+/// one-digit counts lines up; longer counts grow into a pill.
 pub fn count_badge<'a, Message: 'a>(
     count: impl Into<Cow<'a, str>> + 'a,
     tone: CountTone,
 ) -> Element<'a, Message> {
+    let count = count.into();
+    let width = if count.chars().count() <= 1 {
+        Length::Fixed(COUNT_BADGE_HEIGHT)
+    } else {
+        Length::Shrink
+    };
     widget::container(
-        widget::text(count.into())
+        widget::text(count)
             .size(design::TEXT_CAPTION - 0.5)
             .line_height(iced::widget::text::LineHeight::Absolute(
                 COUNT_BADGE_HEIGHT.into(),
@@ -124,10 +158,10 @@ pub fn count_badge<'a, Message: 'a>(
             .font(cosmic::font::semibold())
             .wrapping(iced::widget::text::Wrapping::None),
     )
-    .padding([0.0, 5.0])
+    .padding([0.0, COUNT_BADGE_PADDING])
     .center_y(Length::Fixed(COUNT_BADGE_HEIGHT))
     .align_x(Alignment::Center)
-    .width(Length::Shrink)
+    .width(width)
     .class(cosmic::theme::Container::custom(move |theme| {
         count_badge_style(theme, tone)
     }))
@@ -156,6 +190,7 @@ fn count_badge_style(theme: &Theme, tone: CountTone) -> widget::container::Style
         }
         // The control's own label colour carries through.
         CountTone::OnAccent => (iced::Color::from_rgba(0.0, 0.0, 0.0, 0.2), None),
+        CountTone::Accent => (design::accent_color(theme), Some(on_accent_color(theme))),
     };
     widget::container::Style {
         background: Some(iced::Background::Color(fill)),

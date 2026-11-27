@@ -4377,6 +4377,101 @@ fn row_indicators_share_one_reserved_slot() {
     }
 }
 
+/// Unread news is one accent count badge. A more urgent state keeps its mark
+/// with the count badged beside it, on the same line: the count used to be a
+/// 9 px number stacked under a dot or the mark.
+#[test]
+fn an_unread_count_is_one_badge_beside_any_more_urgent_mark() {
+    let renderer = headless_renderer();
+    let states: [(&str, fn(&mut AttentionSummary)); 4] = [
+        ("unread", |_| {}),
+        ("working", |summary| summary.working = 1),
+        ("failed", |summary| summary.failed = 1),
+        ("waiting", |summary| summary.waiting = 1),
+    ];
+    for (name, urgent) in states {
+        for (unread, label) in [(1, "1"), (9, "9"), (10, "10"), (99, "99"), (120, "99+")] {
+            let mut summary = AttentionSummary {
+                unread,
+                ..AttentionSummary::default()
+            };
+            urgent(&mut summary);
+            let mut element: Element<'_, SidebarAction> =
+                attention_indicator(summary).expect("unread news has an indicator");
+            let mut tree = Tree::new(&element);
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(200.0, WORKTREE_ROW_HEIGHT)),
+            );
+            let mut collect = TextsAndControls::default();
+            element
+                .as_widget_mut()
+                .operate(&mut tree, Layout::new(&node), &renderer, &mut collect);
+            let texts: Vec<_> = collect
+                .texts
+                .iter()
+                .map(|(text, _)| text.as_str())
+                .collect();
+            assert_eq!(texts, [label], "{name} with {unread} unread");
+            let bounds = node.bounds();
+            assert!(
+                bounds.height <= crate::ui_controls::COUNT_BADGE_HEIGHT,
+                "{name} with {unread} unread stacks its count: {bounds:?}"
+            );
+            assert!(
+                bounds.width <= attention_indicator_width_bound(summary),
+                "{name} with {unread} unread is wider than the delete control covers: {bounds:?}"
+            );
+            if name == "unread" && unread < 10 {
+                assert_eq!(
+                    bounds.width, ROW_STATUS_WIDTH,
+                    "a one-figure count is a circle"
+                );
+            }
+        }
+    }
+}
+
+/// A status wider than its slot widens the slot towards the title rather
+/// than drawing over it, and stays under the delete control's fill.
+#[test]
+fn a_wide_channel_status_gives_way_to_its_title_and_hides_under_delete() {
+    let mut channel = SidebarChannel::new(
+        ChannelId::new(),
+        "Investigate why switching channels stalls".into(),
+        false,
+        Some(crate::agent::ActivityState::Waiting),
+        true,
+        120,
+        true,
+        1,
+    );
+    channel.attention.unread = 120;
+    let cover = ICON_CONTROL_SIZE
+        .max(ROW_GUTTER + channel_indicator_width_bound(channel.attention, channel.chats));
+    assert!(
+        cover > ICON_CONTROL_SIZE,
+        "the fixture's status outgrows the delete button"
+    );
+    for width in (160..=360).step_by(20) {
+        let width = width as f32;
+        let row = channel_row_layout(&channel, width, false);
+        let (count, badge) = row.badge().expect("the row draws its unread count");
+        assert_eq!(count, "99+");
+        assert!(
+            row.title.x + row.title.width <= badge.x,
+            "at {width}px the title {:?} runs under the count {badge:?}",
+            row.title
+        );
+        // The figures sit inside the pill's 5 px inset.
+        assert!(
+            badge.x - 5.0 >= width - cover,
+            "at {width}px the count {badge:?} peeks past the delete fill, {cover}px wide"
+        );
+    }
+}
+
 /// How far right anything inside the scroll viewport's padded content
 /// reaches. The `filtered_scroll` decorator, the scrollable and its content
 /// container all span the pane deliberately; the first node inside that
