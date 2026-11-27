@@ -2759,17 +2759,10 @@ fn start_publishing(
             .unwrap_or_else(|| setup_error(message))
     })?;
     let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
-    // An agent's conversation runs in the agent's directory whoever starts
-    // it. A handoff from a terminal continues that terminal's process where it
-    // runs, and reading history or joining a provider's own socket starts
-    // nothing.
+    // An agent's conversation keeps its checked directory when switching
+    // from a terminal. A socket attachment also needs its pin for dispatch.
     let agent_directory = if execution.is_none()
-        && source.is_none()
-        && !matches!(
-            spec.transport,
-            chat::protocol::TransportSpec::History
-                | chat::protocol::TransportSpec::UnixWebSocket { .. }
-        )
+        && !matches!(spec.transport, chat::protocol::TransportSpec::History)
         && let Ok(registry) = super::agent_execution::registry(host)
     {
         super::agent_execution::working_directory::for_conversation(&registry, &session)
@@ -2816,12 +2809,15 @@ fn start_publishing(
         .mailbox_seal
         .as_ref()
         .map(|seal| Arc::new(seal.recognizer()));
-    super::account_lifecycle::ensure_launch(
+    super::account_lifecycle::ensure_launch_at_directory(
         host,
         &spec.working_directory,
         &spec.environment,
         &spec.unset_environment,
         false,
+        agent_directory
+            .as_ref()
+            .map(|(_, opened)| opened.directory.as_ref()),
     )?;
     let mut initial = adapter.initialize_for_start().map_err(setup_error)?;
     let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
@@ -5132,14 +5128,19 @@ fn process_inner(
                     "A shared Codex source must be reattached, not replaced",
                 ));
             }
-            // The terminal starts the provider's own program at this path. An
-            // agent's is judged as any start of its provider is. A terminal
-            // takes no descriptor, so this refuses a link that stands there
-            // and not one put there after the check.
-            if let Ok(registry) = super::agent_execution::registry(host) {
-                super::agent_execution::working_directory::for_conversation(&registry, &session)
-                    .map_err(unavailable)?;
-            }
+            // Keep the admitted directory through teardown and pass it to
+            // the terminal holder that will start the replacement provider.
+            let directory = if let Ok(registry) = super::agent_execution::registry(host) {
+                super::agent_execution::working_directory::for_launch(
+                    &registry,
+                    session.id,
+                    &recipe.working_directory,
+                )
+                .map_err(unavailable)?
+                .map(|opened| (registry, opened))
+            } else {
+                None
+            };
             let terminal_id = crate::model::TerminalId::new();
             let mut terminal = crate::model::TerminalSession {
                 owned_codex_listener: None,
@@ -5206,6 +5207,12 @@ fn process_inner(
                 .launch
                 .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
                 .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
+            if directory.is_some() && recipe.working_directory != terminal.launch.working_directory
+            {
+                return Err(unavailable(
+                    "The terminal resume directory changed during handoff; retry the exact handoff",
+                ));
+            }
             terminal.launch = recipe.clone();
             terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
                 recipe,
@@ -5234,7 +5241,7 @@ fn process_inner(
                     .map_err(unavailable)?;
             }
             owners.require_current(host, &closing)?;
-            let (descriptor, replacement_worker) = super::state::spawn_terminal_view_owned(
+            let (descriptor, replacement_worker) = super::state::spawn_handoff_terminal(
                 host,
                 client,
                 terminal,
@@ -5242,8 +5249,8 @@ fn process_inner(
                     initially_visible: false,
                     ..Default::default()
                 },
-                Some(handle.execution_environment()),
-                false,
+                handle.execution_environment(),
+                directory,
             )?;
             let publication = (|| {
                 let mut state = host.lock().unwrap_or_else(|p| p.into_inner());

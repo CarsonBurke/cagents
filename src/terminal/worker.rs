@@ -3393,6 +3393,7 @@ impl Worker {
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         isolate_codex_tmp,
+                        config.launch_directory.clone(),
                         reservation,
                     )?
                 } else {
@@ -3402,6 +3403,7 @@ impl Worker {
                         child_exit_tx,
                         config.holder_recovery.clone(),
                         isolate_codex_tmp,
+                        config.launch_directory.clone(),
                     )?
                 };
                 #[cfg(not(any(test, feature = "test-support")))]
@@ -3411,6 +3413,7 @@ impl Worker {
                     child_exit_tx,
                     config.holder_recovery.clone(),
                     isolate_codex_tmp,
+                    config.launch_directory.clone(),
                 )?;
                 (held, Vec::new())
             }

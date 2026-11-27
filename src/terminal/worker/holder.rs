@@ -102,6 +102,9 @@ enum Request {
         recovery: Option<Recovery>,
         #[serde(default)]
         isolate_codex_tmp: bool,
+        // A managed launch carries this identity and one directory right.
+        #[serde(default)]
+        launch_directory: Option<crate::agent_execution::DirectoryIdentity>,
     },
     /// The daemon no longer needs the terminal. The holder exits, closing its
     /// master; any process still on the terminal is hung up.
@@ -333,7 +336,7 @@ pub(super) fn spawn(
     size: PtySize,
     exits: Sender<ChildExit>,
 ) -> Result<Held, String> {
-    spawn_recoverable(command, size, exits, None, false)
+    spawn_recoverable(command, size, exits, None, false, None)
 }
 
 pub(super) fn spawn_recoverable(
@@ -342,6 +345,7 @@ pub(super) fn spawn_recoverable(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
     isolate_codex_tmp: bool,
+    launch_directory: Option<Arc<File>>,
 ) -> Result<Held, String> {
     let reservation = crate::daemon::child_reaper::reserve()
         .map_err(|error| format!("reserve terminal holder child custody: {error}"))?;
@@ -351,6 +355,7 @@ pub(super) fn spawn_recoverable(
         exits,
         recovery,
         isolate_codex_tmp,
+        launch_directory,
         reservation,
     )
 }
@@ -361,8 +366,19 @@ pub(super) fn spawn_reserved(
     exits: Sender<ChildExit>,
     recovery: Option<Recovery>,
     isolate_codex_tmp: bool,
+    launch_directory: Option<Arc<File>>,
     reservation: crate::daemon::child_reaper::Reservation,
 ) -> Result<Held, String> {
+    let launch_directory = launch_directory
+        .map(|directory| {
+            let identity = crate::agent_execution::DirectoryIdentity::from_metadata(
+                &directory.metadata().map_err(|error| error.to_string())?,
+            );
+            checked_launch_directory(identity, directory)
+        })
+        .transpose()?;
+    let expected_directory = launch_directory.as_ref().map(|pin| pin.0);
+    let directory_fd = launch_directory.as_ref().map(|pin| pin.1.as_fd());
     #[cfg(test)]
     let fixture_runtime = command.get_env("XDG_RUNTIME_DIR").map(PathBuf::from);
     // Every image that can start a holder has to be able to serve as one.
@@ -432,8 +448,9 @@ pub(super) fn spawn_reserved(
             size,
             recovery,
             isolate_codex_tmp,
+            launch_directory: expected_directory,
         },
-        &[],
+        directory_fd.as_slice(),
         deadline,
         MAX_FRAME as usize,
         3,
@@ -483,6 +500,9 @@ pub(super) fn spawn_reserved(
             return Err("New terminal holder evidence does not match its exact child".into());
         }
         holder.record = Some(record);
+    }
+    if expected_directory.is_some() && launch_directory != expected_directory {
+        return Err("Terminal holder acknowledged a different launch directory".into());
     }
     watched(
         holder,
@@ -1464,18 +1484,27 @@ fn serve(control: UnixStream) -> i32 {
         let _ = send(&control, &Report::Failed(message), &[]);
         1
     };
-    let (command, size, mut recovery, isolate_codex_tmp) = match receive::<Request>(&control) {
-        Ok(Some((
-            Request::Spawn {
+    let (command, size, mut recovery, isolate_codex_tmp, approved_directory, mut descriptors) =
+        match receive::<Request>(&control) {
+            Ok(Some((
+                Request::Spawn {
+                    command,
+                    size,
+                    recovery,
+                    isolate_codex_tmp,
+                    launch_directory,
+                },
+                descriptors,
+            ))) => (
                 command,
                 size,
                 recovery,
                 isolate_codex_tmp,
-            },
-            _,
-        ))) => (command, size, recovery, isolate_codex_tmp),
-        _ => return 1,
-    };
+                launch_directory,
+                descriptors,
+            ),
+            _ => return 1,
+        };
     if let Some(recovery) = &recovery {
         let authority = (|| {
             let boot = crate::daemon::read_boot_id()?;
@@ -1513,7 +1542,17 @@ fn serve(control: UnixStream) -> i32 {
         .first()
         .map(|program| program.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let launch_directory = match pin_launch_directory(&command) {
+    let launch_directory = match (approved_directory, descriptors.len()) {
+        (None, 0) => pin_launch_directory(&command),
+        (Some(identity), 1) => checked_launch_directory(
+            identity,
+            Arc::new(File::from(
+                descriptors.pop().expect("one launch directory descriptor"),
+            )),
+        ),
+        _ => Err("Terminal launch directory identity and descriptor count disagree".into()),
+    };
+    let launch_directory = match launch_directory {
         Ok(pin) => pin,
         Err(error) => return fail(error),
     };
@@ -2648,6 +2687,26 @@ mod tests {
     }
 
     #[test]
+    fn terminal_holder_spawns_in_the_directory_passed_by_host() {
+        let directory = tempfile::tempdir().unwrap();
+        let requested = directory.path().join("requested");
+        let original = directory.path().join("original");
+        std::fs::create_dir(&requested).unwrap();
+        let mut command = command("echo started > launch-marker; echo ready; read line");
+        command.cwd(&requested);
+        let (identity, approved) = pin_launch_directory(&command).unwrap();
+        std::fs::rename(&requested, &original).unwrap();
+        std::fs::create_dir(&requested).unwrap();
+
+        let (exits, _exited) = crossbeam_channel::bounded(1);
+        let held = spawn_recoverable(command, size(), exits, None, false, Some(approved)).unwrap();
+        read_until(&held.master, "ready");
+        assert_eq!(held.launch_directory.as_ref().unwrap().0, identity);
+        assert!(original.join("launch-marker").is_file());
+        assert!(!requested.join("launch-marker").exists());
+    }
+
+    #[test]
     fn adopted_terminal_transfers_the_same_original_launch_directory_and_child() {
         let directory = tempfile::tempdir().unwrap();
         let original = directory.path().join("launch");
@@ -3125,6 +3184,7 @@ mod tests {
             exits,
             None,
             true,
+            None,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -3194,6 +3254,7 @@ mod tests {
             exits,
             None,
             false,
+            None,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -3273,6 +3334,7 @@ mod tests {
             exits,
             None,
             false,
+            None,
             reaper.reserve().unwrap(),
         )
         .unwrap();
@@ -3406,7 +3468,8 @@ mod tests {
                     size(),
                     exits,
                     Some(recovery.clone()),
-                    false
+                    false,
+                    None,
                 )
                 .is_err(),
                 "a complete proof without the daemon lease cannot register a holder"
@@ -3419,6 +3482,7 @@ mod tests {
                 exits,
                 Some(recovery),
                 false,
+                None,
             )
             .unwrap();
             read_until(&held.master, "ready");
