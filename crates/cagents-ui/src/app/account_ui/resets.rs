@@ -1255,7 +1255,7 @@ pub(in crate::app) mod tests {
             available_count: 2,
             expires_at: None,
             usable: true,
-            held_for_unused_limits: false,
+            unused_limit_hold: None,
         }
     }
 

@@ -851,7 +851,7 @@ mod tests {
                 available_count: 2,
                 expires_at: Some(1_900_000_000),
                 usable: true,
-                held_for_unused_limits: false,
+                unused_limit_hold: None,
             }],
             windows: Vec::new(),
             credits: None,

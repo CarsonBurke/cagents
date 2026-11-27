@@ -99,6 +99,17 @@ impl ResetScope {
     }
 }
 
+/// A provider-offered grant held while every limit it clears is unused, or
+/// the live observation that released that local hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnusedLimitHold {
+    Held,
+    Released {
+        window_key: String,
+        observed_at: u64,
+    },
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(remote = "Self")]
 pub struct UsageReset {
@@ -111,10 +122,8 @@ pub struct UsageReset {
     /// Inventory can include grants that are paused or have nothing to
     /// refill.
     pub usable: bool,
-    /// The provider offered this grant, but reported zero use on every
-    /// cleared limit. Only this local hold can be lifted by a live report.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub held_for_unused_limits: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unused_limit_hold: Option<UnusedLimitHold>,
 }
 
 /// Account-info RPC retains its fixed postcard fields. The local hold is
@@ -160,7 +169,7 @@ impl<'de> Deserialize<'de> for UsageReset {
             available_count: wire.available_count,
             expires_at: wire.expires_at,
             usable: wire.usable,
-            held_for_unused_limits: false,
+            unused_limit_hold: None,
         })
     }
 }
@@ -338,6 +347,78 @@ pub fn inventory_lines(resets: &[UsageReset], now_secs: i64) -> Vec<String> {
 }
 
 impl UsageSnapshot {
+    /// Integrate a complete inventory into newer usage figures.
+    pub fn merge_reset_inventory(&mut self, full: &Self, now: u64) {
+        let mut resets = full.resets.clone();
+        self.retain_newer_reset_releases(&mut resets, full.observed_at, now, |_| true);
+        self.resets = resets;
+    }
+
+    /// A scoped frame does not move the account-wide clock. Keep the scoped
+    /// figure that released a hold if a complete probe observed it earlier.
+    pub fn retain_newer_scoped_reset_usage(&mut self, previous: &Self, now: u64) {
+        previous.retain_newer_reset_releases(&mut self.resets, self.observed_at, now, |window| {
+            if window.kind != WindowKind::Scoped {
+                return false;
+            }
+            let key = super::claude::stable_window_key(&window.key);
+            if let Some(probed) = self
+                .windows
+                .iter_mut()
+                .find(|probed| super::claude::stable_window_key(&probed.key) == key)
+            {
+                probed.used = window.used;
+                probed.resets_at = window.resets_at.or(probed.resets_at);
+            } else {
+                self.windows.push(window.clone());
+            }
+            true
+        });
+    }
+
+    fn retain_newer_reset_releases(
+        &self,
+        resets: &mut [UsageReset],
+        read_at: u64,
+        now: u64,
+        mut retain_window: impl FnMut(&UsageWindow) -> bool,
+    ) {
+        for previous in &self.resets {
+            let Some(UnusedLimitHold::Released {
+                window_key,
+                observed_at,
+            }) = &previous.unused_limit_hold
+            else {
+                continue;
+            };
+            if *observed_at <= read_at
+                || *observed_at > now.saturating_add(super::schedule::CLOCK_SLACK)
+            {
+                continue;
+            }
+            let Some(window) = self.windows.iter().find(|window| {
+                window.used > 0.0
+                    && super::claude::stable_window_key(&window.key) == window_key.as_str()
+            }) else {
+                continue;
+            };
+            if let Some(reset) = resets.iter_mut().find(|reset| {
+                reset.unused_limit_hold == Some(UnusedLimitHold::Held)
+                    && reset.id == previous.id
+                    && reset.kind == previous.kind
+                    && reset.available_count == previous.available_count
+                    && reset.expires_at == previous.expires_at
+                    && ordered_scopes(&reset.scopes) == ordered_scopes(&previous.scopes)
+            }) && retain_window(window)
+            {
+                reset.usable = true;
+                reset
+                    .unused_limit_hold
+                    .clone_from(&previous.unused_limit_hold);
+            }
+        }
+    }
+
     /// One usable reset for a window that is near or at its limit.
     pub fn actionable_reset(&self, window: &UsageWindow, now_secs: i64) -> Option<&UsageReset> {
         (window.used >= super::WARNING_FRACTION || window.binding)
@@ -416,13 +497,13 @@ mod tests {
             available_count: 2,
             expires_at: Some(100),
             usable: true,
-            held_for_unused_limits: false,
+            unused_limit_hold: None,
         };
         let held = UsageReset {
             id: "fable".into(),
             scopes: vec![ResetScope::Model("Fable".into())],
             usable: false,
-            held_for_unused_limits: true,
+            unused_limit_hold: Some(UnusedLimitHold::Held),
             ..offered.clone()
         };
         let current = vec![held, offered];
@@ -445,7 +526,7 @@ mod tests {
             current
                 .into_iter()
                 .map(|reset| UsageReset {
-                    held_for_unused_limits: false,
+                    unused_limit_hold: None,
                     ..reset
                 })
                 .collect::<Vec<_>>()
@@ -589,7 +670,7 @@ mod tests {
             available_count: 2,
             expires_at: Some(200),
             usable: true,
-            held_for_unused_limits: false,
+            unused_limit_hold: None,
         };
         assert!(reset.is_available(199));
         assert!(!reset.is_available(200));
@@ -637,7 +718,7 @@ mod tests {
                 available_count: 2,
                 expires_at: None,
                 usable: true,
-                held_for_unused_limits: false,
+                unused_limit_hold: None,
             };
             assert_eq!(
                 reset.confirmation_question("fixture@example.test"),

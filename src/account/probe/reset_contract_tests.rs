@@ -405,12 +405,12 @@ for line in sys.stdin:
         available_count: 9,
         expires_at: None,
         usable: true,
-        held_for_unused_limits: false,
+        unused_limit_hold: None,
     });
     previous.resets.push(super::super::UsageReset {
         id: "held-for-unused-limits".into(),
         usable: false,
-        held_for_unused_limits: true,
+        unused_limit_hold: Some(super::super::resets::UnusedLimitHold::Held),
         ..previous.resets[0].clone()
     });
     for (cache_name, switched) in [("same-login-cache", false), ("changed-login-cache", true)] {

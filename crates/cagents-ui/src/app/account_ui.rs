@@ -1602,8 +1602,8 @@ fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Pro
 
 /// Whether figures observed at `observed_at` still describe the account at
 /// `now`: they are recent, and no window has reset since they were read.
-fn merge_complete_inventory(current: &mut UsageSnapshot, full: &UsageSnapshot) {
-    current.resets.clone_from(&full.resets);
+fn merge_complete_inventory(current: &mut UsageSnapshot, full: &UsageSnapshot, now: Millis) {
+    current.merge_reset_inventory(full, now);
     current.ordinary_usage_allowed = current
         .ordinary_usage_allowed
         .or(full.ordinary_usage_allowed);
@@ -4875,7 +4875,7 @@ impl Cagents {
                 {
                     // A later partial usage frame cannot erase fresh inventory
                     // returned by this owner/login's forced complete reading.
-                    merge_complete_inventory(current, &snapshot);
+                    merge_complete_inventory(current, &snapshot, now);
                     state.inventory_observed_at = Some(snapshot.observed_at);
                     state.usage_invalidated = false;
                     merged_inventory = true;
@@ -4883,8 +4883,17 @@ impl Cagents {
                 state.schedule.abandon();
             }
             Outcome::Answered {
-                identity, snapshot, ..
+                identity,
+                mut snapshot,
+                ..
             } => {
+                if provider == Provider::Claude
+                    && ticket.usage_generation == state.usage_generation
+                    && identity == state.identity
+                    && let Some(current) = state.snapshot.as_ref()
+                {
+                    snapshot.retain_newer_scoped_reset_usage(current, now);
+                }
                 // A changed identity confirms that the login attempt ended,
                 // but accepting that identity for this account is separate.
                 // The attempt ends once the home reports
@@ -8582,7 +8591,7 @@ mod tests {
             available_count: 2,
             expires_at: None,
             usable: true,
-            held_for_unused_limits: false,
+            unused_limit_hold: None,
         }];
         let gauge =
             account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
@@ -11188,6 +11197,90 @@ mod app_tests {
                 true,
             ));
             assert!(app.automatic_account(&current).is_none(), "{source:?}");
+        }
+    }
+
+    #[test]
+    fn delayed_inventory_cannot_hold_a_reset_released_by_newer_live_usage() {
+        use serde_json::json;
+        let reports = [
+            (
+                json!({
+                    "status":"allowed",
+                    "unifiedWindows":{
+                        "seven_day":{"utilization":0.5},
+                        "seven_day_overage_included":{"utilization":0.98}
+                    }
+                }),
+                0,
+            ),
+            (
+                json!({
+                    "rateLimitType":"seven_day_overage_included",
+                    "utilization":0.98
+                }),
+                1_000,
+            ),
+        ];
+
+        for (report, account_age) in reports {
+            let mut app = context_inspector_test_app(false);
+            let id = app.account_ui.add_managed_fixture(Provider::Claude, 1990);
+            let recipe = recipe_on(&app, &id);
+            let now = now_ms();
+            let mut delayed = account::claude::parse_usage(
+                &json!({"rate_limits":{
+                "limits":[
+                    {"kind":"weekly_all","percent":50},
+                    {"kind":"weekly_scoped","scope":"Fable 5.1","percent":0}
+                ],
+                "cedar_ember":{"eligible":true,"grants":[
+                    {"id":"fable","resets_left":2,"clears":["seven_day_overage_included"],
+                     "usable_now":true,"use_requires_limit":false,
+                     "percent_used":{"seven_day_overage_included":0}}
+                ]}}}),
+                now - 2_000,
+            );
+            assert!(!delayed.resets[0].is_available(unix_seconds(now)));
+            let state = app.account_ui.account_mut(&id).unwrap();
+            state.snapshot = Some(delayed.clone());
+            state.inventory_observed_at = Some(delayed.observed_at);
+            let ticket = state.start_probe(Trigger::Manual, now - 1_000);
+            let (owner, identity) = (state.owner, state.identity.clone());
+            delayed.observed_at = now - 1_000;
+            let live =
+                LiveReport::Claude(account::claude::parse_rate_limit_event(&report).unwrap());
+            drop(app.account_reported(Provider::Claude, &recipe, vec![(live, now)]));
+            let current = app
+                .account_ui
+                .account(&id)
+                .unwrap()
+                .snapshot
+                .as_ref()
+                .unwrap();
+            assert!(current.resets[0].is_available(unix_seconds(now)));
+
+            drop(app.account_probed(
+                id.clone(),
+                owner,
+                ticket,
+                Outcome::Answered {
+                    identity,
+                    catalog: None,
+                    snapshot: Box::new(delayed),
+                },
+            ));
+            let state = app.account_ui.account(&id).unwrap();
+            assert_eq!(state.inventory_observed_at, Some(now - 1_000));
+            let current = state.snapshot.as_ref().unwrap();
+            assert_eq!(current.observed_at, now - account_age);
+            let fable = current
+                .windows
+                .iter()
+                .find(|window| window.key == "weekly_scoped:Fable 5.1")
+                .unwrap();
+            assert_eq!(fable.used, 0.98);
+            assert!(current.resets[0].is_available(unix_seconds(now)));
         }
     }
 

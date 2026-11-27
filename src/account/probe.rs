@@ -287,7 +287,7 @@ async fn run_reading(
         snapshot.resets = previous.snapshot.resets;
         for reset in &mut snapshot.resets {
             reset.usable = false;
-            reset.held_for_unused_limits = false;
+            reset.unused_limit_hold = None;
         }
     }
     if let (
