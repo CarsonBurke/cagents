@@ -169,7 +169,8 @@ fn user_request_keeps_readiness_and_authenticates_before_one_device_operation() 
             // `finished` shows the request needed no other (#3127).
             || {
                 starts.set(starts.get() + 1);
-                crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())
+                crate::control::ControlClient::connect(&socket)
+                    .map_err(|error| error.to_string().into())
             },
         )
         .unwrap(),
@@ -360,7 +361,7 @@ fn scoped_and_no_start_requests_preserve_selected_socket_errors_without_startup(
             || panic!("ordinary User uses readiness, not a selected-only fallback"),
             || {
                 starts.set(starts.get() + 1);
-                Err("User daemon readiness failed".into())
+                Err("User daemon readiness failed".to_owned().into())
             },
         ),
         Err("User daemon readiness failed".into())
@@ -434,4 +435,70 @@ fn missing_selected_socket_never_starts_or_retries_as_user() {
         assert_eq!(selections.get(), 1);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
     }
+}
+
+/// A device daemon of another protocol answers the handshake in its own
+/// envelope version. Both ways of reaching it keep that number, so the
+/// person is told which side to update rather than a generic failure.
+#[test]
+fn a_device_daemon_of_another_protocol_is_reported_as_incompatible() {
+    for (no_start, actual) in [(true, PROTOCOL_VERSION - 1), (false, PROTOCOL_VERSION + 1)] {
+        let directory = tempfile::Builder::new().prefix("dv-").tempdir().unwrap();
+        let socket = directory.path().join("selected.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        let worker = thread::spawn(move || {
+            let (mut peer, _) = listener.accept().unwrap();
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: actual,
+                    request_id: Some(hello.request_id),
+                    proof: proof(),
+                    message: ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::UnsupportedVersion,
+                        "protocol version is unsupported",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+        });
+        let connect = socket.clone();
+        let failure = super::request_described(
+            Operation::Home,
+            Authority::default(),
+            no_start,
+            || Ok(socket),
+            || match crate::control::ControlClient::connect(&connect) {
+                Err(error @ crate::control::ControlError::UnsupportedVersion { .. }) => {
+                    Err(super::ReadyError::Control(error))
+                }
+                result => result.map_err(|error| error.to_string().into()),
+            },
+            super::refusable,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(failure, super::Failure::Incompatible(version) if version == actual),
+            "{failure:?}"
+        );
+        worker.join().unwrap();
+    }
+}
+
+#[test]
+fn only_a_devices_daemon_refusal_is_retyped() {
+    use super::{ReadyError, ready_error};
+    use crate::terminal::HostedTerminalStartError;
+    let refusal = || HostedTerminalStartError::HostIncompatible { actual: 1 };
+    assert!(matches!(
+        ready_error(refusal(), true),
+        ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual: 1 })
+    ));
+    // This computer's own daemon keeps the guidance to rebuild it.
+    let ReadyError::Other(local) = ready_error(refusal(), false) else {
+        panic!("a local refusal was retyped");
+    };
+    assert_eq!(local, refusal().to_string());
 }

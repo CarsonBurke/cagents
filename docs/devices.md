@@ -5,8 +5,10 @@ runs on your desktop. Terminals, native conversations, account probes, and the
 **Device files** tools execute on the selected device. Each device has its own
 saved windows; opening another device does not move or stop the existing jobs.
 
-Install matching `cagents` and `cagentsd` executables on both computers. The remote
-machine does not need a display or `cagents-ui`. Set up ordinary SSH access first:
+Both computers run the same cagents version. Install cagents on your desktop;
+`cagents device update` installs that version on the device (see
+[Updating a device](#updating-a-device)). The remote machine does not need a
+display. Set up ordinary SSH access first:
 
 ```console
 ssh build-host hostname
@@ -103,8 +105,45 @@ connects separately under your own configuration, as before.
 Closing the window detaches its SSH streams; daemon-hosted jobs continue. SSH
 keepalives detect lost connections, and the normal terminal/chat reconnect paths
 establish new streams. Startup failures identify the selected device and include
-SSH diagnostics. A protocol mismatch requires installing a matched executable
-set before reconnecting.
+SSH diagnostics. When the device runs another cagents version, the failure says
+which side is older; an older device can be brought up to date with
+`cagents device update`.
+
+## Updating a device
+
+The desktop and the device's daemon speak an internal protocol that changes
+between versions, so after you update cagents on your desktop, a device is
+updated to match it:
+
+```console
+cagents device update build-host
+```
+
+The command sends this computer's installed cagents to the device over your SSH
+connection, checks there that it arrived intact, and installs it beside the
+device's current version with the same installer a release uses. The device's daemon then
+hands over to the new version the way `cagents daemon upgrade` does locally:
+terminals keep their processes, and work that cannot be carried waits or is
+listed for your decision. Run it from a terminal to answer those prompts; pass
+`--yes` to accept the handover without prompting, and `--interrupt` to also stop
+work that would otherwise block it. A device that is already compatible is left
+alone.
+
+It needs only SSH: the device downloads nothing, and no credentials are copied.
+It refuses, without changing the device, when:
+
+- the device runs a newer cagents than this computer (update this computer
+  instead; a device is never downgraded),
+- the device is not 64-bit x86 Linux with glibc, or its glibc is older than this
+  build requires,
+- the device's `cagents` was installed some other way, such as a distribution
+  package (update it that way), or
+- this computer runs a development build rather than an installed one.
+
+On a device without cagents, it installs into `~/.local/share/cagents-install`
+with links in `~/.local/bin`; set the device's `executable` to
+`~/.local/bin/cagents` by its absolute path if that directory is not on the
+non-interactive SSH `PATH`.
 
 The first device-window implementation uses Device files for remote filesystem
 and essential Git operations. The existing rich repository editor, language

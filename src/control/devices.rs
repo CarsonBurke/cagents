@@ -38,6 +38,22 @@ pub enum DeviceCommand {
         /// A linked device's name.
         name: String,
     },
+    /// Bring a device to this computer's cagents build so it can connect.
+    #[command(
+        after_help = "Sends this computer's installed build over SSH, installs it beside the device's with its own installer, and hands the device's daemon over through the device's update review, so its terminals keep running. Nothing is sent when the device already has the build. A device running a newer build is never downgraded. Run it in a system terminal outside cagents."
+    )]
+    Update {
+        /// A device name from devices.json.
+        name: String,
+        /// Accept the device's update review without a prompt: terminals
+        /// continue, other conversations wait until idle, and anything else
+        /// that would stop blocks the update.
+        #[arg(long)]
+        yes: bool,
+        /// Also permit active native turns on the device to stop.
+        #[arg(long)]
+        interrupt: bool,
+    },
 }
 
 impl DeviceCommand {
@@ -48,6 +64,14 @@ impl DeviceCommand {
 }
 
 pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError> {
+    if let DeviceCommand::Update {
+        name,
+        yes,
+        interrupt,
+    } = command
+    {
+        return update(&name, crate::device::provision::Options { yes, interrupt });
+    }
     // This computer's daemon first: selecting the device routes every later
     // connection there.
     let mut local = control_daemon_client()?;
@@ -83,6 +107,7 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
                 },
             })
         }
+        DeviceCommand::Update { .. } => unreachable!("handled before the local daemon"),
         DeviceCommand::AllowAgents { name } => set_allowed(&mut trust, name, true),
         DeviceCommand::DenyAgents { name } => set_allowed(&mut trust, name, false),
         DeviceCommand::Unlink { name } => {
@@ -117,6 +142,81 @@ pub(super) fn execute(command: DeviceCommand) -> Result<CommandOutput, AppError>
             })
         }
     }
+}
+
+/// `cagents device update`: needs no daemon on this computer, only the
+/// device's SSH connection and this computer's installed build.
+fn update(
+    name: &str,
+    options: crate::device::provision::Options,
+) -> Result<CommandOutput, AppError> {
+    use crate::device::provision::{Outcome, Step};
+    let device = saved(name)?;
+    crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
+    let version = crate::version();
+    let terminal = io::stderr().is_terminal();
+    let mut sending = false;
+    let mut progress = |step: Step| {
+        let line = match step {
+            Step::Inspecting => format!("Checking {name}…"),
+            Step::Sending { read, total } => {
+                let percent = read.saturating_mul(100) / total.max(1);
+                let first = !std::mem::replace(&mut sending, true);
+                if terminal {
+                    eprint!("\rSending cagents {version} to {name}: {percent}%");
+                    if percent >= 100 {
+                        eprintln!();
+                    }
+                } else if first {
+                    eprintln!("Sending cagents {version} to {name}…");
+                }
+                return;
+            }
+            Step::Installing => format!("Installing it on {name}…"),
+            Step::Upgrading => format!("Handing {name}'s daemon over to cagents {version}…"),
+            Step::Verifying => format!("Connecting to {name}…"),
+            Step::Note(note) => note.to_owned(),
+        };
+        eprintln!("{line}");
+    };
+    let outcome = crate::device::provision::update(&device, options, &mut progress)
+        .map_err(|error| AppError::new("device", error))?;
+    let protocol = crate::terminal_ipc::PROTOCOL_VERSION;
+    let (state, sent, human) = match outcome {
+        Outcome::AlreadyCompatible { running: true } => (
+            "compatible",
+            None,
+            format!(
+                "{name} already runs a daemon this computer can use (protocol {protocol}). Nothing changed."
+            ),
+        ),
+        Outcome::AlreadyCompatible { running: false } => (
+            "compatible",
+            None,
+            format!("{name}'s cagents already uses protocol {protocol}. Nothing changed."),
+        ),
+        Outcome::Updated { sent } => (
+            "updated",
+            sent,
+            format!("{name} now runs cagents {version}."),
+        ),
+        Outcome::Installed { sent } => (
+            "installed",
+            Some(sent),
+            format!("Installed cagents {version} on {name}. Its daemon starts when you connect."),
+        ),
+    };
+    Ok(CommandOutput {
+        command: "device.update",
+        data: json!({
+            "device": name,
+            "state": state,
+            "version": version,
+            "protocol": protocol,
+            "sent_bytes": sent,
+        }),
+        human,
+    })
 }
 
 fn set_allowed(

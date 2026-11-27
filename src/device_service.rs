@@ -1756,10 +1756,38 @@ pub fn request_unless_busy(operation: Operation) -> Result<Reply, crate::control
 
 /// A User connection to the daemon, started if need be, on the connection
 /// whose handshake proved it ready.
-fn ready_client() -> Result<crate::control::ControlClient, String> {
+fn ready_client() -> Result<crate::control::ControlClient, ReadyError> {
     crate::terminal::connect_ready_daemon()
         .map(|ready| ready.client)
-        .map_err(|error| error.to_string())
+        .map_err(|error| ready_error(error, crate::device::is_remote()))
+}
+
+/// A device's protocol refusal stays typed so it can say which side to
+/// update. This computer's own daemon keeps its rebuild guidance.
+fn ready_error(error: crate::terminal::HostedTerminalStartError, remote: bool) -> ReadyError {
+    use crate::terminal::HostedTerminalStartError;
+    match error {
+        HostedTerminalStartError::Connect(
+            error @ crate::control::ControlError::UnsupportedVersion { .. },
+        ) => ReadyError::Control(error),
+        HostedTerminalStartError::HostIncompatible { actual } if remote => {
+            ReadyError::Control(crate::control::ControlError::UnsupportedVersion { actual })
+        }
+        error => ReadyError::Other(error.to_string()),
+    }
+}
+
+/// Why no ready connection was made. A protocol mismatch keeps its type, so
+/// a caller can say which side is older; everything else is its message.
+enum ReadyError {
+    Control(crate::control::ControlError),
+    Other(String),
+}
+
+impl From<String> for ReadyError {
+    fn from(message: String) -> Self {
+        Self::Other(message)
+    }
 }
 
 #[cfg(any(feature = "ui", test))]
@@ -1775,7 +1803,7 @@ fn request_as(
     authority: crate::agent_execution::Authority,
     no_start: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
-    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
+    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, ReadyError>,
 ) -> Result<Reply, String> {
     request_described(
         operation,
@@ -1792,8 +1820,8 @@ fn request_described<E: From<String>>(
     authority: crate::agent_execution::Authority,
     no_start: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
-    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, String>,
-    describe: impl FnOnce(crate::control::ControlError) -> E,
+    ready_client: impl FnOnce() -> Result<crate::control::ControlClient, ReadyError>,
+    mut describe: impl FnMut(crate::control::ControlError) -> E,
 ) -> Result<Reply, E> {
     // A session's capability proves its lineage to the device as the
     // connection authenticates (`ControlClient::for_device`); the device then
@@ -1801,10 +1829,17 @@ fn request_described<E: From<String>>(
     // Presence, including an empty/invalid capability, must never become User
     // startup or scope. Use the same captured authority after resolving a socket.
     let mut client = if authority.token().is_some() || no_start {
-        crate::control::ControlClient::connect(&selected_socket()?)
-            .map_err(|error| error.to_string())?
+        crate::control::ControlClient::connect(&selected_socket()?).map_err(
+            |error| match error {
+                error @ crate::control::ControlError::UnsupportedVersion { .. } => describe(error),
+                error => E::from(error.to_string()),
+            },
+        )?
     } else {
-        ready_client()?
+        ready_client().map_err(|error| match error {
+            ReadyError::Control(error) => describe(error),
+            ReadyError::Other(message) => E::from(message),
+        })?
     };
     client
         .authenticate(authority)
@@ -1817,6 +1852,8 @@ fn request_described<E: From<String>>(
 pub(crate) enum Failure {
     /// This computer or the device refused it, for the reason given.
     Refused(String),
+    /// The device's daemon speaks this other protocol.
+    Incompatible(u16),
     Failed(String),
 }
 
@@ -1834,16 +1871,23 @@ pub(crate) fn request_refusable(operation: Operation) -> Result<Reply, Failure> 
         crate::control::daemon_autostart_disabled(),
         || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
         ready_client,
-        |error| match error {
-            crate::control::ControlError::DeviceAccess(message)
-            | crate::control::ControlError::Remote {
-                code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
-                message,
-                ..
-            } => Failure::Refused(message),
-            error => Failure::Failed(error.to_string()),
-        },
+        refusable,
     )
+}
+
+fn refusable(error: crate::control::ControlError) -> Failure {
+    match error {
+        crate::control::ControlError::DeviceAccess(message)
+        | crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::PermissionDenied,
+            message,
+            ..
+        } => Failure::Refused(message),
+        crate::control::ControlError::UnsupportedVersion { actual } => {
+            Failure::Incompatible(actual)
+        }
+        error => Failure::Failed(error.to_string()),
+    }
 }
 
 #[cfg(test)]

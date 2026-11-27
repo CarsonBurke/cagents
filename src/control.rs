@@ -4058,7 +4058,7 @@ where
         }
         // An agent must never link a device or grant itself access to one.
         TopCommand::Device { command } if command.changes_access() => {
-            Some("Device links and grants require your own terminal".into())
+            Some("Device links, grants and updates require your own terminal".into())
         }
         _ => None,
     };
@@ -4386,6 +4386,8 @@ where
         }
         let kind = if error.kind() == io::ErrorKind::PermissionDenied {
             "permission_denied"
+        } else if crate::device::incompatible(&error).is_some() {
+            "device_incompatible"
         } else {
             "device"
         };
