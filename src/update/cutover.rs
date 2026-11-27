@@ -327,6 +327,32 @@ impl Intent {
     }
 
     #[cfg(feature = "host")]
+    fn verify_selected_ready_claim(
+        &self,
+        layout: &InstallLayout,
+        state: &Path,
+        job: &UpdateJob,
+    ) -> Result<bool, UpdateError> {
+        if self.witness.is_legacy() {
+            return Ok(false);
+        }
+        let Some(ready) = ready_plan::selected_evidence(layout, state, job)? else {
+            return Ok(false);
+        };
+        ready
+            .verify_exited_cutover_claim(
+                &self.request_digest,
+                &self.checkpoint_digest,
+                &self.source,
+                &self.windows,
+                &self.successor,
+                &self.process,
+            )
+            .map_err(invalid)?;
+        Ok(true)
+    }
+
+    #[cfg(feature = "host")]
     fn verify_resumed_inventory(
         &self,
         saved: OriginalInventory,
@@ -533,6 +559,50 @@ pub(super) fn recorded_selection(
     Ok(Some(intent.stage))
 }
 
+/// Recover only previously confirmed Codex threads for the exact selected
+/// Ready update. Called under runtime and saved-data leases after ordinary
+/// holder discovery and interrupted run settlement.
+#[cfg(feature = "host")]
+pub fn selected_reconnectable_codex() -> Result<Vec<crate::upgrade::handoff::Chat>, UpdateError> {
+    let executable = crate::process::current_executable()?;
+    let layout = match locate(&executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    let state = layout.prefix.join(".update");
+    let Some(job) = read_job(&state)? else {
+        return Ok(Vec::new());
+    };
+    if !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
+        || layout.version != job.version
+    {
+        return Ok(Vec::new());
+    }
+    let Some(intent) = read(&state, &job.id)? else {
+        return Ok(Vec::new());
+    };
+    if intent.stage != Stage::Pending
+        || !intent.names_selected(&layout)?
+        || crate::process::mapped_region_identity(
+            std::process::id(),
+            crate::process::own_code_address(),
+        )? != intent.target_image
+        || !intent.original_exited()?
+        || !intent.witness_present(&state)?
+        || !intent.verify_selected_ready_claim(&layout, &state, &job)?
+    {
+        return Ok(Vec::new());
+    }
+    intent.verify_request(&state)?;
+    let original = intent.read_witness(&state)?;
+    let store = crate::upgrade::handoff::Store::observe_existing()
+        .map_err(invalid)?
+        .ok_or_else(|| invalid("Selected Ready recovery is missing its saved work directory"))?;
+    let recovered = store.recovered_chats().map_err(invalid)?;
+    Ok(recovered.reconnectable_codex(&original.chats, &intent.successor))
+}
+
 /// An unrelated job must not replace the unfinished status between the
 /// coordinator releasing its lease and this successor acquiring its own.
 pub(super) fn pending_selected(
@@ -589,20 +659,8 @@ pub(super) fn finish(
     if reentered && (!intent.witness_present(state)? || !intent.original_exited()?) {
         return Ok(None);
     }
-    if reentered
-        && !intent.witness.is_legacy()
-        && let Some(ready) = ready_plan::selected_evidence(layout, state, &job)?
-    {
-        ready
-            .verify_exited_cutover_claim(
-                &intent.request_digest,
-                &intent.checkpoint_digest,
-                &intent.source,
-                &intent.windows,
-                &intent.successor,
-                &intent.process,
-            )
-            .map_err(invalid)?;
+    if reentered {
+        intent.verify_selected_ready_claim(layout, state, &job)?;
     }
     if !reentered && intent.process.pid != std::process::id() as i32 {
         return Ok(None);

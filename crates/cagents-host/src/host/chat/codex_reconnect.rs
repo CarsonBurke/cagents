@@ -45,7 +45,7 @@ pub(super) fn require_current_binding(
 
 /// Resolve may reopen the exact registered conversation after a daemon loss.
 /// An unowned saved pane still has an attachment-only Resolve operation.
-pub(super) fn restore(host: &SharedHost, source: &Session) -> Result<bool, ProtocolError> {
+pub(in crate::host) fn restore(host: &SharedHost, source: &Session) -> Result<bool, ProtocolError> {
     if source.launch.provider != Provider::Codex {
         return Ok(false);
     }

@@ -183,6 +183,67 @@ fn restore_ordinary_with(
     Ok(restored)
 }
 
+/// Ordinary recovery already settled unproved runs and adopted any live
+/// holders. Reconnect only the exact earlier registered conversation, then
+/// publish the new owner's aliases before permitting cutover settlement.
+#[cfg(target_os = "macos")]
+pub(super) fn reconnect_selected_codex(host: &SharedHost) -> Result<(), String> {
+    use crate::upgrade::handoff::RecoveredChat;
+
+    let candidates = match crate::update::selected_reconnectable_codex() {
+        Ok(candidates) if candidates.is_empty() => return Ok(()),
+        Ok(candidates) => candidates,
+        Err(error) => {
+            tracing::warn!(%error, "could not authenticate a pending Codex reconnect");
+            return Ok(());
+        }
+    };
+    // Ordinary settlement is intentionally optional without a registry.
+    // Reopening an execution owner here requires that settlement to have run.
+    if let Err(error) = agent_execution::registry(host) {
+        tracing::warn!(%error, "cannot reconnect a Codex conversation without its execution registry");
+        return Ok(());
+    }
+    let store = Store::discover()?;
+    for evidence in candidates {
+        let id = evidence.source.id;
+        if host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .contains_key(&id)
+        {
+            continue;
+        }
+        match chat::codex_reconnect::restore(host, &evidence.source) {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(error) => {
+                tracing::warn!(session = %id, detail = %error.message,
+                    "the selected update could not reconnect its saved Codex conversation");
+                continue;
+            }
+        }
+        let replacement = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            let record = state
+                .chats
+                .get(&id)
+                .ok_or("Reconnected Codex owner disappeared")?;
+            let mut session = record.session.clone();
+            session.launch.session_id = record.handle.session_id();
+            session.native_continuity = record.handle.native_continuity();
+            session
+        };
+        store.record_recovered(&[RecoveredChat {
+            evidence,
+            replacement,
+            aliases: Vec::new(),
+        }])?;
+    }
+    Ok(())
+}
+
 /// Settle what agents were left doing by an earlier daemon. A committed
 /// acceptance is not proof of provider delivery: until a restored actor
 /// supplies exact run evidence, never authorize a resend. With every earlier
