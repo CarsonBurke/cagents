@@ -10037,6 +10037,33 @@ struct ProjectMenus<'a> {
     device: Option<&'a str>,
 }
 
+/// The commands a device window's menu offers for a project row
+/// (`worktree_id` `None`) or a checkout row, alone or as one of several
+/// selected rows. The app checks that its device routing runs every one.
+pub fn device_menu_commands(
+    project_id: ProjectId,
+    worktree_id: Option<WorktreeId>,
+    device: &str,
+) -> Vec<ProjectCommand> {
+    [None, Some(2)]
+        .into_iter()
+        .flat_map(|selection_count| {
+            project_menu_commands(
+                project_id,
+                worktree_id,
+                true,
+                true,
+                ProjectMenus {
+                    editors: &[],
+                    device: Some(device),
+                },
+                selection_count,
+            )
+        })
+        .map(|(_, _, command)| command)
+        .collect()
+}
+
 /// The commands a project or checkout row's menu lists, before grouping.
 /// A device window lists only what runs on the device, and says where: its
 /// files open in cagents' own browser, and the commands that need this
