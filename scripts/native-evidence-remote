@@ -67,8 +67,11 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
                   HOST, as it does for both sides of a pair.
   shot NAME [--lossless]
                   Capture on HOST and bring back shots/SIDE-NAME.webp;
-                  --lossless keeps every pixel.
-  fetch           Bring back every shot and the manifest.
+                  --lossless keeps every pixel. Exits 4 when that shot was
+                  edited here and so kept; the capture is in raw/.
+  fetch           Bring back every shot and the manifest. The host's copies
+                  go to DIR/raw/; a shot in DIR/shots/ edited since it was
+                  brought back is kept, never overwritten.
   where           Print the task and checkouts on HOST.
   clean           Remove the task's session, checkouts, refs and directory
                   from HOST; the shots here are kept.
@@ -487,15 +490,21 @@ receive_shots() {
     ' >"$archive"
 }
 
-# Brings back the task's shots directory, manifest included.
+# Brings back the task's shots directory, manifest included. The host's
+# copies land in raw/; one in shots/ is replaced only while it is missing or
+# still what was last brought back, so a shot edited here, such as one with an
+# address masked out, is never overwritten by its original.
 fetch_shots() (
     archive=$(mktemp -- "$task/.shots.XXXXXXXX")
-    trap 'rm -f -- "$archive"' EXIT
+    incoming=$(mktemp -d -- "$task/.incoming.XXXXXXXX")
+    trap 'rm -rf -- "$archive" "$incoming"' EXIT
     retry_transfer '124 255' 'screenshot download' receive_shots "$archive" ||
         die "could not bring back the shots from $host"
     # Nothing comes back from a host with no shots yet.
     if [ -s "$archive" ]; then
-        "${client[@]}" local tar -C "$task/shots" -xf "$archive"
+        "${client[@]}" local tar -C "$incoming" -xf "$archive"
+        /usr/bin/python3 -I "$tool_root/scripts/native-evidence-shots.py" deliver "$task" "$incoming" ||
+            die "could not keep the shots brought back from $host"
     fi
 )
 
@@ -705,6 +714,8 @@ case $command in
         side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
         if [ -n "$side" ]; then
             printf '%s\n' "$task/shots/$side-$1.webp"
+            # Status 4: the path holds a shot edited here, not this capture.
+            cmp -s -- "$task/shots/$side-$1.webp" "$task/raw/$side-$1.webp" || exit 4
         else
             printf '%s\n' "$task/shots"
         fi

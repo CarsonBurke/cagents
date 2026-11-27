@@ -121,7 +121,8 @@ STUBS = {
         fi
         if [ -n "${shot:-}" ]; then
             mkdir -p "$STUB_TASK/niri/shots"
-            printf png > "$STUB_TASK/niri/shots/$shot.png"
+            if [ -e "$STUB_LOG/shot-text" ]; then cp "$STUB_LOG/shot-text" "$STUB_TASK/niri/shots/$shot.png"
+            else printf png > "$STUB_TASK/niri/shots/$shot.png"; fi
         fi
     """,
     "niri": """
@@ -153,8 +154,16 @@ STUBS = {
     "magick": """
         #!/bin/bash
         if [ "$1" = identify ]; then printf '1500x900'; exit 0; fi
+        # The privacy check's scaling for OCR, to its standard output.
+        if [ "${@: -1}" = png:- ]; then exec cat "$1"; fi
         printf '%s\\n' "$*" >> "$STUB_LOG/magick"
         cp "$1" "${@: -1}"
+    """,
+    # Reads an image's bytes as its text, as OCR would read the words on it.
+    "tesseract": """
+        #!/bin/sh
+        if [ "$1" = --list-langs ]; then printf 'List of available languages (1):\\neng\\n'; exit 0; fi
+        exec cat
     """,
     "rustup": """
         #!/bin/sh
@@ -328,6 +337,8 @@ class Evidence(unittest.TestCase):
             )]),
             "HOME": str(self.root / "real-home"),
             "STUB_LOG": str(self.logs),
+            # The shot-time identity check reads no real account registry.
+            "CAGENTS_SCREENSHOT_CAGENTS": "/bin/false",
             "STUB_BIN": str(self.bin),
             "STUB_TASK": str(self.task),
             "CLAUDE_CONFIG_DIR": "/must/not/reach/the/fixture",
@@ -1756,6 +1767,28 @@ class Evidence(unittest.TestCase):
         self.assertIn("-define webp:lossless=true",
                       (self.logs / "magick").read_text().splitlines()[-1])
         self.assertIn("after-edges.webp", (self.task / "shots" / "manifest.tsv").read_text())
+        # A shot edited here, as one with an address masked out is, outlives a
+        # retake; the new capture waits in raw/.
+        masked = self.task / "shots" / "after-empty-state.webp"
+        masked.write_text("masked")
+        (self.logs / "shot-text").write_text("Signed in as someone@example.com")
+        retake = self.run_tool("shot", "empty-state", check=False)
+        # The path it prints holds the edited shot, which its status says.
+        self.assertEqual(retake.returncode, 4, retake.stderr)
+        self.assertEqual(retake.stdout.strip(), str(masked))
+        self.assertEqual(masked.read_text(), "masked")
+        self.assertEqual((self.task / "raw" / "after-empty-state.webp").read_text(),
+                         "Signed in as someone@example.com")
+        self.assertIn(f"kept {masked}, which changed after it was delivered", retake.stderr)
+        # This host's OCR gives early word of the address, masked in the report.
+        self.assertIn("shows an email address (s…e@e…e.com)", retake.stderr)
+        self.assertNotIn("someone@", retake.stderr)
+        # An unedited shot follows its retake, and a fixture address is no identity.
+        (self.logs / "shot-text").write_text("Signed in as fixture@example.test")
+        retake = self.run_tool("shot", "edges", "--lossless")
+        self.assertEqual((self.task / "shots" / "after-edges.webp").read_text(), "Signed in as fixture@example.test")
+        self.assertNotIn("kept", retake.stderr)
+        self.assertNotIn("shows", retake.stderr)
         self.assertEqual(self.run_tool("shot", "edges", "--lossy", check=False).returncode, 2)
         self.assertEqual(
             self.run_tool("shot", "edges", "--lossless", "extra", check=False).returncode, 2)
@@ -3273,6 +3306,54 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-edges.webp"))
         self.assertEqual((self.remote_task / "shot-arguments").read_text().strip(),
                          "shot edges --lossless")
+
+    def test_a_shot_edited_here_is_never_overwritten_by_a_later_fetch(self) -> None:
+        checkout = self.checkout("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        self.run_tool("shot", "home")
+        local = self.task / "shots" / "after-home.webp"
+        self.assertEqual((self.task / "raw" / "after-home.webp").read_text(), "webp")
+        # Masked here, as an account's address would be before publishing.
+        local.write_text("masked")
+        for fetch in (("shot", "other"), ("fetch",), ("stop",), ("fetch",)):
+            result = self.run_tool(*fetch)
+            self.assertEqual(local.read_text(), "masked", fetch)
+            # Nothing new came for it, so there is nothing to say.
+            self.assertNotIn("kept", result.stderr)
+        self.assertEqual((self.task / "shots" / "after-other.webp").read_text(), "webp")
+        # Retaken, the path printed holds the edited shot, which its status says.
+        self.run_tool("start", "after")
+        (self.remote_task / "shots" / "after-home.webp").unlink()
+        retake = self.run_tool("shot", "home", check=False)
+        self.assertEqual(retake.returncode, 4, retake.stderr)
+        self.assertEqual(retake.stdout.strip(), str(local))
+        self.assertEqual(local.read_text(), "masked")
+        self.run_tool("stop")
+        # A retake on the host waits in raw/ beside the edited shot.
+        (self.remote_task / "shots" / "after-home.webp").write_text("retaken")
+        result = self.run_tool("fetch")
+        self.assertIn(f"kept {local}, which changed after it was delivered; the new capture is "
+                      f"{self.task}/raw/after-home.webp", result.stderr)
+        self.assertEqual(local.read_text(), "masked")
+        self.assertEqual((self.task / "raw" / "after-home.webp").read_text(), "retaken")
+        # One left as it was delivered follows its retake, as does the manifest.
+        (self.remote_task / "shots" / "after-other.webp").write_text("retaken")
+        self.run_tool("fetch")
+        self.assertEqual((self.task / "shots" / "after-other.webp").read_text(), "retaken")
+        self.assertEqual((self.task / "shots" / "manifest.tsv").read_text(),
+                         (self.remote_task / "shots" / "manifest.tsv").read_text())
+        # A shot from before originals were kept, unlike the host's, stays too.
+        (self.task / "raw" / "after-other.webp").unlink()
+        (self.task / "shots" / "after-other.webp").write_text("older")
+        self.run_tool("fetch")
+        self.assertEqual((self.task / "shots" / "after-other.webp").read_text(), "older")
+        # And so does an edited one through a whole comparison.
+        steps = self.root / "steps.sh"
+        steps.write_text('evidence shot home\n')
+        self.run_tool("pair", "--before", str(checkout), "--after", str(checkout), "--steps", str(steps))
+        self.assertEqual(local.read_text(), "masked")
+        self.assertEqual((self.task / "shots" / "before-home.webp").read_text(), "webp")
 
     def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
         checkout = self.checkout("after", {"src.rs": "\n"})

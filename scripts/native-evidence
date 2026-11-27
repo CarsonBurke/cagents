@@ -116,6 +116,8 @@ both use the same fixture data and selected providers.
                   session's portal reports to the app.
   shot NAME [--lossless]
                   Capture shots/SIDE-NAME.webp and record its source revision.
+                  The capture also goes to raw/; a shot edited since the last
+                  capture is kept, the new one waits in raw/, and shot exits 4.
                   --lossless keeps every pixel, for comparing edges, borders
                   and fades pixel by pixel; the default is smaller and lossy.
   open-window SLOT
@@ -1607,16 +1609,30 @@ if w > width + 2 or h > height + 2:
 ' <<<"$observed"
         timeout -k 5 60 niri-harness --no-heal --session "$session_name" shot "$side-$name" >/dev/null
     )
-    local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv"
-    magick "$harness_root/shots/$side-$name.png" "${encoding[@]}" "$webp"
+    local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv" incoming
+    # The capture lands in raw/ and replaces the shot only while that is
+    # missing or still the last capture, so a retake never overwrites a shot
+    # edited since, such as one with an address masked out.
+    incoming=$(mktemp -d -- "$task/.incoming.XXXXXXXX")
+    if ! magick "$harness_root/shots/$side-$name.png" "${encoding[@]}" "$incoming/$side-$name.webp" ||
+        ! /usr/bin/python3 -I "$tool_root/scripts/native-evidence-shots.py" deliver "$task" "$incoming"; then
+        rm -rf -- "$incoming"
+        die "could not save the shot $side-$name"
+    fi
+    rm -rf -- "$incoming"
     # A retake replaces its row, so each image has one record of its source.
     {
         grep -vF -- "$side-$name.webp"$'\t' "$manifest" 2>/dev/null || true
         printf '%s\t%s\t%s\t%s\t%s\n' "$side-$name.webp" "$built_revision" "$built_tree" \
-            "$(cat "$state/width")" "$(magick identify -format '%wx%h' "$webp")"
+            "$(cat "$state/width")" "$(magick identify -format '%wx%h' "$task/raw/$side-$name.webp")"
     } >"$manifest.new"
     mv -- "$manifest.new" "$manifest"
+    # Early word of an identity in the capture, from this host's OCR; the
+    # check that refuses it is the one before publishing.
+    /usr/bin/python3 -I "$tool_root/scripts/pr-screenshots" scan --warn "$task/raw/$side-$name.webp" >&2 || true
     printf '%s\n' "$webp"
+    # Status 4: the path holds the edited shot, not this capture.
+    cmp -s -- "$webp" "$task/raw/$side-$name.webp" || return 4
 }
 
 cmd_stop() {
