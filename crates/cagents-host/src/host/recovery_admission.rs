@@ -114,6 +114,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReadExitedQueuePage { .. }
         | R::ChatReadExitedQueue { .. }
         | R::ChatCommitExitedQueue { .. }
+        | R::ReadChatClose { .. }
+        | R::AcknowledgeChatClose { .. }
         // Device links name no hosted process.
         | R::DeviceTrust { .. }
         | R::PeerChallenge
@@ -128,7 +130,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::ChatClose { chat_id } => Access::Close(Some(*chat_id)),
         R::CloseTerminalChecked { terminal_id, .. } => Access::Close(Some(*terminal_id)),
         R::CloseTerminalSource { session, .. } => Access::Close(Some(session.id)),
-        R::ChatCloseRetained { session } => Access::Close(Some(session.id)),
+        R::ChatCloseRetained { session } | R::BeginChatClose { session, .. } => Access::Close(Some(session.id)),
         R::Shutdown | R::ShutdownV1 { .. } => Access::Shutdown,
         R::ChatStart {
             session,

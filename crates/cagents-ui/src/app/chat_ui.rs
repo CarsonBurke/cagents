@@ -451,6 +451,12 @@ pub enum Action {
     /// stopped holding it: a closed card, an abandoned start, or a start that
     /// finished for a card which could no longer hold it.
     Retired(Target, Result<(), String>),
+    ChatCloseAccepted(Target, background_close::CloseHandoff),
+    ChatCloseOutcome(
+        Target,
+        uuid::Uuid,
+        Result<crate::terminal::ipc::ChatCloseOutcome, String>,
+    ),
     /// A chat card with no daemon handoff to take has given up its actor, so
     /// a terminal can take its place.
     ReturnedLocally(Target, Result<(), ReturnRefused>),
@@ -1064,6 +1070,8 @@ impl Action {
             Self::ResumeCommitted(..) => "ResumeCommitted",
             Self::RetainedCopyCommitted(..) => "RetainedCopyCommitted",
             Self::Retired(..) => "Retired",
+            Self::ChatCloseAccepted(..) => "ChatCloseAccepted",
+            Self::ChatCloseOutcome(..) => "ChatCloseOutcome",
             Self::ReturnedLocally(..) => "ReturnedLocally",
             Self::Wake(..) => "Wake",
             Self::OpeningName(..) => "OpeningName",
@@ -1310,6 +1318,8 @@ impl Action {
                 | Self::UnnamedAgentRunning(..)
                 | Self::UnnamedAgentEnded(..)
                 | Self::Retired(..)
+                | Self::ChatCloseAccepted(..)
+                | Self::ChatCloseOutcome(..)
                 | Self::DispatchQueued(..)
                 | Self::ClearCopied(..)
                 | Self::DisarmInterrupt(..)
@@ -1888,6 +1898,12 @@ impl State {
     /// replaces the daemon or the process hearing its answer waits for it.
     pub(super) fn closing_in_background(&self) -> bool {
         !self.background_closes.is_empty()
+    }
+
+    pub(super) fn close_handoffs_pending(&self) -> bool {
+        self.background_closes
+            .values()
+            .any(|closing| closing.awaiting_acceptance)
     }
 
     fn attempt(&self, card: CardId) -> Option<&Attempt> {
@@ -12571,8 +12587,7 @@ impl Cagents {
     /// Closes a chat card, in whatever state its conversation is.
     ///
     /// The card leaves at once. What the conversation holds in the daemon is
-    /// given up in the background: through the live connection when there is
-    /// one, otherwise by identity against the daemon's inventory, and for a
+    /// given up by the daemon using the captured conversation, and for a
     /// start or restart still in flight, when that request answers. Nothing a
     /// conversation can be doing - never started, connecting, failed,
     /// disconnected, or live - keeps its card on screen.
@@ -12676,14 +12691,14 @@ impl Cagents {
         // drops the surface. In-flight operations move to the detached ledger
         // only after commit succeeds, and retire when their own answer lands.
         let pending = self.chat_ui.phases.contains_key(&card);
-        let handle = match self.cards.get(&card) {
-            Some(CardRuntime::Chat(runtime)) if runtime.connected() => runtime
-                .handle()
-                .filter(|handle| !handle.snapshot().exited)
-                .cloned(),
-            _ => None,
-        };
         if !pending && self.chat_ui.close_refused.contains(&session.id) {
+            let handle = match self.cards.get(&card) {
+                Some(CardRuntime::Chat(runtime)) if runtime.connected() => runtime
+                    .handle()
+                    .filter(|handle| !handle.snapshot().exited)
+                    .cloned(),
+                _ => None,
+            };
             let target = self.chat_ui.next_target(card);
             self.chat_ui.phases.insert(
                 card,
@@ -12715,7 +12730,7 @@ impl Cagents {
         let retire = if pending {
             Task::none()
         } else {
-            self.close_chat_in_background(card, handle, session, title.unwrap_or_default())
+            self.close_chat_in_background(card, session, title.unwrap_or_default())
         };
         Task::batch([retire, remove])
     }
@@ -16429,6 +16444,12 @@ impl Cagents {
                         ]);
                     }
                 }
+            }
+            Action::ChatCloseAccepted(target, handoff) => {
+                return self.background_close_accepted(target, handoff);
+            }
+            Action::ChatCloseOutcome(target, receipt, outcome) => {
+                return self.background_close_outcome(target, receipt, outcome);
             }
             Action::Retired(target, result) => {
                 if self.chat_ui.background_closes.contains_key(&target) {

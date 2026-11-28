@@ -38,19 +38,33 @@ pub(super) fn close_sessions_sparing_agents(sessions: Vec<CardKind>) -> Result<(
 /// Fresh can be attempted again; inventory alone cannot authorize that change.
 pub(super) fn close_captured_chat(source: crate::chat::Session) -> Result<(), String> {
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let Some(mut client) = connect(&socket)? else {
-        return no_daemon_captured_close_result(&source);
+    let Some(mut client) = connect_for_chat_close(&socket, &source)? else {
+        return Ok(());
     };
     close_captured_chat_with(&mut client, &source)
 }
 
+pub(super) fn connect_for_chat_close(
+    socket: &std::path::Path,
+    source: &crate::chat::Session,
+) -> Result<Option<crate::control::ControlClient>, String> {
+    let client = connect(socket)?;
+    if client.is_none() {
+        no_daemon_captured_close_result(source)?;
+    }
+    Ok(client)
+}
+
 fn no_daemon_captured_close_result(source: &crate::chat::Session) -> Result<(), String> {
-    if source.terminal.is_some() {
+    if source.terminal.is_some()
+        || source.owned_codex_listener.is_some()
+        || source.native_continuity.retains_provider()
+    {
         return Err(
             "Reconnect the daemon to confirm the retained native provider has stopped".into(),
         );
     }
-    no_daemon_close_result(&[CardKind::Chat(source.clone())])
+    Ok(())
 }
 
 fn close_captured_chat_with(
@@ -5414,6 +5428,22 @@ pub(in crate::app) mod close_tests {
             },
         }));
         source
+    }
+
+    #[test]
+    fn pane_close_without_a_daemon_only_settles_an_unretained_chat() {
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("daemon.sock");
+        let mut source = captured_source();
+        assert!(connect_for_chat_close(&socket, &source).unwrap().is_none());
+        source.native_continuity = crate::chat::NativeContinuity::Durable {
+            provider_version: "fixture".into(),
+        };
+        assert!(connect_for_chat_close(&socket, &source).is_err());
+        source.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(connect_for_chat_close(&socket, &source).is_err());
+        assert!(connect_for_chat_close(&socket, &paired_source()).is_err());
     }
 
     #[test]

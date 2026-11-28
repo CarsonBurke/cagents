@@ -1,15 +1,7 @@
-//! Closing a chat takes its pane away at once. Stopping the conversation, which
-//! the daemon does by asking its provider to end and proving it gone, belongs
-//! to a job the pane does not wait for: the job holds what the pane closed and
-//! answers for it when the daemon does.
-//!
-//! The window saves each close until the daemon has answered it, so a close
-//! the window did not stay to hear is asked again on its next launch, and a
-//! refusal is still reported then. A close the daemon refuses leaves the
-//! conversation running with no pane, so the refusal is reported with a way
-//! back to it. Its next close is the reader's attempt to deal with what held
-//! it, and so waits on its pane, where a second refusal is shown beside
-//! whatever it can end.
+//! A closing pane leaves immediately. The daemon stops the provider and keeps
+//! its result even if the window leaves once its handoff is accepted. A
+//! refusal leaves the conversation running and offers a way back to it. Its
+//! next close waits on its pane so a second refusal can show what it can end.
 //!
 //! A conversation reopened while it is stopping gets its pane at once, which
 //! waits to attach until the stop settles, so no pane starts or attaches to a
@@ -23,6 +15,11 @@
 use super::*;
 use crate::model::StoppingChat;
 use crate::persistence::SavedConversation;
+use crate::{
+    control::{ControlClient, ControlError},
+    terminal::ipc::ChatCloseOutcome,
+};
+use uuid::Uuid;
 
 /// A conversation stopping in the background after its pane closed.
 #[derive(Debug)]
@@ -31,10 +28,20 @@ pub(in crate::app) struct Closing {
     card: CardId,
     /// The conversation as its pane closed.
     session: chat::Session,
+    receipt: Option<Uuid>,
+    pub(super) awaiting_acceptance: bool,
     /// Panes that hold it again while it stops: reopens of it, and the
     /// closed pane itself when a shared view kept it. Each waits in its
     /// place, unattached, until the stop settles.
     reopens: Vec<CardId>,
+}
+
+#[derive(Debug, Clone)]
+pub enum CloseHandoff {
+    AlreadyStopped,
+    Accepted,
+    Refused(String),
+    Uncertain,
 }
 
 pub(super) enum SharedChatClose {
@@ -118,33 +125,77 @@ impl Cagents {
     pub(super) fn close_chat_in_background(
         &mut self,
         card: CardId,
-        handle: Option<Arc<ClientHandle>>,
         session: chat::Session,
         title: String,
     ) -> Task<Message> {
         let target = self.chat_ui.next_target(card);
+        let receipt = Uuid::new_v4();
         self.chat_ui.background_closes.insert(
             target,
             Closing {
                 card,
                 session: session.clone(),
+                receipt: Some(receipt),
+                awaiting_acceptance: true,
                 reopens: Vec::new(),
             },
         );
-        // Saved before anything is sent, so a window that closes before the
-        // daemon answers still asks again, and reports, on its next launch.
+        // Save the receipt before handing off. Even if the acknowledgement
+        // is lost, the next window reads this receipt without issuing a stop.
         let stopping = &mut Arc::make_mut(&mut self.durable).stopping_chats;
         stopping.retain(|stopping| stopping.session.id != session.id);
         stopping.push(StoppingChat {
             session: session.clone(),
             card,
             title,
+            close_receipt: Some(receipt),
             refused: None,
             dismissed: false,
             stopped: false,
         });
         self.persist();
-        ask_to_stop(target, handle, session, false)
+        self.hand_off_close(target, receipt, session, false)
+    }
+
+    fn hand_off_close(
+        &self,
+        target: Target,
+        receipt: Uuid,
+        session: chat::Session,
+        at_launch: bool,
+    ) -> Task<Message> {
+        let flush = self.session.as_ref().map(|writer| writer.request_flush());
+        cosmic::task::future(async move {
+            let handoff = close_observer(move || {
+                // Once accepted, even a process crash must leave the next
+                // window enough information to read the daemon's receipt.
+                if let Some(flush) = flush {
+                    flush?
+                        .recv_timeout(Duration::from_secs(20))
+                        .map_err(|error| error.to_string())??;
+                }
+                if at_launch {
+                    crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+                }
+                let socket = crate::terminal::ipc::daemon_socket_path()
+                    .map_err(|error| error.to_string())?;
+                let Some(mut client) =
+                    crate::app::channel_ui::connect_for_chat_close(&socket, &session)?
+                else {
+                    return Ok(CloseHandoff::AlreadyStopped);
+                };
+                Ok(match client.begin_chat_close(receipt, session) {
+                    Ok(()) => CloseHandoff::Accepted,
+                    Err(error @ ControlError::Remote { .. }) => {
+                        CloseHandoff::Refused(error.reason())
+                    }
+                    Err(_) => CloseHandoff::Uncertain,
+                })
+            })
+            .await
+            .unwrap_or_else(CloseHandoff::Refused);
+            Message::ChatUi(Action::ChatCloseAccepted(target, handoff))
+        })
     }
 
     /// Whether the pane `card`, restoring `session`, waits for
@@ -170,8 +221,8 @@ impl Cagents {
             .any(|stopped| stopped.id == id)
     }
 
-    /// Asks again to stop each chat the last window closed without hearing
-    /// the daemon's answer, and puts back the refusals it had heard. A pane
+    /// Reads outstanding receipts and puts back refusals already presented
+    /// by the last window. A pending pre-receipt save is submitted once. A pane
     /// that reopened one before that window closed waits for the answer, as
     /// it did then, or goes back to the conversation still running. A closed
     /// pane a shared view put back after its conversation stopped goes, with
@@ -249,22 +300,138 @@ impl Cagents {
             if reopens.contains(&stopping.card) {
                 self.chat_ui.hidden_returns.insert(stopping.card);
             }
+            let submit = !stopping.stopped && stopping.close_receipt.is_none();
+            let receipt = if submit {
+                let receipt = Uuid::new_v4();
+                if let Some(saved) = Arc::make_mut(&mut self.durable)
+                    .stopping_chats
+                    .iter_mut()
+                    .find(|saved| saved.session.id == id)
+                {
+                    saved.close_receipt = Some(receipt);
+                }
+                self.persist();
+                Some(receipt)
+            } else {
+                stopping.close_receipt
+            };
             self.chat_ui.background_closes.insert(
                 target,
                 Closing {
                     card: stopping.card,
                     session: stopping.session.clone(),
+                    receipt,
+                    awaiting_acceptance: submit,
                     reopens,
                 },
             );
-            tasks.push(if stopping.stopped {
-                self.background_close_finished(target, Ok(()))
-            } else {
-                ask_to_stop(target, None, stopping.session, true)
+            tasks.push(match receipt {
+                Some(receipt) if submit => {
+                    self.hand_off_close(target, receipt, stopping.session, true)
+                }
+                Some(receipt) => read_close(target, receipt, true, Duration::ZERO),
+                None => self.background_close_finished(target, Ok(())),
             });
         }
         tasks.push(self.hide_returned_closes());
         Task::batch(tasks)
+    }
+
+    pub(super) fn background_close_accepted(
+        &mut self,
+        target: Target,
+        handoff: CloseHandoff,
+    ) -> Task<Message> {
+        let Some(closing) = self.chat_ui.background_closes.get_mut(&target) else {
+            return Task::none();
+        };
+        closing.awaiting_acceptance = false;
+        let receipt = closing.receipt.expect("submitted close has a receipt");
+        match handoff {
+            CloseHandoff::AlreadyStopped => return self.background_close_finished(target, Ok(())),
+            CloseHandoff::Refused(reason) => {
+                return self.background_close_finished(target, Err(reason));
+            }
+            CloseHandoff::Accepted | CloseHandoff::Uncertain => {}
+        }
+        if self.exit.is_some() {
+            return self.finish_close_handoffs_for_exit();
+        }
+        read_close(target, receipt, false, Duration::ZERO)
+    }
+
+    fn finish_close_handoffs_for_exit(&mut self) -> Task<Message> {
+        if !self.chat_ui.close_handoffs_pending() {
+            return self.advance_exit(|exit| exit.chats_closed = true);
+        }
+        Task::none()
+    }
+
+    pub(super) fn background_close_outcome(
+        &mut self,
+        target: Target,
+        receipt: Uuid,
+        outcome: Result<ChatCloseOutcome, String>,
+    ) -> Task<Message> {
+        if !self
+            .chat_ui
+            .background_closes
+            .get(&target)
+            .is_some_and(|closing| closing.receipt == Some(receipt))
+        {
+            return Task::none();
+        }
+
+        let result = match outcome {
+            Ok(ChatCloseOutcome::Finished(result)) => result,
+            Ok(ChatCloseOutcome::Missing) => {
+                return self.background_close_finished(
+                    target,
+                    Err("The daemon has no receipt confirming it accepted this stop.".into()),
+                );
+            }
+            Ok(ChatCloseOutcome::Pending) => {
+                return if self.exit.is_none() {
+                    read_close(target, receipt, false, Duration::ZERO)
+                } else {
+                    Task::none()
+                };
+            }
+            Err(error) => {
+                tracing::warn!(%error, "could not read the outcome of a closed chat");
+                return if self.exit.is_none() {
+                    read_close(target, receipt, true, Duration::from_secs(5))
+                } else {
+                    Task::none()
+                };
+            }
+        };
+        let apply = self.background_close_finished(target, result);
+        let Some(flush) = self
+            .session
+            .as_ref()
+            .and_then(|writer| writer.request_flush().ok())
+        else {
+            return apply;
+        };
+        // An accepted close's projection must survive a window exit before the
+        // daemon can forget the receipt. A failed flush leaves it readable.
+        let acknowledge = iced::Task::future(async move {
+            let result = close_observer(move || {
+                flush
+                    .recv_timeout(Duration::from_secs(20))
+                    .map_err(|error| error.to_string())??;
+                connect_close_daemon(false)?
+                    .acknowledge_chat_close(receipt)
+                    .map_err(|error| error.reason())
+            })
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(%error, "could not acknowledge the saved chat close outcome");
+            }
+        })
+        .discard();
+        Task::batch([apply, acknowledge])
     }
 
     /// The daemon's answer to a background close.
@@ -285,6 +452,13 @@ impl Cagents {
         let fenced_gives_way =
             result.is_err() && returned && self.shared_views.quarantined.contains(&closing.card);
         let durable = Arc::make_mut(&mut self.durable);
+        if let Some(stopping) = durable
+            .stopping_chats
+            .iter_mut()
+            .find(|saved| saved.session.id == id)
+        {
+            stopping.close_receipt = None;
+        }
         let refused = match result {
             Ok(()) => {
                 self.chat_ui.close_refused.remove(&id);
@@ -326,10 +500,7 @@ impl Cagents {
         if self.exit.is_some() {
             // Nothing reopens on the way out. A refusal heard now is saved,
             // and reported when the window next opens.
-            if self.chat_ui.background_closes.is_empty() {
-                return self.advance_exit(|exit| exit.chats_closed = true);
-            }
-            return Task::none();
+            return self.finish_close_handoffs_for_exit();
         }
         let mut tasks = Vec::new();
         // The closed pane itself first: a refused stop puts it back on what
@@ -728,6 +899,7 @@ impl Cagents {
                 session: session.clone(),
                 card,
                 title,
+                close_receipt: None,
                 refused: None,
                 dismissed: false,
                 stopped: true,
@@ -1263,27 +1435,41 @@ impl Cagents {
     }
 }
 
-/// Sends the daemon a closed chat's stop, answered by `Action::Retired`. One
-/// asked again at launch first brings up the daemon the launch would start
-/// anyway, so its absence is not taken for a refusal.
-fn ask_to_stop(
-    target: Target,
-    handle: Option<Arc<ClientHandle>>,
-    session: chat::Session,
-    at_launch: bool,
-) -> Task<Message> {
+fn connect_close_daemon(ensure_ready: bool) -> Result<ControlClient, String> {
+    if ensure_ready {
+        crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
+    ControlClient::connect(&socket).map_err(|error| error.to_string())
+}
+
+fn read_close(target: Target, receipt: Uuid, ensure_ready: bool, delay: Duration) -> Task<Message> {
     cosmic::task::future(async move {
-        let result = tokio::task::spawn_blocking(move || {
-            if at_launch {
-                crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
-            }
-            close_conversation(handle, Some(session))
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        let outcome = close_observer(move || {
+            connect_close_daemon(ensure_ready)?
+                .read_chat_close(receipt)
+                .map_err(|error| error.reason())
         })
-        .await
-        .map_err(|error| error.to_string())
-        .and_then(|result| result);
-        Message::ChatUi(Action::Retired(target, result))
+        .await;
+        Message::ChatUi(Action::ChatCloseOutcome(target, receipt, outcome))
     })
+}
+
+/// A pending read or flush must never keep the window's async runtime alive.
+async fn close_observer<T: Send + 'static>(
+    observe: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    let (reply, received) = tokio::sync::oneshot::channel();
+    std::thread::Builder::new()
+        .name("chat-close-receipt".into())
+        .spawn(move || {
+            let _ = reply.send(observe());
+        })
+        .map_err(|error| error.to_string())?;
+    received.await.map_err(|error| error.to_string())?
 }
 
 /// What a refused close's notice says.

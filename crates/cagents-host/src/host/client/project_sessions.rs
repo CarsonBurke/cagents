@@ -250,7 +250,8 @@ fn close_owned(
             session: session.clone(),
             basis,
         };
-        let result = super::process_admitted_request(host, client_id, request, Some(shared), true);
+        let result =
+            super::process_admitted_request(host, client_id, request, Some(shared), true, None);
         let error = match result {
             Ok((
                 ServerResponse::TerminalCloseChecked {

@@ -417,9 +417,9 @@ pub struct TerminalExit {
     pub occurred_at_unix_ms: i64,
 }
 
-/// A chat whose pane closed before the daemon said its conversation stopped,
-/// or whose stop the daemon refused. It is saved so that what happened is
-/// still reported when the window closed first.
+/// The window's presentation of a chat whose pane closed. A pending close
+/// names a daemon receipt; settled entries keep existing notice and shared
+/// pane removal state.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StoppingChat {
     /// The conversation as its pane closed.
@@ -429,6 +429,10 @@ pub struct StoppingChat {
     /// What its pane was called, to name it if it can't be stopped.
     #[serde(default)]
     pub title: String,
+    /// Receipt to read when the daemon accepted or may have accepted the stop.
+    /// Legacy saves have no receipt and submit the outstanding close once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub close_receipt: Option<uuid::Uuid>,
     /// Why the daemon refused to stop it. `None` while its answer is still
     /// to come.
     #[serde(default)]

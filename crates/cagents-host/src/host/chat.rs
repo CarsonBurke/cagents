@@ -3,6 +3,7 @@ use super::state::{ClientId, HostLock, HostState, SharedHost};
 mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
+pub(super) mod background_close;
 pub(super) mod capacity;
 mod codex_owners;
 pub(super) mod codex_reconnect;

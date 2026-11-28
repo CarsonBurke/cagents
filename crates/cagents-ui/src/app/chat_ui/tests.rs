@@ -14090,7 +14090,9 @@ fn a_shared_pane_admitted_while_its_stop_is_asked_again_waits_for_it() {
     next.workspace = Cagents::rebuild_workspace(&next.durable);
     next.await_shared_chat_admission(card, session.clone());
     drop(next.resume_stopping_chats());
-    let target = next.background_close_for_test(card).expect("asked again");
+    let target = next
+        .background_close_for_test(card)
+        .expect("receipt is read");
     drop(next.admit_shared_chat(&original));
     assert!(
         next.chat_ui.attempt(card).is_none(),
@@ -27259,65 +27261,58 @@ fn a_reopen_waiting_on_a_refused_close_attaches_to_what_still_runs() {
     );
 }
 
-/// Closing the window does not wait for a chat closed just before it. The
-/// exit waits only as long as it would for its window; what it does not stay
-/// to hear is saved, asked again at the next launch, and a refusal it does
-/// hear is reported then.
+/// Once the daemon has accepted the close, window exit can proceed while
+/// the provider is still stopping. The next window reads the same receipt.
 #[test]
 fn a_close_the_exit_does_not_hear_is_reported_at_the_next_launch() {
-    for answer in [
-        None,
-        Some(Ok(())),
-        Some(Err("Codex is still running.".to_owned())),
-    ] {
+    for acknowledged in [false, true] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let source = app.chat_return_session(card).unwrap();
         let _ = app.update(Message::CloseCard(card));
         let target = retired(&mut app, card);
+        let receipt = app.durable.stopping_chats[0].close_receipt.unwrap();
         let window = window::Id::unique();
         app.core.set_main_window_id(Some(window));
         let _ = app.update(Message::WindowCloseRequested(window));
-        assert!(app.exit.is_some(), "the window closes at once");
         let _ = app.update(Message::WindowClosed(window));
         let _ = app.update(Message::LanguageServersReaped);
         assert!(!app.exit.unwrap().is_complete());
 
-        let _ = app.update(match answer.clone() {
-            Some(result) => Message::ChatUi(Action::Retired(target, result)),
-            None => Message::ExitChatClosesTimedOut,
+        let _ = app.update(if acknowledged {
+            Message::ChatUi(Action::ChatCloseAccepted(
+                target,
+                background_close::CloseHandoff::Accepted,
+            ))
+        } else {
+            Message::ExitChatClosesTimedOut
         });
         assert!(app.exit.unwrap().is_complete());
-        let saved = app.persistent_workspace().stopping_chats.clone();
-        assert_eq!(saved, app.durable.stopping_chats);
+        assert!(
+            app.chat_ui.closing_in_background(),
+            "the stop has yet to settle"
+        );
 
-        // The next launch, from what was saved.
         let mut next = crate::app::tests::context_inspector_test_app(false);
-        Arc::make_mut(&mut next.durable).stopping_chats = saved;
+        next.durable = app.persistent_workspace();
         let task = next.resume_stopping_chats();
-        match answer {
-            None => {
-                assert!(task.units() > 0, "it asks again");
-                assert!(next.chat_ui.closing_in_background());
-                assert!(!next.has_close_failure_notices());
-                let target = *next.chat_ui.background_closes.keys().next().unwrap();
-                let _ = next.update(Message::ChatUi(Action::Retired(
-                    target,
-                    Err("Codex is still running.".into()),
-                )));
-                assert!(next.has_close_failure_notices());
-            }
-            Some(Ok(())) => {
-                assert!(next.durable.stopping_chats.is_empty());
-                assert!(!next.chat_ui.closing_in_background());
-                assert!(!next.has_close_failure_notices());
-            }
-            Some(Err(_)) => {
-                assert!(!next.chat_ui.closing_in_background(), "nothing to ask");
-                assert!(next.has_close_failure_notices());
-                assert!(next.chat_ui.close_refused.contains(&source.id));
-            }
-        }
+        assert!(task.units() > 0, "the persisted receipt is read");
+        assert!(
+            !next.chat_ui.close_handoffs_pending(),
+            "no new stop is submitted"
+        );
+        assert!(!next.has_close_failure_notices());
+        let target = next.background_close_for_test(card).unwrap();
+        let _ = next.update(Message::ChatUi(Action::ChatCloseOutcome(
+            target,
+            receipt,
+            Ok(crate::terminal::ipc::ChatCloseOutcome::Finished(Err(
+                "Codex is still running.".into(),
+            ))),
+        )));
+        assert!(next.has_close_failure_notices());
+        assert!(next.chat_ui.close_refused.contains(&source.id));
+        assert_eq!(next.durable.stopping_chats[0].close_receipt, None);
     }
 }
 
@@ -27355,7 +27350,9 @@ fn a_closed_pane_a_view_brings_back_at_the_next_launch_goes_again() {
             let _ = came_back(&mut next);
         }
         let _ = next.resume_stopping_chats();
-        let target = next.background_close_for_test(card).expect("asked again");
+        let target = next
+            .background_close_for_test(card)
+            .expect("receipt is read");
         let _ = next.update(Message::ChatUi(Action::Retired(target, Ok(()))));
         if !before_answer {
             let _ = came_back(&mut next);
@@ -27373,7 +27370,7 @@ fn a_closed_pane_a_view_brings_back_at_the_next_launch_goes_again() {
 
 /// A pane reopened while its conversation was still stopping is not saved
 /// while it waits, as no reopen is until its conversation starts. Closing
-/// the window then saves only the stop, which the next launch asks again
+/// the window then saves only the receipt, which the next launch reads
 /// and finishes without a pane or a notice.
 #[test]
 fn a_reopen_waiting_when_the_window_closed_leaves_only_its_stop_saved() {
@@ -27401,8 +27398,10 @@ fn a_reopen_waiting_when_the_window_closed_leaves_only_its_stop_saved() {
     next.durable = saved;
     assert!(reopened_pane(&next, card, &source).is_empty());
     let task = next.resume_stopping_chats();
-    assert!(task.units() > 0, "it asks again");
-    let target = next.background_close_for_test(card).expect("asked again");
+    assert!(task.units() > 0, "the receipt is read");
+    let target = next
+        .background_close_for_test(card)
+        .expect("receipt is read");
     let _ = next.update(Message::ChatUi(Action::Retired(target, Ok(()))));
     assert!(next.durable.stopping_chats.is_empty());
     assert!(!next.chat_ui.closing_in_background());
