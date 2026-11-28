@@ -33,7 +33,7 @@ usage() {
     cat <<'EOF'
 Usage: scripts/release COMMAND [VERSION] [OPTIONS]
 
-  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY | --dry-run] [--build-host HOST] [--macos-host MAC]
+  cut [--wait] [--commit SHA] [--notes FILE] [--key KEY | --dry-run] [--build-host HOST] [--macos-host MAC] [--android-assets DIR]
                    Release a bundle HOST already built: the newest bundle of
                    main whose tests passed, or SHA's. Says how far it is
                    behind main and offers to wait for a prebuild of the tip
@@ -49,6 +49,8 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    --macos-host (default CAGENTS_RELEASE_MACOS_HOST), MAC
                    reuses the commit's prepared Apple Silicon bundle, or
                    builds, signs it ad hoc and smoke-tests it if needed.
+                   --android-assets adds the signed APKs prepared for SHA by
+                   mise run mobile:release, after offline verification.
                    --dry-run assembles and verifies the bundle in a
                    temporary directory without changing tags or signing
                    release metadata.
@@ -60,7 +62,7 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
   bump VERSION     Set every product manifest and Cargo.lock to VERSION.
                    Commit it through a pull request, then tag the merged
                    commit: git tag -a vVERSION -m vVERSION COMMIT
-  build VERSION [--notes FILE] [--build-host HOST] [--macos-host MAC]
+  build VERSION [--notes FILE] [--build-host HOST] [--macos-host MAC] [--android-assets DIR]
                    Build tag vVERSION on HOST (default: CAGENTS_RELEASE_BUILD_HOST
                    or fw16) in the glibc-baseline environment, require its
                    passing test verdict from main's sentinel there (testing
@@ -70,7 +72,7 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    ~/.local/state/cagents-release). FILE holds the notes an
                    installed cagents shows; by default they are the features,
                    fixes and speedups since the previous tag here.
-                   --macos-host adds the macOS release, as for cut.
+                   --macos-host and --android-assets add assets as for cut.
   rehearse VERSION [--staged | --from-draft] [--build-host HOST]
                    Rehearse installed cagents updating from the newest
                    published release to the signed cut VERSION, on HOST,
@@ -126,6 +128,7 @@ NOTES=
 FEED=
 COMMIT=
 KEY=
+ANDROID_ASSETS=
 WAIT=false
 STAGED=false
 FROM_DRAFT=false
@@ -135,11 +138,11 @@ MACOS_FLAG=false
 DRY_RUN=false
 while (($#)); do
     case $1 in
-        --notes|--build-host|--macos-host|--feed|--commit|--key)
+        --notes|--build-host|--macos-host|--android-assets|--feed|--commit|--key)
             (($# >= 2)) && [[ -n $2 ]] || fail "$1 requires a value"
             case $1 in
                 --notes) NOTES=$2 ;; --build-host) BUILD_HOST=$2 ;; --macos-host) MACOS_HOST=$2; MACOS_FLAG=true ;;
-                --feed) FEED=$2 ;;
+                --android-assets) ANDROID_ASSETS=$2 ;; --feed) FEED=$2 ;;
                 --commit) COMMIT=$2 ;; --key) KEY=$2 ;;
             esac
             shift 2
@@ -165,6 +168,8 @@ done
 [[ $MACOS_FLAG == false || $ACTIONS == false ]] || fail 'GitHub Actions builds no macOS release yet; cut it here with --macos-host'
 [[ $MACOS_FLAG == false || $COMMAND == cut || $COMMAND == build || $COMMAND == prepare-macos ]] \
     || fail '--macos-host is for cut, build and prepare-macos'
+[[ -z $ANDROID_ASSETS || ( $ACTIONS == false && ( $COMMAND == cut || $COMMAND == build ) ) ]] \
+    || fail '--android-assets is for local cut and build'
 if [[ $COMMAND == cut && $ACTIONS == false ]] || [[ $COMMAND == build || $COMMAND == prepare-macos ]]; then
     # ssh hands the host's login shell the command line, which may not be POSIX.
     [[ -z $MACOS_HOST || $MACOS_HOST =~ ^[A-Za-z0-9][-A-Za-z0-9_.@]*$ ]] || fail "unsafe --macos-host: $MACOS_HOST"
@@ -225,6 +230,14 @@ lock_release_bundle() {
     mkdir -p -- "$BUNDLES"
     exec 7>"$BUNDLES/.release-$VERSION.lock"
     flock 7
+}
+
+add_android() {
+    [[ -n $ANDROID_ASSETS ]] || return 0
+    repository_git cat-file -e "$2:scripts/package-android" 2>/dev/null \
+        || fail "$2 predates Android APK packaging"
+    "$ROOT_DIR/scripts/package-android" stage --dir "$ANDROID_ASSETS" --output "$1" \
+        --version "$VERSION" --source-commit "$2"
 }
 
 build() {
@@ -317,10 +330,11 @@ EOF
     scp -q -r -- "$BUILD_HOST:$remote_output" "$bundle.partial"
     "$ROOT_DIR/scripts/release-metadata" check --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$commit" >/dev/null || fail 'the copied bundle does not match its metadata'
-    if [[ -n $MACOS_HOST ]]; then
+    if [[ -n $MACOS_HOST || -n $ANDROID_ASSETS ]]; then
         local protocol
         protocol=$(jq -r .protocol "$bundle.partial/release-metadata.json")
-        add_macos "$bundle.partial" "$commit"
+        if [[ -n $MACOS_HOST ]]; then add_macos "$bundle.partial" "$commit"; fi
+        add_android "$bundle.partial" "$commit"
         rm -- "$bundle.partial/release-metadata.json"
         "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
             --source-commit "$commit" --protocol "$protocol" --notes "$NOTES" >/dev/null
@@ -846,6 +860,7 @@ cut_release() {
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
     [[ $(wc -c < "$NOTES") -le 65536 ]] || fail 'release notes exceed 64 KiB; pass a shorter --notes FILE'
     add_macos "$bundle.partial" "$sha"
+    add_android "$bundle.partial" "$sha"
     rm -- "$bundle.partial/release-metadata.json"
     "$ROOT_DIR/scripts/release-metadata" write --dir "$bundle.partial" --version "$VERSION" \
         --source-commit "$sha" --protocol "$protocol" --notes "$NOTES" >/dev/null

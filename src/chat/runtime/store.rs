@@ -222,6 +222,7 @@ pub struct Store {
     copy_cache: uuid::Uuid,
     copy_revision: u64,
     copy_projection: Vec<Option<crate::chat::TextCopySource>>,
+    presented_cursors: Vec<Cursor>,
     file_revision: u64,
     child_file_ordinal: i64,
     child_files_seen: bool,
@@ -600,6 +601,7 @@ impl Store {
                 copy_cache,
                 copy_revision: 0,
                 copy_projection: Default::default(),
+                presented_cursors: Vec::new(),
                 file_revision: 0,
                 child_file_ordinal: 0,
                 child_files_seen: false,
@@ -1101,6 +1103,7 @@ impl Store {
         transaction.execute("UPDATE file_metadata SET revision=?1", [revision])?;
         transaction.commit()?;
         self.file_revision = revision;
+        self.presented_cursors.clear();
         self.end = end;
         self.first = first;
         self.newest = newest;
@@ -2023,14 +2026,13 @@ impl Store {
     ) -> Result<Window, String> {
         self.flush_text()?;
         let mut copy_projection = Vec::new();
-        let old_copy: std::collections::HashMap<_, _> = previous
+        // The provider can choose the same ID as a generated part. The
+        // database record and part index name the resident allocation.
+        let old: std::collections::HashMap<_, _> = self
+            .presented_cursors
             .iter()
-            .zip(&self.copy_projection)
-            .map(|(item, source)| (item.id.as_str(), source.clone()))
-            .collect();
-        let old: std::collections::HashMap<_, _> = previous
-            .iter()
-            .map(|item| (item.id.as_str(), item))
+            .copied()
+            .zip(previous.iter().zip(&self.copy_projection))
             .collect();
         let mut reused = std::collections::HashSet::new();
         let records = {
@@ -2167,12 +2169,11 @@ impl Store {
                     .changed
                     .as_ref()
                     .is_some_and(|changed| !changed.contains(&id))
-                    && old_copy
-                        .get(item_id.as_ref())
-                        .is_some_and(|source| *source == copy_source)
-                    && let Some(previous) = old.get(item_id.as_ref())
+                    && let Some((previous, source)) = old.get(&(ordinal, part))
+                    && previous.id == item_id
+                    && *source == &copy_source
                 {
-                    reused.insert(item_id.into_owned());
+                    reused.insert((ordinal, part));
                     newest = Some(
                         newest.map_or((ordinal, part), |old: Cursor| old.max((ordinal, part))),
                     );
@@ -2416,17 +2417,19 @@ impl Store {
         };
         let changes = items
             .iter()
-            .filter(|item| !reused.contains(&item.id))
-            .map(|item| {
-                crate::chat::presentation::ItemChange::between(
-                    old.get(item.id.as_str()).map(|item| item.as_ref()),
-                    item,
-                )
+            .zip(&cursors)
+            .filter(|(_, cursor)| !reused.contains(cursor))
+            .map(|(item, cursor)| {
+                let previous = old
+                    .get(cursor)
+                    .map(|(item, _)| item.as_ref())
+                    .filter(|previous| previous.id == item.id);
+                crate::chat::presentation::ItemChange::between(previous, item)
             })
             .collect();
         drop(old);
-        drop(old_copy);
         self.copy_projection = copy_projection;
+        self.presented_cursors = cursors;
         previous.clear();
         self.dirty = false;
         self.paging = false;

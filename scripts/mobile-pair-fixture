@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Pair the Android app with a throwaway computer, to exercise pairing end to
+# Pair a mobile client with a throwaway computer, to exercise pairing end to
 # end without touching your own SSH server or ~/.ssh/authorized_keys.
 #
 #   scripts/mobile-pair-fixture start CAGENTS_BIN_DIR [--host ADDRESS]... [--port PORT]
@@ -32,7 +32,7 @@
 # also gives sshd a host certificate for it, signed by a throwaway CA, which
 # clients that accept certificates negotiate first. authorize adds the
 # `--mobile` line for a phone set up by hand: the public key from the app's
-# Settings, with or without the rest of its authorized_keys line.
+# Settings, with or without the rest of its authorized_keys line (Ed25519 or P-256).
 #
 # Run it from a shell of your own: the bridge refuses to pair under an agent's
 # authority, and this does nothing to get past that.
@@ -233,9 +233,10 @@ authorize)
     [ -e "$state" ] || die "start it first"
     # shellcheck source=/dev/null
     source "$state"
-    # A whole key: ssh-ed25519 and its 51-character blob, not the README's placeholder.
-    key=$(grep -oE 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}' <<<"$*" | head -n1) || true
-    [ -n "$key" ] || die "authorize needs the phone's ssh-ed25519 public key, as Settings shows it"
+    pattern='(^|[[:blank:]])(ssh-ed25519|ecdsa-sha2-nistp256)[[:blank:]]+([A-Za-z0-9+/]+={0,2})([[:blank:]]|$)'
+    [[ $* != *$'\n'* && $* =~ $pattern ]] || die "authorize needs an Ed25519 or P-256 phone public key"
+    key="${BASH_REMATCH[2]} ${BASH_REMATCH[3]}"
+    ssh-keygen -lf /dev/stdin <<<"$key" >/dev/null 2>&1 || die "invalid phone public key"
     printf 'command="env HOME=%s/home XDG_RUNTIME_DIR=%s/run %s/cagents daemon bridge --mobile",restrict %s phone-by-hand\n' \
         "$base" "$base" "$bin" "$key" >>"$base/authorized_keys"
     echo "authorized $key"

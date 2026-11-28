@@ -17,9 +17,33 @@ pub(in crate::host) struct Startup {
     pub(super) source: Session,
     pub(super) requested: Session,
     pub(super) context: Arc<chat::protocol::ExecutionContext>,
+    /// A failed in-process startup needs teardown before any holder adoption.
+    pub(super) local: bool,
     /// An initial named resume failed after installation. Only this exact
     /// attachment may finish its normal semantic close before a retry starts.
     pub(super) failed_close: Option<super::CloseTarget>,
+}
+
+impl Startup {
+    pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
+        &self.source.launch.recipe.working_directory
+    }
+
+    pub(in crate::host) fn local_source(&self) -> Option<&Session> {
+        self.local.then_some(&self.source)
+    }
+
+    pub(super) fn matches(&self, source: &Session) -> bool {
+        &self.source == source || &self.requested == source
+    }
+}
+
+pub(super) fn local_startup_conflicts(state: &HostState, source: &Session) -> bool {
+    state.native_actor_startups.values().any(|pending| {
+        pending.local
+            && (pending.source.id == source.id
+                || same_conversation(&pending.source.launch, &source.launch))
+    })
 }
 
 /// Unit-only HostState fixtures intentionally exercise local transports without
@@ -1169,41 +1193,81 @@ pub(super) fn reconcile_startup_for_start(
     host: &SharedHost,
     source: &Session,
 ) -> Result<bool, chat::protocol::SetupError> {
-    use chat::protocol::SetupError;
     if prepare_failed_start_for_start(host, source)?.is_some() {
         return Ok(true);
     }
-    let pending = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    use chat::protocol::SetupError;
+    let (pending, _cleanup) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
-        if &pending.source != source && &pending.requested != source {
+        if !pending.matches(source) {
             return Err(SetupError::Invalid(
                 "The retained startup belongs to another exact descriptor".into(),
             ));
         }
-        if state.chats.contains_key(&source.id) || state.chat_spawning.contains_key(&source.id) {
+        if state.chat_spawning.contains_key(&source.id)
+            || state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| !pending.local || record.handle.owns_work())
+        {
             return Err(SetupError::Unavailable(
                 "The exact retained startup is still transitioning".into(),
             ));
         }
-        (pending.source.clone(), pending.context.clone())
+        let pending = pending.clone();
+        // Hold the same fence as Close while proving and releasing the failed
+        // startup. A concurrent Close must keep its receipt through retirement.
+        let cleanup = super::capacity::Reservation::closing(host, &mut state, &pending.source)
+            .map_err(|error| SetupError::Unavailable(error.message))?;
+        (pending, cleanup)
     };
-    match pending
-        .1
-        .reconcile_cleanup()
-        .map_err(SetupError::Unavailable)?
-    {
-        chat::protocol::LaunchOutcome::NoProvider
-        | chat::protocol::LaunchOutcome::TeardownProved => {
-            forget_startup(host, &pending.0, &pending.1);
-            Ok(true)
+    prove_startup_cleanup(&pending.context).map_err(SetupError::Unavailable)?;
+    forget_startup(host, &pending.source, &pending.context);
+    Ok(true)
+}
+
+pub(in crate::host) fn has_local_startup(host: &SharedHost, id: TerminalId) -> bool {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .native_actor_startups
+        .get(&id)
+        .is_some_and(|startup| startup.local)
+}
+
+/// The caller holds the exact close reservation. Retain the receipt until
+/// its durable retirement commits, including when that commit needs a retry.
+pub(super) fn prove_local_startup_closed(
+    host: &SharedHost,
+    source: &Session,
+    named: &Session,
+) -> Result<Option<Startup>, String> {
+    let pending = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .native_actor_startups
+        .get(&source.id)
+        .filter(|startup| startup.local)
+        .cloned();
+    if let Some(pending) = &pending {
+        if !pending.matches(source) && !pending.matches(named) {
+            return Err("The retained startup belongs to another exact descriptor".into());
         }
-        chat::protocol::LaunchOutcome::Uncertain => Err(SetupError::Unavailable(
+        prove_startup_cleanup(&pending.context)?;
+    }
+    Ok(pending)
+}
+
+fn prove_startup_cleanup(context: &chat::protocol::ExecutionContext) -> Result<(), String> {
+    match context.reconcile_cleanup()? {
+        chat::protocol::LaunchOutcome::NoProvider
+        | chat::protocol::LaunchOutcome::TeardownProved => Ok(()),
+        chat::protocol::LaunchOutcome::Uncertain => Err(
             "The exact retained startup has not proved cleanup; no second provider was started"
                 .into(),
-        )),
+        ),
     }
 }
 
@@ -1319,6 +1383,7 @@ mod startup_retryability_tests {
                 source: source.clone(),
                 requested: source.clone(),
                 context: context.clone(),
+                local: false,
                 failed_close: None,
             },
         );

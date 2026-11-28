@@ -62,7 +62,7 @@ use crate::{
     agent::Provider,
     chat::{
         self, Session,
-        runtime::{Handle, Update},
+        runtime::{Handle, Update, UpgradeRestoreQueueBudget},
     },
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
@@ -1357,6 +1357,9 @@ fn reserve_unhosted_allocation(
 /// conversation an earlier boot left, with no owner, agent or launch, has
 /// nothing to close. Everything else needs its exact close receipt.
 pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
+    if retained_actor::has_local_startup(host, session.id) {
+        return native_cleanup::close_from_pane(host, session);
+    }
     if super::agent_execution::close_lost_agent_from_pane(host, session)? {
         return Ok(());
     }
@@ -1440,21 +1443,35 @@ fn settle_lost_execution(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
+    settle_lost_execution_after_startup(host, session, proof, None)
+}
+
+fn settle_lost_execution_after_startup(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+    startup: Option<&retained_actor::Startup>,
+) -> Result<(), String> {
     if !claimed_for_close(&host.lock().unwrap_or_else(|p| p.into_inner()), session) {
         return Err("This conversation's Close lost its claim; it was not closed".into());
     }
     refuse_scheduled_agent(host, session)?;
-    if let Some(holds) = what_holds(host, session, proof)? {
-        return Err(lost_execution_refusal(session, holds));
-    }
-    let _ = return_listener_allocation(session);
-    let Ok(registry) = super::agent_execution::registry(host) else {
-        return Ok(());
-    };
+    let registry = super::agent_execution::registry(host)?;
     let sources = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retained_agent_sources(session.id)?;
+    if let Some(startup) = startup
+        && sources.iter().any(|source| {
+            !matches!(source, crate::agent_execution::HostedSession::Chat(source) if startup.matches(source))
+        })
+    {
+        return Err("The retained startup belongs to another exact descriptor".into());
+    }
+    if let Some(holds) = what_holds_after_startup(host, session, proof, startup)? {
+        return Err(lost_execution_refusal(session, holds));
+    }
+    let _ = return_listener_allocation(session);
     for source in sources {
         let crate::agent_execution::HostedSession::Chat(source) = source else {
             return Err("Retained execution ownership changed to another surface".into());
@@ -1798,6 +1815,15 @@ fn what_holds(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<Option<Holds>, String> {
+    what_holds_after_startup(host, session, proof, None)
+}
+
+fn what_holds_after_startup(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+    settled_startup: Option<&retained_actor::Startup>,
+) -> Result<Option<Holds>, String> {
     // A receipt exact cleanup did not consume names another descriptor of
     // the terminal. It confirms that one's close, and says nothing either way
     // about this one, so it neither holds nor settles this Close: the evidence
@@ -1807,7 +1833,9 @@ fn what_holds(
         if codex_terminal_owner(&state, session).is_some()
             || state.chat_handoffs.contains_key(&session.id)
             || state.native_actor_startups.values().any(|startup| {
-                startup.source.id == session.id || startup.requested.id == session.id
+                (startup.source.id == session.id || startup.requested.id == session.id)
+                    && settled_startup
+                        .is_none_or(|settled| !Arc::ptr_eq(&startup.context, &settled.context))
             })
         {
             return Ok(Some(Holds::InProgress));
@@ -1829,13 +1857,29 @@ fn what_holds(
     };
     // A startup cleanup owner retained for the agent is a launch of this boot
     // whose teardown is unconfirmed.
-    if agent.is_some_and(|agent| {
+    if agent.as_ref().is_some_and(|agent| {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .execution_startups
             .contains_key(&agent.id)
     }) {
         return Ok(Some(Holds::LaunchUnconfirmed));
+    }
+    // A proved teardown for this daemon's exact unpublished local provider
+    // suffices when the descriptor cannot also name an independent owner.
+    if settled_startup.is_some_and(|startup| {
+        startup.matches(session)
+            && startup.source.proof.as_ref() == Some(proof)
+            && [session, &startup.source].into_iter().all(|source| {
+                source.terminal.is_none()
+                    && !source.native_continuity.retains_provider()
+                    && source.owned_codex_listener.is_none()
+            })
+    }) && session.proof.as_ref().is_none_or(|issued| issued == proof)
+        && agent.as_ref().is_none_or(|agent| agent.console.is_none())
+        && owners.as_ref().is_ok_and(Vec::is_empty)
+    {
+        return Ok(None);
     }
     use super::upgrade_inspect::ExecutionEnd;
     match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
@@ -2318,6 +2362,12 @@ fn publication_refusal(
     }
 }
 
+#[derive(Clone, Copy)]
+struct UpgradeRestart<'a> {
+    launch: &'a chat::Launch,
+    queue_budget: &'a UpgradeRestoreQueueBudget,
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -2327,7 +2377,7 @@ fn start_with_execution(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
-    restart_launch: Option<&chat::Launch>,
+    upgrade_restart: Option<UpgradeRestart<'_>>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
 ) -> Result<ServerResponse, ProtocolError> {
     let id = session.id;
@@ -2340,7 +2390,7 @@ fn start_with_execution(
         selection,
         execution_environment,
         execution,
-        restart_launch,
+        upgrade_restart,
         pane,
         None,
     )?;
@@ -2361,10 +2411,11 @@ fn start_publishing(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
-    restart_launch: Option<&chat::Launch>,
+    upgrade_restart: Option<UpgradeRestart<'_>>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
     reconnect: Option<&codex_reconnect::Managed>,
 ) -> Result<ServerResponse, ProtocolError> {
+    let restart_launch = upgrade_restart.map(|restart| restart.launch);
     // Reading the floor can fail transiently. The client routes an ordinary
     // start of a fenced conversation through its update resume, so a start
     // that still reaches the fence cannot pass it by repeating itself. Name no
@@ -2387,7 +2438,8 @@ fn start_publishing(
             .native_actor_startups
             .get(&session.id)
             .filter(|pending| {
-                (pending.source == session || pending.requested == session)
+                !pending.local
+                    && pending.matches(&session)
                     && !state.chats.contains_key(&session.id)
                     && !state.chat_spawning.contains_key(&session.id)
             })
@@ -2969,7 +3021,8 @@ fn start_publishing(
         }
         if state.chat_spawning.iter().any(|(id, pending)| {
             *id != session.id && same_conversation(&pending.launch, &session.launch)
-        }) {
+        }) || retained_actor::local_startup_conflicts(&state, &session)
+        {
             return Err(retryable_unavailable(
                 "This exact conversation is already starting",
             ));
@@ -3037,6 +3090,7 @@ fn start_publishing(
         state.inventory_changed();
         (source_handle, replacing)
     };
+    let mut managed_startup = None;
     let result = (|| {
         if let Some((previous, current)) = &replacing {
             previous.require_current(host)?;
@@ -3266,9 +3320,18 @@ fn start_publishing(
                     source: startup_source.clone(),
                     requested: requested_source.clone(),
                     context,
+                    local: false,
                     failed_close: None,
                 },
             );
+        } else if let Some(context) = execution.as_ref().filter(|_| agent_directory.is_some()) {
+            managed_startup = Some(retained_actor::Startup {
+                source: startup_source.clone(),
+                requested: requested_source.clone(),
+                context: context.clone(),
+                local: true,
+                failed_close: None,
+            });
         }
         let handle = if let Some(prepared_identity) = prepared_identity {
             // The helper creates and owns the sole live reducer and Store.
@@ -3281,32 +3344,21 @@ fn start_publishing(
                 notify,
             )
         } else {
-            Handle::start_owned(
+            let handle = Handle::start_owned(
                 spec,
                 adapter,
                 initial,
                 store,
                 session.clone(),
                 recovery_environment,
+                upgrade_restart.map(|restart| restart.queue_budget.clone()),
                 notify,
-            )
+            );
+            #[cfg(test)]
+            let handle = startup_tests::fail_managed_start_after_spawn(&execution, handle);
+            handle
         }
         .map_err(|message| {
-            // A start in an agent's directory owns its launch as an agent's
-            // run does: a provider it left starting is ended here, since no
-            // run holds it to end later.
-            let message = match (&agent_directory, &execution) {
-                (Some(_), Some(context)) if !remote => match context.reconcile_cleanup() {
-                    Ok(
-                        chat::protocol::LaunchOutcome::NoProvider
-                        | chat::protocol::LaunchOutcome::TeardownProved,
-                    ) => message,
-                    cleanup => format!(
-                        "{message}. The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
-                    ),
-                },
-                _ => message,
-            };
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| retryable_unavailable(message))
@@ -3619,6 +3671,26 @@ fn start_publishing(
             unavailable("The saved conversation did not publish its confirmed attachment")
         })
     })();
+    let result = result.map_err(|mut failure| {
+        if let Some(pending) = managed_startup {
+            let cleanup = pending.context.reconcile_cleanup();
+            if !matches!(
+                cleanup,
+                Ok(chat::protocol::LaunchOutcome::NoProvider
+                    | chat::protocol::LaunchOutcome::TeardownProved)
+            ) {
+                // Keep ownership before releasing admission, including when
+                // startup failed after returning a handle but before publication.
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.native_actor_startups.insert(pending.source.id, pending);
+                state.inventory_changed();
+                failure.message.push_str(&format!(
+                    ". The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
+                ));
+            }
+        }
+        failure
+    });
     drop(admission);
     result
 }
@@ -5781,7 +5853,7 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
-    let closing = {
+    let (closing, current) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -5793,10 +5865,13 @@ pub(super) fn close_captured(
             ));
         };
         let current = record.current_session();
-        capacity::Reservation::removing(host, &mut state, &source, current)?
+        let closing = capacity::Reservation::removing(host, &mut state, &source, current.clone())?;
+        (closing, current)
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
+    let local_startup =
+        retained_actor::prove_local_startup_closed(host, &source, &current).map_err(unavailable)?;
     let detached = super::agent_execution::detached_work_on_close(host, source.id);
     handle.decide_detached_work(detached);
     if let Err(error) = handle.close_for_resume() {
@@ -5978,6 +6053,9 @@ pub(super) fn close_captured(
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     drop(record);
+    if let Some(startup) = local_startup {
+        retained_actor::forget_startup(host, &startup.source, &startup.context);
+    }
     super::state::retire_recovered_upgrade_chat(host, chat_id);
     Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
@@ -6339,57 +6417,14 @@ pub(super) fn restored_terminal_source(
     Ok(replacement)
 }
 
-/// Lock queue time is shared by the entire checkpoint, rather than granted
-/// anew to every conversation while the daemon's accept loop is unavailable.
-pub(super) struct UpgradeRestoreQueueBudget {
-    remaining: Duration,
-}
-
-impl Default for UpgradeRestoreQueueBudget {
-    fn default() -> Self {
-        Self {
-            remaining: Duration::from_secs(60),
-        }
-    }
-}
-
-impl UpgradeRestoreQueueBudget {
-    fn permits(&self, queued: Duration) -> bool {
-        queued.is_zero() || queued < self.remaining
-    }
-
-    fn charge(&mut self, queued: Duration) {
-        self.remaining = self.remaining.saturating_sub(queued);
-    }
-}
-
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
 ) -> Result<(), String> {
-    restore_upgrade_with_queue_budget(host, saved, &mut UpgradeRestoreQueueBudget::default())
+    restore_upgrade_with_queue_budget(host, saved, &UpgradeRestoreQueueBudget::default())
 }
 
 pub(super) fn restore_upgrade_with_queue_budget(
-    host: &SharedHost,
-    saved: &crate::upgrade::handoff::Chat,
-    queue_budget: &mut UpgradeRestoreQueueBudget,
-) -> Result<(), String> {
-    let result = restore_upgrade_with_queue_limit(host, saved, queue_budget);
-    let handle = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&saved.source.id)
-        .map(|record| record.handle.clone());
-    // Charge unsuccessful restarts too, before their stop removes the actor.
-    if let Some(handle) = handle {
-        queue_budget.charge(handle.startup_lock_wait());
-    }
-    result
-}
-
-fn restore_upgrade_with_queue_limit(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
     queue_budget: &UpgradeRestoreQueueBudget,
@@ -6405,7 +6440,10 @@ fn restore_upgrade_with_queue_limit(
     let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
     // Every provider keeps the descriptor already issued to windows. The
     // checkpoint's normalized resume arguments are execution context only.
-    let restart_launch = Some(&saved.launch);
+    let upgrade_restart = Some(UpgradeRestart {
+        launch: &saved.launch,
+        queue_budget,
+    });
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         session.proof = Some(state.proof().clone());
@@ -6456,7 +6494,7 @@ fn restore_upgrade_with_queue_limit(
         selection,
         Default::default(),
         None,
-        restart_launch,
+        upgrade_restart,
         None,
     )
     .map_err(|error| error.message)?;
@@ -6488,11 +6526,6 @@ fn restore_upgrade_with_queue_limit(
             );
         }
         let queued = handle.startup_lock_wait();
-        if !queue_budget.permits(queued) {
-            return Err(
-                "Codex startup lock queue budget for this upgrade restore was exhausted".into(),
-            );
-        }
         if let Some(actual) = handle.confirmed_session_id() {
             if Some(&actual) != saved.launch.session_id.as_ref() {
                 return Err("The restarted provider confirmed a different conversation".into());

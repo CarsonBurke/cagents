@@ -2287,7 +2287,7 @@ fn open_deliveries_show_no_sender_address() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.cards
             .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-        drop(app.handle_chat_ui(Action::Toggle(target, delivered.id.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, delivered.id.clone().into())));
         let live = app.chat_runtime_mut(target).unwrap();
         preparation::drain_fixture(live);
         assert!(live.item_expanded(&delivered.id));

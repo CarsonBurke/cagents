@@ -386,8 +386,10 @@ use crate::{
 /// chat command that moves the window to any cached item. An older CLI is sent
 /// snapshots without the count, and an older update source is read without it.
 ///
-/// Version 226 adds manual provider CLI installation and update requests.
-pub const PROTOCOL_VERSION: u16 = 226;
+/// Version 226 adds exact Work card pins and a publication watermark for replies.
+///
+/// Version 227 adds manual provider CLI installation and update requests.
+pub const PROTOCOL_VERSION: u16 = 227;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

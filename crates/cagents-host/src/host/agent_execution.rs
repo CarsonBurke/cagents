@@ -235,7 +235,7 @@ pub(super) fn prompt(
     let (accepted, start) = accept(host, authority, request)?;
     let start = start.map_err(|error| unstarted(host, &accepted, error))?;
     if interrupt && let Start::Queued { behind } = start {
-        interrupt_ahead(host, agent, behind).map_err(|error| {
+        interrupt_ahead(host, agent, accepted.run.id, behind).map_err(|error| {
             format!(
                 "Run {} waits behind the agent's current work, which could not be interrupted: {error}",
                 accepted.run.id
@@ -622,20 +622,36 @@ fn resume(
 
 /// Stops what the agent is doing so the prompt queued behind it goes next:
 /// the run ahead, or a turn no run started.
-fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> Result<(), String> {
+fn interrupt_ahead(
+    host: &SharedHost,
+    agent: AgentId,
+    follow_up: RunId,
+    behind: Option<RunId>,
+) -> Result<(), String> {
     let gate = agent_gate(host, agent);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
-    let (record, head) = {
+    let (record, running) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let head = behind
-            .map(|run| store.agent_run(run))
-            .transpose()?
-            .filter(|run| !run.state.is_terminal());
-        (store.agent(agent)?, head)
+        // The courier may have dispatched this prompt before we took the
+        // gate. The observed predecessor may also have finished on its own.
+        if !store.agent_run_is_queued(follow_up)? {
+            return Ok(());
+        }
+        let running = if let Some(head) = behind {
+            if store.agent_run(head)?.state.is_terminal() {
+                return Ok(());
+            }
+            // A head that is itself waiting unsent stays first. Stop the
+            // interactive turn it waits on.
+            (!store.agent_run_is_queued(head)?).then_some(head)
+        } else {
+            None
+        };
+        (store.agent(agent)?, running)
     };
-    if let Some(head) = &head
-        && withdraw_undelivered(host, &mut dispatch, Some(head.id))?
+    if let Some(head) = behind
+        && withdraw_undelivered(host, &mut dispatch, Some(head))?
     {
         return Ok(());
     }
@@ -654,16 +670,7 @@ fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> 
     let Some(handle) = handle else {
         return Err(not_running());
     };
-    // A head that is itself waiting unsent stays first; the turn it waits on
-    // is what stops.
-    let running = head.filter(|head| {
-        !registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent_run_is_queued(head.id)
-            .unwrap_or(true)
-    });
-    handle.interrupt_owned(running.map(|run| run.id), false)
+    handle.interrupt_owned(running, false)
 }
 
 /// The usage limit that stops `agent`'s live conversation, if one does.
@@ -1977,10 +1984,19 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .preflight_agent_close(&origin, id)?;
+    let close_unpublished_startup = || {
+        if let Some(HostedSession::Chat(session)) = agent.session.as_ref()
+            && super::chat::retained_actor::has_local_startup(host, session.id)
+        {
+            super::chat::close_retained_native(host, session)?;
+        }
+        Ok::<_, String>(())
+    };
     if agent.closed {
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not
         // start or contact a provider, and keeps the completed run history.
+        close_unpublished_startup()?;
         let closed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -1998,6 +2014,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     };
     if ended {
         super::chat::codex_reconnect::reconcile_startup(host, &registry, id)?;
+        close_unpublished_startup()?;
     }
     // A daemon stop already proved this agent's process ended and revoked its
     // authority; only its saved conversation remains to retire.
@@ -2023,6 +2040,8 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                 };
                 if let Some(target) = hosted {
                     super::chat::close_captured(host, target).map_err(|error| error.message)?;
+                } else if super::chat::retained_actor::has_local_startup(host, session.id) {
+                    super::chat::close_retained_native(host, session)?;
                 } else if lost_with_earlier_boot(host, &agent, pending.as_ref()) {
                     // A changed kernel boot proves that process is gone, even
                     // with no daemon stop recorded for it. The fence refuses

@@ -578,7 +578,8 @@ mod tests {
                 census: Census {
                     terminals: vec![source.clone()],
                     ..Default::default()
-                },
+                }
+                .into(),
                 windows: Vec::new(),
             },
         };
@@ -629,7 +630,8 @@ mod tests {
                     limitation: None,
                 }],
                 ..Default::default()
-            },
+            }
+            .into(),
             windows: vec![],
         };
         let bytes = serde_json::to_vec(&capture).unwrap();
@@ -789,7 +791,8 @@ mod tests {
                 chats: vec![original.clone()],
                 snapshots: vec![snapshot.clone()],
                 ..Default::default()
-            },
+            }
+            .into(),
             windows: vec![],
         };
         let bytes = serde_json::to_vec(&capture).unwrap();

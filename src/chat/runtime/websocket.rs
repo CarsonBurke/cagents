@@ -257,6 +257,7 @@ fn join_launched(
     path: &Path,
     limits: ListenerLimits,
     queued: &AtomicU64,
+    upgrade_budget: Option<&UpgradeRestoreQueueBudget>,
     lock_wait: impl FnMut() -> Option<LockWait>,
     halted: impl FnMut() -> Option<&'static str>,
 ) -> Result<UnixStream, String> {
@@ -264,6 +265,7 @@ fn join_launched(
         path,
         limits,
         queued,
+        upgrade_budget,
         lock_wait,
         halted,
         Instant::now,
@@ -275,6 +277,7 @@ fn join_launched_with_clock(
     path: &Path,
     limits: ListenerLimits,
     queued: &AtomicU64,
+    upgrade_budget: Option<&UpgradeRestoreQueueBudget>,
     mut lock_wait: impl FnMut() -> Option<LockWait>,
     mut halted: impl FnMut() -> Option<&'static str>,
     mut now: impl FnMut() -> Instant,
@@ -300,11 +303,18 @@ fn join_launched_with_clock(
         let current = now();
         if current.duration_since(sampled) >= limits.sample {
             if let Some(wait) = lock_wait() {
-                waited += current.duration_since(sampled);
+                let sample = current.duration_since(sampled);
+                waited += sample;
                 queued.store(
                     u64::try_from(waited.as_millis()).unwrap_or(u64::MAX),
                     Ordering::Release,
                 );
+                if upgrade_budget.is_some_and(|budget| budget.exhausted_after(sample)) {
+                    return Err(
+                        "Codex startup lock queue budget for this upgrade restore was exhausted"
+                            .into(),
+                    );
+                }
                 if waited >= limits.queued {
                     return Err(format!(
                         "Codex server waited more than {} seconds for {} to release a lock it needs to start",
@@ -357,6 +367,7 @@ impl Actor {
             path,
             LISTENER_LIMITS,
             &self.startup_lock_wait,
+            self.upgrade_queue_budget.as_ref(),
             || group.and_then(launched_lock_wait),
             || {
                 startup_halt_reason(self.child.as_ref(), self.stop.load(Ordering::Acquire)).or_else(
@@ -646,7 +657,14 @@ mod tests {
         path: &Path,
         halted: impl FnMut() -> Option<&'static str>,
     ) -> Result<UnixStream, String> {
-        join_launched(path, LISTENER_LIMITS, &AtomicU64::new(0), || None, halted)
+        join_launched(
+            path,
+            LISTENER_LIMITS,
+            &AtomicU64::new(0),
+            None,
+            || None,
+            halted,
+        )
     }
 
     #[test]
@@ -992,6 +1010,7 @@ mod tests {
                 path,
                 limits,
                 &queued,
+                None,
                 || (elapsed.get() < lock_until).then_some(LockWait { holder: Some(7) }),
                 || None,
                 || origin + elapsed.get(),
@@ -1027,6 +1046,62 @@ mod tests {
     }
 
     #[test]
+    fn failed_unpublished_restart_leaves_only_its_unspent_lock_queue_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("codex.sock");
+        let budget = UpgradeRestoreQueueBudget::default();
+        let second = Duration::from_secs(1);
+        let limits = ListenerLimits {
+            sample: second,
+            ..LISTENER_LIMITS
+        };
+        let attempt = |stopped_at: Option<Duration>| {
+            let origin = Instant::now();
+            let elapsed = std::cell::Cell::new(Duration::ZERO);
+            let queued = AtomicU64::new(0);
+            let result = join_launched_with_clock(
+                &path,
+                limits,
+                &queued,
+                Some(&budget),
+                || Some(LockWait { holder: None }),
+                || {
+                    (stopped_at == Some(elapsed.get()))
+                        .then_some("The unpublished provider stopped")
+                },
+                || origin + elapsed.get(),
+                || elapsed.set(elapsed.get() + second),
+            );
+            let queued = Duration::from_millis(queued.load(Ordering::Acquire));
+            (result.unwrap_err(), queued)
+        };
+
+        assert_eq!(
+            attempt(Some(41 * second)),
+            ("The unpublished provider stopped".into(), 40 * second),
+        );
+        let exhausted = "Codex startup lock queue budget for this upgrade restore was exhausted";
+        assert_eq!(attempt(None), (exhausted.into(), 20 * second));
+        assert_eq!(attempt(None), (exhausted.into(), second));
+
+        // Only a real lock wait needs aggregate capacity. A later listener
+        // that starts without queueing may still be restored.
+        let server = bound(&path);
+        assert_eq!(unsafe { libc::listen(server.as_raw_fd(), 1) }, 0);
+        assert!(
+            join_launched(
+                &path,
+                limits,
+                &AtomicU64::new(0),
+                Some(&budget),
+                || None,
+                || None,
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
     fn a_lock_that_is_never_released_ends_the_wait_naming_its_holder() {
         let directory = tempfile::tempdir().unwrap();
         let limits = ListenerLimits {
@@ -1039,6 +1114,7 @@ mod tests {
             &directory.path().join("codex.sock"),
             limits,
             &AtomicU64::new(0),
+            None,
             || Some(LockWait { holder: Some(4242) }),
             || None,
         )

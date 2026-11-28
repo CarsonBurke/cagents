@@ -2,6 +2,8 @@ use super::*;
 use std::os::unix::fs::symlink;
 
 const PHONE_KEY: [u8; 32] = [7; 32];
+// Public half of a throwaway `ssh-keygen -t ecdsa -b 256` key.
+const P256_PHONE_KEY: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBPZ/3vz2fVK4zzWECDFJC+0X3oyVBr3/8XbkI1/deqadFhu7oBg1JcMZy+WwDqw7HpYPFDqLcVmiuKMhsEZsRFc=";
 
 fn phone_key() -> PublicKey {
     PublicKey::ed25519(&PHONE_KEY)
@@ -206,8 +208,12 @@ fn scene() -> Scene {
 }
 
 fn request_line() -> Vec<u8> {
+    request_line_for(&phone_key())
+}
+
+fn request_line_for(key: &PublicKey) -> Vec<u8> {
     serde_json::to_vec(&api::PairClientLine::Pair(api::PairRequest {
-        key: format!("{} ignored comment", phone_key().openssh()),
+        key: format!("{} ignored comment", key.openssh()),
         name: "Pixel\n9".into(),
     }))
     .unwrap()
@@ -332,11 +338,23 @@ fn the_code_is_the_one_recorded_for_the_app() {
 
 #[test]
 fn allowing_a_phone_swaps_the_one_time_key_for_the_phones_own() {
+    let p256 = PublicKey::parse(P256_PHONE_KEY).unwrap();
+    assert!(!p256.is_ed25519());
+    assert_eq!(
+        p256.fingerprint(),
+        "SHA256:ceCoF8sDYtCjhYrafDedqwRVrZTQefFMjdHyOFhJN10"
+    );
+    for key in [phone_key(), p256] {
+        assert_restricted_pairing(key);
+    }
+}
+
+fn assert_restricted_pairing(key: PublicKey) {
     let scene = scene();
     assert_eq!(scene.pairing.progress(scene.now), Progress::Waiting);
-    let (_input, bridge) = bridge(&scene, Some(request_line()));
+    let (_input, bridge) = bridge(&scene, Some(request_line_for(&key)));
     let request = wait_for_request(&scene);
-    assert_eq!(request.key, phone_key());
+    assert_eq!(request.key, key);
     assert_eq!(request.name, "Pixel 9");
     assert_eq!(
         scene
@@ -351,13 +369,75 @@ fn allowing_a_phone_swaps_the_one_time_key_for_the_phones_own() {
         scene.keys.read().unwrap(),
         format!(
             "command=\"/x/cagents daemon bridge --mobile\",restrict {} Pixel 9\n",
-            phone_key().openssh()
+            key.openssh()
         )
     );
     assert!(!scene.pairing.directory.exists(), "the bridge cleaned up");
     // The backup never holds a one-time key.
     let backup = scene.keys.path().with_file_name(BACKUP_NAME);
     assert!(!backup.exists() || !fs::read_to_string(backup).unwrap().contains("pairing"));
+}
+
+#[test]
+fn p256_requires_the_right_curve_a_complete_point_and_no_trailing_data() {
+    let valid = PublicKey::parse(P256_PHONE_KEY).unwrap();
+    let curve = 4 + ECDSA_P256.len() + 4;
+    let point_len = curve + b"nistp256".len();
+    let point = point_len + 4;
+    let change = |edit: fn(&mut Vec<u8>)| {
+        let mut blob = valid.blob.clone();
+        edit(&mut blob);
+        blob
+    };
+    let mut wrong_curve = valid.blob.clone();
+    wrong_curve[curve..point_len].copy_from_slice(b"nistp384");
+    let mut wrong_length = valid.blob.clone();
+    wrong_length[point_len..point].copy_from_slice(&u32::MAX.to_be_bytes());
+    let mut wrong_format = valid.blob.clone();
+    wrong_format[point] = 0x02;
+    let mut off_curve = valid.blob.clone();
+    off_curve[point + 1..].fill(0);
+
+    let scene = scene();
+    let contents = scene.keys.read().unwrap();
+    for blob in [
+        wrong_curve,
+        wrong_length,
+        wrong_format,
+        off_curve,
+        change(|blob| {
+            blob.pop();
+        }),
+        change(|blob| blob.push(0)),
+    ] {
+        let key = PublicKey {
+            kind: ECDSA_P256.into(),
+            blob,
+        };
+        let (send, input) = mpsc::channel();
+        send.send(Ok(request_line_for(&key))).unwrap();
+        assert_eq!(
+            pair(
+                &scene.pairing.directory,
+                &input,
+                || scene.now,
+                &mut Vec::new()
+            ),
+            pair_error(INVALID_PHONE_KEY)
+        );
+        let request = Request {
+            key,
+            name: "Phone".into(),
+        };
+        assert_eq!(
+            scene
+                .pairing
+                .allow(&request, "/x/cagents daemon bridge --mobile"),
+            Err(INVALID_PHONE_KEY.into())
+        );
+    }
+    assert_eq!(scene.pairing.progress(scene.now), Progress::Waiting);
+    assert_eq!(scene.keys.read().unwrap(), contents);
 }
 
 #[test]
@@ -434,7 +514,7 @@ fn a_code_works_once_and_only_until_it_expires() {
 }
 
 #[test]
-fn only_ed25519_keys_and_well_formed_requests_are_taken() {
+fn unsupported_keys_and_malformed_requests_are_refused() {
     let scene = scene();
     for line in [
         br#"{"type":"pair","key":"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQ","name":"x"}"#.to_vec(),

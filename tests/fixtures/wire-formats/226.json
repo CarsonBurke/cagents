@@ -731,10 +731,6 @@
         [
           "Unknown",
           "Unit"
-        ],
-        [
-          "CagentsManaged",
-          "Unit"
         ]
       ]
     },
@@ -10586,32 +10582,6 @@
         [
           "WatchDeviceStats",
           "Unit"
-        ],
-        [
-          "ProviderUpdate",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ProviderManage",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -14532,6 +14502,31 @@
               ]
             ]
           }
+        ],
+        [
+          "PinCard",
+          {
+            "Struct": [
+              [
+                "repository",
+                "Str"
+              ],
+              [
+                "key",
+                {
+                  "Container": "cagents::work::ItemKey"
+                }
+              ],
+              [
+                "column",
+                {
+                  "Option": {
+                    "Container": "cagents::work::Column"
+                  }
+                }
+              ]
+            ]
+          }
         ]
       ]
     },
@@ -14609,6 +14604,17 @@
                 {
                   "Container": "cagents::work::ConversationPullRequests"
                 }
+              ]
+            ]
+          }
+        ],
+        [
+          "PinSaved",
+          {
+            "Struct": [
+              [
+                "through_revision",
+                "U64"
               ]
             ]
           }

@@ -86,9 +86,10 @@ line:
 {"type":"pair","key":"ssh-ed25519 AAAA…","name":"Pixel 9"}
 ```
 
-`key` is the phone's own public key, in OpenSSH form; only Ed25519 keys are
-accepted. `name` is how the computer will list the phone. Once the request is
-in front of the person, the computer answers:
+`key` is the phone's own OpenSSH public key, either `ssh-ed25519` or
+`ecdsa-sha2-nistp256`. P-256 keys carry the `nistp256` curve name and an
+uncompressed public point. `name` is how the computer will list the phone.
+Once the request is in front of the person, the computer answers:
 
 ```json
 {"type":"pair_waiting"}

@@ -208,6 +208,30 @@ impl ControlClient {
         .map(drop)
     }
 
+    /// Pins the exact card selected on the board.
+    pub fn pin_work_card_exact(
+        &mut self,
+        repository: PathBuf,
+        key: ItemKey,
+        column: Option<Column>,
+    ) -> Result<u64, ControlError> {
+        self.work(
+            Request::PinCard {
+                repository,
+                key,
+                column,
+            },
+            BOARD_TIMEOUT,
+        )
+        .and_then(|response| match response {
+            Response::PinSaved { through_revision } => Ok(through_revision),
+            _ => Err(unexpected_response(
+                "Pin Work card",
+                &ServerResponse::Work(response),
+            )),
+        })
+    }
+
     /// Subscribes this connection to the Work board and returns it, with the
     /// revision later boards from [`Self::next_work_board`] supersede.
     pub fn watch_work(&mut self) -> Result<(u64, Board), ControlError> {

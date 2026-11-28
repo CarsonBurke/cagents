@@ -220,7 +220,7 @@ class PublisherSignatures(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         scripts = self.checkout / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("publish-release", "release-metadata"):
+        for name in ("publish-release", "release-metadata", "package-android"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         # Artifact smoke has its own suite; here it only must be reached.
         (scripts / "smoke-release-artifacts").write_text("#!/bin/sh\nexit 0\n")
@@ -262,10 +262,11 @@ class PublisherSignatures(unittest.TestCase):
         self.git("commit", "-q", "-m", f"release {version}")
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
 
-    def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False) -> Path:
+    def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False,
+               android: bool = False) -> Path:
         """A complete bundle of VERSION, its metadata signed by SIGNERS in
-        order; another VARIANT is another build of it. With MACOS it also
-        carries the Apple Silicon build."""
+        order; another VARIANT is another build of it. MACOS and ANDROID add
+        their platform assets."""
         dist = Path(tempfile.mkdtemp(prefix=f"dist-{version}-", dir=self.directory))
         cagents_archive(dist / f"cagents-{version}-{TARGET}.tar.gz", "cagents", version, "dev.cagents.Cagents")
         cagents_archive(dist / f"cagents-browserless-{version}-{TARGET}.tar.gz", "cagents-browserless", version,
@@ -290,6 +291,11 @@ class PublisherSignatures(unittest.TestCase):
             macos_archive(dist / f"cagents-{version}-aarch64-apple-darwin.tar.gz", version)
             (dist / "install-macos.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
             sums("SHA256SUMS-macos", [f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh"])
+        if android:
+            apk_names = [f"cagents-android-{version}.apk", "cagents-android.apk"]
+            for name in apk_names:
+                (dist / name).write_bytes(b"fixture APK")
+            sums("SHA256SUMS-android", apk_names)
         commit = self.git("rev-parse", f"v{version}^{{commit}}").strip()
         subprocess.run([sys.executable, "-I", str(self.checkout / "scripts/release-metadata"), "write",
                         "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
@@ -355,14 +361,14 @@ class PublisherSignatures(unittest.TestCase):
                                "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
-    def drafted(self, macos: bool = False) -> Path:
+    def drafted(self, macos: bool = False, android: bool = False) -> Path:
         """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
         release workflow leaves it; its bundle."""
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         self.bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
                                               "release-metadata.json.sig": "release-metadata.json.sig"})
-        release = self.bundle("0.2.5", ["new"], macos=macos)
+        release = self.bundle("0.2.5", ["new"], macos=macos, android=android)
         result = self.publish("0.2.5", release, "--draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified v0.2.5 as a draft", result.stdout)
@@ -627,6 +633,40 @@ class PublisherSignatures(unittest.TestCase):
         result = self.promote("0.2.5", digest)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((served / "SHA256SUMS-macos").read_bytes(), (release / "SHA256SUMS-macos").read_bytes())
+
+    def android_tools(self):
+        tools = self.directory / "android-tools"
+        tools.mkdir()
+        fingerprint = "a" * 64
+        aapt = "#!/bin/sh\necho \"package: name='dev.cagents.mobile' versionCode='2005' versionName='0.2.5'\"\n"
+        apksigner = f"#!/bin/sh\necho 'Signer #1 certificate SHA-256 digest: {fingerprint}'\n"
+        for name, script in (("aapt", aapt), ("apksigner", apksigner)):
+            (tools / name).write_text(script)
+            (tools / name).chmod(0o755)
+        self.environment.update(CAGENTS_ANDROID_BUILD_TOOLS=str(tools), CAGENTS_ANDROID_SIGNER_SHA256=fingerprint)
+
+    def test_verify_only_requires_the_trusted_android_signer_and_all_assets(self):
+        self.android_tools()
+        bridge = self.bridges(release_metadata=self.bundle("0.2.4", ["old"]))
+        dist = self.bundle("0.2.5", ["new"], android=True)
+        result = self.verify("0.2.5", dist, "--bridge", str(bridge))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        del self.environment["CAGENTS_ANDROID_SIGNER_SHA256"]
+        self.assertRefused(self.verify("0.2.5", dist, "--bridge", str(bridge)), "set CAGENTS_ANDROID_SIGNER_SHA256")
+        (dist / "cagents-android.apk").unlink()
+        self.assertRefused(self.verify("0.2.5", dist, "--bridge", str(bridge)), "expected assets")
+
+    def test_a_draft_with_both_platforms_carries_the_stable_android_alias(self):
+        self.android_tools()
+        release = self.drafted(macos=True, android=True)
+        served = self.directory / "github/releases/v0.2.5/assets"
+        names = ("cagents-android-0.2.5.apk", "cagents-android.apk", "SHA256SUMS-android")
+        for name in names:
+            self.assertEqual((served / name).read_bytes(), (release / name).read_bytes())
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((served / "cagents-android.apk").read_bytes(), b"fixture APK")
 
     def restamp(self, dist: Path, signers: list[str]):
         """Rewrites DIST's macOS checksums and metadata after a change, and signs it again."""

@@ -519,12 +519,23 @@ pub(crate) fn wake() -> io::Result<Wake> {
     })
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn set_read_timeout_or_hangup(
-    stream: &std::os::unix::net::UnixStream,
+    stream: &UnixStream,
     timeout: Option<std::time::Duration>,
 ) -> io::Result<()> {
-    let result = stream.set_read_timeout(timeout);
+    socket_option_or_hangup(stream, stream.set_read_timeout(timeout))
+}
+
+pub(crate) fn set_write_timeout_or_hangup(
+    stream: &UnixStream,
+    timeout: Option<std::time::Duration>,
+) -> io::Result<()> {
+    socket_option_or_hangup(stream, stream.set_write_timeout(timeout))
+}
+
+fn socket_option_or_hangup(stream: &UnixStream, result: io::Result<()>) -> io::Result<()> {
+    #[cfg(not(target_os = "macos"))]
+    let _ = stream;
     #[cfg(target_os = "macos")]
     if matches!(&result, Err(error) if error.raw_os_error() == Some(libc::EINVAL)) {
         // XNU refuses new socket options after a full shutdown. The peer

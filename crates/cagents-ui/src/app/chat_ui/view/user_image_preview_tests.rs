@@ -126,10 +126,10 @@ fn click_prompt(renderer: &cosmic::Renderer, runtime: &Runtime, item: &chat::Ite
         .iter()
         .map(|message| match message {
             Message::ChatUi(Action::OpenImage(target, id)) => {
-                format!("OpenImage({target:?}, {id})")
+                format!("OpenImage({target:?}, {})", id.id)
             }
             Message::ChatUi(Action::LoadImage(target, id)) => {
-                format!("LoadImage({target:?}, {id})")
+                format!("LoadImage({target:?}, {})", id.id)
             }
             message => format!("{message:?}"),
         })
@@ -171,7 +171,7 @@ fn restored_user_image_opens_viewer_from_its_rendered_preview() {
     );
     assert!(matches!(messages.as_slice(),
         [Message::ChatUi(Action::OpenImage(target, id))]
-            if *target == runtime.target && id == &item.id));
+            if *target == runtime.target && id.id == item.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
@@ -314,7 +314,7 @@ fn selected_child_user_image_uses_its_own_preview_despite_parent_id_collision() 
         "{texts:?}"
     );
     assert!(matches!(messages.as_slice(),
-        [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id == &child.id));
+        [Message::ChatUi(Action::OpenImage(found, id))] if *found == target && id.id == child.id));
     let Message::ChatUi(open) = messages.into_iter().next().unwrap() else {
         unreachable!()
     };
@@ -389,7 +389,7 @@ fn a_wide_short_attachment_hugs_its_picture_with_no_caption_beneath() {
     );
     assert!(matches!(messages.as_slice(),
         [Message::ChatUi(Action::OpenImage(target, id))]
-            if *target == runtime.target && id == &item.id));
+            if *target == runtime.target && id.id == item.id));
 }
 
 #[test]

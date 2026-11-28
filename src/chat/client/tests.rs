@@ -596,16 +596,41 @@ fn a_switch_handshake_that_times_out_or_closes_is_typed_by_how_it_ended() {
     for (closes, expected) in [(false, Recovery::Unresponsive), (true, Recovery::Unreached)] {
         let (mut client, server) = UnixStream::pair().unwrap();
         client
-            .set_read_timeout(Some(Duration::from_millis(50)))
+            .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
         if closes {
             drop(server);
         }
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
-        let failure = receive_handshake(&mut client, &mut codec, 1, None)
-            .map_err(switch_unasked)
-            .unwrap_err();
+        let failure =
+            receive_handshake(&mut client, &mut codec, 1, None, Duration::from_millis(50))
+                .map_err(switch_unasked)
+                .unwrap_err();
         assert_eq!(failure.recovery, expected, "{failure:?}");
+    }
+}
+
+#[test]
+fn a_partial_connect_reply_obeys_the_chat_deadline() {
+    use std::io::Write;
+
+    for bytes in [&[0, 0][..], &[0, 0, 0, 32, 0][..]] {
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        server.write_all(bytes).unwrap();
+
+        let started = Instant::now();
+        let result = connect_handshake(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            None,
+            Duration::from_millis(50),
+        );
+
+        assert!(matches!(result, Err(HandshakeError::Unanswered(_))));
+        assert!(started.elapsed() < Duration::from_secs(1));
     }
 }
 
@@ -641,7 +666,7 @@ fn a_connected_reply_whose_body_proof_differs_from_its_envelope_is_refused() {
         )
         .unwrap();
     assert!(matches!(
-        receive_handshake(&mut client, &mut codec, 1, None),
+        receive_handshake(&mut client, &mut codec, 1, None, Duration::from_millis(50)),
         Err(HandshakeError::ProofChanged(None))
     ));
 }
@@ -674,7 +699,7 @@ fn a_connected_reply_with_matching_proofs_is_accepted() {
         )
         .unwrap();
     assert!(matches!(
-        receive_handshake(&mut client, &mut codec, 1, None),
+        receive_handshake(&mut client, &mut codec, 1, None, Duration::from_millis(50)),
         Ok(ServerResponse::Connected { .. })
     ));
 }
