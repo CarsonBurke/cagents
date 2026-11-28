@@ -22,6 +22,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -411,6 +412,24 @@ impl Census {
         record.aliases = self.aliases.clone();
         record.presentations = self.presentations.clone();
         record
+    }
+
+    fn with_historical_pages(&self) -> Cow<'_, Self> {
+        if self.snapshots.len() >= self.chats.len() {
+            return Cow::Borrowed(self);
+        }
+        let mut census = self.clone();
+        census.snapshots.extend(
+            self.chats
+                .iter()
+                .filter(|source| !self.snapshots.iter().any(|saved| &saved.source == *source))
+                .map(|source| super::floor::StoppedSnapshot {
+                    source: source.clone(),
+                    snapshot: crate::chat::Snapshot::default(),
+                    limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
+                }),
+        );
+        Cow::Owned(census)
     }
 
     /// Recovery later saves this capture's pages beside the stopped-pane
@@ -1339,19 +1358,8 @@ impl PendingRecovery {
             self.census.terminals = original.terminals;
             self.census.chats = original.chats;
         }
-        let missing: Vec<_> = self
-            .census
-            .chats
-            .iter()
-            .filter(|source| !self.census.snapshots.iter().any(|saved| &saved.source == *source))
-            .map(|source| super::floor::StoppedSnapshot {
-                source: source.clone(),
-                snapshot: crate::chat::Snapshot::default(),
-                limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
-            })
-            .collect();
-        if !missing.is_empty() {
-            self.census.snapshots.extend(missing);
+        if let Cow::Owned(census) = self.census.with_historical_pages() {
+            self.census = census.into();
         }
         self.census.freeze().map_err(|error| error.to_string())?;
         self.producer = Some(CaptureProducer::ExplicitCensus {
@@ -1398,6 +1406,22 @@ impl PendingRecovery {
         .is_some())
     }
 
+    fn bind_manual_census(&self) -> Result<(), String> {
+        self.census
+            .with_historical_pages()
+            .validate_capture(&self.source)?;
+        persist_bound_capture(
+            &self.checkpoint_path,
+            &CapturedCensus {
+                producer: self.producer.clone(),
+                source: self.source.clone(),
+                checkpoint_hash: Some(self.checkpoint_hash.clone()),
+                census: self.census.clone(),
+                windows: self.windows.clone(),
+            },
+        )
+    }
+
     pub(crate) fn authorize_manual(
         self,
         selected_hash: &str,
@@ -1430,19 +1454,7 @@ impl PendingRecovery {
         let bytes =
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
-        // The original complete capture is immutable. Installer recovery
-        // fills in missing historical pages before publishing its capture.
-        self.census.validate_capture(&self.source)?;
-        persist_bound_capture(
-            &self.checkpoint_path,
-            &CapturedCensus {
-                producer: self.producer.clone(),
-                source: self.source.clone(),
-                checkpoint_hash: Some(self.checkpoint_hash.clone()),
-                census: self.census.clone(),
-                windows: self.windows.clone(),
-            },
-        )?;
+        self.bind_manual_census()?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
         let cli =
@@ -3413,7 +3425,7 @@ fn validate_settled_identity(
             .parent()
             .ok_or("Prepared checkpoint has no directory")?,
     )?;
-    record.census.validate_evidence(&record.source)?;
+    let _ = record.recovery_census()?;
     record.validate_census()?;
     let layout = crate::update::locate(target).map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
@@ -4708,6 +4720,18 @@ fn validate_reviewed(
 }
 
 impl RecoveryRecord {
+    /// Derive the view used for recovery and its paused pages while preserving
+    /// the stored census that authorizes the request.
+    pub fn recovery_census(&self) -> Result<Cow<'_, Census>, String> {
+        let census = if matches!(self.origin, Origin::ExplicitRecovery { .. }) {
+            self.census.with_historical_pages()
+        } else {
+            Cow::Borrowed(&*self.census)
+        };
+        census.validate_evidence(&self.source)?;
+        Ok(census)
+    }
+
     fn normalized_issued_chat(&self, descriptor: &Session) -> Session {
         let mut normalized = descriptor.clone();
         let Some(after) = normalized.terminal.as_mut() else {

@@ -3192,6 +3192,113 @@ fn settled_files() -> SettledFiles {
     }
 }
 
+#[test]
+fn historical_prepared_missing_page_keeps_exact_manual_census() {
+    let mut files = settled_files();
+    let chat_root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(chat_root.path());
+    let (chat, _, _, _) = scale_chat(&preparation, 0, 0, 0);
+    let (captured_chat, snapshot, _, _) = scale_chat(&preparation, 1, 1, 8);
+    let mut pages = SnapshotCapture::default();
+    pages.push(captured_chat.clone(), snapshot).unwrap();
+    files.record.census.snapshots = pages.finish();
+    let captured_page = files.record.census.snapshots[0].clone();
+    files
+        .record
+        .census
+        .chats
+        .extend([chat.clone(), captured_chat.clone()]);
+    let original = serde_json::to_string(&files.record.census).unwrap();
+    let raw = format!(r#"{{"future_field": {{"counter": 1}}, {}"#, &original[1..]);
+    files.record.census = serde_json::from_str(&raw).unwrap();
+
+    let capture = CapturedCensus {
+        producer: Some(CaptureProducer::Acknowledged {
+            job: files.record.job.clone(),
+            request_hash: files.record.job_request_hash.clone(),
+        }),
+        source: files.record.source.clone(),
+        checkpoint_hash: Some(files.record.checkpoint_hash.clone()),
+        census: files.record.census.clone(),
+        windows: files.record.windows.clone(),
+    };
+    persist_bound_capture(&files.checkpoint, &capture).unwrap();
+    let capture_path = bound_capture_path(&files.checkpoint, &files.record.checkpoint_hash);
+    let capture_before = fs::read(&capture_path).unwrap();
+    let pending = PendingRecovery::inspect_at(&files.checkpoint)
+        .unwrap()
+        .unwrap();
+    assert!(pending.original_census_complete);
+    assert_eq!(pending.census.snapshots, [captured_page.clone()]);
+    pending.bind_manual_census().unwrap();
+    assert_eq!(fs::read(&capture_path).unwrap(), capture_before);
+    assert_eq!(pending.census.hash().unwrap(), digest(raw.as_bytes()));
+
+    assert!(files.record.recovery_census().is_err());
+    files.record.origin = Origin::ExplicitRecovery {
+        checkpoint: files.record.checkpoint_hash.clone(),
+    };
+    files.record.reviewed = None;
+    files
+        .record
+        .paused_chats
+        .extend([chat.id, captured_chat.id]);
+    let request = serde_json::to_vec(&ManualRequest {
+        version: 1,
+        job: files.record.job.clone(),
+        checkpoint: files.record.checkpoint_hash.clone(),
+        source: files.record.source.clone(),
+        target: files.target.clone(),
+        target_hash: files.record.target_hash.clone(),
+        census_hash: digest(raw.as_bytes()),
+        windows: files.record.windows.clone(),
+    })
+    .unwrap();
+    files.record.request_identity = digest(&request);
+    files
+        .record
+        .job_request_hash
+        .clone_from(&files.record.request_identity);
+    save(
+        &files
+            .root
+            .path()
+            .join("install/.update")
+            .join(format!("{}.request", files.record.job)),
+        &request,
+    );
+    validate_settled_record(
+        &files.record,
+        &files.checkpoint_bytes,
+        &files.checkpoint,
+        &files.target,
+    )
+    .unwrap();
+    let paused_view = files.record.recovery_census().unwrap();
+    assert_eq!(paused_view.snapshots.len(), 2);
+    assert_eq!(paused_view.snapshots[0], captured_page);
+    let page = paused_view.snapshots[1].clone();
+    assert_eq!(page.source, chat);
+    assert!(page.snapshot.items.is_empty());
+    assert!(page.snapshot.session_id.is_none());
+    assert!(
+        page.limitation
+            .as_deref()
+            .unwrap()
+            .contains("No transcript page was captured")
+    );
+    drop(paused_view);
+    assert_eq!(files.record.census.snapshots, [captured_page]);
+    assert_eq!(files.record.census.hash().unwrap(), digest(raw.as_bytes()));
+
+    let mut foreign = page.clone();
+    foreign.source.id = TerminalId::new();
+    for pages in [vec![page.clone(), page], vec![foreign]] {
+        files.record.census.snapshots = pages;
+        assert!(files.record.recovery_census().is_err());
+    }
+}
+
 fn complete_files(files: &SettledFiles) {
     let recovered = pending_retirement(&files.checkpoint, &files.target)
         .unwrap()
