@@ -2703,7 +2703,10 @@ impl Command {
             | Self::ReadTextCopy { .. }
             // The messages it hurries gave their work when they were queued,
             // and asking twice changes nothing.
-            | Self::SendQueuedNow => false,
+            | Self::SendQueuedNow
+            // A side question is answered beside the conversation: no turn
+            // starts, and nothing the provider does on it lasts.
+            | Self::SideQuestion(_) => false,
         }
     }
 
@@ -2736,7 +2739,8 @@ impl Command {
             | Self::ListBranches
             | Self::LoadLater
             | Self::ReadTextCopy { .. }
-            | Self::SendQueuedNow => false,
+            | Self::SendQueuedNow
+            | Self::SideQuestion(_) => false,
         }
     }
 }
@@ -2830,6 +2834,115 @@ pub enum Command {
     /// [`Capabilities::send_queued_now`] says so; [`Snapshot::send_now`]
     /// says how it went.
     SendQueuedNow,
+    /// Asks a question beside the conversation, answered from its context
+    /// without tools and kept out of its history: see [`SideQuestion`]. It
+    /// neither waits for nor interrupts a running turn. Carried only where
+    /// [`Capabilities::side_questions`] says so; the answer arrives as an
+    /// [`Event::SideAnswer`] under the same `id`.
+    SideQuestion(SideQuestion),
+}
+
+/// A question asked beside a conversation, the way Claude Code's `/btw` asks
+/// one: the provider answers it from the conversation's context in a single
+/// reply, uses no tools, and records neither the question nor the answer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideQuestion {
+    /// The asker's name for this question, which its answer carries back.
+    pub id: String,
+    pub question: String,
+    /// The side questions asked before this one in the same thread, oldest
+    /// first, so a follow-up can refer to them.
+    pub history: Vec<SideExchange>,
+}
+
+/// One side question and the answer it got.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideExchange {
+    pub question: String,
+    pub answer: String,
+}
+
+impl SideQuestion {
+    /// Why `provider` can't answer one here, for a person who asked.
+    pub fn unavailable(provider: crate::agent::Provider) -> &'static str {
+        use crate::agent::Provider;
+        match provider {
+            Provider::Claude => {
+                "This version of Claude Code can't answer side questions. Update it to 2.1.268 or later."
+            }
+            Provider::Codex => "Codex can't answer side questions in this conversation.",
+            Provider::Antigravity => {
+                "Antigravity can't answer side questions here. Its agent server has no way to ask one."
+            }
+            Provider::Muse => {
+                "Muse can't answer side questions here. Its agent server has no way to ask one."
+            }
+            Provider::Omp => {
+                "OMP can't answer side questions here. Its /btw works only in the OMP terminal app."
+            }
+        }
+    }
+    /// The longest question, in bytes, the composer sends.
+    pub const MAX_QUESTION: usize = 16 * 1024;
+    /// How many earlier exchanges a follow-up carries.
+    pub const MAX_HISTORY: usize = 8;
+    /// The most bytes of earlier exchanges a follow-up carries.
+    pub const MAX_HISTORY_BYTES: usize = 256 * 1024;
+
+    /// Refuses a question no provider should be sent.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.id.is_empty() || self.id.len() > 128 {
+            return Err("Malformed side question identifier");
+        }
+        if self.question.trim().is_empty() {
+            return Err("Write a question after /btw");
+        }
+        if self.question.len() > Self::MAX_QUESTION {
+            return Err("This side question is too long");
+        }
+        let bytes: usize = self
+            .history
+            .iter()
+            .map(|exchange| exchange.question.len() + exchange.answer.len())
+            .sum();
+        if self.history.len() > Self::MAX_HISTORY || bytes > Self::MAX_HISTORY_BYTES {
+            return Err("This side question carries too much earlier conversation");
+        }
+        Ok(())
+    }
+}
+
+/// What became of a [`SideQuestion`]. It is shown beside the conversation and
+/// never enters its transcript, snapshot or history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SideAnswer {
+    /// The [`SideQuestion::id`] it answers.
+    pub id: String,
+    pub outcome: SideOutcome,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SideOutcome {
+    /// The provider's answer, as Markdown.
+    Answered(String),
+    /// Why there is no answer, in words for the person who asked.
+    Failed(String),
+}
+
+impl SideAnswer {
+    pub fn answered(id: impl Into<String>, text: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            outcome: SideOutcome::Answered(text.into()),
+        }
+    }
+
+    pub fn failed(id: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            outcome: SideOutcome::Failed(reason.into()),
+        }
+    }
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -3854,6 +3967,14 @@ pub struct Capabilities {
         skip_serializing_if = "crate::terminal_ipc::before_queue_holds"
     )]
     pub queue_holds: bool,
+    /// Whether [`Command::SideQuestion`] is carried: the provider can answer
+    /// a question from the conversation's context beside it, without tools
+    /// and without recording it.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_side_questions"
+    )]
+    pub side_questions: bool,
 }
 
 /// Omit capabilities appended after the recipient's protocol version.
@@ -3867,9 +3988,12 @@ impl Serialize for Capabilities {
 impl<'de> Deserialize<'de> for Capabilities {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
-            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 2));
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 3));
         }
         if crate::terminal_ipc::decoding_before(crate::terminal_ipc::QUEUE_HOLDS) {
+            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 2));
+        }
+        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SIDE_QUESTIONS) {
             return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
         }
         Self::deserialize(deserializer)
@@ -4266,6 +4390,11 @@ pub enum Event {
         from: String,
         into: String,
     },
+    /// The answer to a [`Command::SideQuestion`]. The runtime hands it to the
+    /// surfaces and keeps it out of the snapshot and the store, so it is
+    /// never serialized.
+    #[serde(skip)]
+    SideAnswer(SideAnswer),
 }
 
 #[cfg(feature = "host")]
@@ -4560,6 +4689,44 @@ mod retained_native_pair_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_side_question_is_refused_before_it_reaches_a_provider() {
+        use super::{Command, SideExchange, SideQuestion};
+        let question = |id: &str, text: &str, history: usize, answer: usize| SideQuestion {
+            id: id.into(),
+            question: text.into(),
+            history: (0..history)
+                .map(|_| SideExchange {
+                    question: "q".into(),
+                    answer: "a".repeat(answer),
+                })
+                .collect(),
+        };
+        assert!(question("id", "why?", SideQuestion::MAX_HISTORY, 1).validate().is_ok());
+        assert!(question("", "why?", 0, 0).validate().is_err());
+        assert!(question(&"x".repeat(129), "why?", 0, 0).validate().is_err());
+        assert!(question("id", "   ", 0, 0).validate().is_err());
+        assert!(
+            question("id", &"x".repeat(SideQuestion::MAX_QUESTION + 1), 0, 0)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            question("id", "why?", SideQuestion::MAX_HISTORY + 1, 1)
+                .validate()
+                .is_err()
+        );
+        assert!(
+            question("id", "why?", 2, SideQuestion::MAX_HISTORY_BYTES / 2)
+                .validate()
+                .is_err()
+        );
+        // Neither asking nor answering is work or a file query.
+        let command = Command::SideQuestion(question("id", "why?", 0, 0));
+        assert!(!command.gives_work());
+        assert!(!command.queries_file_changes());
+    }
+
     #[test]
     fn transcript_part_ids_round_trip_and_reject_partial_claims() {
         let part = super::TranscriptPart {

@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 224,
+    proven_at: 225,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -185,6 +185,16 @@ pub fn before_acp_reasoning_observations<T>(_: &T) -> bool {
     encoding_before(ACP_REASONING_OBSERVATIONS)
 }
 
+/// The first protocol whose chat capabilities say whether the provider answers
+/// side questions, and which carries the answers to them. A client before it
+/// is sent the capabilities it knows and never an answer.
+pub const SIDE_QUESTIONS: u16 = 225;
+
+/// Omit the trailing side-question capability from older wire layouts.
+pub fn before_side_questions<T>(_: &T) -> bool {
+    encoding_before(SIDE_QUESTIONS)
+}
+
 /// Reads a struct whose last `omitted` fields a source from before the
 /// protocol that added them never encoded. Postcard reads a struct as a tuple
 /// of its fields, so the struct is read as a tuple of the fields that source
@@ -277,6 +287,11 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
     ),
     ("cagents::chat::Capabilities", &["queue_holds"], QUEUE_HOLDS),
     (
+        "cagents::chat::Capabilities",
+        &["side_questions"],
+        SIDE_QUESTIONS,
+    ),
+    (
         "cagents::workspace_model::WorkspaceModel",
         &["project_order"],
         PROJECT_ORDER,
@@ -337,6 +352,11 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         SEND_QUEUED_NOW,
     ),
     ("cagents::chat::Capabilities", &["queue_holds"], QUEUE_HOLDS),
+    (
+        "cagents::chat::Capabilities",
+        &["side_questions"],
+        SIDE_QUESTIONS,
+    ),
 ];
 
 /// Variants a later protocol appended that a client from before it is sent as

@@ -141,6 +141,7 @@ pub(in crate::app) use update_recovery::UpdateWait;
 mod scroll;
 mod selectable_prose;
 mod selection;
+mod side_question;
 mod step;
 mod stopped;
 mod text_copy;
@@ -568,6 +569,10 @@ pub enum Action {
     DismissRestoredWaiting(Target),
     /// Puts away the composer's note of something that didn't happen.
     DismissComposerNote(Target),
+    /// The provider took a side question, by its identifier, or refused it.
+    SideQuestionSent(Target, String, Result<(), String>),
+    DismissSideQuestion(Target),
+    CopySideAnswer(Target),
     /// Moves a draft just opened on a provider Accounts finds missing, if it
     /// is still untouched.
     MoveDraftOffMissingProvider(Target),
@@ -1089,6 +1094,9 @@ impl Action {
             Self::SendQueuedNow(..) => "SendQueuedNow",
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
             Self::DismissComposerNote(..) => "DismissComposerNote",
+            Self::SideQuestionSent(..) => "SideQuestionSent",
+            Self::DismissSideQuestion(..) => "DismissSideQuestion",
+            Self::CopySideAnswer(..) => "CopySideAnswer",
             Self::MoveDraftOffMissingProvider(..) => "MoveDraftOffMissingProvider",
             Self::ComposerActions(..) => "ComposerActions",
             Self::ComposerActionsQuery(..) => "ComposerActionsQuery",
@@ -3916,6 +3924,8 @@ pub(super) struct Runtime {
     /// changes or goes, the model or launch it answered changes, or a real
     /// failure of the same attachment replaces it on the error card.
     composer_note: Option<String>,
+    /// The `/btw` card docked on the composer, while it is open.
+    side_question: Option<side_question::Thread>,
     /// What dictation shows in this composer, and the download's progress
     /// when that is what it shows.
     dictation: Option<dictation::Pane>,
@@ -5629,6 +5639,7 @@ impl Runtime {
             warm: None,
             error: None,
             composer_note: None,
+            side_question: None,
             dictation: None,
             dictation_progress: None,
             capacity_refusal: None,
@@ -15988,6 +15999,10 @@ impl Cagents {
                         }
                         return Task::none();
                     }
+                    Wake::SideAnswer(answer) => {
+                        self.side_answered(target, answer);
+                        return Task::none();
+                    }
                     wake => wake,
                 };
                 // Ready refreshes the new handle. An early disconnect
@@ -16041,6 +16056,7 @@ impl Cagents {
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
+                        runtime.side_question_lost();
                     }
                     if let Some((name, source)) = current
                         .filter(|_| needs_name)
@@ -16231,7 +16247,9 @@ impl Cagents {
                         }
                         runtime.disconnected = true;
                         runtime.error = Some(error);
+                        runtime.side_question_lost();
                     }
+                    Wake::SideAnswer(_) => return Task::none(),
                 }
                 let session = runtime.session.clone();
                 self.commit_chat_session(target.card, session);
@@ -16721,6 +16739,11 @@ impl Cagents {
                             || runtime.provider_coming_up()))
                 {
                     return Task::none();
+                }
+                // A side question goes beside whatever the conversation is
+                // doing: no account routing, queue or wait for the turn.
+                if side_question::invocation(&runtime.composer.text()).is_some() {
+                    return self.ask_side_question(target);
                 }
                 if let Some((account, generation, revision)) =
                     self.automatic_chat_account(target, mode)
@@ -18230,6 +18253,11 @@ impl Cagents {
                     runtime.composer_note = None;
                 }
             }
+            Action::SideQuestionSent(target, id, result) => {
+                self.side_question_sent(target, &id, result);
+            }
+            Action::DismissSideQuestion(target) => return self.dismiss_side_question(target),
+            Action::CopySideAnswer(target) => return self.copy_side_answer(target),
             Action::MoveDraftOffMissingProvider(target) => {
                 if matches!(self.cards.get(&target.card),
                     Some(CardRuntime::Chat(runtime)) if runtime.target == target)

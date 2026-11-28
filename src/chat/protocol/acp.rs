@@ -2174,6 +2174,10 @@ impl Adapter for Acp {
             Command::LoadEarlier => Err(format!(
                 "{label} loads a resumed conversation completely when it opens."
             )),
+            // ACP has no request for a question beside the conversation.
+            Command::SideQuestion(_) => Err(format!(
+                "{label} can't answer side questions here. Its agent server has no way to ask one."
+            )),
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
             Command::ReadTextCopy { .. } => {
                 Err("Text copies are served by the transcript cache".into())

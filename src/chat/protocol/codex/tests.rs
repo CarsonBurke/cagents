@@ -2362,6 +2362,8 @@ fn adapter() -> Codex {
         suggestion_turn: None,
         prediction_turn: None,
         predictions_unsupported: false,
+        latest_turn: None,
+        samples_unsupported: false,
         subagent_status: None,
         subagent_waiting: false,
         subagent_detail: String::new(),
@@ -8214,4 +8216,123 @@ fn tracked_compaction_defers_to_native_queue_writes_and_releases_for_direct_inpu
             assert!(ack.compaction.is_none());
         }
     }
+}
+
+fn side_question(id: &str, text: &str) -> chat::SideQuestion {
+    chat::SideQuestion {
+        id: id.into(),
+        question: text.into(),
+        history: vec![chat::SideExchange {
+            question: "earlier question".into(),
+            answer: "earlier answer".into(),
+        }],
+    }
+}
+
+fn side_answers(step: &Step) -> Vec<&chat::SideAnswer> {
+    step.events
+        .iter()
+        .filter_map(|event| match event {
+            Event::SideAnswer(answer) => Some(answer),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_side_question_samples_the_running_turn_without_joining_it() {
+    let mut current = adapter();
+    assert!(current.capabilities().side_questions);
+    // Nothing to sample before the thread has a turn.
+    assert!(
+        current
+            .command(Command::SideQuestion(side_question("early", "why?")))
+            .is_err()
+    );
+    current
+        .receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn-running","status":"inProgress","items":[]}}}))
+        .unwrap();
+    let step = current
+        .command(Command::SideQuestion(side_question("q1", "which test failed?")))
+        .unwrap();
+    let [request] = step.writes.as_slice() else {
+        panic!("{:?}", step.writes);
+    };
+    assert_eq!(request["method"], "thread/sample");
+    let params = &request["params"];
+    assert_eq!(params["threadId"], "thread-exact");
+    assert_eq!(params["expectedTurnId"], "turn-running");
+    assert_eq!(params["allowInProgressTurn"], true);
+    let prompt = params["prompt"].as_str().unwrap();
+    assert!(prompt.contains("which test failed?"), "{prompt}");
+    assert!(prompt.contains("earlier answer"), "{prompt}");
+    assert!(prompt.contains("Do not use tools"), "{prompt}");
+    // The turn keeps running, and the question is nobody's message.
+    assert!(step.events.is_empty(), "{:?}", step.events);
+
+    let step = current
+        .receive(json!({"id":request["id"],"result":{"responseId":"r","sourceTurnId":"turn-running","text":"`parses_config`"}}))
+        .unwrap();
+    assert_eq!(
+        side_answers(&step),
+        vec![&chat::SideAnswer::answered("q1", "`parses_config`")]
+    );
+}
+
+#[test]
+fn a_sample_that_reached_for_a_tool_or_failed_says_so_to_its_asker() {
+    let mut current = adapter();
+    current
+        .receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn","status":"inProgress","items":[]}}}))
+        .unwrap();
+    let ask = |current: &mut Codex, id: &str| {
+        current
+            .command(Command::SideQuestion(side_question(id, "why?")))
+            .unwrap()
+            .writes
+            .remove(0)
+    };
+    let request = ask(&mut current, "tool");
+    let step = current
+        .receive(json!({"id":request["id"],"result":{"responseId":"r","sourceTurnId":"turn","text":null}}))
+        .unwrap();
+    assert!(
+        matches!(&side_answers(&step)[0].outcome, chat::SideOutcome::Failed(reason) if reason.contains("tool"))
+    );
+
+    let request = ask(&mut current, "busy");
+    let step = current
+        .receive(json!({"id":request["id"],"error":{"code":-32000,"message":"rate limited"}}))
+        .unwrap();
+    assert_eq!(
+        side_answers(&step),
+        vec![&chat::SideAnswer::failed(
+            "busy",
+            "Codex couldn't answer: rate limited"
+        )]
+    );
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Error { .. }))
+    );
+
+    // A server without the method stops offering side questions.
+    let request = ask(&mut current, "old");
+    let step = current
+        .receive(json!({"id":request["id"],"error":{"code":-32601,"message":"unknown method"}}))
+        .unwrap();
+    assert!(matches!(
+        &side_answers(&step)[0].outcome,
+        chat::SideOutcome::Failed(_)
+    ));
+    assert!(step.events.iter().any(
+        |event| matches!(event, Event::Capabilities(capabilities) if !capabilities.side_questions)
+    ));
+    assert!(
+        current
+            .command(Command::SideQuestion(side_question("again", "why?")))
+            .is_err()
+    );
 }

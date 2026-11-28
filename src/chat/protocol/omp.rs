@@ -1023,6 +1023,7 @@ impl Adapter for Omp {
                 return Err("File changes are served by the transcript cache".into()),
             Command::LoadLater => return Err("Newer history is served by the transcript cache".into()),
             Command::LoadEarlier => return Err("OMP history is loaded completely during connection.".into()),
+            Command::SideQuestion(_) => return Err(crate::chat::SideQuestion::unavailable(crate::agent::Provider::Omp).into()),
             Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),
             Command::RefreshPermissions | Command::UpdatePermissionSettings { .. } => return Err("Permission rule settings are available for Claude sessions".into()),
             Command::Slash{command} => {let mut request=self.request("prompt");request["message"]=command.into();step.writes.push(request);}
