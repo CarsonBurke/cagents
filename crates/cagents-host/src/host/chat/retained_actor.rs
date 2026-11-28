@@ -1193,8 +1193,8 @@ pub(super) fn reconcile_startup_for_start(
         return Ok(true);
     }
     use chat::protocol::SetupError;
-    let pending = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let (pending, _cleanup) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
@@ -1213,10 +1213,15 @@ pub(super) fn reconcile_startup_for_start(
                 "The exact retained startup is still transitioning".into(),
             ));
         }
-        (pending.source.clone(), pending.context.clone())
+        let pending = pending.clone();
+        // Hold the same fence as Close while proving and releasing the failed
+        // startup. A concurrent Close must keep its receipt through retirement.
+        let cleanup = super::capacity::Reservation::closing(host, &mut state, &pending.source)
+            .map_err(|error| SetupError::Unavailable(error.message))?;
+        (pending, cleanup)
     };
-    prove_startup_cleanup(&pending.1).map_err(SetupError::Unavailable)?;
-    forget_startup(host, &pending.0, &pending.1);
+    prove_startup_cleanup(&pending.context).map_err(SetupError::Unavailable)?;
+    forget_startup(host, &pending.source, &pending.context);
     Ok(true)
 }
 

@@ -15,11 +15,16 @@ struct StartupFailure {
     provider: Mutex<Option<Handle>>,
     attempts: AtomicUsize,
     ready: AtomicBool,
+    before_cleanup: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl LaunchCleanup for StartupFailure {
     fn cleanup(&self) -> Result<LaunchOutcome, String> {
         let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+        let before_cleanup = self.before_cleanup.lock().unwrap().take();
+        if let Some(before_cleanup) = before_cleanup {
+            before_cleanup();
+        }
         if self.ready.load(Ordering::Relaxed) {
             self.provider.lock().unwrap().as_ref().unwrap().cleanup()
         } else if attempt == 0 {
@@ -141,6 +146,23 @@ fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
     assert!(!host.lock().unwrap().chats.contains_key(&source.id));
 
     failure.ready.store(true, Ordering::Relaxed);
+    let closing_host = host.clone();
+    let closing_source = source.clone();
+    *failure.before_cleanup.lock().unwrap() = Some(Box::new(move || {
+        assert!(
+            close_retained_from_pane(&closing_host, &closing_source)
+                .unwrap_err()
+                .contains("another transition is pending"),
+            "Close must wait for the retry's exact cleanup claim",
+        );
+        assert!(
+            closing_host
+                .lock()
+                .unwrap()
+                .native_actor_startups
+                .contains_key(&closing_source.id)
+        );
+    }));
     assert!(matches!(
         start().unwrap(),
         ServerResponse::ChatAttached { .. }
