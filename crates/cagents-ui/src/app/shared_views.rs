@@ -4095,6 +4095,7 @@ impl Cagents {
                 }
             }
         }
+        let mut detached_aliases = HashSet::new();
         for (scope, alias, shared, move_draft) in adoptions {
             if self.shared_views.blocked.contains(&scope) {
                 continue;
@@ -4130,8 +4131,18 @@ impl Cagents {
                 self.carry_draft_model(alias, shared.id);
                 self.forget_adopted_chat_alias(alias);
             }
+            // A draft start rollback can capture the workspace during
+            // detach. It sees all earlier removals and this alias's current
+            // membership, just as it does when there is only one alias.
+            if !detached_aliases.is_empty() && self.has_draft_start_capture(alias) {
+                self.remove_shared_channel_members(|id| detached_aliases.contains(id));
+                detached_aliases.clear();
+            }
             self.detach_shared_pane(alias);
-            self.remove_shared_channel_member(alias);
+            detached_aliases.insert(alias);
+        }
+        if !detached_aliases.is_empty() {
+            self.remove_shared_channel_members(|id| detached_aliases.contains(id));
         }
     }
 
@@ -4242,18 +4253,15 @@ enum AliasResolution {
 impl Cagents {
     /// Removing an alias or moving a pane to a worktree must leave a valid
     /// saved channel even when its now-empty inactive view needs no projection.
-    fn remove_shared_channel_member(&mut self, id: CardId) {
-        if !self
-            .durable
-            .channels
-            .iter()
-            .any(|channel| channel.focused == Some(id) || channel.cards.contains(&id))
-        {
+    fn remove_shared_channel_members(&mut self, remove: impl Fn(&CardId) -> bool) {
+        if !self.durable.channels.iter().any(|channel| {
+            channel.focused.as_ref().is_some_and(&remove) || channel.cards.iter().any(&remove)
+        }) {
             return;
         }
         for channel in &mut Arc::make_mut(&mut self.durable).channels {
-            channel.cards.retain(|card| *card != id);
-            if channel.focused == Some(id) {
+            channel.cards.retain(|id| !remove(id));
+            if channel.focused.as_ref().is_some_and(&remove) {
                 channel.focused = channel.cards.first().copied();
             }
         }
@@ -4372,7 +4380,7 @@ impl Cagents {
         view: &View,
         owned: &HashSet<CardId>,
         listed: &HashSet<CardId>,
-        mut current: Vec<CardId>,
+        current: Vec<CardId>,
     ) -> Task<Message> {
         let index = match &view.scope {
             Scope::Channel(id) => {
@@ -4413,7 +4421,6 @@ impl Cagents {
         let mut tasks = Vec::new();
         let mut user_titles_changed = false;
         let mut retained_upgrades = Vec::new();
-        let local_order = current.clone();
         let local_members = current.iter().copied().collect::<HashSet<_>>();
         for id in current.iter().copied() {
             if self.chat_is_unused_default(id) && view.panes.is_empty() {
@@ -4506,7 +4513,6 @@ impl Cagents {
             }
             self.retain_local_pane(id);
         }
-        current.extend(retained_upgrades);
         for shared in &view.panes {
             if self.shared_views.quarantined.contains(&shared.id) {
                 // A new terminal its view accepted and fences waits for no
@@ -4530,7 +4536,7 @@ impl Cagents {
                     projected.to_mut().scope = Some(path.clone());
                 }
                 self.worktree_owners.insert(projected.id, path.clone());
-                self.remove_shared_channel_member(projected.id);
+                self.remove_shared_channel_members(|id| *id == projected.id);
             }
 
             if let CardKind::Repository(repository) = &projected.kind {
@@ -4603,13 +4609,13 @@ impl Cagents {
             if self.shared_upgrade_target_changed(pane) {
                 let (pending, saved_copy) = self.preserve_pending_shared_upgrade(pane.id);
                 tasks.push(pending);
-                current.extend(saved_copy);
+                retained_upgrades.extend(saved_copy);
             }
             self.prepare_shared_chat_upgrade(pane);
             if self.chat_awaiting_admission(pane.id) {
                 let (task, saved_copy) = self.admit_shared_chat(pane);
                 tasks.push(task);
-                current.extend(saved_copy);
+                retained_upgrades.extend(saved_copy);
             }
             let keep_live = self.observe_terminal_save(pane);
             if !keep_live {
@@ -4852,7 +4858,7 @@ impl Cagents {
             local.user_title = self.chrome_ui.user_titles.get(&id).cloned();
             Some(local)
         };
-        let mut strip = view
+        let strip = view
             .panes
             .iter()
             .filter_map(|pane| {
@@ -4866,56 +4872,39 @@ impl Cagents {
             })
             .collect::<Vec<_>>();
         let shared = strip.iter().map(|pane| pane.id).collect::<HashSet<_>>();
-        let retained = current
-            .into_iter()
-            .filter(|id| {
-                (self.shared_views.quarantined.contains(id) && !shared.contains(id))
-                    || self.shared_views.retained.contains(id)
-                    || self.reopen_pending(*id)
-                    || self.awaits_first_publication(*id, view)
-                    || (view.panes.is_empty() && self.chat_is_unused_default(*id))
-                    || self
-                        .card_state(*id)
-                        .is_some_and(|card| card.kind.is_utility())
-            })
-            .collect::<Vec<_>>();
-        let mut visible = strip.iter().map(|pane| pane.id).collect::<Vec<_>>();
-        let mut held = Vec::new();
-        for id in retained {
-            // A fenced card the view does not place keeps its local place:
-            // after the nearest card it followed here. So does a pane still
-            // reopening, which is not shared until it starts, and a chat yet
-            // to be published, rather than jumping to the end of the strip
-            // meanwhile.
-            if shared.contains(&id)
-                || !(self.shared_views.quarantined.contains(&id)
-                    || self.reopen_pending(id)
-                    || self.awaits_first_publication(id, view))
-            {
-                visible.push(id);
+        let mut preceding = None;
+        let mut retained = Vec::new();
+        let mut held_after = HeldPanes::new();
+        for id in current {
+            if shared.contains(&id) {
+                // The canonical strip already places this member, even when
+                // it still has local retention state.
+                preceding = Some(id);
                 continue;
             }
-            let before = local_order
-                .iter()
-                .position(|prior| *prior == id)
-                .unwrap_or(local_order.len());
-            let place = local_order[..before]
-                .iter()
-                .rev()
-                .find_map(|prior| visible.iter().position(|placed| placed == prior))
-                .map_or(0, |index| index + 1);
-            visible.insert(place, id);
-            held.extend(local_pane(id));
+            // A fenced, reopening or unpublished card the view does not
+            // place stays beside its nearest earlier visible local card.
+            let keeps_place = self.shared_views.quarantined.contains(&id)
+                || self.reopen_pending(id)
+                || self.awaits_first_publication(id, view);
+            if keeps_place {
+                let previous = held_after.insert(preceding, (id, local_pane(id)));
+                debug_assert!(previous.is_none(), "a local member has one successor");
+            } else if self.shared_views.retained.contains(&id)
+                || (view.panes.is_empty() && self.chat_is_unused_default(id))
+                || self
+                    .card_state(id)
+                    .is_some_and(|card| card.kind.is_utility())
+            {
+                retained.push(id);
+            } else {
+                continue;
+            }
+            preceding = Some(id);
         }
-        // The strip shows held cards too, in their visible order.
-        for pane in held {
-            let place = visible
-                .iter()
-                .take(visible.iter().position(|id| *id == pane.id).unwrap_or(0))
-                .filter(|id| strip.iter().any(|placed| placed.id == **id))
-                .count();
-            strip.insert(place, Cow::Owned(pane));
-        }
+        // A newly retained copy was not in the original local order.
+        retained.extend(retained_upgrades);
+        let (visible, strip) = merge_held_panes(strip, retained, held_after);
         if let Some(index) = index {
             let channel = &self.durable.channels[index];
             let focused = channel
@@ -5364,6 +5353,40 @@ impl Cagents {
         );
         let _ = self.workspace.arrange(cards);
     }
+}
+
+type HeldPanes = HashMap<Option<CardId>, (CardId, Option<Pane>)>;
+
+/// A held pane follows its local predecessor, which may itself be held.
+/// Keep visible-only IDs as anchors without giving them strip descriptors.
+fn merge_held_panes<'a>(
+    strip: Vec<Cow<'a, Pane>>,
+    retained: Vec<CardId>,
+    mut held_after: HeldPanes,
+) -> (Vec<CardId>, Vec<Cow<'a, Pane>>) {
+    if held_after.is_empty() {
+        let visible = strip.iter().map(|pane| pane.id).chain(retained).collect();
+        return (visible, strip);
+    }
+    let mut visible = Vec::with_capacity(strip.len() + retained.len() + held_after.len());
+    let mut projected = Vec::with_capacity(strip.len() + held_after.len());
+    let rows = std::iter::once((None, None))
+        .chain(strip.into_iter().map(|pane| (Some(pane.id), Some(pane))))
+        .chain(retained.into_iter().map(|id| (Some(id), None)));
+    for (mut anchor, pane) in rows {
+        visible.extend(anchor);
+        projected.extend(pane);
+        while let Some((id, pane)) = held_after.remove(&anchor) {
+            visible.push(id);
+            projected.extend(pane.map(Cow::Owned));
+            anchor = Some(id);
+        }
+    }
+    debug_assert!(
+        held_after.is_empty(),
+        "all held panes have a visible predecessor"
+    );
+    (visible, projected)
 }
 
 // A layout snapshot can predate a runtime exit. Missing recipe metadata cannot

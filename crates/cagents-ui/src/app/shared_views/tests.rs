@@ -5857,6 +5857,75 @@ fn a_peer_closing_the_focused_pane_leaves_a_focus_storage_accepts() {
 }
 
 #[test]
+fn held_panes_follow_local_predecessors_when_shared_panes_reorder() {
+    let (mut app, channel, _, template) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(channel);
+    let panes: [_; 7] = std::array::from_fn(|_| {
+        let mut pane = template.clone();
+        pane.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut pane.kind {
+            browser.id = BrowserId::new();
+        }
+        pane
+    });
+    let [
+        leading,
+        first,
+        held,
+        held_next,
+        last,
+        local,
+        held_after_local,
+    ] = panes.each_ref().map(|pane| pane.id);
+    let mut view = View::empty(channel);
+    view.panes = panes.to_vec();
+    app.workspace_model.views = vec![view.clone()];
+    drop(app.reconcile_shared_views());
+    app.shared_views
+        .quarantined
+        .extend([leading, held, held_next, held_after_local]);
+    app.retain_local_pane(first);
+    app.retain_local_pane(local);
+    view.panes = vec![panes[4].clone(), panes[1].clone()];
+    app.workspace_model.views = vec![view.clone()];
+    app.shared_views.applying = true;
+    drop(app.project_shared_view(&view, &HashSet::from([first, last])));
+
+    let order = [
+        leading,
+        last,
+        first,
+        held,
+        held_next,
+        local,
+        held_after_local,
+    ];
+    assert_eq!(app.durable.channels[0].cards, order);
+    let durable_order = app
+        .durable
+        .cards
+        .iter()
+        .map(|card| card.id)
+        .filter(|id| order.contains(id))
+        .collect::<Vec<_>>();
+    assert_eq!(durable_order, order);
+    assert_eq!(
+        app.workspace.order().collect::<Vec<_>>(),
+        [
+            leading,
+            last,
+            first,
+            held,
+            held_next,
+            held_after_local,
+            local
+        ]
+    );
+    crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
+}
+
+#[test]
 fn a_peer_editing_many_panes_rebuilds_the_strip_once() {
     let (mut app, a, _, first) = fixture();
     app.active_workspace = Some(PathBuf::from("/repo"));
@@ -6824,6 +6893,52 @@ fn repository_refresh_adopts_cross_repository_alias_without_losing_its_draft() {
             .map(String::as_str),
         Some("saved cross-repository draft  ")
     );
+}
+
+#[test]
+fn adopting_several_aliases_keeps_inactive_channel_members_and_focus_valid() {
+    let (mut app, source, destination, survivor) = fixture();
+    app.active_workspace = Some(PathBuf::from("/repo"));
+    Arc::make_mut(&mut app.durable).active_channel = Some(source);
+    let mut source_view = View::empty(source);
+    source_view.panes.push(survivor.clone());
+    drop(app.project_shared_view(&source_view, &HashSet::from([survivor.id])));
+
+    let mut destination_view = View::empty(destination);
+    let mut aliases = Vec::new();
+    for _ in 0..2 {
+        let terminal = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(terminal, None));
+        let alias = app.workspace.focused().unwrap();
+        aliases.push(alias);
+        let mut canonical = Pane::from_card(app.card_state(alias).unwrap(), None).unwrap();
+        canonical.id = CardId::new();
+        destination_view.panes.push(canonical);
+    }
+    let mut destination_focus = survivor.clone();
+    destination_focus.id = CardId::new();
+    if let CardKind::Browser(browser) = &mut destination_focus.kind {
+        browser.id = BrowserId::new();
+    }
+    let mut existing = View::empty(destination);
+    existing.panes.push(destination_focus.clone());
+    drop(app.project_shared_view(&existing, &HashSet::from([destination_focus.id])));
+    destination_view.panes.push(destination_focus.clone());
+    let owned = destination_view.panes.iter().map(|pane| pane.id).collect();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.active_channel = None;
+    durable.channels[0].focused = Some(aliases[0]);
+    app.active_workspace = None;
+    app.prepare_shared_aliases(&[destination_view], &owned);
+
+    assert_eq!(app.durable.channels[0].cards, [survivor.id]);
+    assert_eq!(app.durable.channels[0].focused, Some(survivor.id));
+    assert_eq!(app.durable.channels[1].cards, [destination_focus.id]);
+    assert_eq!(app.durable.channels[1].focused, Some(destination_focus.id));
+    for alias in aliases {
+        assert!(!app.card_state(alias).unwrap().existence.is_open());
+    }
+    crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
 }
 
 #[test]
