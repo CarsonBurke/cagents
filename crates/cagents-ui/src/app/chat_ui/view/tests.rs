@@ -96,11 +96,8 @@ fn attachment_refusal_is_an_inline_composer_notice_with_only_dismiss() {
         "notice renders with no staged attachments"
     );
     assert!(
-        !texts
-            .0
-            .iter()
-            .any(|(text, _)| text == "Review the details before trying again."),
-        "attachment refusal does not render the general failure card"
+        runtime.failure_ui.incidents.is_empty(),
+        "attachment refusal does not render a failure notice"
     );
     let accessible =
         element

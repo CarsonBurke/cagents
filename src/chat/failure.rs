@@ -105,11 +105,24 @@ pub enum FailureKind {
 
 /// Opens the runtime's report of a provider that memory exhaustion ended.
 /// The runtime composes these; they are not provider text.
-pub const PROVIDER_OUT_OF_MEMORY: &str = "The system ran out of memory, so the agent was stopped.";
+pub const PROVIDER_OUT_OF_MEMORY: &str =
+    "The computer ran out of memory, so the agent was stopped.";
 /// Opens the runtime's report of a command that memory exhaustion ended
 /// while its provider kept running.
 pub const COMMAND_OUT_OF_MEMORY: &str =
+    "The computer ran out of memory, so one of the agent's commands was stopped.";
+/// How earlier builds opened the same reports. An agent kept running across
+/// an update may still report with them.
+const LEGACY_PROVIDER_OUT_OF_MEMORY: &str =
+    "The system ran out of memory, so the agent was stopped.";
+const LEGACY_COMMAND_OUT_OF_MEMORY: &str =
     "The system ran out of memory, so a command the agent started was stopped.";
+
+/// Whether `report` is the runtime's report of a command memory exhaustion
+/// ended, in this build's words or an earlier one's.
+fn reports_command_out_of_memory(report: &str) -> bool {
+    report.starts_with(COMMAND_OUT_OF_MEMORY) || report.starts_with(LEGACY_COMMAND_OUT_OF_MEMORY)
+}
 /// Opens the runtime's report of a provider process that exited on its own.
 pub const PROVIDER_EXITED: &str = "Provider exited with ";
 
@@ -149,7 +162,7 @@ pub mod actor_transport {
 /// conversation. It still gets its notice in the transcript, but the
 /// conversation's state does not become an error.
 pub fn is_notice(message: &str) -> bool {
-    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY) || answers_one_send(message)
+    reports_command_out_of_memory(message.trim_start()) || answers_one_send(message)
 }
 
 /// Whether `message` answers one send and leaves the conversation as it
@@ -288,9 +301,11 @@ impl<'a> Failure<'a> {
             kind
         } else if timed_out.is_some() {
             FailureKind::Unresponsive
-        } else if runtime_report.starts_with(PROVIDER_OUT_OF_MEMORY) {
+        } else if runtime_report.starts_with(PROVIDER_OUT_OF_MEMORY)
+            || runtime_report.starts_with(LEGACY_PROVIDER_OUT_OF_MEMORY)
+        {
             FailureKind::OutOfMemory
-        } else if runtime_report.starts_with(COMMAND_OUT_OF_MEMORY) {
+        } else if reports_command_out_of_memory(runtime_report) {
             FailureKind::CommandOutOfMemory
         } else if super::no_allowance_reason(provider, runtime_report).is_some() {
             // Before limits: the provider's reason may mention its quota.
@@ -389,31 +404,33 @@ impl<'a> Failure<'a> {
             ),
             FailureKind::Capacity => (
                 format!("{name} is temporarily at capacity"),
-                "Try again when the provider is available.",
+                "Try again in a few minutes.",
             ),
             FailureKind::Connection => (
                 format!("{name} connection was interrupted"),
-                "Check the connection before retrying.",
+                "Check your internet connection, then try again.",
             ),
             FailureKind::Interrupted => (
                 format!("{name} request was interrupted"),
-                "Review the retained work before continuing.",
+                "Check what was done before you continue.",
             ),
             FailureKind::OutOfMemory => (
-                format!("{program} stopped because the system ran out of memory"),
-                "The system stopped the agent to keep the computer responsive. Free up memory before you resume the conversation.",
+                format!("{program} stopped because the computer ran out of memory"),
+                "Free up some memory, then resume the conversation.",
             ),
             FailureKind::CommandOutOfMemory => (
                 // Its step reads "failed", as the agent reported it: this
                 // says why, in the same word.
-                "A command failed because the system ran out of memory".to_owned(),
-                "The system stopped the command to free memory. The agent is still running and sees the failure.",
+                "A command failed because the computer ran out of memory".to_owned(),
+                // Shown for as long as the notice is, so it must stay true
+                // after the agent finishes.
+                "The agent was told the command failed.",
             ),
             FailureKind::Exited => (
                 exit_summary(program, &signal),
-                // The stopped chat's bar offers what fits, Resume or Try
-                // again; this only says where the cause is.
-                "Details show what the agent reported before it stopped.",
+                // The stopped chat's controls offer what fits, Resume or Try
+                // again, and the notice's details hold what it reported.
+                "",
             ),
             FailureKind::Unresponsive => (
                 if timed_out == Some(true) {
@@ -1496,7 +1513,7 @@ mod tests {
         assert!(failure.action.contains("resume"), "{}", failure.action);
         assert_eq!(
             failure.summary,
-            "Claude Code stopped because the system ran out of memory"
+            "Claude Code stopped because the computer ran out of memory"
         );
         assert_eq!(failure.details, oom);
 
@@ -1508,13 +1525,29 @@ mod tests {
         // The stopped command's step reads "failed"; the card agrees.
         assert_eq!(
             failure.summary,
-            "A command failed because the system ran out of memory"
+            "A command failed because the computer ran out of memory"
         );
-        assert!(
-            failure.action.contains("still running"),
-            "{}",
-            failure.action
-        );
+        // The agent carries on, and the notice outlives its work: no
+        // claim that it is still working.
+        assert_eq!(failure.action, "The agent was told the command failed.");
+        // An agent kept running across an update reports in the words an
+        // earlier build used, which read the same.
+        for (legacy, kind) in [
+            (
+                "The system ran out of memory, so the agent was stopped. systemd-oomd ended it. Provider exited with signal: 9 (SIGKILL)",
+                FailureKind::OutOfMemory,
+            ),
+            (
+                "The system ran out of memory, so a command the agent started was stopped. systemd-oomd ended it; the agent is still running.",
+                FailureKind::CommandOutOfMemory,
+            ),
+        ] {
+            assert_eq!(
+                Failure::parse(Provider::Claude, legacy).map(|failure| failure.kind),
+                Some(kind)
+            );
+            assert_eq!(is_notice(legacy), kind == FailureKind::CommandOutOfMemory);
+        }
 
         for (raw, summary) in [
             (

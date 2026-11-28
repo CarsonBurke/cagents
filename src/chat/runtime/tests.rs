@@ -1075,7 +1075,7 @@ fn each_check_that_finds_stopped_commands_gives_a_new_notice() {
     assert_eq!(
         first,
         format!(
-            "{} systemd-oomd ended it (3 processes); the agent is still running.",
+            "{} systemd-oomd ended it (3 processes); the agent carried on.",
             super::super::failure::COMMAND_OUT_OF_MEMORY
         )
     );

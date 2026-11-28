@@ -371,6 +371,20 @@ impl<'a> VirtualRows<'a> {
             0.0,
         )
     }
+    /// A row built now under a key of its own, so its measured height stays
+    /// with it as rows are added around it, reached through `aliases` while
+    /// it is not drawn.
+    fn push_keyed(
+        &mut self,
+        (key, revision, estimate): (u64, u64, f32),
+        aliases: Vec<iced::advanced::widget::Id>,
+        rhythm: Rhythm,
+        row: Element<'a, Message>,
+    ) -> usize {
+        let mut row = virtualized::Row::once(key, revision, estimate, None, move || row);
+        row.aliases = aliases;
+        self.append(row, Some(rhythm), 0.0)
+    }
     fn lazy(
         &mut self,
         key: u64,
@@ -435,6 +449,20 @@ thread_local! {
 
 /// Sets a gap's key apart from the key of the row it precedes.
 const GAP_KEY: u64 = 0x9e37_79b9_7f4a_7c15;
+
+/// How many of an exchange's rows a notice at item `at` follows, given the
+/// first item each row draws, in drawing order: every row up to the last
+/// that holds an item at or before it. A notice with no item follows them
+/// all.
+fn notice_rows_before(firsts: &[usize], at: Option<usize>) -> usize {
+    match at {
+        None => firsts.len(),
+        Some(at) => firsts
+            .iter()
+            .rposition(|first| *first <= at)
+            .map_or(0, |row| row + 1),
+    }
+}
 
 /// One row an exchange contributes to the transcript.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -3131,16 +3159,6 @@ impl Runtime {
             });
             let mut builder = selection::Catalog::builder();
             if let Some(agent) = selected {
-                for incident in self.failure_ui.incidents.iter().filter(|incident| {
-                    self.incident_has_child_detail(incident, &agent.id)
-                        && !agent.items.iter().any(|item| {
-                            self.failure_ui
-                                .child_item(&agent.id, &item.id)
-                                .is_some_and(|(found, _)| found.key == incident.key)
-                        })
-                }) {
-                    self.selection_failure(&mut builder, incident);
-                }
                 for item in items {
                     if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id)
                     {
@@ -3151,6 +3169,17 @@ impl Runtime {
                     }
                     self.selection_item(&mut builder, item, turn::slot_of(item), true);
                 }
+                // After the subagent's work, as its transcript draws them.
+                for incident in self.failure_ui.incidents.iter().filter(|incident| {
+                    self.incident_has_child_detail(incident, &agent.id)
+                        && !agent.items.iter().any(|item| {
+                            self.failure_ui
+                                .child_item(&agent.id, &item.id)
+                                .is_some_and(|(found, _)| found.key == incident.key)
+                        })
+                }) {
+                    self.selection_failure(&mut builder, incident);
+                }
             } else {
                 for incident in self.failure_ui.incidents.iter().filter(|incident| {
                     !incident.active_recovery
@@ -3160,30 +3189,49 @@ impl Runtime {
                     self.selection_failure(&mut builder, incident);
                 }
                 for turn in &self.turns {
-                    for index in &turn.prompt {
-                        if let Some(item) = items.get(*index) {
-                            self.selection_item(&mut builder, item, turn::Slot::Prose, true);
+                    // What the exchange draws, row by row as the transcript
+                    // draws it, with its notices among the rows as they are
+                    // placed there. A closed strip of steps selects none.
+                    let steps_shown = self.steps_shown(turn);
+                    let notices = self.placed_turn_notices(turn);
+                    let select_notices = |builder: &mut selection::DocumentBuilder, rows| {
+                        for (_, incident) in notices.iter().filter(|(before, _)| *before == rows) {
+                            self.selection_failure(builder, incident);
                         }
-                    }
-                    if self.steps_shown(turn) {
-                        for placed in &turn.steps {
-                            if let Some(item) = items.get(placed.index) {
-                                self.selection_item(&mut builder, item, placed.slot, true);
+                    };
+                    select_notices(&mut builder, 0);
+                    let mut rows = 0;
+                    self.for_each_turn_part(turn, |placement| match placement {
+                        // An item with no row yet, such as one still being
+                        // prepared, is selected as its part of the exchange
+                        // is: a prompt or prose always, a step only while the
+                        // steps are open.
+                        Placement::Unplaced(item) => {
+                            let is =
+                                |index: usize| items.get(index).is_some_and(|it| it.id == item.id);
+                            let slot = if turn.prompt.iter().any(|index| is(*index)) {
+                                Some(turn::Slot::Prose)
+                            } else if let Some(placed) =
+                                turn.prose.iter().find(|placed| is(placed.index))
+                            {
+                                Some(placed.slot)
+                            } else {
+                                steps_shown.then(|| turn::slot_of(item))
+                            };
+                            if let Some(slot) = slot {
+                                self.selection_item(&mut builder, item, slot, true);
                             }
                         }
-                    }
-                    for placed in &turn.prose {
-                        if let Some(item) = items.get(placed.index) {
-                            self.selection_item(&mut builder, item, placed.slot, true);
+                        Placement::Row(part, _) => {
+                            for (index, slot) in self.turn_part_items(turn, part, steps_shown) {
+                                if let Some(item) = items.get(index) {
+                                    self.selection_item(&mut builder, item, slot, true);
+                                }
+                            }
+                            rows += 1;
+                            select_notices(&mut builder, rows);
                         }
-                    }
-                    for incident in self.failure_ui.incidents.iter().filter(|incident| {
-                        !incident.active_recovery
-                            && incident.child_scope.is_none()
-                            && incident.anchor.as_ref() == Some(&turn.key)
-                    }) {
-                        self.selection_failure(&mut builder, incident);
-                    }
+                    });
                 }
                 if let Some(local) = self.local_prompt()
                     && let Some(prepared) = &local.presentation.prepared
@@ -3549,22 +3597,6 @@ impl Runtime {
             if let Some(placeholder) = child_placeholder(agent) {
                 transcript.push(transcript_body(placeholder, target));
             }
-            for incident in self
-                .failure_ui
-                .incidents
-                .iter()
-                .filter(|incident| self.incident_has_child_detail(incident, &agent.id))
-            {
-                let has_item = agent.items.iter().any(|item| {
-                    self.failure_ui
-                        .child_item(&agent.id, &item.id)
-                        .is_some_and(|(found, _)| found.key == incident.key)
-                });
-                if !has_item {
-                    transcript
-                        .push(self.failure_view_with_reset(incident, reset_controls.as_ref()));
-                }
-            }
             let mut gallery_rest = 0;
             for (index, item) in agent.items.iter().enumerate() {
                 // Drawn already, as a tile of the gallery before it.
@@ -3574,12 +3606,12 @@ impl Runtime {
                 }
                 if let Some((incident, first)) = self.failure_ui.child_item(&agent.id, &item.id) {
                     if first {
-                        transcript.push(
-                            widget::container(
-                                self.failure_view_with_reset(incident, reset_controls.as_ref()),
-                            )
-                            .id(self.find_anchor(&item.id))
-                            .into(),
+                        let anchor = self.find_anchor(&item.id);
+                        self.push_notice_row(
+                            &mut transcript,
+                            incident,
+                            reset_controls.as_ref(),
+                            anchor,
                         );
                     }
                     continue;
@@ -3739,6 +3771,23 @@ impl Runtime {
                 );
                 let _ = row_index; // Virtual placeholder bounds supply item anchors.
             }
+            // How the subagent itself ended, when no item of its own carries
+            // it: after the work it did, where it happened.
+            for incident in self
+                .failure_ui
+                .incidents
+                .iter()
+                .filter(|incident| self.incident_has_child_detail(incident, &agent.id))
+            {
+                let has_item = agent.items.iter().any(|item| {
+                    self.failure_ui
+                        .child_item(&agent.id, &item.id)
+                        .is_some_and(|(found, _)| found.key == incident.key)
+                });
+                if !has_item {
+                    self.push_notice(&mut transcript, incident, reset_controls.as_ref());
+                }
+            }
         } else {
             if snapshot.has_earlier {
                 transcript.push(paging_view(
@@ -3785,13 +3834,7 @@ impl Runtime {
                 );
             }
             for incident in self.failure_ui.incidents.iter().filter(unanchored) {
-                transcript.push(
-                    widget::container(
-                        self.failure_view_with_reset(incident, reset_controls.as_ref()),
-                    )
-                    .id(self.find_anchor(&format!("failure:{}", incident.key)))
-                    .into(),
-                );
+                self.push_notice(&mut transcript, incident, reset_controls.as_ref());
             }
             // Each row an exchange draws, and the gap above it.
             transcript.children.reserve(
@@ -3801,26 +3844,14 @@ impl Runtime {
                     .sum(),
             );
             for turn in &self.turns {
-                self.push_turn_rows(
+                self.push_turn_rows_noticed(
                     &mut transcript,
                     turn,
                     content_width,
                     markdown_settings,
                     dark,
+                    reset_controls.as_ref(),
                 );
-                for incident in self.failure_ui.incidents.iter().filter(|incident| {
-                    !incident.active_recovery
-                        && incident.child_scope.is_none()
-                        && incident.anchor.as_ref() == Some(&turn.key)
-                }) {
-                    transcript.push(
-                        widget::container(
-                            self.failure_view_with_reset(incident, reset_controls.as_ref()),
-                        )
-                        .id(self.find_anchor(&format!("failure:{}", incident.key)))
-                        .into(),
-                    );
-                }
             }
             if !snapshot.has_later
                 && snapshot.activity() == crate::agent::ActivityState::Idle
@@ -6188,7 +6219,200 @@ impl Runtime {
         settings: markdown::Settings,
         dark: bool,
     ) {
+        self.push_turn_rows_with(transcript, turn, content_width, settings, dark, None);
+    }
+
+    /// An exchange's rows with the notices of what happened during it, each
+    /// after the row of the item it happened at, so they read in order with
+    /// the exchange's work rather than after all of it.
+    fn push_turn_rows_noticed<'a>(
+        &'a self,
+        transcript: &mut VirtualRows<'a>,
+        turn: &'a turn::Turn,
+        content_width: f32,
+        settings: markdown::Settings,
+        dark: bool,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) {
+        self.push_turn_rows_with(
+            transcript,
+            turn,
+            content_width,
+            settings,
+            dark,
+            Some(reset_controls),
+        );
+    }
+
+    /// The notices drawn in the main transcript's exchange `turn`.
+    fn turn_notices<'s>(
+        &'s self,
+        turn: &'s turn::Turn,
+    ) -> impl Iterator<Item = &'s failure::Incident> + 's {
+        self.failure_ui.incidents.iter().filter(move |incident| {
+            !incident.active_recovery
+                && incident.child_scope.is_none()
+                && incident.anchor.as_ref() == Some(&turn.key)
+        })
+    }
+
+    /// Every item a row of `turn` draws, with its slot, in drawing order.
+    /// A closed strip of steps draws none of its items' text.
+    fn turn_part_items(
+        &self,
+        turn: &turn::Turn,
+        part: TurnPart,
+        steps_shown: bool,
+    ) -> Vec<(usize, turn::Slot)> {
+        match part {
+            TurnPart::Prompt(index) => vec![(index, turn::Slot::Prose)],
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
+                vec![(turn.prose[prose].index, turn.prose[prose].slot)]
+            }
+            TurnPart::Gallery {
+                prompt: true,
+                start,
+                len,
+            } => turn.prompt[start..start + len]
+                .iter()
+                .map(|index| (*index, turn::Slot::Prose))
+                .collect(),
+            TurnPart::Gallery { start, len, .. } => turn.prose[start..start + len]
+                .iter()
+                .map(|placed| (placed.index, placed.slot))
+                .collect(),
+            TurnPart::Steps if steps_shown => turn
+                .steps
+                .iter()
+                .map(|placed| (placed.index, placed.slot))
+                .collect(),
+            TurnPart::Steps => Vec::new(),
+        }
+    }
+
+    /// The first item, in the transcript's order, that a row of `turn`
+    /// draws.
+    fn turn_part_first(&self, turn: &turn::Turn, part: TurnPart) -> usize {
+        match part {
+            TurnPart::Prompt(index) => index,
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => turn.prose[prose].index,
+            TurnPart::Gallery {
+                prompt: true,
+                start,
+                ..
+            } => turn.prompt[start],
+            TurnPart::Gallery { start, .. } => turn.prose[start].index,
+            TurnPart::Steps => turn
+                .steps
+                .iter()
+                .filter(|placed| {
+                    self.snapshot
+                        .items
+                        .get(placed.index)
+                        .is_some_and(|item| self.failure_ui.item(&item.id).is_none())
+                })
+                .map(|placed| placed.index)
+                .min()
+                .unwrap_or(usize::MAX),
+        }
+    }
+
+    /// How many rows an exchange draws.
+    #[cfg(test)]
+    pub(super) fn turn_row_count(&self, turn: &turn::Turn) -> usize {
+        let mut rows = 0;
+        self.for_each_turn_part(turn, |placement| {
+            if matches!(placement, Placement::Row(..)) {
+                rows += 1;
+            }
+        });
+        rows
+    }
+
+    /// The notices of `turn`, each with the number of its rows drawn before
+    /// it: those up to the last, in drawing order, that holds an item at or
+    /// before the notice's own. A notice with no item of its own follows
+    /// them all.
+    pub(super) fn placed_turn_notices<'s>(
+        &'s self,
+        turn: &'s turn::Turn,
+    ) -> Vec<(usize, &'s failure::Incident)> {
+        let mut notices = self.turn_notices(turn).peekable();
+        if notices.peek().is_none() {
+            return Vec::new();
+        }
+        let mut firsts = Vec::new();
+        self.for_each_turn_part(turn, |placement| {
+            if let Placement::Row(part, _) = placement {
+                firsts.push(self.turn_part_first(turn, part));
+            }
+        });
+        notices
+            .map(|incident| (notice_rows_before(&firsts, incident.at), incident))
+            .collect()
+    }
+
+    /// Draws `incident`'s notice as a row of the transcript, a line of the
+    /// timeline or a card set apart from it.
+    fn push_notice<'a>(
+        &self,
+        transcript: &mut VirtualRows<'a>,
+        incident: &failure::Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) {
+        let anchor = self.find_anchor(&format!("failure:{}", incident.key));
+        self.push_notice_row(transcript, incident, reset_controls, anchor);
+    }
+
+    /// Draws `incident`'s notice as a row keyed by the incident, reached
+    /// through `anchor` whether or not it is drawn.
+    fn push_notice_row<'a>(
+        &self,
+        transcript: &mut VirtualRows<'a>,
+        incident: &failure::Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+        anchor: iced::advanced::widget::Id,
+    ) {
         use std::hash::{Hash, Hasher};
+        let (notice, card) = self.failure_notice(incident, reset_controls);
+        let open = self.failure_ui.expanded.contains(&incident.key);
+        let mut key = crate::fingerprint::hasher();
+        ("notice", &incident.key).hash(&mut key);
+        let mut revision = crate::fingerprint::hasher();
+        (self.failure_ui.revision, open, card).hash(&mut revision);
+        let estimate = match (card, open) {
+            (true, _) => 120.0,
+            (false, true) => 140.0,
+            (false, false) => TIMELINE_ROW,
+        };
+        transcript.push_keyed(
+            (key.finish(), revision.finish(), estimate),
+            vec![anchor.clone()],
+            if card { Rhythm::Opening } else { Rhythm::Line },
+            widget::container(notice).id(anchor).into(),
+        );
+    }
+
+    fn push_turn_rows_with<'a>(
+        &'a self,
+        transcript: &mut VirtualRows<'a>,
+        turn: &'a turn::Turn,
+        content_width: f32,
+        settings: markdown::Settings,
+        dark: bool,
+        notices: Option<Option<&crate::app::account_ui::resets::Controls>>,
+    ) {
+        use std::hash::{Hash, Hasher};
+        let placed = match notices {
+            Some(_) => self.placed_turn_notices(turn),
+            None => Vec::new(),
+        };
+        let reset_controls = notices.flatten();
+        let push_notices = |transcript: &mut VirtualRows<'a>, before: usize| {
+            for (_, incident) in placed.iter().filter(|(rows, _)| *rows == before) {
+                self.push_notice(transcript, incident, reset_controls);
+            }
+        };
         let items = &self.snapshot.items;
         let now = self.source_now_ms();
         let mut common = self.turn_common_hasher(turn, dark);
@@ -6288,6 +6512,9 @@ impl Runtime {
                 (_, Some(item)) => row_estimate(item, rhythm, footer, content_width),
                 (_, None) => TIMELINE_ROW,
             };
+            if rows == 0 {
+                push_notices(transcript, 0);
+            }
             rows += 1;
             let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
             transcript.lazy(
@@ -6303,6 +6530,7 @@ impl Runtime {
                     })
                 },
             );
+            push_notices(transcript, rows);
         });
         if rows == 0 {
             // An exchange that draws nothing yet is still reached through a
@@ -6319,6 +6547,7 @@ impl Runtime {
                 0.0,
                 || widget::Space::new().into(),
             );
+            push_notices(transcript, 0);
         }
     }
 
