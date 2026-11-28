@@ -930,8 +930,10 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
                         .into_iter()
                         .filter_map(|(index, _)| items.get(index))
                         .map(|item| {
-                            let cached =
-                                runtime.presentation_cache().get(&item.id).filter(|cached| {
+                            let cached = runtime
+                                .presentation_cache()
+                                .get(runtime.cache_key(item))
+                                .filter(|cached| {
                                     cached
                                         .item
                                         .as_ref()
@@ -1033,10 +1035,7 @@ impl Runtime {
             .map(|(_, plans)| plans.clone())
             .unwrap_or_default();
         for plan in plans.iter() {
-            if self
-                .active_item(&plan.id)
-                .is_none_or(|item| plan.source.as_ptr() != Arc::as_ptr(item))
-            {
+            if self.find_plan_item(plan).is_none() {
                 continue;
             }
             if self.selected_subagent.is_some() {
@@ -1049,6 +1048,13 @@ impl Runtime {
         }
         self.find_anchor(key)
     }
+
+    fn find_plan_item(&self, plan: &ItemPlan) -> Option<&Arc<chat::Item>> {
+        self.active_items()?
+            .iter()
+            .find(|item| plan.source.as_ptr() == Arc::as_ptr(item))
+    }
+
     pub(super) fn apply_find_plan(&mut self, key: &str) {
         let plans = self
             .find_navigation
@@ -1072,17 +1078,26 @@ impl Runtime {
             if !in_group {
                 continue;
             }
-            let Some(item) = self
-                .active_item(&plan.id)
-                .cloned()
-                .filter(|item| plan.source.as_ptr() == Arc::as_ptr(item))
-            else {
+            let Some(item) = self.find_plan_item(plan).cloned() else {
                 continue;
             };
             if self.reveal_failure_for_find(&plan.id).is_some() {
                 continue;
             }
-            let changed = if let Some(child) = &child {
+            let changed = if requires_row_identity(&self.colliding_row_ids, &item.id) {
+                let row = self.row_target(&item);
+                for part in plan
+                    .parts
+                    .iter()
+                    .filter_map(|key| key.rsplit_once('#').map(|(_, part)| part))
+                {
+                    if !self.row_part_unfolded(&item, part) {
+                        self.find_unfolded_rows
+                            .insert((row.clone(), part.to_owned()));
+                    }
+                }
+                plan.expand && !self.row_expanded(&item) && self.find_expanded_rows.insert(row)
+            } else if let Some(child) = &child {
                 let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
                 for part in &plan.parts {
                     disclosure.part(part, self.child_unfolded.entry(child.clone()).or_default());
@@ -1110,24 +1125,26 @@ impl Runtime {
                 prepare_reports = true;
                 continue;
             }
+            let cache_key = self.cache_key(&item);
             if changed
                 && !self
                     .presentation_cache()
-                    .get(&plan.id)
+                    .get(cache_key)
                     .is_some_and(|cached| cached.preparing)
                 && (CachedItem::prose(&item.content).is_none()
                     || self
                         .presentation_cache()
-                        .get(&plan.id)
+                        .get(cache_key)
                         .is_some_and(|cached| cached.coordination.is_some()))
             {
                 let theme = self.syntax_theme;
+                let cache_key = cache_key.to_owned();
                 let cache = self.presentation_cache_mut();
-                let previous = cache.remove(&plan.id);
-                cache.insert(
-                    plan.id.clone(),
-                    CachedItem::updated(&item.content, theme, previous, true, false, None),
-                );
+                let previous = cache.remove(&cache_key);
+                let mut cached =
+                    CachedItem::updated(&item.content, theme, previous, true, false, None);
+                cached.item = Some(item);
+                cache.insert(cache_key, cached);
             }
         }
         if prepare_reports {
@@ -1855,12 +1872,15 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
                     .into_iter()
                     .filter_map(|(index, raw_disclosure)| {
                         let item = all.get(index)?.clone();
-                        let cached = runtime.presentation_cache().get(&item.id).filter(|cached| {
-                            cached
-                                .item
-                                .as_ref()
-                                .is_some_and(|shown| Arc::ptr_eq(shown, &item))
-                        });
+                        let cached = runtime
+                            .presentation_cache()
+                            .get(runtime.cache_key(&item))
+                            .filter(|cached| {
+                                cached
+                                    .item
+                                    .as_ref()
+                                    .is_some_and(|shown| Arc::ptr_eq(shown, &item))
+                            });
                         let mut tools: Vec<_> = tools(cached)
                             .map(|tool| (tool.find_identity(), tool.text.clone()))
                             .collect();
@@ -1961,7 +1981,7 @@ fn small_raw_work(runtime: &Runtime) -> bool {
                     .saturating_mul(8),
             );
         }
-        let cached = runtime.presentation_cache().get(&item.id);
+        let cached = runtime.presentation_cache().get(runtime.cache_key(item));
         for tool in tools(cached) {
             work = work.saturating_add(tool.text.len()).saturating_add(query);
         }

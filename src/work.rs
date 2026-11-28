@@ -233,6 +233,12 @@ pub enum Request {
     Remove(Box<Removal>),
     /// The snapshots earlier removals kept, newest first.
     Snapshots { scope: Scope },
+    /// A board interaction names the actual repository and card key.
+    PinCard {
+        repository: PathBuf,
+        key: ItemKey,
+        column: Option<Column>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -252,6 +258,10 @@ pub enum Response {
     WatchingConversation {
         revision: u64,
         pull_requests: Box<ConversationPullRequests>,
+    },
+    /// Boards published through this revision predate the saved pin.
+    PinSaved {
+        through_revision: u64,
     },
 }
 

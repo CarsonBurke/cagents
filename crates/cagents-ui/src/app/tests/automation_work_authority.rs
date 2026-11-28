@@ -9,7 +9,7 @@ use crate::{
         ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
         ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
     },
-    work::{Board, Column, Item, ItemKey, Request as WorkRequest, Response as WorkResponse, Scope},
+    work::{Board, Column, Item, ItemKey, Request as WorkRequest, Response as WorkResponse},
 };
 use cosmic::iced::futures::StreamExt;
 use std::{
@@ -190,8 +190,8 @@ impl Peer {
                     if !refuse_authentication {
                         assert_eq!(request.proof.as_ref(), Some(&proof()));
                         assert!(
-                            matches!(&request.request, ClientRequest::Work(actual) if actual == &WorkRequest::Pin {
-                                scope: Scope::Project(item().project), item: "branch:fix/scope".into(), column: Some(Column::Stale),
+                            matches!(&request.request, ClientRequest::Work(actual) if actual == &WorkRequest::PinCard {
+                                repository: item().project, key: item().key, column: Some(Column::Stale),
                             }),
                             "Pin must preserve its exact Work envelope"
                         );
@@ -201,7 +201,9 @@ impl Peer {
                             response(
                                 &mut peer,
                                 &request,
-                                ServerResponse::Work(WorkResponse::Pinned(Box::new(item()))),
+                                ServerResponse::Work(WorkResponse::PinSaved {
+                                    through_revision: 1,
+                                }),
                             );
                         }
                     }
@@ -301,7 +303,7 @@ fn exercise_app(role: &str) {
                 }
                 None
             }
-            Message::WorkUi(crate::work_ui::Action::Pinned(result)) => Some(result),
+            Message::WorkUi(crate::work_ui::Action::Pinned(_, result)) => Some(result),
             _ => panic!("unexpected owning completion"),
         };
         if let Some(result) = result {
@@ -311,7 +313,7 @@ fn exercise_app(role: &str) {
                     "Couldn't pin this card: this window's agent session isn't allowed to change Work."
                 );
             } else {
-                assert_eq!(result, &Ok(()));
+                assert_eq!(result.as_ref().unwrap().revision, 1);
             }
         }
         drop(app.update(completion));
@@ -336,7 +338,7 @@ fn exercise_app(role: &str) {
             Message::AutomationUi(crate::automation_ui::Action::Received { result, .. }) => {
                 result.as_ref().as_ref().unwrap_err().clone()
             }
-            Message::WorkUi(crate::work_ui::Action::Pinned(result)) => result.unwrap_err(),
+            Message::WorkUi(crate::work_ui::Action::Pinned(_, result)) => result.unwrap_err(),
             _ => panic!("unexpected owning completion"),
         };
         assert_eq!(
@@ -357,8 +359,12 @@ fn start(app: &mut Cagents, operation: Operation) -> Task<Message> {
         Operation::Automation => app.update_automation_ui(crate::automation_ui::Action::Refresh),
         Operation::Pin { .. } => {
             drop(app.update_work_ui(crate::work_ui::Action::Watched(
+                app.work_ui.pane(),
                 crate::work_ui::Watch::Board {
-                    revision: 1,
+                    version: crate::work_ui::BoardVersion {
+                        daemon: Arc::new(proof()),
+                        revision: 1,
+                    },
                     first: true,
                     board: Arc::new(Board {
                         generated_at_unix_ms: 1_000,

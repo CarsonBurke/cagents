@@ -24,15 +24,19 @@ const REFUSED_FOR: Duration = if cfg!(test) {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(super) enum CopyKey {
     /// An item's own Copy, in the row under it.
+    #[cfg(test)]
     Item(String),
     /// The Copy on one block of a step: its input, its output or a change.
+    #[cfg(test)]
     Block(String, CopyPart),
+    Row(RowTarget, CopyPart),
     /// A failure card's Copy details.
     Failure(String),
 }
 
 impl CopyKey {
     /// The control a copy of item `id`, or of its `part`, was made from.
+    #[cfg(test)]
     pub(super) fn of(id: String, part: Option<&CopyPart>) -> Self {
         match part {
             None | Some(CopyPart::Text) => Self::Item(id),
@@ -41,19 +45,32 @@ impl CopyKey {
     }
 
     /// Whether this is the control for item `id`, or for its `part`.
+    #[cfg(test)]
     pub(super) fn is(&self, id: &str, part: Option<&CopyPart>) -> bool {
         match (self, part) {
             (Self::Item(item), None | Some(CopyPart::Text)) => item == id,
             (Self::Block(item, block), Some(part)) => item == id && block == part,
+            (Self::Row(row, copied), part) => {
+                row.id == id && copied == part.unwrap_or(&CopyPart::Text)
+            }
             _ => false,
         }
     }
 
-    /// The item whose control this is, or "" for a failure card's.
-    pub(super) fn item(&self) -> &str {
+    fn owns_item(&self, runtime: &Runtime, item: &chat::Item) -> bool {
         match self {
-            Self::Item(id) | Self::Block(id, _) => id,
-            Self::Failure(_) => "",
+            Self::Row(row, _) => {
+                #[cfg(test)]
+                if row.test_by_id {
+                    return row.id == item.id;
+                }
+                row.is(item, runtime.selected_subagent.as_deref())
+            }
+            #[cfg(test)]
+            Self::Item(id) | Self::Block(id, _) => {
+                id == &item.id && !runtime.colliding_row_ids.contains(id)
+            }
+            Self::Failure(_) => false,
         }
     }
 }
@@ -157,8 +174,27 @@ impl Runtime {
     }
 
     /// What the Copy for item `id`, or for its `part`, shows.
+    #[cfg(test)]
     pub(super) fn copy_state(&self, id: &str, part: Option<&CopyPart>) -> CopyState {
         self.copy_state_where(|key| key.is(id, part))
+    }
+
+    pub(super) fn row_copy_state(&self, item: &chat::Item, part: Option<&CopyPart>) -> CopyState {
+        self.copy_state_where(|key| {
+            key.owns_item(self, item)
+                && match key {
+                    CopyKey::Row(_, copied) => copied == part.unwrap_or(&CopyPart::Text),
+                    #[cfg(test)]
+                    CopyKey::Item(_) | CopyKey::Block(..) => key.is(&item.id, part),
+                    CopyKey::Failure(_) => false,
+                }
+        })
+    }
+
+    pub(super) fn row_copy_feedback(&self, item: &chat::Item) -> Option<&CopyFeedback> {
+        self.copy_feedback
+            .as_ref()
+            .filter(|feedback| feedback.key.owns_item(self, item))
     }
 
     /// What failure `key`'s Copy details shows.
@@ -307,7 +343,7 @@ fn item_with_source<'a>(
 }
 
 impl Request {
-    fn read(self, target: Target, id: String) -> Task<Message> {
+    fn read(self, target: Target, row: RowTarget) -> Task<Message> {
         let handle = self.handle.clone();
         let source = self.source.clone();
         cosmic::task::future(async move {
@@ -315,7 +351,7 @@ impl Request {
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
-            Message::ChatUi(Action::MessageCopied(target, id, self, result))
+            Message::ChatUi(Action::MessageCopied(target, row, self, result))
         })
     }
 
@@ -587,7 +623,7 @@ impl Cagents {
     pub(super) fn start_message_copy(
         &mut self,
         target: Target,
-        id: String,
+        row: RowTarget,
         part: Option<CopyPart>,
         source: Option<chat::TextCopySource>,
     ) -> Task<Message> {
@@ -596,7 +632,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        let key = CopyKey::of(id.clone(), part.as_ref());
+        let key = CopyKey::Row(row.clone(), part.clone().unwrap_or(CopyPart::Text));
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
             return runtime.tell_copy(key, Some(UNAVAILABLE.into()));
         };
@@ -627,13 +663,13 @@ impl Cagents {
             prefix,
             retried: false,
         };
-        request.read(target, id)
+        request.read(target, row)
     }
 
     pub(super) fn finish_message_copy(
         &mut self,
         target: Target,
-        id: String,
+        row: RowTarget,
         request: Request,
         result: Result<String, String>,
     ) -> Task<Message> {
@@ -667,18 +703,18 @@ impl Cagents {
         let refused = result
             .as_ref()
             .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
-        let key = CopyKey::of(id.clone(), request.part.as_ref());
+        let key = CopyKey::Row(row.clone(), request.part.clone().unwrap_or(CopyPart::Text));
         if refused || !request.snapshot_is_current(&current_snapshot) {
             // It may have been accepted once, before its write found the
             // source changed.
             if runtime.copy_feedback_at(&key).is_some() {
                 runtime.copy_feedback = None;
             }
-            return match request.reread(&current_snapshot, &id) {
+            return match request.reread(&current_snapshot, &row.id) {
                 Some(reread)
                     if !request.retried && !(refused && reread.source == request.source) =>
                 {
-                    reread.read(target, id)
+                    reread.read(target, row)
                 }
                 Some(_) => runtime.tell_copy(key, Some(chat::TEXT_COPY_CHANGED.into())),
                 None => runtime.tell_copy(key, Some(UNAVAILABLE.into())),
@@ -686,7 +722,7 @@ impl Cagents {
         }
         match result {
             Ok(text) => Task::batch([
-                message_clipboard_write(target, id, request, text),
+                message_clipboard_write(target, row, request, text),
                 runtime.tell_copy(key, None),
             ]),
             Err(error) => runtime.tell_copy(key, Some(error)),
@@ -778,13 +814,13 @@ fn clipboard_write(
 /// rather than dropping the copy without a word.
 fn message_clipboard_write(
     target: Target,
-    id: String,
+    row: RowTarget,
     request: Request,
     text: String,
 ) -> Task<Message> {
-    let mut read = Some((id, request, text));
+    let mut read = Some((row, request, text));
     iced::Task::done(()).then(move |_| {
-        let Some((id, request, text)) = read.take() else {
+        let Some((row, request, text)) = read.take() else {
             return Task::none();
         };
         if !request.context.is_current(request.intent) {
@@ -793,7 +829,7 @@ fn message_clipboard_write(
         if !request.snapshot_is_current(&request.handle.snapshot()) {
             return cosmic::task::message(Message::ChatUi(Action::MessageCopied(
                 target,
-                id,
+                row,
                 request,
                 Ok(text),
             )));
@@ -945,7 +981,7 @@ mod tests {
                 else {
                     panic!("a changed copy reads again and writes nothing yet");
                 };
-                assert_eq!((read_target, id.as_str()), (target, "step"));
+                assert_eq!((read_target, id.id.as_str()), (target, "step"));
                 assert!(effects.next().await.is_none());
                 request
             })

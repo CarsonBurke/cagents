@@ -49,7 +49,6 @@ pub enum Command {
     Reconnect,
     Relaunch,
     CopyDetails,
-    Transcript,
     Folder,
     NewTerminal,
     Close,
@@ -57,6 +56,7 @@ pub enum Command {
 
 #[derive(Debug, Clone)]
 pub enum Action {
+    Reveal(Box<terminal_failure::TranscriptIntent>),
     User {
         card: CardId,
         request: uuid::Uuid,
@@ -74,7 +74,7 @@ pub enum Action {
 }
 impl Action {
     pub(super) fn is_user_action(&self) -> bool {
-        matches!(self, Self::User { .. })
+        matches!(self, Self::User { .. } | Self::Reveal(_))
     }
 }
 
@@ -604,6 +604,15 @@ impl Cagents {
     }
 
     pub(super) fn update_saved_terminal(&mut self, action: Action) -> Task<Message> {
+        if let Action::Reveal(intent) = action {
+            if !self.saved_terminal_diagnostics_allowed(intent.card())
+                || self.pane_close_owned(intent.card())
+                || self.refuse_for_deleting_card(intent.card())
+            {
+                return Task::none();
+            }
+            return self.update_terminal_failure(terminal_failure::Action::Reveal(intent));
+        }
         let Action::Inspected {
             card,
             source,
@@ -666,9 +675,6 @@ impl Cagents {
                     );
                     chat_ui::invalidate_copy_intent();
                     iced::clipboard::write(text).map(cosmic::Action::App)
-                }
-                Command::Transcript if self.saved_terminal_diagnostics_allowed(card) => {
-                    self.update_terminal_failure(terminal_failure::Action::Reveal(card))
                 }
                 Command::Folder => self.dispatch(Message::OpenRepository),
                 Command::NewTerminal => self.dispatch(Message::NewTerminal),
@@ -895,16 +901,16 @@ impl Cagents {
                 .into(),
         ]);
         let diagnostics = widget::flex_row(vec![
-            crate::ui_controls::button::secondary("Copy details")
-                .id(control_id("copy"))
-                .name("Copy saved terminal details")
-                .on_press(action(Command::CopyDetails))
-                .into(),
-            self.terminal_transcript_control(
-                card,
-                self.saved_terminal_diagnostics_allowed(card)
-                    .then(|| action(Command::Transcript)),
+            crate::ui_controls::owned(
+                (card, entry.request),
+                crate::ui_controls::button::secondary("Copy details")
+                    .id(control_id("copy"))
+                    .name("Copy saved terminal details")
+                    .on_press(action(Command::CopyDetails)),
             ),
+            self.terminal_transcript_control(card, |intent| {
+                Message::SavedTerminal(Action::Reveal(intent))
+            }),
         ])
         .spacing(space::S as u16);
         let directory_notice = match entry.directory {

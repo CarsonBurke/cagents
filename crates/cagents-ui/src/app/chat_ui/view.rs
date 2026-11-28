@@ -3371,7 +3371,7 @@ impl Runtime {
         if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
             if matches!(item.content, ItemContent::Text { .. }) {
                 if let Some(prompt) = self.prepared_prompt(item) {
-                    let text = prompt.shown(self.item_expanded(&item.id));
+                    let text = prompt.shown(self.row_expanded(item));
                     builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
                 }
             } else if matches!(item.content, ItemContent::Image { .. }) {
@@ -3387,7 +3387,7 @@ impl Runtime {
             }
             return;
         }
-        let Some(cached) = self.presentation_cache().get(&item.id) else {
+        let Some(cached) = self.presentation_cache().get(self.cache_key(item)) else {
             return;
         };
         if cached.placeholder {
@@ -3401,21 +3401,21 @@ impl Runtime {
                     kind: chat::DeliveryKind::Notice,
                     ..
                 }
-            ) && !self.item_expanded(&item.id)
+            ) && !self.row_expanded(item)
                 && !matches!(&item.content, ItemContent::Delivery { summary, .. } if summary.starts_with("Monitor event: "))
             {
                 return;
             }
-            literal.catalog(builder, item, self.item_expanded(&item.id));
+            literal.catalog(builder, item, self.row_expanded(item));
             return;
         }
         if literal_content::Prepared::required(&item.content) {
             return;
         }
-        if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
+        if slot == turn::Slot::Thinking && !self.row_expanded(item) {
             return;
         }
-        if matches!(item.content, ItemContent::Delivery { .. }) && !self.item_expanded(&item.id) {
+        if matches!(item.content, ItemContent::Delivery { .. }) && !self.row_expanded(item) {
             return;
         }
         if matches!(
@@ -3437,13 +3437,13 @@ impl Runtime {
         // open detail.
         if let Some(coordinated) = &cached.coordination
             && detail
-            && self.item_expanded(&item.id)
+            && self.row_expanded(item)
         {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
         }
-        if detail && self.item_expanded(&item.id) {
+        if detail && self.row_expanded(item) {
             if let Some(input) = &cached.tool_input {
                 builder.indexed(
                     &item.id,
@@ -3487,8 +3487,9 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let mut revision = crate::fingerprint::hasher();
         (
+            std::ptr::from_ref(item),
             cached.revision,
-            self.item_expanded(&item.id),
+            self.row_expanded(item),
             self.child_find_revision(),
             dark,
             cached.shows_figures().then(|| self.figures.version()),
@@ -3501,7 +3502,7 @@ impl Runtime {
                 cached.image_source.is_some(),
                 cached.image_wait.is_some(),
                 cached.image_unavailable,
-                self.preview_request.as_deref() == Some(item.id.as_str()),
+                self.preview_requested(item),
             )
                 .hash(&mut revision);
         }
@@ -3522,6 +3523,14 @@ impl Runtime {
                 reasoning_elapsed(&agent.items, index, finished, None),
             )
                 .hash(&mut revision);
+        }
+        self.row_copy_feedback(item)
+            .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
+            .hash(&mut revision);
+        if cached.coordination.is_some() {
+            let mut unfolded: Vec<_> = self.row_unfolded_parts(item).collect();
+            unfolded.sort_unstable();
+            unfolded.hash(&mut revision);
         }
         revision.finish()
     }
@@ -3723,7 +3732,7 @@ impl Runtime {
                     }
                     continue;
                 }
-                let Some(cached) = self.child_cache.get(&item.id) else {
+                let Some(cached) = self.child_cache.get(self.cache_key(item)) else {
                     continue;
                 };
                 // As in the lead's transcript, a thought with nothing to
@@ -3749,7 +3758,7 @@ impl Runtime {
                     let mut aliases = Vec::with_capacity(2 * run);
                     for (offset, picture) in pictures.iter().enumerate() {
                         picture.id.hash(&mut revision);
-                        if let Some(cached) = self.child_cache.get(&picture.id) {
+                        if let Some(cached) = self.child_cache.get(self.cache_key(picture)) {
                             self.child_item_revision(
                                 agent,
                                 index + offset,
@@ -3807,6 +3816,9 @@ impl Runtime {
                 use std::hash::{Hash, Hasher};
                 let mut key = crate::fingerprint::hasher();
                 ("selected-child-item", &item.id).hash(&mut key);
+                if self.colliding_row_ids.contains(&item.id) {
+                    index.hash(&mut key);
+                }
                 let revision = self.child_item_revision(
                     agent,
                     index,
@@ -3852,7 +3864,7 @@ impl Runtime {
                                     .filter(|coordinated| coordinated.is_card())
                                 {
                                     let raw = self
-                                        .item_expanded(&item.id)
+                                        .row_expanded(item)
                                         .then(|| self.step_detail(item, cached, markdown_settings));
                                     self.coordination_card(item, coordinated, raw)
                                 } else {
@@ -4254,7 +4266,7 @@ impl Runtime {
                                 }
                                 .is_some_and(|item| {
                                     self.presentation_cache()
-                                        .get(&item.id)
+                                        .get(self.cache_key(item))
                                         .is_none_or(|cached| cached.placeholder)
                                 })
                             }
@@ -4280,7 +4292,7 @@ impl Runtime {
                             .iter()
                             .filter(|item| {
                                 self.presentation_cache()
-                                    .get(&item.id)
+                                    .get(self.cache_key(item))
                                     .is_none_or(|cached| cached.placeholder)
                             })
                             .map(|item| item.id.as_str())
@@ -6865,7 +6877,7 @@ impl Runtime {
             let Some(item) = items.get(index) else {
                 continue;
             };
-            let cached = self.cache.get(&item.id);
+            let cached = self.cache.get(row_cache_key(&self.parent_cache_keys, item));
             // A delivery is drawn once its body is parsed, as an answer is.
             if matches!(item.content, ItemContent::Delivery { .. }) && cached.is_none() {
                 visit(Placement::Unplaced(item));
@@ -6907,7 +6919,7 @@ impl Runtime {
             };
             let cached = Some(item)
                 .filter(|item| self.failure_ui.item(&item.id).is_none())
-                .and_then(|item| self.cache.get(&item.id));
+                .and_then(|item| self.cache.get(row_cache_key(&self.parent_cache_keys, item)));
             visit(match cached {
                 Some(prepared)
                     if placed.slot == turn::Slot::Card && prepared.coordination.is_some() =>
@@ -6927,9 +6939,16 @@ impl Runtime {
         let mut key = crate::fingerprint::hasher();
         match part {
             TurnPart::Steps => (1u8, &turn.key).hash(&mut key),
-            TurnPart::Prompt(index) => (2u8, &self.snapshot.items[index].id).hash(&mut key),
-            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
-                (3u8, &self.snapshot.items[turn.prose[prose].index].id).hash(&mut key)
+            TurnPart::Prompt(index) | TurnPart::Card(index) | TurnPart::Prose(index) => {
+                let (kind, index) = match part {
+                    TurnPart::Prompt(_) => (2u8, index),
+                    _ => (3u8, turn.prose[index].index),
+                };
+                let item = &self.snapshot.items[index];
+                (kind, &item.id).hash(&mut key);
+                if self.colliding_row_ids.contains(&item.id) {
+                    index.hash(&mut key);
+                }
             }
             TurnPart::Gallery { .. } => (
                 4u8,
@@ -7016,7 +7035,7 @@ impl Runtime {
                     item.id.hash(&mut hasher);
                     coordinating |= self.hash_turn_item(
                         placed.index,
-                        self.cache.get(&item.id),
+                        self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
                         Some(placed.slot),
                         now,
                         &mut hasher,
@@ -7036,7 +7055,13 @@ impl Runtime {
                         continue;
                     };
                     item.id.hash(&mut hasher);
-                    self.hash_turn_item(index, self.cache.get(&item.id), None, now, &mut hasher);
+                    self.hash_turn_item(
+                        index,
+                        self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
+                        None,
+                        now,
+                        &mut hasher,
+                    );
                 }
                 false
             }
@@ -7091,9 +7116,10 @@ impl Runtime {
         // The latest observation can change at provider heartbeat speed even
         // when the rendered content and elapsed second are unchanged.
         (
+            Arc::as_ptr(item),
             item.started_at.or(item.at),
             slot,
-            self.item_expanded(&item.id),
+            self.row_expanded(item),
         )
             .hash(hasher);
         if item.content.is_step() {
@@ -7125,9 +7151,7 @@ impl Runtime {
         // Only this item's controls change on copy: which of them its last
         // copy answers at, and what it said there. Copying again refreshes
         // how long that shows without changing what is drawn.
-        self.copy_feedback
-            .as_ref()
-            .filter(|feedback| feedback.key.item() == item.id)
+        self.row_copy_feedback(item)
             .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
             .hash(hasher);
         cached
@@ -7140,7 +7164,7 @@ impl Runtime {
                     cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
                     cached.image.as_ref().map(iced::widget::image::Handle::id),
                     cached.image_source.is_some(),
-                    self.preview_request.as_deref() == Some(item.id.as_str()),
+                    self.preview_requested(item),
                     cached.image_wait.is_some(),
                     cached.image_unavailable,
                 )
@@ -7183,10 +7207,11 @@ impl Runtime {
             .unfolded
             .iter()
             .filter(|key| {
-                key.strip_prefix(item.id.as_str())
+                key.strip_prefix(row_cache_key(&self.parent_cache_keys, item))
                     .is_some_and(|part| part.starts_with('#'))
             })
             .map(String::as_str)
+            .chain(self.row_unfolded_parts(item))
             .collect();
         unfolded.sort_unstable();
         unfolded.hash(hasher);
@@ -7197,7 +7222,7 @@ impl Runtime {
     /// coordination row carries its actions in its context menu instead.
     fn prose_action_footer(&self, item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
         if slot == turn::Slot::Thinking
-            && !(self.item_expanded(&item.id)
+            && !(self.row_expanded(item)
                 && cached
                     .reasoning
                     .as_ref()
@@ -7223,14 +7248,21 @@ impl Runtime {
         let items = &self.snapshot.items;
         let placed = |index: usize| {
             let item = items.get(index)?;
-            Some((item, self.cache.get(&item.id)?))
+            Some((
+                item,
+                self.cache
+                    .get(row_cache_key(&self.parent_cache_keys, item))?,
+            ))
         };
         match part {
             TurnPart::Prompt(index) => {
                 let Some(item) = items.get(index) else {
                     return widget::Space::new().into();
                 };
-                let body = match (&item.content, self.cache.get(&item.id)) {
+                let body = match (
+                    &item.content,
+                    self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
+                ) {
                     // Never in the user's own bubble.
                     (ItemContent::Delivery { .. }, Some(cached)) => {
                         self.delivery_view(item, cached, settings)
@@ -7273,8 +7305,18 @@ impl Runtime {
                         if self.failure_ui.item(&item.id).is_some() {
                             continue;
                         }
-                        let key = selection::logical_identity(&item.id, &[9]);
-                        let revision = cached.revision;
+                        let key = if self.colliding_row_ids.contains(&item.id) {
+                            selection::logical_identity(&item.id, &[9, placed_step.index as u32])
+                        } else {
+                            selection::logical_identity(&item.id, &[9])
+                        };
+                        let revision = {
+                            use std::hash::{Hash, Hasher};
+                            let mut revision = crate::fingerprint::hasher();
+                            (cached.revision, Arc::as_ptr(item), self.row_expanded(item))
+                                .hash(&mut revision);
+                            revision.finish()
+                        };
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
                         // A message keeps the row it has alone, its
@@ -7282,7 +7324,7 @@ impl Runtime {
                         let row = match cached.coordination.as_deref() {
                             Some(coordinated) if turn.messages => {
                                 let raw = self
-                                    .item_expanded(&item.id)
+                                    .row_expanded(item)
                                     .then(|| self.step_detail(item, cached, settings));
                                 self.coordination_card(item, coordinated, raw)
                             }
@@ -7327,7 +7369,7 @@ impl Runtime {
                 let body = match (&cached.coordination, &item.content) {
                     (Some(coordinated), _) if part == TurnPart::Card(prose) => {
                         let raw = self
-                            .item_expanded(&item.id)
+                            .row_expanded(item)
                             .then(|| self.step_detail(item, cached, settings));
                         self.coordination_card(item, coordinated, raw)
                     }
@@ -7756,27 +7798,34 @@ impl Runtime {
     }
 
     /// Whether item `id`'s own Copy is saying what its copy did.
+    #[cfg(test)]
     pub(super) fn copy_note_shown(&self, id: &str) -> bool {
         self.copy_state(id, None).is_telling()
     }
 
+    pub(super) fn row_copy_note_shown(&self, item: &chat::Item) -> bool {
+        self.row_copy_state(item, None).is_telling()
+    }
+
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        let state = self.copy_state(&item.id, None);
+        let state = self.row_copy_state(item, None);
         let mut controls = vec![small_icon(
             state.icon(),
             state.label("Copy this message"),
             if item.logical_copy_body().is_some()
                 && !self
-                    .presentation_cache()
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref())
+                    .coordination_for(item)
                     .is_some_and(|card| card.is_card())
             {
-                Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+                Action::CopyMessage(
+                    self.target,
+                    self.row_target(item),
+                    self.message_copy_source(item),
+                )
             } else if let Some(source) = self.excerpted_output_source(item) {
-                Action::CopyStep(self.target, item.id.clone(), CopyPart::Text, source)
+                Action::CopyStep(self.target, self.row_target(item), CopyPart::Text, source)
             } else {
-                Action::Copy(self.target, item.id.clone(), CopyPart::Text)
+                Action::Copy(self.target, self.row_target(item), CopyPart::Text)
             },
         )];
         // What the copy did, beside the Copy that made it. It stands in for
@@ -7785,7 +7834,7 @@ impl Runtime {
             controls.push(said);
         } else if let Some((at, stamp, full)) = self
             .presentation_cache()
-            .get(&item.id)
+            .get(self.cache_key(item))
             .and_then(|cached| cached.stamp.as_ref())
             && item.at == Some(*at)
         {
@@ -8070,7 +8119,7 @@ impl Runtime {
             self.prompt_text(item)
         };
         let long = prepared.map_or(pending_long, |prompt| prompt.long);
-        let expanded = self.item_expanded(&item.id);
+        let expanded = self.row_expanded(item);
         let logical = selectable_prose::Logical {
             identity: selection::logical_identity(&item.id, &[2]),
             start: 0,
@@ -8078,7 +8127,7 @@ impl Runtime {
         let body: Element<'static, Message> = if attachment {
             // Empty unowned paths also represent documents and refused image
             // receipts. Keep their descriptor instead of a generic read error.
-            if let Some(cached) = self.presentation_cache().get(&item.id)
+            if let Some(cached) = self.presentation_cache().get(self.cache_key(item))
                 && matches!(&item.content, ItemContent::Image { path, reference, .. }
                     if reference.is_some() || !path.is_empty())
             {
@@ -8099,7 +8148,7 @@ impl Runtime {
                             None,
                             Some(logical),
                             self.presentation_cache()
-                                .get(&item.id)
+                                .get(self.cache_key(item))
                                 .map(|cached| &cached.flow_cache),
                         )
                     } else if let ItemContent::Image {
@@ -8123,7 +8172,7 @@ impl Runtime {
                     design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
                 settings.style.font = iced::Font::default();
                 if text.len() > 2048 {
-                    let flow = self.presentation_cache()[&item.id]
+                    let flow = self.presentation_cache()[self.cache_key(item)]
                         .flow_cache
                         .markdown_entry(logical.identity, text.clone(), settings.style);
                     selectable_prose::flow_source(
@@ -8159,7 +8208,7 @@ impl Runtime {
                         None,
                         None,
                         Some(expanded),
-                        Some(Action::Toggle(self.target, item.id.clone())),
+                        Some(Action::Toggle(self.target, self.row_target(item))),
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -8173,7 +8222,7 @@ impl Runtime {
             message,
             self.message_copy(item),
             Alignment::End,
-            self.copy_note_shown(&item.id),
+            self.row_copy_note_shown(item),
         ))
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -8329,7 +8378,7 @@ impl Runtime {
         else {
             return self.prompt_view(item);
         };
-        let expanded = self.item_expanded(&item.id);
+        let expanded = self.row_expanded(item);
         let notice = if *kind == chat::DeliveryKind::Notice {
             let Some(notice) = self
                 .prepared_literal(item)
@@ -8415,7 +8464,7 @@ impl Runtime {
             failed.then_some(chat::ToolStatus::Failed.into()),
             trailing,
             disclosure.then_some(expanded),
-            disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
+            disclosure.then(|| Action::Toggle(self.target, self.row_target(item))),
         );
         let heading_row = crate::interaction::tooltip(heading_row, heading.clone());
         let mut rows = Vec::new();
@@ -8471,7 +8520,7 @@ impl Runtime {
                     .into(),
                 self.message_copy(item),
                 Alignment::Start,
-                self.copy_note_shown(&item.id),
+                self.row_copy_note_shown(item),
             )
         };
         widget::container(body)
@@ -8511,7 +8560,7 @@ impl Runtime {
                 .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
             (delivery_has_body(None, body, remainder), false)
         };
-        delivery_actions(has_body, monitor, long, self.item_expanded(&item.id))
+        delivery_actions(has_body, monitor, long, self.row_expanded(item))
     }
 
     /// An assistant answer, its reasoning, its narration, or a system notice.
@@ -8553,7 +8602,7 @@ impl Runtime {
                 prose::view(cached, settings, self.target, self.find.as_deref()),
                 self.message_copy(item),
                 Alignment::Start,
-                self.copy_note_shown(&item.id),
+                self.row_copy_note_shown(item),
             ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
@@ -8581,7 +8630,7 @@ impl Runtime {
             let finished = reasoning_finished(items, busy, index);
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
-            let expanded = has_text && self.item_expanded(&item.id);
+            let expanded = has_text && self.row_expanded(item);
             let mut elapsed = reasoning_elapsed(items, index, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
@@ -8609,7 +8658,7 @@ impl Runtime {
                 (!finished).then_some(chat::ToolStatus::Running.into()),
                 elapsed,
                 has_text.then_some(expanded),
-                has_text.then(|| Action::Toggle(target, item.id.clone())),
+                has_text.then(|| Action::Toggle(target, self.row_target(item))),
             );
             let mut rows = vec![header];
             if expanded {
@@ -8618,7 +8667,7 @@ impl Runtime {
                         prose::view(cached, settings, target, self.find.as_deref()),
                         self.message_copy(item),
                         Alignment::Start,
-                        self.copy_note_shown(&item.id),
+                        self.row_copy_note_shown(item),
                     ))
                     .padding([step::GAP_S, step::GAP_M])
                     .max_width(design::READABLE_MEASURE)
@@ -8653,7 +8702,7 @@ impl Runtime {
             prose::view(cached, settings, self.target, self.find.as_deref()),
             self.message_copy(item),
             Alignment::Start,
-            self.copy_note_shown(&item.id),
+            self.row_copy_note_shown(item),
         ))
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)
