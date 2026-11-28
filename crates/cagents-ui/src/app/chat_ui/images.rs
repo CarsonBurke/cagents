@@ -1078,9 +1078,12 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
         .collect()
 }
 
-fn resume_viewer((target, serial): &(Target, u64)) -> impl iced::futures::Stream<Item = Message> {
-    let message = action(Action::ResumeImageViewer(*target, *serial));
-    iced::futures::stream::once(async { message })
+fn resume_viewer(
+    (target, serial): &(Target, u64),
+) -> iced::futures::stream::Once<std::future::Ready<Message>> {
+    iced::futures::stream::once(std::future::ready(action(Action::ResumeImageViewer(
+        *target, *serial,
+    ))))
 }
 
 struct Entry {
