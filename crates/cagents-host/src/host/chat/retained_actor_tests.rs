@@ -3392,20 +3392,31 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
             .message
             .contains("1 chat is open (1 of them starting), and the limit is 1")
     );
+    assert_eq!(host.lock().unwrap().inventory_generation, generation);
     cleanup.fail.store(true, Ordering::SeqCst);
     assert!(
         retained_actor::reconcile_startup(&host, &source)
             .unwrap_err()
             .contains("fixture cleanup remains unconfirmed")
     );
-    assert_eq!(capacity::usage(&host.lock().unwrap()), 1);
-    assert_eq!(host.lock().unwrap().inventory_generation, generation);
+    {
+        let state = host.lock().unwrap();
+        assert_eq!(capacity::usage(&state), 1);
+        assert!(state.chat_spawning.is_empty());
+        assert!(Arc::ptr_eq(
+            &state.native_actor_startups[&source.id].context,
+            &original
+        ));
+        // The failed cleanup acquired and released its exact closing fence.
+        assert_eq!(state.inventory_generation, generation + 2);
+    }
     cleanup.fail.store(false, Ordering::SeqCst);
     cleanup.proved.store(true, Ordering::SeqCst);
     assert!(retained_actor::reconcile_startup(&host, &source).unwrap());
     assert!(host.lock().unwrap().native_actor_startups.is_empty());
     assert_eq!(capacity::usage(&host.lock().unwrap()), 0);
-    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
+    // The successful retry also retires the original startup.
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 5);
     assert_eq!(cleanup.observations.load(Ordering::SeqCst), 4);
     assert_eq!(
         original.outcome(),
@@ -3448,9 +3459,9 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     assert!(retained_actor::reconcile_startup(&host, &source).unwrap());
     assert_eq!(no_provider.observations.load(Ordering::SeqCst), 1);
     assert_eq!(capacity::usage(&host.lock().unwrap()), 0);
-    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 3);
     retained_actor::forget_startup(&host, &source, &successor);
-    assert_eq!(host.lock().unwrap().inventory_generation, generation + 1);
+    assert_eq!(host.lock().unwrap().inventory_generation, generation + 3);
 }
 
 #[test]
