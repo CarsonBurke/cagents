@@ -944,6 +944,10 @@ impl Cagents {
                 generation,
                 result,
             } => {
+                let panel = self.sidebar_model.source_control.as_ref().filter(|_| {
+                    self.workspace_view_shown().is_some()
+                        && self.sidebar_state.section_expanded(PanelSection::Untracked)
+                });
                 let Some(entry) = self
                     .refresh_ui
                     .git
@@ -1017,7 +1021,7 @@ impl Cagents {
                             self.refresh_ui.git.forget(project);
                             return Task::none();
                         };
-                        apply_local(row, &snapshot);
+                        apply_local(row, &snapshot, panel);
                         if row.github_ready {
                             row.refresh_worktree_pull_requests();
                         }
@@ -1647,7 +1651,15 @@ fn catalog_changes(
     removed
 }
 
-fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
+fn apply_local(
+    project: &mut SidebarProject,
+    snapshot: &Snapshot,
+    panel: Option<&SourceControlModel>,
+) {
+    // The shown panel owns its checkout's count once it has read untracked
+    // files. A partial sidebar read cannot replace that measurement, or
+    // combine newer tracked counts with files that may since have been staged.
+    let panel = panel.filter(|source| source.key.project_id == project.id);
     let mut previous = std::mem::take(&mut project.worktrees)
         .into_iter()
         .map(|row| (row.id, row))
@@ -1656,10 +1668,16 @@ fn apply_local(project: &mut SidebarProject, snapshot: &Snapshot) {
         .worktrees
         .iter()
         .map(|(record, status)| {
+            let inspected = panel
+                .filter(|source| {
+                    record.id == source.key.worktree_id && record.path == source.key.canonical_path
+                })
+                .and_then(SourceControlModel::source_snapshot)
+                .map(|snapshot| &snapshot.status);
             let mut row = previous
                 .remove(&record.id)
                 .unwrap_or_else(|| SidebarWorktree::from_repository(record, status.as_ref()));
-            row.apply_repository(record, status.as_ref());
+            row.apply_repository(record, status.as_ref(), inspected);
             let head = snapshot.heads.get(&record.id).cloned();
             if row.head_repository != head {
                 row.clear_pull_request();
@@ -2311,7 +2329,7 @@ mod tests {
         project.github_status = "Remote authority unchanged".into();
         project.github_ready = true;
         snapshot.worktrees[0].0.branch = Some("refs/heads/changed".into());
-        apply_local(&mut project, &snapshot);
+        apply_local(&mut project, &snapshot, None);
         assert_eq!(project.name, "Stable project");
         assert_eq!(project.github_status, "Remote authority unchanged");
         assert!(project.github_ready);
@@ -2320,6 +2338,71 @@ mod tests {
             Some(sidebar::RowDeletion::Deleting)
         );
         assert_eq!(project.worktrees[0].branch.as_deref(), Some("changed"));
+    }
+
+    #[test]
+    fn sidebar_status_does_not_replace_the_open_panels_change_count() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut snapshot = fixture(&directory.path().join("repo"));
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let project = install_git_project(&mut app, &snapshot).id;
+        let card = app.workspace.focused().unwrap();
+        app.active_workspace = Some(snapshot.worktrees[0].0.path.clone());
+        app.open_pane_inspector_now(card);
+        app.context_sections
+            .set_open(context_sections::Section::Workspace, true);
+        drop(app.project_workspace(false));
+        assert!(app.workspace_view_shown().is_some());
+        let key = app.sidebar_state.active_worktree().unwrap().clone();
+        let mut panel = sidebar::test_support::snapshot();
+        let deliver_panel = |app: &mut Cagents, panel: &crate::repository::RepositorySnapshot| {
+            drop(app.update(Message::SourceControlLoaded {
+                key: key.clone(),
+                request: app.refresh_ui.source_generation,
+                result: Ok(source_control_ui::source_control_read(
+                    key.clone(),
+                    None,
+                    panel.clone(),
+                    None,
+                    FileTree::Deferred,
+                )),
+            }));
+        };
+        deliver_panel(&mut app, &panel);
+        assert_eq!(app.context_rail_indicators().dirty_count, Some(4));
+
+        let status = snapshot.worktrees[0].1.as_mut().unwrap();
+        assert!(status.untracked_omitted);
+        status.dirty.unstaged = 3;
+        status.tracking = TrackingState::Compared {
+            upstream: "refs/remotes/origin/main".into(),
+            ahead: 5,
+            behind: 1,
+        };
+        let deliver_sidebar = |app: &mut Cagents| {
+            drop(app.update(Message::GitUi(Action::Read {
+                project,
+                generation: 1,
+                result: Ok((snapshot.clone(), None).into()),
+            })));
+        };
+        deliver_sidebar(&mut app);
+        assert_eq!(app.context_rail_indicators().dirty_count, Some(4));
+        let row = &app.sidebar_model.project(project).unwrap().worktrees[0];
+        assert_eq!((row.ahead, row.behind), (Some(5), Some(1)));
+
+        // A complete read can clear the count once the checkout is clean.
+        panel.status = StatusSnapshot::default();
+        deliver_panel(&mut app, &panel);
+        deliver_sidebar(&mut app);
+        assert_eq!(app.context_rail_indicators().dirty_count, None);
+
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleSection {
+            key: key.clone(),
+            section: PanelSection::Untracked,
+        })));
+        deliver_sidebar(&mut app);
+        assert_eq!(app.context_rail_indicators().dirty_count, Some(3));
     }
 
     #[test]
@@ -3074,7 +3157,7 @@ mod tests {
         );
     }
 
-    fn catalog_app(snapshot: &Snapshot) -> (Cagents, ProjectState) {
+    fn install_git_project(app: &mut Cagents, snapshot: &Snapshot) -> ProjectState {
         let project = ProjectState {
             id: ProjectId::new(),
             generation: 0,
@@ -3083,7 +3166,6 @@ mod tests {
             kind: ProjectKind::Git,
             existence: Existence::Open,
         };
-        let mut app = super::super::tests::context_inspector_test_app(false);
         app.sidebar_model.projects.push(SidebarProject::new(
             project.id,
             snapshot.repository.id,
@@ -3101,6 +3183,12 @@ mod tests {
             .git
             .entries
             .insert(project.id, Entry::new(snapshot.clone(), 1, None));
+        project
+    }
+
+    fn catalog_app(snapshot: &Snapshot) -> (Cagents, ProjectState) {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let project = install_git_project(&mut app, snapshot);
         (app, project)
     }
 
@@ -3292,7 +3380,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived]);
         git(
             directory.path(),
@@ -3350,7 +3438,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived]);
         assert_eq!(attached_number(&app), Some(7));
         for (step, expected) in [
@@ -3373,7 +3461,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
         git(
             directory.path(),
@@ -3403,7 +3491,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
         git(
             directory.path(),
@@ -3504,7 +3592,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         git(directory.path(), &["reset", "--hard", "main"]);
         let (reset, plan) = read_local(
             project.id,
@@ -3568,7 +3656,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
         let old_read = read_local(
             project.id,
@@ -3617,7 +3705,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let (snapshot, key, archived) = archived_fixture(directory.path());
         let (mut app, project) = catalog_app(&snapshot);
-        apply_local(&mut app.sidebar_model.projects[0], &snapshot);
+        apply_local(&mut app.sidebar_model.projects[0], &snapshot, None);
         archived_remote(&mut app, project.id, &key, vec![archived.clone()]);
         let mut recent = archived.pull_request;
         recent.number = 8;

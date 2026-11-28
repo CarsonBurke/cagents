@@ -1213,8 +1213,14 @@ impl SidebarWorktree {
         row
     }
 
-    /// Apply each authoritative read, including the transition back to clean.
-    pub fn apply_repository(&mut self, record: &WorktreeRecord, status: Option<&StatusSnapshot>) {
+    /// Apply the repository read. The inspected checkout can supply a full
+    /// change count while the repository read supplies tracking information.
+    pub fn apply_repository(
+        &mut self,
+        record: &WorktreeRecord,
+        status: Option<&StatusSnapshot>,
+        inspected: Option<&StatusSnapshot>,
+    ) {
         let branch = record.branch.as_deref().map(|branch| {
             branch
                 .strip_prefix("refs/heads/")
@@ -1230,26 +1236,33 @@ impl SidebarWorktree {
         self.locked = record.lock.locked;
         self.created_at_unix_ms = record.created_at_unix_ms;
         if let Some(status) = status {
-            self.apply_status(status);
+            let changes = inspected
+                .filter(|inspected| status.untracked_omitted && !inspected.untracked_omitted)
+                .unwrap_or(status);
+            self.apply_status_parts(status, changes);
         }
         self.refresh_status_chrome();
     }
 
     /// Apply each authoritative read, including the transition back to clean.
     pub fn apply_status(&mut self, status: &StatusSnapshot) {
+        self.apply_status_parts(status, status);
+    }
+
+    fn apply_status_parts(&mut self, status: &StatusSnapshot, changes: &StatusSnapshot) {
         let (ahead, behind) = match &status.tracking {
             TrackingState::Compared { ahead, behind, .. } => (Some(*ahead), Some(*behind)),
             _ => (None, None),
         };
-        if self.untracked_omitted == status.untracked_omitted
-            && self.dirty.as_ref() == Some(&status.dirty)
+        if self.untracked_omitted == changes.untracked_omitted
+            && self.dirty.as_ref() == Some(&changes.dirty)
             && self.ahead == ahead
             && self.behind == behind
         {
             return;
         }
-        self.dirty = Some(status.dirty.clone());
-        self.untracked_omitted = status.untracked_omitted;
+        self.dirty = Some(changes.dirty.clone());
+        self.untracked_omitted = changes.untracked_omitted;
         self.ahead = ahead;
         self.behind = behind;
         self.refresh_status_chrome();
