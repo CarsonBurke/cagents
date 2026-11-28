@@ -357,18 +357,20 @@ mod tests {
         fs::DirBuilder::new().mode(0o700).create(&replaced).unwrap();
 
         let root = Root::open(state).unwrap();
-        collect(&root, None, SystemTime::now()).unwrap();
+        let collected = collect(&root, None, SystemTime::now());
+        let kept_active = active.is_dir();
+        drop(extractor.stdin.take());
+        assert!(extractor.wait().unwrap().success());
+        collected.unwrap();
         assert!(!abandoned.exists());
         assert!(!abandoned_lease.exists());
         assert!(legacy.is_dir());
-        assert!(active.is_dir());
+        assert!(kept_active);
         assert!(replaced.is_dir());
         assert!(diagnostic.is_dir());
         assert!(fs::symlink_metadata(link).unwrap().is_symlink());
         assert_eq!(fs::read(kept_file).unwrap(), b"support data");
 
-        drop(extractor.stdin.take());
-        assert!(extractor.wait().unwrap().success());
         collect(&root, None, SystemTime::now()).unwrap();
         assert!(!active.exists());
     }
