@@ -62,22 +62,19 @@ runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/wp.XXXXXX")
 mark_fixture_root "$root"
 mkdir -p "$root"/{home,data,config,cache,state,trace}
 
-environment=(
-    -u CAGENTS_SESSION_ID
+fixture_command=(
+    env -u CAGENTS_SESSION_ID
     HOME="$root/home" XDG_RUNTIME_DIR="$runtime"
     CLAUDE_CONFIG_DIR="$root/home/.claude" CODEX_HOME="$root/home/.codex"
     XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config"
     XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" GIT_TRACE2="$root/trace"
 )
-fixture() {
-    env "${environment[@]}" "$@"
-}
 fixture_processes() {
     grep -lzx "XDG_RUNTIME_DIR=$runtime" /proc/[0-9]*/environ 2>/dev/null |
         cut -d/ -f3 | grep -vx "$$" || true
 }
 cleanup() {
-    fixture "$bin/cagents" --no-start daemon stop >/dev/null 2>&1 || true
+    "${fixture_command[@]}" "$bin/cagents" --no-start daemon stop >/dev/null 2>&1 || true
     local pids
     pids=$(fixture_processes)
     [ -z "$pids" ] || kill $pids 2>/dev/null || true
@@ -133,9 +130,9 @@ done
 # the fixture's environment applies only to the command it starts.
 if command -v systemd-run >/dev/null && systemd-run --user --scope --quiet true 2>/dev/null; then
     systemd-run --user --scope --quiet --collect -p IOAccounting=yes \
-        fixture "$bin/cagents" project open "$project" >/dev/null
+        "${fixture_command[@]}" "$bin/cagents" project open "$project" >/dev/null
 else
-    fixture "$bin/cagents" project open "$project" >/dev/null
+    "${fixture_command[@]}" "$bin/cagents" project open "$project" >/dev/null
 fi
 daemon=$(fixture_processes | while read -r pid; do
     if [ "$(cat "/proc/$pid/comm" 2>/dev/null)" = cagentsd ]; then echo "$pid"; fi

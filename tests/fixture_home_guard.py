@@ -861,6 +861,64 @@ for _case, _variable, _provided_default in SECONDARY_CASES:
 class OutsideScriptContracts(Home):
     """Standalone writers use invented files and harmless shell delegates only."""
 
+    def test_work_polling_launch_preserves_fixture_paths_with_or_without_a_scope(self):
+        source = (ROOT / "scripts/measure-work-polling").read_text()
+        # Exercise the actual environment and launch blocks with external
+        # stand-ins. No Git worktrees, daemon, or systemd scope are created.
+        setup = source.split('mkdir -p "$root"/{home,data,config,cache,state,trace}\n', 1)[1]
+        setup = setup.split("fixture_processes()", 1)[0]
+        launch = source.split("if command -v systemd-run", 1)[1].split("daemon=", 1)[0]
+        bin_dir = self.home / "bin"
+        scope = bin_dir / "systemd-run"
+        scope.write_text(
+            '#!/bin/sh\n'
+            '[ "$XDG_RUNTIME_DIR" = "$CALLER_RUNTIME" ] || exit 2\n'
+            '[ "$1 $2 $3" = "--user --scope --quiet" ] || exit 2\n'
+            'shift 3\n'
+            'if [ "$1" = true ]; then exit "$SCOPE_PROBE_STATUS"; fi\n'
+            '[ "$1 $2 $3" = "--collect -p IOAccounting=yes" ] || exit 2\n'
+            'shift 3\n'
+            'export SCOPED=yes\n'
+            'exec "$@"\n'
+        )
+        cli = bin_dir / "cagents"
+        cli.write_text(
+            '#!/bin/sh\n'
+            'printf "%s\\n" "${SCOPED:-no}" "$HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" '
+            '"$XDG_RUNTIME_DIR" "${CAGENTS_SESSION_ID:-}" "$@" >&2\n'
+        )
+        for command in (scope, cli):
+            command.chmod(0o700)
+
+        runtime = self.home / "runtime"
+        fixture_home = self.home / "home"
+        project = self.home / "project"
+        self.marked()
+        script = 'root=$1 runtime=$2 bin=$3 project=$4\n' + setup + "if command -v systemd-run" + launch
+        for status, scoped in (("0", "yes"), ("1", "no")):
+            with self.subTest(scoped=scoped):
+                env = self.env | {
+                    "PATH": f"{bin_dir}:/usr/bin:/bin",
+                    "HOME": str(self.account),
+                    "CLAUDE_CONFIG_DIR": str(self.account),
+                    "CODEX_HOME": str(self.account),
+                    "XDG_RUNTIME_DIR": str(self.account),
+                    "CALLER_RUNTIME": str(self.account),
+                    "SCOPE_PROBE_STATUS": status,
+                    "CAGENTS_SESSION_ID": "caller-session",
+                }
+                result = self.run_command(
+                    ["bash", "-eu", "-c", script, "work-polling-launch", str(self.home),
+                     str(runtime), str(bin_dir), str(project)],
+                    env=env,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stderr.splitlines(), [
+                    scoped, str(fixture_home), str(fixture_home / ".claude"),
+                    str(fixture_home / ".codex"), str(runtime), "",
+                    "project", "open", str(project),
+                ])
+
     def prepare_fault(self, *, marked=False, legacy=True):
         self.fault_root = self.account
         if marked:

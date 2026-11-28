@@ -120,8 +120,9 @@ JOBS = (
     Job("tooling", suites=(
         Suite("fixture home guard", "tests/fixture_home_guard.py",
               sources=(*FIXTURE_HOME_HELPERS, "scripts/rehearse_update_fault.py",
-                       "scripts/run-redraw-latency"),
+                       "scripts/run-redraw-latency", "scripts/measure-work-polling"),
               syntax=(("sh", "tests/fixtures/lib/fixture-home.sh"),
+                      ("bash", "scripts/measure-work-polling"),
                       ("sh", "scripts/run-redraw-latency"))),
         Suite("Cargo artifacts", "tests/cargo_artifacts.py", sources=("scripts/cargo_artifacts.py",)),
         Suite("vendored checkout-cache hooks", "tests/checkout_cache_vendor_hooks.py",
