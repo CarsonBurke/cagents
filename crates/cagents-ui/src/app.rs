@@ -3368,7 +3368,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         | Message::ResetSettings
         | Message::DismissStatus => true,
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
-        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
+        Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::CloseContext(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
         // The pointer's coming and going is reported whatever is open, so a
         // hover or a hold it ended does not outlast the dialog.
@@ -11326,20 +11326,39 @@ impl Cagents {
         {
             return (task, Projection::Full);
         }
+        // Status bar popovers answer Escape on their own surfaces; these
+        // answer it while the surface is not drawn.
         if is_escape_press(&event) && self.phone_ui.open && !self.modal_is_open() {
             return (
-                self.update_phone(phone_ui::Action::Menu(false)),
+                self.update_phone(phone_ui::Action::Dismiss(widget::Id::new(
+                    phone_ui::CONTROL_ID,
+                ))),
                 Projection::Full,
             );
         }
         if is_escape_press(&event) && self.device_ui.menu_open && !self.modal_is_open() {
             return (
-                self.update_device(device_ui::Action::Menu(false)),
+                self.update_device(device_ui::Action::DismissMenu(widget::Id::new(
+                    device_ui::MENU_CONTROL_ID,
+                ))),
                 Projection::Full,
             );
         }
-        // The model search field captures Escape to blur itself. Close
-        // its picker in the same press, while dialogs retain priority.
+        // The pickers answer Escape on their own surfaces, back where they
+        // opened from; this answers it while a surface is not drawn. The
+        // composer's menus return to the composer.
+        if is_escape_press(&event)
+            && let Some(card) = self.workspace.focused()
+            && !self.pane_content_inputs_blocked(card)
+            && let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
+            && let Some(opener) = runtime.open_picker_opener()
+        {
+            let target = runtime.target;
+            return (
+                self.handle_chat_ui(chat_ui::Action::DismissPicker(target, opener)),
+                Projection::Full,
+            );
+        }
         if is_escape_press(&event)
             && self
                 .workspace
@@ -13178,7 +13197,15 @@ impl Cagents {
                             .filter(|context| context.card == id)
                             .map_or(iced::Point::ORIGIN, |context| context.point),
                     ),
-                    Message::TerminalFind(terminal_ui::Action::DismissContext(id)),
+                    // A right click opens it on the terminal, which keeps the
+                    // keyboard after Escape.
+                    crate::ui_controls::Close::new(
+                        Message::TerminalFind(terminal_ui::Action::CloseContext(id)),
+                        self.card_keyboard_focus(id),
+                        move |opener| {
+                            Message::TerminalFind(terminal_ui::Action::DismissContext(id, opener))
+                        },
+                    ),
                 );
                 let mut content = Vec::new();
                 if let Some(notice) = self.terminal_save_notice(id, false) {

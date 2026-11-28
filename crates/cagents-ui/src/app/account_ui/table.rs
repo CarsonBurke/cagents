@@ -97,6 +97,19 @@ impl Table {
     }
 }
 
+/// Add account, which opens the menu of ways to add one.
+pub(in crate::app) fn add_id() -> widget::Id {
+    widget::Id::new("accounts.add")
+}
+
+/// An account row's actions control.
+pub(in crate::app) fn menu_id(account: &AccountId) -> widget::Id {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account.hash(&mut hasher);
+    widget::Id::new(format!("accounts.menu.{:016x}", hasher.finish()))
+}
+
 pub(in crate::app) fn rename_id() -> widget::Id {
     widget::Id::new("accounts.rename")
 }
@@ -513,6 +526,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
             .align_y(Alignment::Center),
     )
     .name("Add account")
+    .id(add_id())
     .selected(state.table.add_menu)
     .class(cosmic::theme::Button::Suggested)
     .padding([space::XS, space::M])
@@ -532,7 +546,11 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                 add_button,
                 state.table.add_menu.then(|| add_menu(state, browser_busy)),
                 widget::popover::Position::Bottom,
-                action(Action::AddMenu(false)),
+                crate::ui_controls::Close::new(
+                    action(Action::AddMenu(false)),
+                    add_id(),
+                    |opener| action(Action::Dismiss(opener)),
+                ),
             )
         });
     let (title, caption) = match crate::device::selected() {
@@ -1441,6 +1459,7 @@ fn actions<'a>(
     let removing = state.removing.contains(&account.id);
     let menu_button = crate::ui_controls::icon_button(Icon::More, "Account actions")
         .compact()
+        .id(menu_id(&account.id))
         .on_press_maybe(
             (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
         );
@@ -1456,7 +1475,11 @@ fn actions<'a>(
             menu_button,
             open.then(|| menu(app, account, project)),
             widget::popover::Position::Bottom,
-            Message::AccountUi(Action::Menu(None)),
+            crate::ui_controls::Close::new(
+                Message::AccountUi(Action::Menu(None)),
+                menu_id(&account.id),
+                |opener| Message::AccountUi(Action::Dismiss(opener)),
+            ),
         )
     };
     let first: Element<'a, Message> = if removing {

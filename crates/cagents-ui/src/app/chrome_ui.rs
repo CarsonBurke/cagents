@@ -60,6 +60,9 @@ pub(super) struct State {
     pub(super) workspace_switcher_preview: Option<CardId>,
     pub(super) projects_collapsed: bool,
     popup: Option<Popup>,
+    /// The pane the notices popup was opened for, rather than from its
+    /// control, where dismissing it returns the keyboard.
+    notices_for: Option<CardId>,
     attention_page: usize,
     focus_index: usize,
     /// The shell's own Tab traversal, set aside while a popup owns Tab: the
@@ -2173,6 +2176,53 @@ mod tests {
             );
         }
     }
+
+    /// Escape, a popup's Close control, or its own control again return
+    /// the keyboard to the control that opened it; a press outside leaves
+    /// the keyboard where the press put it.
+    #[test]
+    fn dismissing_a_header_popup_returns_to_its_control() {
+        use crate::app::tests::task_focuses;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        for (open, popup, control) in [
+            (Action::ToggleNewTab, Popup::NewTab, TOOLBAR_FOCUS_ID),
+            (Action::ToggleNotices, Popup::Notices, NOTICES_CONTROL_ID),
+            (
+                Action::ToggleAttention,
+                Popup::Attention,
+                ATTENTION_CONTROL_ID,
+            ),
+        ] {
+            let control = widget::Id::new(control);
+            drop(app.update_chrome(open.clone()));
+            assert_eq!(app.chrome_ui.popup, Some(popup));
+            let Message::ChromeUi(dismiss) = popup.close().dismiss() else {
+                unreachable!()
+            };
+            assert!(matches!(&dismiss, Action::Dismiss(to) if *to == control));
+            let task = app.update_chrome(dismiss);
+            assert_eq!(app.chrome_ui.popup, None);
+            assert_eq!(task_focuses(task, &control), (true, false), "{popup:?}");
+
+            drop(app.update_chrome(open.clone()));
+            let task = app.update_chrome(open.clone());
+            assert_eq!(app.chrome_ui.popup, None);
+            assert_eq!(
+                task_focuses(task, &control),
+                (true, false),
+                "{popup:?} toggled"
+            );
+
+            drop(app.update_chrome(open));
+            let task = app.update_chrome(Action::Close);
+            assert_eq!(app.chrome_ui.popup, None);
+            assert_eq!(
+                task_focuses(task, &control),
+                (false, true),
+                "{popup:?} outside"
+            );
+        }
+    }
 }
 
 impl State {
@@ -2190,6 +2240,7 @@ impl State {
 
     pub(super) fn close(&mut self) {
         self.popup = None;
+        self.notices_for = None;
     }
 
     /// Whether something other than pane `card` is being renamed: another
@@ -2207,12 +2258,31 @@ impl State {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Popup {
+pub(super) enum Popup {
     NewTab,
     Notices,
     Attention,
     /// The waiting update's list of who it waits for.
     Update,
+}
+
+impl Popup {
+    /// The control that opens the popup, where Escape returns.
+    fn opener(self) -> widget::Id {
+        widget::Id::new(match self {
+            Self::NewTab => TOOLBAR_FOCUS_ID,
+            Self::Notices => NOTICES_CONTROL_ID,
+            Self::Attention => ATTENTION_CONTROL_ID,
+            Self::Update => super::update_ui::WAITING_CONTROL_ID,
+        })
+    }
+
+    /// How the popup closes: see [`crate::ui_controls::Close`].
+    pub(super) fn close(self) -> crate::ui_controls::Close<Message> {
+        crate::ui_controls::Close::new(Message::ChromeUi(Action::Close), self.opener(), |opener| {
+            Message::ChromeUi(Action::Dismiss(opener))
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2286,7 +2356,12 @@ pub enum Action {
     ToggleUpdate,
     AttentionPage(usize),
     ShowNoticesFor(CardId),
+    /// Closes the open popup, leaving the keyboard where it is: a press
+    /// outside it, or something else taking its place.
     Close,
+    /// Escape or a Close control closed the open popup: focus goes back to
+    /// the control that opened it.
+    Dismiss(widget::Id),
     TabsScrolled(f32),
     /// The pointer came over the tab strip, or left it.
     TabsHover(bool),
@@ -2461,6 +2536,7 @@ mod tab_style_tests {
 }
 
 const NOTICES_CONTROL_ID: &str = "chrome.notices";
+const ATTENTION_CONTROL_ID: &str = "attention.control";
 const RETIRING_NOTICES_ID: &str = "chrome.notices.retiring";
 const NOTICES_CLOSE_ID: &str = "chrome.notices.close";
 const NOTICES_DISMISS_ALL_ID: &str = "chrome.notices.dismiss";
@@ -2576,7 +2652,10 @@ impl Cagents {
             return None;
         }
         if is_escape_press(event) {
-            return Some((self.update_chrome(Action::Close), Projection::Full));
+            return Some((
+                self.update_chrome(Action::Dismiss(popup.opener())),
+                Projection::Full,
+            ));
         }
         let backwards = is_tab_press(event).or_else(|| match event {
             keyboard::Event::KeyPressed {
@@ -2844,7 +2923,7 @@ impl Cagents {
         if self.modal_is_open()
             && !matches!(
                 action,
-                Action::Close | Action::UnhoverTab(_) | Action::TabsHover(_)
+                Action::Close | Action::Dismiss(_) | Action::UnhoverTab(_) | Action::TabsHover(_)
             )
         {
             return Task::none();
@@ -3062,8 +3141,15 @@ impl Cagents {
                     if matches!(action, Action::ShowNoticesFor(_)) {
                         return Task::none();
                     }
-                    return self.update_chrome(Action::Close);
+                    // Its own control closes it, as Escape does.
+                    return self.update_chrome(Action::Dismiss(popup.opener()));
                 }
+                // Notices shown for a pane return to the pane, where the
+                // keyboard was.
+                self.chrome_ui.notices_for = match action {
+                    Action::ShowNoticesFor(card) => Some(card),
+                    _ => None,
+                };
                 if popup == Popup::Attention {
                     self.chrome_ui.attention_page = 0;
                 }
@@ -3086,23 +3172,24 @@ impl Cagents {
                 self.focus_popup_control(ring)
             }
             Action::Close => {
+                self.chrome_ui.close();
+                Task::none()
+            }
+            Action::Dismiss(opener) => {
                 let popup = self.chrome_ui.popup.take();
-                if popup == Some(Popup::Attention)
-                    && (self.modal_is_open() || self.focused_repository_is_saving())
+                let notices_for = self.chrome_ui.notices_for.take();
+                if popup.is_none()
+                    || (popup == Some(Popup::Attention)
+                        && (self.modal_is_open() || self.focused_repository_is_saving()))
                 {
-                    // A queued outside-close cannot unfocus a dialog/editor
-                    // that acquired the keyboard after this overlay was drawn.
+                    // A queued dismissal cannot unfocus a dialog/editor that
+                    // acquired the keyboard after this overlay was drawn.
                     return Task::none();
                 }
-                popup.map_or_else(Task::none, |popup| {
-                    iced::widget::operation::focus(widget::Id::new(match popup {
-                        Popup::NewTab => TOOLBAR_FOCUS_ID,
-                        Popup::Notices => NOTICES_CONTROL_ID,
-                        Popup::Attention => "attention.control",
-                        Popup::Update => super::update_ui::WAITING_CONTROL_ID,
-                    }))
-                    .map(cosmic::Action::App)
-                })
+                match notices_for {
+                    Some(card) if popup == Some(Popup::Notices) => self.focus_pane_keyboard(card),
+                    _ => crate::ui_controls::return_focus(opener).map(cosmic::Action::App),
+                }
             }
             Action::Launch(kind) => {
                 self.chrome_ui.close();
@@ -3208,7 +3295,7 @@ impl Cagents {
             control,
             content,
             widget::popover::Position::Bottom,
-            Message::ChromeUi(Action::Close),
+            Popup::NewTab.close(),
         )
     }
 
@@ -3419,7 +3506,7 @@ impl Cagents {
 
     fn attention_control(&self) -> Element<'_, Message> {
         let control = crate::ui_controls::icon_button(Icon::Inbox, "Attention")
-            .id(widget::Id::new("attention.control"))
+            .id(widget::Id::new(ATTENTION_CONTROL_ID))
             .selected(self.attention_is_open())
             .on_press_maybe(
                 (!self.modal_is_open()).then_some(Message::ChromeUi(Action::ToggleAttention)),
@@ -3430,7 +3517,7 @@ impl Cagents {
             control,
             content,
             widget::popover::Position::Bottom,
-            Message::ChromeUi(Action::Close),
+            Popup::Attention.close(),
         )
     }
 
@@ -3520,7 +3607,7 @@ impl Cagents {
                 Icon::Close,
                 "Close Attention",
                 widget::Id::new("attention.close"),
-                Some(Message::ChromeUi(Action::Close)),
+                Some(Popup::Attention.close().dismiss()),
             ),
         ])
         .align_y(Alignment::Center)
@@ -3680,7 +3767,7 @@ impl Cagents {
                     Icon::Close,
                     "Close application notices",
                     widget::Id::new(NOTICES_CLOSE_ID),
-                    Some(Message::ChromeUi(Action::Close)),
+                    Some(Popup::Notices.close().dismiss()),
                 ));
                 let heading = widget::row::with_children(heading_children)
                     .align_y(Alignment::Center)
@@ -3733,7 +3820,7 @@ impl Cagents {
             )),
             content,
             widget::popover::Position::Bottom,
-            Message::ChromeUi(Action::Close),
+            Popup::Notices.close(),
         ))
     }
 

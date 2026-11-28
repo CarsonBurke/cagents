@@ -912,6 +912,11 @@ pub enum RepositoryAction {
     CloseToolbarOverflow {
         card: CardId,
     },
+    /// Escape closed the toolbar's overflow: focus goes back to `opener`.
+    DismissToolbarOverflow {
+        card: CardId,
+        opener: widget::Id,
+    },
     ZoomFont {
         card: CardId,
         delta: i8,
@@ -1006,6 +1011,7 @@ impl RepositoryAction {
             | Self::ReplaceMatch { card, .. }
             | Self::ToggleToolbarOverflow { card }
             | Self::CloseToolbarOverflow { card }
+            | Self::DismissToolbarOverflow { card, .. }
             | Self::ZoomFont { card, .. }
             | Self::PdfPage { card, .. }
             | Self::PdfTone { card, .. }
@@ -8831,6 +8837,10 @@ impl RepositoryRuntime {
                 self.toolbar_overflow_open = false;
                 Task::none()
             }
+            RepositoryAction::DismissToolbarOverflow { opener, .. } => {
+                self.toolbar_overflow_open = false;
+                crate::ui_controls::return_focus(opener)
+            }
             RepositoryAction::ZoomFont { .. } => Task::none(),
         }
     }
@@ -10601,6 +10611,11 @@ fn replace_focus_id(card: CardId) -> widget::Id {
 pub fn focus_restore_id(card: CardId) -> widget::Id {
     widget::Id::new(format!("repository.{card}.view"))
 }
+
+/// The toolbar control that opens the commands it has no room for.
+pub fn toolbar_overflow_id(card: CardId) -> widget::Id {
+    widget::Id::new(format!("repository.{card}.more"))
+}
 fn branch_comparison_icon() -> widget::icon::Handle {
     static ICON: LazyLock<widget::icon::Handle> = LazyLock::new(|| {
         widget::icon::from_svg_bytes(&br#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><g fill="none" stroke="black" stroke-width="1.7" stroke-linecap="round"><circle cx="6" cy="5" r="2"/><circle cx="6" cy="19" r="2"/><circle cx="18" cy="5" r="2"/><path d="M6 7v10M18 7c0 7-12 3-12 10"/></g></svg>"#[..]).symbolic(true)
@@ -11013,6 +11028,7 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
     overflow.extend(secondary);
     overflow.extend(language_choice(card, runtime));
     let more = icon_button(Icon::More, "More file actions")
+        .id(toolbar_overflow_id(card))
         .selected(runtime.toolbar_overflow_open)
         .on_press(RepositoryAction::ToggleToolbarOverflow { card });
     controls.push(crate::ui_controls::popover(
@@ -11026,7 +11042,11 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
             .into()
         }),
         widget::popover::Position::Bottom,
-        RepositoryAction::CloseToolbarOverflow { card },
+        crate::ui_controls::Close::new(
+            RepositoryAction::CloseToolbarOverflow { card },
+            toolbar_overflow_id(card),
+            move |opener| RepositoryAction::DismissToolbarOverflow { card, opener },
+        ),
     ));
     let actions = widget::row::with_children(controls)
         .spacing(crate::design::TOOLBAR_GROUP_SPACING)

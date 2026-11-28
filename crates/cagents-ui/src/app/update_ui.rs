@@ -1149,7 +1149,7 @@ impl Cagents {
             anchor,
             (open && enabled).then(|| self.waiting_popover(wait)),
             widget::popover::Position::Bottom,
-            Message::ChromeUi(chrome_ui::Action::Close),
+            chrome_ui::Popup::Update.close(),
         )
     }
 
@@ -1162,7 +1162,7 @@ impl Cagents {
                 .into(),
             crate::ui_controls::icon_button(Icon::Close, "Close")
                 .id(widget::Id::new(WAITING_CLOSE_ID))
-                .on_press(Message::ChromeUi(chrome_ui::Action::Close))
+                .on_press(chrome_ui::Popup::Update.close().dismiss())
                 .into(),
         ])
         .align_y(Alignment::Center)

@@ -170,7 +170,13 @@ impl Runtime {
                 crate::ui_controls::icon_button(Icon::Close, "Close permissions")
                     .compact()
                     .id(card_control_id(target.card, "chat-permission-close"))
-                    .on_press(action(Action::PermissionPicker(target, false)))
+                    .on_press(
+                        self.picker_close(
+                            super::PERMISSION_PICKER_CONTROL,
+                            Action::PermissionPicker(target, false),
+                        )
+                        .dismiss(),
+                    )
                     .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
                     .into(),
             ])

@@ -58,9 +58,12 @@ pub use labelled::labelled;
 pub use list_row::{ListRow, list_row, row_label};
 pub use owned::owned;
 pub use placeholder::{Placeholder, placeholder};
+#[cfg(test)]
+pub(crate) use popover::focuses;
 pub use popover::{
-    MenuItem, SCROLLING_FRAME, menu_divider, menu_item, menu_rows, popover, popover_item,
-    popover_menu, popover_scroll, scrolling_popover, scrolling_width,
+    Close, MenuItem, SCROLLING_FRAME, escape_dismisses, menu_divider, menu_item, menu_rows,
+    popover, popover_item, popover_menu, popover_scroll, return_focus, scrolling_popover,
+    scrolling_width,
 };
 pub use pull_request_state::{
     ChecksSummary, UNPUSHED_LABEL, WorktreePullRequestState, check_state_glyph, check_state_label,

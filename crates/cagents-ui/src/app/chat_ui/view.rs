@@ -4978,15 +4978,16 @@ impl Runtime {
                 .align_y(Alignment::Center),
             )
             .name("Resolve blocked permissions")
+            .id(card_control_id(
+                target.card,
+                super::PERMISSION_RESOLVE_CONTROL,
+            ))
             .class(crate::ui_controls::control_style(
                 self.permission_picker,
                 None,
             ))
             .padding(CONTROL_PADDING)
-            .on_press(action(Action::PermissionPicker(
-                target,
-                !self.permission_picker,
-            )))
+            .on_press(action(Action::ResolvePermissions(target)))
             .into()
         });
         // Money a reader is spending: two decimals, because four decimals of
@@ -5120,7 +5121,10 @@ impl Runtime {
             self.permission_picker
                 .then(|| self.permissions_view(available, content_width - 32.0)),
             widget::popover::Position::Top,
-            action(Action::PermissionPicker(target, false)),
+            self.picker_close(
+                super::PERMISSION_PICKER_CONTROL,
+                Action::PermissionPicker(target, false),
+            ),
         );
         let pane = widget::container(super::layout::pane(
             // The first block holds the transcript, which runs on down to
@@ -5838,7 +5842,10 @@ impl Runtime {
                     ),
                 )
                 .name("Choose permission mode")
-                .id(card_control_id(target.card, "chat-permission-picker"))
+                .id(card_control_id(
+                    target.card,
+                    super::PERMISSION_PICKER_CONTROL,
+                ))
                 .class(crate::ui_controls::control_style(open, None))
                 .padding(CONTROL_PADDING)
                 .on_press(action(Action::PermissionPicker(target, !open)));
@@ -5963,7 +5970,7 @@ impl Runtime {
                 accounts.current, gauge.label
             )),
         })
-        .id(card_control_id(target.card, "chat-account-picker"))
+        .id(card_control_id(target.card, super::ACCOUNT_PICKER_CONTROL))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::AccountPicker(target, !open)));
@@ -6052,7 +6059,10 @@ impl Runtime {
             anchor,
             choices,
             widget::popover::Position::Top,
-            action(Action::AccountPicker(target, false)),
+            self.picker_close(
+                super::ACCOUNT_PICKER_CONTROL,
+                Action::AccountPicker(target, false),
+            ),
         )
     }
 
@@ -6138,7 +6148,7 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .name(name)
-        .id(card_control_id(target.card, "chat-model-picker"))
+        .id(card_control_id(target.card, super::MODEL_PICKER_CONTROL))
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
@@ -6147,7 +6157,10 @@ impl Runtime {
             anchor,
             self.model_search(offers),
             widget::popover::Position::Top,
-            action(Action::ModelPicker(target, false)),
+            self.picker_close(
+                super::MODEL_PICKER_CONTROL,
+                Action::ModelPicker(target, false),
+            ),
         )
     }
 

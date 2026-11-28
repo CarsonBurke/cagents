@@ -17,7 +17,7 @@ use crate::{
     agent::ActivityState,
     design::{self, space},
     model::TerminalId,
-    ui_controls::{Icon, icon_button, placeholder, popover, popover_item},
+    ui_controls::{Close, Icon, icon_button, placeholder, popover, popover_item},
     work::{ActivitySource, Board, Column, Forge, Item, ItemKey, PullRequestState},
 };
 
@@ -80,7 +80,20 @@ impl CardRef {
     fn names(&self, item: &Item) -> bool {
         item.project == self.project && item.key == self.key
     }
+
+    /// One of this card's controls, by `role`, for focus to return to.
+    fn control_id(&self, role: &str) -> widget::Id {
+        widget::Id::new(format!(
+            "work.card.{:016x}.{role}",
+            card_key(&self.project, &self.key)
+        ))
+    }
 }
+
+/// The scope picker's control.
+pub const SCOPE_CONTROL_ID: &str = "work.scope";
+/// The control that opens what the board could not read.
+pub const PROBLEMS_CONTROL_ID: &str = "work.problems";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum Layout {
@@ -124,6 +137,9 @@ pub enum Action {
     ScopeMenu(bool),
     /// Opens or closes the details of what the board could not read.
     Problems(bool),
+    /// Escape or a Close control closed the open popover: focus goes back
+    /// to the control that opened it.
+    Dismiss(widget::Id),
     /// Shows one project, by repository, or all of them.
     Scope(Option<PathBuf>),
     Query(String),
@@ -133,7 +149,10 @@ pub enum Action {
     Refreshed(Result<(), String>),
     /// The card's main action: its worktree, else its pull request.
     Open(CardRef),
+    /// Opens a card's actions from its actions control, or closes them.
     Menu(Option<CardRef>),
+    /// Opens a card's actions from a right click on the card itself.
+    CardMenu(CardRef),
     OpenWorktree(CardRef),
     OpenPullRequest(CardRef),
     OpenUrl(String),
@@ -159,6 +178,8 @@ impl Action {
 #[derive(Debug, Clone)]
 pub enum Effect {
     Refresh,
+    /// Return the keyboard to this control.
+    Focus(widget::Id),
     Pin {
         project: PathBuf,
         item: String,
@@ -199,6 +220,9 @@ pub struct State {
     /// [`Layout::Worktrees`].
     board_layout: Layout,
     menu: Option<CardRef>,
+    /// Whether the card's menu opened from a right click on the card,
+    /// rather than from its actions control.
+    menu_from_card: bool,
     refreshing: bool,
     /// The last refresh or pin that failed.
     error: Option<String>,
@@ -206,6 +230,16 @@ pub struct State {
 }
 
 impl State {
+    /// The control `card`'s menu returns the keyboard to when dismissed:
+    /// the card a right click opened it on, or the card's actions control.
+    fn menu_opener(&self, card: &CardRef) -> widget::Id {
+        card.control_id(if self.menu_from_card && self.menu.as_ref() == Some(card) {
+            "open"
+        } else {
+            "actions"
+        })
+    }
+
     /// Forgets the board when the pane closes, so a reopened pane never
     /// shows a board from before it was closed.
     pub fn reset(&mut self) {
@@ -304,6 +338,13 @@ impl State {
                 }
                 None
             }
+            Action::Dismiss(opener) => {
+                let open = std::mem::take(&mut self.scope_menu)
+                    | std::mem::take(&mut self.problems_open)
+                    | self.menu.take().is_some();
+                // A dismissal queued behind another close moves nothing.
+                open.then_some(Effect::Focus(opener))
+            }
             Action::Scope(scope) => {
                 self.scope = scope;
                 self.scope_menu = false;
@@ -351,6 +392,12 @@ impl State {
                     self.problems_open = false;
                 }
                 self.menu = menu;
+                self.menu_from_card = false;
+                None
+            }
+            Action::CardMenu(card) => {
+                self.update(Action::Menu(Some(card)));
+                self.menu_from_card = true;
                 None
             }
             Action::OpenWorktree(card) => {
@@ -549,6 +596,7 @@ impl State {
             .align_y(Alignment::Center),
         )
         .name("Choose project")
+        .id(widget::Id::new(SCOPE_CONTROL_ID))
         .class(crate::ui_controls::control_style(self.scope_menu, None))
         .padding([space::XS, space::S])
         .on_press_maybe((!projects.is_empty()).then_some(Action::ScopeMenu(!self.scope_menu)));
@@ -590,7 +638,11 @@ impl State {
             anchor,
             content,
             widget::popover::Position::Bottom,
-            Action::ScopeMenu(false),
+            Close::new(
+                Action::ScopeMenu(false),
+                widget::Id::new(SCOPE_CONTROL_ID),
+                Action::Dismiss,
+            ),
         )
     }
 
@@ -708,6 +760,7 @@ impl State {
                 .align_y(Alignment::Center),
         )
         .name(name)
+        .id(widget::Id::new(PROBLEMS_CONTROL_ID))
         .class(crate::ui_controls::control_style(open, None))
         .padding([space::XXS, space::XS])
         .on_press(Action::Problems(!open));
@@ -732,7 +785,11 @@ impl State {
             anchor,
             content,
             widget::popover::Position::Bottom,
-            Action::Problems(false),
+            Close::new(
+                Action::Problems(false),
+                widget::Id::new(PROBLEMS_CONTROL_ID),
+                Action::Dismiss,
+            ),
         ))
     }
 
@@ -959,12 +1016,13 @@ impl State {
         let selected = self.menu.as_ref() == Some(&card);
         let button = widget::button::custom(content)
             .name(open_name(item))
+            .id(card.control_id("open"))
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
             .on_press(Action::Open(card.clone()));
         widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
+            .on_right_press(Action::CardMenu(card))
             .into()
     }
 
@@ -1022,12 +1080,13 @@ impl State {
         let button =
             widget::button::custom(widget::column::with_children(lines).spacing(space::XXS))
                 .name(open_name(item))
+                .id(card.control_id("open"))
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
                 .on_press(Action::Open(card.clone()));
         widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::Menu(Some(card)))
+            .on_right_press(Action::CardMenu(card))
             .into()
     }
 
@@ -1201,6 +1260,7 @@ impl State {
         let open = self.menu.as_ref() == Some(card);
         let anchor = icon_button(Icon::More, "Card actions")
             .compact()
+            .id(card.control_id("actions"))
             .selected(open)
             .on_press(Action::Menu((!open).then(|| card.clone())));
         let content = open.then(|| {
@@ -1324,7 +1384,7 @@ impl State {
             anchor,
             content,
             widget::popover::Position::Bottom,
-            Action::Menu(None),
+            Close::new(Action::Menu(None), self.menu_opener(card), Action::Dismiss),
         )
     }
 }
@@ -3229,5 +3289,38 @@ mod tests {
             age(30 * 24 * 60 * minute, 27 * 24 * 60 * minute, false),
             "3d"
         );
+    }
+
+    /// Escape returns the keyboard to what opened a popover: the scope or
+    /// problems control, a card's actions control, or the card a right
+    /// click opened its menu on.
+    #[test]
+    fn dismissing_a_popover_returns_to_what_opened_it() {
+        let card = CardRef::of(&item("fix", "cagents"));
+        let mut state = State::default();
+        let dismissed = |state: &mut State, opener: widget::Id| {
+            assert!(matches!(
+                state.update(Action::Dismiss(opener.clone())),
+                Some(Effect::Focus(to)) if to == opener
+            ));
+            assert!(!state.scope_menu && !state.problems_open && state.menu.is_none());
+            assert!(
+                state.update(Action::Dismiss(opener)).is_none(),
+                "nothing open, nothing to return from"
+            );
+        };
+        state.scope_menu = true;
+        dismissed(&mut state, widget::Id::new(SCOPE_CONTROL_ID));
+        state.problems_open = true;
+        dismissed(&mut state, widget::Id::new(PROBLEMS_CONTROL_ID));
+        for (open, role) in [
+            (Action::Menu(Some(card.clone())), "actions"),
+            (Action::CardMenu(card.clone()), "open"),
+        ] {
+            state.update(open);
+            let opener = state.menu_opener(&card);
+            assert_eq!(opener, card.control_id(role));
+            dismissed(&mut state, opener);
+        }
     }
 }

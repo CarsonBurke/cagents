@@ -5273,6 +5273,10 @@ impl SidebarState {
                     self.query.clear();
                 }
             }
+            SidebarAction::CloseControls => {
+                self.controls_expanded = false;
+                self.query.clear();
+            }
             SidebarAction::ToggleWorktrees(project_id) => {
                 toggle_membership(&mut self.expanded_worktree_groups, *project_id);
             }
@@ -5654,7 +5658,12 @@ pub enum SidebarAction {
     ListHover(bool),
     /// Folds or unfolds the Attention list's "In progress" section.
     ToggleInProgress,
+    /// Shows or hides the search controls. Hiding them returns the keyboard
+    /// to the search toggle.
     ToggleControls,
+    /// A press outside the compact search popover hid it, leaving the
+    /// keyboard wherever the press put it.
+    CloseControls,
     ToggleProject(ProjectId),
     ToggleWorktrees(ProjectId),
     SetWorktreeDisplay {
@@ -6818,7 +6827,12 @@ fn header<'a>(
                         .into()
                 }),
                 widget::popover::Position::Point(cosmic::iced::Point::new(COMPACT_WIDTH, 0.0)),
-                SidebarAction::ToggleControls,
+                // Escape hides it as the toggle does, back on the toggle.
+                crate::ui_controls::Close::new(
+                    SidebarAction::CloseControls,
+                    search_toggle_focus_id(),
+                    |_| SidebarAction::ToggleControls,
+                ),
             ));
         } else {
             actions.push(search_button);

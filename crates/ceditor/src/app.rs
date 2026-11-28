@@ -47,6 +47,8 @@ use std::{
 
 const QUICK_OPEN_ROW_HEIGHT: f32 = 40.0;
 const QUICK_OPEN_ROW_SPACING: f32 = 2.0;
+/// The toolbar control that opens the notices.
+const NOTICES_CONTROL_ID: &str = "ceditor.notices";
 
 mod checkout;
 mod notification_ui;
@@ -325,7 +327,10 @@ pub enum Message {
     Jump(CardId, LspPosition),
     Key(keyboard::Event, bool),
     Notices,
+    /// A press outside closed the notices, leaving the keyboard where it is.
     CloseNotices,
+    /// Escape or Close closed the notices: focus goes back to `opener`.
+    DismissNotices(widget::Id),
     Dismiss,
     ToggleSidebar,
     NewTab,
@@ -2449,10 +2454,19 @@ impl Editor {
             return Task::none();
         }
         self.notices_open = false;
-        let focus = self.current().map_or_else(Task::none, |tab| {
-            tab.runtime.focus_editor(tab.id).map(cosmic::Action::App)
-        });
-        Task::batch([focus, self.resume_pending_files()])
+        self.resume_pending_files()
+    }
+
+    /// Closes the notices as Escape and their Close control do: back on the
+    /// control that opened them.
+    fn dismiss_notices(&mut self, opener: widget::Id) -> Task<Message> {
+        if !self.notices_open {
+            return Task::none();
+        }
+        Task::batch([
+            self.close_notices(),
+            cagents_ui_kit::ui_controls::return_focus(opener).map(cosmic::Action::App),
+        ])
     }
 
     fn notices_control(&self) -> Option<Element<'_, Message>> {
@@ -2473,6 +2487,7 @@ impl Editor {
                 "Notices"
             },
         )
+        .id(widget::Id::new(NOTICES_CONTROL_ID))
         .selected(self.notices_open)
         .on_press_maybe((self.notices_open || !self.modal_open()).then_some(Message::Notices));
         let content = self.notices_open.then(|| {
@@ -2506,7 +2521,7 @@ impl Editor {
                 widget::row::with_children(vec![
                     widget::text::title3("Notices").width(Length::Fill).into(),
                     icon_button(Icon::Close, "Close notices (Escape)")
-                        .on_press(Message::CloseNotices)
+                        .on_press(Message::DismissNotices(widget::Id::new(NOTICES_CONTROL_ID)))
                         .id(widget::Id::new("ceditor.notices.close"))
                         .into(),
                 ])
@@ -2536,7 +2551,11 @@ impl Editor {
             anchor,
             content,
             widget::popover::Position::Bottom,
-            Message::CloseNotices,
+            cagents_ui_kit::ui_controls::Close::new(
+                Message::CloseNotices,
+                widget::Id::new(NOTICES_CONTROL_ID),
+                Message::DismissNotices,
+            ),
         ))
     }
 
@@ -3540,7 +3559,7 @@ impl Application for Editor {
                     return self.update(Message::Sidebar(SidebarAction::CancelGitConfirmation));
                 }
                 if self.notices_open {
-                    return self.close_notices();
+                    return self.dismiss_notices(widget::Id::new(NOTICES_CONTROL_ID));
                 }
                 if self.file_dialog.is_some() {
                     return self.update(Message::CancelFileOperation);
@@ -4930,7 +4949,7 @@ impl Application for Editor {
                 }
                 Message::Notices => {
                     if self.notices_open {
-                        return self.close_notices();
+                        return self.dismiss_notices(widget::Id::new(NOTICES_CONTROL_ID));
                     }
                     if !self.modal_open() {
                         self.notices_open = true;
@@ -4942,6 +4961,7 @@ impl Application for Editor {
                     Task::none()
                 }
                 Message::CloseNotices => self.close_notices(),
+                Message::DismissNotices(opener) => self.dismiss_notices(opener),
                 Message::Dismiss => {
                     self.notice = None;
                     for tab in &mut self.tabs {
@@ -8373,6 +8393,63 @@ mod tests {
         app.settings_open = false;
         drop(app.update(Message::Select(id)));
         assert!(app.tab(id).unwrap().pending_fragment.is_none());
+    }
+
+    /// Escape or Close closes the notices back on their control, rather
+    /// than leaving the keyboard nowhere; a press outside leaves it where
+    /// the press put it.
+    #[test]
+    fn dismissing_the_notices_returns_to_their_control() {
+        use iced::advanced::widget::operation::{Focusable, Outcome};
+        use iced::futures::{FutureExt, StreamExt};
+        struct Control(bool);
+        impl Focusable for Control {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+        let control = widget::Id::new(NOTICES_CONTROL_ID);
+        let focuses = |task: Task<Message>| {
+            let Some(mut stream) = iced::runtime::task::into_stream(task) else {
+                return false;
+            };
+            let mut asked = Control(false);
+            while let Some(Some(action)) = stream.next().now_or_never() {
+                let iced::runtime::Action::Widget(mut operation) = action else {
+                    continue;
+                };
+                loop {
+                    operation.focusable(Some(&control), iced::Rectangle::default(), &mut asked);
+                    match operation.finish() {
+                        Outcome::Chain(next) => operation = next,
+                        _ => break,
+                    }
+                }
+            }
+            asked.0
+        };
+
+        let mut app = editor();
+        app.notice = Some("boom".into());
+        drop(app.update(Message::Notices));
+        assert!(app.notices_open);
+        assert!(focuses(
+            app.update(Message::DismissNotices(control.clone()))
+        ));
+        assert!(!app.notices_open);
+        assert!(!focuses(app.update(Message::DismissNotices(control.clone()))));
+
+        drop(app.update(Message::Notices));
+        assert!(focuses(app.update(Message::Notices)), "its control again");
+        drop(app.update(Message::Notices));
+        assert!(!focuses(app.update(Message::CloseNotices)), "outside");
+        assert!(!app.notices_open);
     }
 
     #[test]

@@ -28,7 +28,7 @@ use crate::{
         SidebarWorktree, WorktreeOperationPhase, WorktreeOperationRow, WorktreePullRequestState,
         is_primary_worktree,
     },
-    ui_controls::{Icon, badge, icon_button, placeholder, popover, popover_item},
+    ui_controls::{Close, Icon, badge, icon_button, placeholder, popover, popover_item},
     work_ui::Layout,
 };
 
@@ -85,10 +85,25 @@ pub enum Menu {
     Worktree(ProjectId, WorktreeId),
 }
 
+impl Menu {
+    /// One of this row's controls, by `role`, for focus to return to.
+    fn control_id(self, role: &str) -> widget::Id {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        self.hash(&mut hasher);
+        widget::Id::new(format!("worktrees.{:016x}.{role}", hasher.finish()))
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Query(String),
+    /// Opens a row's actions from its actions control, or closes them.
     Menu(Option<Menu>),
+    /// Opens a row's actions from a right click on the row itself.
+    RowMenu(Menu),
+    /// Escape closed the open menu: focus goes back to what opened it.
+    Dismiss(widget::Id),
     /// Shows one of the board's layouts in the pane instead.
     Layout(Layout),
     /// One of the sidebar's own project and worktree actions.
@@ -101,13 +116,15 @@ impl Action {
     /// Whether this only closes the open menu, which nothing ever needs to
     /// refuse.
     pub fn closes_menu(&self) -> bool {
-        matches!(self, Self::Menu(None))
+        matches!(self, Self::Menu(None) | Self::Dismiss(_))
     }
 }
 
 /// What only the application can do for this view.
 #[derive(Debug, Clone)]
 pub enum Effect {
+    /// Return the keyboard to this control.
+    Focus(widget::Id),
     Layout(Layout),
     Sidebar(SidebarAction),
     FocusPane(CardId),
@@ -171,6 +188,9 @@ impl Entry {
 pub struct State {
     query: String,
     menu: Option<Menu>,
+    /// Whether the open menu opened from a right click on its row, rather
+    /// than from the row's actions control.
+    menu_from_row: bool,
     entries: Vec<Entry>,
     /// The projects revision and query the entries were listed from.
     listed: Option<(u64, String)>,
@@ -180,6 +200,16 @@ pub struct State {
 }
 
 impl State {
+    /// The control `menu` returns the keyboard to when dismissed: the row
+    /// a right click opened it on, or the row's actions control.
+    fn menu_opener(&self, menu: Menu) -> widget::Id {
+        menu.control_id(if self.menu_from_row && self.menu == Some(menu) {
+            "open"
+        } else {
+            "actions"
+        })
+    }
+
     /// Forgets what the view derived when the pane closes; the query stays.
     pub fn reset(&mut self) {
         self.menu = None;
@@ -274,8 +304,16 @@ impl State {
             }
             Action::Menu(menu) => {
                 self.menu = menu;
+                self.menu_from_row = false;
                 None
             }
+            Action::RowMenu(menu) => {
+                self.menu = Some(menu);
+                self.menu_from_row = true;
+                None
+            }
+            // A dismissal queued behind another close moves nothing.
+            Action::Dismiss(opener) => self.menu.take().map(|_| Effect::Focus(opener)),
             Action::Layout(layout) => Some(Effect::Layout(layout)),
             Action::Sidebar(action) => {
                 self.menu = None;
@@ -745,6 +783,7 @@ impl<'a> View<'a> {
         let open = self.state.menu == Some(menu);
         let anchor = icon_button(Icon::More, format!("{} actions", project.name))
             .compact()
+            .id(menu.control_id("actions"))
             .selected(open)
             .on_press_maybe(self.gated(Action::Menu((!open).then_some(menu))));
         let content = (open && !self.modal_open).then(|| {
@@ -798,7 +837,17 @@ impl<'a> View<'a> {
             anchor,
             content,
             widget::popover::Position::Bottom,
+            self.menu_close(menu),
+        )
+    }
+
+    /// How a row's menu closes: Escape returns to what opened it, the row
+    /// a right click opened it on or the row's actions control.
+    fn menu_close(&self, menu: Menu) -> Close<Action> {
+        Close::new(
             Action::Menu(None),
+            self.state.menu_opener(menu),
+            Action::Dismiss,
         )
     }
 
@@ -979,6 +1028,7 @@ impl<'a> View<'a> {
         let selected = current || self.state.menu == Some(menu);
         let button = widget::button::custom(lines)
             .name(name)
+            .id(menu.control_id("open"))
             .class(crate::work_ui::card_style(selected))
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
@@ -990,7 +1040,7 @@ impl<'a> View<'a> {
         if self.modal_open {
             row.into()
         } else {
-            row.on_right_press(Action::Menu(Some(menu))).into()
+            row.on_right_press(Action::RowMenu(menu)).into()
         }
     }
 
@@ -1150,6 +1200,7 @@ impl<'a> View<'a> {
                 &indicators,
                 agents.len(),
             ))
+            .id(menu.control_id("open"))
             .class(crate::work_ui::card_style(selected))
             .padding([space::XS + space::XXS, space::S])
             .width(Length::Fill)
@@ -1158,7 +1209,7 @@ impl<'a> View<'a> {
         if self.modal_open || deleting {
             row.into()
         } else {
-            row.on_right_press(Action::Menu(Some(menu))).into()
+            row.on_right_press(Action::RowMenu(menu)).into()
         }
     }
 
@@ -1292,6 +1343,7 @@ impl<'a> View<'a> {
         let deleting = worktree.deletion == Some(RowDeletion::Deleting);
         let anchor = icon_button(Icon::More, format!("{} actions", worktree.label()))
             .compact()
+            .id(menu.control_id("actions"))
             .selected(open)
             .on_press_maybe(
                 self.gated(Action::Menu((!open).then_some(menu)))
@@ -1428,7 +1480,7 @@ impl<'a> View<'a> {
             anchor,
             content,
             widget::popover::Position::Bottom,
-            Action::Menu(None),
+            self.menu_close(menu),
         )
     }
 }
@@ -1760,5 +1812,35 @@ mod tests {
         let projects = vec![notes];
         state.refresh(2, &projects);
         assert_eq!(worktree_labels(&state, &projects), ["# notes", "empty"]);
+    }
+
+    /// Escape returns the keyboard to what opened a row's menu: its actions
+    /// control, or the row a right click opened it on.
+    #[test]
+    fn dismissing_a_row_menu_returns_to_what_opened_it() {
+        let projects = vec![project(
+            "cagents",
+            vec![worktree("/src/cagents", "main", 0)],
+        )];
+        let menu = Menu::Worktree(projects[0].id, projects[0].worktrees[0].id);
+        let mut state = State::default();
+        state.refresh(1, &projects);
+        for (open, role) in [
+            (Action::Menu(Some(menu)), "actions"),
+            (Action::RowMenu(menu), "open"),
+        ] {
+            drop(state.update(open));
+            let opener = state.menu_opener(menu);
+            assert_eq!(opener, menu.control_id(role));
+            assert!(matches!(
+                state.update(Action::Dismiss(opener.clone())),
+                Some(Effect::Focus(to)) if to == opener
+            ));
+            assert_eq!(state.menu, None);
+            assert!(
+                state.update(Action::Dismiss(opener)).is_none(),
+                "nothing open, nothing to return from"
+            );
+        }
     }
 }

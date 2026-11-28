@@ -6379,7 +6379,7 @@ fn permission_keyboard_traverses_visible_approvals_pages_retry_and_close_both_wa
             "exactly the focused popup button should activate"
         );
         match messages.into_iter().next().unwrap() {
-            Message::ChatUi(Action::PermissionPicker(_, false)) => "close".into(),
+            Message::ChatUi(Action::DismissPicker(..)) => "close".into(),
             Message::ChatUi(Action::PermissionPage(_, page)) => format!("page:{page:?}"),
             Message::ChatUi(Action::Answer(_, request, answer)) => {
                 format!("answer:{request}:{answer}")
@@ -6451,15 +6451,20 @@ fn permission_keyboard_skips_disabled_actions_and_closes_an_unsent_popup() {
         ),
         false,
     );
-    assert!(matches!(
-        messages.as_slice(),
-        [Message::ChatUi(Action::PermissionPicker(_, false))]
-    ));
+    let composer = crate::app::card_control_id(card, "chat-composer");
+    assert!(
+        matches!(
+            messages.as_slice(),
+            [Message::ChatUi(Action::DismissPicker(_, opener))] if *opener == composer
+        ),
+        "Close returns to the composer the shortcut opened it from"
+    );
     for message in messages {
-        drop(app.handle_chat_ui(match message {
+        let task = app.handle_chat_ui(match message {
             Message::ChatUi(action) => action,
             _ => unreachable!(),
-        }));
+        });
+        assert_eq!(task_focuses(task, &composer), (true, false));
     }
     assert!(!chat_runtime(&app, card).permission_picker);
     assert!(!app.chat_start_pending(card));
@@ -9365,72 +9370,7 @@ pub(in crate::app) fn answer_start(
     )));
 }
 
-/// Whether `task` asks for the keyboard to go to `control`.
-///
-/// Focus is a widget operation, not a message. Each operation the task
-/// issues is shown two controls the way a widget tree would show them:
-/// the one asked about, and another that holds the keyboard.
-pub(super) fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
-    task_focuses_from(task, control, &widget::Id::new("the control in use"))
-}
-
-/// Whether `task` focuses `control` while `holder` has the keyboard, and
-/// whether `holder` still has it after, following chained operations.
-fn task_focuses_from(
-    task: Task<Message>,
-    control: &widget::Id,
-    elsewhere: &widget::Id,
-) -> (bool, bool) {
-    use cosmic::iced::advanced::widget::operation::Focusable;
-    use cosmic::iced::futures::StreamExt;
-
-    struct Control(bool);
-    impl Focusable for Control {
-        fn is_focused(&self) -> bool {
-            self.0
-        }
-        fn focus(&mut self) {
-            self.0 = true;
-        }
-        fn unfocus(&mut self) {
-            self.0 = false;
-        }
-    }
-
-    let mut asked = Control(false);
-    let mut holder = Control(true);
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
-            return;
-        };
-        // Whatever else the task carries may wait on a daemon that is not
-        // there. A focus operation is ready at once, so a short quiet
-        // spell means there is none still to come.
-        while let Ok(Some(action)) =
-            tokio::time::timeout(Duration::from_millis(250), stream.next()).await
-        {
-            if let cosmic::iced::runtime::Action::Widget(mut operation) = action {
-                loop {
-                    let bounds = cosmic::iced::Rectangle::default();
-                    operation.focusable(Some(control), bounds, &mut asked);
-                    operation.focusable(Some(elsewhere), bounds, &mut holder);
-                    match operation.finish() {
-                        cosmic::iced::advanced::widget::operation::Outcome::Chain(next) => {
-                            operation = next;
-                        }
-                        _ => break,
-                    }
-                }
-            }
-        }
-    });
-    runtime.shutdown_background();
-    (asked.0, holder.0)
-}
+pub(super) use crate::app::tests::{task_focuses, task_focuses_from};
 
 /// A conversation that finishes attaching while another pane is in use
 /// used to focus its own composer, which also blurred whatever the user
@@ -27640,4 +27580,85 @@ fn startup_releases_only_a_complete_direct_queue_after_its_checkpoint() {
             assert!(!saved.chat_drafts.contains_key(&card));
         }
     }
+}
+
+/// Escape or Close in a picker returns the keyboard to where it was when
+/// the picker opened: its button, the composer for a shortcut, or the
+/// blocked-actions control that offered it. A press outside it moves the
+/// keyboard nowhere.
+#[test]
+fn dismissing_a_picker_returns_the_keyboard_to_where_it_opened_from() {
+    use crate::workspace_widget::GlobalShortcut;
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Claude);
+    let target = chat_runtime(&app, card).target;
+    let control = |name| crate::app::card_control_id(card, name);
+    let dismissal = |app: &Cagents, control| {
+        let runtime = chat_runtime(app, card);
+        assert!(runtime.open_picker_opener().is_some(), "a picker is open");
+        let Message::ChatUi(action) = runtime
+            .picker_close(control, Action::ModelPicker(target, false))
+            .dismiss()
+        else {
+            unreachable!()
+        };
+        let Action::DismissPicker(_, opener) = &action else {
+            panic!("dismissing names an opener: {action:?}");
+        };
+        let opener = opener.clone();
+        assert_eq!(Some(opener.clone()), runtime.open_picker_opener());
+        (action, opener)
+    };
+
+    // Opened from its button: back to the button.
+    drop(app.update(Message::ChatUi(Action::ModelPicker(target, true))));
+    let (action, opener) = dismissal(&app, MODEL_PICKER_CONTROL);
+    assert_eq!(opener, control(MODEL_PICKER_CONTROL));
+    assert_eq!(
+        task_focuses(app.handle_chat_ui(action), &opener),
+        (true, false)
+    );
+    assert!(chat_runtime(&app, card).model_picker.is_none());
+
+    // A press outside closes it in place.
+    drop(app.update(Message::ChatUi(Action::ModelPicker(target, true))));
+    let task = app.handle_chat_ui(Action::ModelPicker(target, false));
+    assert_eq!(
+        task_focuses(task, &control(MODEL_PICKER_CONTROL)),
+        (false, true)
+    );
+
+    // Opened by its shortcut while typing: back to the composer.
+    drop(app.open_chat_control(GlobalShortcut::ChatModel));
+    let (action, opener) = dismissal(&app, MODEL_PICKER_CONTROL);
+    assert_eq!(opener, control("chat-composer"));
+    assert_eq!(
+        task_focuses(app.handle_chat_ui(action), &opener),
+        (true, false)
+    );
+
+    // The shortcut again closes it the same way.
+    drop(app.open_chat_control(GlobalShortcut::ChatPermissions));
+    let task = app.open_chat_control(GlobalShortcut::ChatPermissions);
+    assert!(!chat_runtime(&app, card).permission_picker);
+    assert_eq!(task_focuses(task, &control("chat-composer")), (true, false));
+
+    // Offered by the blocked-actions control: back to that control.
+    drop(app.handle_chat_ui(Action::ResolvePermissions(target)));
+    assert!(chat_runtime(&app, card).permission_picker);
+    let (action, opener) = dismissal(&app, PERMISSION_PICKER_CONTROL);
+    assert_eq!(opener, control(PERMISSION_RESOLVE_CONTROL));
+    assert_eq!(
+        task_focuses(app.handle_chat_ui(action), &opener),
+        (true, false)
+    );
+
+    // A dismissal queued after the picker closed moves nothing.
+    assert_eq!(
+        task_focuses(
+            app.handle_chat_ui(Action::DismissPicker(target, opener.clone())),
+            &opener
+        ),
+        (false, true)
+    );
 }

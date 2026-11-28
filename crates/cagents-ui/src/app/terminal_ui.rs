@@ -18,7 +18,10 @@ pub enum Action {
         Option<crate::terminal::SearchMatch>,
         Option<Url>,
     ),
-    DismissContext(CardId),
+    /// Closes the menu, leaving the keyboard where it is.
+    CloseContext(CardId),
+    /// Escape closed the menu: the keyboard goes back to `opener`.
+    DismissContext(CardId, widget::Id),
     Copy(CardId, String),
     CopySelection(CardId, crate::terminal::SearchMatch),
     PasteClipboard(CardId),
@@ -73,10 +76,7 @@ mod tests {
         let card = CardId::new();
         let rows = |app: &Cagents| {
             let items = app.terminal_menu(card).expect("an open menu");
-            let mut menu = crate::ui_controls::menu_rows(
-                items,
-                Message::TerminalFind(Action::DismissContext(card)),
-            );
+            let mut menu = crate::ui_controls::menu_rows(items);
             let mut tree = Tree::new(&menu);
             let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
             let node = menu.as_widget_mut().layout(
@@ -169,11 +169,12 @@ mod tests {
             link: Some(link.clone()),
             point: iced::Point::ORIGIN,
         });
+        let opener = app.card_keyboard_focus(card);
         {
             let items = app.terminal_menu(card).expect("an open menu");
-            let mut menu = crate::ui_controls::menu_rows(
-                items,
-                Message::TerminalFind(Action::DismissContext(card)),
+            let mut menu = crate::ui_controls::escape_dismisses(
+                crate::ui_controls::menu_rows(items),
+                Message::TerminalFind(Action::DismissContext(card, opener.clone())),
             );
             let mut tree = Tree::new(&menu);
             let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
@@ -210,11 +211,28 @@ mod tests {
             assert!(
                 matches!(
                     messages.as_slice(),
-                    [Message::TerminalFind(Action::DismissContext(dismissed))] if *dismissed == card
+                    [Message::TerminalFind(Action::DismissContext(dismissed, to))]
+                        if *dismissed == card && *to == opener
                 ),
-                "Escape dismisses the menu"
+                "Escape dismisses the menu, back to the terminal"
             );
         }
+        let task = app.update(Message::TerminalFind(Action::DismissContext(
+            card,
+            opener.clone(),
+        )));
+        assert!(app.terminal_context.is_none());
+        assert_eq!(
+            crate::app::tests::task_focuses(task, &opener),
+            (true, false),
+            "the keyboard goes back to the terminal"
+        );
+        app.terminal_context = Some(Context {
+            card,
+            selection: None,
+            link: Some(link.clone()),
+            point: iced::Point::ORIGIN,
+        });
         drop(app.update(Message::OpenLink(
             card,
             link,
@@ -752,6 +770,18 @@ impl Cagents {
                 error_notice,
             ]);
         }
+        // The menu closes even when its terminal has gone meanwhile.
+        let action = match action {
+            Action::CloseContext(_) => {
+                self.terminal_context = None;
+                return Task::none();
+            }
+            Action::DismissContext(_, opener) => {
+                self.terminal_context = None;
+                return crate::ui_controls::return_focus(opener).map(cosmic::Action::App);
+            }
+            action => action,
+        };
         let card = match &action {
             Action::Open(card)
             | Action::Close(card)
@@ -760,7 +790,6 @@ impl Cagents {
             | Action::Next(card, _)
             | Action::Focus(card, _)
             | Action::Context(card, ..)
-            | Action::DismissContext(card)
             | Action::Copy(card, _)
             | Action::CopySelection(card, _)
             | Action::PasteClipboard(card)
@@ -769,6 +798,7 @@ impl Cagents {
             | Action::SelectAll(card)
             | Action::Clear(card)
             | Action::Refresh(card, _) => *card,
+            Action::CloseContext(_) | Action::DismissContext(..) => unreachable!("handled above"),
         };
         let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
             // Recovery may have parked the card while this timer was asleep.
@@ -795,6 +825,9 @@ impl Cagents {
                 }
                 return Task::none();
             }
+            Action::CloseContext(_) | Action::DismissContext(..) => {
+                unreachable!("handled above")
+            }
             Action::Context(_, point, selection, link) => {
                 self.terminal_context = Some(Context {
                     card,
@@ -802,10 +835,6 @@ impl Cagents {
                     link,
                     point,
                 });
-                return Task::none();
-            }
-            Action::DismissContext(_) => {
-                self.terminal_context = None;
                 return Task::none();
             }
             Action::Copy(_, text) => {
