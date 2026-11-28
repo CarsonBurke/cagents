@@ -1185,6 +1185,10 @@ impl Action {
                 // A timer fires once: one dropped under a dialog would leave
                 // its conversations waiting for an attempt nothing makes.
                 | Self::ReattachDue(..)
+                // Each step of the update recovery watch must reach its handler.
+                | Self::UpdateRecoveryDue
+                | Self::UpdateRecoveryAnswered(..)
+                | Self::UpdateRecoveryReady
                 | Self::UpdatesAcknowledged(..)
                 | Self::CommandFinished(..)
                 | Self::CommandsDue(..)
