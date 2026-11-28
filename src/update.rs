@@ -81,10 +81,12 @@ pub(crate) use windows::reopen as reopen_update_windows;
 #[doc(hidden)]
 pub use windows::{
     PROBE_ARGUMENT as UI_FIRST_FRAME_PROBE, PROBE_RECEIPT as UI_FIRST_FRAME_RECEIPT,
-    validate_probe_environment,
 };
 #[cfg(feature = "ui")]
 pub mod startup;
+#[cfg(feature = "ui")]
+#[doc(hidden)]
+pub use startup::validate_probe_environment;
 use std::{
     fs::{self, File, OpenOptions},
     io::{self, Read, Seek, SeekFrom, Write},

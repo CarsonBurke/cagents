@@ -6,7 +6,7 @@ pub const PROBE_ARGUMENT: &str = "--internal-first-frame-probe";
 pub const PROBE_RECEIPT: &str = "first-frame-v1\n";
 const PROBE_LIMIT: u64 = 512 * 1024 * 1024;
 
-const PRIVATE_PATHS: &[(&str, &str)] = &[
+pub(super) const PRIVATE_PATHS: &[(&str, &str)] = &[
     ("HOME", "home"),
     ("XDG_RUNTIME_DIR", "runtime"),
     ("XDG_CONFIG_HOME", "config"),
@@ -185,42 +185,6 @@ fn configure_display(command: &mut Command) -> io::Result<()> {
         .or_else(|| std::env::home_dir().map(|home| home.join(".Xauthority")))
     {
         command.env("XAUTHORITY", std::path::absolute(authority)?);
-    }
-    Ok(())
-}
-
-/// Refuse direct invocations against an installed copy and its real data.
-#[cfg(feature = "ui")]
-pub fn validate_probe_environment() -> io::Result<()> {
-    let root = std::env::current_dir()?;
-    let executable = crate::process::current_executable()?;
-    let image = executable
-        .parent()
-        .ok_or_else(|| io::Error::other("probe image has no directory"))?;
-    let private = |path: &Path| {
-        fs::symlink_metadata(path).is_ok_and(|metadata| {
-            metadata.is_dir()
-                && metadata.uid() == crate::daemon::current_uid()
-                && metadata.mode() & 0o077 == 0
-        })
-    };
-    if !private(&root)
-        || !private(image)
-        || executable
-            .file_name()
-            .is_none_or(|name| name != "cagents-ui")
-        || ["cagents", "cagentsd"]
-            .iter()
-            .any(|name| image.join(name).exists())
-        || PRIVATE_PATHS.iter().any(|(key, name)| {
-            let path = root.join(name);
-            std::env::var_os(key).as_deref() != Some(path.as_os_str())
-                || !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
-        })
-    {
-        return Err(io::Error::other(
-            "native startup check requires a private workspace",
-        ));
     }
     Ok(())
 }

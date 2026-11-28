@@ -4,6 +4,7 @@ use super::{
     UpdateError, UpdateJob, UpdatePhase,
     impact::Disposition,
     progress::{self, Edge},
+    windows::PRIVATE_PATHS,
 };
 use notify::{RecursiveMode, Watcher};
 use std::{
@@ -16,6 +17,41 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+
+/// Refuse direct invocations against an installed copy and its real data.
+pub fn validate_probe_environment() -> io::Result<()> {
+    let root = std::env::current_dir()?;
+    let executable = crate::process::current_executable()?;
+    let image = executable
+        .parent()
+        .ok_or_else(|| io::Error::other("probe image has no directory"))?;
+    let private = |path: &Path| {
+        fs::symlink_metadata(path).is_ok_and(|metadata| {
+            metadata.is_dir()
+                && metadata.uid() == crate::daemon::current_uid()
+                && metadata.mode() & 0o077 == 0
+        })
+    };
+    if !private(&root)
+        || !private(image)
+        || executable
+            .file_name()
+            .is_none_or(|name| name != "cagents-ui")
+        || ["cagents", "cagentsd"]
+            .iter()
+            .any(|name| image.join(name).exists())
+        || PRIVATE_PATHS.iter().any(|(key, name)| {
+            let path = root.join(name);
+            std::env::var_os(key).as_deref() != Some(path.as_os_str())
+                || !fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir())
+        })
+    {
+        return Err(io::Error::other(
+            "native startup check requires a private workspace",
+        ));
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LockState {
