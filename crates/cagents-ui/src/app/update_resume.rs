@@ -10,7 +10,7 @@ use super::*;
 use crate::model::TerminalId;
 use crate::persistence::{Taken, UpdateResumeStore};
 use crate::update::UpdateJob;
-use crate::update::in_flight::{InFlight, Outcome, TaskKind};
+use crate::update::in_flight::{InFlight, Outcome, ResumePoint, TaskKind};
 
 /// The most conversations the offer lists by name; the rest are counted.
 const LISTED: usize = 6;
@@ -28,6 +28,8 @@ pub(super) struct State {
     /// Those asked to resume here, until the shared record says this window
     /// took them first.
     taking: Vec<TerminalId>,
+    /// Saved history checks for this job: false until the read returns.
+    history_checks: HashMap<TerminalId, bool>,
     /// What is still on offer, in the update's order.
     offers: Vec<Outcome>,
 }
@@ -35,6 +37,8 @@ pub(super) struct State {
 #[derive(Clone, Debug)]
 pub enum Action {
     Loaded(String, Result<Vec<TerminalId>, String>),
+    HistoryChecked(String, Vec<(TerminalId, bool)>),
+    DispatchChecked(super::chat_ui::Target, u64, Vec<(u64, bool)>),
     /// The shared record's answer to taking conversations off the update's
     /// offer, with the ones among them to resume.
     Taken(String, Vec<Resume>, Result<Taken, String>),
@@ -50,6 +54,28 @@ pub struct Resume {
     id: TerminalId,
     prompt: String,
     label: String,
+    point: Option<ResumePoint>,
+    advanced: bool,
+}
+
+pub(super) fn check_resume_dispatch(
+    target: super::chat_ui::Target,
+    turn: u64,
+    launch: crate::chat::Launch,
+    checks: Vec<(u64, ResumePoint)>,
+) -> Task<Message> {
+    let ids = checks.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    cosmic::task::future(async move {
+        let checked = tokio::task::spawn_blocking(move || {
+            checks
+                .into_iter()
+                .map(|(id, point)| (id, point.advanced_on_disk(&launch)))
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|_| ids.into_iter().map(|id| (id, false)).collect());
+        Message::UpdateResume(Action::DispatchChecked(target, turn, checked))
+    })
 }
 
 impl State {
@@ -232,21 +258,24 @@ impl Cagents {
     pub(super) fn offer_update_resume(&mut self, job: &UpdateJob) -> Task<Message> {
         let state = &mut self.update_resume;
         if !job.phase.is_terminal() || !job.in_flight.iter().any(Outcome::lost) {
-            state.job = None;
-            state.handled = None;
-            state.offers.clear();
+            *state = State {
+                store: state.store.take(),
+                ..State::default()
+            };
             return Task::none();
         }
         if state.job.as_ref().is_some_and(|known| known.id == job.id) {
-            return Task::none();
+            return self.check_update_resume_history();
         }
-        state.job = Some(job.clone());
-        state.handled = None;
-        state.offers.clear();
+        *state = State {
+            store: state.store.take(),
+            job: Some(job.clone()),
+            ..State::default()
+        };
         let Some(store) = state.store.clone() else {
             state.handled = Some(Vec::new());
             state.rebuild();
-            return Task::none();
+            return self.check_update_resume_history();
         };
         let id = job.id.clone();
         cosmic::task::future(async move {
@@ -278,7 +307,25 @@ impl Cagents {
                 merged.retain(|id| !handled.contains(id));
                 state.handled = Some(handled.into_iter().chain(merged).collect());
                 state.rebuild();
-                Task::none()
+                self.check_update_resume_history()
+            }
+            Action::HistoryChecked(job, checked) => {
+                let state = &mut self.update_resume;
+                if state.job.as_ref().is_none_or(|known| known.id != job) {
+                    return Task::none();
+                }
+                let mut continued = Vec::new();
+                for (id, advanced) in checked {
+                    state.history_checks.insert(id, true);
+                    if advanced {
+                        state.handle(id);
+                        continued.push(id);
+                    }
+                }
+                self.take_update_offer(continued, Vec::new())
+            }
+            Action::DispatchChecked(target, turn, checked) => {
+                self.update_resume_dispatch_checked(target, turn, checked)
             }
             Action::Taken(job, resumes, result) => self.update_resume_taken(job, resumes, result),
             Action::Show(id) => {
@@ -306,6 +353,57 @@ impl Cagents {
         }
     }
 
+    /// Check exact provider history away from the window thread. A card may
+    /// appear after the job, so its first attachment also asks for this read.
+    pub(super) fn check_update_resume_history(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return Task::none();
+        }
+        let state = &self.update_resume;
+        let Some(job) = state.job.as_ref().map(|job| job.id.clone()) else {
+            return Task::none();
+        };
+        let checks: Vec<_> = state
+            .offers
+            .iter()
+            .filter(|outcome| !state.history_checks.contains_key(&outcome.work.id))
+            .filter_map(|outcome| {
+                let id = outcome.work.id;
+                let point = outcome.resume_point.as_ref()?;
+                let (card, _) = self.session_card(id)?;
+                let launch = self.update_resume_launch(card)?;
+                point
+                    .matches_launch(launch)
+                    .then(|| (id, point.clone(), launch.clone()))
+            })
+            .collect();
+        if checks.is_empty() {
+            return Task::none();
+        }
+        self.update_resume
+            .history_checks
+            .extend(checks.iter().map(|(id, _, _)| (*id, false)));
+        let ids = checks.iter().map(|(id, _, _)| *id).collect::<Vec<_>>();
+        cosmic::task::future(async move {
+            let checked = tokio::task::spawn_blocking(move || {
+                checks
+                    .into_iter()
+                    .map(|(id, point, launch)| (id, point.advanced_on_disk(&launch)))
+                    .collect()
+            })
+            .await
+            .unwrap_or_else(|_| ids.into_iter().map(|id| (id, false)).collect());
+            Message::UpdateResume(Action::HistoryChecked(job, checked))
+        })
+    }
+
+    fn update_resume_launch(&self, card: CardId) -> Option<&crate::chat::Launch> {
+        match &self.card_state(card)?.kind {
+            CardKind::Chat(session) => Some(&session.launch),
+            _ => None,
+        }
+    }
+
     /// Resumes each offered conversation in `ids` that can take the message,
     /// once this window is the first to take it off the offer, and says
     /// which could not.
@@ -318,7 +416,7 @@ impl Cagents {
                 .offers
                 .iter()
                 .find(|outcome| outcome.work.id == id)
-                .filter(|_| !self.update_resume.taking.contains(&id))
+                .filter(|outcome| self.update_resume_eligible(outcome))
             else {
                 continue;
             };
@@ -335,6 +433,8 @@ impl Cagents {
                 id,
                 prompt: continue_prompt(&outcome.work),
                 label,
+                point: outcome.resume_point.clone(),
+                advanced: false,
             });
         }
         if !refused.is_empty() {
@@ -350,7 +450,9 @@ impl Cagents {
         // Off the offer at once; sent once the shared record answers, unless
         // the reader writes to the conversation first.
         self.update_resume.taking.extend(ids.iter().copied());
-        if self.update_resume.store.is_none() {
+        if self.update_resume.store.is_none()
+            && (crate::device::is_remote() || resumes.iter().all(|resume| resume.point.is_none()))
+        {
             let first = ids;
             return self.update_resume_taken(
                 job,
@@ -367,23 +469,49 @@ impl Cagents {
     /// Takes `ids` off the update's offer in every window, then resumes
     /// those of `resumes` this window took first.
     fn take_update_offer(&self, ids: Vec<TerminalId>, resumes: Vec<Resume>) -> Task<Message> {
-        let (Some(store), Some(job)) = (
-            self.update_resume.store.clone(),
-            self.update_resume.job.as_ref().map(|job| job.id.clone()),
-        ) else {
+        let Some(job) = self.update_resume.job.as_ref().map(|job| job.id.clone()) else {
             return Task::none();
         };
-        if ids.is_empty() {
+        let store = self.update_resume.store.clone();
+        if ids.is_empty() || (store.is_none() && resumes.is_empty()) {
             return Task::none();
         }
+        let checks: Vec<_> = if crate::device::is_remote() {
+            Vec::new()
+        } else {
+            resumes
+                .iter()
+                .enumerate()
+                .filter(|(_, resume)| resume.point.is_some())
+                .filter_map(|(index, resume)| {
+                    let (card, _) = self.session_card(resume.id)?;
+                    Some((index, self.update_resume_launch(card)?.clone()))
+                })
+                .collect()
+        };
         cosmic::task::future(async move {
             let taking = job.clone();
+            let mut checked = resumes.clone();
             let result = tokio::task::spawn_blocking(move || {
-                store.take(&taking, &ids).map_err(|error| error.to_string())
+                let result = match store {
+                    Some(store) => store.take(&taking, &ids).map_err(|error| error.to_string()),
+                    None => Ok(Taken {
+                        first: ids,
+                        handled: Vec::new(),
+                    }),
+                };
+                for (index, launch) in checks {
+                    let resume = &mut checked[index];
+                    resume.advanced = resume
+                        .point
+                        .as_ref()
+                        .is_some_and(|point| point.advanced_on_disk(&launch));
+                }
+                (checked, result)
             })
-            .await
-            .map_err(|error| error.to_string())
-            .and_then(|result| result);
+            .await;
+            let (resumes, result) =
+                result.unwrap_or_else(|error| (resumes, Err(error.to_string())));
             Message::UpdateResume(Action::Taken(job, resumes, result))
         })
     }
@@ -395,6 +523,9 @@ impl Cagents {
         result: Result<Taken, String>,
     ) -> Task<Message> {
         let state = &mut self.update_resume;
+        if state.job.as_ref().is_none_or(|known| known.id != job) {
+            return Task::none();
+        }
         // One the reader wrote to while the record was asked is under way
         // again, and no longer being taken.
         let resumes: Vec<_> = resumes
@@ -404,10 +535,9 @@ impl Cagents {
         state
             .taking
             .retain(|id| !resumes.iter().any(|resume| resume.id == *id));
-        let current = state.job.as_ref().is_some_and(|known| known.id == job);
         let first = match result {
             Ok(taken) => {
-                if current && let Some(handled) = &mut state.handled {
+                if let Some(handled) = &mut state.handled {
                     for id in taken.handled {
                         if !handled.contains(&id) {
                             handled.push(id);
@@ -420,9 +550,7 @@ impl Cagents {
             // have sent the same message. They stay on offer to try again.
             Err(error) => {
                 tracing::warn!(%error, "could not record the update resume offer");
-                if current {
-                    state.rebuild();
-                }
+                state.rebuild();
                 let labels: Vec<_> = resumes.into_iter().map(|resume| resume.label).collect();
                 if !labels.is_empty() {
                     self.status = Some(TransientNotice::warning(unchecked_notice(&labels)));
@@ -430,20 +558,31 @@ impl Cagents {
                 return Task::none();
             }
         };
-        if current {
-            state.rebuild();
-        }
+        state.rebuild();
         let mut tasks = Vec::new();
         let mut elsewhere = Vec::new();
         let mut refused = Vec::new();
         for resume in resumes {
+            let card = self.session_card(resume.id).map(|(card, _)| card);
+            if resume.advanced
+                || card
+                    .zip(resume.point.as_ref())
+                    .is_some_and(|(card, point)| {
+                        self.update_resume_launch(card)
+                            .is_none_or(|launch| !point.matches_launch(launch))
+                            || self.chat_update_resume_advanced(card, point)
+                    })
+            {
+                self.update_resume.handle(resume.id);
+                continue;
+            }
             if !first.contains(&resume.id) {
                 elsewhere.push(resume.label);
                 continue;
             }
-            let sent = self
-                .session_card(resume.id)
-                .and_then(|(card, _)| self.resume_lost_work(card, resume.prompt.clone()));
+            let sent = card.and_then(|card| {
+                self.resume_lost_work(card, resume.prompt.clone(), resume.point.clone())
+            });
             match sent {
                 Some(task) => {
                     self.update_resume.handle(resume.id);
@@ -456,7 +595,7 @@ impl Cagents {
             // Changed while the record was asked: back on offer, here and in
             // the other windows.
             let ids: Vec<_> = refused.iter().map(|resume| resume.id).collect();
-            if current && let Some(handled) = &mut self.update_resume.handled {
+            if let Some(handled) = &mut self.update_resume.handled {
                 handled.retain(|id| !ids.contains(id));
                 self.update_resume.rebuild();
             }
@@ -503,13 +642,51 @@ impl Cagents {
         self.take_update_offer(vec![id], Vec::new())
     }
 
+    /// Keep confirmed advancement even if the pane subsequently reads an
+    /// older history page or releases its transcript.
+    pub(super) fn observe_update_resume_advance(&mut self, card: CardId) -> Task<Message> {
+        if self.update_resume.offers.is_empty() {
+            return Task::none();
+        }
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
+            return Task::none();
+        };
+        let id = session.id;
+        let advanced = self.update_resume.offers.iter().any(|outcome| {
+            outcome.work.id == id
+                && outcome
+                    .resume_point
+                    .as_ref()
+                    .is_some_and(|point| self.chat_update_resume_advanced(card, point))
+        });
+        if !advanced {
+            return Task::none();
+        }
+        self.update_resume.handle(id);
+        self.update_resume.taking.retain(|taking| *taking != id);
+        self.take_update_offer(vec![id], Vec::new())
+    }
+
     /// The offered conversations this window holds a tab for. Another
     /// window's are offered there.
     fn offered_here(&self) -> impl Iterator<Item = &Outcome> {
-        self.update_resume.offers.iter().filter(|outcome| {
-            !self.update_resume.taking.contains(&outcome.work.id)
-                && self.session_card(outcome.work.id).is_some()
-        })
+        self.update_resume
+            .offers
+            .iter()
+            .filter(|outcome| self.update_resume_eligible(outcome))
+    }
+
+    fn update_resume_eligible(&self, outcome: &Outcome) -> bool {
+        let id = outcome.work.id;
+        !self.update_resume.taking.contains(&id)
+            && self.update_resume.history_checks.get(&id) != Some(&false)
+            && self.session_card(id).is_some_and(|(card, _)| {
+                outcome.resume_point.as_ref().is_none_or(|point| {
+                    self.update_resume_launch(card)
+                        .is_some_and(|launch| point.matches_launch(launch))
+                        && !self.chat_update_resume_advanced(card, point)
+                })
+            })
     }
 
     fn offer_label(&self, outcome: &Outcome) -> String {

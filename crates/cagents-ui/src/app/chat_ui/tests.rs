@@ -11969,7 +11969,10 @@ fn resuming_stopped_work_on_saved_history_starts_a_provider_to_send_it() {
     let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
     let source = reading_saved_history(&mut app, card);
     assert!(app.chat_takes_resume(card));
-    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert!(
+        app.resume_lost_work(card, "Carry on".into(), None)
+            .is_some()
+    );
     let attempt = app.chat_ui.attempt(card).expect("a provider starts");
     assert_eq!(attempt.intent, chat::Intent::Start);
     assert_eq!(attempt.session, source);
@@ -11994,7 +11997,10 @@ fn a_resume_held_while_reopening_starts_a_provider_if_it_reopens_as_saved_histor
     let attempt = app.chat_ui.attempt(card).expect("the reader reattaches");
     assert_eq!(attempt.intent, chat::Intent::Restore);
     let restoring = attempt.target;
-    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert!(
+        app.resume_lost_work(card, "Carry on".into(), None)
+            .is_some()
+    );
     assert_eq!(held(&app, card).as_deref(), Some("Carry on"));
 
     answer_start(
@@ -12028,7 +12034,10 @@ fn a_resume_on_a_disconnected_reader_reconnects_then_starts_a_provider() {
     let target = chat_runtime(&app, card).target;
     app.chat_runtime_mut(target).unwrap().disconnected = true;
     assert!(app.chat_takes_resume(card));
-    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert!(
+        app.resume_lost_work(card, "Carry on".into(), None)
+            .is_some()
+    );
     let attempt = app.chat_ui.attempt(card).expect("the reader reconnects");
     assert_eq!(attempt.intent, chat::Intent::Restore);
     let restoring = attempt.target;
@@ -12063,7 +12072,10 @@ fn a_resume_held_while_reopening_waits_for_saved_history_to_load() {
     let target = chat_runtime(&app, card).target;
     drop(app.handle_chat_ui(Action::Reconnect(target)));
     let restoring = app.chat_ui.attempt(card).unwrap().target;
-    assert!(app.resume_lost_work(card, "Carry on".into()).is_some());
+    assert!(
+        app.resume_lost_work(card, "Carry on".into(), None)
+            .is_some()
+    );
     let loading = Snapshot {
         history_loading: true,
         ..saved_history_snapshot(&source)

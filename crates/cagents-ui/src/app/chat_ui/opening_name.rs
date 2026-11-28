@@ -21,21 +21,7 @@ static READS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
 /// linked transcript, or one with no such prompt within
 /// [`resume_ui::HEAD_BYTES`].
 pub(super) fn read(launch: &chat::Launch) -> Option<String> {
-    let id = launch.session_id.as_deref()?;
-    let home = launch.provider.session_root(&launch.recipe)?;
-    let path = match launch.provider {
-        Provider::Claude => {
-            // Claude files a conversation under its canonical directory. A
-            // removed worktree keeps the saved path, which was canonical.
-            let directory = &launch.recipe.working_directory;
-            let cwd = directory
-                .canonicalize()
-                .unwrap_or_else(|_| directory.clone());
-            crate::agent::claude_transcript(&home, &cwd, id).ok()?
-        }
-        Provider::Codex => crate::agent::codex_rollout(&home, id).ok()?,
-        Provider::Omp | Provider::Antigravity | Provider::Muse => return None,
-    };
+    let path = crate::agent::native_history_path(launch)?;
     super::super::resume_ui::first_prompt(
         launch.provider,
         &path,

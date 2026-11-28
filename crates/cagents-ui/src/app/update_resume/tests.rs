@@ -19,6 +19,7 @@ fn outcome(id: TerminalId, fate: Fate, work: impl FnOnce(&mut InFlight)) -> Outc
     work(&mut recorded);
     Outcome {
         work: recorded,
+        resume_point: None,
         label: "Recorded label".into(),
         fate,
     }
@@ -229,6 +230,8 @@ fn taken_request(app: &mut Cagents, id: TerminalId) -> Option<Resume> {
             id,
             prompt: continue_prompt(&outcome.work),
             label: app.offer_label(&outcome),
+            point: outcome.resume_point,
+            advanced: false,
         }
     })
 }
@@ -581,4 +584,193 @@ fn the_notice_names_every_conversation_that_could_not_be_resumed() {
         refused_notice(&labels(&["login", "ci", "notes"])),
         "login, ci and notes can't take a message right now, so they weren't resumed."
     );
+}
+
+const RESUME_SESSION: &str = "d1ffb0e0-d588-478a-94e4-be7d954d3c5b";
+const BEFORE_INPUT: &str = "d1ffb0e0-d588-478a-94e4-be7d954d3c5c";
+const AFTER_INPUT: &str = "d1ffb0e0-d588-478a-94e4-be7d954d3c5d";
+
+fn anchored_outcome(id: TerminalId) -> Outcome {
+    let mut outcome = outcome(id, Fate::Stopped, |work| work.turn = true);
+    outcome.resume_point = Some(
+        serde_json::from_value(serde_json::json!({
+            "provider": Provider::Claude, "session": RESUME_SESSION, "turn": BEFORE_INPUT,
+        }))
+        .unwrap(),
+    );
+    outcome
+}
+
+fn reply(task: Task<Message>) -> Action {
+    use cosmic::iced::futures::StreamExt;
+
+    let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("update task");
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    match executor.block_on(stream.next()) {
+        Some(cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+            Message::UpdateResume(action),
+        ))) => action,
+        _ => panic!("expected an update resume reply"),
+    }
+}
+
+fn write_resume_input(file: &mut std::fs::File, uuid: &str) {
+    use std::io::Write;
+
+    writeln!(
+        file,
+        "{}",
+        serde_json::json!({
+            "type": "user", "sessionId": RESUME_SESSION, "uuid": uuid,
+            "message": {"role": "user", "content": "Proceed with the plan."}
+        })
+    )
+    .unwrap();
+}
+
+#[test]
+fn saved_provider_history_is_checked_before_showing_claiming_and_sending() {
+    #[derive(PartialEq, Eq)]
+    enum Continued {
+        Offer,
+        Claim,
+        Dispatch,
+        Never,
+    }
+    for when in [
+        Continued::Offer,
+        Continued::Claim,
+        Continued::Dispatch,
+        Continued::Never,
+    ] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat_for_provider(&mut app, Provider::Claude, Some(RESUME_SESSION));
+        let id = session_id(&app, card);
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            panic!("the pane is a chat");
+        };
+        session.launch.recipe.working_directory = root.clone();
+        session.launch.recipe.environment =
+            [("HOME".to_owned(), root.to_str().unwrap().to_owned())].into();
+
+        let launch = session.launch.clone();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("the pane has a chat runtime");
+        };
+        runtime.session.launch = launch;
+
+        let project = root.join(".claude/projects").join(
+            root.to_str()
+                .unwrap()
+                .replace(|ch: char| !ch.is_ascii_alphanumeric(), "-"),
+        );
+        std::fs::create_dir_all(&project).unwrap();
+        let mut history =
+            std::fs::File::create(project.join(format!("{RESUME_SESSION}.jsonl"))).unwrap();
+        write_resume_input(&mut history, BEFORE_INPUT);
+        if when == Continued::Offer {
+            write_resume_input(&mut history, AFTER_INPUT);
+        }
+
+        let update = job(UpdatePhase::Complete, vec![anchored_outcome(id)]);
+        let read = app.offer_update_resume(&update);
+        assert!(
+            offered(&app).is_empty(),
+            "a provider-history read is pending"
+        );
+        drop(app.update_update_resume(reply(read)));
+
+        if when == Continued::Offer {
+            assert!(offered(&app).is_empty(), "the provider already advanced");
+        } else {
+            assert_eq!(offered(&app), vec![id]);
+            if when == Continued::Claim {
+                write_resume_input(&mut history, AFTER_INPUT);
+            }
+            let take = app.update_update_resume(Action::Resume(id));
+            let dispatch = app.update_update_resume(reply(take));
+            if when == Continued::Dispatch || when == Continued::Never {
+                assert!(held(&app, card).is_some());
+                assert_eq!(sent(&app, card), None);
+                if when == Continued::Dispatch {
+                    write_resume_input(&mut history, AFTER_INPUT);
+                }
+                drop(app.update_update_resume(reply(dispatch)));
+            }
+        }
+        assert!(offered(&app).is_empty());
+        if when == Continued::Never {
+            assert!(sent(&app, card).is_some_and(|message| message.contains("carry on")));
+            assert_eq!(handled(&app), vec![id]);
+            continue;
+        }
+        assert_eq!(sent(&app, card), None);
+        assert_eq!(held(&app, card), None);
+        assert_eq!(handled(&app), vec![id]);
+    }
+}
+
+#[test]
+fn replacing_the_update_discards_a_stale_resume_claim_for_the_same_chat() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _record = shared(&mut app);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some("resumed"));
+    let id = session_id(&app, card);
+    let old = job(
+        UpdatePhase::Complete,
+        vec![outcome(id, Fate::Stopped, |work| work.turn = true)],
+    );
+    offer(&mut app, &old, &[]);
+    drop(app.update_update_resume(Action::Resume(id)));
+    let old_resume = taken_request(&mut app, id).unwrap();
+
+    let mut new = old.clone();
+    new.id = "update-2".into();
+    offer(&mut app, &new, &[]);
+    drop(app.update_update_resume(Action::Resume(id)));
+    drop(app.update_update_resume(Action::Taken(
+        old.id,
+        vec![old_resume],
+        Ok(Taken {
+            first: vec![id],
+            handled: vec![id],
+        }),
+    )));
+    assert_eq!(app.update_resume.taking, vec![id]);
+    assert_eq!(sent(&app, card), None);
+    assert_eq!(held(&app, card), None);
+}
+
+#[test]
+fn a_claim_cannot_send_into_a_new_provider_session_on_the_same_terminal_id() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let _record = shared(&mut app);
+    let card = live_chat_for_provider(&mut app, Provider::Claude, Some(RESUME_SESSION));
+    let id = session_id(&app, card);
+    let update = job(UpdatePhase::Complete, vec![anchored_outcome(id)]);
+    offer(&mut app, &update, &[]);
+    drop(app.update_update_resume(Action::HistoryChecked(update.id.clone(), vec![(id, false)])));
+    drop(app.update_update_resume(Action::Resume(id)));
+    let resume = taken_request(&mut app, id).unwrap();
+
+    let CardKind::Chat(session) = &mut app.card_state_mut(card).unwrap().kind else {
+        panic!("the card holds a chat");
+    };
+    session.launch.session_id = Some(AFTER_INPUT.into());
+    assert_eq!(session.id, id);
+    drop(app.update_update_resume(Action::Taken(
+        update.id,
+        vec![resume],
+        Ok(Taken {
+            first: vec![id],
+            handled: vec![id],
+        }),
+    )));
+    assert!(offered(&app).is_empty());
+    assert_eq!(sent(&app, card), None);
+    assert_eq!(held(&app, card), None);
 }

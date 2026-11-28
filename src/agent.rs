@@ -4,7 +4,7 @@ use crate::model::LaunchRecipe;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-mod claude;
+pub(crate) mod claude;
 // The window reads a conversation's opening to name its channel; the daemon
 // reads whole transcripts to resume and observe them.
 #[cfg(any(feature = "ui", feature = "host"))]
@@ -30,6 +30,24 @@ mod omp;
 
 #[cfg(feature = "host")]
 pub mod observe;
+
+/// The provider-owned transcript of the exact conversation this launch names.
+#[cfg(feature = "ui")]
+pub fn native_history_path(launch: &crate::chat::Launch) -> Option<PathBuf> {
+    let id = launch.session_id.as_deref()?;
+    let home = launch.provider.session_root(&launch.recipe)?;
+    match launch.provider {
+        Provider::Claude => {
+            let directory = &launch.recipe.working_directory;
+            let cwd = directory
+                .canonicalize()
+                .unwrap_or_else(|_| directory.clone());
+            claude_transcript(&home, &cwd, id).ok()
+        }
+        Provider::Codex => codex_rollout(&home, id).ok(),
+        _ => None,
+    }
+}
 
 /// Where Omp keeps its data - its sessions and its agent database - for
 /// `launch`, resolved as Omp resolves it: its profile, its configuration

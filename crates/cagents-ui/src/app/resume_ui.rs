@@ -3563,7 +3563,8 @@ mod tests {
         assert!(!app.cards.contains_key(&card), "nothing has attached yet");
 
         assert!(
-            app.resume_lost_work(card, "Carry on".into()).is_some(),
+            app.resume_lost_work(card, "Carry on".into(), None)
+                .is_some(),
             "a reopening conversation takes the message"
         );
         assert_eq!(app.persistent_workspace().chat_drafts[&card], "Carry on");
@@ -3581,7 +3582,10 @@ mod tests {
         let (card, _) = reopening(&app);
         assert!(app.reopen_preparing(card));
         assert!(!app.chat_takes_resume(card));
-        assert!(app.resume_lost_work(card, "Carry on".into()).is_none());
+        assert!(
+            app.resume_lost_work(card, "Carry on".into(), None)
+                .is_none()
+        );
     }
 
     #[test]

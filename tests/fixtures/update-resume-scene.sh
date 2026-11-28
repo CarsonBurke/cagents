@@ -14,10 +14,13 @@
 #            that conversation received and dismisses the rest, capturing each
 #            state.
 #
+#   continued-shots  same as shots, with the CI conversation continued in
+#                    provider history before the window reads the update.
+#
 # A session's start reopens the seeded conversations under new ids, which the
 # update names, so the update is recorded within the session that shows it.
 set -euo pipefail
-scene=${1:?usage: update-resume-scene.sh prepare|shots}
+scene=${1:?usage: update-resume-scene.sh prepare|shots|continued-shots}
 fx=$(evidence env sh -c 'printf %s "$CAGENTS_EVIDENCE_FIXTURE"' | tail -1)
 . "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
 require_fixture_home HOME "$fx/home"
@@ -44,8 +47,8 @@ x,y,w,h=found; print(f"{x+w//2},{y+h//2}")' "$1"
 }
 
 record_update() {
-    evidence env python3 - "$fx/home/.config/fixture-update-review.json" <<'FIXTURE'
-import json, os, sqlite3, sys
+    evidence env python3 - "$fx/home/.config/fixture-update-review.json" "$scene" <<'FIXTURE'
+import json, os, sqlite3, sys, uuid
 from pathlib import Path
 fixture = Path(os.environ['CAGENTS_EVIDENCE_FIXTURE']).resolve()
 root = Path(os.environ['XDG_DATA_HOME']).resolve() / 'cagents-development'
@@ -72,6 +75,40 @@ in_flight = [
     {'id': ids['notes'], 'label': 'Draft the release notes', 'fate': 'continued',
      'tasks': [task('toolu_notes', 'subagent', 'Collect merged PRs')]},
 ]
+if sys.argv[2] == 'continued-shots':
+    # Append what an external Claude CLI turn leaves in provider history.
+    # The resident actor is deliberately left holding its older transcript.
+    config = Path(os.environ['CLAUDE_CONFIG_DIR']).resolve()
+    assert config.is_relative_to(fixture)
+    def prompt(row):
+        content = row.get('message', {}).get('content')
+        if isinstance(content, list):
+            return '\n'.join(block.get('text', '') for block in content)
+        return content
+    targets = {'Watch CI on the release branch.': 1, 'Rename the old settings keys.': 2}
+    matches = {}
+    for path in config.glob('projects/*/*.jsonl'):
+        rows = [json.loads(line) for line in path.read_text().splitlines()]
+        for row in rows:
+            if row.get('type') == 'user' and prompt(row) in targets:
+                index = targets[prompt(row)]
+                assert index not in matches
+                matches[index] = (path, row, rows[-1])
+    for index in targets.values():
+        _, previous, _ = matches[index]
+        session = previous['sessionId']
+        turn = previous.get('message', {}).get('id') or previous['uuid']
+        assert str(uuid.UUID(turn)) == turn
+        in_flight[index]['resume_point'] = {'provider': 'Claude', 'session': session, 'turn': turn}
+    path, previous, tail = matches[1]
+    session = previous['sessionId']
+    new_turn = str(uuid.uuid5(uuid.UUID(session), 'continued outside cagents'))
+    with path.open('a') as stream:
+        stream.write(json.dumps({
+            'type': 'user', 'uuid': new_turn, 'sessionId': session,
+            'parentUuid': tail['uuid'], 'cwd': previous['cwd'],
+            'message': {'role': 'user', 'content': 'Check the release branch again.'},
+        }) + '\n')
 job = {
     'id': 'fixture-update-review',
     'version': '0.0.0-fixture',
@@ -105,7 +142,7 @@ prepare)
     spawn --name notes --prompt 'Draft the release notes.'
     sleep 5
     ;;
-shots)
+shots|continued-shots)
     record_update
     # Only this private native app receives a regular window-close request.
     evidence nested niri msg action close-window >/dev/null
@@ -117,7 +154,7 @@ shots)
     evidence drive click "$channel_title"
     sleep 3
     shot update-resume-offer
-    if evidence drive observe 2>/dev/null | grep -q 'Resume all'; then
+    if [ "$scene" = shots ] && evidence drive observe 2>/dev/null | grep -q 'Resume all'; then
         # The last Resume belongs to the settings conversation.
         evidence drive click "$(exact Resume)"
         sleep 6

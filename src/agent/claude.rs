@@ -312,6 +312,193 @@ pub fn transcript_for_start(
     Ok(path)
 }
 
+#[cfg(any(feature = "ui", feature = "host"))]
+/// Whether a user message is Claude Code's record that the person stopped
+/// the turn, which it adds as though the person had written it.
+pub(crate) fn stop_record(message: &serde_json::Value) -> bool {
+    let text = match &message["content"] {
+        serde_json::Value::String(text) => text.as_str(),
+        serde_json::Value::Array(blocks) => match blocks.as_slice() {
+            [block] if block["type"] == "text" => block["text"].as_str().unwrap_or_default(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    matches!(
+        text.trim(),
+        "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
+    )
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+pub(crate) fn root_input(value: &serde_json::Value) -> bool {
+    let origin = value.get("origin").filter(|origin| !origin.is_null());
+    if value["message"]["role"] != "user"
+        || stop_record(&value["message"])
+        || value["uuid"].as_str().is_none_or(str::is_empty)
+        || !value["parent_tool_use_id"].is_null()
+        || !value["sourceToolUseID"].is_null()
+        || value["teamName"]
+            .as_str()
+            .is_some_and(|name| !name.is_empty())
+        || origin.is_some_and(|origin| origin["kind"] != "human")
+        || [
+            "isMeta",
+            "isSidechain",
+            "isSynthetic",
+            "isReplay",
+            "isCompactSummary",
+            "isVisibleInTranscriptOnly",
+        ]
+        .iter()
+        .any(|key| value[*key] == true)
+    {
+        return false;
+    }
+    let input_text = |text: &str| {
+        let text = text.trim();
+        !text.is_empty() && (origin.is_some() || !claude_context_only(text))
+    };
+    let content = &value["message"]["content"];
+    if let Some(text) = content.as_str() {
+        return input_text(text);
+    }
+    let Some(blocks) = content.as_array() else {
+        return false;
+    };
+    let mut has_input = false;
+    for block in blocks {
+        match block["type"].as_str() {
+            Some("text") => {
+                let Some(text) = block["text"].as_str() else {
+                    return false;
+                };
+                has_input |= input_text(text);
+            }
+            Some("image" | "document") if block["source"].is_object() => has_input = true,
+            _ => return false,
+        }
+    }
+    has_input
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+/// `content` after the `Another Claude session sent a message:` line the
+/// harness introduces a peer's envelope with, where there is one.
+pub(crate) fn without_preface(content: &str) -> &str {
+    match content.split_once('\n') {
+        Some((preface, rest))
+            if preface.starts_with("Another Claude session sent a message")
+                && preface.ends_with(':') =>
+        {
+            rest
+        }
+        _ => content,
+    }
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+/// Splits an element whose opening tag is a line of its own into its
+/// attributes, its body and whatever follows its closing tag, which must
+/// also stand on a line of its own. `content` starts at the opening tag.
+pub(crate) fn element<'a>(content: &'a str, tag: &str) -> Option<(&'a str, &'a str, &'a str)> {
+    let (open, rest) = content.split_once('\n')?;
+    let attributes = open
+        .strip_prefix('<')?
+        .strip_prefix(tag)?
+        .strip_suffix('>')?;
+    if !(attributes.is_empty() || attributes.starts_with(' ')) {
+        return None;
+    }
+    let close = format!("</{tag}>");
+    if let Some(after) = rest.strip_prefix(&close) {
+        return Some((attributes, "", after));
+    }
+    let end = rest.find(&format!("\n{close}"))?;
+    Some((attributes, &rest[..end], &rest[end + 1 + close.len()..]))
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+fn claude_context_only(mut text: &str) -> bool {
+    // Only a whole context envelope is a note. Preserve human text after
+    // the envelope, including when Claude puts both in one text block.
+    const WRAPPERS: &[(&str, &str)] = &[
+        ("<system-reminder>", "</system-reminder>"),
+        ("<task-notification>", "</task-notification>"),
+        ("<fork-boilerplate>", "</fork-boilerplate>"),
+        ("<local-command-caveat>", "</local-command-caveat>"),
+        ("<local-command-stdout>", "</local-command-stdout>"),
+        ("<local-command-stderr>", "</local-command-stderr>"),
+    ];
+    while let Some((rest, close)) = WRAPPERS
+        .iter()
+        .find_map(|&(open, close)| text.strip_prefix(open).map(|rest| (rest, close)))
+    {
+        let Some((_, trailing)) = rest.split_once(close) else {
+            return false;
+        };
+        text = trailing.trim_start();
+    }
+    let peer = without_preface(text);
+    text.is_empty()
+        || model_only_note(text)
+        || ["agent-message", "cross-session-message", "teammate-message"]
+            .into_iter()
+            .any(|tag| element(peer, tag).is_some())
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+/// Whether `text` is wholly one of the notes Claude Code writes for the
+/// model alone.
+pub(crate) fn model_only_note(text: &str) -> bool {
+    let text = text.trim();
+    let wrapped = |tag: &str| {
+        let mut rest = text;
+        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
+        while let Some(inner) = rest.strip_prefix(open.as_str()) {
+            let Some((_, after)) = inner.split_once(close.as_str()) else {
+                return false;
+            };
+            rest = after.trim_start();
+            if rest.is_empty() {
+                return true;
+            }
+        }
+        false
+    };
+    image_note(text)
+        || wrapped("system-reminder")
+        || wrapped("local-command-caveat")
+        || wrapped("fork-boilerplate")
+        || (text.starts_with("(Re-invocation of /") && text.ends_with(')'))
+}
+
+#[cfg(any(feature = "ui", feature = "host"))]
+/// Claude Code's notes on an image: how it scaled one a tool returned, such
+/// as `[Image: original 2600x1800, displayed at 2306x1596. Multiply
+/// coordinates by 1.13 to map to original image.]`, or where it saved one the
+/// reader attached, as `[Image: source: /path/1.png]`. Every line must be one
+/// whole note, so a note followed by anything else still shows, even when
+/// that ends in a bracket of its own. A saved path may hold brackets, but a
+/// closing one before more words ends its note.
+fn image_note(text: &str) -> bool {
+    let note = |line: &str| {
+        line.strip_prefix("[Image: ")
+            .and_then(|rest| rest.strip_suffix(']'))
+            .is_some_and(|rest| match rest.strip_prefix("source: ") {
+                Some(path) => !path.contains("] "),
+                None => {
+                    !rest.contains(['[', ']'])
+                        && rest
+                            .strip_prefix("original ")
+                            .is_some_and(|rest| rest.contains(", displayed at "))
+                }
+            })
+    };
+    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
+    lines.next().is_some_and(note) && lines.all(note)
+}
+
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
