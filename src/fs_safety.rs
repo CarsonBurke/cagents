@@ -1859,7 +1859,7 @@ fn read_attribute(file: &File, name: &CStr) -> io::Result<Option<Vec<u8>>> {
     read_attribute_with_limit(file, name, usize::MAX)
 }
 
-fn read_attribute_with_limit(
+pub(crate) fn read_attribute_with_limit(
     file: &File,
     name: &CStr,
     limit: usize,
@@ -1912,8 +1912,8 @@ fn read_attribute_with_limit(
     Err(io::Error::from_raw_os_error(libc::ERANGE))
 }
 
-/// Sets one attribute on the replacement.
-fn write_attribute(file: &File, name: &CStr, value: &[u8]) -> io::Result<()> {
+/// Sets one attribute on an open file.
+pub(crate) fn write_attribute(file: &File, name: &CStr, value: &[u8]) -> io::Result<()> {
     // SAFETY: `name` and `value` outlive the call and the length passed is the
     // value's own. A zero flag means "create or replace", which is what a
     // freshly created replacement needs.

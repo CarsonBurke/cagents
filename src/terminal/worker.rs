@@ -18,6 +18,7 @@ use close_processes::{FrozenFamily, RootIdentity};
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
+    ffi::CStr,
     fs::File,
     io::{BufWriter, Read, Write},
     os::{
@@ -7277,6 +7278,19 @@ struct TranscriptWriter {
     worker: JoinHandle<()>,
 }
 
+// A resumed terminal can have a different ID but append to the same inode.
+// Keep this state on the open transcript, where it also ages out with the log.
+const TRANSCRIPT_CAP_ATTRIBUTE: &CStr = c"user.cagents.transcript-cap.v1";
+const TRANSCRIPT_RECORDING: &[u8] = b"0";
+const TRANSCRIPT_CAPPED: &[u8] = b"1";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TranscriptCapState {
+    Untracked,
+    Recording,
+    Capped,
+}
+
 impl TranscriptWriter {
     fn start(
         path: PathBuf,
@@ -7287,9 +7301,10 @@ impl TranscriptWriter {
         let file = open_private_read_append_file(&path)
             .map_err(|error| format!("open transcript {}: {error}", path.display()))?;
         let location = crate::transcript_location::capture(terminal, &path, &file);
-        let (written, capped) = transcript_write_position(&file, max_bytes)
+        let (written, cap_state) = transcript_write_position(&file, max_bytes)
             .map_err(|error| format!("inspect transcript {}: {error}", path.display()))?;
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
+        let capped = cap_state == TranscriptCapState::Capped;
         let capped_flag = Arc::new(AtomicBool::new(capped));
         let published_cap = Arc::clone(&capped_flag);
         let worker = thread::Builder::new()
@@ -7309,6 +7324,17 @@ impl TranscriptWriter {
                             if !within_cap {
                                 capped = true;
                                 published_cap.store(true, Ordering::Relaxed);
+                                // Commit the cap after the accepted PTY bytes and
+                                // before the advisory marker. A stopped daemon
+                                // can leave a capped file without a marker.
+                                if writer.flush().is_err() {
+                                    break;
+                                }
+                                if cap_state == TranscriptCapState::Recording
+                                    && !set_transcript_cap(writer.get_ref(), true)
+                                {
+                                    continue;
+                                }
                                 let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
                                 let _ = writer.flush();
                                 continue;
@@ -7362,18 +7388,70 @@ impl TranscriptWriter {
     }
 }
 
-/// A rejected batch can leave a marked transcript below the PTY byte cap.
-fn transcript_write_position(file: &File, max_bytes: u64) -> std::io::Result<(u64, bool)> {
+fn transcript_write_position(
+    file: &File,
+    max_bytes: u64,
+) -> std::io::Result<(u64, TranscriptCapState)> {
+    use TranscriptCapState::{Capped, Recording, Untracked};
+
     let written = file.metadata()?.len();
     if written > max_bytes {
-        return Ok((written, true));
+        return Ok((written, Capped));
     }
+    let track_cap =
+        match crate::fs_safety::read_attribute_with_limit(file, TRANSCRIPT_CAP_ATTRIBUTE, 1) {
+            Ok(Some(value)) if value == TRANSCRIPT_RECORDING => return Ok((written, Recording)),
+            Ok(Some(value)) if value == TRANSCRIPT_CAPPED => return Ok((written, Capped)),
+            Ok(None) => true,
+            Ok(Some(_)) => {
+                tracing::warn!("unrecognized terminal transcript cap state");
+                false
+            }
+            Err(error) => {
+                if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                    tracing::warn!(%error, "could not read terminal transcript cap state");
+                }
+                false
+            }
+        };
+    // Old files can contain a real truncation marker below the byte limit.
+    // Retain that interpretation only when no writer-owned state is available.
+    let capped = legacy_transcript_capped(file, written)?;
+    let tracked = track_cap && set_transcript_cap(file, capped);
+    let state = if capped {
+        Capped
+    } else if tracked {
+        Recording
+    } else {
+        Untracked
+    };
+    Ok((written, state))
+}
+
+fn legacy_transcript_capped(file: &File, written: u64) -> std::io::Result<bool> {
     let mut tail = [0; TRANSCRIPT_TRUNCATED_MARKER.len()];
     let Some(offset) = written.checked_sub(tail.len() as u64) else {
-        return Ok((written, false));
+        return Ok(false);
     };
     file.read_exact_at(&mut tail, offset)?;
-    Ok((written, tail.as_slice() == TRANSCRIPT_TRUNCATED_MARKER))
+    Ok(tail.as_slice() == TRANSCRIPT_TRUNCATED_MARKER)
+}
+
+fn set_transcript_cap(file: &File, capped: bool) -> bool {
+    let value = if capped {
+        TRANSCRIPT_CAPPED
+    } else {
+        TRANSCRIPT_RECORDING
+    };
+    match crate::fs_safety::write_attribute(file, TRANSCRIPT_CAP_ATTRIBUTE, value) {
+        Ok(()) => true,
+        Err(error) => {
+            if error.raw_os_error() != Some(libc::EOPNOTSUPP) {
+                tracing::warn!(%error, "could not save terminal transcript cap state");
+            }
+            false
+        }
+    }
 }
 
 fn encode_key_input(
