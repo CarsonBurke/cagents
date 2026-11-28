@@ -26725,13 +26725,14 @@ fn a_closed_pane_a_view_brings_back_at_the_next_launch_goes_again() {
         let closed = app.persistent_workspace();
         assert_eq!(stopping(&app), vec![(source.id, None)]);
 
-        // The next launch: the view still holds the pane, as the window
-        // saved the close but the view did not hear it.
+        // The next launch loads the saved close. The view still holds the
+        // pane and brings it back at the chosen time.
         let mut next = crate::app::tests::context_inspector_test_app(false);
         next.durable = closed;
-        Arc::make_mut(&mut next.durable).cards = open.cards.clone();
         next.workspace = Cagents::rebuild_workspace(&next.durable);
         let came_back = |next: &mut Cagents| {
+            Arc::make_mut(&mut next.durable).cards = open.cards.clone();
+            next.workspace = Cagents::rebuild_workspace(&next.durable);
             let task = next.attach_shared_chat(card, source.clone());
             assert!(
                 !next.cards.contains_key(&card) && next.chat_ui.attempt(card).is_none(),
