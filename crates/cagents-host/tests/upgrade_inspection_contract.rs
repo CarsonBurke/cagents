@@ -11,7 +11,10 @@ use cagents::{
         TerminalSession, WorkspaceState,
     },
     persistence::{SnapshotBase, StateStore},
-    process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+    process::{
+        CancellationToken, CommandSpec, ProcessExecutor, ProcessFailure, ProcessOutput,
+        SystemProcessExecutor,
+    },
     terminal::TerminalSpawnOptions,
     terminal_ipc::{ProtocolErrorCode, TerminalCloseResult, TerminalDescriptor},
 };
@@ -213,6 +216,70 @@ fn source_digest(source: &TerminalSession) -> Result<[u8; 32], String> {
     Ok(Sha256::digest(serde_json::to_vec(&source).map_err(|e| e.to_string())?).into())
 }
 
+fn finish_inspection_fixture(
+    root: &Path,
+    program: &Path,
+    result: Result<ProcessOutput, ProcessFailure>,
+) -> Result<(), String> {
+    let (stdout, stderr) = match &result {
+        Ok(output) => (&output.stdout, &output.stderr),
+        Err(failure) => (&failure.stdout, &failure.stderr),
+    };
+    // Write bounded child output before checking the executor and test status.
+    fs::write(root.join("stdout.log"), stdout).map_err(|error| error.to_string())?;
+    fs::write(root.join("stderr.log"), stderr).map_err(|error| error.to_string())?;
+    let output = result
+        .and_then(|output| output.require_success(program))
+        .map_err(|error| error.to_string())?;
+    let text = String::from_utf8_lossy(&output.stdout);
+    if !text.lines().any(|line| line == "running 1 test")
+        || !text
+            .lines()
+            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed; 0 ignored;"))
+    {
+        return Err("private child did not report exactly one passing inspection".into());
+    }
+    // The exact test has already checked the original shell and holder exited
+    // and joined both private daemon children.
+    fs::remove_dir_all(root).map_err(|error| format!("could not remove settled fixture: {error}"))
+}
+
+#[test]
+fn upgrade_inspection_cleanup_requires_an_exact_passing_child() {
+    let passed = b"running 1 test\ntest result: ok. 1 passed; 0 failed; 0 ignored;";
+    let unmatched = b"running 0 tests\ntest result: ok. 0 passed; 0 failed; 0 ignored;";
+    for (success, stdout, removed) in [
+        (true, passed.as_slice(), true),
+        (false, passed.as_slice(), false),
+        (true, unmatched.as_slice(), false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        fs::write(root.join("inspection.json"), b"private receipt").unwrap();
+        let output = ProcessOutput {
+            exit_code: Some(i32::from(!success)),
+            signal: None,
+            success,
+            stdout: stdout.to_vec(),
+            stderr: b"private diagnostics".to_vec(),
+        };
+        let result = finish_inspection_fixture(root, Path::new("private-fixture"), Ok(output));
+        assert_eq!(result.is_ok(), removed, "{result:?}");
+        assert_eq!(root.try_exists().unwrap(), !removed);
+        if !removed {
+            assert_eq!(
+                fs::read(root.join("inspection.json")).unwrap(),
+                b"private receipt"
+            );
+            assert_eq!(fs::read(root.join("stdout.log")).unwrap(), stdout);
+            assert_eq!(
+                fs::read(root.join("stderr.log")).unwrap(),
+                b"private diagnostics"
+            );
+        }
+    }
+}
+
 #[test]
 fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
     const CHILD: &str = "CAGENTS_UPGRADE_INSPECTION_FIXTURE";
@@ -257,18 +324,12 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
         }
         // Inherited delegation stays intact; only this child receives the private profile.
         let result = SystemProcessExecutor.execute(&spec, &CancellationToken::new());
-        let (stdout, stderr) = match &result {
-            Ok(output) => (&output.stdout, &output.stderr),
-            Err(failure) => (&failure.stdout, &failure.stderr),
-        };
-        // Preserve bounded raw child output even on timeout/spawn failure,
-        // before either executor or nonzero-exit assertion can unwind.
-        fs::write(root.join("stdout.log"), stdout).unwrap();
-        fs::write(root.join("stderr.log"), stderr).unwrap();
-        let output = result.unwrap();
-        let output = output.require_success(&spec.program).unwrap();
-        let text = String::from_utf8_lossy(&output.stdout);
-        assert!(text.contains("running 1 test") && text.contains("1 passed; 0 failed; 0 ignored"));
+        finish_inspection_fixture(&root, &spec.program, result).unwrap_or_else(|error| {
+            panic!(
+                "private upgrade inspection retained at {}: {error}",
+                root.display()
+            )
+        });
         return;
     }
     let expected_scope = match std::env::var(SCOPE).as_deref() {
