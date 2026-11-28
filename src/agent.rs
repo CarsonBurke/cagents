@@ -602,7 +602,7 @@ impl Provider {
     /// Read only the canonical selector position in an already normalized recipe.
     /// Shared checkpoint validation uses this parser before any daemon starts.
     pub fn resume_id(self, arguments: &[String]) -> Option<&str> {
-        let (selector, id) = if self.adapter().resume_precedes_options {
+        let (selector, id) = if self.resume_precedes_options() {
             match arguments {
                 [selector, id, ..] => (selector, id),
                 _ => return None,
@@ -631,9 +631,13 @@ impl Provider {
         self.adapter().resume_picker
     }
 
+    pub(crate) fn resume_precedes_options(self) -> bool {
+        self.adapter().resume_precedes_options
+    }
+
     pub(crate) fn append_resume(self, arguments: &mut Vec<String>, id: String) {
         let resume = [self.resume_flag().into(), id];
-        if self.adapter().resume_precedes_options {
+        if self.resume_precedes_options() {
             arguments.splice(0..0, resume);
         } else {
             arguments.extend(resume);
@@ -642,7 +646,7 @@ impl Provider {
 
     /// Open the provider's own conversation picker rather than naming one.
     pub(crate) fn append_resume_picker(self, arguments: &mut Vec<String>) {
-        if self.adapter().resume_precedes_options {
+        if self.resume_precedes_options() {
             arguments.insert(0, self.resume_flag().into());
         } else {
             arguments.push(self.resume_flag().into());

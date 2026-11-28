@@ -275,6 +275,23 @@ mod acp_permission_tests {
         };
         launch.recipe.program = "/bin/muse-upstream".into();
 
+        let mut bare = launch.clone();
+        bare.recipe.arguments.clear();
+        let terminal = bare
+            .terminal_recipe_with_permission_mode(Some("manual"))
+            .unwrap();
+        assert_eq!(
+            terminal.arguments,
+            ["resume", id, "--approval-mode", "untrusted"]
+        );
+        assert!(bare.resumes_in_terminal(&terminal));
+
+        let mut issued_by_older_daemon = terminal;
+        issued_by_older_daemon.arguments = ["--approval-mode", "untrusted", "resume", id]
+            .map(str::to_owned)
+            .into();
+        assert!(bare.resumes_in_terminal(&issued_by_older_daemon));
+
         for mode in [None, Some("dontAsk"), Some("denyUnmatched")] {
             let failure = launch
                 .terminal_recipe_with_permission_mode(mode)
@@ -554,20 +571,28 @@ impl Launch {
                 _ => None,
             }
         };
-        if self
-            .terminal_recipe_with_permission_mode(mode.as_deref())
-            .as_ref()
-            == Ok(recipe)
-        {
+        let confirmed = self.terminal_recipe_with_permission_mode(mode.as_deref());
+        if confirmed.as_ref() == Ok(recipe) {
             return true;
         }
-        // Older daemons left Muse's on-request mode unnamed. Recognize only
-        // the exact argv they produced for already-issued handoff receipts.
-        self.provider == Provider::Muse
-            && mode.as_deref() == Some("auto")
-            && self.terminal_recipe().is_some_and(|mut legacy| {
+        if self.provider != Provider::Muse {
+            return false;
+        }
+        // Older daemons left on-request unnamed and placed a non-default
+        // mode before a bare resume subcommand. Recognize exact receipts
+        // already issued that way while emitting the corrected argv.
+        if mode.as_deref() == Some("auto") {
+            return self.terminal_recipe().is_some_and(|mut legacy| {
                 apply_acp_permission_mode(&mut legacy, self.provider, "auto") && legacy == *recipe
-            })
+            });
+        }
+        confirmed.is_ok_and(|mut legacy| {
+            if legacy.arguments.len() != 4 {
+                return false;
+            }
+            legacy.arguments.rotate_right(2);
+            legacy == *recipe
+        })
     }
 
     /// Return to the CLI using the current provider-confirmed identity, not a
@@ -713,7 +738,11 @@ fn write_acp_permission_mode(
     // Muse places the resume subcommand and ID before its options.
     if let Some(mode) = mode {
         let at = match arguments.as_slice() {
-            [.., flag, _] if flag == provider.resume_flag() => arguments.len() - 2,
+            [.., flag, _]
+                if !provider.resume_precedes_options() && flag == provider.resume_flag() =>
+            {
+                arguments.len() - 2
+            }
             _ => arguments.len(),
         };
         arguments.splice(at..at, [acp.mode_option.into(), mode.into()]);
