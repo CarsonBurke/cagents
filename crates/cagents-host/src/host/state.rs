@@ -89,7 +89,6 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
-    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -327,6 +326,7 @@ pub(crate) struct HostState {
     /// Where this daemon allocates each Codex conversation's own listener.
     pub(super) codex_listeners: super::chat::CodexListenerRoots,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    terminal_completions: retention::Completions,
     pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// The transcript each spawning terminal's worker opens, kept with its
@@ -609,6 +609,7 @@ impl HostState {
             proof: Arc::new(proof),
             codex_listeners: super::chat::CodexListenerRoots::at(std::env::temp_dir()),
             terminals: BTreeMap::new(),
+            terminal_completions: retention::Completions::default(),
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             spawning_transcripts: BTreeMap::new(),
@@ -1852,7 +1853,7 @@ impl HostState {
     }
 
     pub(super) fn retire_terminal(&mut self, terminal_id: TerminalId) -> Option<TerminalRecord> {
-        let record = self.terminals.remove(&terminal_id)?;
+        let record = self.remove_terminal_record(terminal_id)?;
         // A long-lived resident can outlast the bounded publication history.
         // Retain this actual departing worker before absence becomes visible.
         self.published_terminal_workers
@@ -2201,6 +2202,7 @@ impl HostState {
             crate::model::agent_recovery::observed_hint_from_launch(&session.launch);
         self.inventory_changed();
         self.notification_closed.remove(&terminal_id);
+        self.terminal_completions.watch(terminal_id, &handle);
         self.terminals.insert(
             terminal_id,
             TerminalRecord {
@@ -2215,7 +2217,6 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
-                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -6311,7 +6312,7 @@ fn start_terminal_view_owned_reserved(
             let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
             if adopting {
                 state.settle_startup_custody(&terminal_id);
-                if state.terminals.remove(&terminal_id).is_some()
+                if state.remove_terminal_record(terminal_id).is_some()
                     && let Some(courier) = &state.mailbox
                 {
                     courier.wake();
