@@ -28,3 +28,21 @@ if (typeof viewer.showModal === "function") {
 
   viewer.addEventListener("close", () => trigger.focus({ preventScroll: true }));
 }
+
+// The sticky navigation gains its bottom border once the page scrolls under it.
+const nav = document.querySelector(".nav");
+const sentinel = document.querySelector(".scroll-sentinel");
+if (nav && sentinel && "IntersectionObserver" in window) {
+  new IntersectionObserver(([entry]) => {
+    nav.classList.toggle("is-scrolled", !entry.isIntersecting);
+  }).observe(sentinel);
+}
+
+// Show the reader's own keyboard shortcuts. Without JavaScript, or on any
+// other platform, the page shows Linux's.
+const platform = navigator.userAgentData?.platform || navigator.platform || "";
+if (/^mac/i.test(platform)) {
+  for (const keys of document.querySelectorAll(".keys[data-platform]")) {
+    keys.hidden = keys.dataset.platform !== "mac";
+  }
+}
