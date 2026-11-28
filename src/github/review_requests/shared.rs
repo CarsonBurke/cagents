@@ -31,6 +31,12 @@ const CENSUS_AFTER: u64 = 5 * 60;
 /// asked again after this.
 const PROBE_REFUSED_FOR: u64 = 10 * 60;
 
+pub(super) fn backoff(failures: u32) -> u64 {
+    REFRESH
+        .saturating_mul(1 << failures.saturating_sub(1).min(16))
+        .min(MAX_BACKOFF)
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Observation {
     pub revision: u64,
@@ -60,6 +66,8 @@ struct Stored {
     error: Option<String>,
     due: u64,
     failures: u32,
+    #[serde(default)]
+    page_due: u64,
     observed: Vec<Observation>,
     /// The probe's validator from when the last complete census started,
     /// and when that was.
@@ -89,6 +97,7 @@ impl Default for Stored {
             error: None,
             due: 0,
             failures: 0,
+            page_due: 0,
             observed: Vec::new(),
             validator: None,
             census_at: 0,
@@ -101,6 +110,14 @@ impl Default for Stored {
 }
 
 impl Stored {
+    fn schedule(&mut self, completed: u64) {
+        self.due = self
+            .scan
+            .history_due()
+            .map_or(self.page_due, |history| self.page_due.min(history))
+            .max(completed.saturating_add(PACE));
+    }
+
     fn result(self, repository: &GitHubRepoKey, now: u64) -> PollResult {
         let observed = if self.error.is_none() {
             self.observed
@@ -323,7 +340,9 @@ fn poll_with(
             .map(Arc::new)
             .map_err(|error| format!("Cannot inherit the GitHub review flight: {error}"))
     };
-    if stored.scan.settled()
+    let work = stored.scan.next_due_work(now, stored.page_due <= now);
+    if matches!(work, Work::Page { cursor: None })
+        && stored.scan.discovery_complete()
         && stored
             .probe_refused_at
             .is_none_or(|at| now.saturating_sub(at) >= PROBE_REFUSED_FOR)
@@ -340,10 +359,11 @@ fn poll_with(
             {
                 validate_context()?;
                 stored.probe_refused_at = None;
-                // Not past the census due at CENSUS_AFTER, however the ticks fall.
-                stored.due = clock()
+                let completed = clock();
+                stored.page_due = completed
                     .saturating_add(REFRESH)
                     .min(stored.census_at.saturating_add(CENSUS_AFTER));
+                stored.schedule(completed);
                 pr_status::store(&path, &stored).map_err(|error| error.to_string())?;
                 return Ok(stored.result(repository, now));
             }
@@ -361,7 +381,6 @@ fn poll_with(
         };
         stored.pending = Some((validator, now));
     }
-    let work = stored.scan.next_work();
     if matches!(work, Work::Page { cursor: None }) {
         stored.attention_scan_start = Some(ScanPoint {
             incarnation: stored.incarnation.clone(),
@@ -427,6 +446,7 @@ fn poll_with(
             Reply::History(page) => {
                 if !same_viewer {
                     stored.attention_scan_start = None;
+                    stored.page_due = completed;
                 }
                 stored.scan.history(&work, page)
             }
@@ -441,32 +461,37 @@ fn poll_with(
         }
         applied
     });
-    if applied.is_err() {
-        // Timeline classification is independent of the repository's complete
-        // pagination. Only a failed repository page invalidates that census.
-        if matches!(work, Work::Page { .. }) {
+    if matches!(work, Work::Page { .. }) {
+        stored.error = applied.err();
+        if stored.error.is_some() {
             stored.attention_scan_start = None;
+            observed.clear();
+            stored.failures = stored.failures.saturating_add(1);
+            stored.page_due = completed.saturating_add(backoff(stored.failures));
+        } else {
+            stored.failures = 0;
+            if finished_census && let Some((validator, at)) = stored.pending.take() {
+                stored.validator = validator;
+                stored.census_at = at;
+            }
+            stored.page_due =
+                completed.saturating_add(if finished_census { REFRESH } else { PACE });
         }
-        stored.scan.failed_history(&work);
-        observed.clear();
-        stored.failures = stored.failures.saturating_add(1);
-    } else if stored.scan.settled() {
-        stored.failures = 0;
-        if let Some((validator, at)) = stored.pending.take() {
-            stored.validator = validator;
-            stored.census_at = at;
+    } else {
+        if stored.failures == 0 {
+            stored.error = None;
+        }
+        if let Err(error) = applied {
+            observed.clear();
+            stored.scan.failed_history(&work, completed);
+            if rate_limit.is_some() {
+                stored.error = Some(error);
+            } else {
+                tracing::debug!(?work, %error, "review timeline unavailable");
+            }
         }
     }
-    stored.error = applied.err();
-    stored.due = completed.saturating_add(if stored.failures > 0 {
-        REFRESH
-            .saturating_mul(1 << stored.failures.saturating_sub(1).min(16))
-            .min(MAX_BACKOFF)
-    } else if stored.scan.settled() {
-        REFRESH
-    } else {
-        PACE
-    });
+    stored.schedule(completed);
     if let Some(limit) = rate_limit {
         stored.due = stored.due.max(limit.retry_at);
         pr_status::record_cooldown(
@@ -1276,7 +1301,7 @@ pub(crate) mod tests {
             &history,
             Err(GitHubError::Inspection("timeline unavailable".into())),
         );
-        assert!(failed.error.is_some());
+        assert!(failed.error.is_none());
         assert!(failed.census.is_none());
         let completed = run(
             failed.due,
@@ -1305,6 +1330,66 @@ pub(crate) mod tests {
             census.current,
             [(1, "request-1".into()), (2, "request-2".into())].into()
         );
+    }
+
+    #[test]
+    fn failing_timeline_retries_without_slowing_repository_pages() {
+        use crate::github::review_requests::{Reviewer, scan::History};
+
+        let root = private_root();
+        let cancel = CancellationToken::new();
+        let repository = repository();
+        let mut tick = 1000;
+        let mut next_page = 1;
+        let mut attempts = Vec::new();
+        let result = loop {
+            let result = poll_with(
+                root.path(),
+                "account",
+                &repository,
+                &cancel,
+                || tick,
+                |work, _| match work {
+                    Work::Page { cursor } => {
+                        let expected = (next_page != 1).then(|| format!("page-{next_page}"));
+                        assert_eq!(cursor, &expected);
+                        let next = (next_page < 13).then(|| format!("page-{}", next_page + 1));
+                        let Reply::Page(mut page) = page("viewer", &[next_page], next.as_deref())
+                        else {
+                            unreachable!()
+                        };
+                        if next_page == 1 {
+                            page.entries[0]
+                                .viewer_latest_review_request
+                                .as_mut()
+                                .unwrap()
+                                .requested_reviewer = Some(Reviewer {
+                                kind: "User".into(),
+                                id: Some("viewer".into()),
+                            });
+                        }
+                        next_page += 1;
+                        Ok(Reply::Page(page))
+                    }
+                    Work::History { number: 1, .. } => {
+                        attempts.push(tick);
+                        Err(GitHubError::Inspection("timeline unavailable".into()))
+                    }
+                    other => panic!("unexpected work {other:?}"),
+                },
+                || Ok(()),
+                unprobed,
+            )
+            .unwrap();
+            if next_page == 14 {
+                break result;
+            }
+            assert_eq!(result.due, tick + PACE);
+            tick = result.due;
+        };
+        assert_eq!(attempts, [1006, 1066]);
+        assert_eq!(result.scan.requested[&1].history, History::Unknown);
+        assert_eq!(result.census.unwrap().current.len(), 13);
     }
 
     #[test]
