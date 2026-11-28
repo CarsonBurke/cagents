@@ -225,7 +225,18 @@ impl CookieStorage {
         url: &ServoUrl,
         context: SameSiteContext,
     ) -> Option<String> {
-        let cookie_list = self.matching_cookies(url, CookieSource::HTTP, Some(context));
+        self.cookies_in_context(url, CookieSource::HTTP, context)
+    }
+
+    /// `cookies_for_url`, leaving out the `SameSite` cookies that `context`
+    /// excludes.
+    pub fn cookies_in_context(
+        &mut self,
+        url: &ServoUrl,
+        source: CookieSource,
+        context: SameSiteContext,
+    ) -> Option<String> {
+        let cookie_list = self.matching_cookies(url, source, Some(context));
         Self::cookie_string(cookie_list)
     }
 
@@ -285,8 +296,8 @@ impl CookieStorage {
     }
 
     /// The cookies for `url`, also applying `SameSite` when there is a request
-    /// `context`. Without one, as for `document.cookie` and the embedder's
-    /// cookie APIs, `SameSite` is not applied.
+    /// or document `context`. Without one, as for the embedder's cookie APIs
+    /// and the Cookie Store API, `SameSite` is not applied.
     fn matching_cookies<'a>(
         &'a mut self,
         url: &'a ServoUrl,
@@ -298,9 +309,9 @@ impl CookieStorage {
 
         cookies
             .iter_mut()
-            .filter(move |c| match context {
-                Some(context) => c.appropriate_for_request(url, context),
-                None => c.appropriate_for_url(url, source),
+            .filter(move |c| {
+                c.appropriate_for_url(url, source) &&
+                    context.is_none_or(|context| context.permits_retrieval(c.cookie.same_site()))
             })
             .sorted_by(|a: &&mut ServoCookie, b: &&mut ServoCookie| {
                 // The user agent SHOULD sort the cookie-list

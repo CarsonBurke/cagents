@@ -54,7 +54,7 @@ use crate::async_runtime::{init_async_runtime, spawn_task};
 use crate::connector::{
     CACertificates, CertificateErrorOverrideManager, create_http_client, create_tls_config,
 };
-use crate::cookie::ServoCookie;
+use crate::cookie::{SameSiteContext, ServoCookie};
 use crate::cookie_storage::CookieStorage;
 use crate::embedder::NetToEmbedderMsg;
 use crate::fetch::cors_cache::CorsCache;
@@ -463,18 +463,21 @@ impl ResourceChannelManager {
                     &request,
                     cookie.into_inner().to_owned(),
                     source,
+                    None,
                     http_state,
                 );
                 if let Some(sender) = sender {
                     let _ = sender.send(());
                 }
             },
-            CoreResourceMsg::SetCookiesForUrl(request, cookies, source) => {
+            CoreResourceMsg::SetCookiesForUrl(request, cookies, source, site_for_cookies) => {
+                let same_site = SameSiteContext::for_document(&site_for_cookies, &request);
                 for cookie in cookies {
                     self.resource_manager.set_cookie_for_url(
                         &request,
                         cookie.into_inner(),
                         source,
+                        Some(same_site),
                         http_state,
                     );
                 }
@@ -484,15 +487,17 @@ impl ResourceChannelManager {
                     &url,
                     cookie.into_inner().to_owned(),
                     source,
+                    None,
                     http_state,
                 );
                 self.send_cookie_response(cookie_store_id, CookieData::Set(Ok(())));
             },
-            CoreResourceMsg::GetCookieStringForUrl(url, consumer, source) => {
+            CoreResourceMsg::GetCookieStringForUrl(url, consumer, source, site_for_cookies) => {
+                let same_site = SameSiteContext::for_document(&site_for_cookies, &url);
                 let mut cookie_jar = http_state.cookie_jar.write();
                 cookie_jar.remove_expired_cookies_for_url(&url);
                 consumer
-                    .send(cookie_jar.cookies_for_url(&url, source))
+                    .send(cookie_jar.cookies_in_context(&url, source, same_site))
                     .unwrap();
             },
             CoreResourceMsg::GetCookiesForUrl(url, consumer, source) => {
@@ -684,9 +689,13 @@ impl CoreResourceManager {
         request: &ServoUrl,
         cookie: Cookie<'static>,
         source: CookieSource,
+        same_site: Option<SameSiteContext>,
         http_state: &Arc<HttpState>,
     ) {
-        if let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) {
+        let Some(cookie) = ServoCookie::new_wrapped(cookie, request, source) else {
+            return;
+        };
+        if same_site.is_none_or(|same_site| same_site.permits_storage(cookie.cookie.same_site())) {
             let mut cookie_jar = http_state.cookie_jar.write();
             cookie_jar.push(cookie, request, source)
         }

@@ -4974,7 +4974,7 @@ impl Document {
     /// an opaque origin otherwise.
     /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
     pub(crate) fn site_for_cookies(&self) -> ImmutableOrigin {
-        let origin = self.origin().immutable().clone();
+        let origin = self.cookie_origin();
         let mut top_origin = origin.clone();
         let mut parent = self.window().parent_info();
         while let Some(pipeline_id) = parent {
@@ -4983,7 +4983,7 @@ impl Document {
             let Some(ancestor) = ScriptThread::find_document(pipeline_id) else {
                 return ImmutableOrigin::new_opaque();
             };
-            let ancestor_origin = ancestor.origin().immutable().clone();
+            let ancestor_origin = ancestor.cookie_origin();
             if !is_same_site(&ancestor_origin, &origin) {
                 return ImmutableOrigin::new_opaque();
             }
@@ -4991,6 +4991,18 @@ impl Document {
             parent = ancestor.window().parent_info();
         }
         top_origin
+    }
+
+    /// A sandboxed document's origin is opaque, but for cookies it counts as
+    /// the site of its URL.
+    fn cookie_origin(&self) -> ImmutableOrigin {
+        if self.has_active_sandboxing_flag(
+            SandboxingFlagSet::SANDBOXED_ORIGIN_BROWSING_CONTEXT_FLAG,
+        ) {
+            self.url().origin()
+        } else {
+            self.origin().immutable().clone()
+        }
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {
@@ -6109,7 +6121,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             .window
             .as_global_scope()
             .resource_threads()
-            .send(GetCookieStringForUrl(url, tx, NonHTTP));
+            .send(GetCookieStringForUrl(
+                url,
+                tx,
+                NonHTTP,
+                self.site_for_cookies(),
+            ));
         let cookies = rx.recv().unwrap();
         Ok(cookies.map_or(DOMString::new(), DOMString::from))
     }
@@ -6138,7 +6155,12 @@ impl DocumentMethods<crate::DomTypeHolder> for Document {
             .window
             .as_global_scope()
             .resource_threads()
-            .send(SetCookiesForUrl(self.url(), cookies, NonHTTP));
+            .send(SetCookiesForUrl(
+                self.url(),
+                cookies,
+                NonHTTP,
+                self.site_for_cookies(),
+            ));
         Ok(())
     }
 

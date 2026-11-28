@@ -113,6 +113,20 @@ fn a_request_is_same_site_only_when_every_url_shares_its_site_for_cookies() {
         "http://www.example.com/",
         Some("https://www.example.com")
     )));
+    // A fully qualified host is its own site, not one shared by every
+    // dotted host under its public suffix.
+    assert!(!same_site(request(
+        "https://victim.com./",
+        Some("https://attacker.com.")
+    )));
+    assert!(!same_site(request(
+        "https://www.example.com./",
+        Some("https://www.example.com")
+    )));
+    assert!(same_site(request(
+        "https://app.example.com./",
+        Some("https://www.example.com.")
+    )));
     // A request whose client sets no site for cookies is cross-site.
     assert!(!same_site(request("https://www.example.com/", None)));
     // So is one whose client has a cross-site ancestor.
@@ -357,4 +371,69 @@ fn a_cross_site_subresource_response_cannot_set_lax_cookies() {
         cookies_stored(cross_site, RequestMode::Navigate),
         ["plain", "restricted"]
     );
+}
+
+/// `document.cookie` through the resource thread, as script sends it: a
+/// document reads and writes with its own site for cookies.
+#[test]
+fn document_cookie_in_a_cross_site_frame_neither_sees_nor_sets_restricted_cookies() {
+    use net::connector::CACertificates;
+    use net::protocols::ProtocolRegistry;
+    use net::resource_thread::new_core_resource_thread;
+    use net_traits::CoreResourceMsg;
+    use profile_traits::mem::ProfilerChan as MemProfilerChan;
+    use profile_traits::time::ProfilerChan;
+    use servo_base::generic_channel;
+    use servo_url::ImmutableOrigin;
+
+    let (tx, _rx) = generic_channel::channel().unwrap();
+    let (mtx, _mrx) = generic_channel::channel().unwrap();
+    let (resource_thread, _private) = new_core_resource_thread(
+        None,
+        ProfilerChan(Some(tx)),
+        MemProfilerChan(mtx),
+        crate::create_generic_embedder_proxy(),
+        None,
+        CACertificates::Default,
+        false,
+        std::sync::Arc::new(ProtocolRegistry::default()),
+    );
+    let page = url("https://www.example.com/");
+    let top_level = site("https://www.example.com");
+    let cross_site = ImmutableOrigin::new_opaque();
+    let set = |cookie: &str, site_for_cookies: &ImmutableOrigin| {
+        let cookie = cookie::Cookie::parse(cookie.to_owned()).unwrap();
+        resource_thread
+            .send(CoreResourceMsg::SetCookiesForUrl(
+                page.clone(),
+                vec![hyper_serde::Serde(cookie)],
+                CookieSource::NonHTTP,
+                site_for_cookies.clone(),
+            ))
+            .unwrap();
+    };
+    let get = |site_for_cookies: &ImmutableOrigin| {
+        let (sender, receiver) = generic_channel::channel().unwrap();
+        resource_thread
+            .send(CoreResourceMsg::GetCookieStringForUrl(
+                page.clone(),
+                sender,
+                CookieSource::NonHTTP,
+                site_for_cookies.clone(),
+            ))
+            .unwrap();
+        names(receiver.recv().unwrap())
+    };
+
+    set("framed=1; SameSite=Lax", &cross_site);
+    set("open=1", &cross_site);
+    set("lax=1; SameSite=Lax", &top_level);
+    set("strict=1; SameSite=Strict", &top_level);
+
+    assert_eq!(get(&top_level), ["lax", "open", "strict"]);
+    assert_eq!(get(&cross_site), ["open"]);
+
+    let (sender, receiver) = generic_channel::oneshot().unwrap();
+    resource_thread.send(CoreResourceMsg::Exit(sender)).unwrap();
+    receiver.recv().unwrap();
 }

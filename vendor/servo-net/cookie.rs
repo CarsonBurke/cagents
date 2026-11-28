@@ -14,7 +14,7 @@ use http::Method;
 use log::{Level, debug, log_enabled};
 use net_traits::CookieSource;
 use net_traits::pub_domains::is_pub_domain;
-use net_traits::request::Request;
+use net_traits::request::{Request, is_same_site_for_cookies};
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take, take_while_m_n};
 use nom::combinator::{opt, recognize};
@@ -22,7 +22,7 @@ use nom::multi::{many0, many1, separated_list1};
 use nom::sequence::{delimited, preceded, terminated};
 use nom::{IResult, Parser};
 use serde::{Deserialize, Serialize};
-use servo_url::ServoUrl;
+use servo_url::{ImmutableOrigin, ServoUrl};
 use time::{Date, Duration, Month, OffsetDateTime, Time};
 
 /// A stored cookie that wraps the definition in cookie-rs. This is used to implement
@@ -348,14 +348,6 @@ impl ServoCookie {
                 string.parse::<Ipv6Addr>().is_err())
     }
 
-    /// The retrieval algorithm's `SameSite` exclusion for a cookie whose other
-    /// attributes already match the request.
-    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-retrieval-algorithm>
-    pub fn appropriate_for_request(&self, url: &ServoUrl, context: SameSiteContext) -> bool {
-        self.appropriate_for_url(url, CookieSource::HTTP) &&
-            context.permits_retrieval(self.cookie.same_site())
-    }
-
     /// <http://tools.ietf.org/html/rfc6265#section-5.4> step 1
     pub fn appropriate_for_url(&self, url: &ServoUrl, source: CookieSource) -> bool {
         if log_enabled!(Level::Debug) {
@@ -399,8 +391,8 @@ impl ServoCookie {
         if self.cookie.http_only().unwrap_or(false) && source == CookieSource::NonHTTP {
             return false;
         }
-        // `SameSite` is applied by `appropriate_for_request`, for callers that
-        // have a request. TODO: Apply Partitioning checks
+        // `SameSite` is applied by `SameSiteContext::permits_retrieval`, for
+        // callers that know the request or document. TODO: Apply Partitioning checks
 
         true
     }
@@ -694,6 +686,18 @@ impl SameSiteContext {
             same_site: request.is_same_site_for_cookies(),
             top_level_navigation: request.is_top_level_navigation(),
             safe_method: is_safe_method(&request.method),
+        }
+    }
+
+    /// The context of `document.cookie` for a document at `url`: its
+    /// restricted cookies are hidden from it, and it can't set any, when its
+    /// site for cookies is cross-site.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-non-http-apis>
+    pub fn for_document(site_for_cookies: &ImmutableOrigin, url: &ServoUrl) -> SameSiteContext {
+        SameSiteContext {
+            same_site: is_same_site_for_cookies(site_for_cookies, url),
+            top_level_navigation: false,
+            safe_method: true,
         }
     }
 

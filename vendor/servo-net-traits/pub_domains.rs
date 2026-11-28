@@ -66,8 +66,19 @@ impl PubDomainRules {
             .filter(|s| !s.starts_with("//"))
             .collect()
     }
+    /// <https://url.spec.whatwg.org/#host-public-suffix>: a trailing dot
+    /// takes no part in matching the rules but stays on the result, so
+    /// `a.com.` and `b.com.` are different sites and `com.` is public.
     fn suffix_pair<'a>(&self, domain: &'a str) -> (&'a str, &'a str) {
         let domain = domain.trim_start_matches('.');
+        let Some(name) = domain.strip_suffix('.') else {
+            return self.undotted_suffix_pair(domain);
+        };
+        let (public, registrable) = self.undotted_suffix_pair(name);
+        let dotted = |suffix: &str| &domain[domain.len() - suffix.len() - 1..];
+        (dotted(public), dotted(registrable))
+    }
+    fn undotted_suffix_pair<'a>(&self, domain: &'a str) -> (&'a str, &'a str) {
         let mut suffix = domain;
         let mut prev_suffix = domain;
         for (index, _) in domain.match_indices('.') {
@@ -96,6 +107,7 @@ impl PubDomainRules {
         // domain != "" &&
         // self.public_suffix(domain) == domain.
         let domain = domain.trim_start_matches('.');
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
         match domain.find('.') {
             None => !domain.is_empty(),
             Some(index) => {
@@ -109,6 +121,7 @@ impl PubDomainRules {
         // self.public_suffix(domain) != domain &&
         // self.registrable_suffix(domain) == domain.
         let domain = domain.trim_start_matches('.');
+        let domain = domain.strip_suffix('.').unwrap_or(domain);
         match domain.find('.') {
             None => false,
             Some(index) => {

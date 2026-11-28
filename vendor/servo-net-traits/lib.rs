@@ -651,16 +651,30 @@ pub enum CoreResourceMsg {
         CookieSource,
         Option<GenericSender<()>>,
     ),
-    /// Store a set of cookies for a given originating URL
-    SetCookiesForUrl(ServoUrl, Vec<Serde<Cookie<'static>>>, CookieSource),
+    /// Store a set of cookies for a given originating URL, from a document
+    /// with the given site for cookies (cagents patch: it decides whether
+    /// `SameSite=Lax` and `Strict` cookies may be set).
+    SetCookiesForUrl(
+        ServoUrl,
+        Vec<Serde<Cookie<'static>>>,
+        CookieSource,
+        ImmutableOrigin,
+    ),
     SetCookieForUrlAsync(
         CookieStoreId,
         ServoUrl,
         Serde<Cookie<'static>>,
         CookieSource,
     ),
-    /// Retrieve the stored cookies as a header string for a given URL.
-    GetCookieStringForUrl(ServoUrl, GenericSender<Option<String>>, CookieSource),
+    /// Retrieve the stored cookies as a header string for a given URL, for a
+    /// document with the given site for cookies (cagents patch: it decides
+    /// whether `SameSite=Lax` and `Strict` cookies are included).
+    GetCookieStringForUrl(
+        ServoUrl,
+        GenericSender<Option<String>>,
+        CookieSource,
+        ImmutableOrigin,
+    ),
     /// Retrieve the stored cookies as a vector for the given URL.
     GetCookiesForUrl(
         ServoUrl,

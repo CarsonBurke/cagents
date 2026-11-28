@@ -121,3 +121,20 @@ fn test_weirdness() {
     );
     assert!(!is_pub_domain(pub_suffix("city.yokohama.jp")));
 }
+
+#[test]
+fn test_trailing_dot() {
+    // https://url.spec.whatwg.org/#host-public-suffix keeps the trailing dot
+    // out of the rule match and on the result.
+    assert_eq!(pub_suffix("foo.bar.com."), "com.");
+    assert_eq!(reg_suffix("foo.bar.com."), "bar.com.");
+    assert_eq!(reg_suffix("foo.city.yokohama.jp."), "city.yokohama.jp.");
+    assert_eq!(reg_suffix("com."), "com.");
+    assert_ne!(reg_suffix("a.com."), reg_suffix("b.com."));
+    assert_ne!(reg_suffix("a.com."), reg_suffix("a.com"));
+    assert!(is_pub_domain("com."));
+    assert!(is_pub_domain("hello.bd."));
+    assert!(!is_pub_domain("foo.com."));
+    assert!(is_reg_domain("foo.com."));
+    assert!(!is_reg_domain("com."));
+}
