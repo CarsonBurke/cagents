@@ -742,7 +742,7 @@ impl HostClientWire {
                     let client = next_client;
                     next_client += 1;
                     workers.push(thread::spawn(move || {
-                        crate::host::client::serve(stream, client, host);
+                        crate::host::client::serve_fixture_user(stream, client, host);
                     }));
                     continue;
                 }
