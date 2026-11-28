@@ -17,7 +17,7 @@ pub(in crate::host) enum Error {
     Invalid(String),
     #[error("{0}")]
     PermissionDenied(String),
-    #[error("An update is in progress. Try running the automation again when it finishes.")]
+    #[error("{}", agent_execution::NEW_WORK_HELD)]
     UpdateInProgress,
 }
 

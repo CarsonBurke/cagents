@@ -415,6 +415,7 @@ fn an_update_defers_manual_and_scheduled_automation_admission() {
     let update = crate::instance::UiUpdateGuard::acquire().unwrap();
     let error = run_now().expect_err("manual automation was admitted during the update");
     assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+    assert_eq!(error.message, agent_execution::NEW_WORK_HELD);
     assert!(error.retryable);
     assert_eq!(
         fixture.handle.tick(&fixture.host).unwrap(),
