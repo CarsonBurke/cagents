@@ -76,11 +76,11 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
     let project = root.join("project");
     let elsewhere = root.join("elsewhere");
     std::fs::create_dir_all(&elsewhere).unwrap();
-    let shell = |id: TerminalId| {
+    let terminal = |id, program, arguments| {
         let recipe = LaunchRecipe {
             unset_environment: Default::default(),
-            program: "/bin/sh".into(),
-            arguments: vec!["-c".into(), "cat".into()],
+            program,
+            arguments,
             working_directory: project.clone(),
             environment: Default::default(),
         };
@@ -98,6 +98,7 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
             },
         }
     };
+    let shell = |id| terminal(id, "/bin/sh".into(), vec!["-c".into(), "cat".into()]);
     const USER: u64 = 1;
     const AGENT: u64 = 2;
     const PEER: u64 = 3;
@@ -166,7 +167,15 @@ fn an_agent_moves_only_the_panes_it_controls_and_makes_a_channel_only_by_moving_
     };
 
     // Three sessions the person started, and a shell the agent started.
-    let agent = spawn_as(USER, shell(TerminalId::new()));
+    // The fake provider runs with Full permission so it can start a raw shell.
+    let agent = spawn_as(
+        USER,
+        terminal(
+            TerminalId::new(),
+            root.join("bin/claude").to_string_lossy().into_owned(),
+            vec!["--dangerously-skip-permissions".into()],
+        ),
+    );
     let peer = spawn_as(USER, shell(TerminalId::new()));
     let lonely = spawn_as(USER, shell(TerminalId::new()));
     authenticate(AGENT, agent.id);
