@@ -70,9 +70,16 @@ limited to one per 2 GiB of available memory; set it lower on a shared host.
 Download and build temporary files stay in its private
 disk cache. The next build reclaims recognized scratch left by interrupted
 runs after taking the cache lock. A supervisor keeps that lock through
-sandbox teardown. The cache also keeps one checkout of the source. Each build
-rewrites only the files that changed, so Cargo
-recompiles only the crates they belong to.
+sandbox teardown. The cache keeps a source-only checkout of the selected
+commit. Each build rewrites only changed files so Cargo can reuse unaffected
+crates. Use a full checkout for automatic release notes, or pass
+`--notes FILE` to build from a shallow checkout.
+
+Add `--timings` to `release:build` to retain Cargo's unit reports for each
+product and variant. The builder prints their directory inside its private
+build cache. The build log also gives the archive packaging and offline smoke
+times. Keep the Cargo job count and toolchain the same when comparing an
+empty target directory with a build after switching commits.
 
 ## Native integrated browser capability smoke
 
@@ -92,6 +99,10 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
+- with a Linux AppImage build, `cagents-${VERSION}-x86_64.AppImage` and its
+  byte-identical `cagents-x86_64.AppImage` alias. Both are covered by
+  `SHA256SUMS` and the signed metadata. The alias provides the
+  [latest download](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-x86_64.AppImage).
 - with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
   `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
 - with an [Android build](#android), `cagents-android-${VERSION}.apk`,
@@ -422,16 +433,28 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    - a private user with its own headless desktop installs the published
      release;
    - it opens three windows, one holding nothing, and seeds chats, agents, a
-     channel, terminals with a long-lived child and a chat whose provider has
-     already stopped;
+     channel and terminals with a long-lived child;
+   - it also seeds a chat whose provider has already stopped when the
+     **published source tag** lists `ended-provider` in
+     `scripts/release-rehearsal-capabilities.txt`. That capability requires
+     both the stopped-provider lifecycle fix (#4832) and the checkpoint
+     verification fix (#3860). Before declaring the capability, verify
+     that the source reports the chat as exited or omits it from its live
+     inventory before the update begins, including when the provider
+     outlives the worker. Published 0.2.3 and 0.2.4 run the standard matrix
+     without that seed;
    - the published build's own updater finds the cut in a file feed made
      from the cut bundle, checks its signature against the release keys, and
      updates;
    - it requires every pane, chat, agent and terminal to survive, NEW to
      serve, the windows to reopen on NEW, and no reopened window to show
      "Update failed" or "Update not installed";
-   - then, as after a reboot, it closes the windows, stops NEW's daemon and
-     reopens them, and requires the same again.
+   - then, as after a reboot, it closes the windows, deliberately stops
+     NEW's daemon and reopens the windows. The update must still read
+     `Complete` with NEW serving. A note that saved panes could not
+     reconnect is expected for the seeded terminal and console panes after
+     this stop. The harness verifies that they survived the update before
+     it stops their daemon.
 
    It takes about 12 minutes, plus the published release's download the
    first time. Interrupting it stops the run on the host too. The options

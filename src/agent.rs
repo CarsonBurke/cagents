@@ -546,17 +546,20 @@ impl Provider {
     pub fn launched(launch: &LaunchRecipe) -> Option<(Self, &[String])> {
         if Self::is_interpreter(&launch.program) {
             let script = Path::new(launch.arguments.first()?);
-            let provider = ADAPTERS
-                .iter()
-                .find(|adapter| (adapter.recognizes_script)(script))?
-                .provider;
-            Some((provider, &launch.arguments[1..]))
+            Some((Self::from_script(script)?, &launch.arguments[1..]))
         } else {
             Some((
                 Self::from_program(&launch.program)?,
                 launch.arguments.as_slice(),
             ))
         }
+    }
+
+    pub(crate) fn from_script(script: &Path) -> Option<Self> {
+        ADAPTERS
+            .iter()
+            .find(|adapter| (adapter.recognizes_script)(script))
+            .map(|adapter| adapter.provider)
     }
 
     /// Preserve the existing process-recovery normalization without granting an ID.

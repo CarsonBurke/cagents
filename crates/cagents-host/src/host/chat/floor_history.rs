@@ -977,9 +977,8 @@ mod flow_tests {
             assert!(successor.proof.is_none());
             assert!(chat::is_retained_resume_successor(&reader, &successor));
         }
-        // A process outside this host still names the old exact conversation.
-        // This is parsed by the production census against an owned proc fixture,
-        // avoiding unrelated protected processes on a shared build machine.
+        // Use the production census with a private process table so a real
+        // transcript reader outside the daemon is represented without starting it.
         let source = &record.chats[0];
         let pid = std::process::id() + 1;
         let process = processes.join(pid.to_string());
@@ -995,15 +994,43 @@ mod flow_tests {
             format!("{pid} (old-provider) {}", fields.join(" ")),
         )
         .unwrap();
+        std::fs::write(process.join("environ"), b"PATH=/usr/bin\0").unwrap();
+        let conversation = source.launch.session_id.as_ref().unwrap();
+        for (executable, argv) in [
+            (
+                "/usr/bin/tail",
+                format!("tail\0-f\0/tmp/{conversation}.jsonl\0"),
+            ),
+            (
+                "/usr/bin/watch",
+                format!("watch\0--exec\0cat\0/tmp/{conversation}.jsonl\0"),
+            ),
+        ] {
+            std::os::unix::fs::symlink(executable, process.join("exe")).unwrap();
+            std::fs::write(process.join("cmdline"), argv).unwrap();
+            assert!(
+                matches!(
+                    super::super::process(
+                        &host,
+                        1,
+                        ClientRequest::ChatPrepareResume {
+                            source: source.clone()
+                        },
+                    ),
+                    Ok(ServerResponse::ChatResumePrepared { .. })
+                ),
+                "{executable} blocked a stopped conversation"
+            );
+            std::fs::remove_file(process.join("exe")).unwrap();
+        }
+
+        // The matching provider selector still fences the same resume.
         std::fs::write(
             process.join("cmdline"),
-            format!(
-                "claude\0--resume\0{}\0",
-                source.launch.session_id.as_ref().unwrap()
-            ),
+            format!("claude\0--resume\0{conversation}\0"),
         )
         .unwrap();
-        std::fs::write(process.join("environ"), b"PATH=/usr/bin\0").unwrap();
+        std::os::unix::fs::symlink("/usr/bin/claude", process.join("exe")).unwrap();
         let failure = super::super::process(
             &host,
             1,

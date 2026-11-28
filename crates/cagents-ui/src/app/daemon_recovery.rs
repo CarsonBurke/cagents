@@ -2082,6 +2082,13 @@ mod tests {
 
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
+        let executable = directory.path().join("codex");
+        fs::copy("/bin/bash", &executable).unwrap();
+        fs::write(
+            directory.path().join("resume"),
+            b"printf '%s\\n' \"$$\" > \"$2\"\nIFS= read -r barrier\n",
+        )
+        .unwrap();
         let marker = directory.path().join("writer.pid");
         let mut original = session(directory.path(), &proof("old"));
         let conversation = uuid::Uuid::new_v4().to_string();
@@ -2092,16 +2099,17 @@ mod tests {
         // writer outlive its short-lived launcher so it is outside that
         // replacement's process tree. Its inherited stdin owns its lifetime.
         let mut launcher = Command::new("/usr/bin/python3")
+            .current_dir(directory.path())
             .arg("-c")
             .arg(
                 r#"import os, sys
 if os.fork():
     os._exit(0)
 os.setsid()
-os.execl('/bin/sh', 'sh', '-c', 'printf "%s\n" "$$" > "$2"; IFS= read -r barrier',
-         'fixture', sys.argv[1], sys.argv[2])
+os.execl(sys.argv[1], 'codex', 'resume', sys.argv[2], sys.argv[3])
 "#,
             )
+            .arg(executable)
             .arg(conversation)
             .arg(&marker)
             .stdin(Stdio::piped())
@@ -2517,6 +2525,7 @@ os.execl('/bin/sh', 'sh', '-c', 'printf "%s\n" "$$" > "$2"; IFS= read -r barrier
             format!("omp\0--session\0/tmp/2026-09-09_{id}.jsonl\0"),
         )
         .unwrap();
+        std::os::unix::fs::symlink("/usr/bin/omp", process.join("exe")).unwrap();
         let result = ensure_no_surviving_process(&original, u32::MAX, directory.path());
         assert!(
             result

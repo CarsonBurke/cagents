@@ -19,6 +19,7 @@
 
 mod conversation;
 mod details;
+pub mod notify;
 mod overview;
 pub mod pairing;
 mod terminal;

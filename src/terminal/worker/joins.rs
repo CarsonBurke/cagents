@@ -5,9 +5,10 @@
 //! per terminal is needed. A successful join and a requested holder release are
 //! separate facts, including when Stop arrives after a carry/preserve join.
 use super::PublishedState;
+use crate::terminal::service_init::ServiceInit;
 use std::{
     sync::{
-        Arc, Condvar, Mutex, OnceLock,
+        Arc, Condvar, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     thread::{self, JoinHandle},
@@ -18,7 +19,7 @@ use std::{
 pub(super) const CAPACITY: usize = 1024;
 const LANES: usize = 2;
 static RESERVED: AtomicUsize = AtomicUsize::new(0);
-static SERVICE: OnceLock<Result<Service, String>> = OnceLock::new();
+static SERVICE: ServiceInit<Service> = ServiceInit::new();
 
 pub(super) struct Reservation {
     service: &'static Service,
@@ -146,28 +147,25 @@ struct Service {
     _receiver: crossbeam_channel::Receiver<Arc<JoinOwner>>,
 }
 fn service() -> Result<&'static Service, String> {
-    SERVICE
-        .get_or_init(|| {
-            let (sender, receiver) = crossbeam_channel::bounded::<Arc<JoinOwner>>(CAPACITY);
-            for lane in 0..LANES {
-                let receiver = receiver.clone();
-                thread::Builder::new()
-                    .name(format!("terminal-worker-join-{lane}"))
-                    .spawn(move || {
-                        while let Ok(owner) = receiver.recv() {
-                            finish(&owner);
-                        }
-                    })
-                    .map_err(|error| format!("Terminal join service unavailable: {error}"))?;
-            }
-            Ok(Service {
-                sender,
-                pending: Mutex::new(Vec::with_capacity(CAPACITY)),
-                _receiver: receiver,
-            })
+    SERVICE.get_or_try_init(|| {
+        let (sender, receiver) = crossbeam_channel::bounded::<Arc<JoinOwner>>(CAPACITY);
+        for lane in 0..LANES {
+            let receiver = receiver.clone();
+            thread::Builder::new()
+                .name(format!("terminal-worker-join-{lane}"))
+                .spawn(move || {
+                    while let Ok(owner) = receiver.recv() {
+                        finish(&owner);
+                    }
+                })
+                .map_err(|error| format!("Terminal join service unavailable: {error}"))?;
+        }
+        Ok(Service {
+            sender,
+            pending: Mutex::new(Vec::with_capacity(CAPACITY)),
+            _receiver: receiver,
         })
-        .as_ref()
-        .map_err(Clone::clone)
+    })
 }
 
 /// `release` uses the existing completed-holder policy. Only final HandleInner

@@ -731,10 +731,6 @@
         [
           "Unknown",
           "Unit"
-        ],
-        [
-          "CagentsManaged",
-          "Unit"
         ]
       ]
     },
@@ -10588,30 +10584,8 @@
           "Unit"
         ],
         [
-          "ProviderUpdate",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ProviderManage",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
+          "SendTestMobileNotification",
+          "Unit"
         ]
       ]
     },

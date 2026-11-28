@@ -8,6 +8,7 @@ CACHE=${CAGENTS_RELEASE_CACHE:-"$HOME/.cache/cagents-release/ubuntu-22.04-amd64"
 OUTPUT=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 REF=
 NOTES=
+TIMINGS=false
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz
 source "$ROOT_DIR/scripts/release-build-cache"
 
@@ -23,14 +24,16 @@ while (($#)); do
             case $1 in --ref) REF=$2 ;; --output) OUTPUT=$2 ;; --notes) NOTES=$2 ;; esac
             shift 2
             ;;
+        --timings) TIMINGS=true; shift ;;
         --help)
             printf '%s\n' \
-                'Usage: scripts/build-release-linux [--ref REF] [--output DIR] [--notes FILE]' \
+                'Usage: scripts/build-release-linux [--ref REF] [--output DIR] [--notes FILE] [--timings]' \
                 'Build and verify Linux releases locally in rootless Ubuntu 22.04.' \
                 'REF defaults to v<Cargo.toml version>; only committed source is exported.' \
                 'DIR defaults to CAGENTS_DIST_DIR or dist and must be empty.' \
                 'FILE holds the release notes in Markdown; by default they are the features,' \
                 'fixes and speedups committed since the previous release tag.' \
+                '--timings retains one Cargo unit report per product and variant in the private build cache.' \
                 'DIR also receives release-metadata.json, which must be signed before publishing.' \
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
                 'Git, curl, GNU tar/coreutils, flock, setsid, network access, and ample disk space.' \
@@ -102,10 +105,16 @@ PROTOCOL=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "
 if [[ -n $NOTES ]]; then
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
     NOTES=$(realpath -- "$NOTES")
+elif [[ $(git -C "$ROOT_DIR" rev-parse --is-shallow-repository) != false ]]; then
+    fail 'automatic release notes need full history; fetch it or pass --notes FILE'
 fi
 for file in scripts/package-linux.sh scripts/package-ceditor-linux.sh install.sh; do
     git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:$file" || fail "missing source file: $file"
 done
+if [[ $TIMINGS == true ]] && ! git -C "$ROOT_DIR" grep -Fq CAGENTS_RELEASE_CARGO_TIMINGS_DIR \
+    "$SOURCE_COMMIT" -- scripts/package-linux.sh; then
+    fail 'the selected source does not support Cargo unit timings'
+fi
 # A source-only export must not silently omit submodule contents.
 while read -r mode type object path; do
     [[ $mode != 160000 ]] || fail 'source ref contains submodules; source-only export is unsupported'
@@ -195,31 +204,16 @@ for directory in cargo target source source.git; do
     [[ ! -L $CACHE/$directory ]] || fail "cache $directory must not be a symlink"
     mkdir -p -- "$CACHE/$directory"
 done
+timing_environment=()
+if [[ $TIMINGS == true ]]; then
+    [[ ! -L $CACHE/timings && ! -L $CACHE/rootfs/timings ]] || fail 'unsafe timing reports directory'
+    mkdir -p -- "$CACHE/timings" "$CACHE/rootfs/timings"
+    timing_directory=$(mktemp -d "$CACHE/timings/qualification.${SOURCE_COMMIT:0:12}.XXXXXX")
+    timing_environment=(--bind "$timing_directory" /timings --setenv CAGENTS_RELEASE_CARGO_TIMINGS_DIR /timings)
+    printf 'Cargo unit timings: %s\n' "$timing_directory"
+fi
 mkdir "$WORK/dist"
-# Keep one checkout of the source in the cache. Git rewrites only the files that
-# differ from the previous build, and Cargo sees those files as newer than its
-# artifacts, so it rebuilds exactly what changed, for an older ref too.
-# Unchanged path crates stay fresh. The repository stays outside the tree, so
-# /source has no .git, just as an archive export had none.
-source_git() {
-    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
-        git -c core.hooksPath=/dev/null -c core.autocrlf=false -c gc.autoDetach=false \
-        --git-dir="$CACHE/source.git" --work-tree="$CACHE/source" "$@"
-}
-# A shallow repository cannot supply the complete history the cache keeps.
-[[ $(git -C "$ROOT_DIR" rev-parse --is-shallow-repository) == false ]] ||
-    fail 'the source repository is shallow; fetch its full history first'
-# Match the source's object format; nothing from the caller's Git
-# configuration may choose another.
-[[ -f $CACHE/source.git/HEAD ]] ||
-    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q --bare \
-        --object-format="$(git -C "$ROOT_DIR" rev-parse --show-object-format)" "$CACHE/source.git"
-# The cache lock is held, so any Git lock left here is from a killed build.
-find "$CACHE/source.git" -name '*.lock' -type f -delete
-# A full fetch from the local repository is incremental after the first.
-source_git fetch -q --no-tags "$ROOT_DIR" "$SOURCE_COMMIT"
-source_git checkout -q -f --detach "$SOURCE_COMMIT"
-source_git clean -q -ffdx
+checkout_release_source "$ROOT_DIR" "$SOURCE_COMMIT"
 # User lookup must work without importing the host's account database.
 printf 'root:x:0:0:root:/root:/bin/bash\nbuilder:x:%s:%s:Release builder:/home/builder:/bin/bash\n' \
     "$CALLER_UID" "$CALLER_GID" > "$WORK/passwd"
@@ -245,6 +239,7 @@ run_release_phase bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --setenv CARGO_HOME /cargo --setenv CARGO_TARGET_DIR /target \
     --setenv CARGO_BUILD_JOBS "$JOBS" --setenv CAGENTS_DIST_DIR /dist \
     --setenv CAGENTS_RELEASE_TARGET x86_64-unknown-linux-gnu \
+    "${timing_environment[@]}" \
     --setenv SOURCE_COMMIT "$SOURCE_COMMIT" --setenv SOURCE_REF "$REF" \
     --setenv SOURCE_DATE_EPOCH "$SOURCE_DATE_EPOCH" \
     --setenv CC /usr/bin/clang --setenv CXX /usr/bin/clang++ --setenv LIBCLANG_PATH /usr/lib/llvm-14/lib \

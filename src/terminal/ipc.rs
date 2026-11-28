@@ -388,8 +388,10 @@ use crate::{
 ///
 /// Version 226 adds exact Work card pins and a publication watermark for replies.
 ///
-/// Version 227 adds manual provider CLI installation and update requests.
-pub const PROTOCOL_VERSION: u16 = 227;
+/// Version 227 appends the mobile relay test request.
+///
+/// Version 228 adds manual provider CLI installation and update requests.
+pub const PROTOCOL_VERSION: u16 = 228;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -977,6 +979,8 @@ pub enum ClientRequest {
     /// figure a window shows moves. The device is read only while some
     /// connection watches.
     WatchDeviceStats,
+    /// Ask the daemon mobile relay worker for a test notification.
+    SendTestMobileNotification,
     /// Check and, if eligible, update the selected provider CLI on the daemon's computer.
     ProviderUpdate {
         provider: crate::agent::Provider,

@@ -2190,6 +2190,38 @@ fn process_admitted_request(
                 false,
             ))
         }
+        ClientRequest::SendTestMobileNotification => {
+            let relay = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mobile_relay
+                .clone();
+            let answer = relay
+                .ok_or("The mobile notification worker is unavailable")
+                .and_then(|relay| relay.test());
+            // Only this caller waits for the test. A slow relay cannot hold
+            // admission for shutdown, upgrades or exclusive workspace work.
+            drop(_shared);
+            let outcome = match answer {
+                Ok(answer) => match answer.recv_timeout(crate::notifications::TEST_TIMEOUT) {
+                    Ok(outcome) => outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::notifications::TestOutcome::TimedOut
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::notifications::TestOutcome::Unavailable(
+                            "The mobile notification worker stopped".into(),
+                        )
+                    }
+                },
+                Err(message) => crate::notifications::TestOutcome::Unavailable(message.into()),
+            };
+            Ok((
+                ServerResponse::NotificationTest { outcome },
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::AcknowledgeNotification { id } => {
             if let Some(notifications) =
                 &host.lock().unwrap_or_else(|p| p.into_inner()).notifications

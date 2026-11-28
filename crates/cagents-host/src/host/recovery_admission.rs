@@ -95,6 +95,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::WatchWork
         | R::WatchDeviceStats
         | R::WatchConversationPullRequests { .. }

@@ -1035,7 +1035,9 @@ fn initialize_serving_host(
         }
     };
     if let Some(broker) = &notification_broker {
-        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.notifications = Some(broker.handle());
+        state.mobile_relay = broker.mobile_relay();
     }
     // Cache sweeps preserve unretired helper journals and live Store leases.
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {

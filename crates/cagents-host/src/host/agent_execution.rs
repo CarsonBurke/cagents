@@ -38,6 +38,8 @@ pub(super) use ownership::{cancel_agent_run, reconcile_agent_run};
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
 pub(super) const EXECUTION_CLIENT: u64 = 0;
+pub(super) const NEW_WORK_HELD: &str =
+    "The daemon is not starting new work now, as during an update; try again shortly";
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {

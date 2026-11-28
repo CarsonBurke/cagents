@@ -124,6 +124,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::ChatStart { .. }
         | R::ChatStartInPane { .. }
         | R::ChatRecoverAccount { .. }

@@ -109,6 +109,13 @@ TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUST
 EXCERPT_CHARACTERS = 12000
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
+# How often the sentinel's own build directory is trimmed. The guard before
+# each of its builds keeps that build's directory out of the pruner's runs,
+# yet nearly every commit gives its lanes' crates new incremental state.
+BUILD_TRIM_SECONDS = 60 * 60
+PRUNER = Path(__file__).resolve().parent / "prune-build-dirs"
+# Seconds after which that trim starts no new search or removal.
+BUILD_TRIM_BUDGET = 600
 # Diagnostic files outlive transient failures, with a daily sweep under the watcher lock.
 EVIDENCE_SWEEP_SECONDS = 24 * 60 * 60
 LOG_RETENTION_SECONDS = 30 * EVIDENCE_SWEEP_SECONDS
@@ -176,6 +183,45 @@ def prune_evidence(directory, state):
     expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff, protected)
     state["evidence_swept_at"] = now
     save(directory / "state.json", state)
+
+
+def trim_build(repository, directory):
+    """At most hourly, after a tick's builds and before the next can start,
+    runs prune-build-dirs on the sentinel's checkout and its mirrored build
+    directory, at idle priority within a budget: it bounds the incremental
+    state its target directory keeps, which the guard before each of its
+    builds keeps out of the runs it starts, and removes the directory once
+    nothing has built there for the idle time. Its own lock leaves the
+    host's pruner runs, which the guard waits for, to themselves."""
+    checkout = repository / ".worktrees" / "main-build-sentinel"
+    if not PRUNER.is_file() or not checkout.is_dir():
+        return
+    with (directory / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return
+        path = directory / "state.json"
+        state = json.loads(path.read_text()) if path.exists() else {}
+        now = time.time()
+        last = state.get("build_trimmed_at")
+        if last is not None and 0 <= now - last < BUILD_TRIM_SECONDS:
+            return
+        state["build_trimmed_at"] = now
+        save(path, state)
+    command = ["nice", "-n", "19", str(PRUNER), "--apply", "--budget", str(BUILD_TRIM_BUDGET),
+               "--lock", str(directory / "build-trim.lock"),
+               "--output", str(directory / "build-trim.log")]
+    idle = os.environ.get("CAGENTS_BUILD_PRUNE_IDLE_DAYS")
+    if idle:
+        command += ["--max-idle", idle]
+    if shutil.which("ionice"):
+        command = ["ionice", "-c", "3", *command]
+    mirror = Path("/var/tmp/cargo-build") / checkout.resolve().relative_to("/")
+    with contextlib.suppress(OSError, subprocess.SubprocessError):
+        subprocess.run(command, cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=2 * BUILD_TRIM_BUDGET,
+                       env=dict(os.environ, CAGENTS_BUILD_PRUNE_ROOTS=f"{checkout}:{mirror}"))
 
 
 def git(repository, *args):
@@ -406,17 +452,26 @@ def keep_main_build(repository, directory, state):
     builds.mkdir(exist_ok=True)
     (builds / ".lock").touch()
     checkout = repository / ".worktrees" / "main-build-sentinel"
+    cached = (builds / sha).is_dir()
+    if not cached and git(checkout, "rev-parse", "HEAD") != sha:
+        # A bisection may have moved the worktree to an older revision.
+        checkout = checkout_commit(repository, sha)
     tool = checkout / "scripts/native-evidence"
-    if not (builds / sha).is_dir() and tool.exists() and git(checkout, "rev-parse", "HEAD") == sha:
+    if not cached and tool.exists():
         # The commit's own tool, which says what its builds compile; one
         # older than that builds nothing here.
         listed = subprocess.run([str(tool), "__build-arguments"], cwd=checkout, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if listed.returncode == 0 and listed.stdout.strip():
             print(f"main-build-sentinel: {sha} native-evidence build", flush=True)
+            # This cache is optional. Leave the next tick a chance to check
+            # main even when all build slots are busy.
+            environment = os.environ.copy()
+            environment.setdefault("CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS", "120")
             with (directory / "logs" / f"{sha}-evidence.log").open("w") as log:
                 built = subprocess.run([str(tool), "--task", str(EVIDENCE_TASK), "build", "before", str(checkout)],
-                                       cwd=checkout, stdout=log, stderr=subprocess.STDOUT).returncode
+                                       cwd=checkout, env=environment, stdout=log,
+                                       stderr=subprocess.STDOUT).returncode
             staging = builds / f".{sha}.new"
             try:
                 if built == 0:
@@ -798,6 +853,9 @@ def tick(repository, directory, github_repository):
         except BlockingIOError:
             return
         tick_locked(repository, directory, github_repository)
+        # Still holding the checkout, so no build of the sentinel's starts
+        # meanwhile and takes the locks of what it would trim.
+        trim_build(repository, directory)
     # And on every tick, for a prebuild that waited for memory and gave up.
     start_prebuild()
 
@@ -874,12 +932,15 @@ def tick_locked(repository, directory, github_repository):
         # Before the tests, which take long enough to bundle the commit beside.
         start_prebuild()
         test_main(repository, directory, state)
-        # Neither release gate needs a development-runtime build. Keep it
-        # before bisecting moves the checkout off the checked commit.
-        keep_main_build(repository, directory, state)
         if state.get("bisect"):
             bisect(repository, directory, state)
-        report_pending_tests(directory, state)
+        # A build-slot wait for optional evidence must not hide a verdict.
+        # A GitHub notification failure still leaves the exact cache build
+        # available while the saved verdict waits for a retry.
+        try:
+            report_pending_tests(directory, state)
+        finally:
+            keep_main_build(repository, directory, state)
 
 
 def main():

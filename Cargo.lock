@@ -1380,6 +1380,7 @@ dependencies = [
  "toml 1.1.4+spec-1.1.0",
  "tracing",
  "tungstenite",
+ "ureq 3.5.2",
  "url",
  "uuid",
 ]

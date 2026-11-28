@@ -56,6 +56,7 @@ use crate::{
 
 use super::{
     TRANSCRIPT_TRUNCATED_MARKER, TerminalTheme,
+    service_init::ServiceInit,
     snapshot::{RenderSnapshot, VisualResources},
     types::{
         KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
@@ -464,24 +465,21 @@ type ArchiveObserver = dyn Fn(TerminalEvent) + Send + Sync;
 type Notice = Box<dyn FnOnce() + Send>;
 
 fn event_notifier() -> Result<&'static Sender<Notice>, String> {
-    static NOTIFIER: OnceLock<Result<Sender<Notice>, String>> = OnceLock::new();
-    NOTIFIER
-        .get_or_init(|| {
-            let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
-            thread::Builder::new()
-                .name("terminal-event-notify".into())
-                .spawn(move || {
-                    for notice in pending {
-                        // A subscriber panic must not lose later terminals'
-                        // metadata or completion notifications.
-                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
-                    }
-                })
-                .map_err(|error| format!("start shared terminal event monitor: {error}"))?;
-            Ok(notices)
-        })
-        .as_ref()
-        .map_err(Clone::clone)
+    static NOTIFIER: ServiceInit<Sender<Notice>> = ServiceInit::new();
+    NOTIFIER.get_or_try_init(|| {
+        let (notices, pending) = crossbeam_channel::unbounded::<Notice>();
+        thread::Builder::new()
+            .name("terminal-event-notify".into())
+            .spawn(move || {
+                for notice in pending {
+                    // Isolate subscriber panics so later terminals still
+                    // receive metadata and completion notifications.
+                    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(notice));
+                }
+            })
+            .map_err(|error| format!("start shared terminal event monitor: {error}"))?;
+        Ok(notices)
+    })
 }
 
 fn notify_archived(notice: impl FnOnce() + Send + 'static) {
