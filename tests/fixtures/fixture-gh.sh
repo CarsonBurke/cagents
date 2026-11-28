@@ -13,7 +13,10 @@
 #       headRepository. Each repository lists
 #       those whose url is under https://github.com/OWNER/NAME/pull/, in file
 #       order. An optional fixtureReviewRequests counts the times the viewer
-#       was asked to review it.
+#       was asked to review it. A fixtureReviewFiles array enables that PR's
+#       review context, file and discussion reads.
+#   home/.config/fixture-forge-canonical-repository  The canonical OWNER/NAME
+#       to return for case-insensitive matches in repo view.
 #   home/.config/fixture-forge-delay  Seconds every answer waits first.
 #   home/.config/fixture-forge-graphql-reset  A Unix timestamp. GraphQL
 #       fails with exhausted primary quota until then; REST still answers.
@@ -139,6 +142,14 @@ github_slug() {
 }
 
 repository_json() {
+    canonical_file=$config/fixture-forge-canonical-repository
+    if [ -f "$canonical_file" ]; then
+        canonical=$(cat -- "$canonical_file")
+        if [ -n "$canonical" ] && [ "$(github_slug "https://github.com/$canonical")" = "$canonical" ] &&
+            [ "$(printf '%s' "$canonical" | tr '[:upper:]' '[:lower:]')" = "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" ]; then
+            set -- "$canonical"
+        fi
+    fi
     printf '{"nameWithOwner":"%s","url":"https://github.com/%s"}\n' "$1" "$1"
 }
 
@@ -199,7 +210,8 @@ repo_view() {
         sed -n 's/^remote\.\(.*\)\.gh-resolved base$/\1/p' || :)
     for name in $resolved upstream github origin $(printf '%s\n' "$remotes" | grep -vx -e upstream -e github -e origin || :); do
         printf '%s\n' "$remotes" | grep -qxF -- "$name" || continue
-        slug=$(github_slug "$(git remote get-url -- "$name")")
+        # Read the configured URL before any offline file transport rewrite.
+        slug=$(github_slug "$(git config --get-all "remote.$name.url" | sed -n '1p')")
         if [ -n "$slug" ]; then
             repository_json "$slug"
             return
@@ -364,6 +376,41 @@ pr() {
     esac
 }
 
+review_read() {
+    review_section=$1
+    check_seed
+    found=$(seeded "$owner/$name" | jq -c --argjson number "${number:-0}" '
+        first(.[] | select(.number == $number and (.fixtureReviewFiles | type) == "array")) // empty')
+    if [ -z "$found" ]; then
+        review_not_found
+    fi
+    ! "$include" || headers '200 OK' graphql
+    printf '%s\n' "$found" | jq -c --arg login "$login" --arg section "$review_section" --argjson offset "${cursor:-0}" '
+        def connection($nodes; $next):
+            {nodes: $nodes, pageInfo: {hasNextPage: ($next != null), endCursor: $next}};
+        def files: .fixtureReviewFiles
+            | connection(.[$offset:$offset + 100];
+                if length > $offset + 100 then ($offset + 100 | tostring) else null end);
+        (if $section == "context" then
+            del(.fixtureReviewFiles) + {viewerDidAuthor: (.author.login == $login),
+                reviews: connection([]; null), files: files}
+         elif $section == "files" then
+            {files: files}
+         else
+            {($section): connection([]; null)}
+         end) as $pr
+        | {data: {viewer: {login: $login}, repository: {pullRequest: $pr}}}'
+}
+
+review_not_found() {
+    # GitHub answers 200 with an error; gh prints it and fails.
+    message="Could not resolve to a PullRequest with the number of ${number:-0}."
+    ! "$include" || headers '200 OK' graphql
+    printf '{"data":{"repository":{"pullRequest":null}},"errors":[{"type":"NOT_FOUND","path":["repository","pullRequest"],"locations":[{"line":1,"column":1}],"message":"%s"}]}\n' "$message"
+    printf 'gh: %s\n' "$message" >&2
+    exit 1
+}
+
 api() {
     include=false method= endpoint= query= number= cursor= fields=false owner= name= limit=50
     search_open= search_all= open_limit=50 all_limit=100 if_none_match=
@@ -520,14 +567,12 @@ api() {
                         statusCheckRollup: {contexts: (.statusCheckRollup // [] | contexts($from)
                             | del(.totalCount))}}}]}}}}}'
                 ;;
-            *'pullRequest(number:'*)
-                # GitHub answers 200 with an error; gh prints it and fails.
-                message="Could not resolve to a PullRequest with the number of ${number:-0}."
-                ! "$include" || headers '200 OK' graphql
-                printf '{"data":{"repository":{"pullRequest":null}},"errors":[{"type":"NOT_FOUND","path":["repository","pullRequest"],"locations":[{"line":1,"column":1}],"message":"%s"}]}\n' "$message"
-                printf 'gh: %s\n' "$message" >&2
-                exit 1
-                ;;
+            'query('*'pullRequest(number:$number){'*'reviews(first:10,'*) review_read context ;;
+            'query('*'pullRequest(number:$number){files(first:100,'*) review_read files ;;
+            'query('*'pullRequest(number:$number){reviewThreads(first:50,'*) review_read reviewThreads ;;
+            'query('*'pullRequest(number:$number){comments(first:50,'*) review_read comments ;;
+            'query('*'pullRequest(number:$number){reviews(first:50,'*) review_read reviews ;;
+            *'pullRequest(number:'*) review_not_found ;;
             *) unsupported api graphql ;;
         esac
         return

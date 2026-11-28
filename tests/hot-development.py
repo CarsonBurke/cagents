@@ -206,7 +206,10 @@ class HotRunner(unittest.TestCase):
                 self.assertEqual(hot.main(), 23)
             state.execute.assert_not_called()
             state.run.assert_called_once()
-            self.assertEqual(state.run.call_args.args[0][-2:], ["--", "--help"])
+            launch = state.run.call_args.args[0]
+            self.assertEqual(launch[-2:], ["--", "--help"])
+            self.assertIn(["--setenv", "CAGENTS_DEVELOPMENT_UI_LOG", str(logfile)],
+                          [launch[i:i + 3] for i in range(len(launch))])
             self.assertEqual(state.run.call_args.kwargs["stderr"], subprocess.STDOUT)
             output = state.run.call_args.kwargs["stdout"]
             self.assertEqual(output.name, str(logfile))

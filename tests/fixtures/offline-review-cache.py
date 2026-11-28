@@ -1,8 +1,11 @@
 #!/usr/bin/python3
-"""Give a native-evidence fixture a cached pull request review GitHub can't refresh.
+"""Seed a native pull request review with an offline GitHub stand-in.
 
 Run it in a session, once the app has started, before opening the review:
     scripts/native-evidence env python3 tests/fixtures/offline-review-cache.py
+
+Pass --live to open the review without a cached snapshot. The forge serves
+the review and its Git refs offline, with a different URL casing than Git.
 
 It commits a base and a pull request head to the fixture project, checks the
 head out as the worktree .worktrees/cache-key on fix/cache-key, gives the
@@ -34,7 +37,9 @@ sys.dont_write_bytecode = True
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
 from fixture_home import require_fixture_home
 
-REMOTE = "https://github.com/octo-org/fixture-app"
+CANONICAL_SLUG = "octo-org/fixture-app"
+REMOTE = f"https://github.com/{CANONICAL_SLUG}"
+MIXED_CASE_REMOTE = "https://github.com/Octo-Org/Fixture-App"
 REPOSITORY = {"host": "github.com", "port": None, "owner": "octo-org", "name": "fixture-app"}
 # How src/github_identity.rs's gh_selector names the repository, lowercased,
 # in the review_cache tables' key.
@@ -45,6 +50,7 @@ VIEWER = "fixture"
 # Not the store's clock domain, so the app's own next save supersedes it.
 WRITE_EPOCH = "fixture-offline-review"
 GIT_ENVIRONMENT = {
+    "GIT_ALLOW_PROTOCOL": "file",
     "GIT_CONFIG_GLOBAL": "/dev/null",
     "GIT_CONFIG_NOSYSTEM": "1",
     "GIT_AUTHOR_NAME": "Fixture",
@@ -203,6 +209,28 @@ def diff_entries(project, oids):
     return entries
 
 
+def seed_live_review(fixture, project, config, oids, entries):
+    """Serve the actual Git refs without changing the configured GitHub identity."""
+    upstream = fixture / "review-upstream.git"
+    if require_fixture_home("fixture Git remote", upstream) != upstream:
+        fail(f"{upstream} must be inside this fixture")
+    if not upstream.exists():
+        git(fixture, "init", "--quiet", "--bare", str(upstream))
+    git(project, "push", "--quiet", upstream.as_uri(), f"+{oids['base']}:refs/heads/main",
+        f"+{oids['head']}:refs/pull/{NUMBER}/head")
+    git(project, "config", "--replace-all", f"url.{upstream.as_uri()}.insteadOf", MIXED_CASE_REMOTE)
+    write(config / "fixture-forge-canonical-repository", CANONICAL_SLUG + "\n")
+
+    seed = pull_request(oids)
+    seed["fixtureReviewFiles"] = [
+        {"path": os.fsdecode(bytes(entry["path"])), "changeType": entry["kind"].upper(),
+         "additions": entry["added_lines"], "deletions": entry["removed_lines"],
+         "viewerViewedState": "UNVIEWED"}
+        for entry in entries
+    ]
+    return seed
+
+
 def snapshot(oids):
     """src/review_cache.rs's Snapshot without its files, as the store keeps it."""
     range_ = {
@@ -282,8 +310,9 @@ def write(path, content):
 
 
 def main():
-    if len(sys.argv) > 1:
-        fail(f"takes no arguments; run it as: scripts/native-evidence env python3 {sys.argv[0]}")
+    if sys.argv[1:] not in ([], ["--live"]):
+        fail(f"usage: scripts/native-evidence env python3 {sys.argv[0]} [--live]")
+    live = bool(sys.argv[1:])
     fixture = os.environ.get("CAGENTS_EVIDENCE_FIXTURE")
     if not fixture:
         fail("run it in a native-evidence fixture: scripts/native-evidence env python3 " + sys.argv[0])
@@ -294,28 +323,44 @@ def main():
     if not ((fixture / "bin").is_dir() and (project / ".git").exists() and home.is_dir()
             and Path.home().resolve() == home):
         fail(f"{fixture} is not a native-evidence fixture whose HOME is this one; start a session first")
-    database = store_path(fixture)
-    if fixture not in database.resolve().parents:
-        fail(f"{database} is outside the fixture {fixture}")
-    if not database.is_file():
-        fail(f"{database} does not exist yet; start a session with this side's app first")
     project = require_fixture_home("fixture repository", project)
     config = require_fixture_home("XDG_CONFIG_HOME", home / ".config")
-    database = require_fixture_home("workspace database", database)
+    has_origin = "origin" in git(project, "remote").split()
+    if live:
+        if has_origin:
+            origin = git(project, "config", "--get", "remote.origin.url")
+            if origin.lower() != REMOTE:
+                fail(f"{project} already has a different origin; use a fresh native-evidence fixture")
+    else:
+        database = store_path(fixture)
+        if fixture not in database.resolve().parents:
+            fail(f"{database} is outside the fixture {fixture}")
+        if not database.is_file():
+            fail(f"{database} does not exist yet; start a session with this side's app first")
+        database = require_fixture_home("workspace database", database)
     oids = prepare_commits(project)
+    entries = diff_entries(project, oids)
     config.mkdir(exist_ok=True)
     # The switch goes on before the remote appears: a failed read while the
     # remote is there makes the app wait before asking again.
     require_fixture_home("fixture forge", config / "fixture-forge").touch()
     seeds = config / "fixture-forge-prs.json"
     others = [seed for seed in (json.loads(seeds.read_text()) if seeds.exists() else [])
-              if seed.get("number") != NUMBER or not seed.get("url", "").startswith(REMOTE + "/")]
-    write(seeds, json.dumps([*others, pull_request(oids)], indent=1) + "\n")
-    if "origin" not in git(project, "remote").split():
-        git(project, "remote", "add", "origin", REMOTE)
-    write_cache(database, oids, diff_entries(project, oids))
-    print(json.dumps({"project": str(project), "worktree": str(project / ".worktrees" / "cache-key"),
-                      "pull_request": f"{REMOTE}/pull/{NUMBER}", "store": str(database), **oids}))
+              if seed.get("number") != NUMBER or not seed.get("url", "").lower().startswith(REMOTE + "/")]
+    summary = {"project": str(project), "worktree": str(project / ".worktrees" / "cache-key"),
+               "pull_request": f"{REMOTE}/pull/{NUMBER}", **oids}
+    if live:
+        pr = seed_live_review(fixture, project, config, oids, entries)
+    else:
+        pr = pull_request(oids)
+        write_cache(database, oids, entries)
+        summary["store"] = str(database)
+    write(seeds, json.dumps([*others, pr], indent=1) + "\n")
+    if not has_origin:
+        git(project, "remote", "add", "origin", MIXED_CASE_REMOTE if live else REMOTE)
+    elif live:
+        git(project, "remote", "set-url", "origin", MIXED_CASE_REMOTE)
+    print(json.dumps(summary))
 
 
 if __name__ == "__main__":

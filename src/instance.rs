@@ -940,6 +940,10 @@ pub fn report_startup_failure() {
 /// development run can read what its daemon did.
 pub const DEVELOPMENT_DAEMON_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_DAEMON_LOG";
 
+/// Absolute diagnostic destination inherited by windows descended from the
+/// development runner, including through the device-switch CLI.
+pub const DEVELOPMENT_UI_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_UI_LOG";
+
 /// Points standard error at [`DEVELOPMENT_DAEMON_LOG_ENV`]'s file when a
 /// development build names one, and removes the variable so the daemon's
 /// terminals and agents do not inherit it; children that inherit standard

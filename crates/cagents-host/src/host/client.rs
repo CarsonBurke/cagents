@@ -26,6 +26,8 @@ use super::{
 };
 
 mod project_sessions;
+#[cfg(any(test, feature = "development"))]
+mod reply_fixture;
 
 #[cfg(test)]
 mod automation_authority_tests;
@@ -230,6 +232,8 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
     // an update. Any other older client is refused as before.
     let mut protocol = None;
     let mut older = None;
+    #[cfg(feature = "development")]
+    let mut fixture_peer = None;
     loop {
         let frame = if connected {
             // An older CLI's requests are read as it encoded them; see
@@ -253,6 +257,10 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
             let requires_session_authority = peer
                 .is_none_or(|peer| crate::daemon::peer_requires_session_authority(&reader, peer));
             let pid = peer.map(|peer| peer.pid);
+            #[cfg(feature = "development")]
+            {
+                fixture_peer = pid;
+            }
             host.lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .record_client_peer(client_id, pid, requires_session_authority);
@@ -372,6 +380,14 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
         let releases_retention = may_release_retention(&request);
+        #[cfg(feature = "development")]
+        let manual_run = matches!(
+            request,
+            ClientRequest::Automation {
+                operation: crate::automations::Request::RunNow { .. },
+                ..
+            }
+        );
         // An attached terminal's live events follow its reply and replay.
         let hold =
             matches!(request, ClientRequest::Attach { .. }).then(|| delivery.hold_broadcasts());
@@ -422,6 +438,12 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
         }
         match outcome {
             Ok((response, extras, shutdown)) => {
+                #[cfg(feature = "development")]
+                if manual_run && fixture_peer.is_some_and(reply_fixture::drop_run_now_reply) {
+                    // The accepted run is durable. End only this client's
+                    // stream before its acknowledgement is queued.
+                    break;
+                }
                 let proof = current_proof(&host);
                 let response_failed =
                     push_response(&delivery, &proof, request_id, response).is_err();

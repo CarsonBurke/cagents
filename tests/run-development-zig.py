@@ -425,6 +425,7 @@ exit 83
                     XDG_RUNTIME_DIR=str(self.root / "nh-evidence"),
                     DISPLAY="", NIRI_SOCKET="private-niri.sock", APP_ENV=str(app_environment))
         self.assertIn("CAGENTS_DEVELOPMENT_INSTANCE=review2571", app_environment.read_text())
+        self.assertIn(f"CAGENTS_DEVELOPMENT_UI_LOG={log}", app_environment.read_text())
         self.assertFalse(harness_calls.exists(), "the runner started another compositor")
         self.assertTrue(log.exists())
 
@@ -771,11 +772,11 @@ exit 83
         limit.write_text('#!/bin/sh\nshift 2\n"$@"\necho limit-message >&2\n')
         limit.chmod(0o755)
         log = self.root / "ui.log"
+        log.write_text("previous window\n")
         result, _ = self.launch("--browserless", "--log-file", str(log))
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("limit-message", result.stderr)
-        self.assertTrue(log.exists())
-        self.assertNotIn("limit-message", log.read_text())
+        self.assertEqual(log.read_text(), "previous window\n")
 
     def test_a_launch_building_on_the_build_host_always_asks_it(self):
         # Cargo's dependency lists stay there, so nothing here can say the

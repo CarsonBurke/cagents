@@ -4,7 +4,7 @@ use std::{
     io::{self, IsTerminal, Read, Write},
     os::{
         fd::{AsFd, AsRawFd},
-        unix::{net::UnixStream, process::CommandExt},
+        unix::{fs::OpenOptionsExt, net::UnixStream, process::CommandExt},
     },
     path::{Path, PathBuf},
     process::{ChildStdout, Command, ExitCode, Stdio},
@@ -5021,6 +5021,37 @@ fn opens_device_window(command: &Command) -> bool {
     command.get_args().any(|argument| argument == "--device")
 }
 
+/// The development runner's foreground UI writes to this file. Its other
+/// windows reopen it in append mode while stdout remains the startup protocol.
+fn ui_launch_stderr(command: &Command) -> Stdio {
+    let path = command
+        .get_envs()
+        .find(|(key, _)| *key == instance::DEVELOPMENT_UI_LOG_ENV)
+        .map_or_else(
+            || std::env::var_os(instance::DEVELOPMENT_UI_LOG_ENV),
+            |(_, value)| value.map(OsStr::to_os_string),
+        );
+    if let Some(path) = path
+        && instance::IS_DEVELOPMENT
+        && Path::new(&path).is_absolute()
+    {
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+        {
+            Ok(file) => return Stdio::from(file),
+            Err(error) => eprintln!(
+                "cagents: cannot append to UI log {}: {error}",
+                Path::new(&path).display()
+            ),
+        }
+    }
+    Stdio::null()
+}
+
 pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
@@ -5043,10 +5074,11 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     {
         return darwin_ui::launch(command, &bundle, timeout);
     }
+    let stderr = ui_launch_stderr(command);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(stderr)
         .process_group(0);
     // SAFETY: the hook performs only the close_range syscall before exec.
     unsafe {
@@ -12670,6 +12702,31 @@ mod tests {
             ])
             .env_remove("CAGENTS_UI_LAUNCH_RECOVERY_PROGRESS");
         spawn_ui_process(&mut command).unwrap();
+    }
+
+    #[test]
+    fn ui_launcher_appends_diagnostics_without_mixing_them_into_the_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("UI diagnostics.log");
+        std::fs::write(&log, "original window\n").unwrap();
+
+        for text in ["switched device", "second window"] {
+            let mut command = Command::new("sh");
+            command
+                .args([
+                    "-c",
+                    r#"printf '%s\n' "$1" >&2; printf 'ready\n'"#,
+                    "ui",
+                    text,
+                ])
+                .env(instance::DEVELOPMENT_UI_LOG_ENV, &log);
+            assert_eq!(spawn_ui_process(&mut command).unwrap(), None);
+        }
+
+        assert_eq!(
+            std::fs::read_to_string(log).unwrap(),
+            "original window\nswitched device\nsecond window\n"
+        );
     }
 
     #[test]
