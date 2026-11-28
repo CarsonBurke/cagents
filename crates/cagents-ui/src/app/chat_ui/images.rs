@@ -2796,22 +2796,31 @@ mod tests {
             reset: 0,
             transcript: None,
             from_transcript: false,
-            origin: None,
-            serial: 7,
+            origin: Some(Origin {
+                root: "/fixture".into(),
+                child: false,
+                device: None,
+            }),
+            serial: 0,
             reading: None,
         };
         // A read the viewer has moved on from, or one for an earlier viewer,
         // is not kept.
-        gallery.loaded(7, "b", Loaded::Ready(pixels()));
-        gallery.loaded(6, "a", Loaded::Ready(pixels()));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (serial, first) = gallery.awaiting();
+        gallery.loaded(serial, "b", Loaded::Ready(pixels()));
+        gallery.loaded(serial + 1, &first, Loaded::Ready(pixels()));
         assert!(gallery.entries.iter().all(|entry| entry.full.is_none()));
-        gallery.loaded(7, "a", Loaded::Failed("gone".into()));
+        gallery.loaded(serial, &first, Loaded::Failed("gone".into()));
         assert_eq!(gallery.entries[0].error.as_deref(), Some("gone"));
         // Browsing away and back tries a failed picture again.
         drop(gallery.next(ViewerHost::Dialog, true));
         drop(gallery.next(ViewerHost::Dialog, false));
         assert_eq!(gallery.entries[0].error, None);
-        gallery.loaded(7, "a", Loaded::Ready(pixels()));
+        gallery.loaded(serial, &first, Loaded::Ready(pixels()));
+        assert!(gallery.entries[0].full.is_none());
+        let (current, shown) = gallery.awaiting();
+        gallery.loaded(current, &shown, Loaded::Ready(pixels()));
         assert!(gallery.entries[0].full.is_some());
         // Only the shown picture is held whole.
         drop(gallery.next(ViewerHost::Dialog, true));
