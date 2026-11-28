@@ -37,7 +37,7 @@ EDITOR_MEMBERS = (
 INSTALL_TIMEOUT_SECONDS = 60
 
 COORDINATOR = r'''
-import json, os, pathlib, subprocess, sys
+import hashlib, json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
 log = pathlib.Path(os.environ['FIXTURE_CALLS'])
 def record(event, **fields):
@@ -55,13 +55,16 @@ commands = ('coordinate-install', 'verify-install-guard', 'record-deferred-insta
 if len(args) == 2 and args[0] in commands and args[1] == '--help':
     print('Options:\n  --stage-only  Preserve the running application')
 elif args[0] == 'coordinate-install':
-    helper = pathlib.Path(sys.argv[0]).resolve().with_name('cagentsd')
+    executable = pathlib.Path(sys.argv[0]).resolve()
+    helper = executable.with_name('cagentsd')
     # The real coordinator resolves this exact sibling, never a PATH fallback.
     inspected = subprocess.run([str(helper), '--inspect-upgrade-source', 'fixture'],
                                check=True, capture_output=True, text=True)
     assert json.loads(inspected.stdout) == {'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}
-    record('coordinate', executable=str(pathlib.Path(sys.argv[0]).resolve()),
-           helper=str(helper), mode=helper.stat().st_mode & 0o777)
+    record('coordinate', executable=str(executable), helper=str(helper),
+           mode=helper.stat().st_mode & 0o777,
+           executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+           helper_sha256=hashlib.sha256(helper.read_bytes()).hexdigest())
     installer = args[args.index('--installer') + 1]
     child_args = args[args.index('--') + 1:]
     environment = dict(os.environ, CAGENTS_UI_UPDATE_GUARD_FD='fixture-only')
@@ -562,11 +565,29 @@ exec /usr/bin/awk "$@"
         self.assertTrue(rollback.is_dir())
 
     def test_fresh_prefix_uses_the_verified_candidate_pair(self):
+        real_tar = shutil.which("tar")
+        members = (f"{TOP}/bin/cagents", f"{TOP}/bin/cagentsd")
+        self.python(self.tools / "tar", f'''
+import json, os, sys
+
+args = sys.argv[1:]
+requested = [arg for arg in args if arg in {members!r}]
+if requested:
+    with open(os.environ["FIXTURE_CALLS"], "a") as calls:
+        calls.write(json.dumps(dict(event="bootstrap-extract", members=requested)) + "\\n")
+os.execv({real_tar!r}, [{real_tar!r}, *args])
+''')
         self.assertFalse(self.prefix.exists())
         coordinator = self.assert_installed(self.install(), 'candidate')
-        self.assertEqual(Path(coordinator['executable']).parent, Path(coordinator['helper']).parent)
-        self.assertEqual(Path(coordinator['helper']).name, 'cagentsd')
+        executable = Path(coordinator['executable'])
+        self.assertEqual(executable.name, 'cagents-install-coordinator')
+        self.assertEqual(Path(coordinator['helper']), executable.with_name('cagentsd'))
         self.assertEqual(coordinator['mode'], 0o700)
+        for role, name in (("executable", "cagents"), ("helper", "cagentsd")):
+            digest = hashlib.sha256((self.payload / "bin" / name).read_bytes()).hexdigest()
+            self.assertEqual(coordinator[f'{role}_sha256'], digest)
+        self.assertEqual([event["members"] for event in self.events()
+                          if event["event"] == "bootstrap-extract"], [list(members)] * 2)
 
     def test_public_downloads_disable_curl_configuration(self):
         self.environment.update(
@@ -614,16 +635,19 @@ else:
 
     def test_source_inspector_extraction_failure_stops_before_publication(self):
         real_tar = shutil.which("tar")
+        members = [f"{TOP}/bin/cagents", f"{TOP}/bin/cagentsd"]
         self.python(self.tools / "tar", f'''
-import os, sys
+import os, subprocess, sys
 args = sys.argv[1:]
-if args[0] == '-xOzf' and args[-1] == '{TOP}/bin/cagentsd':
+if args[-2:] == {members!r}:
+    # Leave only the coordinator extracted, as a mid-extraction error would.
+    subprocess.run([{real_tar!r}, *args[:-1]], check=True)
     sys.exit(23)
 os.execv({real_tar!r}, [{real_tar!r}, *args])
 ''')
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('could not extract the verified source inspector', result.stderr)
+        self.assertIn('could not extract the verified update coordinator and source inspector', result.stderr)
         self.assertFalse(self.prefix.exists())
         self.assertFalse(self.calls.exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
