@@ -29,20 +29,20 @@ pub struct WriteOrder {
 
 impl WriteOrder {
     pub fn capture() -> Result<Self, String> {
-        static EPOCH: std::sync::OnceLock<Result<String, String>> = std::sync::OnceLock::new();
-        let epoch = EPOCH
-            .get_or_init(|| {
-                let boot = crate::model::current_boot_id()
-                    .map_err(|error| format!("Cannot identify the review-cache clock: {error}"))?;
-                let boot = uuid::Uuid::parse_str(boot.as_str())
-                    .map_err(|error| format!("Invalid review-cache boot identity: {error}"))?;
-                Ok(format!("boottime-v1:{boot}"))
-            })
-            .clone()?;
+        static EPOCH: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let epoch = if let Some(epoch) = EPOCH.get() {
+            epoch
+        } else {
+            let boot = crate::model::current_boot_id()
+                .map_err(|error| format!("Cannot identify the review-cache clock: {error}"))?;
+            let boot = uuid::Uuid::parse_str(boot.as_str())
+                .map_err(|error| format!("Invalid review-cache boot identity: {error}"))?;
+            EPOCH.get_or_init(|| format!("boottime-v1:{boot}"))
+        };
         let since_boot = crate::process::clock::since_boot()
             .map_err(|error| format!("Cannot read the review-cache clock: {error}"))?;
         Ok(Self {
-            epoch,
+            epoch: epoch.clone(),
             tick: Self::checked_tick(since_boot)?,
         })
     }
@@ -282,6 +282,51 @@ mod tests {
             "json" => Box::new(JsonStore::new(directory.join("review.json"))),
             _ => panic!("unknown cache lane"),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_cache_order_recovers_from_a_temporary_boot_id_read_failure() {
+        const CHILD: &str = "CAGENTS_TEST_REVIEW_CACHE_BOOT_ID_RETRY";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "review_cache::tests::review_cache_order_recovers_from_a_temporary_boot_id_read_failure",
+                ])
+                .env(CHILD, "1")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: each pointer refers to a live rlimit. Only this isolated
+        // test process changes its soft limit, then restores it before asserting.
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        let limited = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: limit.rlim_max,
+        };
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limited) }, 0);
+        let first = WriteOrder::capture();
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+
+        assert!(
+            first
+                .unwrap_err()
+                .contains("Cannot identify the review-cache clock")
+        );
+        let recovered =
+            WriteOrder::capture().expect("cache writes can recover after the limit is restored");
+        assert_eq!(recovered.epoch, WriteOrder::capture().unwrap().epoch);
     }
 
     #[test]
