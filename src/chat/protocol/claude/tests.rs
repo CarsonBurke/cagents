@@ -14071,6 +14071,55 @@ fn claude_history_correlation_budget_counts_only_retained_rewritten_carriers() {
     assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
 }
 
+#[test]
+fn a_failed_earlier_page_replays_the_same_records_after_repair() {
+    let history = correlation_history(vec![
+        json!({"type":"user","uuid":"before","message":{"content":"Earlier question"}}),
+        json!({"type":"assistant","uuid":"call","message":{"content":[{"type":"tool_use","id":"tool","name":null}]}}),
+        json!({"type":"assistant","uuid":"after","message":{"content":"Earlier answer"}}),
+    ]);
+    let from = history.offset;
+    let Link::Record(offset, len, _) = history.chain[1] else {
+        panic!("tool call should be indexed");
+    };
+    let mut adapter = Claude {
+        history: Some(history),
+        ..Claude::default()
+    };
+    assert!(adapter.command(Command::LoadEarlier).is_err());
+    let history = adapter.history.as_mut().unwrap();
+    assert_eq!(history.offset, from);
+
+    // Repair the indexed carrier in place, at the same length and offset.
+    history.file.seek(SeekFrom::Start(offset)).unwrap();
+    let mut carrier = vec![0; len as usize];
+    history.file.read_exact(&mut carrier).unwrap();
+    let repaired = String::from_utf8(carrier)
+        .unwrap()
+        .replace("\"name\":null", "\"name\":\"Go\"");
+    assert_eq!(repaired.len() as u64, len);
+    history.file.seek(SeekFrom::Start(offset)).unwrap();
+    history.file.write_all(repaired.as_bytes()).unwrap();
+
+    let page = adapter.command(Command::LoadEarlier).unwrap();
+    let [
+        Event::History {
+            items, has_earlier, ..
+        },
+    ] = page.events.as_slice()
+    else {
+        panic!("expected the repaired page");
+    };
+    assert!(!has_earlier);
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.id.as_str())
+            .collect::<Vec<_>>(),
+        ["before:0", "tool", "after:0"]
+    );
+}
+
 /// A lead conversation fed live frames, as the store projects them.
 #[derive(Default)]
 struct Lead {

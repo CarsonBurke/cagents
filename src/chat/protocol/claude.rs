@@ -4722,17 +4722,27 @@ impl Adapter for Claude {
                     return Err("Claude has no earlier persisted history".into());
                 };
                 let from = history.offset;
-                let frames = history.page();
-                let has_earlier = history.offset > 0;
-                self.history = Some(history);
-                let mut step = Step::default();
                 // An earlier page replays launches whose agents settled long
                 // ago; which agents are still running is already known.
                 let running = self.background_agents.clone();
-                for frame in frames? {
-                    self.history_message(&frame, &mut step)?;
-                }
+                let replay = history.page().and_then(|frames| {
+                    let mut step = Step::default();
+                    for frame in frames {
+                        self.history_message(&frame, &mut step)?;
+                    }
+                    Ok(step)
+                });
                 self.background_agents = running;
+                let step = match replay {
+                    Ok(step) => step,
+                    Err(error) => {
+                        // No page was published. Retry must read these same
+                        // records, including the ones replayed before the error.
+                        history.offset = from;
+                        self.history = Some(history);
+                        return Err(error);
+                    }
+                };
                 let items = step
                     .events
                     .into_iter()
@@ -4746,10 +4756,9 @@ impl Adapter for Claude {
                     .collect();
                 let mut items = settled(items);
                 self.stop_earlier_steps(&mut items);
-                let unfetched = self
-                    .history
-                    .as_mut()
-                    .map(|history| history.unfetched(from - history.offset, items.len()));
+                let has_earlier = history.offset > 0;
+                let unfetched = Some(history.unfetched(from - history.offset, items.len()));
+                self.history = Some(history);
                 Ok(Step {
                     events: vec![Event::History {
                         items,

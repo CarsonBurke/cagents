@@ -3201,6 +3201,7 @@ struct Echo;
 fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
     struct HistoryFixture {
         attempts: usize,
+        refuses_command: bool,
     }
     impl Adapter for HistoryFixture {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -3224,7 +3225,9 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
             let events = match command {
                 Command::LoadEarlier => {
                     self.attempts += 1;
-                    if self.attempts <= 2 {
+                    if self.attempts <= 2 && self.refuses_command {
+                        return Err("page failed".into());
+                    } else if self.attempts <= 2 {
                         vec![
                             Event::HistoryLoading(false),
                             Event::HistoryError("page failed".into()),
@@ -3253,7 +3256,12 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
             Ok(Step::default())
         }
     }
-    for unrelated in [None, Some("different failure"), Some("page failed")] {
+    for (refuses_command, unrelated) in [
+        (true, None),
+        (false, None),
+        (false, Some("different failure")),
+        (false, Some("page failed")),
+    ] {
         let spec = ProcessSpec {
             stdout_noise: None,
             followed: false,
@@ -3266,13 +3274,19 @@ fn successful_history_retry_clears_its_error_but_preserves_unrelated_errors() {
             working_directory: std::env::temp_dir(),
             environment: BTreeMap::new(),
         };
-        let mut adapter: Box<dyn Adapter> = Box::new(HistoryFixture { attempts: 0 });
+        let mut adapter: Box<dyn Adapter> = Box::new(HistoryFixture {
+            attempts: 0,
+            refuses_command,
+        });
         let mut initial = adapter.initialize().unwrap();
         let store = preflight(&spec, &mut initial).unwrap();
         let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
         until(&handle, |snapshot| snapshot.ready);
         for _ in 0..2 {
-            handle.command(Command::LoadEarlier).unwrap();
+            assert_eq!(
+                handle.command(Command::LoadEarlier).is_err(),
+                refuses_command
+            );
             assert_eq!(
                 handle.snapshot(None).unwrap().error.as_deref(),
                 Some("page failed")
