@@ -2042,10 +2042,12 @@ impl Scanner {
             for (repository, name) in &projects {
                 shared.track(repository, name);
             }
-            drop(shared);
-            handle.changed();
-            handle.projection_changed();
         }
+        drop(shared);
+        // A request may already have adopted a new name or project. The
+        // committed change still needs to reach the board and conversations.
+        handle.changed();
+        handle.projection_changed();
         true
     }
 
