@@ -1,13 +1,18 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import test from "node:test";
+import { renderDownloads } from "../lib/downloads.js";
+import { PLATFORMS } from "../lib/release.js";
 import { loadScreens, renderPage, sharedThemes } from "../lib/screens.js";
 
 const root = new URL("../", import.meta.url);
 const repository = new URL("../", root);
 const screens = loadScreens(root);
-const page = renderPage(readFileSync(new URL("index.html", root), "utf8"), {
-  screens,
+const source = readFileSync(new URL("index.html", root), "utf8");
+// The page as built when GitHub can't be reached, and once every download is released.
+const page = renderDownloads(renderPage(source, { screens }), { release: null });
+const released = renderDownloads(renderPage(source, { screens }), {
+  release: { assets: Object.values(PLATFORMS).map(({ asset }) => ({ name: asset })) },
 });
 
 test("every screenshot has both formats in every theme it lists, at a sensible weight", () => {
@@ -71,7 +76,7 @@ test("in-page links and repository links lead somewhere", () => {
 
 test("install actions lead to the installation guide, never to a command", () => {
   const guide = "https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md";
-  const installs = [...page.matchAll(/<a class="button primary[^"]*" href="([^"]+)">/g)].map(([, href]) => href);
+  const installs = [...page.matchAll(/<a class="button primary[^"]*" href="([^"]+)"/g)].map(([, href]) => href);
   assert.ok(installs.length >= 3, "the navigation, hero and closing band each offer Install");
   for (const href of installs) assert.equal(href, guide);
   for (const platform of ["#install-with-the-verified-installer", "#install-on-apple-silicon-macos"]) {
@@ -169,4 +174,25 @@ test("the stylesheet's light-capture switch matches the markup", () => {
   assert.ok(css.includes('picture[data-themes~="light"]'), "styles.css no longer keys light surfaces on data-themes");
   const html = renderPage(fakePage(["one"]), { screens: fakeScreens({ one: ["dark", "light"] }) });
   assert.ok(html.includes('<picture data-themes="dark light">'));
+});
+
+test("download links fall back to guides until the files are released", () => {
+  const assets = /releases\/latest\/download\//;
+  assert.doesNotMatch(page, assets, "an unreleased file would be a dead link");
+  assert.ok(page.includes(`href="${PLATFORMS.android.fallback}"`));
+  for (const { asset } of Object.values(PLATFORMS)) {
+    assert.ok(released.includes(`href="https://github.com/CarsonBurke/cagents/releases/latest/download/${asset}"`), asset);
+  }
+  for (const html of [page, released]) {
+    assert.doesNotMatch(html, /%%|<!--(?:download-offers|qr:)/, "every download placeholder is filled");
+    const offers = JSON.parse(/<script type="application\/json" id="download-offers">([^<]+)<\/script>/.exec(html)[1]);
+    assert.deepEqual(Object.keys(offers).sort(), ["android", "linux", "mac"]);
+  }
+  assert.match(page, /Install on Linux/);
+  assert.match(released, /Download for Linux/);
+});
+
+test("the Android section the QR code opens exists", () => {
+  assert.match(page, /<section[^>]* id="android"/);
+  assert.match(page, /<svg class="qr"[^>]*role="img" aria-label="[^"]+"/);
 });

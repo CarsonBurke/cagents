@@ -10,6 +10,8 @@
     "preview": "vite preview"
   },
   "devDependencies": {
+    "jsqr": "^1.4.0",
+    "uqr": "^0.1.3",
     "vite": "^8.2.2"
   }
 }

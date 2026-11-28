@@ -1,3 +1,5 @@
+import { currentPlatform } from "./platform.js";
+
 const viewer = document.querySelector(".screenshot-viewer");
 const imageRegion = viewer.querySelector(".viewer-image");
 const expandedImage = imageRegion.querySelector("img");
@@ -38,12 +40,27 @@ if (nav && sentinel && "IntersectionObserver" in window) {
   }).observe(sentinel);
 }
 
-// Show the reader's own keyboard shortcuts. Without JavaScript, or on any
-// other platform, the page shows Linux's. iPadOS also reports "MacIntel"
-// and gets the Mac keys, which suit an iPad with a keyboard.
-const platform = navigator.userAgentData?.platform || navigator.platform || "";
-if (/^mac/i.test(platform)) {
-  for (const keys of document.querySelectorAll(".keys[data-platform]")) {
-    keys.hidden = keys.dataset.platform !== "mac";
+// Offer the download for the visitor's system. Without JavaScript, and on
+// systems cagents has no build for, the buttons stay on the install guide.
+const offers = JSON.parse(document.getElementById("download-offers")?.textContent ?? "{}");
+currentPlatform().then((platform) => {
+  document.documentElement.dataset.platform = platform;
+  const offer = offers[platform];
+  for (const button of document.querySelectorAll("[data-download-button]")) {
+    if (offer) {
+      button.href = offer.href;
+      button.textContent = offer.button;
+    }
+    // cagents has no iPhone app, so the hero explains that instead.
+    if (platform === "ios") button.hidden = true;
   }
-}
+  for (const note of document.querySelectorAll("[data-note]")) note.hidden = note.dataset.note !== platform;
+  document.querySelector(`[data-download-item="${platform}"]`)?.classList.add("is-yours");
+
+  // Show the reader's own keyboard shortcuts; the page shows Linux's until
+  // then. Intel Macs and iPads, which report "MacIntel", get the Mac keys too.
+  const mac = platform === "mac" || /^mac/i.test(navigator.platform ?? "");
+  for (const keys of document.querySelectorAll(".keys[data-platform]")) {
+    keys.hidden = keys.dataset.platform !== (mac ? "mac" : "linux");
+  }
+});
