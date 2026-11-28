@@ -360,26 +360,39 @@ fn prune_at(
     let Some(root) = open_directory(directory)? else {
         return Ok(());
     };
+    let mut removed = false;
     for path in record_paths(directory)? {
         let path = path?;
         let mut record = read_record(&root, &path, true)?;
         if keep_source(&record.source) {
             continue;
         }
-        record.prune_allocations(referenced);
+        let changed = record.prune_allocations(referenced);
         if record.chats.is_empty() && record.terminals.is_empty() {
             crate::fs_safety::unlink_within(&root, OsStr::new(&record.file_name()?))
                 .map_err(|error| error.to_string())?;
-        } else {
+            removed = true;
+        } else if changed {
             record.write_to(&root)?;
         }
     }
-    crate::fs_safety::sync_directory(&root).map_err(|error| error.to_string())
+    if removed {
+        crate::fs_safety::sync_directory(&root).map_err(|error| error.to_string())?;
+    }
+    Ok(())
 }
 
 impl Record {
     #[cfg(any(feature = "host", test))]
-    fn prune_allocations(&mut self, referenced: &std::collections::BTreeSet<TerminalId>) {
+    fn prune_allocations(&mut self, referenced: &std::collections::BTreeSet<TerminalId>) -> bool {
+        let entries = |record: &Self| {
+            record.chats.len()
+                + record.terminals.len()
+                + record.aliases.len()
+                + record.snapshots.len()
+                + record.presentations.len()
+        };
+        let before = entries(self);
         let pending: std::collections::BTreeSet<_> = self
             .presentations
             .iter()
@@ -397,7 +410,7 @@ impl Record {
         self.terminals.retain(|id| referenced.contains(id));
         // Broad service ownership is only needed while that source is still
         // installed. Retain the exact affected pane identities afterwards.
-        self.service_stopped = false;
+        std::mem::take(&mut self.service_stopped) || entries(self) != before
     }
 }
 

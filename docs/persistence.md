@@ -401,11 +401,41 @@ Drafts are written through the daemon (`EditDraft { pane, revision, text,
 attachments }`), debounced in the window per pane and applied with a revision
 check, so a stale window cannot overwrite a newer draft from another window.
 
+## Conversation history retention
+
+Claude and Codex own their transcript and rollout files. Cagents resolves them
+using the saved provider session ID, account home and, for Claude, the working
+directory. A managed home has the same history ownership as a linked or system
+home. An absent Cagents descriptor gives no information about a conversation
+opened from a provider CLI or another installation. Cagents applies no
+automatic expiry or deletion to provider history or saved conversation
+descriptors, including records of closed panes. Closing a pane ends its
+presentation and any work covered by that action. The saved history remains.
+
+The shared store's `panes` and `agents` records and the window stores' `cards`
+records carry session descriptors. Retained actor ownership and retirement
+records, active upgrade checkpoints and the stopped-session ledger also refer
+to provider history. The stopped-session ledger can hold a captured transcript
+page that the provider cannot reproduce. Startup prunes that derived data only
+after reading the saved session inventory, which includes open panes and agents
+as well as window chat descriptors saved before or after provider confirmation.
+The current recovery source, the installed source and unrestored presentations
+keep their existing protection. An incomplete window read leaves the ledger in
+place.
+
+The [user guide](user-guide.md#keep-and-back-up-conversation-history) describes
+how to inspect and export the provider history and saved descriptors. A future
+deletion operation needs an exact preview with account homes, affected saved
+sessions and recovery dependencies, a way to export those records before
+confirmation, and a fresh ownership check before deletion. Shared homes and
+sessions started outside Cagents require provider or user authority over the
+files.
+
 ## Lifecycle and garbage collection
 
 | Data | Kept while | Then |
 | --- | --- | --- |
-| `closed_panes` chat rows with a provider session | 180 days, at most 5000 rows, and never while its resource is hosted or pinned | deleted oldest first |
+| `closed_panes` chat rows with a provider session or a stopped capture (planned stage 5 store) | retained without an age or count limit | see [Conversation history retention](#conversation-history-retention) |
 | `closed_panes` other rows | 30 days, and never while its resource is hosted or pinned | deleted |
 | `retired_panes`, empty `view_scopes` | until no window can seed from a local copy (stage 5) | then 30 days |
 | `view_operations` | 7 days after `applied_at_unix_ms` (`OPERATION_RETENTION`); conversion from schema 22 starts every existing row's age at the conversion | deleted by the daemon's runtime collector, at most 5000 rows every 10 minutes. `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client could apply it twice. A window's publisher therefore never resends a pane change more than 24 hours (`REPLAY_LIMIT`) after first sending it, and a test holds the retention at six times that. A pending terminal's insert, whose operation is the pane's id, is sent again by a restarted window regardless of age; that is safe because an insert of a pane the view holds or retired changes nothing |
@@ -419,10 +449,11 @@ check, so a stale window cannot overwrite a newer draft from another window.
 
 Collection runs in the daemon on a background thread every 10 minutes and
 once at start, each pass bounded in rows so a large backlog drains over a few
-passes instead of one long transaction. Transcript pruning
-(`TranscriptPruner`, run beside each window's startup) keeps the transcripts of
-every resource in `panes` and `closed_panes`, so a transcript lives as long as
-the closed pane that names it. It lists the transcript directory before asking
+passes instead of one long transaction. Terminal output pruning
+(`TranscriptPruner`, run beside each window's startup) covers the Cagents-owned
+`transcripts/*.log` directory. A saved pane protects its terminal log from
+orphan removal. Non-resident logs are also subject to file and directory size
+limits. The pruner lists the transcript directory before asking
 who owns each file, and never removes one that a terminal or conversation the
 daemon holds or is starting writes or carries (`ListResidentTerminals`): the
 daemon reserves a terminal, with its transcript path, before its writer creates
