@@ -2806,8 +2806,32 @@ fn native_restart_cannot_change_the_issued_account_environment() {
 struct Echo(bool);
 #[test]
 fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
+    automatic_handoff(false);
+}
+
+#[test]
+fn automatic_handoff_keeps_the_original_history_after_a_late_publication_failure() {
+    automatic_handoff(true);
+}
+
+fn automatic_handoff(grow_on_close: bool) {
     use std::os::unix::fs::PermissionsExt;
-    struct Idle;
+    struct Idle(Option<std::path::PathBuf>);
+
+    impl Drop for Idle {
+        fn drop(&mut self) {
+            if let Some(path) = &self.0 {
+                // Simulate a provider's last write during shutdown. Use a
+                // sparse file so the test needs no transcript-sized allocation.
+                std::fs::File::options()
+                    .write(true)
+                    .open(path)
+                    .unwrap()
+                    .set_len(256 * 1024 * 1024 + 1)
+                    .unwrap();
+            }
+        }
+    }
     impl Adapter for Idle {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())
@@ -2919,7 +2943,7 @@ done
     let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
     let handle = Handle::start(
         spec,
-        Box::new(Idle),
+        Box::new(Idle(grow_on_close.then(|| transcript.clone()))),
         initial,
         store,
         Some(conversation.into()),
@@ -3085,8 +3109,35 @@ done
         replacement.clone(),
         Some(generation),
         Default::default(),
-    )
-    .unwrap();
+    );
+    if grow_on_close {
+        let failure = response.unwrap_err();
+        assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(failure.retryable);
+        assert!(
+            failure
+                .message
+                .contains("Resume the conversation on its original account")
+        );
+        assert!(handle.is_completed());
+        let state = host.lock().unwrap();
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.chats[&source.id].handle.same_actor(&handle));
+        assert!(!state.chats.contains_key(&replacement.id));
+        assert!(!divergent.exists());
+        assert_eq!(
+            std::fs::read_dir(divergent.parent().unwrap())
+                .unwrap()
+                .count(),
+            0
+        );
+        let mut history = std::fs::File::open(transcript).unwrap();
+        let mut prefix = [0; 3];
+        std::io::Read::read_exact(&mut history, &mut prefix).unwrap();
+        assert_eq!(&prefix, b"{}\n");
+        return;
+    }
+    let response = response.unwrap();
     let ServerResponse::ChatAttached { session, snapshot } = response else {
         panic!("Expected confirmed account attachment")
     };

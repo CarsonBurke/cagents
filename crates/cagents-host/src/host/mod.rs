@@ -576,11 +576,11 @@ fn start_runtime_collection(
     root: std::path::PathBuf,
     model: Option<model::Registry>,
 ) -> io::Result<()> {
-    let mut next_upgrade_collection = std::time::Instant::now();
+    let mut next_daily_collection = std::time::Instant::now();
     runtime_collector(host, RUNTIME_COLLECT_INTERVAL, move |host, first| {
         let now = std::time::Instant::now();
-        if now >= next_upgrade_collection {
-            next_upgrade_collection = now + std::time::Duration::from_secs(24 * 60 * 60);
+        if now >= next_daily_collection {
+            next_daily_collection = now + std::time::Duration::from_secs(24 * 60 * 60);
             let serving = host
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner())
@@ -592,6 +592,11 @@ fn start_runtime_collection(
                 Ok(0) => {}
                 Ok(files) => tracing::info!(files, "removed expired upgrade evidence"),
                 Err(error) => tracing::warn!(%error, "upgrade evidence collection did not finish"),
+            }
+            if let Err(error) = service::attempt("account history staging cleanup", || {
+                crate::account::handoff::sweep_codex().map_err(|error| error.to_string())
+            }) {
+                tracing::warn!(%error, "abandoned Codex account history copies were not fully swept");
             }
         }
         collect_runtime_directory(host, &root, model.as_ref(), first)

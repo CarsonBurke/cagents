@@ -4163,8 +4163,8 @@ struct AdmittedSwitch {
 ///
 /// Every refusal here leaves the original exactly as it was: what is held is
 /// the reservation and the staged copy of its history, which both drop with
-/// the refusal. Staging may leave the alternate account's empty, private
-/// project directory, which no conversation reads.
+/// the refusal. Staging may leave an empty directory for the alternate
+/// account's history.
 fn admit_account_recovery(
     host: &SharedHost,
     source: &Session,
@@ -4285,7 +4285,13 @@ fn recover_account(
             .close_if_idle_for_resume(generation)
             .map_err(unavailable)?;
         // Publish what the conversation wrote between staging and its close.
-        history.commit().map_err(unavailable)?;
+        // A failed publication leaves the source's exact close and its
+        // original history available for ordinary recovery.
+        history.commit_after_close().map_err(|failure| {
+            retryable_unavailable(format!(
+                "{failure}. Resume the conversation on its original account."
+            ))
+        })?;
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
