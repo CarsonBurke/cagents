@@ -114,6 +114,8 @@ use crate::{
 /// The ordinary budget for one control exchange: a connect, a handshake, a
 /// write, or the wait for a reply. Read it through [`io_timeout`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A complete paged inventory shares this budget, even while every page advances.
+const TERMINAL_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // Match the window's attachment budget, which gives the daemon time to
@@ -928,6 +930,8 @@ pub enum ControlError {
     },
     #[error("the daemon did not publish a current terminal snapshot before the deadline")]
     SnapshotTimeout,
+    #[error("timed out listing the terminal inventory")]
+    TerminalListTimeout,
     #[error("the daemon returned a terminal list page that does not follow the previous one")]
     StalledListPage,
     #[error("the daemon returned an invalid page for the retired input queue")]
@@ -985,6 +989,12 @@ impl ControlError {
             other => other.to_string(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RequestDeadline {
+    Request(Instant),
+    TerminalList(Instant),
 }
 
 /// Why a request a person is waiting on did not complete, separating the
@@ -1429,8 +1439,13 @@ impl ControlClient {
     /// hold all of it. A terminal present throughout appears exactly once. An
     /// update source from before pages answers it in one reply.
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
+        self.list_until(Instant::now() + TERMINAL_LIST_TIMEOUT)
+    }
+
+    fn list_until(&mut self, deadline: Instant) -> Result<Vec<TerminalDescriptor>, ControlError> {
+        let deadline = RequestDeadline::TerminalList(deadline);
         if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
-            return match self.request_strict(ClientRequest::List)? {
+            return match self.request_until(ClientRequest::List, None, deadline)? {
                 ServerResponse::Listed { terminals } => Ok(terminals),
                 response => Err(unexpected_response("a terminal list", &response)),
             };
@@ -1438,7 +1453,7 @@ impl ControlClient {
         let mut inventory: Vec<TerminalDescriptor> = Vec::new();
         loop {
             let after = inventory.last().map(|terminal| terminal.session.id);
-            match self.request_strict(ClientRequest::ListPage { after })? {
+            match self.request_until(ClientRequest::ListPage { after }, None, deadline)? {
                 ServerResponse::ListedPage {
                     terminals,
                     complete,
@@ -3187,7 +3202,7 @@ impl ControlClient {
         request: ClientRequest,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        self.request_until(request, None, deadline)
+        self.request_until(request, None, RequestDeadline::Request(deadline))
     }
 
     fn request_attached_with_deadline(
@@ -3196,14 +3211,18 @@ impl ControlClient {
         terminal_id: TerminalId,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        self.request_until(request, Some(terminal_id), deadline)
+        self.request_until(
+            request,
+            Some(terminal_id),
+            RequestDeadline::Request(deadline),
+        )
     }
 
     fn request_until(
         &mut self,
         request: ClientRequest,
         streaming_terminal: Option<TerminalId>,
-        deadline: Instant,
+        deadline: RequestDeadline,
     ) -> Result<ServerResponse, ControlError> {
         let result = self.request_inner(request, streaming_terminal, Some(deadline));
         let read_restored = self.restore_read_timeout();
@@ -3219,12 +3238,30 @@ impl ControlClient {
         &mut self,
         request: ClientRequest,
         streaming_terminal: Option<TerminalId>,
-        deadline: Option<Instant>,
+        deadline: Option<RequestDeadline>,
     ) -> Result<ServerResponse, ControlError> {
         let request = self.for_device(request)?;
+        let (deadline, list_limited) = match deadline {
+            None => (None, false),
+            Some(RequestDeadline::Request(deadline)) => (Some(deadline), false),
+            Some(RequestDeadline::TerminalList(deadline)) => {
+                let per_request = Instant::now() + io_timeout();
+                (Some(deadline.min(per_request)), deadline <= per_request)
+            }
+        };
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
-        let result = self.request_inner_unobserved(request, streaming_terminal, deadline);
+        let result = self
+            .request_inner_unobserved(request, streaming_terminal, deadline)
+            .map_err(|error| {
+                // An exhausted inventory budget can give a responsive daemon
+                // only a few milliseconds for its last page.
+                if list_limited && is_timeout_error(&error) {
+                    ControlError::TerminalListTimeout
+                } else {
+                    error
+                }
+            });
         #[cfg(feature = "ui")]
         crate::daemon_health::request(&self.stream, &result, health_request);
         result
@@ -3586,12 +3623,14 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
 /// Whether `error` is a read or write that ran out of time, rather than a
 /// connection the daemon ended or a reply it gave.
 pub fn is_timeout_error(error: &ControlError) -> bool {
-    matches!(error, ControlError::ReplyTimeout { .. })
-        || matches!(
-            error,
-            ControlError::Frame(FrameError::Io(error))
-                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
-        )
+    matches!(
+        error,
+        ControlError::ReplyTimeout { .. } | ControlError::TerminalListTimeout
+    ) || matches!(
+        error,
+        ControlError::Frame(FrameError::Io(error))
+            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    )
 }
 
 fn response_from_message(message: ServerMessage) -> Result<ServerResponse, ControlError> {
@@ -6346,7 +6385,9 @@ fn protocol_error(error: ControlError) -> AppError {
         return limit_reached(*code, message.clone(), &refusal);
     }
     let kind = match &error {
-        ControlError::WaitTimeout { .. } | ControlError::SnapshotTimeout => "timeout",
+        ControlError::WaitTimeout { .. }
+        | ControlError::SnapshotTimeout
+        | ControlError::TerminalListTimeout => "timeout",
         ControlError::DeviceAccess(_) => "permission_denied",
         ControlError::Connect(_)
         | ControlError::Configure(_)
@@ -10325,6 +10366,68 @@ mod tests {
             }
             assert_eq!(server.join().unwrap(), expected_after);
         }
+    }
+
+    #[test]
+    fn listing_spends_the_same_deadline_on_its_next_page() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let root = tempfile::tempdir().unwrap();
+        let terminal_id = TerminalId::new();
+        let terminal = TerminalDescriptor::relaunchable(
+            terminal_id,
+            LaunchRecipe::shell(root.path().canonicalize().unwrap()).unwrap(),
+            None,
+        );
+        thread::scope(|scope| {
+            let (result_sent, result_observed) = std::sync::mpsc::channel();
+            let peer = scope.spawn(move || {
+                let request: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                write_frame(
+                    &mut server,
+                    &connected_envelope(request.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let page: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(page.request, ClientRequest::ListPage { after: None });
+                write_frame(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(page.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ListedPage {
+                                terminals: vec![terminal],
+                                complete: false,
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let page: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(
+                    page.request,
+                    ClientRequest::ListPage {
+                        after: Some(terminal_id)
+                    }
+                );
+                // Hold the stream open so the client must use its list deadline.
+                result_observed
+                    .recv_timeout(Duration::from_secs(4))
+                    .unwrap();
+            });
+            let mut client = ControlClient::from_stream(client).unwrap();
+            let budget = Duration::from_secs(2);
+            let result = client.list_until(Instant::now() + budget);
+            result_sent.send(()).unwrap();
+            drop(client);
+            peer.join().unwrap();
+            assert!(
+                matches!(result, Err(ControlError::TerminalListTimeout)),
+                "{result:?}"
+            );
+        });
     }
 
     #[test]

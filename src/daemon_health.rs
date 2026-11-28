@@ -438,6 +438,11 @@ mod tests {
         );
     }
     #[test]
+    fn an_expired_terminal_list_budget_does_not_change_daemon_health() {
+        let result: Result<(), _> = Err(ControlError::TerminalListTimeout);
+        assert!(control_outcome(&result).is_none());
+    }
+    #[test]
     fn terminal_control_transport_failures_are_unreachable() {
         for kind in [
             io::ErrorKind::ConnectionReset,
