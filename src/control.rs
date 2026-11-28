@@ -5078,6 +5078,13 @@ fn ui_launch_stderr(command: &Command) -> Stdio {
 }
 
 pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
+    spawn_ui_process_with_progress(command, &mut || {})
+}
+
+pub(crate) fn spawn_ui_process_with_progress(
+    command: &mut Command,
+    recovering: &mut dyn FnMut(),
+) -> io::Result<Option<String>> {
     crate::install_guard::sanitize_child_environment(command);
     // Capture the budget before spawning: the child can consume the checkpoint
     // while restoring, but the launcher must retain its full startup allowance.
@@ -5114,7 +5121,7 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     let result = stdout
         .as_mut()
         .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
-        .and_then(|stdout| read_ui_launch_handshake(stdout, timeout));
+        .and_then(|stdout| read_ui_launch_handshake_with_progress(stdout, timeout, recovering));
     finish_ui_launch(child, result, stdout)
 }
 
@@ -5205,6 +5212,14 @@ pub(crate) fn read_ui_launch_handshake(
     response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
+    read_ui_launch_handshake_with_progress(response_stream, timeout, &mut || {})
+}
+
+fn read_ui_launch_handshake_with_progress(
+    response_stream: &mut (impl Read + AsFd),
+    timeout: Duration,
+    recovering: &mut dyn FnMut(),
+) -> io::Result<Option<String>> {
     crate::descriptor::set_nonblocking(response_stream.as_fd())?;
 
     let started = Instant::now();
@@ -5243,6 +5258,7 @@ pub(crate) fn read_ui_launch_handshake(
                         // this window starts. Its saved-pane inventory supplies
                         // one bounded allowance, never an endless keepalive.
                         deadline = ui_recovery_deadline(started, deadline, items);
+                        recovering();
                         response = remaining;
                         continue;
                     }

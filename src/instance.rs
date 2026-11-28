@@ -2611,13 +2611,12 @@ impl UiUpdateGuard {
         self.closed.clear();
         let mut notes = Vec::new();
         let mut failures = Vec::new();
-        for slot in slots {
-            match launch_window_at(executable, false, Some(slot), None, self.restore_policy) {
-                Ok(Some(note)) => notes.push((slot.clone(), note)),
-                Ok(None) => {}
-                Err(error) => failures.push((slot.clone(), error.to_string())),
-            }
-        }
+        let record = |slot: &str, outcome: io::Result<Option<String>>| match outcome {
+            Ok(Some(note)) => notes.push((slot.to_owned(), note)),
+            Ok(None) => {}
+            Err(error) => failures.push((slot.to_owned(), error.to_string())),
+        };
+        relaunch_window_batches(slots, executable, self.restore_policy, record);
         let devices = || crate::device::list().unwrap_or_default();
         let (errors, device_notes) = split_relaunch_failures(failures, |slot| {
             window_device_identity(&self.runtime, slot, &devices())
@@ -2694,6 +2693,68 @@ fn request_cutover_window(
         return Err(io::Error::other("A saved window is still reopening"));
     }
     Ok(result)
+}
+
+fn relaunch_window_batches(
+    slots: &[String],
+    executable: &Path,
+    restore_policy: WindowRestorePolicy,
+    mut record: impl FnMut(&str, io::Result<Option<String>>),
+) {
+    // A missing store may snapshot primary's database after its recovery
+    // flush. Only overlap independent, already persisted windows.
+    let mut stores = std::collections::BTreeSet::new();
+    let overlap = cfg!(target_os = "linux")
+        && slots.len() > 1
+        && slots.iter().all(|slot| {
+            window_database_path(slot)
+                .and_then(fs::symlink_metadata)
+                .is_ok_and(|metadata| {
+                    metadata.is_file() && stores.insert((metadata.dev(), metadata.ino()))
+                })
+        });
+    // Limit simultaneous recoveries to avoid starting every renderer at once.
+    let width = if overlap { 3 } else { 1 };
+    let launch = |slot: &str| launch_window_at(executable, false, Some(slot), None, restore_policy);
+    for batch in slots.chunks(width) {
+        if let [slot] = batch {
+            record(slot, launch(slot));
+            continue;
+        }
+        std::thread::scope(|scope| {
+            let mut attempts = Vec::with_capacity(batch.len());
+            for slot in batch {
+                let (recovery, admitted) = std::sync::mpsc::channel();
+                let worker = std::thread::Builder::new().spawn_scoped(scope, move || {
+                    let mut command =
+                        window_launch_command(executable, false, Some(slot), None, restore_policy)?;
+                    crate::control::spawn_ui_process_with_progress(&mut command, &mut || {
+                        let _ = recovery.send(());
+                    })
+                });
+                let attempt = match worker {
+                    Ok(worker) => {
+                        // Recovery starts after the window acquires its lease
+                        // and initializes saved state. Older windows omit the
+                        // progress frame, so wait for their final handshake.
+                        let _ = admitted.recv();
+                        Ok(worker)
+                    }
+                    Err(_) => Err(launch(slot)),
+                };
+                attempts.push((slot, attempt));
+            }
+            for (slot, attempt) in attempts {
+                let outcome = match attempt {
+                    Ok(worker) => worker.join().unwrap_or_else(|_| {
+                        Err(io::Error::other("window startup worker panicked"))
+                    }),
+                    Err(outcome) => outcome,
+                };
+                record(slot, outcome);
+            }
+        });
+    }
 }
 
 /// A naturally opened window can take its lease before binding activation.
@@ -3037,6 +3098,22 @@ fn launch_window_at(
     source: Option<&str>,
     restore_policy: WindowRestorePolicy,
 ) -> io::Result<Option<String>> {
+    crate::control::spawn_ui_process(&mut window_launch_command(
+        executable,
+        new_window,
+        slot,
+        source,
+        restore_policy,
+    )?)
+}
+
+fn window_launch_command(
+    executable: &Path,
+    new_window: bool,
+    slot: Option<&str>,
+    source: Option<&str>,
+    restore_policy: WindowRestorePolicy,
+) -> io::Result<process::Command> {
     if let Some(slot) = slot {
         validate_window_slot(slot)?;
     }
@@ -3063,7 +3140,7 @@ fn launch_window_at(
     if let Some(source) = source {
         command.args(["--from-window", source]);
     }
-    crate::control::spawn_ui_process(&mut command)
+    Ok(command)
 }
 
 #[derive(Debug, Error)]
@@ -5388,6 +5465,111 @@ mod tests {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relaunch_overlaps_recovery_only_for_independent_saved_windows() {
+        const FIXTURE: &str = "CAGENTS_TEST_RELAUNCH_FIXTURE";
+        const MODE: &str = "CAGENTS_TEST_RELAUNCH_MODE";
+        if let Some(directory) = env::var_os(FIXTURE) {
+            let executable = PathBuf::from(directory).join("fake-ui");
+            let slots = ["primary", "window-2", "window-3"].map(str::to_owned);
+            let mode = env::var(MODE).unwrap();
+            for slot in slots
+                .iter()
+                .filter(|slot| mode != "missing-store" || *slot != "window-3")
+            {
+                let database = window_database_path(slot).unwrap();
+                fs::create_dir_all(database.parent().unwrap()).unwrap();
+                File::create(database).unwrap();
+            }
+            let result = UiUpdateGuard::acquire()
+                .unwrap()
+                .relaunch_windows_with_notes(&slots, &executable);
+            assert_eq!(
+                result.unwrap().as_deref(),
+                Some("primary: Slow pane; window-2: Second pane; window-3: Third pane")
+            );
+            return;
+        }
+
+        let root = tempdir().unwrap();
+        let executable = root.path().join("fake-ui");
+        fs::write(
+            &executable,
+            r#"#!/bin/sh
+set -eu
+[ "$1" = --window ]
+cd "$CAGENTS_TEST_RELAUNCH_FIXTURE/$CAGENTS_TEST_RELAUNCH_MODE"
+case "$2" in
+    primary) note='slow pane'; previous= ;;
+    window-2) note='second pane'; previous=primary ;;
+    window-3) note='third pane'; previous=window-2 ;;
+    *) exit 1 ;;
+esac
+if [ "$CAGENTS_TEST_RELAUNCH_MODE" != legacy ]; then
+    printf 'recovering: 0\n'
+fi
+if [ "$CAGENTS_TEST_RELAUNCH_MODE" = recovery ]; then
+    : > "$2.started"
+    if [ "$2" = primary ]; then
+        remaining=100
+        until [ -f window-2.started ] && [ -f window-3.started ]; do
+            if [ "$remaining" -eq 0 ]; then
+                printf 'error: later windows did not start during primary recovery\n'
+                exit 0
+            fi
+            remaining=$((remaining - 1))
+            sleep 0.05
+        done
+    fi
+else
+    if [ -n "$previous" ] && [ ! -f "$previous.finished" ]; then
+        printf 'error: window started before the previous serial handshake finished\n'
+        exit 0
+    fi
+    sleep 0.1
+fi
+: > "$2.finished"
+printf 'ready-with-pane-notes: %s\n' "$note"
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        for directory in [
+            "home",
+            "runtime",
+            "config",
+            "cache",
+            "recovery",
+            "legacy",
+            "missing-store",
+        ] {
+            fs::create_dir(root.path().join(directory)).unwrap();
+        }
+        let test = std::thread::current().name().unwrap().to_owned();
+        for mode in ["recovery", "legacy", "missing-store"] {
+            let output = process::Command::new(env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .env("HOME", root.path().join("home"))
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("XDG_DATA_HOME", root.path().join(mode))
+                .env("XDG_CACHE_HOME", root.path().join("cache"))
+                .env(FIXTURE, root.path())
+                .env(MODE, mode)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{mode}: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]
