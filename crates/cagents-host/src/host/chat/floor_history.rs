@@ -94,6 +94,7 @@ fn projection(
             .map(|item| (**item).clone())
             .collect(),
         has_earlier: false,
+        unfetched: None,
     }];
     if let Some(id) = &session.launch.session_id {
         events.push(chat::Event::Session {

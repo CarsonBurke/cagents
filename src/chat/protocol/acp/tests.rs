@@ -2012,7 +2012,11 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
     let step = acp.receive(reply(&load, muse_new())).unwrap();
     let [
         Event::OpeningTitle(title),
-        Event::History { items, has_earlier },
+        Event::History {
+            items,
+            has_earlier,
+            unfetched,
+        },
         ..,
     ] = step.events.as_slice()
     else {
@@ -2020,6 +2024,7 @@ fn a_resumed_conversation_replays_into_one_bounded_history() {
     };
     assert_eq!(title.text(), "Investigate ACP history");
     assert!(!has_earlier);
+    assert_eq!(*unfetched, None, "a replay holds nothing back");
     assert_eq!(items.len(), exchanges + 1);
     assert_eq!(items[0].id, history::TRUNCATED_ID);
     let last = &items[items.len() - 2];
