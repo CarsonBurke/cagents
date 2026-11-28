@@ -377,8 +377,12 @@ use crate::{
 /// Version 222 appends tracked compaction requests and outcome replies.
 ///
 /// Version 223 adds managed account removal planning, transcript transfer and archival.
-/// Version 224 adds manual provider CLI installation and update requests.
-pub const PROTOCOL_VERSION: u16 = 224;
+///
+/// Version 224 appends `ConversationWorktree::last_activity_unix_ms` to
+/// order conversation Work rows by local file and commit activity.
+///
+/// Version 225 adds manual provider CLI installation and update requests.
+pub const PROTOCOL_VERSION: u16 = 225;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

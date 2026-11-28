@@ -731,10 +731,6 @@
         [
           "Unknown",
           "Unit"
-        ],
-        [
-          "CagentsManaged",
-          "Unit"
         ]
       ]
     },
@@ -10551,32 +10547,6 @@
         [
           "WatchDeviceStats",
           "Unit"
-        ],
-        [
-          "ProviderUpdate",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ProviderManage",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -13914,6 +13884,12 @@
         ],
         [
           "pull_request",
+          {
+            "Option": "U64"
+          }
+        ],
+        [
+          "last_activity_unix_ms",
           {
             "Option": "U64"
           }

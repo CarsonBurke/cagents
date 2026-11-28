@@ -1146,6 +1146,7 @@ mod tests {
                 deletions: 1,
             }),
             pull_request,
+            last_activity_unix_ms: None,
         }
     }
 
@@ -1335,6 +1336,7 @@ mod workload {
             changed_paths: Some(3),
             diff: None,
             pull_request,
+            last_activity_unix_ms: None,
         };
         let rows: Vec<(u64, Relation)> = (1..=4)
             .map(|number| (number, Relation::Pushed))

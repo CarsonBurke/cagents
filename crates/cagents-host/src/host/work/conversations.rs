@@ -1888,6 +1888,14 @@ fn edited_worktrees(
             // Filled in from what was measured, which the scan does not hold.
             diff: None,
             pull_request: listed(worktree),
+            last_activity_unix_ms: crate::work::last_activity(
+                worktree.head.as_ref(),
+                worktree.comparison.as_ref(),
+                worktree.dirty.as_ref(),
+                None,
+                worktree.created_at_unix_ms,
+            )
+            .map(|activity| activity.at_unix_ms),
         })
         .collect()
 }
