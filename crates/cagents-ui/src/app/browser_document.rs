@@ -34,9 +34,14 @@ pub(super) struct BrowserDocument {
 
 enum Fetch {
     Idle,
-    Running { received: u64, total: Option<u64> },
+    Running {
+        received: u64,
+        total: Option<u64>,
+    },
     Done(Fetched),
     Failed(String),
+    /// The reader stopped loading a PDF.
+    Stopped,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,7 +71,8 @@ impl BrowserDocument {
     /// Whether this still answers for a page the browser reported again, as
     /// after a reload: a document that failed is worth another try.
     pub(super) fn holds(&self, document: &UnrenderableDocument) -> bool {
-        self.document.url == document.url && !matches!(self.fetch, Fetch::Failed(_))
+        self.document.url == document.url
+            && !matches!(self.fetch, Fetch::Failed(_) | Fetch::Stopped)
     }
 
     /// Renders the open PDF's pages again for a display of another density.
@@ -340,7 +346,7 @@ impl Cagents {
                 {
                     document._fetching = None;
                     document.fetch = match document.intent {
-                        Intent::View => Fetch::Failed("Loading was stopped.".to_owned()),
+                        Intent::View => Fetch::Stopped,
                         Intent::Save | Intent::Open => Fetch::Idle,
                     };
                 }
@@ -416,8 +422,9 @@ impl Cagents {
         };
         document.saving = true;
         let fetched = fetched.clone();
-        // The viewer still reads its pages from the cached copy.
-        let keep = document.viewer.is_some();
+        // The viewer still reads its pages from the cached copy, and an
+        // application it was handed to may still have it open.
+        let keep = document.viewer.is_some() || document.handed_out;
         let generation = document.generation;
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || save_into(&fetched, &downloads, keep))
@@ -442,7 +449,7 @@ impl Cagents {
                 document.intent = Intent::Open;
                 return Task::none();
             }
-            (None, Fetch::Idle | Fetch::Failed(_)) => {
+            (None, Fetch::Idle | Fetch::Failed(_) | Fetch::Stopped) => {
                 return self.start_browser_document_fetch(card, Intent::Open);
             }
         };
@@ -467,7 +474,7 @@ impl Cagents {
             // there is no column to lay out.
             (Some(viewer), _) if viewer.page_count() == 0 && viewer.failure().is_none() => {
                 crate::ui_controls::placeholder("Loading PDF")
-                    .icon(Icon::Import)
+                    .icon(Icon::TextFile)
                     .into()
             }
             (Some(viewer), _) if viewer.failure().is_none() => {
@@ -480,17 +487,28 @@ impl Cagents {
                         })
                     })
                     .collect();
-                controls.push(widget::Space::new().width(Length::Fill).into());
-                controls.extend(self.browser_document_file_actions(card, document));
+                controls.push(
+                    widget::row::with_children(self.browser_document_file_actions(card, document))
+                        .spacing(space::XS)
+                        .align_y(Alignment::Center)
+                        .into(),
+                );
+                // Groups wrap onto another line in a narrow pane rather than
+                // pushing the file actions out of reach.
                 widget::column::with_children(vec![
                     widget::container(
                         widget::row::with_children(controls)
                             .align_y(Alignment::Center)
-                            .spacing(space::XS),
+                            .spacing(space::L)
+                            .wrap()
+                            .vertical_spacing(space::XXS),
                     )
-                    .height(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
-                    .padding([0.0, space::S])
-                    .center_y(Length::Fixed(BROWSER_TOOLBAR_HEIGHT))
+                    .width(Length::Fill)
+                    // One line is as tall as the browser's own toolbar.
+                    .padding([
+                        (BROWSER_TOOLBAR_HEIGHT - design::PRIMARY_CONTROL_SIZE) / 2.0,
+                        space::S,
+                    ])
                     .class(cosmic::theme::Container::Background)
                     .into(),
                     crate::design::horizontal_rule(),
@@ -524,12 +542,12 @@ impl Cagents {
                     ),
                     None => crate::chat::approximate_size(*received),
                 };
-                let title = match document.intent {
-                    Intent::View => "Loading PDF",
-                    Intent::Save | Intent::Open => "Downloading",
+                let (title, icon) = match document.intent {
+                    Intent::View => ("Loading PDF", Icon::TextFile),
+                    Intent::Save | Intent::Open => ("Downloading", Icon::Download),
                 };
                 crate::ui_controls::placeholder(title)
-                    .icon(Icon::Import)
+                    .icon(icon)
                     .detail(progress)
                     .action(
                         crate::ui_controls::button::secondary("Cancel")
@@ -537,30 +555,25 @@ impl Cagents {
                     )
                     .into()
             }
-            (None, Fetch::Failed(message)) if document.intent == Intent::View => {
-                crate::ui_controls::placeholder("This PDF couldn't be loaded")
+            (None, Fetch::Failed(message)) => {
+                let title = match document.intent {
+                    Intent::View => "This PDF couldn't be loaded",
+                    Intent::Save | Intent::Open => "This file couldn't be downloaded",
+                };
+                crate::ui_controls::placeholder(title)
                     .icon(Icon::Warning)
                     .detail(message.as_str())
-                    .action(
-                        widget::row::with_children(vec![
-                            crate::ui_controls::button::primary("Try again")
-                                .on_press(Message::BrowserDocument(card, Action::Retry))
-                                .into(),
-                            crate::ui_controls::button::secondary("Open in system browser")
-                                .on_press(Message::OpenBrowserInSystem(card))
-                                .into(),
-                        ])
-                        .spacing(space::S),
-                    )
+                    .action(retry_actions(card))
                     .into()
             }
+            (None, Fetch::Stopped) => crate::ui_controls::placeholder("Stopped loading")
+                .icon(Icon::Stop)
+                .detail(display_name(&document.document, &document.fetch))
+                .action(retry_actions(card))
+                .into(),
             (None, fetch) => {
                 let name = display_name(&document.document, fetch);
                 let (title, detail) = match (fetch, &document.saved) {
-                    (Fetch::Failed(message), _) => (
-                        "The browser can't show this file".to_owned(),
-                        message.clone(),
-                    ),
                     // Once saved, the panel says where the file went, so the
                     // reader knows what Open and Show in folder act on.
                     (_, Some(saved)) => (
@@ -603,7 +616,7 @@ impl Cagents {
             );
         } else {
             actions.push(
-                crate::ui_controls::icon_button(Icon::Save, "Download")
+                crate::ui_controls::icon_button(Icon::Download, "Download")
                     .on_press_maybe(
                         (!document.saving)
                             .then_some(Message::BrowserDocument(card, Action::Download)),
@@ -658,4 +671,19 @@ fn folder_name(path: &Path) -> String {
         .and_then(Path::file_name)
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "Downloads".to_owned())
+}
+
+/// The way back from a fetch that failed or was stopped: another try, or the
+/// system browser, which may manage what this one couldn't.
+fn retry_actions<'a>(card: CardId) -> Element<'a, Message> {
+    widget::row::with_children(vec![
+        crate::ui_controls::button::primary("Try again")
+            .on_press(Message::BrowserDocument(card, Action::Retry))
+            .into(),
+        crate::ui_controls::button::secondary("Open in system browser")
+            .on_press(Message::OpenBrowserInSystem(card))
+            .into(),
+    ])
+    .spacing(space::S)
+    .into()
 }

@@ -69,7 +69,43 @@ pub struct Fetched {
     /// Whether `path` is the reader's own file, as for a `file:` page, rather
     /// than a copy the application made and may remove.
     pub original: bool,
+    /// Keeps the copy's directory from another fetch's pruning while this,
+    /// or a clone of it, is held.
+    lease: CacheLease,
 }
+
+/// A shared lock on a fetch's cache directory.
+///
+/// Pruning takes the directory's lock exclusively before removing it, so a
+/// document still open past the cache's lifetime, in this process or another
+/// instance's, is passed by. The lock is the directory's own, so nothing is
+/// added to it and an emptied directory can still be removed.
+#[derive(Debug, Clone, Default)]
+struct CacheLease {
+    /// The lock lasts as long as the open directory.
+    _directory: Option<std::sync::Arc<std::fs::File>>,
+}
+
+impl CacheLease {
+    fn take(directory: &Path) -> Self {
+        let file = std::fs::File::open(directory).and_then(|file| {
+            file.lock_shared()?;
+            Ok(file)
+        });
+        Self {
+            _directory: file.ok().map(std::sync::Arc::new),
+        }
+    }
+}
+
+/// Every lease is the same as far as a fetch's result is concerned.
+impl PartialEq for CacheLease {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for CacheLease {}
 
 impl Fetched {
     pub fn file_name(&self) -> String {
@@ -178,6 +214,7 @@ async fn fetch(
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| write_failure(&error))?;
+    let lease = CacheLease::take(&directory);
     // A fetch that fails or is stopped leaves nothing behind.
     let mut unfinished = Unfinished(Some(directory.clone()));
     let partial = directory.join(".partial");
@@ -232,6 +269,7 @@ async fn fetch(
         bytes: received,
         is_pdf: is_pdf(&head),
         original: false,
+        lease,
     })
 }
 
@@ -295,6 +333,7 @@ async fn local_file(url: &Url) -> Result<Fetched, String> {
         bytes: metadata.len(),
         is_pdf: is_pdf(&head),
         original: true,
+        lease: CacheLease::default(),
     })
 }
 
@@ -322,10 +361,7 @@ pub fn save_into(fetched: &Fetched, directory: &Path, keep: bool) -> io::Result<
         if !fetched.original && !keep {
             match std::fs::hard_link(&fetched.path, &candidate) {
                 Ok(()) => {
-                    let _ = std::fs::remove_file(&fetched.path);
-                    if let Some(parent) = fetched.path.parent() {
-                        let _ = std::fs::remove_dir(parent);
-                    }
+                    remove_cached(&fetched.path);
                     return Ok(candidate);
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -349,12 +385,24 @@ pub fn save_into(fetched: &Fetched, directory: &Path, keep: bool) -> io::Result<
             let _ = std::fs::remove_file(&candidate);
             return Err(error);
         }
+        if !fetched.original && !keep {
+            // A move across file systems: the cache copy is not needed now.
+            remove_cached(&fetched.path);
+        }
         return Ok(candidate);
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
         "every name for this file is taken",
     ))
+}
+
+/// Removes the application's copy of a file and its emptied directory.
+fn remove_cached(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
 }
 
 fn split_extension(name: &str) -> (&str, &str) {
@@ -364,7 +412,8 @@ fn split_extension(name: &str) -> (&str, &str) {
     }
 }
 
-/// Removes cached fetches older than [`CACHE_LIFETIME`].
+/// Removes cached fetches older than [`CACHE_LIFETIME`] that nothing holds a
+/// [`CacheLease`] on.
 fn prune(cache: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(cache) else {
         return;
@@ -376,7 +425,14 @@ fn prune(cache: &Path, now: SystemTime) {
             .ok()
             .and_then(|modified| now.duration_since(modified).ok())
             .is_some_and(|age| age > CACHE_LIFETIME);
-        if old && entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+        if !old || !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        // Held until the directory is gone, so no lease is taken meanwhile.
+        let unclaimed = std::fs::File::open(entry.path())
+            .ok()
+            .filter(|directory| directory.try_lock().is_ok());
+        if unclaimed.is_some() {
             let _ = std::fs::remove_dir_all(entry.path());
         }
     }
@@ -634,6 +690,7 @@ mod tests {
             bytes: 5,
             is_pdf: true,
             original: false,
+            lease: CacheLease::default(),
         };
         std::fs::write(&fetched.path, b"%PDF-").unwrap();
 
@@ -658,6 +715,7 @@ mod tests {
             bytes: 5,
             is_pdf: true,
             original: true,
+            lease: CacheLease::default(),
         };
         let saved = save_into(&fetched, &root.path().join("Downloads"), false).unwrap();
         assert!(own.exists());
@@ -823,5 +881,24 @@ mod tests {
         assert!(root.path().join("recent").exists());
         prune(root.path(), SystemTime::now() + CACHE_LIFETIME * 2);
         assert!(!root.path().join("recent").exists());
+    }
+
+    #[test]
+    fn pruning_passes_by_a_fetch_still_in_use() {
+        let root = tempfile::tempdir().unwrap();
+        let open = root.path().join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::write(open.join("paper.pdf"), b"%PDF-").unwrap();
+        let lease = CacheLease::take(&open);
+        assert!(lease._directory.is_some());
+        let later = SystemTime::now() + CACHE_LIFETIME * 2;
+        prune(root.path(), later);
+        assert!(
+            open.join("paper.pdf").exists(),
+            "an open document keeps its file"
+        );
+        drop(lease);
+        prune(root.path(), later);
+        assert!(!open.exists());
     }
 }
