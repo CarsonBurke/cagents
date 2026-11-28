@@ -14028,15 +14028,14 @@ impl Cagents {
                 if !runtime.snapshot.has_earlier {
                     return Task::none();
                 }
+                runtime.scroll_memory.release(scroll::Edge::Latest);
                 runtime.scroll_memory.cancel_landing();
                 if !runtime.commands.is_idle()
                     || runtime.queued.is_some()
                     || runtime.disconnected
                     || runtime.snapshot.history_loading
                 {
-                    if runtime.deferred_page != Some(HistoryNavigation::Latest) {
-                        runtime.deferred_page = Some(HistoryNavigation::Seek);
-                    }
+                    runtime.deferred_page = Some(HistoryNavigation::Seek);
                     return Task::none();
                 }
                 runtime.deferred_page = Some(HistoryNavigation::ContinueSeek);
@@ -14058,11 +14057,7 @@ impl Cagents {
             }
             // The reader at the conversation's end is at its newest history,
             // as End takes them there.
-            view::Sought::Latest => {
-                runtime.scroll_memory.cancel_landing();
-                runtime.sought = None;
-                self.handle_chat_action(Action::Latest(target))
-            }
+            view::Sought::Latest => self.handle_chat_action(Action::Latest(target)),
         }
     }
 
@@ -14072,6 +14067,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        runtime.scroll_memory.release(scroll::Edge::Latest);
         if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
@@ -14080,9 +14076,7 @@ impl Cagents {
             // A provider page can insert items ahead of an index. Recompute
             // it from the reader's position after the page arrives.
             runtime.scroll_memory.cancel_landing();
-            if runtime.deferred_page != Some(HistoryNavigation::Latest) {
-                runtime.deferred_page = Some(HistoryNavigation::Seek);
-            }
+            runtime.deferred_page = Some(HistoryNavigation::Seek);
             return Task::none();
         }
         if let Some(at) = landing {
@@ -18498,6 +18492,9 @@ impl Cagents {
                 };
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
+                    runtime.scroll_memory.cancel_landing();
+                    runtime.sought = None;
+                    runtime.deferred_page = None;
                     if !runtime.commands.is_idle() {
                         runtime
                             .scroll_memory
@@ -19331,13 +19328,7 @@ impl Cagents {
                 // A track click, a drag of the thumb or a fast fling can take
                 // the reader past what is loaded. A page from the window's
                 // edge would not reach them, so the window moves to them.
-                if let Some(sought) = sought.filter(|_| {
-                    // The newest history is already on its way, and the
-                    // reader at its edge is waiting for it there.
-                    runtime
-                        .page_request
-                        .is_none_or(|(page, _)| page != view::Page::Latest)
-                }) {
+                if let Some(sought) = sought {
                     runtime.earlier_asked = None;
                     runtime.later_asked = None;
                     return self.follow_into_history(target, sought);

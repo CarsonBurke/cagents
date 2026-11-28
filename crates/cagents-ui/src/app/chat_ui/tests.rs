@@ -3524,6 +3524,68 @@ fn a_new_seek_runs_after_an_earlier_seek_fails() {
 }
 
 #[test]
+fn seeking_earlier_supersedes_a_queued_or_failed_latest_request() {
+    for running in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = history_fixture(&mut app);
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.has_later = true;
+        snapshot.history.before = 40;
+        snapshot.history.after = 20;
+        handle.publish_snapshot_for_test(snapshot);
+        app.chat_runtime_mut(target).unwrap().refresh();
+        if !running {
+            drop(app.chat_send(
+                target,
+                Command::SetPermissionMode {
+                    mode: "manual".into(),
+                },
+                false,
+            ));
+        }
+        drop(app.handle_chat_ui(Action::Latest(target)));
+        let runtime = chat_runtime(&app, card);
+        if running {
+            assert_eq!(
+                runtime.commands.in_flight().unwrap().page,
+                Some(view::Page::Latest)
+            );
+        } else {
+            assert_eq!(runtime.deferred_page, Some(HistoryNavigation::Latest));
+        }
+
+        let scroll = view::Scroll::new(0.0, 9_000.0, 400.0).with_unloaded(view::Unloaded {
+            before: 4_000.0,
+            after: 2_000.0,
+        });
+        drop(app.handle_chat_ui(Action::Scrolled(
+            target,
+            None,
+            scroll,
+            Some(view::Page::Earlier),
+        )));
+        assert_eq!(
+            chat_runtime(&app, card).deferred_page,
+            Some(HistoryNavigation::Seek)
+        );
+        settle(
+            &mut app,
+            card,
+            if running {
+                Err("history unavailable".into())
+            } else {
+                Ok(())
+            },
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.scroll_memory.edge(None), Some(scroll::Edge::Start));
+        assert_eq!(runtime.sought, Some(0));
+        assert!(runtime.commands.in_flight().unwrap().seeks());
+    }
+}
+
+#[test]
 fn a_seek_uses_the_history_extent_after_an_in_flight_provider_page() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let (card, target, handle) = history_fixture(&mut app);
