@@ -5014,6 +5014,17 @@
         [
           "SendQueuedNow",
           "Unit"
+        ],
+        [
+          "Seek",
+          {
+            "Struct": [
+              [
+                "index",
+                "U64"
+              ]
+            ]
+          }
         ]
       ]
     },
@@ -5393,6 +5404,24 @@
         [
           "offset",
           "U64"
+        ]
+      ]
+    },
+    "cagents::chat::HistoryExtent": {
+      "Struct": [
+        [
+          "before",
+          "U64"
+        ],
+        [
+          "after",
+          "U64"
+        ],
+        [
+          "unfetched",
+          {
+            "Option": "U64"
+          }
         ]
       ]
     },
@@ -6519,6 +6548,12 @@
                 "U64"
               ]
             }
+          }
+        ],
+        [
+          "history",
+          {
+            "Container": "cagents::chat::HistoryExtent"
           }
         ]
       ]
@@ -14467,31 +14502,6 @@
               ]
             ]
           }
-        ],
-        [
-          "PinCard",
-          {
-            "Struct": [
-              [
-                "repository",
-                "Str"
-              ],
-              [
-                "key",
-                {
-                  "Container": "cagents::work::ItemKey"
-                }
-              ],
-              [
-                "column",
-                {
-                  "Option": {
-                    "Container": "cagents::work::Column"
-                  }
-                }
-              ]
-            ]
-          }
         ]
       ]
     },
@@ -14569,17 +14579,6 @@
                 {
                   "Container": "cagents::work::ConversationPullRequests"
                 }
-              ]
-            ]
-          }
-        ],
-        [
-          "PinSaved",
-          {
-            "Struct": [
-              [
-                "through_revision",
-                "U64"
               ]
             ]
           }

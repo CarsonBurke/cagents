@@ -1166,9 +1166,14 @@ class Rehearsal:
     def observe_window(self, window):
         """Focuses WINDOW and observes its text, or None if another was observed."""
         self.call('wm', 'action', 'focus-window', '--id', window['id'])
-        _, text = self.call('drive', '--json', 'observe', timeout=30)
+        return self.observe_focused_window(window)
+
+    def observe_focused_window(self, window, *, with_text=True):
+        flags = () if with_text else ('--no-text',)
+        _, text = self.call('drive', '--json', 'observe', *flags, timeout=30)
         observation = json.loads(text)
-        return observation if observation['window']['id'] == window['id'] else None
+        observed = observation['window']
+        return observation if observed['id'] == window['id'] and observed.get('focused') else None
 
     def verify_bundled_ceditor(self, version):
         """Launch through the installed command and check the window and matched service."""
@@ -1212,6 +1217,46 @@ class Rehearsal:
 
     HEADER = {'row': 21, 'step': 24, 'span': 420, 'right': 120}
 
+    @staticmethod
+    def frame_pixels(path):
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            from PIL import Image
+            with Image.open(path) as image:
+                return image.size, image.convert('RGB').tobytes()
+        except (ImportError, OSError, TypeError):
+            return None
+
+    def ocr_frame(self, observation):
+        # An accessibility observation can change even when pixels don't.
+        if observation.get('source') == 'ocr':
+            return self.frame_pixels(observation.get('frame'))
+        return None
+
+    def header_observations(self, window, observation, row, step, span, right):
+        """Move over every header position, reusing OCR for identical frames."""
+        width = observation['window']['size'][0]
+        pixels = self.ocr_frame(observation)
+        for x in range(width-right, max(width-right-span, 0), -step):
+            self.call('drive', 'hover', f'{x},{row}', timeout=30)
+            if pixels is not None:
+                frame = self.observe_focused_window(window, with_text=False)
+                if frame is None:
+                    yield x, None
+                    return
+                if self.frame_pixels(frame.get('frame')) == pixels:
+                    yield x, observation
+                    continue
+            observation = self.observe_focused_window(window)
+            if observation is None:
+                yield x, None
+                return
+            # Opening a notices popover can overwrite the driver's frame
+            # before the caller requests the next header position.
+            pixels = self.ocr_frame(observation)
+            yield x, observation
+
     def header_offers_update(self, version):
         """Before an in-app update, finds the main window's update control by
         the same hover scan inspect_header uses afterwards, so that finding
@@ -1219,12 +1264,10 @@ class Rehearsal:
         window = self.mapped()['main']
         observation = self.observe_window(window)
         if observation is not None:
-            width = observation['window']['size'][0]
-            first = width-self.HEADER['right']
-            for x in range(first, max(first-self.HEADER['span'], 0), -self.HEADER['step']):
-                self.call('drive', 'hover', f'{x},{self.HEADER["row"]}', timeout=30)
-                observation = self.observe_window(window)
-                words = ' '.join(run.get('text','') for run in (observation or {}).get('runs',[]))
+            for _, observation in self.header_observations(window, observation, **self.HEADER):
+                if observation is None:
+                    break
+                words = ' '.join(run.get('text','') for run in observation.get('runs',[]))
                 if visible_phrase(words, 'Update to') and version in words:
                     self.call('drive', 'hover', '850,750', timeout=30, check=False)
                     return words
@@ -1247,11 +1290,8 @@ class Rehearsal:
         if observation is None:
             return evidence
         evidence['observed'] = True
-        width = observation['window']['size'][0]
         seen = set()
-        for x in range(width-right, max(width-right-span, 0), -step):
-            self.call('drive', 'hover', f'{x},{row}', timeout=30)
-            observation = self.observe_window(window)
+        for x, observation in self.header_observations(window, observation, row, step, span, right):
             if observation is None:
                 evidence['observed'] = False
                 break

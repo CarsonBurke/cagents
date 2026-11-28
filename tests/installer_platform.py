@@ -127,7 +127,7 @@ class InstallerPlatform(unittest.TestCase):
             "removal left the current entry",
         )
         self.assertFalse((self.prefix / "versions").exists())
-        self.assertFalse((self.prefix / ".cagents-install-root").exists())
+        self.assertEqual((self.prefix / ".cagents-install-root").read_text(), "cagents install root\n")
         self.assertEqual((self.prefix / "sentinel").read_bytes(), b"existing installation\n")
         self.assertEqual((self.home / "sentinel").read_bytes(), b"saved user data\n")
         self.assertFalse((self.home / "network-called").exists())

@@ -771,6 +771,40 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     }
 }
 
+/// Only a field marked as read as absent may be missing from what an older
+/// source answers: one this build is merely sent without still fails.
+#[test]
+fn an_older_source_may_omit_only_the_fields_read_as_absent() {
+    let current = traced();
+    let protocol = crate::update::source::protocols()
+        .find(|&protocol| protocol < HISTORY_EXTENTS)
+        .unwrap();
+    let older = recorded(protocol);
+    let restated = restated_for(protocol);
+    let selected = selected_for(protocol);
+    assert!(
+        decoding_lifecycle_differences(
+            &older,
+            &current,
+            &restated,
+            &decoded_for(protocol),
+            &selected
+        )
+        .is_empty()
+    );
+    let decoded: Vec<_> = decoded_for(protocol)
+        .into_iter()
+        .filter(|field| *field != ("cagents::chat::Snapshot", "history"))
+        .collect();
+    let unmarked = decoding_lifecycle_differences(&older, &current, &restated, &decoded, &selected);
+    assert!(
+        unmarked
+            .iter()
+            .any(|difference| difference.contains("history") || difference.contains("snapshot")),
+        "{unmarked:?}"
+    );
+}
+
 #[test]
 fn inspector_proof_detects_each_request_response_and_reachable_history_change() {
     // Every admitted Current source must prove the inspector as well as
