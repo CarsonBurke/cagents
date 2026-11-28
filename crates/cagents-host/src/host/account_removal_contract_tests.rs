@@ -141,7 +141,7 @@ fn removal_counts_copies_resumes_and_archives_through_the_selected_daemon() {
         "payload": {"id": thread_id, "cwd": root, "source": "cli", "model_provider": "openai"}
     });
     fs::write(&source_transcript, format!("{transcript}\n")).unwrap();
-    fs::write(source_home.join("auth.json"), "fixture-only login").unwrap();
+    fs::write(source_home.join("fixture-login"), "fixture-only login").unwrap();
     fs::write(archive_home.join("keep"), "kept").unwrap();
 
     let bin = root.join("bin");
@@ -159,7 +159,7 @@ case "$CODEX_HOME/" in "$fixture/"*) ;; *) exit 70 ;; esac
 if [ "${{1:-}}" = logout ]; then
     test ! -f "$CODEX_HOME/refuse-logout" || exit 72
     : > "$CODEX_HOME/logged-out"
-    rm -f -- "$CODEX_HOME/auth.json"
+    rm -f -- "$CODEX_HOME/fixture-login"
     exit 0
 fi
 export CAGENTS_TOOL_ROWS_FIXTURE_ROOT="$fixture"
@@ -313,7 +313,8 @@ exec /usr/bin/python3 -I "{}" "$@" 2>>"$fixture/codex.stderr"
         fs::read(&target_transcript).unwrap()
     );
     assert!(source_home.join("logged-out").exists());
-    assert!(!target_home.join("auth.json").exists());
+    assert!(!source_home.join("fixture-login").exists());
+    assert!(!target_home.join("fixture-login").exists());
     assert!(store.load().unwrap().is_archived(source_key));
 
     let mut replacement = source.clone();

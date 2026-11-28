@@ -131,7 +131,7 @@ mod tests {
             b"nested",
         )
         .unwrap();
-        fs::write(source.join(".credentials.json"), b"private fixture login").unwrap();
+        fs::write(source.join("fixture-login"), b"private fixture login").unwrap();
         fs::write(source.join("projects/settings.json"), b"config").unwrap();
 
         let inventory = Inventory::read(Provider::Claude, &source).unwrap();
@@ -152,7 +152,7 @@ mod tests {
         }
         assert_eq!(fs::read(target.join(&relative)).unwrap(), b"conversation");
         assert_eq!(fs::read(source.join(&relative)).unwrap(), b"conversation");
-        assert!(!target.join(".credentials.json").exists());
+        assert!(!target.join("fixture-login").exists());
         assert!(!target.join(project).join("subagents").exists());
         std::os::unix::fs::symlink(source.join(project), source.join("projects/-alias")).unwrap();
         assert!(
