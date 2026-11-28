@@ -332,8 +332,15 @@ if [ "$UNINSTALL" -eq 1 ]; then
         esac
     fi
     rm -rf "$PREFIX/versions" "$PREFIX/current"
-    rm -f "$MARKER"
-    rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
+    # Keep ownership of a nonempty prefix so it can still be used to reinstall.
+    remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 ! -name "${MARKER##*/}" -print) \
+        || fail "could not inspect $PREFIX; kept its installation marker"
+    if [ -z "$remaining" ]; then
+        rm -f "$MARKER"
+        rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
+    else
+        note "kept $PREFIX and its installation marker because it holds files this installer did not make"
+    fi
     if [ "$PURGE" -eq 1 ]; then
         printf 'Removed cagents and its data.\n'
     else

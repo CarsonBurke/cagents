@@ -67,14 +67,16 @@ esac''')
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def reinstall(self):
+    def run_installer(self, *options):
         result = subprocess.run(
-            ["/bin/sh", str(self.installer), "--no-start", "--prefix", str(self.prefix),
-             "--version", VERSION, "--publish-tree", str(self.stage),
-             "--publisher", str(self.stage / "bin/cagents")],
+            ["/bin/sh", str(self.installer), "--prefix", str(self.prefix), *options],
             env=self.environment, cwd=self.root, text=True, capture_output=True, timeout=30,
         )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def reinstall(self):
+        self.run_installer("--no-start", "--version", VERSION, "--publish-tree", str(self.stage),
+                           "--publisher", str(self.stage / "bin/cagents"))
 
     def test_reinstall_repairs_a_non_executable_program(self):
         program = self.tree / "bin/cagents-ui"
@@ -93,6 +95,20 @@ esac''')
         before = [tree.stat().st_ino for tree in trees]
         self.reinstall()
         self.assertEqual([tree.stat().st_ino for tree in trees], before)
+
+    def test_uninstall_can_reinstall_in_a_prefix_with_user_files(self):
+        notes = self.prefix / "notes.txt"
+        notes.write_text("user file\n")
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.tree.exists())
+        self.assertEqual(notes.read_text(), "user file\n")
+        self.reinstall()
+        self.assertTrue(self.tree.is_dir())
+        self.assertEqual(notes.read_text(), "user file\n")
+
+    def test_uninstall_removes_an_empty_prefix(self):
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.prefix.exists())
 
 
 if __name__ == "__main__":
