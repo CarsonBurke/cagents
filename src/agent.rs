@@ -23,7 +23,7 @@ pub use codex::rollout as codex_rollout;
 pub(crate) mod antigravity;
 #[cfg(feature = "host")]
 pub(crate) use antigravity::MODES as ANTIGRAVITY_MODES;
-mod muse;
+pub(crate) mod muse;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) use muse::offers_model as muse_offers_model;
 mod omp;

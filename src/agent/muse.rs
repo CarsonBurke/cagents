@@ -132,6 +132,24 @@ pub(super) const ADAPTER: ProviderAdapter = ProviderAdapter {
     },
 };
 
+/// Muse's ACP mode identifiers paired with their cagents names.
+pub(crate) const SESSION_MODES: &[(&str, &str)] = &[
+    ("promptUnmatched", "manual"),
+    ("onRequest", "auto"),
+    ("denyUnmatched", "dontAsk"),
+    ("allowAll", "bypassPermissions"),
+];
+
+/// Resolve a terminal spelling, an ACP identifier, or a cagents mode name
+/// to the cagents name used to translate between launch surfaces.
+pub(crate) fn approval_meaning(mode: &str) -> Option<&'static str> {
+    let mode = ADAPTER.acp?.mode_meaning(mode);
+    SESSION_MODES
+        .iter()
+        .find(|(session, meaning)| *session == mode || *meaning == mode)
+        .map(|(_, meaning)| *meaning)
+}
+
 /// The executable a wrapper named `muse` conventionally runs.
 const UPSTREAM: &str = "muse-upstream";
 

@@ -1786,7 +1786,7 @@ fn new_chat_pins_selected_home_credential_policy_and_system_resolves_the_default
                     home.to_str().unwrap()
                 );
             }
-            let returned = local_return_launch(&session).unwrap();
+            let returned = local_return_launch(&session, None).unwrap();
             assert_eq!(returned.program, provider.executable());
             assert_eq!(
                 returned.working_directory,
@@ -1800,6 +1800,24 @@ fn new_chat_pins_selected_home_credential_policy_and_system_resolves_the_default
             );
         }
     }
+}
+
+#[test]
+fn an_unstarted_muse_chat_cannot_open_a_terminal_in_deny_unmatched_mode() {
+    let mut session = fresh_chat_session(
+        Provider::Muse,
+        TerminalId::new(),
+        "/project".into(),
+        &Account::system(Provider::Muse),
+        false,
+    )
+    .unwrap();
+    session.launch.recipe.arguments = vec!["--approval-mode".into(), "dontAsk".into()];
+
+    let failure = local_return_launch(&session, None).unwrap_err();
+    assert!(failure.contains("no equivalent for Deny unmatched actions"));
+    let terminal = local_return_launch(&session, Some("auto")).unwrap();
+    assert_eq!(terminal.arguments, ["--approval-mode", "on-request"]);
 }
 
 #[test]

@@ -14,6 +14,7 @@
 //! - Contributor mode, which lets Meta use the conversation for product
 //!   improvement, is always off.
 use super::{Profile, Settings, Startup, auth_required};
+use crate::agent::muse::{SESSION_MODES, approval_meaning};
 use crate::chat::Launch;
 use crate::model::LaunchRecipe;
 
@@ -27,12 +28,7 @@ pub static PROFILE: Profile = Profile {
     // "Run every action without asking for approval". Offered in the order
     // of the Claude modes they roughly correspond to, rather than Muse's
     // own, which leads with running everything unasked.
-    modes: &[
-        (PROMPT_UNMATCHED, "manual"),
-        (ON_REQUEST, "auto"),
-        (DENY_UNMATCHED, "dontAsk"),
-        (ALLOW_ALL, "bypassPermissions"),
-    ],
+    modes: SESSION_MODES,
     offers_model: crate::agent::muse_offers_model,
     sign_in_required: auth_required,
     sign_in_advice: None,
@@ -44,13 +40,6 @@ pub static PROFILE: Profile = Profile {
     backgrounds_commands: false,
     subagents: false,
 };
-
-/// Muse's ACP mode identifiers.
-const ALLOW_ALL: &str = "allowAll";
-const PROMPT_UNMATCHED: &str = "promptUnmatched";
-const ON_REQUEST: &str = "onRequest";
-const DENY_UNMATCHED: &str = "denyUnmatched";
-const MODES: [&str; 4] = [ALLOW_ALL, PROMPT_UNMATCHED, ON_REQUEST, DENY_UNMATCHED];
 
 /// `muse acp` options that set up the server and mean the same there.
 const SERVER_VALUES: [&str; 5] = [
@@ -95,9 +84,9 @@ fn launch(launch: &Launch) -> Result<Startup, String> {
             "--model" => settings.model = Some(value()?),
             "--reasoning-effort" | "--effort" => settings.reasoning = Some(value()?),
             "--approval-mode" => settings.mode = Some(mode(&value()?)?),
-            "--disable-approval" => implied_mode = Some(ALLOW_ALL),
+            "--disable-approval" => implied_mode = Some(PROFILE.own_mode("bypassPermissions")),
             "--yolo" => {
-                implied_mode = Some(ALLOW_ALL);
+                implied_mode = Some(PROFILE.own_mode("bypassPermissions"));
                 arguments.extend(["--disable-sandbox".into(), "--trust-workspace".into()]);
             }
             "--contributor-mode" => {
@@ -168,20 +157,12 @@ fn launch(launch: &Launch) -> Result<Startup, String> {
 /// cagents mode one means, as `agent spawn` does for "Deny unmatched
 /// actions", which the terminal cannot name.
 fn mode(approval: &str) -> Result<String, String> {
-    let mode = match approval {
-        "never" => ALLOW_ALL,
-        "on-request" => ON_REQUEST,
-        "untrusted" => PROMPT_UNMATCHED,
-        mode if MODES.contains(&mode) => mode,
-        // What a mode means, as cagents names it.
-        meaning if MODES.contains(&PROFILE.own_mode(meaning)) => PROFILE.own_mode(meaning),
-        _ => {
-            return Err(format!(
-                "Muse has no approval mode {approval:?}; choose manual, auto, dontAsk or bypassPermissions, or the terminal's never, on-request or untrusted."
-            ));
-        }
-    };
-    Ok(mode.to_owned())
+    let meaning = approval_meaning(approval).ok_or_else(|| {
+        format!(
+            "Muse has no approval mode {approval:?}; choose manual, auto, dontAsk or bypassPermissions, or the terminal's never, on-request or untrusted."
+        )
+    })?;
+    Ok(PROFILE.own_mode(meaning).to_owned())
 }
 
 /// The executable to serve ACP with: `muse-upstream` where the launch's

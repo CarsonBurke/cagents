@@ -5342,9 +5342,10 @@ fn process_inner(
             let snapshot = handle.snapshot(None).ok_or_else(|| {
                 unavailable("Exact native snapshot is unavailable; no replacement was started")
             })?;
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
-                "Wait for the provider's confirmed exact conversation before returning to terminal",
-            ))?;
+            let recipe = session
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .map_err(unavailable)?;
             if session.launch.provider == Provider::Codex
                 && (session.terminal.is_some()
                     || session
@@ -5406,6 +5407,64 @@ fn process_inner(
                 record.returning_terminal = true;
                 record.completion_observed = false;
                 state.inventory_changed();
+            }
+            // Closing interrupts active work and waits for confirmed teardown.
+            // Never start a second writer before teardown has been proved.
+            owners.close(host, &closing)?;
+            let snapshot = handle.snapshot(None).ok_or_else(|| {
+                unavailable(
+                    "Exact native final snapshot is unavailable; retirement remains unconfirmed",
+                )
+            })?;
+            if snapshot.session_id != session.launch.session_id {
+                return Err(unavailable(
+                    "Provider identity changed during shutdown; retry the exact terminal handoff",
+                ));
+            }
+            // Autonomous policy changes can arrive while the native writer
+            // shuts down. The final confirmed snapshot wins over launch flags.
+            let recipe = match session
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+            {
+                Ok(recipe) => recipe,
+                Err(reason) => {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    owners.require_locked(&state, &closing)?;
+                    state
+                        .chats
+                        .get_mut(&chat_id)
+                        .expect("checked actor")
+                        .returning_terminal = false;
+                    state.inventory_changed();
+                    drop(state);
+                    changed_owned(
+                        &Arc::downgrade(host),
+                        chat_id,
+                        owners.target.instance,
+                        Update::Observed {
+                            generation: snapshot.generation,
+                        },
+                    );
+                    return Err(unavailable(format!(
+                        "{reason} The chat stopped during the switch. Reopen it in chat to continue."
+                    )));
+                }
+            };
+            if directory.is_some() && recipe.working_directory != terminal.launch.working_directory
+            {
+                return Err(unavailable(
+                    "The terminal resume directory changed during handoff; retry the exact handoff",
+                ));
+            }
+            terminal.launch = recipe.clone();
+            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            };
+            {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                owners.require_locked(&state, &closing)?;
                 state.recovery_independence.extend(chat_id, terminal_id);
                 // The terminal resumes this chat's conversation under its
                 // claim, which refuses any other's (see
@@ -5423,36 +5482,6 @@ fn process_inner(
                 }
             }
             let _handing_off = HandingOff(host, terminal_id);
-            // Closing interrupts active work and waits for confirmed teardown.
-            // Never start a second writer before teardown has been proved.
-            owners.close(host, &closing)?;
-            let snapshot = handle.snapshot(None).ok_or_else(|| {
-                unavailable(
-                    "Exact native final snapshot is unavailable; retirement remains unconfirmed",
-                )
-            })?;
-            if snapshot.session_id != session.launch.session_id {
-                return Err(unavailable(
-                    "Provider identity changed during shutdown; retry the exact terminal handoff",
-                ));
-            }
-            // Autonomous policy changes can arrive while the native writer
-            // shuts down. The final confirmed snapshot wins over launch flags.
-            let recipe = session
-                .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
-                .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
-            if directory.is_some() && recipe.working_directory != terminal.launch.working_directory
-            {
-                return Err(unavailable(
-                    "The terminal resume directory changed during handoff; retry the exact handoff",
-                ));
-            }
-            terminal.launch = recipe.clone();
-            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-                recipe,
-                last_exit: None,
-            };
             // Teardown is proved, so the terminal takes over the chat's lineage
             // and whatever agents it started, unless another of its sessions runs.
             owners.require_current(host, &closing)?;

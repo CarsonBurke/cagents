@@ -264,6 +264,73 @@ mod acp_permission_tests {
         }
         assert!(!launch.resumes_in_terminal(&recipe(&["--model", "m"])));
     }
+    #[test]
+    fn muse_terminal_handoff_requires_a_representable_approval_mode() {
+        let id = "98608bab-5eb6-4cf5-8f9b-46019bf29df7";
+        let mut launch = Launch {
+            provider: Provider::Muse,
+            recipe: recipe(&["--approval-mode=dontAsk", "--disable-write", "--model", "m"]),
+            session_id: Some(id.into()),
+            draft_model: None,
+        };
+        launch.recipe.program = "/bin/muse-upstream".into();
+
+        for mode in [None, Some("dontAsk"), Some("denyUnmatched")] {
+            let failure = launch
+                .terminal_recipe_with_permission_mode(mode)
+                .unwrap_err();
+            assert!(failure.contains("no equivalent for Deny unmatched actions"));
+        }
+        // Native resume keeps its recorded mode. A terminal cannot use it.
+        assert!(!launch.resumes_in_terminal(&launch.terminal_recipe().unwrap()));
+
+        for (mode, approval) in [
+            ("manual", "untrusted"),
+            ("auto", "on-request"),
+            ("bypassPermissions", "never"),
+        ] {
+            let terminal = launch
+                .terminal_recipe_with_permission_mode(Some(mode))
+                .unwrap();
+            assert_eq!(terminal.program, launch.recipe.program);
+            assert_eq!(
+                terminal.arguments,
+                [
+                    "resume",
+                    id,
+                    "--disable-write",
+                    "--model",
+                    "m",
+                    "--approval-mode",
+                    approval
+                ]
+            );
+            assert!(launch.resumes_in_terminal(&terminal));
+        }
+        let mut issued_by_older_daemon = launch.terminal_recipe().unwrap();
+        assert!(apply_acp_permission_mode(
+            &mut issued_by_older_daemon,
+            Provider::Muse,
+            "auto"
+        ));
+        assert!(launch.resumes_in_terminal(&issued_by_older_daemon));
+        issued_by_older_daemon
+            .arguments
+            .push("--disable-shell".into());
+        assert!(!launch.resumes_in_terminal(&issued_by_older_daemon));
+
+        // The live policy can also be stricter than the original launch.
+        launch.recipe.arguments[0] = "--approval-mode=never".into();
+        assert!(
+            launch
+                .terminal_recipe_with_permission_mode(Some("dontAsk"))
+                .is_err()
+        );
+        assert!(
+            launch.terminal_recipe_with_permission_mode(None).is_ok(),
+            "an existing terminal spelling is valid before the chat reports a mode"
+        );
+    }
 }
 
 /// Local wall-clock time for a conversation stamp, as `14:32`.
@@ -429,19 +496,17 @@ impl Launch {
             && matches!(std::fs::metadata(&self.recipe.working_directory), Err(error) if error.kind() == std::io::ErrorKind::NotFound)
     }
 
-    /// Resume with the last provider-confirmed Claude policy. A permission
-    /// change is session state, so an original CLI bypass must not restore it
-    /// when the user returns from native chat.
-    pub fn terminal_recipe_with_permission_mode(&self, mode: Option<&str>) -> Option<LaunchRecipe> {
-        let mut recipe = self.terminal_recipe()?;
-        if let Some(mode) = mode {
-            if self.provider == Provider::Claude {
-                apply_claude_permission_mode(&mut recipe, mode);
-            } else {
-                apply_acp_permission_mode(&mut recipe, self.provider, mode);
-            }
-        }
-        Some(recipe)
+    /// Resume with the last provider-confirmed policy, when the terminal
+    /// can express it. The original launch only supplies an unreported mode.
+    pub fn terminal_recipe_with_permission_mode(
+        &self,
+        mode: Option<&str>,
+    ) -> Result<LaunchRecipe, &'static str> {
+        let mut recipe = self.terminal_recipe().ok_or(
+            "Cannot form a safe terminal resume command for this conversation's exact ID.",
+        )?;
+        apply_terminal_permission_mode(&mut recipe, self.provider, mode)?;
+        Ok(recipe)
     }
 
     /// Whether `recipe` is a terminal this conversation may hand off to: its
@@ -451,9 +516,8 @@ impl Launch {
     /// the resume by nothing else.
     pub fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
         let mode = if self.provider.speaks_acp() {
-            // Its default mode goes unnamed, and any other comes before the
-            // conversation it resumes.
-            if self.terminal_recipe().as_ref() == Some(recipe) {
+            // An exact resume can leave its original mode unnamed.
+            if self.terminal_recipe_with_permission_mode(None).as_ref() == Ok(recipe) {
                 return true;
             }
             acp_permission_mode(recipe, self.provider)
@@ -463,21 +527,31 @@ impl Launch {
                 _ => None,
             }
         };
-        self.terminal_recipe_with_permission_mode(mode.as_deref())
+        if self
+            .terminal_recipe_with_permission_mode(mode.as_deref())
             .as_ref()
-            == Some(recipe)
+            == Ok(recipe)
+        {
+            return true;
+        }
+        // Older daemons left Muse's on-request mode unnamed. Recognize only
+        // the exact argv they produced for already-issued handoff receipts.
+        self.provider == Provider::Muse
+            && mode.as_deref() == Some("auto")
+            && self.terminal_recipe().is_some_and(|mut legacy| {
+                apply_acp_permission_mode(&mut legacy, self.provider, "auto") && legacy == *recipe
+            })
     }
 
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
+    /// Native resumes also use this shape. To start a terminal from a chat,
+    /// validate its approval mode with `terminal_recipe_with_permission_mode`.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
         let id = self.session_id.as_deref()?;
         if id.len() != 36
             || uuid::Uuid::parse_str(id).is_err()
-            || std::path::Path::new(&self.recipe.program)
-                .file_name()?
-                .to_str()?
-                != self.provider.executable()
+            || Provider::from_program(&self.recipe.program) != Some(self.provider)
         {
             return None;
         }
@@ -529,6 +603,44 @@ pub fn apply_claude_permission_mode(recipe: &mut LaunchRecipe, mode: &str) -> bo
     true
 }
 
+/// Apply a native chat's mode to a terminal launch, or check the recorded
+/// mode when the chat has yet to report one.
+pub fn apply_terminal_permission_mode(
+    recipe: &mut LaunchRecipe,
+    provider: Provider,
+    mode: Option<&str>,
+) -> Result<(), &'static str> {
+    if provider == Provider::Muse {
+        let acp = provider.acp().expect("Muse has an ACP adapter");
+        let Some(mode) = mode.or_else(|| named_acp_permission_modes(recipe, acp).last()) else {
+            return Ok(());
+        };
+        let Some(meaning) = crate::agent::muse::approval_meaning(mode) else {
+            return Err(
+                "Muse's approval mode is unknown. Choose a supported mode in chat before switching to terminal.",
+            );
+        };
+        let terminal = acp.own_mode(meaning);
+        if terminal == "dontAsk" {
+            return Err(
+                "Muse's terminal has no equivalent for Deny unmatched actions. Change the permission mode in chat before switching to terminal.",
+            );
+        }
+        // A confirmed mode must be explicit even when it is the default.
+        // Muse can otherwise take its policy from configuration or switches.
+        if !named_acp_permission_modes(recipe, acp).eq([terminal]) {
+            write_acp_permission_mode(recipe, provider, acp, Some(terminal));
+        }
+    } else if let Some(mode) = mode {
+        if provider == Provider::Claude {
+            apply_claude_permission_mode(recipe, mode);
+        } else {
+            apply_acp_permission_mode(recipe, provider, mode);
+        }
+    }
+    Ok(())
+}
+
 /// Names the cagents permission mode `meaning` on an ACP agent's terminal
 /// command line, in the agent's own words, in place of any mode it named.
 /// Returns whether `provider` serves ACP and has such a mode.
@@ -544,6 +656,21 @@ pub fn apply_acp_permission_mode(
     if !acp.modes.iter().any(|(mode, _)| *mode == own) {
         return false;
     }
+    write_acp_permission_mode(
+        recipe,
+        provider,
+        acp,
+        (own != acp.default_mode).then_some(own),
+    );
+    true
+}
+
+fn write_acp_permission_mode(
+    recipe: &mut LaunchRecipe,
+    provider: Provider,
+    acp: crate::agent::Acp,
+    mode: Option<&str>,
+) {
     let mut arguments = Vec::with_capacity(recipe.arguments.len() + 2);
     let mut original = std::mem::take(&mut recipe.arguments).into_iter();
     let inline = format!("{}=", acp.mode_option);
@@ -554,38 +681,45 @@ pub fn apply_acp_permission_mode(
             arguments.push(argument);
         }
     }
-    // The agent's terminal may not accept its default by name. The mode goes
-    // before a conversation the command resumes, which is read only at the
-    // end of the command.
-    if own != acp.default_mode {
+    // Keep the provider's selector at the end when its CLI expects it there.
+    // Muse places the resume subcommand and ID before its options.
+    if let Some(mode) = mode {
         let at = match arguments.as_slice() {
             [.., flag, _] if flag == provider.resume_flag() => arguments.len() - 2,
             _ => arguments.len(),
         };
-        arguments.splice(at..at, [acp.mode_option.into(), own.into()]);
+        arguments.splice(at..at, [acp.mode_option.into(), mode.into()]);
     }
     recipe.arguments = arguments;
-    true
 }
 
 /// The cagents permission mode an ACP agent's terminal command line starts
 /// it in, for a provider that serves ACP.
 pub fn acp_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
     let acp = provider.acp()?;
+    let mode = named_acp_permission_modes(recipe, acp)
+        .last()
+        .unwrap_or(acp.default_mode);
+    Some(acp.mode_meaning(mode).to_owned())
+}
+
+fn named_acp_permission_modes(
+    recipe: &LaunchRecipe,
+    acp: crate::agent::Acp,
+) -> impl Iterator<Item = &str> {
     let inline = format!("{}=", acp.mode_option);
-    let mut named = None;
     let mut arguments = recipe.arguments.iter();
-    while let Some(argument) = arguments.next() {
-        if argument == acp.mode_option {
-            named = arguments.next().map(String::as_str);
-        } else if let Some(mode) = argument.strip_prefix(&inline) {
-            named = Some(mode);
+    std::iter::from_fn(move || {
+        while let Some(argument) = arguments.next() {
+            if argument == acp.mode_option {
+                return arguments.next().map(String::as_str);
+            }
+            if let Some(mode) = argument.strip_prefix(&inline) {
+                return Some(mode);
+            }
         }
-    }
-    Some(
-        acp.mode_meaning(named.unwrap_or(acp.default_mode))
-            .to_owned(),
-    )
+        None
+    })
 }
 
 /// What a card is asking the daemon to do with a conversation.
@@ -4556,7 +4690,7 @@ mod tests {
                 .any(|argument| argument == "--dangerously-skip-permissions")
         );
         assert_eq!(
-            launch.terminal_recipe_with_permission_mode(None),
+            launch.terminal_recipe_with_permission_mode(None).ok(),
             launch.terminal_recipe()
         );
     }
