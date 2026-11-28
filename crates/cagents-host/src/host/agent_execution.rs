@@ -1676,9 +1676,44 @@ pub(in crate::host) fn adopt_successor(
         .unwrap_or_else(|p| p.into_inner())
         .adopt_successor(predecessor, successor)?;
     if changed {
+        if predecessor.id == successor.id {
+            issue_in_place_predecessor(host, predecessor, successor);
+        }
         announce(host, &registry);
     }
     Ok(changed)
+}
+
+/// Record `predecessor`, the process a conversation reopened in place
+/// replaced, as a descriptor issued for `successor`, as an update or Codex
+/// reconnect records the descriptor it replaced. A window still showing the
+/// predecessor, such as the one whose reopen is still answering when the
+/// agent's pane moves, or another window on the same agent, then resolves it
+/// to the running successor and attaches, rather than being told its
+/// conversation is gone. Resolution only attaches: nothing is started or
+/// resent.
+fn issue_in_place_predecessor(
+    host: &SharedHost,
+    predecessor: &chat::Session,
+    successor: &chat::Session,
+) {
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    // A later restart may already run under this ID; the alias belongs to
+    // exactly this successor.
+    if state
+        .chats
+        .get(&successor.id)
+        .is_none_or(|record| record.session != *successor)
+    {
+        return;
+    }
+    let sources = state.upgrade_chats.entry(successor.id).or_default();
+    if !sources.iter().any(|issued| issued.source == *predecessor) {
+        sources.push(crate::upgrade::handoff::ChatSource {
+            source: predecessor.clone(),
+            launch: predecessor.launch.clone(),
+        });
+    }
 }
 
 /// Whether `predecessor`, the agent's bound process, ended with the earlier

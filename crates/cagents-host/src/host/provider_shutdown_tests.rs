@@ -1900,3 +1900,51 @@ fn a_send_whose_agent_cannot_follow_the_restart_says_so() {
     drop(registry);
     handle.close().unwrap();
 }
+
+/// Regression for #4570. A window that reopened an agent's chat after its
+/// daemon was lost can see the agent's pane move to the reopened process
+/// before its own start answers; another window on that agent sees only the
+/// move. Either still holds the lost daemon's descriptor, and resolves it as
+/// the conversation's earlier process. Once the agent follows the reopened
+/// chat, that resolution names the running chat, so the window attaches to
+/// it instead of reporting that it couldn't reconnect. Until then, or for a
+/// descriptor the agent never held, nothing is resolved, and resolving
+/// starts nothing.
+#[test]
+fn a_window_still_showing_a_reopened_chats_lost_process_attaches_to_it() {
+    use crate::terminal_ipc::ServerResponse;
+    let directory = tempfile::tempdir().unwrap();
+    let (host, _, session, reopened, handle) = restarted_beside_its_agent(
+        directory.path(),
+        crate::agent::Provider::Antigravity,
+        chat::NativeContinuity::ReconnectOnly,
+        false,
+    );
+    host.lock().unwrap().register_client(17);
+    assert!(
+        reconnect_from_window(&host, &session).is_err(),
+        "an agent that has not followed the reopened chat vouches for nothing"
+    );
+
+    assert!(agent_execution::follow_restart(&host, &reopened));
+    let running = host.lock().unwrap().chats[&reopened.id].current_session();
+    assert_eq!(running.proof, reopened.proof);
+    for _ in 0..2 {
+        match reconnect_from_window(&host, &session).unwrap() {
+            ServerResponse::UpgradeChatResolved { session: resolved } => {
+                assert_eq!(resolved, running)
+            }
+            other => panic!("unexpected response {other:?}"),
+        }
+    }
+    let unrelated = chat::Session {
+        launch: chat::Launch {
+            session_id: Some(Uuid::new_v4().to_string()),
+            ..session.launch.clone()
+        },
+        ..session.clone()
+    };
+    assert!(reconnect_from_window(&host, &unrelated).is_err());
+    assert_eq!(host.lock().unwrap().chats.len(), 1, "nothing was started");
+    handle.close().unwrap();
+}
