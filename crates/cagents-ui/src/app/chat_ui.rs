@@ -1577,8 +1577,7 @@ pub(super) struct State {
     refusals_to_show: HashMap<TerminalId, String>,
     /// Closed panes whose conversation has stopped, with that conversation.
     /// A shared view that never heard of the close, as when the window closed
-    /// first, can bring one back; still holding it, it goes again rather than
-    /// attach.
+    /// first, can bring one back. Its automatic removal consumes this entry.
     stopped_closes: HashMap<CardId, chat::Session>,
     /// Such panes a view brought back before putting them in the strip: they
     /// go once it has.

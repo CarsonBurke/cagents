@@ -772,6 +772,100 @@ fn a_refused_close_keeps_the_pane_closed_and_says_other_windows_may_show_it() {
     }
 }
 
+#[test]
+fn a_stopped_shared_chat_retries_removal_once_and_reports_only_the_final_refusal() {
+    use super::super::workspace_model_sync::ModelUpdate;
+    use crate::app::chat_ui::Action;
+
+    for (stop_arrives_first, with_view, seeding) in [
+        (false, false, false),
+        (true, false, false),
+        (false, true, false),
+        (true, true, false),
+        (false, true, true),
+        (true, true, true),
+    ] {
+        let (mut app, _, _, pane) = retained_chat_move_fixture();
+        let (tx, rx) = test_model_channel();
+        app.workspace_model_tx = tx;
+        drop(app.begin_chat_close(pane.id));
+        let stopping = app.background_close_for_test(pane.id).unwrap();
+        let (first, scope, change) = app
+            .shared_views
+            .pending
+            .iter()
+            .find(|(_, _, change)| {
+                matches!(change, Change::RemoveSource { before, .. } if before.id == pane.id)
+            })
+            .cloned()
+            .expect("the original Close is published");
+        let finish_stop = |app: &mut Cagents| {
+            drop(app.update(Message::ChatUi(Action::Retired(stopping, Ok(())))));
+        };
+        let refuse = |app: &mut Cagents, operation, change| {
+            if with_view {
+                let view = view_holding(app, &scope);
+                registry_refuses(app, operation, change, view);
+            } else {
+                drop(app.apply_workspace_model_update(ModelUpdate::ViewRefused {
+                    scope: scope.clone(),
+                    operation,
+                    error: "the removal was refused".into(),
+                }));
+            }
+        };
+
+        if stop_arrives_first {
+            finish_stop(&mut app);
+        }
+        if seeding {
+            app.shared_views.seeding.insert(scope.clone());
+        }
+        refuse(&mut app, first, change);
+        assert!(
+            notices(&app).is_empty(),
+            "the first refusal leaves the close settling: {:?}",
+            notices(&app)
+        );
+        if !stop_arrives_first {
+            if !seeding {
+                assert!(app.workspace.is_hidden(pane.id));
+            }
+            finish_stop(&mut app);
+        }
+        if seeding {
+            assert_eq!(resent_close(&app, pane.id, first), None);
+            assert!(notices(&app).is_empty());
+            app.shared_views.seeding.remove(&scope);
+            drop(app.reconcile_shared_views());
+        }
+        let (retry, change) = resent_close(&app, pane.id, first)
+            .expect("one removal is sent after the conversation stops");
+        assert!(!app.workspace.order().any(|card| card == pane.id));
+        assert!(notices(&app).is_empty());
+
+        refuse(&mut app, retry, change);
+        assert_eq!(notices(&app), [closed_here_notice(&app, pane.id)]);
+        assert!(view_holding(&app, &scope).panes.contains(&pane));
+        assert!(!app.card_state(pane.id).unwrap().existence.is_open());
+        assert!(!app.workspace.order().any(|card| card == pane.id));
+        assert!(!app.cards.contains_key(&pane.id));
+        assert!(app.background_close_for_test(pane.id).is_none());
+        drop(app.reconcile_shared_views());
+        assert_eq!(resent_close(&app, pane.id, first), None);
+        assert_eq!(
+            std::iter::from_fn(|| rx.try_recv().ok())
+                .filter(|edit| matches!(edit,
+                    ModelEdit::ChangeView { change: Change::RemoveSource { before, .. }, .. }
+                        if before.id == pane.id
+                ))
+                .count(),
+            2,
+            "the original removal and one retry are the only requests"
+        );
+    }
+}
+
 /// A Close the registry refuses without reporting the scope, as when its
 /// resend waited too long - the daemon trouble behind #2444 - leaves the
 /// pane closed here, and says other windows may show it only while the
