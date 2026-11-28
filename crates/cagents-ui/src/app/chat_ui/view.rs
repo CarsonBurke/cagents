@@ -350,6 +350,7 @@ impl Rhythm {
 /// next semantic boundary instead of adding another gap after an invisible row.
 struct VirtualRows<'a> {
     children: Vec<virtualized::Row<'a>>,
+    body: Option<virtualized::Body<'a>>,
     /// The kind of the last row drawn, which the next row's gap is measured
     /// from. A row that draws nothing leaves it as it was.
     last: Option<Rhythm>,
@@ -359,6 +360,7 @@ impl<'a> VirtualRows<'a> {
     fn new() -> Self {
         Self {
             children: vec![],
+            body: None,
             last: None,
             trailing_footer: 0.0,
         }
@@ -415,20 +417,18 @@ impl<'a> VirtualRows<'a> {
         rhythm: Option<Rhythm>,
         footer: f32,
     ) -> usize {
-        if let (Some(last), Some(next)) = (self.last, rhythm) {
-            let gap = (last.gap(next) - self.trailing_footer).max(0.0);
-            if gap > 0.0 {
-                // A gap is keyed by the row it precedes, so history loaded
-                // above it does not hand it another gap's measured height.
-                let key = match row.key {
-                    0 => self.children.len() as u64,
-                    key => key.rotate_left(1) ^ GAP_KEY,
-                };
-                self.children
-                    .push(virtualized::Row::space(key, u64::from(gap.to_bits()), gap));
-            }
+        let history = self.body.as_ref().map_or(0, |body| body.rows.len());
+        if let Some(gap) = transcript_gap(
+            self.last,
+            self.trailing_footer,
+            rhythm,
+            row.key,
+            self.children.len() + history,
+        ) {
+            self.children
+                .push(virtualized::Row::space(gap.key, gap.revision, gap.estimate));
         }
-        let index = self.children.len();
+        let index = self.children.len() + history;
         if row.key == 0 {
             row.key = index as u64;
         }
@@ -439,6 +439,71 @@ impl<'a> VirtualRows<'a> {
         }
         index
     }
+}
+
+fn transcript_gap(
+    previous: Option<Rhythm>,
+    footer: f32,
+    next: Option<Rhythm>,
+    row_key: u64,
+    index: usize,
+) -> Option<virtualized::Descriptor> {
+    let height = (previous?.gap(next?) - footer).max(0.0);
+    (height > 0.0).then(|| {
+        // The gap follows the identity of the row it precedes, even after a page.
+        let key = if row_key == 0 {
+            index as u64
+        } else {
+            row_key.rotate_left(1) ^ GAP_KEY
+        };
+        virtualized::Descriptor::new(key, u64::from(height.to_bits()), height, None)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum HistoryPart {
+    Turn(usize, TurnPart),
+    Notice(usize),
+    Empty,
+    Gap(f32),
+}
+
+enum TurnRow {
+    Part {
+        part: Option<TurnPart>,
+        descriptor: virtualized::Descriptor,
+        rhythm: Option<Rhythm>,
+        footer: f32,
+    },
+    Notice(usize),
+    Alias(iced::advanced::widget::Id),
+}
+
+#[derive(PartialEq)]
+struct HistoryKey {
+    target: Target,
+    presentation: u64,
+    turns: revised::Stamp,
+    expanded: (revised::Stamp, revised::Stamp, revised::Stamp),
+    failures: (u64, revised::Stamp, revised::Stamp),
+    cards: Vec<Option<bool>>,
+    width: u32,
+    previous: Option<Rhythm>,
+    footer: u32,
+}
+
+/// The body of the parent's transcript, excluding per-view rows such as
+/// paging controls, queued prompts and the closing activity.
+pub(super) struct HistoryRows {
+    key: HistoryKey,
+    descriptors: std::rc::Rc<[virtualized::Descriptor]>,
+    parts: std::rc::Rc<[HistoryPart]>,
+    last: Option<Rhythm>,
+    footer: f32,
+    // Delivery labels and exact row disclosures can depend on the current
+    // publication. A weak fence preserves its identity without keeping it.
+    snapshot_source: Option<std::sync::Weak<Snapshot>>,
+    delivery_addresses: Option<std::sync::Weak<std::collections::BTreeMap<String, String>>>,
 }
 
 #[cfg(test)]
@@ -3281,8 +3346,8 @@ impl Runtime {
                     let steps_shown = self.steps_shown(turn);
                     let notices = self.placed_turn_notices(turn);
                     let select_notices = |builder: &mut selection::DocumentBuilder, rows| {
-                        for (_, incident) in notices.iter().filter(|(before, _)| *before == rows) {
-                            self.selection_failure(builder, incident);
+                        for &(_, index) in notices.iter().filter(|(before, _)| *before == rows) {
+                            self.selection_failure(builder, &self.failure_ui.incidents[index]);
                         }
                     };
                     select_notices(&mut builder, 0);
@@ -3970,23 +4035,13 @@ impl Runtime {
             for incident in self.failure_ui.incidents.iter().filter(unanchored) {
                 self.push_notice(&mut transcript, incident, reset_controls.as_ref());
             }
-            // Each row an exchange draws, and the gap above it.
-            transcript.children.reserve(
-                self.turns
-                    .iter()
-                    .map(|turn| 2 * (turn.prompt.len() + turn.prose.len() + 1))
-                    .sum(),
+            self.push_history_rows(
+                &mut transcript,
+                content_width,
+                markdown_settings,
+                dark,
+                reset_controls.as_ref(),
             );
-            for turn in &self.turns {
-                self.push_turn_rows_noticed(
-                    &mut transcript,
-                    turn,
-                    content_width,
-                    markdown_settings,
-                    dark,
-                    reset_controls.as_ref(),
-                );
-            }
             if !snapshot.has_later
                 && snapshot.activity() == crate::agent::ActivityState::Idle
                 && snapshot.queued_messages.is_empty()
@@ -4208,15 +4263,19 @@ impl Runtime {
         // last rows rest at, and scrolled content passes through it.
         let transcript_index = content.len();
         let transcript = widget::container(
-            widget::container(virtualized::column(transcript.children, Default::default()))
-                .padding(
-                    iced::Padding::new(step::GAP_M)
-                        .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
-                        .bottom(step::GAP_M + step::GAP_S)
-                        .right(step::GAP_M.max(transcript_clearance)),
-                )
-                .width(Length::Fill)
-                .max_width(super::layout::READING_COLUMN),
+            widget::container(virtualized::column_with_body(
+                transcript.children,
+                transcript.body,
+                Default::default(),
+            ))
+            .padding(
+                iced::Padding::new(step::GAP_M)
+                    .top(step::GAP_M + if transcript_index > 0 { space::S } else { 0.0 })
+                    .bottom(step::GAP_M + step::GAP_S)
+                    .right(step::GAP_M.max(transcript_clearance)),
+            )
+            .width(Length::Fill)
+            .max_width(super::layout::READING_COLUMN),
         )
         .center_x(Length::Fill);
         let transcript_layer = if self.visible.load(Ordering::Relaxed) {
@@ -6393,41 +6452,239 @@ impl Runtime {
         settings: markdown::Settings,
         dark: bool,
     ) {
-        self.push_turn_rows_with(transcript, turn, content_width, settings, dark, None);
+        self.describe_turn_rows(turn, content_width, false, |row| match row {
+            TurnRow::Part {
+                part,
+                descriptor,
+                rhythm,
+                footer,
+            } => {
+                let key = descriptor.key;
+                let revision = part.map_or(descriptor.revision, |part| {
+                    self.turn_part_revision(turn, part, key, settings, dark)
+                });
+                let mut row =
+                    virtualized::Row::new(key, revision, descriptor.estimate, None, move || {
+                        match part {
+                            Some(part) => retained::kept(revision, move || {
+                                self.turn_part_view(turn, part, settings)
+                            }),
+                            None => widget::Space::new().into(),
+                        }
+                    });
+                row.aliases = descriptor.aliases;
+                transcript.append(row, rhythm, footer);
+            }
+            TurnRow::Alias(id) => transcript.alias_last(id),
+            TurnRow::Notice(_) => unreachable!("previews do not include failure controls"),
+        });
     }
 
-    /// An exchange's rows with the notices of what happened during it, each
-    /// after the row of the item it happened at, so they read in order with
-    /// the exchange's work rather than after all of it.
-    fn push_turn_rows_noticed<'a>(
+    fn push_history_rows<'a>(
         &'a self,
         transcript: &mut VirtualRows<'a>,
-        turn: &'a turn::Turn,
         content_width: f32,
         settings: markdown::Settings,
         dark: bool,
         reset_controls: Option<&crate::app::account_ui::resets::Controls>,
     ) {
-        self.push_turn_rows_with(
-            transcript,
-            turn,
-            content_width,
-            settings,
-            dark,
-            Some(reset_controls),
-        );
+        if self.turns.is_empty() {
+            return;
+        }
+        let incidents = &self.failure_ui.incidents;
+        let cards = incidents
+            .iter()
+            .map(|incident| {
+                (!incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.is_some())
+                .then(|| self.failure_notice_is_card(incident, reset_controls))
+            })
+            .collect();
+        let key = HistoryKey {
+            target: self.target,
+            presentation: self.presentation_revision,
+            turns: self.turns.stamp(),
+            expanded: (
+                self.expanded.stamp(),
+                self.row_expansions.stamp(),
+                self.find_expanded_rows.stamp(),
+            ),
+            failures: self.failure_ui.exposure(),
+            cards,
+            width: content_width.to_bits(),
+            previous: transcript.last,
+            footer: transcript.trailing_footer.to_bits(),
+        };
+        let mut cache = self.history_rows.borrow_mut();
+        if cache.as_ref().is_none_or(|cached| {
+            cached.key != key
+                || cached
+                    .snapshot_source
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.as_ptr() != Arc::as_ptr(&self.snapshot))
+                || cached.delivery_addresses.as_ref().is_some_and(|addresses| {
+                    addresses.as_ptr() != Arc::as_ptr(&self.agent_addresses)
+                })
+        }) {
+            let mut descriptors = Vec::<virtualized::Descriptor>::new();
+            let mut parts = Vec::new();
+            let mut last = transcript.last;
+            let mut trailing_footer = transcript.trailing_footer;
+            let mut deliveries = false;
+            for (index, turn) in self.turns.iter().enumerate() {
+                self.describe_turn_rows(turn, content_width, true, |row| {
+                    let (mut descriptor, part, rhythm, footer) = match row {
+                        TurnRow::Part {
+                            part,
+                            descriptor,
+                            rhythm,
+                            footer,
+                        } => {
+                            deliveries |= part.is_some_and(|part| {
+                                matches!(part, TurnPart::Prompt(item)
+                                    if matches!(&self.snapshot.items[item].content,
+                                        ItemContent::Delivery { kind, from, sender, summary, body }
+                                            if *kind != chat::DeliveryKind::Notice
+                                                && from.is_empty() && !sender.is_empty()
+                                                && summary.is_empty() && body.is_empty()))
+                            });
+                            (
+                                descriptor,
+                                part.map_or(HistoryPart::Empty, |part| {
+                                    HistoryPart::Turn(index, part)
+                                }),
+                                rhythm,
+                                footer,
+                            )
+                        }
+                        TurnRow::Notice(index) => {
+                            let incident = &incidents[index];
+                            let card =
+                                key.cards[index].expect("a placed notice has a recorded layout");
+                            let anchor = self.find_anchor(&format!("failure:{}", incident.key));
+                            let (descriptor, rhythm) =
+                                self.notice_descriptor(incident, card, anchor);
+                            (descriptor, HistoryPart::Notice(index), Some(rhythm), 0.0)
+                        }
+                        TurnRow::Alias(id) => {
+                            if let Some(last) = descriptors.last_mut() {
+                                last.aliases.push(id);
+                            }
+                            return;
+                        }
+                    };
+                    let position = transcript.children.len() + descriptors.len();
+                    if let Some(gap) =
+                        transcript_gap(last, trailing_footer, rhythm, descriptor.key, position)
+                    {
+                        parts.push(HistoryPart::Gap(gap.estimate));
+                        descriptors.push(gap);
+                    }
+                    if descriptor.key == 0 {
+                        descriptor.key = (transcript.children.len() + descriptors.len()) as u64;
+                    }
+                    descriptors.push(descriptor);
+                    parts.push(part);
+                    if rhythm.is_some() {
+                        last = rhythm;
+                        trailing_footer = footer;
+                    }
+                });
+            }
+            *cache = Some(HistoryRows {
+                key,
+                descriptors: descriptors.into(),
+                parts: parts.into(),
+                last,
+                footer: trailing_footer,
+                snapshot_source: (deliveries
+                    || !self.row_expansions.is_empty()
+                    || !self.find_expanded_rows.is_empty())
+                .then(|| Arc::downgrade(&self.snapshot)),
+                delivery_addresses: deliveries.then(|| Arc::downgrade(&self.agent_addresses)),
+            });
+        }
+        let rows = cache.as_ref().unwrap();
+        let parts = rows.parts.clone();
+        let descriptors = rows.descriptors.clone();
+        let reset_controls = reset_controls.cloned();
+        transcript.body = Some(virtualized::Body {
+            start: transcript.children.len(),
+            rows: descriptors.clone(),
+            revision: Box::new({
+                let parts = parts.clone();
+                let descriptors = descriptors.clone();
+                move |index| {
+                    let descriptor = &descriptors[index];
+                    match parts[index] {
+                        HistoryPart::Turn(turn, part) => self.turn_part_revision(
+                            &self.turns[turn],
+                            part,
+                            descriptor.key,
+                            settings,
+                            dark,
+                        ),
+                        _ => descriptor.revision,
+                    }
+                }
+            }),
+            build: Box::new(move |index, revision| match parts[index] {
+                HistoryPart::Turn(turn, part) => retained::kept(revision, move || {
+                    self.turn_part_view(&self.turns[turn], part, settings)
+                }),
+                HistoryPart::Notice(incident) => self.notice_element(
+                    &incidents[incident],
+                    reset_controls.as_ref(),
+                    &descriptors[index].aliases[0],
+                ),
+                HistoryPart::Empty => widget::Space::new().into(),
+                HistoryPart::Gap(height) => widget::Space::new().height(height).into(),
+            }),
+        });
+        transcript.last = rows.last;
+        transcript.trailing_footer = rows.footer;
+    }
+
+    fn turn_part_revision(
+        &self,
+        turn: &turn::Turn,
+        part: TurnPart,
+        key: u64,
+        settings: markdown::Settings,
+        dark: bool,
+    ) -> u64 {
+        use std::hash::Hash;
+        let items = &self.snapshot.items;
+        let cached = match part {
+            TurnPart::Prompt(index) => self
+                .cache
+                .get(row_cache_key(&self.parent_cache_keys, &items[index])),
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => self.cache.get(row_cache_key(
+                &self.parent_cache_keys,
+                &items[turn.prose[prose].index],
+            )),
+            _ => None,
+        };
+        let mut common = self.turn_common_hasher(turn, dark);
+        prose::inks(&settings.style).hash(&mut common);
+        self.turn_part_fingerprint(turn, part, key, cached, &common, self.source_now_ms())
     }
 
     /// The notices drawn in the main transcript's exchange `turn`.
     fn turn_notices<'s>(
         &'s self,
         turn: &'s turn::Turn,
-    ) -> impl Iterator<Item = &'s failure::Incident> + 's {
-        self.failure_ui.incidents.iter().filter(move |incident| {
-            !incident.active_recovery
-                && incident.child_scope.is_none()
-                && incident.anchor.as_ref() == Some(&turn.key)
-        })
+    ) -> impl Iterator<Item = (usize, &'s failure::Incident)> + 's {
+        self.failure_ui
+            .incidents
+            .iter()
+            .enumerate()
+            .filter(move |(_, incident)| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.as_ref() == Some(&turn.key)
+            })
     }
 
     /// Every item a row of `turn` draws, with its slot, in drawing order.
@@ -6507,10 +6764,7 @@ impl Runtime {
     /// it: those up to the last, in drawing order, that holds an item at or
     /// before the notice's own. A notice with no item of its own follows
     /// them all.
-    pub(super) fn placed_turn_notices<'s>(
-        &'s self,
-        turn: &'s turn::Turn,
-    ) -> Vec<(usize, &'s failure::Incident)> {
+    pub(super) fn placed_turn_notices(&self, turn: &turn::Turn) -> Vec<(usize, usize)> {
         let mut notices = self.turn_notices(turn).peekable();
         if notices.peek().is_none() {
             return Vec::new();
@@ -6522,7 +6776,7 @@ impl Runtime {
             }
         });
         notices
-            .map(|incident| (notice_rows_before(&firsts, incident.at), incident))
+            .map(|(index, incident)| (notice_rows_before(&firsts, incident.at), index))
             .collect()
     }
 
@@ -6547,8 +6801,23 @@ impl Runtime {
         reset_controls: Option<&crate::app::account_ui::resets::Controls>,
         anchor: iced::advanced::widget::Id,
     ) {
-        use std::hash::{Hash, Hasher};
         let (notice, card) = self.failure_notice(incident, reset_controls);
+        let (descriptor, rhythm) = self.notice_descriptor(incident, card, anchor.clone());
+        transcript.push_keyed(
+            (descriptor.key, descriptor.revision, descriptor.estimate),
+            descriptor.aliases,
+            rhythm,
+            widget::container(notice).id(anchor).into(),
+        );
+    }
+
+    fn notice_descriptor(
+        &self,
+        incident: &failure::Incident,
+        card: bool,
+        anchor: iced::advanced::widget::Id,
+    ) -> (virtualized::Descriptor, Rhythm) {
+        use std::hash::{Hash, Hasher};
         let open = self.failure_ui.expanded.contains(&incident.key);
         let mut key = crate::fingerprint::hasher();
         ("notice", &incident.key).hash(&mut key);
@@ -6559,39 +6828,42 @@ impl Runtime {
             (false, true) => 140.0,
             (false, false) => TIMELINE_ROW,
         };
-        transcript.push_keyed(
-            (key.finish(), revision.finish(), estimate),
-            vec![anchor.clone()],
+        (
+            virtualized::Descriptor::new(key.finish(), revision.finish(), estimate, Some(anchor)),
             if card { Rhythm::Opening } else { Rhythm::Line },
-            widget::container(notice).id(anchor).into(),
-        );
+        )
     }
 
-    fn push_turn_rows_with<'a>(
-        &'a self,
-        transcript: &mut VirtualRows<'a>,
-        turn: &'a turn::Turn,
+    fn notice_element(
+        &self,
+        incident: &failure::Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+        anchor: &iced::advanced::widget::Id,
+    ) -> Element<'static, Message> {
+        widget::container(self.failure_notice(incident, reset_controls).0)
+            .id(anchor.clone())
+            .into()
+    }
+
+    fn describe_turn_rows(
+        &self,
+        turn: &turn::Turn,
         content_width: f32,
-        settings: markdown::Settings,
-        dark: bool,
-        notices: Option<Option<&crate::app::account_ui::resets::Controls>>,
+        notices: bool,
+        mut emit: impl FnMut(TurnRow),
     ) {
         use std::hash::{Hash, Hasher};
-        let placed = match notices {
-            Some(_) => self.placed_turn_notices(turn),
-            None => Vec::new(),
+        let placed = if notices {
+            self.placed_turn_notices(turn)
+        } else {
+            Vec::new()
         };
-        let reset_controls = notices.flatten();
-        let push_notices = |transcript: &mut VirtualRows<'a>, before: usize| {
-            for (_, incident) in placed.iter().filter(|(rows, _)| *rows == before) {
-                self.push_notice(transcript, incident, reset_controls);
+        let push_notices = |emit: &mut dyn FnMut(TurnRow), before: usize| {
+            for &(_, index) in placed.iter().filter(|(rows, _)| *rows == before) {
+                emit(TurnRow::Notice(index));
             }
         };
         let items = &self.snapshot.items;
-        let now = self.source_now_ms();
-        let mut common = self.turn_common_hasher(turn, dark);
-        // The rows keep what they were built with, colours included.
-        prose::inks(&settings.style).hash(&mut common);
         // Find reaches an exchange through its first row, whether or not
         // that row is mounted, and so does anything drawn before it.
         // Room for the row's own item too, which is usually all it holds.
@@ -6606,7 +6878,7 @@ impl Runtime {
                     let id = scroll::item_id(&item.id);
                     match rows {
                         0 => leading.push(id),
-                        _ => transcript.alias_last(id),
+                        _ => emit(TurnRow::Alias(id)),
                     }
                     return;
                 }
@@ -6687,41 +6959,34 @@ impl Runtime {
                 (_, None) => TIMELINE_ROW,
             };
             if rows == 0 {
-                push_notices(transcript, 0);
+                push_notices(&mut emit, 0);
             }
             rows += 1;
-            let fingerprint = self.turn_part_fingerprint(turn, part, key, cached, &common, now);
-            transcript.lazy(
-                key,
-                fingerprint,
-                estimate,
-                aliases,
-                Some(rhythm),
+            // The display revision is resolved only when the row mounts
+            // or a new estimate needs comparison with its last measurement.
+            let mut descriptor = virtualized::Descriptor::new(key, 0, estimate, None);
+            descriptor.aliases = aliases;
+            emit(TurnRow::Part {
+                part: Some(part),
+                descriptor,
+                rhythm: Some(rhythm),
                 footer,
-                move || {
-                    retained::kept(fingerprint, move || {
-                        self.turn_part_view(turn, part, settings)
-                    })
-                },
-            );
-            push_notices(transcript, rows);
+            });
+            push_notices(&mut emit, rows);
         });
         if rows == 0 {
-            // An exchange that draws nothing yet is still reached through a
-            // row of its own, which takes no room: the rows around it are
-            // spaced as if it were not there.
+            // Empty exchanges still have a find anchor that takes no space.
             let mut key = crate::fingerprint::hasher();
             (0u8, &turn.key).hash(&mut key);
-            transcript.lazy(
-                key.finish(),
-                common.finish(),
-                0.0,
-                leading,
-                None,
-                0.0,
-                || widget::Space::new().into(),
-            );
-            push_notices(transcript, 0);
+            let mut descriptor = virtualized::Descriptor::new(key.finish(), 0, 0.0, None);
+            descriptor.aliases = leading;
+            emit(TurnRow::Part {
+                part: None,
+                descriptor,
+                rhythm: None,
+                footer: 0.0,
+            });
+            push_notices(&mut emit, 0);
         }
     }
 

@@ -8,7 +8,12 @@ use iced::advanced::{
     widget::{Id, Operation, Tree, operation, tree},
 };
 use iced::{Event, Point, Rectangle, Size, Vector};
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::Cell,
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+    rc::{Rc, Weak},
+};
 
 const OVERSCAN: f32 = 600.0;
 #[cfg(test)]
@@ -82,7 +87,9 @@ impl LogicalRanges {
             })
     }
 }
-pub(super) struct Row<'a> {
+/// Geometry and navigation data that outlives a view. None of it owns a widget.
+#[derive(Clone)]
+pub(super) struct Descriptor {
     pub key: u64,
     pub revision: u64,
     pub estimate: f32,
@@ -90,17 +97,59 @@ pub(super) struct Row<'a> {
     pub anchor: bool,
     pub logical: Option<LogicalRange>,
     pub descendants: LogicalRanges,
+}
+
+impl Descriptor {
+    pub fn new(key: u64, revision: u64, estimate: f32, id: Option<Id>) -> Self {
+        Self {
+            key,
+            revision,
+            estimate,
+            aliases: id.into_iter().collect(),
+            anchor: false,
+            logical: None,
+            descendants: LogicalRanges::default(),
+        }
+    }
+
+    /// Whether this row holds the same place in every index but the offsets.
+    fn same_indexes(&self, other: &Self) -> bool {
+        self.key == other.key
+            && self.anchor == other.anchor
+            && self.aliases == other.aliases
+            && self.logical == other.logical
+            && self.descendants.same(&other.descendants)
+    }
+}
+
+pub(super) struct Row<'a> {
+    descriptor: Descriptor,
     source: Source<'a>,
     content: Option<Element<'a, Message>>,
 }
+
+impl std::ops::Deref for Row<'_> {
+    type Target = Descriptor;
+
+    fn deref(&self) -> &Descriptor {
+        &self.descriptor
+    }
+}
+
+impl std::ops::DerefMut for Row<'_> {
+    fn deref_mut(&mut self) -> &mut Descriptor {
+        &mut self.descriptor
+    }
+}
+
 /// What a row builds its element from.
 enum Source<'a> {
     /// A builder that can run again after the row's tree is evicted.
     Rebuild(Box<dyn Fn() -> Element<'a, Message> + 'a>),
-    /// A builder that runs once; the row keeps the element it built.
+    /// A builder that runs once; the column keeps its element for this view.
     Once(Option<Box<dyn FnOnce() -> Element<'a, Message> + 'a>>),
     /// Empty space of this height, which needs no builder of its own.
-    Space(f32),
+    Space,
 }
 impl<'a> Row<'a> {
     pub fn once(
@@ -111,13 +160,7 @@ impl<'a> Row<'a> {
         build: impl FnOnce() -> Element<'a, Message> + 'a,
     ) -> Self {
         Self {
-            key,
-            revision,
-            estimate,
-            aliases: id.into_iter().collect(),
-            anchor: false,
-            logical: None,
-            descendants: LogicalRanges::default(),
+            descriptor: Descriptor::new(key, revision, estimate, id),
             source: Source::Once(Some(Box::new(build))),
             content: None,
         }
@@ -130,13 +173,7 @@ impl<'a> Row<'a> {
         build: impl Fn() -> Element<'a, Message> + 'a,
     ) -> Self {
         Self {
-            key,
-            revision,
-            estimate,
-            aliases: id.into_iter().collect(),
-            anchor: false,
-            logical: None,
-            descendants: LogicalRanges::default(),
+            descriptor: Descriptor::new(key, revision, estimate, id),
             source: Source::Rebuild(Box::new(build)),
             content: None,
         }
@@ -144,28 +181,21 @@ impl<'a> Row<'a> {
     /// A row of empty space, such as the gap between two other rows.
     pub fn space(key: u64, revision: u64, height: f32) -> Self {
         Self {
-            key,
-            revision,
-            estimate: height,
-            aliases: Vec::new(),
-            anchor: false,
-            logical: None,
-            descendants: LogicalRanges::default(),
-            source: Source::Space(height),
+            descriptor: Descriptor::new(key, revision, height, None),
+            source: Source::Space,
             content: None,
         }
     }
     fn element(&mut self) -> &mut Element<'a, Message> {
-        if self.content.is_none() {
+        self.content.get_or_insert_with(|| {
             #[cfg(test)]
             CONSTRUCTED.with(|count| count.set(count.get() + 1));
-            self.content = Some(match &mut self.source {
+            match &mut self.source {
                 Source::Rebuild(build) => build(),
                 Source::Once(build) => build.take().expect("a static row is built once")(),
-                Source::Space(height) => widget::Space::new().height(*height).into(),
-            });
-        }
-        self.content.as_mut().unwrap()
+                Source::Space => widget::Space::new().height(self.descriptor.estimate).into(),
+            }
+        })
     }
 }
 
@@ -203,8 +233,21 @@ impl Axis {
 }
 
 pub(super) fn column<'a>(rows: Vec<Row<'a>>, window: Window) -> Element<'a, Message> {
+    column_with_body(rows, None, window)
+}
+
+/// Reuses the history descriptions while the rows above and below it can
+/// change independently. The factory reads current view inputs for the rows
+/// that mount, even when the history's shape has stayed the same.
+pub(super) fn column_with_body<'a>(
+    rows: Vec<Row<'a>>,
+    body: Option<Body<'a>>,
+    window: Window,
+) -> Element<'a, Message> {
     Element::new(Column {
         rows,
+        body,
+        body_elements: BTreeMap::new(),
         window,
         revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed),
         axis: Axis::Vertical,
@@ -212,11 +255,21 @@ pub(super) fn column<'a>(rows: Vec<Row<'a>>, window: Window) -> Element<'a, Mess
     })
 }
 
+/// Where the shared history lies among a frame's own rows.
+pub(super) struct Body<'a> {
+    pub start: usize,
+    pub rows: Rc<[Descriptor]>,
+    pub revision: Box<dyn Fn(usize) -> u64 + 'a>,
+    pub build: Box<dyn Fn(usize, u64) -> Element<'a, Message> + 'a>,
+}
+
 /// Horizontal virtualization preserves a physical code line/table row while
 /// only instantiating cells near its horizontal native scroll viewport.
 pub(super) fn row<'a>(rows: Vec<Row<'a>>, height: f32, window: Window) -> Element<'a, Message> {
     Element::new(Column {
         rows,
+        body: None,
+        body_elements: BTreeMap::new(),
         window,
         revision: NEXT_COLUMN.fetch_add(1, Ordering::Relaxed),
         axis: Axis::Horizontal,
@@ -229,7 +282,144 @@ struct Column<'a> {
     cross_estimate: f32,
     revision: u64,
     rows: Vec<Row<'a>>,
+    body: Option<Body<'a>>,
+    body_elements: BTreeMap<usize, (u64, Element<'a, Message>)>,
     window: Window,
+}
+
+impl<'a> Column<'a> {
+    fn len(&self) -> usize {
+        self.rows.len() + self.body.as_ref().map_or(0, |body| body.rows.len())
+    }
+
+    /// A row lives either in the frame's own rows or in the shared slice.
+    fn address(&self, index: usize) -> Result<usize, usize> {
+        if let Some(body) = self.body.as_ref()
+            && let Some(local) = index.checked_sub(body.start)
+        {
+            if local < body.rows.len() {
+                return Err(local);
+            }
+            return Ok(index - body.rows.len());
+        }
+        Ok(index)
+    }
+
+    fn descriptor(&self, index: usize) -> &Descriptor {
+        #[cfg(test)]
+        DESCRIPTORS_READ.with(|count| count.set(count.get() + 1));
+        match self.address(index) {
+            Ok(owned) => &self.rows[owned],
+            Err(shared) => &self.body.as_ref().unwrap().rows[shared],
+        }
+    }
+
+    fn element(&mut self, index: usize) -> (u64, &mut Element<'a, Message>) {
+        match self.address(index) {
+            Ok(owned) => {
+                let row = &mut self.rows[owned];
+                (row.revision, row.element())
+            }
+            Err(shared) => {
+                let (revision, element) = self.body_elements.entry(shared).or_insert_with(|| {
+                    #[cfg(test)]
+                    CONSTRUCTED.with(|count| count.set(count.get() + 1));
+                    let body = self.body.as_ref().unwrap();
+                    let revision = (body.revision)(shared);
+                    (revision, (body.build)(shared, revision))
+                });
+                (*revision, element)
+            }
+        }
+    }
+
+    /// A raw estimate may change before its prepared presentation does.
+    /// While the row still draws the measured revision, keep the measured size.
+    fn corrected_height(&self, index: usize, row: &Descriptor, height: Option<&Height>) -> f32 {
+        let Some(height) = height else {
+            return row.estimate.max(0.0);
+        };
+        let adjusted = height.adjusted(row.estimate);
+        if adjusted == height.height {
+            return height.height;
+        }
+        let revision = match self.address(index) {
+            Ok(_) => row.revision,
+            Err(shared) => (self.body.as_ref().unwrap().revision)(shared),
+        };
+        if revision == height.revision {
+            height.height
+        } else {
+            adjusted
+        }
+    }
+
+    fn refresh_offsets(&self, state: &mut State, range: Range<usize>) {
+        for index in range {
+            let row = self.descriptor(index);
+            let shape = &mut state.shapes[index];
+            let measured = state.heights.get(&row.key);
+            let adjusts = self.address(index).is_err()
+                && measured.is_some_and(|height| height.adjusted(row.estimate) != height.height);
+            let was_adjusted = if adjusts {
+                !state.adjusted_rows.insert(index)
+            } else {
+                state.adjusted_rows.remove(&index)
+            };
+            if adjusts
+                || was_adjusted
+                || shape.revision != row.revision
+                || shape.estimate != row.estimate
+            {
+                shape.revision = row.revision;
+                shape.estimate = row.estimate;
+                state
+                    .offsets
+                    .set(index, self.corrected_height(index, row, measured));
+            }
+        }
+    }
+
+    fn content(&self, index: usize) -> &Element<'a, Message> {
+        match self.address(index) {
+            Ok(owned) => self.rows[owned].content.as_ref().unwrap(),
+            Err(shared) => &self.body_elements[&shared].1,
+        }
+    }
+
+    fn content_mut(&mut self, index: usize) -> &mut Element<'a, Message> {
+        match self.address(index) {
+            Ok(owned) => self.rows[owned].content.as_mut().unwrap(),
+            Err(shared) => &mut self.body_elements.get_mut(&shared).unwrap().1,
+        }
+    }
+
+    fn evict(&mut self, index: usize) {
+        match self.address(index) {
+            Ok(owned) => {
+                let row = &mut self.rows[owned];
+                if !matches!(row.source, Source::Once(_)) {
+                    row.content = None;
+                }
+            }
+            Err(shared) => {
+                self.body_elements.remove(&shared);
+            }
+        }
+    }
+
+    /// Changes outside a retained history slice can be checked on their own
+    /// as long as that history is still at the same indices.
+    fn changed_ranges(&self, previous: Option<&(usize, Weak<[Descriptor]>)>) -> [Range<usize>; 2] {
+        if let (Some(body), Some((start, old_rows))) = (&self.body, previous)
+            && body.start == *start
+            && Weak::ptr_eq(old_rows, &Rc::downgrade(&body.rows))
+        {
+            return [0..body.start, body.start + body.rows.len()..self.len()];
+        }
+        let end = self.len();
+        [0..end, end..end]
+    }
 }
 #[derive(Clone, Copy)]
 struct Height {
@@ -239,51 +429,15 @@ struct Height {
     cross: f32,
 }
 impl Height {
-    fn for_row(&self, row: &Row<'_>) -> f32 {
-        if self.revision == row.revision {
-            self.height
-        } else {
-            (self.height + row.estimate - self.estimate).max(0.0)
-        }
+    fn adjusted(&self, estimate: f32) -> f32 {
+        (self.height + estimate - self.estimate).max(0.0)
     }
 }
 #[cfg(test)]
 thread_local! {
     /// How many times this thread's columns rebuilt every index.
-    static REINDEXES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-/// What a row last gave the column's indexes, so a column rebuilt with the
-/// same rows corrects only the offsets of rows that changed.
-struct Shape {
-    key: u64,
-    anchor: bool,
-    aliases: Vec<Id>,
-    logical: Option<LogicalRange>,
-    descendants: LogicalRanges,
-    revision: u64,
-    estimate: f32,
-}
-impl Shape {
-    fn of(row: &Row<'_>) -> Self {
-        Self {
-            key: row.key,
-            anchor: row.anchor,
-            aliases: row.aliases.clone(),
-            logical: row.logical.clone(),
-            descendants: row.descendants.clone(),
-            revision: row.revision,
-            estimate: row.estimate,
-        }
-    }
-    /// Whether `row` holds the same place in every index but the offsets.
-    fn indexes(&self, row: &Row<'_>) -> bool {
-        self.key == row.key
-            && self.anchor == row.anchor
-            && self.aliases == row.aliases
-            && self.logical == row.logical
-            && self.descendants.same(&row.descendants)
-    }
+    static REINDEXES: Cell<usize> = const { Cell::new(0) };
+    static DESCRIPTORS_READ: Cell<usize> = const { Cell::new(0) };
 }
 
 #[derive(Default)]
@@ -297,7 +451,11 @@ struct State {
     realized: std::ops::Range<usize>,
     offsets: PrefixSums,
     descriptors: u64,
-    shapes: Vec<Shape>,
+    shapes: Vec<Descriptor>,
+    body: Option<(usize, Weak<[Descriptor]>)>,
+    // Only these measured shared rows need their current revision outside the
+    // viewport. A rounded correction can differ even at the same estimate.
+    adjusted_rows: BTreeSet<usize>,
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
@@ -422,54 +580,55 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         // the same rows: a streaming answer changes one row's revision.
         // Rebuilding every index for that is work in the length of the
         // transcript on every frame, so only a changed row is corrected.
+        let changed = self.changed_ranges(state.body.as_ref());
         let reshaped = state.descriptors != self.revision
-            && (state.shapes.len() != self.rows.len()
-                || !self
-                    .rows
-                    .iter()
-                    .zip(&state.shapes)
-                    .all(|(row, shape)| shape.indexes(row)));
+            && (state.shapes.len() != self.len()
+                || !changed
+                    .clone()
+                    .into_iter()
+                    .flatten()
+                    .all(|index| state.shapes[index].same_indexes(self.descriptor(index))));
         if !width_changed && !reshaped && state.descriptors != self.revision {
-            for (index, (row, shape)) in self.rows.iter().zip(&mut state.shapes).enumerate() {
-                if shape.revision != row.revision || shape.estimate != row.estimate {
-                    shape.revision = row.revision;
-                    shape.estimate = row.estimate;
-                    state.offsets.set(
-                        index,
-                        state
-                            .heights
-                            .get(&row.key)
-                            .map_or(row.estimate, |height| height.for_row(row))
-                            .max(0.0),
-                    );
-                }
+            let [before, after] = changed;
+            // Prefix sums use floats. Apply corrections in physical row order
+            // to match the flat layout, including chrome around the shared body.
+            let retained = before.end..after.start;
+            self.refresh_offsets(state, before);
+            for &index in state.adjusted_rows.range(retained) {
+                let row = self.descriptor(index);
+                let measured = state.heights.get(&row.key);
+                state
+                    .offsets
+                    .set(index, self.corrected_height(index, row, measured));
             }
-            state.descriptors = self.revision;
+            self.refresh_offsets(state, after);
         }
         if width_changed || reshaped {
             #[cfg(test)]
             REINDEXES.with(|count| count.set(count.get() + 1));
-            state.shapes = self.rows.iter().map(Shape::of).collect();
-            state.positions = self
-                .rows
+            state.shapes = (0..self.len())
+                .map(|index| self.descriptor(index).clone())
+                .collect();
+            state.positions = state
+                .shapes
                 .iter()
                 .enumerate()
                 .map(|(index, row)| (row.key, index))
                 .collect();
-            state.anchors = self
-                .rows
+            state.anchors = state
+                .shapes
                 .iter()
                 .filter(|row| row.anchor)
                 .map(|row| row.key)
                 .collect();
-            state.aliased = self
-                .rows
+            state.aliased = state
+                .shapes
                 .iter()
                 .enumerate()
                 .filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index))
                 .collect();
             state.logical.clear();
-            for (index, row) in self.rows.iter().enumerate() {
+            for (index, row) in state.shapes.iter().enumerate() {
                 for logical in row.logical.iter().cloned().chain(row.descendants.iter()) {
                     state.logical.entry(logical.identity).or_default().push((
                         logical.bytes.clone(),
@@ -479,8 +638,9 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 }
             }
             // Retain only descriptors still loaded by the transcript window.
-            let keys: HashSet<_> = self.rows.iter().map(|row| row.key).collect();
-            state.heights.retain(|key, _| keys.contains(key));
+            state
+                .heights
+                .retain(|key, _| state.positions.contains_key(key));
             state.cross_extents.clear();
             for measured in state.heights.values() {
                 *state
@@ -488,20 +648,34 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     .entry(measured.cross.to_bits())
                     .or_default() += 1;
             }
+            state.adjusted_rows.clear();
             state.offsets = PrefixSums::new(
-                self.rows
+                state
+                    .shapes
                     .iter()
-                    .map(|row| {
-                        state
-                            .heights
-                            .get(&row.key)
-                            .map_or(row.estimate, |height| height.for_row(row))
-                            .max(0.0)
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let measured = state.heights.get(&row.key);
+                        if self.address(index).is_err()
+                            && measured.is_some_and(|height| {
+                                height.adjusted(row.estimate) != height.height
+                            })
+                        {
+                            state.adjusted_rows.insert(index);
+                        }
+                        self.corrected_height(index, row, measured)
                     })
                     .collect(),
             );
-            state.descriptors = self.revision;
         }
+        if state.descriptors != self.revision {
+            state.descriptors = self.revision;
+            state.body = self
+                .body
+                .as_ref()
+                .map(|body| (body.start, Rc::downgrade(&body.rows)));
+        }
+        let axis = self.axis;
         let mut nodes = Vec::new();
         for _ in 0..3 {
             let total = state.offsets.total();
@@ -534,16 +708,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             nodes.clear();
             let mut changed = false;
             for index in range {
-                let row = &mut self.rows[index];
+                let row = self.descriptor(index);
                 let key = row.key;
-                let revision = row.revision;
                 let estimate = row.estimate;
-                let element = row.element();
+                let (revision, element) = self.element(index);
                 let mut child = previous
                     .remove(&key)
                     .unwrap_or_else(|| Tree::new(&*element));
                 child.diff(element.as_widget_mut());
-                let child_max = match self.axis {
+                let child_max = match axis {
                     Axis::Vertical => Size::new(limits.max().width, f32::INFINITY),
                     Axis::Horizontal => Size::new(f32::INFINITY, f32::INFINITY),
                 };
@@ -566,15 +739,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 let height = self.axis.main(node.size());
                 changed |= (height - state.offsets.values[index]).abs() > 0.5;
                 let cross = self.axis.cross(node.size()).max(0.0);
-                if let Some(previous) = state.heights.insert(
-                    key,
-                    Height {
-                        revision,
-                        height,
-                        estimate,
-                        cross,
-                    },
-                ) && let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits())
+                let measured = Height {
+                    revision,
+                    height,
+                    estimate,
+                    cross,
+                };
+                if let Some(previous) = state.heights.insert(key, measured)
+                    && let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits())
                 {
                     *count -= 1;
                     if *count == 0 {
@@ -583,6 +755,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 }
                 *state.cross_extents.entry(cross.to_bits()).or_default() += 1;
                 state.offsets.set(index, height);
+                if self.address(index).is_err() && measured.adjusted(estimate) != height {
+                    state.adjusted_rows.insert(index);
+                } else {
+                    state.adjusted_rows.remove(&index);
+                }
                 node.move_to_mut(self.axis.point(state.offsets.prefix(index)));
                 nodes.push(node);
                 tree.children.push(child);
@@ -592,10 +769,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             // widget elements or styled fragments once their tree is evicted.
             for key in previous.keys() {
                 if let Some(index) = state.positions.get(key) {
-                    let row = &mut self.rows[*index];
-                    if !matches!(row.source, Source::Once(_)) {
-                        row.content = None;
-                    }
+                    self.evict(*index);
                 }
             }
             if !changed {
@@ -637,7 +811,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         operation.custom(None, layout.bounds(), &mut placeholders);
         if placeholders.visit {
             for &index in &state.aliased {
-                let row = &self.rows[index];
+                let row = self.descriptor(index);
                 for id in &row.aliases {
                     let start = state.offsets.prefix(index);
                     let size = self.axis.size(
@@ -665,17 +839,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 .zip(&mut tree.children)
                 .zip(layout.children())
             {
-                self.rows[*index]
-                    .content
-                    .as_mut()
-                    .unwrap()
-                    .as_widget_mut()
-                    .operate(
-                        child,
-                        child_layout.with_virtual_offset(layout.virtual_offset()),
-                        renderer,
-                        operation,
-                    );
+                self.content_mut(*index).as_widget_mut().operate(
+                    child,
+                    child_layout.with_virtual_offset(layout.virtual_offset()),
+                    renderer,
+                    operation,
+                );
             }
         });
     }
@@ -698,21 +867,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             .zip(layout.children())
         {
             if child_layout.bounds().intersection(viewport).is_some() {
-                self.rows[*index]
-                    .content
-                    .as_mut()
-                    .unwrap()
-                    .as_widget_mut()
-                    .update(
-                        child,
-                        event,
-                        child_layout.with_virtual_offset(layout.virtual_offset()),
-                        cursor,
-                        renderer,
-                        clipboard,
-                        shell,
-                        viewport,
-                    );
+                self.content_mut(*index).as_widget_mut().update(
+                    child,
+                    event,
+                    child_layout.with_virtual_offset(layout.virtual_offset()),
+                    cursor,
+                    renderer,
+                    clipboard,
+                    shell,
+                    viewport,
+                );
             }
         }
     }
@@ -734,20 +898,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             .zip(layout.children())
         {
             if child_layout.bounds().intersection(viewport).is_some() {
-                self.rows[*index]
-                    .content
-                    .as_ref()
-                    .unwrap()
-                    .as_widget()
-                    .draw(
-                        child,
-                        renderer,
-                        theme,
-                        style,
-                        child_layout.with_virtual_offset(layout.virtual_offset()),
-                        cursor,
-                        viewport,
-                    );
+                self.content(*index).as_widget().draw(
+                    child,
+                    renderer,
+                    theme,
+                    style,
+                    child_layout.with_virtual_offset(layout.virtual_offset()),
+                    cursor,
+                    viewport,
+                );
             }
         }
     }
@@ -767,20 +926,13 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
             .zip(layout.children())
             .filter_map(|(((index, _), child), child_layout)| {
                 child_layout.bounds().intersection(viewport)?;
-                Some(
-                    self.rows[*index]
-                        .content
-                        .as_ref()
-                        .unwrap()
-                        .as_widget()
-                        .mouse_interaction(
-                            child,
-                            child_layout.with_virtual_offset(layout.virtual_offset()),
-                            cursor,
-                            viewport,
-                            renderer,
-                        ),
-                )
+                Some(self.content(*index).as_widget().mouse_interaction(
+                    child,
+                    child_layout.with_virtual_offset(layout.virtual_offset()),
+                    cursor,
+                    viewport,
+                    renderer,
+                ))
             })
             .max()
             .unwrap_or_default()
@@ -795,20 +947,36 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
     ) -> Option<overlay::Element<'b, Message, cosmic::Theme, cosmic::Renderer>> {
         let state = tree.state.downcast_ref::<State>();
         let mut overlays = Vec::new();
-        // Rows and trees are disjoint, in the same monotonically increasing order.
-        let mut remaining = self.rows.as_mut_slice();
+        // Each mounted element is borrowed once, in monotonically increasing order.
+        let (start, body_len) = self
+            .body
+            .as_ref()
+            .map_or((0, 0), |body| (body.start, body.rows.len()));
+        let mut owned = self.rows.as_mut_slice();
         let mut offset = 0;
+        let mut shared = self.body_elements.values_mut();
         for (((index, _), child), child_layout) in state
             .mounted
             .iter()
             .zip(&mut tree.children)
             .zip(layout.children())
         {
-            let (_, rest) = remaining.split_at_mut(*index - offset);
-            let (row, rest) = rest.split_first_mut().unwrap();
-            remaining = rest;
-            offset = *index + 1;
-            if let Some(overlay) = row.content.as_mut().unwrap().as_widget_mut().overlay(
+            let element = if (start..start + body_len).contains(index) {
+                // The shared slice owns elements only for mounted rows.
+                &mut shared.next().unwrap().1
+            } else {
+                let position = if *index < start {
+                    *index
+                } else {
+                    *index - body_len
+                };
+                let (_, rest) = owned.split_at_mut(position - offset);
+                let (row, rest) = rest.split_first_mut().unwrap();
+                owned = rest;
+                offset = position + 1;
+                row.content.as_mut().unwrap()
+            };
+            if let Some(overlay) = element.as_widget_mut().overlay(
                 child,
                 child_layout.with_virtual_offset(layout.virtual_offset()),
                 renderer,
@@ -834,16 +1002,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 .zip(&tree.children)
                 .zip(layout.children())
                 .map(|(((index, _), child), child_layout)| {
-                    self.rows[*index]
-                        .content
-                        .as_ref()
-                        .unwrap()
-                        .as_widget()
-                        .a11y_nodes(
-                            child_layout.with_virtual_offset(layout.virtual_offset()),
-                            child,
-                            cursor,
-                        )
+                    self.content(*index).as_widget().a11y_nodes(
+                        child_layout.with_virtual_offset(layout.virtual_offset()),
+                        child,
+                        cursor,
+                    )
                 }),
         )
     }
@@ -1020,7 +1183,211 @@ impl Operation for UpdateViewport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn retained_body_skips_unchanged_offscreen_descriptors() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let viewport = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 300.0,
+            bottom: false,
+        })));
+        let history: Rc<[Descriptor]> = (10..1010)
+            .map(|key| Descriptor::new(key, 0, 40.0, None))
+            .collect();
+        let build = |footer_height: f32| {
+            column_with_body(
+                vec![
+                    Row::space(1, 0, 80.0),
+                    Row::space(2, u64::from(footer_height.to_bits()), footer_height),
+                ],
+                Some(Body {
+                    start: 1,
+                    rows: history.clone(),
+                    revision: Box::new(|_| 0),
+                    build: Box::new(|_, _| widget::Space::new().height(40.0).into()),
+                }),
+                viewport.clone(),
+            )
+        };
+        let mut before = build(24.0);
+        let mut tree = Tree::new(&before);
+        let first = before.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut after = build(48.0);
+        tree.diff(after.as_widget_mut());
+        DESCRIPTORS_READ.with(|count| count.set(0));
+        let second = after.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        assert_eq!(second.size().height, first.size().height + 24.0);
+        assert!(
+            DESCRIPTORS_READ.with(Cell::get) < 100,
+            "layout only reads the mounted rows and changing chrome"
+        );
+    }
+
+    #[test]
+    fn raw_growth_keeps_a_measured_row_until_its_display_revision_changes() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let viewport = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 300.0,
+            bottom: false,
+        })));
+        let rows: Rc<[Descriptor]> = (1..=1000)
+            .map(|key| Descriptor::new(key, 0, 40.0, None))
+            .collect();
+        let build = |rows: Rc<[Descriptor]>, revision| {
+            column_with_body(
+                vec![],
+                Some(Body {
+                    start: 0,
+                    rows,
+                    revision: Box::new(move |index| if index == 0 { revision } else { 0 }),
+                    build: Box::new(|index, _| {
+                        let height = if index == 0 { 180.0 } else { 40.0 };
+                        widget::Space::new().height(height).into()
+                    }),
+                }),
+                viewport.clone(),
+            )
+        };
+        let mut initial = build(rows.clone(), 0);
+        let mut tree = Tree::new(&initial);
+        initial
+            .as_widget_mut()
+            .layout(&mut tree, &renderer, &limits);
+        viewport.set(Some(Viewport {
+            top: 39_000.0,
+            height: 300.0,
+            bottom: false,
+        }));
+        let mut grown = rows.to_vec();
+        grown[0].estimate = 80.0;
+        grown[50].estimate = 80.0;
+        let grown: Rc<[Descriptor]> = grown.into();
+        for (revision, expected) in [(0, 180.0), (1, 220.0)] {
+            let mut view = build(grown.clone(), revision);
+            tree.diff(view.as_widget_mut());
+            view.as_widget_mut().layout(&mut tree, &renderer, &limits);
+            let state = tree.state.downcast_ref::<State>();
+            assert_eq!(state.offsets.values[0], expected);
+            assert_eq!(
+                state.offsets.values[50], 80.0,
+                "an unmeasured row uses its new estimate"
+            );
+        }
+    }
+
+    #[test]
+    fn retained_and_owned_rows_agree_on_the_first_scroll_while_preparing() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut viewport = Viewport {
+            top: 0.0,
+            height: 720.0,
+            bottom: true,
+        };
+        let estimate = |index| {
+            if index == 127 {
+                60.3
+            } else {
+                64.0 + (index % 7) as f32 * 32.0
+            }
+        };
+        let mut owned_tree = None;
+        let mut retained_tree = None;
+        let mut rows: Rc<[Descriptor]> = (0..128)
+            .map(|index| Descriptor::new(index as u64 + 1, 0, estimate(index), None))
+            .collect();
+        for pass in 0..4 {
+            if pass == 1 {
+                let mut changed = rows.to_vec();
+                changed[125].estimate += 96.0;
+                rows = changed.into();
+            }
+            let revision = move |index| u64::from(pass >= 2 && matches!(index, 122 | 125 | 127));
+            let display = move |index, revision| {
+                let height = if index == 127 {
+                    // The original rounded correction differs from this
+                    // height at the same estimate after a revision change.
+                    42.6
+                } else {
+                    estimate(index) + if revision == 1 { 96.0 } else { 0.0 }
+                };
+                widget::Space::new().height(height).into()
+            };
+            let before = 1_060_356.0_f32 + if pass >= 2 { 132.0 } else { 0.0 };
+            let after = if pass >= 2 { 32.3_f32 } else { 18.1 };
+            let chrome = || {
+                [
+                    Row::space(1_001, u64::from(before.to_bits()), before),
+                    Row::space(1_002, u64::from(after.to_bits()), after),
+                ]
+            };
+            let window = Rc::new(Cell::new(Some(viewport)));
+            let [leading, trailing] = chrome();
+            let mut owned = column(
+                std::iter::once(leading)
+                    .chain(rows.iter().enumerate().map(|(index, row)| {
+                        let revision = revision(index);
+                        Row::new(row.key, revision, row.estimate, None, move || {
+                            display(index, revision)
+                        })
+                    }))
+                    .chain(std::iter::once(trailing))
+                    .collect(),
+                window.clone(),
+            );
+            let mut retained = column_with_body(
+                Vec::from(chrome()),
+                Some(Body {
+                    start: 1,
+                    rows: rows.clone(),
+                    revision: Box::new(revision),
+                    build: Box::new(display),
+                }),
+                window,
+            );
+            let owned_tree = owned_tree.get_or_insert_with(|| Tree::new(&owned));
+            let retained_tree = retained_tree.get_or_insert_with(|| Tree::new(&retained));
+            owned_tree.diff(owned.as_widget_mut());
+            retained_tree.diff(retained.as_widget_mut());
+            let owned = owned.as_widget_mut().layout(owned_tree, &renderer, &limits);
+            let retained = retained
+                .as_widget_mut()
+                .layout(retained_tree, &renderer, &limits);
+            let original = owned_tree.state.downcast_ref::<State>();
+            let cached = retained_tree.state.downcast_ref::<State>();
+            assert_eq!(
+                cached.offsets.values, original.offsets.values,
+                "pass {pass}"
+            );
+            assert_eq!(cached.offsets.tree, original.offsets.tree, "pass {pass}");
+            if pass == 2 {
+                let physical = 128;
+                assert_eq!(original.heights[&128].height, 42.6);
+                assert!(!original.realized.contains(&physical));
+                let expected = 42.6_f32 + 60.3_f32 - 60.3_f32;
+                assert_ne!(expected, 42.6);
+                assert_eq!(cached.offsets.values[physical], expected);
+            }
+            assert_eq!(cached.mounted, original.mounted, "pass {pass}");
+            assert_eq!(retained.size(), owned.size(), "pass {pass}");
+            assert!(
+                retained
+                    .children()
+                    .iter()
+                    .map(layout::Node::bounds)
+                    .eq(owned.children().iter().map(layout::Node::bounds)),
+                "mounted row bounds on pass {pass}"
+            );
+            if pass == 1 {
+                viewport.bottom = false;
+                viewport.top = owned.size().height - viewport.height - 3_000.0;
+            }
+        }
+    }
 
     #[test]
     fn measured_shrink_keeps_mounted_flow_until_parent_refresh_and_offscreen_evicts() {
