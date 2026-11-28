@@ -1426,6 +1426,18 @@ class Evidence(unittest.TestCase):
         self.assertFalse(list(state.glob("window-*")))
         self.assertFalse((state / "replaying").exists())
 
+    def test_open_window_proceeds_with_a_shared_slot_observer(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        (self.logs / "runner-exits").touch()
+        lease = self.task / "rt/cagents-development-ui.lock.window-2"
+        with lease.open("w") as observed:
+            fcntl.flock(observed, fcntl.LOCK_SH | fcntl.LOCK_NB)
+            result = self.run_tool("open-window", "window-2", check=False)
+        self.assertIn("before a new window appeared", result.stderr)
+        arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
+        self.assertEqual(arguments[-3:], ["--", "--window", "window-2"])
+
     def test_open_window_cannot_use_the_existing_primary_as_readiness(self) -> None:
         self.built()
         self.run_tool("start", "after")
