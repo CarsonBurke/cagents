@@ -2611,15 +2611,22 @@ impl Cagents {
             model.project_order = order;
             changed = true;
         }
-        for agent in effects.agents {
+        for mut agent in effects.agents {
             if !accepts(MetadataKey::Agent(agent.id)) {
                 continue;
             }
             match model.agents.iter_mut().find(|held| held.id == agent.id) {
-                Some(held) if *held == agent => {}
                 Some(held) => {
-                    *held = agent;
-                    changed = true;
+                    // The command handle is stored for the registry mirror.
+                    // Panes take their title from separate acceptance labels.
+                    // Compare every other field before asking views to settle.
+                    let name = agent.name.take();
+                    held.name = None;
+                    if *held != agent {
+                        *held = agent;
+                        changed = true;
+                    }
+                    held.name = name;
                 }
                 None => {
                     model.agents.push(agent);
