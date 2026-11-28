@@ -243,13 +243,19 @@ fn converse(
 /// recipient takes it.
 fn delivery_json(handed: &Handed) -> Value {
     let delivery = &handed.delivery;
+    let recipient = delivery.recipient.as_ref().map(|member| {
+        let mut recipient = super::sessions::session_json(member, delivery.sent.message.created_ms);
+        // Reach and the listing are sampled separately. Record an exited
+        // entry even if a session of the lineage is now live.
+        if member.exited {
+            recipient["exited"] = json!(true);
+        }
+        recipient
+    });
     json!({
         "message": delivery.sent.message,
         "reach": delivery.sent.reach,
-        "recipient": delivery
-            .recipient
-            .as_ref()
-            .map(|member| super::sessions::session_json(member, delivery.sent.message.created_ms)),
+        "recipient": recipient,
         "notice": notice(handed),
         "agent": handed.agent,
     })
@@ -414,30 +420,33 @@ impl Arrival {
     }
 }
 
+/// Name the live session selected at send time while the pending message
+/// still addresses the lineage. Offline and older receipts use that address.
+pub(super) fn receipt_recipient_label(
+    sent: &Sent,
+    live: Option<(TerminalId, Option<&str>)>,
+) -> String {
+    let to = &sent.message.to;
+    match live {
+        Some((id, title)) if sent.reach != Reach::Offline => Party {
+            lineage: to.lineage,
+            session: Some(id),
+            title: title.map(str::to_owned).or_else(|| to.title.clone()),
+        }
+        .label(),
+        _ => to.label(),
+    }
+}
+
 fn sent_line(delivery: &Delivery, agent: Option<&Handoff>) -> String {
     let sent = &delivery.sent;
     let message = &sent.message;
-    // The pending message addresses a lineage. The listing names the live
-    // session at send time, before any session has received the message.
-    let recipient = delivery
+    let live = delivery
         .recipient
         .as_ref()
-        .filter(|member| !member.exited && sent.reach != Reach::Offline)
-        .map_or_else(
-            || message.to.label(),
-            |member| {
-                Party {
-                    lineage: message.to.lineage,
-                    session: Some(member.session.id),
-                    title: member
-                        .session
-                        .title
-                        .clone()
-                        .or_else(|| message.to.title.clone()),
-                }
-                .label()
-            },
-        );
+        .filter(|member| !member.exited)
+        .map(|member| (member.session.id, member.session.title.as_deref()));
+    let recipient = receipt_recipient_label(sent, live);
     let what = if message.reply_to.is_some() {
         "Replied"
     } else {
@@ -987,6 +996,7 @@ mod tests {
         handed.delivery.recipient.as_mut().unwrap().exited = true;
         let line = delivery_lines(&handed);
         assert!(line.contains("to session 7ced022f;"), "{line}");
+        assert_eq!(delivery_json(&handed)["recipient"]["exited"], json!(true));
     }
 
     #[test]
