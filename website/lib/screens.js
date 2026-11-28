@@ -2,9 +2,7 @@
 // Every screenshot is a real capture of the native app; screens.json names
 // each one's alt text and the themes it was captured in.
 import { readFileSync } from "node:fs";
-
-const escapeHtml = (text) =>
-  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+import { escapeHtml } from "./html.js";
 
 // The pixel size of a WebP, from its VP8, VP8L or VP8X header.
 export function webpSize(bytes) {
@@ -59,19 +57,30 @@ export function pictureHtml(screen, { eager = false } = {}) {
   const img = `<img src="/${screen.files[primary]}.webp" width="${screen.width}" height="${screen.height}" alt="${escapeHtml(screen.alt)}" decoding="async" ${loading} />`;
   const caption = screen.caption ? `<figcaption>${escapeHtml(screen.caption)}</figcaption>` : "";
   const icon = `<svg class="shot-expand-icon" viewBox="-4 -4 24 24" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
-  return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture>${sources.join("")}${img}</picture>${icon}</a>${caption}`;
+  return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture data-themes="${screen.themes.join(" ")}">${sources.join("")}${img}</picture>${icon}</a>${caption}`;
+}
+
+// The themes every screenshot on the page was captured in. A reader sees the
+// app in one theme throughout: until each capture has a light variant, light
+// mode shows the dark captures too, rather than mixing dark and light app
+// windows on one page.
+// Dark comes first, as the fallback, whatever order screens.json lists.
+export function sharedThemes(names, screens) {
+  const themes = ["dark", "light"].filter((theme) => names.every((name) => screens[name].themes.includes(theme)));
+  if (!themes.length) throw new Error(`the page's screenshots share no theme: ${names.join(", ")}`);
+  return themes;
 }
 
 export function renderPage(html, { screens }) {
-  const used = new Set();
-  const out = html
-    .replace(/<!--screenshot:([a-z0-9-]+)(:eager)?-->/g, (_, name, eager) => {
-      const screen = screens[name];
-      if (!screen) throw new Error(`index.html names screenshot ${name}, which screens.json does not list`);
-      used.add(name);
-      return pictureHtml(screen, { eager: Boolean(eager) });
-    });
-  const unused = Object.keys(screens).filter((name) => !used.has(name));
+  const marker = /<!--screenshot:([a-z0-9-]+)(:eager)?-->/g;
+  const names = [...html.matchAll(marker)].map(([, name]) => name);
+  for (const name of names) {
+    if (!screens[name]) throw new Error(`index.html names screenshot ${name}, which screens.json does not list`);
+  }
+  const unused = Object.keys(screens).filter((name) => !names.includes(name));
   if (unused.length) throw new Error(`screens.json lists screenshots the page doesn't show: ${unused.join(", ")}`);
-  return out;
+  const themes = sharedThemes(names, screens);
+  return html.replace(marker, (_, name, eager) =>
+    pictureHtml({ ...screens[name], themes }, { eager: Boolean(eager) }),
+  );
 }
