@@ -2991,34 +2991,11 @@ fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
         if let Err(error) = message.write(&mut codec, &mut stream) {
             // Queued frames cannot be delivered, so there is nothing to drain
             // and the peer only sees the EOF below; `abort` records why.
-            delivery.abort(write_failure(&error));
+            delivery.abort(error);
             break;
         }
     }
     let _ = stream.shutdown(Shutdown::Both);
-}
-
-/// Why a frame never reached the client, in the words the daemon log uses.
-fn write_failure(error: &FrameError) -> String {
-    match error {
-        FrameError::Io(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
-            ) =>
-        {
-            "the client socket could not be written within its send timeout".to_owned()
-        }
-        FrameError::Io(error)
-            if matches!(
-                error.kind(),
-                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
-            ) =>
-        {
-            "the client closed its connection".to_owned()
-        }
-        error => format!("a frame could not be written to the client: {error}"),
-    }
 }
 
 #[cfg(test)]

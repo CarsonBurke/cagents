@@ -3117,7 +3117,7 @@ mod tests {
         let received = |delivery: &DeliveryQueue| {
             delivery.close_after_drain();
             std::iter::from_fn(|| delivery.pop())
-                .map(|outbound| match outbound.message {
+                .map(|outbound| match outbound.into_message() {
                     ServerMessage::WorkBoard { revision, board } => {
                         (revision, board.stale_after_days)
                     }

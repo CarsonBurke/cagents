@@ -261,7 +261,7 @@ mod reconnect_output {
         .unwrap();
         let delivery = host.lock().unwrap().clients[&2].clone();
         let redraw = (0..delivery.queued())
-            .filter_map(|_| match delivery.pop().unwrap().message {
+            .filter_map(|_| match delivery.pop().unwrap().into_message() {
                 ServerMessage::Redraw { generation, .. } => Some(generation),
                 _ => None,
             })
@@ -3567,7 +3567,7 @@ fn spawning_announces_the_terminal_to_observers_but_never_to_its_creator() {
     let announced = |delivery: &Arc<DeliveryQueue>| {
         delivery.close_after_drain();
         std::iter::from_fn(|| delivery.pop())
-            .filter_map(|queued| match queued.message {
+            .filter_map(|queued| match queued.into_message() {
                 ServerMessage::TerminalCreated { terminal } => Some(terminal),
                 _ => None,
             })
@@ -3997,10 +3997,11 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     let mut editor = ModelSocket::connect(&host, 1);
     let mut watcher = ModelSocket::connect(&host, 2);
     let mut unsubscribed = ModelSocket::connect(&host, 3);
-    // Both windows watch, so the origin exclusion is exercised independently
-    // of subscription. Each reply is the new atomic snapshot with closed ids.
+    let mut peer = ModelSocket::connect(&host, 4);
+    // The editor also watches, so origin exclusion is independent of
+    // subscription. Each watcher starts from the same atomic snapshot.
     let mut identity = None;
-    for window in [&mut editor, &mut watcher] {
+    for window in [&mut editor, &mut watcher, &mut peer] {
         let ServerResponse::WorkspaceSnapshot { model, closed } =
             window.request(ClientRequest::WatchWorkspaceModel)
         else {
@@ -4085,6 +4086,7 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     assert_eq!(removed.effects.closed, [pane.id]);
 
     let observed = (0..4).map(|_| watcher.edge()).collect::<Vec<_>>();
+    assert_eq!(observed, (0..4).map(|_| peer.edge()).collect::<Vec<_>>());
     assert_eq!(observed[0].0, opened.sequence);
     assert_eq!(observed[0].1, open);
     assert_eq!(observed[0].2.projects, opened.projects);

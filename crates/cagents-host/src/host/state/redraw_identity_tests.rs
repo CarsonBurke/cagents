@@ -258,7 +258,7 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
         delivery.close_after_drain();
         let mut frames = Vec::new();
         while let Some(message) = delivery.pop() {
-            if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+            if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
                 frames.push(snapshot.generation);
             }
         }
@@ -302,7 +302,7 @@ fn unbound_wake_never_borrows_a_resident_worker_and_binding_does_not_retain_it()
     delivery.close_after_drain();
     let mut frames = Vec::new();
     while let Some(message) = delivery.pop() {
-        if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+        if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
             frames.push(snapshot.generation);
         }
     }
@@ -332,7 +332,7 @@ fn a_busy_host_keeps_one_latest_redraw_without_granting_capture_credit() {
     delivery.close_after_drain();
     let mut generations = Vec::new();
     while let Some(message) = delivery.pop() {
-        if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+        if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
             generations.push(snapshot.generation);
         }
     }
@@ -389,7 +389,7 @@ fn retiring_events_follow_the_published_grid_even_with_a_pending_wake() {
 
         let mut order = Vec::new();
         while let Some(message) = delivery.pop() {
-            match message.message {
+            match message.into_message() {
                 ServerMessage::Snapshot { snapshot, .. } => {
                     assert_eq!(snapshot.generation, 3);
                     order.push("grid");

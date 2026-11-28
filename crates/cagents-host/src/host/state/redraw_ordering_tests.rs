@@ -193,7 +193,7 @@ fn replay(delivery: &DeliveryQueue, id: TerminalId, mut snapshot_pending: bool) 
     };
     while let Some(message) = delivery.pop() {
         let reply = message.wire().request_id.is_some();
-        let snapshot = match message.message {
+        let snapshot = match message.into_message() {
             ServerMessage::Snapshot {
                 terminal_id,
                 snapshot,
@@ -453,9 +453,9 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
     for reply_queued_first in [false, true] {
         let mut fixture = Fixture::new();
         fixture.change(0, "reply");
-        let reply = fixture.reply(1);
+        let mut reply = Some(fixture.reply(1));
         if reply_queued_first {
-            fixture.delivery.push(reply.clone()).unwrap();
+            fixture.delivery.push(reply.take().unwrap()).unwrap();
         }
         let generation = fixture.change(1, "push");
         broadcast_redraw(
@@ -464,7 +464,7 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
             generation,
             &fixture.stream.handle,
         );
-        if !reply_queued_first {
+        if let Some(reply) = reply {
             fixture.delivery.push(reply).unwrap();
         }
         let replay = replay(&fixture.delivery, fixture.id, true);
@@ -549,7 +549,7 @@ fn a_frame_encoded_for_a_retired_worker_never_reaches_a_same_id_successor() {
     fixture.delivery.close_after_drain();
     let mut after_successor = None;
     while let Some(message) = fixture.delivery.pop() {
-        match message.message {
+        match message.into_message() {
             ServerMessage::Snapshot { terminal_id, .. } if terminal_id == fixture.id => {
                 after_successor = Some(Vec::new());
             }
@@ -799,8 +799,8 @@ fn a_redraw_overflowing_a_slow_client_frees_nothing_under_the_host_lock() {
     );
     let notice = fixture.delivery.pop().unwrap();
     assert!(matches!(
-        notice.message,
-        ServerMessage::Error(ref error) if error.code == ProtocolErrorCode::QueueFull
+        notice.wire().message,
+        ServerMessage::Error(error) if error.code == ProtocolErrorCode::QueueFull
     ));
     drop(notice);
     assert!(fixture.delivery.pop().is_none());

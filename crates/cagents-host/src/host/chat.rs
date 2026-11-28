@@ -56,6 +56,7 @@ mod startup_tests;
 #[cfg(test)]
 mod unserved_resume_tests;
 pub(super) mod upgrade_resolution;
+use super::delivery::{Outbound, publish};
 use crate::{
     agent::Provider,
     chat::{
@@ -638,7 +639,6 @@ fn changed_for_instance(
         }
         return;
     }
-    let proof = state.proof().clone();
     if matches!(update, Update::Activity { .. }) {
         state.tally_updates.notify_one();
         if let Some(work) = &state.work {
@@ -705,6 +705,7 @@ fn changed_for_instance(
         }
         return;
     }
+    let proof = state.proof_handle();
     let HostState { chats, clients, .. } = &mut *state;
     let Some(record) = chats.get_mut(&id) else {
         return;
@@ -719,71 +720,75 @@ fn changed_for_instance(
     let queue_ended =
         (completed && !record.returning_terminal && !record.handle.is_read_only_history())
             .then(|| record.current_session());
-    for (&client, &visible) in &record.subscribers {
-        if let Some(source) = &queue_ended
-            && let Some(delivery) = clients.get(&client)
-        {
-            let _ = delivery.push(ServerEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof: proof.clone(),
-                message: ServerMessage::ChatQueueEnded {
-                    source: source.clone(),
-                    execution: record.execution_instance,
-                    current: true,
-                },
-            });
+    if let Update::Observed { generation } = &update {
+        // This update uses each hidden subscriber's own observation epoch.
+        for (&client, &visible) in &record.subscribers {
+            let delivery = clients.get(&client);
+            if let (Some(source), Some(delivery)) = (&queue_ended, delivery) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &proof,
+                    ServerMessage::ChatQueueEnded {
+                        source: source.clone(),
+                        execution: record.execution_instance,
+                        current: true,
+                    },
+                ));
+            }
+            if !visible {
+                let observation = record.observations.entry(client).or_default();
+                if observation.accepts(*generation)
+                    && let Some(delivery) = delivery
+                    && delivery
+                        .push(Outbound::broadcast(
+                            &proof,
+                            ServerMessage::ChatObserved {
+                                chat_id: id,
+                                epoch: observation.epoch,
+                            },
+                        ))
+                        .is_ok()
+                {
+                    observation.notified = true;
+                }
+            }
         }
+    } else if !record.subscribers.is_empty() {
+        let presentation = matches!(update, Update::Presentation);
+        let deliveries = record
+            .subscribers
+            .iter()
+            .filter(|&(_, &visible)| visible || !presentation)
+            .filter_map(|(client, _)| clients.get(client).map(Arc::as_ref));
         let message = match &update {
-            &Update::Activity { state, generation } => ServerMessage::ChatActivity {
+            &Update::Activity { state, generation } => Some(ServerMessage::ChatActivity {
                 chat_id: id,
                 state,
                 generation,
-            },
-            Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
-            &Update::Observed { generation } if !visible => {
-                let observation = record.observations.entry(client).or_default();
-                if !observation.accepts(generation) {
-                    continue;
-                }
-                ServerMessage::ChatObserved {
-                    chat_id: id,
-                    epoch: observation.epoch,
-                }
-            }
-            // Every surface keeps the account's figures, whether or not it
-            // is showing this conversation.
+            }),
+            Update::Presentation => Some(ServerMessage::ChatChanged { chat_id: id }),
+            // Every surface keeps these values, whether or not it shows this
+            // conversation, since it learns of them only as they change.
             Update::AccountUsage {
                 report,
                 observed_at,
-            } => ServerMessage::ChatAccountUsage {
+            } => Some(ServerMessage::ChatAccountUsage {
                 chat_id: id,
                 report: report.clone(),
                 observed_at: *observed_at,
-            },
-            // Every surface keeps them, whether or not it is showing this
-            // conversation, since it learns of them only as they change.
-            Update::AgentAddresses(addresses) => ServerMessage::ChatAgentAddresses {
+            }),
+            Update::AgentAddresses(addresses) => Some(ServerMessage::ChatAgentAddresses {
                 chat_id: id,
                 addresses: addresses.clone(),
-            },
-            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+            }),
+            Update::ActiveModel { revision, model } => Some(ServerMessage::ChatActiveModel {
                 chat_id: id,
                 revision: *revision,
                 model: model.clone(),
-            },
-            _ => continue,
+            }),
+            _ => None,
         };
-        if let Some(delivery) = clients.get(&client) {
-            let delivered = delivery.push(ServerEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof: proof.clone(),
-                message,
-            });
-            if matches!(update, Update::Observed { .. }) && delivered.is_ok() {
-                record.observations.entry(client).or_default().notified = true;
-            }
+        if let Some(message) = message {
+            publish(&proof, deliveries, || message);
         }
     }
     // An old producer callback can consume the shared rearm after an ACK but
