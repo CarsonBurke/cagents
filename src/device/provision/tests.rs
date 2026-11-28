@@ -96,7 +96,9 @@ fn apple_silicon_uses_the_verified_release_route_or_the_installer() {
         }
     );
     assert_eq!(
-        plan_mac(&remote, &Daemon::Compatible).unwrap().action,
+        plan_mac(&remote, &Daemon::Compatible(OURS.version.into()))
+            .unwrap()
+            .action,
         Action::Nothing
     );
     assert!(plan_mac(&remote, &Daemon::Speaks(PROTOCOL_VERSION + 1)).is_err());
@@ -231,7 +233,10 @@ fn a_build_already_on_the_device_is_not_sent_again() {
 #[test]
 fn a_compatible_device_is_left_alone() {
     let remote = installed("0.2.4+local.old");
-    assert_eq!(action(&remote, &Daemon::Compatible), Action::Nothing);
+    assert_eq!(
+        action(&remote, &Daemon::Compatible(OURS.version.into())),
+        Action::Nothing
+    );
     let mut stopped = remote;
     stopped.protocol = Some(PROTOCOL_VERSION);
     assert_eq!(action(&stopped, &Daemon::Stopped), Action::Nothing);
@@ -591,4 +596,44 @@ fn glibc_requirements_come_from_an_executables_version_needs() {
     assert!(glibc_versions(script.path()).unwrap().is_empty());
     assert_eq!(parse_version("2.41"), Some(vec![2, 41]));
     assert!(vec![2, 9] < vec![2, 41]);
+}
+
+#[test]
+fn update_verifies_the_exact_running_build_even_when_protocol_matches() {
+    let device = device("cagents");
+    let verify = |reported: &str| {
+        verify_update(
+            &device,
+            OURS.version,
+            Daemon::Compatible(reported.into()),
+            || panic!("a running daemon confirms its own version"),
+        )
+    };
+    assert!(verify(OURS.version).is_ok());
+    let error = verify("0.2.4+local.old").unwrap_err().to_string();
+    assert!(error.contains("0.2.4+local.old"), "{error}");
+    assert!(error.contains(OURS.version), "{error}");
+}
+
+#[test]
+fn a_stopped_updated_device_must_select_the_matching_installer_build() {
+    for (current, protocol, marked, pinned) in [
+        (OURS.version, PROTOCOL_VERSION, true, false),
+        ("0.2.4+local.old", PROTOCOL_VERSION, true, false),
+        (OURS.version, PROTOCOL_VERSION - 1, true, false),
+        (OURS.version, PROTOCOL_VERSION, false, false),
+        (OURS.version, PROTOCOL_VERSION, true, true),
+    ] {
+        let mut remote = installed(current);
+        remote.protocol = Some(protocol);
+        remote.installation.as_mut().unwrap().marked = marked;
+        if pinned {
+            remote.resolved = installed("0.2.4+local.old").resolved;
+        }
+        let expected = marked && !pinned && protocol == PROTOCOL_VERSION && current == OURS.version;
+        let result = verify_update(&device("cagents"), OURS.version, Daemon::Stopped, || {
+            Ok(remote)
+        });
+        assert_eq!(result.is_ok(), expected, "{result:?}");
+    }
 }

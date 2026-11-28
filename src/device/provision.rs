@@ -76,7 +76,7 @@ pub enum Step<'a> {
 /// The device's daemon, as seen through its bridge without starting it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Daemon {
-    Compatible,
+    Compatible(String),
     Speaks(u16),
     Stopped,
     /// It could not be reached for another reason; the device's own update
@@ -160,7 +160,7 @@ pub fn update(
     let sent = match &plan.action {
         Action::Nothing => {
             return Ok(Outcome::AlreadyCompatible {
-                running: daemon == Daemon::Compatible,
+                running: matches!(daemon, Daemon::Compatible(_)),
             });
         }
         Action::Upgrade { .. } | Action::MacRelease { .. } => None,
@@ -172,6 +172,12 @@ pub fn update(
     };
     let cli = match plan.action {
         Action::Install { upgrade: false, .. } => {
+            progress(Step::Verifying);
+            verify_selected_installation(
+                device,
+                &local.version,
+                Remote::probe(&session, device, &local.version)?,
+            )?;
             return Ok(Outcome::Installed {
                 sent: sent.unwrap_or_default(),
             });
@@ -188,40 +194,59 @@ pub fn update(
         .map(|(version, digest)| (version.as_str(), digest.as_str()));
     session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
-    let updated = || Outcome::Updated {
+    let version = release.map_or(local.version.as_str(), |(version, _)| version);
+    verify_update(device, version, daemon_state(), || {
+        Remote::probe(&session, device, version)
+    })?;
+    Ok(Outcome::Updated {
         sent,
-        version: release
-            .map_or(local.version.as_str(), |(version, _)| version)
-            .to_owned(),
-    };
-    match (daemon_state(), release) {
-        (Daemon::Stopped, Some((version, _))) => {
-            let selected = Remote::probe(&session, device, version)?;
-            if selected.protocol == Some(PROTOCOL_VERSION)
-                && selected
-                    .installation
-                    .and_then(|found| found.current)
-                    .as_deref()
-                    == Some(version)
-            {
-                Ok(updated())
-            } else {
-                Err(io::Error::other(format!(
-                    "Could not verify the installed update on {}",
-                    device.name
-                )))
-            }
-        }
-        (Daemon::Compatible | Daemon::Stopped, _) => Ok(updated()),
-        (Daemon::Speaks(actual), _) => Err(io::Error::other(format!(
-            "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs.",
-            name = device.name
+        version: version.to_owned(),
+    })
+}
+
+fn verify_update(
+    device: &Device,
+    version: &str,
+    daemon: Daemon,
+    probe: impl FnOnce() -> io::Result<Remote>,
+) -> io::Result<()> {
+    let name = &device.name;
+    match daemon {
+        Daemon::Stopped => verify_selected_installation(device, version, probe()?),
+        Daemon::Compatible(actual) if actual == version => Ok(()),
+        Daemon::Compatible(actual) => Err(io::Error::other(format!(
+            "{name} still runs cagents {actual} after the update to {version}. Run `cagents --device {name} daemon status` to inspect the serving daemon."
         ))),
-        (Daemon::Unknown(error), _) => Err(io::Error::other(format!(
-            "{name}'s update finished, but this computer could not reach its daemon: {error}",
-            name = device.name
+        Daemon::Speaks(actual) => Err(io::Error::other(format!(
+            "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs."
+        ))),
+        Daemon::Unknown(error) => Err(io::Error::other(format!(
+            "{name}'s update finished, but this computer could not reach its daemon: {error}"
         ))),
     }
+}
+
+fn verify_selected_installation(
+    device: &Device,
+    version: &str,
+    selected: Remote,
+) -> io::Result<()> {
+    if selected.protocol == Some(PROTOCOL_VERSION)
+        && selected.installation.as_ref().is_some_and(|installation| {
+            installation.marked
+                && installation.current.as_deref() == Some(version)
+                && selected.resolved.as_deref()
+                    == Some(
+                        format!("{}/versions/{version}/bin/cagents", installation.prefix).as_str(),
+                    )
+        })
+    {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "Could not verify that {} selected cagents {version}. Check that its SSH executable ({}) resolves to the installer-selected build.",
+        device.name, device.executable,
+    )))
 }
 
 fn verify_mac_release(
@@ -582,7 +607,7 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
     let version = local.version();
     let refuse = |message: String| Err(io::Error::new(io::ErrorKind::Unsupported, message));
     match daemon {
-        Daemon::Compatible => {
+        Daemon::Compatible(_) => {
             return Ok(Plan {
                 action: Action::Nothing,
                 note: None,
@@ -771,7 +796,10 @@ fn daemon_state() -> Daemon {
         Err(error) => return Daemon::Unknown(error.to_string()),
     };
     match crate::control::ControlClient::connect(&socket) {
-        Ok(_) => Daemon::Compatible,
+        Ok(mut client) => match client.daemon_version() {
+            Ok(version) => Daemon::Compatible(version),
+            Err(error) => Daemon::Unknown(error.to_string()),
+        },
         Err(crate::control::ControlError::UnsupportedVersion { actual }) => Daemon::Speaks(actual),
         Err(_) if super::existing_daemon_missing() => Daemon::Stopped,
         Err(error) => Daemon::Unknown(error.to_string()),
