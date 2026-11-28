@@ -7297,18 +7297,31 @@ fn a_message_to_a_settled_agent_starts_a_run_with_it() {
 
 #[test]
 fn an_update_keeps_a_sent_message_pending_until_delivery_can_resume() {
+    if isolated("an_update_keeps_a_sent_message_pending_until_delivery_can_resume").is_some() {
+        return;
+    }
+    assert_update_defers_delivery(true);
+}
+
+#[test]
+fn an_update_defers_direct_agent_work_without_a_courier() {
+    if isolated("an_update_defers_direct_agent_work_without_a_courier").is_some() {
+        return;
+    }
+    assert_update_defers_delivery(false);
+}
+
+fn assert_update_defers_delivery(start_courier: bool) {
     use crate::{
         agent_execution::mailbox::{Handoff, Outgoing, State as Delivery, To},
         terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
     };
-    if isolated("an_update_keeps_a_sent_message_pending_until_delivery_can_resume").is_some() {
-        return;
-    }
     let (host, request, path) = fixture();
     let root = path.parent().unwrap();
     let first = submit(&host, &Authority::default(), request.clone()).unwrap();
     assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
-    let courier = mailbox::Courier::start_with_update_fence(&host).unwrap();
+    let courier = start_courier.then(|| mailbox::Courier::start_with_update_fence(&host).unwrap());
+    assert_eq!(host.lock().unwrap().mailbox.is_some(), start_courier);
     let agent_request = |operation| {
         crate::host::client::process_request(
             &host,
@@ -7360,6 +7373,8 @@ fn an_update_keeps_a_sent_message_pending_until_delivery_can_resume() {
             .unwrap()
             .1
     };
+    let courier =
+        courier.unwrap_or_else(|| mailbox::Courier::start_with_update_fence(&host).unwrap());
     courier.wake_and_wait_for_scan();
     assert_eq!(message().state, Delivery::Pending);
     assert_eq!(latest().id, first.run.id);

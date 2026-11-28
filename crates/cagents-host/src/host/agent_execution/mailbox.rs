@@ -201,7 +201,12 @@ pub(super) fn defers_for_update(host: &SharedHost) -> bool {
         .unwrap_or_else(|p| p.into_inner())
         .mailbox
         .clone();
-    courier.is_some_and(|courier| courier.defers_for_update())
+    // A daemon can serve requests after recovery without a background courier.
+    // Synchronous admission still has to honor the launch fence.
+    courier.as_ref().map_or_else(
+        crate::instance::update_in_progress,
+        Handle::defers_for_update,
+    )
 }
 
 /// Leaves a message as `post` does, and has an agent cagents hosts take it as
