@@ -3,6 +3,7 @@
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
 - [macOS](#macos)
+- [Android](#android)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Signing](#signing)
@@ -93,6 +94,8 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-ceditor`
 - with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
   `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
+- with an [Android build](#android), `cagents-android-${VERSION}.apk`,
+  `cagents-android.apk`, and `SHA256SUMS-android`, which covers both names
 - `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
 - `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
@@ -223,6 +226,105 @@ and smoke-tests macOS on the selected host. Cut still requires the passing
 fw16 verdict and Linux bundle for that same commit. When cut waits for main's
 tip and the exact tip already has a passing test verdict, it prepares macOS
 while waiting for the Linux bundle.
+
+## Android
+
+The Android companion ships with local releases that include `--android-assets`.
+Once the public download is enabled, include the APKs in every new latest release
+so the [stable download link](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-android.apk)
+keeps working. Use the local release path for Android.
+
+### Set up Android signing on fw16
+
+The release operator provisions the Android signing key for `dev.cagents.mobile`
+once. Use a private directory outside Git, owned by the build user with mode
+`0700`. The packager reads a PKCS#12 keystore named `release.p12` with the key
+alias `cagents-android`, a one-line password in `store.pass`, and the pinned
+certificate fingerprint in `signer.sha256`. Give all three files mode `0600`.
+Android uses this key for in-place app upgrades. Release metadata uses its
+own signing key.
+
+Run this once from a private Bash shell on fw16 with JDK 21. It prompts for a
+new keystore password and refuses to overwrite an existing signing directory.
+
+```sh
+(
+  set -euo pipefail
+  umask 077
+  signing_dir="$HOME/.config/cagents/android-signing"
+  mkdir -p -- "$(dirname -- "$signing_dir")"
+  mkdir -m 700 -- "$signing_dir"
+  cd -- "$signing_dir"
+  read -r -s -p 'Android keystore password: ' android_password
+  printf '\n'
+  printf '%s\n' "$android_password" > store.pass
+  unset android_password
+  keytool -genkeypair -storetype PKCS12 -keystore release.p12 \
+    -storepass:file store.pass -alias cagents-android -keyalg RSA \
+    -keysize 3072 -validity 10000 -dname 'CN=Cagents Android Release'
+  keytool -exportcert -storetype PKCS12 -keystore release.p12 \
+    -storepass:file store.pass -alias cagents-android |
+    sha256sum | cut -d ' ' -f 1 > signer.sha256
+)
+```
+
+Keep an encrypted backup of the keystore and retain its password separately.
+Keep a trusted copy of the public fingerprint on the release workstation.
+Recover the same key and certificate when moving build hosts or changing
+keystore protection. A change of signing key requires an [Android signing
+lineage](https://developer.android.com/tools/apksigner) created while the old
+key is still available. Qualify that migration on the supported Android
+versions and update the packager and verifier together before changing the
+pin. Losing the key without a lineage leaves existing users with a reinstall
+and fresh pairing.
+
+### Build and attach the APKs
+
+Choose the exact trusted commit whose Linux bundle you will cut. On fw16,
+run from a checkout containing that commit with Python 3.11+, JDK 21, and the
+Android SDK configured as for `mobile:build`. Packaging and offline
+verification use Build Tools 36.0.0 under `ANDROID_HOME` (by default
+`~/Android/Sdk`). Set `CAGENTS_ANDROID_BUILD_TOOLS` to an absolute Build Tools
+directory to select another installation.
+
+```sh
+mise run mobile:release -- --ref "$sha" \
+  --signing-dir "$HOME/.config/cagents/android-signing" \
+  --output "/var/tmp/cagents-android-$sha"
+```
+
+Gradle creates the unsigned release APK from the exported commit. The
+packager checks the keystore against the pinned certificate, signs with
+`apksigner`, then verifies the signature and the APK's production package
+ID and version. The APK gets `versionName` from the Cargo release version and
+`versionCode` from `MAJOR * 1000000 + MINOR * 1000 + PATCH`. Minor and patch
+must be below 1000 and the result must be in Android's supported range.
+
+Copy the output directory, including its build receipt, from fw16 to the
+release workstation over SSH. The release workstation needs Python 3.11+,
+Java and the SDK Build Tools for offline APK verification. When you set it
+up, copy only the public fingerprint from the signing directory over an
+authenticated SSH connection and keep that trusted copy for future releases.
+
+```sh
+mkdir -p "$HOME/.config/cagents"
+scp fw16:.config/cagents/android-signing/signer.sha256 "$HOME/.config/cagents/android-signer.sha256"
+```
+
+For each cut, use that fingerprint to verify the supplied APKs.
+
+```sh
+scp -r "fw16:/var/tmp/cagents-android-$sha" /var/tmp/
+export CAGENTS_ANDROID_SIGNER_SHA256="$(cat "$HOME/.config/cagents/android-signer.sha256")"
+mise run release -- cut --commit "$sha" --android-assets "/var/tmp/cagents-android-$sha"
+```
+
+`release build VERSION` also takes `--android-assets`. Both commands
+require the build receipt to match the selected source commit, verify the
+APK and both checksums, then add the three assets to release metadata.
+`release:verify` checks the APKs offline using the same public fingerprint.
+See [Install on Android](../mobile/README.md#install-on-android) for sideloading
+and moving from the debug-key preview.
 
 ## Native platform roadmap
 
