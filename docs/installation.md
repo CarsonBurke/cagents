@@ -5,6 +5,7 @@
 - [Convenience install](#convenience-install)
 - [Debian packages](#debian-packages)
 - [Portable archive](#portable-archive)
+- [Install on Apple Silicon macOS](#install-on-apple-silicon-macos)
 - [What the installer does](#what-the-installer-does)
 - [Updating](#updating)
 - [Uninstall or purge](#uninstall-or-purge)
@@ -21,9 +22,11 @@ refuse there even when you type them yourself.
 
 ## Requirements
 
-The supported release target is **Linux x86_64 with glibc**, built on Ubuntu
-22.04, running in a **Wayland** session. X11, musl, ARM, and other operating
-systems or package formats are not supported yet. A normal graphical login
+The main release target is **Linux x86_64 with glibc**, built on Ubuntu
+22.04, running in a **Wayland** session. From 0.2.4, releases also include a
+preview build for **Apple Silicon Macs** running macOS 11 or newer; see
+[Install on Apple Silicon macOS](#install-on-apple-silicon-macos). X11, musl,
+ARM Linux, Intel Macs, Windows, and other package formats are not supported yet. A normal graphical login
 provides an absolute `XDG_RUNTIME_DIR`, which cagents uses for the private
 daemon socket. The archive installer rejects glibc versions older than 2.35
 and unknown version results before installing or updating. Existing installations
@@ -209,6 +212,75 @@ sha256sum --ignore-missing --strict --check SHA256SUMS
 tar -xzf "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 "./cagents-${VERSION}/bin/cagents" ui
 ```
+
+## Install on Apple Silicon macOS
+
+The macOS build is a preview. It is the same app, daemon and command line as
+on Linux, without the integrated browser, so links open in your default
+browser. The standalone `ceditor` is Linux-only. It needs an Apple Silicon Mac with macOS 11
+or newer and Git 2.36 or newer, which the Xcode Command Line Tools
+(`xcode-select --install`) provide.
+
+Run this in Terminal. It looks up the latest release once, downloads that
+release's installer, archive and checksum manifest, checks both files against
+the manifest, and then installs the checked archive without downloading again:
+
+```sh
+(
+  set -eu
+  releases='https://github.com/CarsonBurke/cagents/releases'
+  latest="$(curl -fsSL --proto '=https' -o /dev/null -w '%{url_effective}' "$releases/latest")"
+  tag="${latest##*/}"
+  case "$tag" in v[0-9]*) ;; *) echo 'Expected a versioned release tag' >&2; exit 1 ;; esac
+  version="${tag#v}"
+  download_dir="$(mktemp -d)"
+  trap 'rm -rf "$download_dir"' 0
+  trap 'exit 1' HUP INT TERM
+  archive="cagents-${version}-aarch64-apple-darwin.tar.gz"
+
+  (
+    cd "$download_dir"
+    curl -fsSL --proto '=https' --fail-early --remote-name-all \
+      "$releases/download/$tag/install-macos.sh" "$releases/download/$tag/SHA256SUMS-macos" \
+      "$releases/download/$tag/$archive"
+    awk -v archive="$archive" \
+      '$2 == "install-macos.sh" { print; installer++ } $2 == archive { print; payload++ }
+       END { exit(installer != 1 || payload != 1) }' \
+      SHA256SUMS-macos > selected-checksums
+    shasum -a 256 -c selected-checksums
+  )
+
+  CAGENTS_ARCHIVE="$download_dir/$archive" \
+  CAGENTS_CHECKSUMS="$download_dir/SHA256SUMS-macos" \
+    sh "$download_dir/install-macos.sh" --version "$version"
+)
+```
+
+It installs as your user, without `sudo`:
+
+- the app as `~/Applications/Cagents.app`, a link to the stable bundle under
+  `~/Library/Application Support/cagents-install`. Spotlight and Launchpad may
+  not list a link, so open it from `~/Applications` or keep it in the Dock;
+- the `cagents` command as `~/.local/bin/cagents`. Add `~/.local/bin` to your
+  `PATH` if it isn't there;
+- a login item that starts the cagents daemon when you log in. The installer
+  also starts it now unless you pass `--no-start`.
+
+The release is signed ad hoc, not notarized by Apple. Installing from Terminal
+avoids Gatekeeper's warning about an unidentified developer; a copy of the app
+downloaded with a browser and opened from Finder is blocked instead.
+
+Quit cagents and run `cagents daemon stop` before you replace or remove an
+installation. `sh install-macos.sh --help` lists every option.
+
+**Updating.** When a newer release is out, cagents says so and shows its
+installer command. Copy it and run it in Terminal; if cagents is still
+running, the installer tells you what to stop first. Releases after 0.2.4 can
+also update from inside the app, as on Linux.
+
+**Removing.** Run the downloaded installer with `--uninstall` to remove the
+app, its links and the login item and keep your settings, sessions and
+transcripts, or with `--purge` to remove those too.
 
 ## What the installer does
 
