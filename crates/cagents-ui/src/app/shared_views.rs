@@ -4609,13 +4609,13 @@ impl Cagents {
             if self.shared_upgrade_target_changed(pane) {
                 let (pending, saved_copy) = self.preserve_pending_shared_upgrade(pane.id);
                 tasks.push(pending);
-                current.extend(saved_copy);
+                retained_upgrades.extend(saved_copy);
             }
             self.prepare_shared_chat_upgrade(pane);
             if self.chat_awaiting_admission(pane.id) {
                 let (task, saved_copy) = self.admit_shared_chat(pane);
                 tasks.push(task);
-                current.extend(saved_copy);
+                retained_upgrades.extend(saved_copy);
             }
             let keep_live = self.observe_terminal_save(pane);
             if !keep_live {
@@ -4888,10 +4888,8 @@ impl Cagents {
                 || self.reopen_pending(id)
                 || self.awaits_first_publication(id, view);
             if keeps_place {
-                held_after
-                    .entry(preceding)
-                    .or_default()
-                    .push((id, local_pane(id)));
+                let previous = held_after.insert(preceding, (id, local_pane(id)));
+                debug_assert!(previous.is_none(), "a local member has one successor");
             } else if self.shared_views.retained.contains(&id)
                 || (view.panes.is_empty() && self.chat_is_unused_default(id))
                 || self
@@ -5357,7 +5355,7 @@ impl Cagents {
     }
 }
 
-type HeldPanes = HashMap<Option<CardId>, Vec<(CardId, Option<Pane>)>>;
+type HeldPanes = HashMap<Option<CardId>, (CardId, Option<Pane>)>;
 
 /// A held pane follows its local predecessor, which may itself be held.
 /// Keep visible-only IDs as anchors without giving them strip descriptors.
@@ -5370,22 +5368,24 @@ fn merge_held_panes<'a>(
         let visible = strip.iter().map(|pane| pane.id).chain(retained).collect();
         return (visible, strip);
     }
+    let mut visible = Vec::with_capacity(strip.len() + retained.len() + held_after.len());
+    let mut projected = Vec::with_capacity(strip.len() + held_after.len());
     let rows = std::iter::once((None, None))
         .chain(strip.into_iter().map(|pane| (Some(pane.id), Some(pane))))
         .chain(retained.into_iter().map(|id| (Some(id), None)));
-    let mut visible = Vec::new();
-    let mut projected = Vec::new();
-    let mut waiting = Vec::new();
-    for (anchor, pane) in rows {
+    for (mut anchor, pane) in rows {
         visible.extend(anchor);
         projected.extend(pane);
-        waiting.extend(held_after.remove(&anchor).into_iter().flatten());
-        while let Some((id, pane)) = waiting.pop() {
+        while let Some((id, pane)) = held_after.remove(&anchor) {
             visible.push(id);
             projected.extend(pane.map(Cow::Owned));
-            waiting.extend(held_after.remove(&Some(id)).into_iter().flatten());
+            anchor = Some(id);
         }
     }
+    debug_assert!(
+        held_after.is_empty(),
+        "all held panes have a visible predecessor"
+    );
     (visible, projected)
 }
 
