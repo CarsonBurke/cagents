@@ -36,7 +36,7 @@ use crate::{
     workspace_model::ModelEdit,
 };
 
-use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
+use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound, publish};
 pub(super) mod update;
 
 const EVENT_REPLAY_CAPACITY: usize = 256;
@@ -384,6 +384,8 @@ pub(crate) struct HostState {
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
+    /// Recent parsed Codex transcripts shared by the daemon's request workers.
+    pub(super) rollouts: Arc<super::agent_execution::Rollouts>,
     /// The connections watching the device's load, and its sampler.
     pub(super) device_stats: super::device_stats::Watch,
     /// Wakes the courier that hands messages to idle conversations.
@@ -430,6 +432,7 @@ pub(crate) struct HostState {
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
+    last_viewport_epoch: u64,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
     /// Ordinary exit has closed new child reservations but still owns exact
@@ -597,6 +600,7 @@ impl HostState {
             peers: Default::default(),
             automations: None,
             work: None,
+            rollouts: Arc::default(),
             device_stats: Default::default(),
             mailbox: None,
             mailbox_seal: None,
@@ -613,6 +617,7 @@ impl HostState {
             mobile_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
+            last_viewport_epoch: 0,
             shutting_down: false,
             shutdown_requested: false,
             ordinary_exit_cleanup_pending: false,
@@ -1229,22 +1234,24 @@ impl HostState {
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
         self.mobile_sessions_changed();
-        let edit = edit.committed();
-        for client_id in &self.model_watchers {
-            if *client_id == origin {
-                continue;
-            }
-            if let Some(delivery) = self.clients.get(client_id) {
-                let _ = delivery.push(Outbound::broadcast(
-                    &self.proof,
-                    ServerMessage::WorkspaceModelEdited {
-                        sequence,
-                        edit: edit.as_ref().clone(),
-                        effects: effects.clone(),
-                    },
-                ));
-            }
+        if let Some(work) = &self.work
+            && !(effects.projects.is_empty() && effects.removed_projects.is_empty())
+        {
+            work.projects_changed();
         }
+        let edit = edit.committed();
+        let deliveries = self
+            .model_watchers
+            .iter()
+            .filter(|&&client| client != origin)
+            .filter_map(|client| self.clients.get(client).map(Arc::as_ref));
+        publish(&self.proof, deliveries, || {
+            ServerMessage::WorkspaceModelEdited {
+                sequence,
+                edit: edit.as_ref().clone(),
+                effects: effects.clone(),
+            }
+        });
         if let Some(titles) = &self.channel_titles {
             for view in &effects.views {
                 if let crate::workspace_model::views::Scope::Channel(id) = view.scope
@@ -6776,9 +6783,10 @@ fn broadcast_redraw(
 struct PlannedFrame {
     client_id: ClientId,
     delivery: Arc<DeliveryQueue>,
-    /// The subscriber's presentation revision when planned. Every resize,
-    /// scroll, snapshot reply and frame that presents the view advances it,
-    /// so a commit that finds it changed knows the frame is stale.
+    /// The viewport's identity and geometry when planned. Presentation
+    /// revisions can repeat across attachments to the same worker.
+    viewport_epoch: u64,
+    /// The subscriber's presentation revision when planned.
     revision: u64,
     /// The worker generation `projected` was captured at.
     source: u64,
@@ -6899,6 +6907,7 @@ fn plan_redraw(
         planned.push(PlannedFrame {
             client_id,
             delivery,
+            viewport_epoch: view.epoch,
             revision,
             source: capture.generation,
             projected: Arc::new(projected),
@@ -6971,17 +6980,18 @@ fn commit_redraw(
             (None, None) => true,
             _ => false,
         };
-        let current_revision = subscriptions
+        let current_view = subscriptions
             .viewports
-            .get(&key)
-            .filter(|_| still_visible && same_connection)
-            .map(|view| view.revision);
-        match current_revision {
-            Some(revision) if revision == planned.revision && unchanged_base => {
+            .get_mut(&key)
+            .filter(|_| still_visible && same_connection);
+        match current_view {
+            Some(view)
+                if view.epoch == planned.viewport_epoch
+                    && view.revision == planned.revision
+                    && unchanged_base =>
+            {
                 let EncodedFrame { planned, wire } = frame;
-                if let Some(view) = subscriptions.viewports.get_mut(&key) {
-                    view.acknowledged_source = planned.source;
-                }
+                view.acknowledged_source = planned.source;
                 subscriptions.record_sent(planned.client_id, terminal_id, planned.projected, true);
                 let _ = planned.delivery.push(Outbound::broadcast(
                     &proof,
@@ -6993,12 +7003,12 @@ fn commit_redraw(
                 committed.queued += 1;
                 committed.bases.push(planned.recorded);
             }
-            Some(revision) => {
+            Some(view) => {
                 let _ = planned.delivery.push(Outbound::broadcast(
                     &proof,
                     ServerMessage::Redraw {
                         terminal_id,
-                        generation: revision,
+                        generation: view.revision,
                     },
                 ));
                 committed.refused.push(frame);
@@ -7129,14 +7139,13 @@ fn record_event_from(
     if wake_exit {
         crate::daemon::wake();
     }
-    let message = ServerMessage::Event {
-        terminal_id,
-        sequence,
-        event: wire_event,
-    };
-    for delivery in deliveries {
-        let _ = delivery.push(Outbound::broadcast(&proof, message.clone()));
-    }
+    publish(&proof, deliveries.iter().map(Arc::as_ref), || {
+        ServerMessage::Event {
+            terminal_id,
+            sequence,
+            event: wire_event,
+        }
+    });
 }
 
 fn transcript_metadata(

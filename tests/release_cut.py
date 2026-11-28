@@ -344,13 +344,18 @@ class ReleaseCut(unittest.TestCase):
         subprocess.run([str(ROOT / "scripts/release-metadata"), "write", "--dir", str(dist), "--version", version,
                         "--source-commit", sha, "--protocol", "9", "--notes", str(notes)],
                        check=True, capture_output=True)
-        verdicts = self.host / ".local/state/cagents-main-sentinel/verdicts"
-        verdicts.mkdir(parents=True, exist_ok=True)
-        (verdicts / f"{sha}.json").write_text(json.dumps({"sha": sha, "passed": passed}))
+        self.verdict(sha, passed=passed)
         if where is None:
             self.bundles.append({"sha": sha, "version": version, "built_at": len(self.bundles)})
         self.write_status()
         return dist
+
+    def verdict(self, sha, passed=True, *, reported_sha=None, outside_code=False):
+        verdicts = self.host / ".local/state/cagents-main-sentinel/verdicts"
+        verdicts.mkdir(parents=True, exist_ok=True)
+        (verdicts / f"{sha}.json").write_text(json.dumps({
+            "sha": reported_sha or sha, "passed": passed, "outside_code": outside_code,
+        }))
 
     def write_status(self, building=None):
         (self.root / "status.json").write_text(json.dumps(
@@ -1000,7 +1005,9 @@ class ReleaseCut(unittest.TestCase):
         pinned = self.root / "pinned"
         pinned.mkdir()
         (pinned / "zig").symlink_to(self.bin / "pinned-zig")
-        self.tool(self.bin / "mise", f"""#!/bin/bash
+        mac_tools = self.host / ".cargo/bin"
+        mac_tools.mkdir(parents=True)
+        self.tool(mac_tools / "mise", f"""#!/bin/bash
 [[ "$*" == 'exec zig@0.15.2 -- which zig' ]] || exit 1
 printf '%s\n' '{pinned / "zig"}'
 """)
@@ -1130,6 +1137,26 @@ printf '%s\n' '{pinned / "zig"}'
         # Actions signs; a local key has no place in it.
         refused = self.release("cut", "--actions", "--key", str(self.root / "key"))
         self.assertIn("drop --key", refused.stderr)
+
+    def test_explicit_actions_cut_uses_the_tested_commit_even_without_a_fw16_bundle(self):
+        self.verdict(self.feature)
+        result = self.release("cut", "--actions", "--commit", self.feature)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.git("rev-parse", "v0.2.4^{commit}"), self.feature)
+        self.assertTrue(any(line.endswith(f"--require-tests {self.feature}") for line in self.log("sentinel.log")))
+        self.assertEqual(self.log("prebuild.log"), [])
+        self.assertFalse((self.root / "bundles/0.2.4").exists())
+
+    def test_explicit_actions_cut_refuses_failed_missing_or_unrelated_verdicts(self):
+        args = ("cut", "--actions", "--commit", self.feature)
+        for verdict in (None, {"passed": False}, {"outside_code": True}, {"reported_sha": self.fix}):
+            with self.subTest(verdict=verdict):
+                if verdict is not None:
+                    self.verdict(self.feature, **verdict)
+                result = self.release(*args)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn(f"no passing fw16 sentinel verdict for {self.feature}", result.stderr)
+                self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
 
     def test_publish_in_actions_pushes_the_tag_and_starts_the_next_version_once_published(self):
         self.bundle(self.fix)

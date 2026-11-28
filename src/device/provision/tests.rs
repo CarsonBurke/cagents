@@ -10,6 +10,10 @@ impl Build for Fake {
     fn version(&self) -> &str {
         self.version
     }
+    fn can_send_linux(&self) -> bool {
+        true
+    }
+
     fn required_glibc(&self) -> io::Result<Option<(Vec<u32>, String)>> {
         Ok(self
             .glibc
@@ -51,6 +55,7 @@ fn installed(current: &str) -> Remote {
             wanted_staged_beside: None,
         }),
         protocol: Some(PROTOCOL_VERSION - 2),
+        signed_release_updates: false,
     }
 }
 
@@ -68,6 +73,115 @@ fn refusal(local: &Fake, remote: &Remote, daemon: &Daemon) -> String {
     plan(&device("cagents"), local, remote, daemon)
         .unwrap_err()
         .to_string()
+}
+
+#[test]
+fn apple_silicon_uses_the_verified_release_route_or_the_installer() {
+    let mut remote = Remote::parse(concat!(
+        "os=Darwin\narch=arm64\nhome=/Users/user\n",
+        "prefix=/Users/user/Library/Application Support/cagents-install\n",
+        "marked=1\ncurrent=0.2.3\nsigned_release_updates=1",
+    ));
+    let desired = Fake {
+        version: "0.2.4",
+        glibc: Some(vec![2, 41]),
+    };
+    let plan_mac =
+        |remote: &Remote, state: &Daemon| plan(&device("cagents"), &desired, remote, state);
+    assert_eq!(
+        plan_mac(&remote, &older()).unwrap().action,
+        Action::MacRelease {
+            cli: "/Users/user/Library/Application Support/cagents-install/current/bin/cagents"
+                .into(),
+        }
+    );
+    assert_eq!(
+        plan_mac(&remote, &Daemon::Compatible).unwrap().action,
+        Action::Nothing
+    );
+    assert!(plan_mac(&remote, &Daemon::Speaks(PROTOCOL_VERSION + 1)).is_err());
+    remote.signed_release_updates = false;
+    assert_eq!(
+        plan_mac(&remote, &older()).unwrap().action,
+        Action::MacInstaller
+    );
+    remote.installation.as_mut().unwrap().current = Some("0.2.5".into());
+    assert!(
+        plan_mac(&remote, &older())
+            .unwrap_err()
+            .to_string()
+            .contains("already selects cagents 0.2.5")
+    );
+    remote.arch = "x86_64".into();
+    assert!(
+        plan_mac(&remote, &older())
+            .unwrap_err()
+            .to_string()
+            .contains("Darwin x86_64")
+    );
+}
+
+#[test]
+fn macos_shell_follows_installer_links_without_gnu_readlink() {
+    let home = tempfile::tempdir().unwrap();
+    let prefix = home
+        .path()
+        .join("Library/Application Support/cagents-install");
+    let cli = prefix.join("versions/0.2.3/bin/cagents");
+    let shim = home.path().join(".local/bin");
+    fs::create_dir_all(cli.parent().unwrap()).unwrap();
+    fs::create_dir_all(&shim).unwrap();
+    let script = |path: &Path, contents: &str| {
+        fs::write(path, contents).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    script(
+        &shim.join("uname"),
+        r#"#!/bin/sh
+case "$1" in -s) echo Darwin;; -m) echo arm64;; esac
+"#,
+    );
+    script(
+        &shim.join("readlink"),
+        r#"#!/bin/sh
+[ "$1" != -f ] && exec /usr/bin/readlink "$@"
+"#,
+    );
+    script(
+        &cli,
+        r#"#!/bin/sh
+case "$*" in
+    'daemon protocol-version') echo 208;;
+    'daemon upgrade --help') echo --require-release;;
+esac
+"#,
+    );
+    fs::write(prefix.join(".cagents-install-root"), "").unwrap();
+    symlink("versions/0.2.3", prefix.join("current")).unwrap();
+    symlink(
+        "../../Library/Application Support/cagents-install/current/bin/cagents",
+        shim.join("cagents"),
+    )
+    .unwrap();
+
+    let output = Command::new("sh")
+        .args([
+            "-c",
+            &format!("exe=cagents\nwanted=0.2.4\nmarker={STAGED_MARKER}\n{PROBE}"),
+        ])
+        .env_clear()
+        .env("HOME", home.path())
+        .env("PATH", format!("{}:/usr/bin:/bin", shim.display()))
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let remote = Remote::parse(&String::from_utf8(output.stdout).unwrap());
+    assert_eq!(
+        remote.resolved.as_deref(),
+        cli.canonicalize().unwrap().to_str()
+    );
+    assert_eq!(remote.protocol, Some(208));
+    assert!(remote.signed_release_updates);
 }
 
 #[test]

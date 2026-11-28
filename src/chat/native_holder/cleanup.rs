@@ -520,12 +520,17 @@ fn find_source(
     let directory = registry::directory(Kind::Native)?;
     let current =
         registry::recovery_candidate(&registry::socket(&directory, source.id), Kind::Native)?;
+    let entries = match fs::read_dir(directory) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let digest = source_digest(source)?;
     let prefix = format!("{}-", source.id);
     let mut candidates = 0;
     #[cfg(target_os = "macos")]
     let mut spared = None;
-    for entry in fs::read_dir(directory).map_err(|error| error.to_string())? {
+    for entry in entries {
         let entry = entry.map_err(|error| error.to_string())?;
         let name = entry.file_name();
         let Some(name) = name.to_str().and_then(|name| name.strip_prefix(&prefix)) else {

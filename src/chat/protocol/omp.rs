@@ -150,7 +150,7 @@ struct Omp {
 }
 #[derive(Default)]
 struct TurnError {
-    message: Option<String>,
+    reply: Option<AssistantError>,
     reported: bool,
 }
 impl TurnError {
@@ -164,8 +164,9 @@ impl TurnError {
             return;
         }
         let message = (outcome == crate::notifications::Kind::Failed)
-            .then_some(self.message.as_deref())
+            .then_some(self.reply.as_ref())
             .flatten()
+            .map(|reply| reply.reason.as_str())
             .or(fallback);
         if let Some(message) = message {
             self.reported = true;
@@ -408,6 +409,9 @@ impl Omp {
         self.read_child(id, step);
     }
     fn child_content(&mut self, frame: Value) -> Result<Step, String> {
+        if text(&frame, "type") == "message_end" && text(&frame["message"], "role") == "user" {
+            self.turn_error.reply = None;
+        }
         // The subscription includes the authoritative partial message. Reapply
         // that full item after history hydration instead of appending a delta
         // that may already be included in the snapshot.
@@ -423,7 +427,56 @@ impl Omp {
                 ..Step::default()
             });
         }
-        self.receive(frame)
+        // A terminal frame may be the first live event after hydration and
+        // may omit messages. Keep the reply's identity from either source so
+        // the child transcript can upsert an overlapping history notice.
+        let error = if text(&frame, "type") == "agent_end" && !agent_continues(&frame) {
+            let observed = self.turn_error.reply.take();
+            frame["messages"]
+                .as_array()
+                .and_then(|messages| {
+                    messages
+                        .iter()
+                        .rev()
+                        .find(|message| is_exchange_message(message))
+                })
+                .map_or(observed, assistant_error)
+        } else {
+            None
+        };
+        let mut step = self.receive(frame)?;
+        step.events
+            .extend(error.map(|error| Event::Item(error.into_item())));
+        Ok(step)
+    }
+    fn child_history(&mut self, messages: &[Value], finished: bool) -> Vec<Event> {
+        let mut events = Vec::new();
+        let mut last_reply = None;
+        for message in messages {
+            match text(message, "role") {
+                "user" => events.extend(
+                    last_reply
+                        .take()
+                        .and_then(assistant_error)
+                        .map(|error| Event::Item(error.into_item())),
+                ),
+                "assistant" => last_reply = Some(message),
+                _ => {}
+            }
+            events.extend(self.message_items(message).into_iter().map(Event::Item));
+        }
+        // A running child's latest reply might still be retried. Hold its
+        // reason until settlement or until a live reply supersedes it.
+        self.turn_error.reply = last_reply.and_then(assistant_error);
+        if finished {
+            events.extend(
+                self.turn_error
+                    .reply
+                    .take()
+                    .map(|error| Event::Item(error.into_item())),
+            );
+        }
+        events
     }
     fn history_page(&mut self, cursor: Option<&str>) -> Value {
         if cursor.is_none() {
@@ -547,33 +600,28 @@ impl Omp {
                         );
                         (format!("tool:{id}"), content)
                     }
-                    "image" => (
-                        format!("{key}:{index}"),
-                        ItemContent::Image {
-                            reference: mapping.as_ref().and_then(|(_, refs)| {
-                                index
-                                    .checked_sub(1)
-                                    .and_then(|index| refs.get(index))
-                                    .cloned()
-                                    .flatten()
-                            }),
-                            path: format!(
-                                "data:{};base64,{}",
-                                text(block, "mimeType"),
-                                text(block, "data")
-                            ),
-                            description: mapping
-                                .as_ref()
-                                .and_then(|(_, refs)| {
-                                    index
-                                        .checked_sub(1)
-                                        .and_then(|index| refs.get(index))
-                                        .and_then(Option::as_ref)
-                                })
-                                .map(|reference| reference.label())
-                                .unwrap_or_else(|| "Image attachment".into()),
-                        },
-                    ),
+                    "image" => {
+                        let reference = mapping.as_ref().and_then(|(_, refs)| {
+                            index
+                                .checked_sub(1)
+                                .and_then(|index| refs.get(index))
+                                .and_then(Option::as_ref)
+                        });
+                        (
+                            format!("{key}:{index}"),
+                            ItemContent::Image {
+                                reference: reference.cloned(),
+                                path: format!(
+                                    "data:{};base64,{}",
+                                    text(block, "mimeType"),
+                                    text(block, "data")
+                                ),
+                                description: reference
+                                    .map(|reference| reference.label())
+                                    .unwrap_or_default(),
+                            },
+                        )
+                    }
                     _ => return None,
                 };
                 Some(Item {
@@ -1070,18 +1118,12 @@ impl Adapter for Omp {
                         self.child_loaded.insert(id.clone());
                     }
                     if let Some(child) = self.children.get_mut(&id) {
-                        for message in frame["data"]["messages"]
-                            .as_array()
-                            .into_iter()
-                            .flatten()
-                            .filter(|_| frame["success"].as_bool() == Some(true))
+                        if frame["success"] == true
+                            && let Some(messages) = frame["data"]["messages"].as_array()
                         {
-                            for item in child.message_items(message) {
-                                step.events.push(Event::SubagentItem {
-                                    id: id.clone(),
-                                    item,
-                                });
-                            }
+                            let history =
+                                child.child_history(messages, self.child_finished.contains(&id));
+                            step.events.extend(chat::child_events(&id, history));
                         }
                         for event in self.child_buffer.remove(&id).unwrap_or_default() {
                             let content = child.child_content(event)?;
@@ -1378,10 +1420,10 @@ impl Adapter for Omp {
                         for message in messages.into_iter().flatten() {
                             // A later prompt starts a new exchange, so an
                             // earlier failure no longer explains the last one.
-                            if matches!(text(message, "role"), "assistant" | "user")
+                            if is_exchange_message(message)
                                 && let Some(error) = &mut self.history_error
                             {
-                                *error = assistant_error(message);
+                                *error = assistant_error(message).map(|reply| reply.reason);
                             }
                             let items = self.message_items(message);
                             if let Some(opening) = &mut self.history_opening {
@@ -1461,7 +1503,7 @@ impl Adapter for Omp {
                         "stop" | "length" => Some(Kind::Succeeded),
                         _ => None,
                     };
-                    self.turn_error.message = assistant_error(&frame["message"]);
+                    self.turn_error.reply = assistant_error(&frame["message"]);
                 }
                 step.events.extend(
                     self.message_items(&frame["message"])
@@ -1631,10 +1673,7 @@ impl Adapter for Omp {
                     .into(),
                 });
             }
-            "agent_end"
-                if frame["isTerminal"].as_bool() == Some(false)
-                    || frame["willContinue"].as_bool() == Some(true) =>
-            {
+            "agent_end" if agent_continues(&frame) => {
                 // OMP can yield for maintenance or asynchronous delivery and
                 // resume the same run. Older runtimes omit this field, so only
                 // an explicit false excludes the terminal boundary below.
@@ -1824,14 +1863,49 @@ fn model_id(value: &Value) -> Option<String> {
         value["id"].as_str()?
     ))
 }
-fn assistant_error(message: &Value) -> Option<String> {
+fn agent_continues(frame: &Value) -> bool {
+    frame["isTerminal"].as_bool() == Some(false) || frame["willContinue"].as_bool() == Some(true)
+}
+
+fn is_exchange_message(message: &Value) -> bool {
+    matches!(text(message, "role"), "assistant" | "user")
+}
+
+struct AssistantError {
+    key: String,
+    reason: String,
+}
+
+impl AssistantError {
+    fn into_item(self) -> Item {
+        let mut item = Item {
+            // Buffered live frames can repeat an assistant reply from history.
+            id: format!("{}:provider-error", self.key),
+            role: Role::System,
+            content: ItemContent::Text {
+                text: self.reason,
+                thinking: false,
+                phase: Phase::Commentary,
+            },
+            started_at: None,
+            at: None,
+        };
+        chat::failure::mark_provider_error(crate::agent::Provider::Omp, &mut item);
+        item
+    }
+}
+
+fn assistant_error(message: &Value) -> Option<AssistantError> {
     if text(message, "role") != "assistant" || text(message, "stopReason") != "error" {
         return None;
     }
     message["errorMessage"]
         .as_str()
         .filter(|message| !message.trim().is_empty())
-        .map(str::to_owned)
+        .map(|reason| AssistantError {
+            key: message_key(message),
+            reason: reason.into(),
+        })
 }
 
 fn message_key(value: &Value) -> String {
@@ -2101,20 +2175,34 @@ mod tests {
             );
             let mut content = vec![json!({"type":"text","text":message})];
             content.extend(request["images"].as_array().unwrap().iter().cloned());
-            let items = adapter
-                .message_items(&json!({"role":"user","id":"omp-unlabeled","content":content}));
+            let received = adapter
+                .receive(json!({"type":"message_end","message":{
+                    "role":"user","timestamp":123,"content":content
+                }}))
+                .unwrap();
+            let items = received
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(&item.content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 3);
             assert!(
-                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+                matches!(items[0], ItemContent::Text { text: restored, .. } if restored == &text)
             );
             assert!(
-                matches!(&items[1].content, ItemContent::Image { reference: Some(r), .. } if r == &reference)
+                matches!(items[1], ItemContent::Image { reference: Some(r), description, .. }
+                    if r == &reference && description == &reference.label())
             );
             assert!(matches!(
-                &items[2].content,
+                items[2],
                 ItemContent::Image {
                     reference: None,
-                    ..
-                }
+                    description,
+                    path,
+                } if description.is_empty() && path.starts_with("data:image/")
             ));
         });
     }
@@ -2495,6 +2583,161 @@ mod tests {
         assert!(thinking.events.iter().any(
             |event| matches!(event, Event::Models { reasoning:Some(level), .. } if level == "auto")
         ));
+    }
+
+    fn child_failure_notices(step: &Step) -> Vec<(&str, &str)> {
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Error { .. }))
+        );
+        step.events
+            .iter()
+            .filter_map(|event| match event {
+                Event::SubagentItem { id, item } => {
+                    assert_eq!(id, "child");
+                    chat::failure::provider_error_text(crate::agent::Provider::Omp, item)
+                        .map(|reason| (item.id.as_str(), reason))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn child_reply(timestamp: u64, stop_reason: &str, reason: &str) -> Value {
+        json!({
+            "role":"assistant","timestamp":timestamp,"content":[],
+            "stopReason":stop_reason,"errorMessage":reason
+        })
+    }
+
+    fn child_frame(adapter: &mut Omp, event: Value) -> Step {
+        adapter
+            .receive(json!({"type":"subagent_event","payload":{"id":"child","event":event}}))
+            .unwrap()
+    }
+
+    #[test]
+    fn child_history_keeps_only_the_last_failure_of_each_failed_exchange() {
+        let mut adapter = Omp::default();
+        let metadata = adapter
+            .receive(json!({"type":"subagent_progress","payload":{
+                "progress":{"id":"child","status":"failed"}
+            }}))
+            .unwrap();
+        let hydrated = adapter
+            .receive(json!({
+                "type":"response","id":metadata.writes[0]["id"],"command":"get_subagent_messages",
+                "success":true,"data":{"messages":[
+                    {"role":"user","timestamp":1,"content":"First request"},
+                    child_reply(2,"error","Retried"),
+                    child_reply(3,"error","First failure"),
+                    {"role":"user","timestamp":4,"content":"Second request"},
+                    child_reply(5,"error","Recovered"),
+                    child_reply(6,"stop",""),
+                    {"role":"user","timestamp":7,"content":"Third request"},
+                    child_reply(8,"error","API quota exhausted")
+                ]}
+            }))
+            .unwrap();
+        assert_eq!(
+            child_failure_notices(&hydrated),
+            [
+                ("assistant:3:provider-error", "First failure"),
+                ("assistant:8:provider-error", "API quota exhausted"),
+            ]
+        );
+    }
+
+    #[test]
+    fn live_child_errors_wait_for_terminal_end_and_share_history_identity() {
+        let mut adapter = Omp::default();
+        let metadata = adapter
+            .receive(json!({"type":"subagent_progress","payload":{
+                "progress":{"id":"child","status":"running"}
+            }}))
+            .unwrap();
+        let retried = child_reply(1, "error", "Transient failure");
+        let failed = child_reply(2, "error", "API quota exhausted");
+        for event in [
+            json!({"type":"agent_start"}),
+            json!({"type":"message_end","message":retried}),
+            json!({"type":"agent_end","isTerminal":false,"messages":[retried]}),
+        ] {
+            assert!(child_failure_notices(&child_frame(&mut adapter, event)).is_empty());
+        }
+        let hydrated = adapter
+            .receive(json!({
+                "type":"response","id":metadata.writes[0]["id"],"command":"get_subagent_messages",
+                "success":true,"data":{"messages":[retried]}
+            }))
+            .unwrap();
+        assert!(child_failure_notices(&hydrated).is_empty());
+        assert!(
+            child_failure_notices(&child_frame(
+                &mut adapter,
+                json!({"type":"message_end","message":failed})
+            ))
+            .is_empty()
+        );
+        let terminal = child_frame(
+            &mut adapter,
+            json!({"type":"agent_end","messages":[failed]}),
+        );
+        assert_eq!(
+            child_failure_notices(&terminal),
+            [("assistant:2:provider-error", "API quota exhausted"),]
+        );
+        let mut reopened = Omp::default();
+        let metadata = reopened
+            .receive(json!({"type":"subagent_progress","payload":{
+                "progress":{"id":"child","status":"failed"}
+            }}))
+            .unwrap();
+        let restored = reopened
+            .receive(json!({
+                "type":"response","id":metadata.writes[0]["id"],"command":"get_subagent_messages",
+                "success":true,"data":{"messages":[failed]}
+            }))
+            .unwrap();
+        assert_eq!(
+            child_failure_notices(&restored),
+            child_failure_notices(&terminal)
+        );
+
+        for event in [
+            json!({"type":"agent_start"}),
+            json!({"type":"message_end","message":child_reply(3,"error","Recovered")}),
+            json!({"type":"message_end","message":child_reply(4,"stop","")}),
+            json!({"type":"agent_end"}),
+        ] {
+            assert!(child_failure_notices(&child_frame(&mut adapter, event)).is_empty());
+        }
+    }
+
+    #[test]
+    fn terminal_child_frame_can_settle_an_error_known_only_from_running_history() {
+        let mut adapter = Omp::default();
+        let metadata = adapter
+            .receive(json!({"type":"subagent_progress","payload":{
+                "progress":{"id":"child","status":"running"}
+            }}))
+            .unwrap();
+        let hydrated = adapter
+            .receive(json!({
+                "type":"response","id":metadata.writes[0]["id"],"command":"get_subagent_messages",
+                "success":true,"data":{"messages":[child_reply(1,"error","API quota exhausted")]}
+            }))
+            .unwrap();
+        assert!(child_failure_notices(&hydrated).is_empty());
+        let terminal = child_frame(&mut adapter, json!({"type":"agent_end","messages":[]}));
+        assert_eq!(
+            child_failure_notices(&terminal),
+            [("assistant:1:provider-error", "API quota exhausted"),]
+        );
+        let repeated = child_frame(&mut adapter, json!({"type":"agent_end","messages":[]}));
+        assert!(child_failure_notices(&repeated).is_empty());
     }
 
     // Reduced from a real OMP 18.2.9 rpc-ui Muse capture. This build ACKs

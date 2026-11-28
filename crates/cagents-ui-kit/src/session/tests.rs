@@ -4697,6 +4697,71 @@ fn pruning_keeps_a_transcript_the_daemon_holds_before_any_window_saves_it() {
 }
 
 #[test]
+fn pruning_with_a_bad_chat_row_keeps_uncertain_files_and_still_removes_oversized_files() {
+    for other_window in [false, true] {
+        let (root, runtime, transcripts) = transcript_pruner_fixture();
+        let other_path = root.path().join("other.sqlite3");
+        let other = other_window.then(|| {
+            SessionRuntime::open(&other_path, BootId::new("boot-prune"))
+                .unwrap()
+                .0
+        });
+        let window = other.as_ref().unwrap_or(&runtime);
+        let workspace = workspace();
+        window.snapshot(Arc::new(workspace.clone()));
+        window.flush(Duration::from_secs(10)).unwrap();
+        let database = Connection::open(&window.database_path).unwrap();
+        let card = workspace.cards[0].id.to_string();
+        database
+            .execute(
+                "UPDATE cards SET kind_tag = 'chat', content_json = ?1 WHERE card_id = ?2",
+                ("{broken", &card),
+            )
+            .unwrap();
+
+        let uncertain = transcript(&transcripts, TerminalId::new());
+        let oversized = transcript(&transcripts, TerminalId::new());
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&oversized)
+            .unwrap()
+            .set_len(2 << 20)
+            .unwrap();
+
+        let prune = || {
+            runtime
+                .transcript_pruner()
+                .prune(
+                    &transcripts,
+                    || Ok(HashSet::new()),
+                    || {
+                        Ok::<_, std::io::Error>(if other_window {
+                            vec![other_path.clone()]
+                        } else {
+                            vec![]
+                        })
+                    },
+                )
+                .unwrap()
+        };
+        let report = prune();
+        assert_eq!(report.removed_orphaned, 0);
+        assert_eq!(report.removed_oversized, 1);
+        assert!(uncertain.is_file());
+        assert!(!oversized.exists());
+
+        database
+            .execute(
+                "UPDATE cards SET content_json = ?1 WHERE card_id = ?2",
+                (r#"{"terminal":null}"#, &card),
+            )
+            .unwrap();
+        assert_eq!(prune().removed_orphaned, 1);
+        assert!(!uncertain.exists());
+    }
+}
+
+#[test]
 fn pruning_leaves_a_terminal_started_while_the_daemon_is_asked() {
     let (_root, runtime, transcripts) = transcript_pruner_fixture();
     let orphan = transcript(&transcripts, TerminalId::new());

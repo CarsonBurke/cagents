@@ -89,9 +89,9 @@ Usage: scripts/release COMMAND [VERSION] [OPTIONS]
                    Add the signed bundle to a file feed, for rehearsing the
                    update before publishing (docs/releasing.md#rehearsing).
   cut --actions [--wait] [--commit SHA]
-                   Choose the commit as cut does, check its version is not
-                   released, and tag it here, for GitHub Actions to build
-                   and sign once publish --actions pushes the tag.
+                   Choose the commit as cut does, or select SHA on main
+                   with passing fw16 tests. Tag it here so GitHub Actions
+                   can qualify the bundle and sign after the tag is pushed.
   publish VERSION --actions [--yes] [--build-host HOST]
                    Record the tagged commit's passing test verdict from HOST,
                    then push the tag to start the release workflow. It leaves
@@ -687,21 +687,25 @@ cut_release() {
     repository_git fetch --quiet "${fetch_options[@]}" origin main
     MAIN=$(repository_git rev-parse --verify origin/main)
     tip=$MAIN
-    status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
+    if [[ $ACTIONS == false || -z $COMMIT ]]; then
+        status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
+    fi
     released=$(released_versions) || fail 'cannot read the tags on origin'
     if [[ -n $COMMIT ]]; then
         sha=$(repository_git rev-parse --verify "$COMMIT^{commit}") || fail "unknown commit: $COMMIT"
         repository_git merge-base --is-ancestor "$sha" "$MAIN" || fail "$sha is not on main"
-        jq -e --arg sha "$sha" '.bundles[] | select(.sha == $sha and .passed == true)' <<< "$status" >/dev/null \
-            || fail "$sha has no prebuilt bundle with passing tests on $BUILD_HOST"
-        behind=$(repository_git rev-list --count --first-parent "$sha..$MAIN")
+        if [[ $ACTIONS == false ]]; then
+            jq -e --arg sha "$sha" '.bundles[] | select(.sha == $sha and .passed == true)' <<< "$status" >/dev/null \
+                || fail "$sha has no prebuilt bundle with passing tests on $BUILD_HOST"
+            pin_bundle "$sha"
+        fi
     elif selected=$(newest_bundle "$status" "$released"); then
         read -r sha behind <<< "$selected"
+        pin_bundle "$sha"
     else
         sha=
     fi
-    [[ -z $sha ]] || pin_bundle "$sha"
-    if [[ $WAIT == false && -n $sha && $behind -gt 0 ]]; then
+    if [[ $WAIT == false && -z $COMMIT && -n $sha && $behind -gt 0 ]]; then
         printf 'The newest bundle with passing tests, %s, is %s commit(s) behind main (%s):\n' \
             "${sha:0:12}" "$behind" "${tip:0:12}"
         repository_git log --oneline --first-parent "$sha..$MAIN" | sed 's/^/  /'
@@ -711,7 +715,7 @@ cut_release() {
         if [[ -t 0 ]]; then
             read -r -p 'Release it, or wait for a prebuild of the tip? [r/w] ' answer
             case $answer in w|W) WAIT=true ;; r|R) ;; *) fail 'nothing released' ;; esac
-        elif [[ -z $COMMIT ]]; then
+        else
             fail "run with --wait to release main's tip, or --commit $sha to release this bundle"
         fi
     fi
@@ -763,15 +767,15 @@ cut_release() {
         printf '%s is on origin but not published; cutting it here, from the same tag.\n' "$TAG"
     fi
     if [[ $ACTIONS == true ]]; then
-        # Actions builds the tag itself; only the commit and version are
-        # decided here, from the bundle whose tests passed.
+        # Actions qualifies its own bundle for the exact tested commit.
+        [[ -z $COMMIT ]] || require_fw16_verdict "$sha" >/dev/null
         unpin_bundle
         if [[ $(repository_git rev-parse --quiet --verify "refs/tags/$TAG^{commit}") != "$sha" ]]; then
             repository_git tag -d "$TAG" >/dev/null 2>&1 || :
         fi
         repository_git tag -a "$TAG" -m "$TAG" "$sha" 2>/dev/null \
             || [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") == "$sha" ]] || fail "cannot tag $sha as $TAG"
-        printf '\nTagged %s at %s for GitHub Actions to build, sign and publish. Its notes will be:\n\n' "$TAG" "$sha"
+        printf '\nTagged %s at %s for GitHub Actions to qualify and sign. Its notes will be:\n\n' "$TAG" "$sha"
         previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) \
             || previous=
         "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
@@ -1151,8 +1155,7 @@ HOST
     ((status == 0)) || fail "the rehearsal of $VERSION did not pass"
 }
 
-# The hosted signing workflow checks the status reported from fw16's verdict.
-record_fw16_tests() {
+require_fw16_verdict() {
     local sha=$1 verdict
     verdict=$(on_host "$sha" <<'HOST'
 set -euo pipefail
@@ -1161,6 +1164,15 @@ scripts/main-build-sentinel --repository "$PWD" --require-tests "$2" </dev/null 
 cat "$HOME/.local/state/cagents-main-sentinel/verdicts/$2.json"
 HOST
     ) || fail "no passing fw16 sentinel verdict for $sha; see the sentinel logs on $BUILD_HOST"
+    jq -es --arg sha "$sha" 'length == 1 and (.[0] | .sha == $sha and .passed == true and (.outside_code | not))' \
+        <<< "$verdict" >/dev/null || fail "no passing fw16 sentinel verdict for $sha; see the sentinel logs on $BUILD_HOST"
+    printf '%s\n' "$verdict"
+}
+
+# The hosted signing workflow checks the status reported from fw16's verdict.
+record_fw16_tests() {
+    local sha=$1 verdict
+    verdict=$(require_fw16_verdict "$sha") || exit 1
     CAGENTS_RELEASE_GITHUB_REPOSITORY=$GITHUB_REPOSITORY \
         "$ROOT_DIR/scripts/release-actions" record-tests "$sha" <<< "$verdict" \
         || fail "the fw16 test status for $TAG could not be recorded"
@@ -1214,7 +1226,7 @@ publish_in_actions() {
     fi
     rm -f -- "$admitted"
     if [[ -z $pushed && $YES == false ]]; then
-        printf 'Pushing %s starts the build for its signed release draft. The tag cannot be moved.\n' "$TAG"
+        printf 'Pushing %s starts the workflow for its signed release draft. The tag cannot be moved.\n' "$TAG"
         read -r -p "Type $VERSION to push it: " answer
         [[ $answer == "$VERSION" ]] || fail 'not pushed'
     fi
@@ -1225,7 +1237,7 @@ publish_in_actions() {
         return 1
     fi
     repository_git push --quiet origin "$tag_object:refs/tags/$TAG" || fail "cannot push $TAG to origin"
-    printf 'Pushed %s. The release workflow builds and signs it in a few hours, and leaves it as a draft:\n' "$TAG"
+    printf 'Pushed %s. The release workflow reuses its prepared Linux bundle when available, or builds and smoke-tests the tag. It leaves a signed draft:\n' "$TAG"
     printf '  https://github.com/%s/actions/workflows/release.yml\n' "$GITHUB_REPOSITORY"
     printf 'Then rehearse its update, and publish it:\n  scripts/release rehearse %s --from-draft\n  scripts/release publish %s --actions\n' \
         "$VERSION" "$VERSION"

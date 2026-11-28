@@ -810,6 +810,13 @@ async fn clean_reload_retains_caret_scroll_and_preview_mode() {
 
 #[tokio::test]
 async fn native_alias_parent_deduplicates_and_survives_other_owner_close() {
+    // Give the kernel watch snapshots their own coordinator so registrations
+    // from other document tests cannot trigger a rebuild during the count.
+    if test_support::isolated_test(
+        "repository_widget::live_tests::native_alias_parent_deduplicates_and_survives_other_owner_close",
+    ) {
+        return;
+    }
     let root = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(root.path().join("real/checkout")).unwrap();
     std::os::unix::fs::symlink("real", root.path().join("alias")).unwrap();
@@ -828,18 +835,20 @@ async fn native_alias_parent_deduplicates_and_survives_other_owner_close() {
     text(a, &mut first, "both updated").await;
     text(b, &mut second, "both updated").await;
     drop(second);
-    // Command ordering makes arm an acknowledgement of preceding unwatch.
-    first
-        .document_watch
-        .as_ref()
-        .unwrap()
-        .arm(vec![real.join("live.txt")]);
+    // An empty registration acknowledges preceding removals without
+    // rearming either owner's watch.
+    let barrier = DocumentWatch::new();
+    barrier.arm(Vec::new());
+    #[cfg(target_os = "linux")]
+    assert_eq!(
+        native_watch_count(&real),
+        1,
+        "closing one alias must keep the shared native watch"
+    );
     std::fs::write(real.join("live.txt"), "still watched").unwrap();
     text(a, &mut first, "still watched").await;
     drop(first);
-    let barrier_root = tempfile::tempdir().unwrap();
-    let barrier = DocumentWatch::new();
-    barrier.arm(vec![barrier_root.path().join("barrier.txt")]);
+    barrier.arm(Vec::new());
     #[cfg(target_os = "linux")]
     assert_eq!(
         native_watch_count(&real),
@@ -948,17 +957,9 @@ async fn clean_reload_invalidates_revision_zero_find_cache() {
 #[cfg(target_os = "linux")]
 #[test]
 fn native_registration_failure_is_visible_and_explicit_retry_restores_delivery() {
-    const CHILD: &str = "CAGENTS_DOCUMENT_WATCH_LIMIT_CHILD";
-    if std::env::var_os(CHILD).is_none() {
-        let output = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "repository_widget::live_tests::native_registration_failure_is_visible_and_explicit_retry_restores_delivery", "--nocapture"])
-            .env(CHILD, "1").output().unwrap();
-        assert!(
-            output.status.success(),
-            "{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    if test_support::isolated_test(
+        "repository_widget::live_tests::native_registration_failure_is_visible_and_explicit_retry_restores_delivery",
+    ) {
         return;
     }
     let root = tempfile::tempdir().unwrap();

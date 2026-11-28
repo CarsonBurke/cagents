@@ -694,6 +694,9 @@ impl LocalHandle {
             Some(NativeOwnership::Adopted(holder, _)) => Some(*holder),
             _ => None,
         };
+        // An adopted holder also attaches by WebSocket and owns its server.
+        let shared_websocket = matches!(spec.transport, TransportSpec::UnixWebSocket { .. })
+            && native_holder.is_none();
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
@@ -981,18 +984,23 @@ impl LocalHandle {
                 } else {
                     true
                 };
-                // Nothing reports the end of a step the provider left running.
-                // A preserved holder's provider is still running its steps.
                 if !preserve_holder {
-                    if let Err(error) = actor
-                        .store
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .stop_running_steps()
+                    // A shared server can keep working after this socket closes.
+                    // Keep its last reported transcript and file-edit statuses.
+                    if !shared_websocket
+                        && let Err(error) = actor
+                            .store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .stop_running_steps()
                     {
                         tracing::warn!(%error, "steps left running could not be marked stopped");
                     }
-                    stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
+                    let mut state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
+                    stop_snapshot_subagents(&mut state);
+                    if !shared_websocket {
+                        stop_snapshot_steps(&mut state);
+                    }
                 }
                 // Publish the adapter's exact final input before any exit
                 // notification lets a reader fetch it. A detached or
@@ -5218,17 +5226,21 @@ fn apply_projected_event(
     child_text_copy::finish(state, child_copy_update);
 }
 
-/// Marks the steps still running or waiting as stopped, copying only those
-/// items. Nothing a provider that ended was doing outlives it; a step it left
-/// going would otherwise read as still working. A subagent waiting on its
-/// background work is ended by [`Event::Exited`], which says why.
-fn stop_snapshot_steps(state: &mut Snapshot) {
-    stop_running_steps(&mut state.items);
+/// Retires the actor's live subagents from its work and shutdown inventories.
+fn stop_snapshot_subagents(state: &mut Snapshot) {
     for agent in &mut state.subagents {
         if agent.is_running() {
             agent.status = ToolStatus::Stopped;
             agent.waiting = false;
         }
+    }
+}
+
+/// Marks unfinished transcript items as stopped after provider teardown,
+/// copying only the items that change.
+fn stop_snapshot_steps(state: &mut Snapshot) {
+    stop_running_steps(&mut state.items);
+    for agent in &mut state.subagents {
         stop_running_steps(&mut agent.items);
     }
 }
@@ -5301,17 +5313,18 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
     state.subagents.last_mut().expect("subagent was inserted")
 }
 
+const MAX_SUBAGENT_HISTORY_BYTES: usize = 64 * 1024;
+
 fn trim_subagent(agent: &mut Subagent) {
-    const MAX_BYTES: usize = 64 * 1024;
     const MAX_ITEMS: usize = 64;
     if let Some(last) = agent.items.last_mut()
-        && last.content.byte_len() > MAX_BYTES
+        && last.content.byte_len() > MAX_SUBAGENT_HISTORY_BYTES
         && child_diagnostics::marked(last)
     {
         child_diagnostics::project(Arc::make_mut(last));
     }
     if let Some(last) = agent.items.last_mut()
-        && last.content.byte_len() > MAX_BYTES
+        && last.content.byte_len() > MAX_SUBAGENT_HISTORY_BYTES
     {
         Arc::make_mut(last).content = ItemContent::Text {
             text: "[This large item is available in the provider transcript.]".into(),
@@ -5324,7 +5337,7 @@ fn trim_subagent(agent: &mut Subagent) {
         .iter()
         .map(|item| item.content.byte_len())
         .sum::<usize>();
-    while agent.items.len() > MAX_ITEMS || bytes > MAX_BYTES {
+    while agent.items.len() > MAX_ITEMS || bytes > MAX_SUBAGENT_HISTORY_BYTES {
         let removed = agent.items.remove(0);
         bytes = bytes.saturating_sub(removed.content.byte_len());
     }

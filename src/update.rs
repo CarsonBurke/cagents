@@ -233,6 +233,9 @@ pub struct Release {
     /// SHA-256 of the signed metadata this release was read from, so the
     /// worker installs exactly the release the person chose.
     metadata: [u8; 32],
+    /// A device update must check the extracted CLI before moving any work.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    required_protocol: Option<u16>,
     archive: Asset,
     checksums: Asset,
     installer: Asset,
@@ -566,7 +569,7 @@ fn installer_updates(version: Option<&str>) -> String {
 }
 
 /// The terminal command that installs `version`, or the latest release.
-fn installer_command(version: Option<&str>) -> String {
+pub(crate) fn installer_command(version: Option<&str>) -> String {
     match version {
         Some(version) => format!(
             "curl -fsSL {}/download/v{version}/install-macos.sh | sh -s -- --version {version}",
@@ -881,15 +884,49 @@ fn installed_terminal_candidate(
     Ok(served.to_owned())
 }
 
+pub(crate) fn macos_device_release(version: &str) -> Result<(String, String), UpdateError> {
+    let version = installed_version(version)?.to_string();
+    let release = feed::Feed::configured()
+        .map_err(invalid)?
+        .macos_for_protocol(
+            &version,
+            crate::terminal_ipc::PROTOCOL_VERSION,
+            &CancellationToken::for_terminal(),
+        )?;
+    let digest = release
+        .metadata
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    Ok((version, digest))
+}
+
 pub fn upgrade_release(
     version: &str,
     yes: bool,
     interrupt: bool,
+    require_release: Option<(&str, u16)>,
 ) -> Result<UpdateJob, UpdateError> {
+    if require_release.is_some() && !cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+        return Err(invalid(
+            "A required Apple Silicon release can only be installed on an Apple Silicon Mac",
+        ));
+    }
     let _interrupt = cancellation::Interrupt::install()?;
     recovery::inspect_pending_current()?;
     let installation = Installation::detect()?;
-    let selected = selected_upgrade(&installation, version)?;
+    let selected = selected_upgrade(
+        &installation,
+        version,
+        require_release.map(|(_, protocol)| protocol),
+    )?;
+    if let Some((digest, _)) = require_release
+        && selected.metadata != feed::parse_digest(digest)?
+    {
+        return Err(invalid(
+            "The signed release changed since it was checked on the controlling computer",
+        ));
+    }
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
@@ -902,11 +939,18 @@ pub fn upgrade_release(
 }
 
 /// The verified release `version`, when it is newer than `installation`.
-fn selected_upgrade(installation: &Installation, version: &str) -> Result<Release, UpdateError> {
+fn selected_upgrade(
+    installation: &Installation,
+    version: &str,
+    required_protocol: Option<u16>,
+) -> Result<Release, UpdateError> {
     let parsed = stable_version(version)?;
-    let selected = feed::Feed::configured()
-        .map_err(invalid)?
-        .release(&parsed.to_string(), &CancellationToken::for_terminal())?;
+    let feed = feed::Feed::configured().map_err(invalid)?;
+    let cancellation = CancellationToken::for_terminal();
+    let selected = match required_protocol {
+        Some(protocol) => feed.macos_for_protocol(version, protocol, &cancellation)?,
+        None => feed.release(version, &cancellation)?,
+    };
     if stable_version(&selected.version)? != parsed
         || parsed <= installed_version(&installation.version)?
     {
@@ -2687,7 +2731,13 @@ fn perform_update(
     };
     let cancellation = CancellationToken::for_job(state, &job.id)?;
     let feed = feed::Feed::configured().map_err(invalid)?;
-    let release = feed.release(&selected.version, &cancellation)?;
+    let release = match selected.required_protocol {
+        Some(protocol) if cfg!(target_os = "macos") => {
+            feed.macos_for_protocol(&selected.version, protocol, &cancellation)?
+        }
+        Some(_) => return Err(invalid("The required release is for Apple Silicon")),
+        None => feed.release(&selected.version, &cancellation)?,
+    };
     if release != selected || !is_newer(&release.version, &installation.version)? {
         return Err(invalid(
             "selected release changed or is no longer an upgrade; check again",
@@ -5876,6 +5926,7 @@ finally:
             url: format!("https://github.com/{REPOSITORY}/releases/tag/v{version}"),
             notes: String::new(),
             metadata: [1; 32],
+            required_protocol: None,
             archive: asset(format!("cagents-{version}-x86_64-unknown-linux-gnu.tar.gz")),
             checksums: asset("SHA256SUMS".into()),
             installer: asset("install.sh".into()),

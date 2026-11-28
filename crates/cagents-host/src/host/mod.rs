@@ -16,6 +16,7 @@ mod device_stats;
 mod device_trust;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
+mod file_revision;
 #[cfg(debug_assertions)]
 mod fixture_close_refusal;
 #[cfg(debug_assertions)]

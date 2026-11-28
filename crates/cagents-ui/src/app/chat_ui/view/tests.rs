@@ -3621,7 +3621,9 @@ fn selected_native_child_renders_identity_and_bounded_selector() {
         "{labels:?}"
     );
     assert!(
-        labels.iter().any(|label| label.contains("Conversation")),
+        labels
+            .iter()
+            .any(|label| label.starts_with("Main conversation")),
         "{labels:?}"
     );
 }
@@ -14763,5 +14765,181 @@ fn browsing_another_provider_hides_the_conversations_settings() {
         let laid = PickerLayout::of(&mut menu);
         assert_eq!(laid.mounts(&effort), shown, "{browsing:?} {query:?}");
         assert_eq!(laid.mounts(&fast), shown, "{browsing:?} {query:?}");
+    }
+}
+
+/// The pane as it lays out at 600 by 800: each control's bounds by its
+/// native accessible name, and the text it shows, in order.
+fn strip_scene(runtime: &Runtime) -> (Vec<(String, iced::Rectangle)>, Vec<String>) {
+    use iced::advanced::{
+        Layout, layout,
+        widget::{Operation, Tree},
+    };
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn text(&mut self, _: Option<&widget::Id>, _: iced::Rectangle, text: &str) {
+            self.0.push(text.to_owned());
+        }
+    }
+    let shortcuts = crate::settings::KeyboardShortcuts::default();
+    let mut element = runtime.view(
+        None,
+        false,
+        true,
+        &shortcuts,
+        600.0,
+        0.0,
+        Place { branch: None },
+        true,
+        None,
+        vec![],
+        true,
+    );
+    let renderer = crate::app::tests::headless_renderer();
+    let mut tree = Tree::new(element.as_widget());
+    let node = element.as_widget_mut().layout(
+        &mut tree,
+        &renderer,
+        &layout::Limits::new(iced::Size::ZERO, iced::Size::new(600.0, 800.0)),
+    );
+    let accessible =
+        element
+            .as_widget()
+            .a11y_nodes(Layout::new(&node), &tree, iced::mouse::Cursor::Unavailable);
+    let controls = accessible
+        .root()
+        .iter()
+        .chain(accessible.children())
+        .filter_map(|node| {
+            let label = node.node().label()?.to_owned();
+            let bounds = node.node().bounds()?;
+            Some((
+                label,
+                iced::Rectangle::new(
+                    iced::Point::new(bounds.x0 as f32, bounds.y0 as f32),
+                    iced::Size::new(bounds.width() as f32, bounds.height() as f32),
+                ),
+            ))
+        })
+        .collect();
+    let mut texts = Texts(Vec::new());
+    element
+        .as_widget_mut()
+        .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+    (controls, texts.0)
+}
+
+fn control(controls: &[(String, iced::Rectangle)], name: &str) -> Option<iced::Rectangle> {
+    controls
+        .iter()
+        .find(|(label, _)| label.starts_with(name))
+        .map(|(_, bounds)| *bounds)
+}
+
+#[test]
+fn the_new_activity_jump_floats_over_the_transcript_without_taking_a_row() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(12));
+    Arc::make_mut(&mut runtime.snapshot)
+        .subagents
+        .push(native_child_fixture());
+    // Well above the end of a long transcript.
+    runtime.scroll = Scroll::new(0.0, 5_000.0, 400.0);
+    let (quiet, _) = strip_scene(&runtime);
+    assert_eq!(control(&quiet, "New activity"), None);
+    runtime.unseen_activity = true;
+    let (shown, texts) = strip_scene(&runtime);
+    assert!(
+        texts.iter().any(|text| text == "↓ New activity"),
+        "{texts:?}"
+    );
+    let jump = control(&shown, "New activity").expect("the jump shows");
+    let main = control(&shown, "Main conversation").expect("the Main tab");
+    // Nothing below the transcript moved for it.
+    assert_eq!(control(&quiet, "Main conversation"), Some(main));
+    // It floats over the transcript's foot, centred, above the strip.
+    assert!(jump.y + jump.height <= main.y, "{jump:?} over {main:?}");
+    assert!(main.y - (jump.y + jump.height) < 2.0 * LATEST_JUMP_BAND);
+    let centre = jump.x + jump.width / 2.0;
+    assert!((centre - 300.0).abs() < 1.0, "{jump:?}");
+    // Disconnected, it stays, unable to act.
+    runtime.disconnected = true;
+    let (disconnected, _) = strip_scene(&runtime);
+    assert!(control(&disconnected, "New activity").is_some());
+}
+
+#[test]
+fn the_jump_never_covers_the_end_it_points_to() {
+    let window = 400.0;
+    let content = 2_000.0;
+    let end = content - window;
+    // At the end, and within the band the jump covers, the end is in view.
+    for below in [0.0, PAGE_REACH, LATEST_JUMP_BAND] {
+        assert!(
+            !Scroll::new(end - below, content, window).leaves_room_for_jump(),
+            "{below}px from the end"
+        );
+    }
+    assert!(Scroll::new(end - LATEST_JUMP_BAND - 1.0, content, window).leaves_room_for_jump());
+    // A transcript that fits has nowhere to jump to.
+    assert!(!Scroll::new(0.0, 300.0, window).leaves_room_for_jump());
+}
+
+/// #3592: the tab names a selected subagent and marks how it stands, and
+/// the line closing its transcript says what it is doing. The heading below
+/// the tabs repeats neither, and nothing waits above a spinning "Working".
+#[test]
+fn a_selected_subagent_says_its_state_once() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+    let mut child = native_child_fixture();
+    child.model = Some("child-model".into());
+    runtime.selected_subagent = Some(child.id.clone());
+    Arc::make_mut(&mut runtime.snapshot).subagents.push(child);
+    let (controls, texts) = strip_scene(&runtime);
+    assert_eq!(
+        texts.iter().filter(|text| text.contains("Working")).count(),
+        1,
+        "{texts:?}"
+    );
+    assert!(
+        !texts
+            .iter()
+            .any(|text| text.contains("Waiting for subagent activity")),
+        "{texts:?}"
+    );
+    // What the tab cannot hold: the task, and where it runs on what.
+    assert!(
+        texts.iter().any(|text| text == "Inspect repository"),
+        "{texts:?}"
+    );
+    assert!(
+        texts
+            .iter()
+            .any(|text| text == "Claude subagent · child-model"),
+        "{texts:?}"
+    );
+    // The tab, whose accessible name carries the state for those who
+    // cannot see its mark.
+    assert!(
+        control(&controls, "Scout · Working · ").is_some(),
+        "{controls:?}"
+    );
+    assert!(texts.iter().any(|text| text == "Scout"), "{texts:?}");
+    assert!(texts.iter().any(|text| text == "Main"), "{texts:?}");
+
+    // Settled, no line closes its transcript, so its heading says how it
+    // stands, once, in words rather than only by the tab's mark.
+    for status in [chat::ToolStatus::Succeeded, chat::ToolStatus::Stopped] {
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status = status;
+        let child = runtime.snapshot.subagents[0].clone();
+        let state = runtime.native_child_status(&child).to_owned();
+        let (_, texts) = strip_scene(&runtime);
+        assert_eq!(
+            texts.iter().filter(|text| **text == state).count(),
+            1,
+            "{status:?}: {texts:?}"
+        );
     }
 }

@@ -56,6 +56,7 @@ mod startup_tests;
 #[cfg(test)]
 mod unserved_resume_tests;
 pub(super) mod upgrade_resolution;
+use super::delivery::{Outbound, publish};
 use crate::{
     agent::Provider,
     chat::{
@@ -638,7 +639,6 @@ fn changed_for_instance(
         }
         return;
     }
-    let proof = state.proof().clone();
     if matches!(update, Update::Activity { .. }) {
         state.tally_updates.notify_one();
         if let Some(work) = &state.work {
@@ -705,6 +705,7 @@ fn changed_for_instance(
         }
         return;
     }
+    let proof = state.proof_handle();
     let HostState { chats, clients, .. } = &mut *state;
     let Some(record) = chats.get_mut(&id) else {
         return;
@@ -719,71 +720,75 @@ fn changed_for_instance(
     let queue_ended =
         (completed && !record.returning_terminal && !record.handle.is_read_only_history())
             .then(|| record.current_session());
-    for (&client, &visible) in &record.subscribers {
-        if let Some(source) = &queue_ended
-            && let Some(delivery) = clients.get(&client)
-        {
-            let _ = delivery.push(ServerEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof: proof.clone(),
-                message: ServerMessage::ChatQueueEnded {
-                    source: source.clone(),
-                    execution: record.execution_instance,
-                    current: true,
-                },
-            });
+    if let Update::Observed { generation } = &update {
+        // This update uses each hidden subscriber's own observation epoch.
+        for (&client, &visible) in &record.subscribers {
+            let delivery = clients.get(&client);
+            if let (Some(source), Some(delivery)) = (&queue_ended, delivery) {
+                let _ = delivery.push(Outbound::broadcast(
+                    &proof,
+                    ServerMessage::ChatQueueEnded {
+                        source: source.clone(),
+                        execution: record.execution_instance,
+                        current: true,
+                    },
+                ));
+            }
+            if !visible {
+                let observation = record.observations.entry(client).or_default();
+                if observation.accepts(*generation)
+                    && let Some(delivery) = delivery
+                    && delivery
+                        .push(Outbound::broadcast(
+                            &proof,
+                            ServerMessage::ChatObserved {
+                                chat_id: id,
+                                epoch: observation.epoch,
+                            },
+                        ))
+                        .is_ok()
+                {
+                    observation.notified = true;
+                }
+            }
         }
+    } else if !record.subscribers.is_empty() {
+        let presentation = matches!(update, Update::Presentation);
+        let deliveries = record
+            .subscribers
+            .iter()
+            .filter(|&(_, &visible)| visible || !presentation)
+            .filter_map(|(client, _)| clients.get(client).map(Arc::as_ref));
         let message = match &update {
-            &Update::Activity { state, generation } => ServerMessage::ChatActivity {
+            &Update::Activity { state, generation } => Some(ServerMessage::ChatActivity {
                 chat_id: id,
                 state,
                 generation,
-            },
-            Update::Presentation if visible => ServerMessage::ChatChanged { chat_id: id },
-            &Update::Observed { generation } if !visible => {
-                let observation = record.observations.entry(client).or_default();
-                if !observation.accepts(generation) {
-                    continue;
-                }
-                ServerMessage::ChatObserved {
-                    chat_id: id,
-                    epoch: observation.epoch,
-                }
-            }
-            // Every surface keeps the account's figures, whether or not it
-            // is showing this conversation.
+            }),
+            Update::Presentation => Some(ServerMessage::ChatChanged { chat_id: id }),
+            // Every surface keeps these values, whether or not it shows this
+            // conversation, since it learns of them only as they change.
             Update::AccountUsage {
                 report,
                 observed_at,
-            } => ServerMessage::ChatAccountUsage {
+            } => Some(ServerMessage::ChatAccountUsage {
                 chat_id: id,
                 report: report.clone(),
                 observed_at: *observed_at,
-            },
-            // Every surface keeps them, whether or not it is showing this
-            // conversation, since it learns of them only as they change.
-            Update::AgentAddresses(addresses) => ServerMessage::ChatAgentAddresses {
+            }),
+            Update::AgentAddresses(addresses) => Some(ServerMessage::ChatAgentAddresses {
                 chat_id: id,
                 addresses: addresses.clone(),
-            },
-            Update::ActiveModel { revision, model } => ServerMessage::ChatActiveModel {
+            }),
+            Update::ActiveModel { revision, model } => Some(ServerMessage::ChatActiveModel {
                 chat_id: id,
                 revision: *revision,
                 model: model.clone(),
-            },
-            _ => continue,
+            }),
+            _ => None,
         };
-        if let Some(delivery) = clients.get(&client) {
-            let delivered = delivery.push(ServerEnvelope {
-                version: PROTOCOL_VERSION,
-                request_id: None,
-                proof: proof.clone(),
-                message,
-            });
-            if matches!(update, Update::Observed { .. }) && delivered.is_ok() {
-                record.observations.entry(client).or_default().notified = true;
-            }
+        if let Some(message) = message {
+            publish(&proof, deliveries, || message);
         }
     }
     // An old producer callback can consume the shared rearm after an ACK but
@@ -2798,6 +2803,8 @@ fn start_publishing(
     )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener_for_start(&process_launch, owned_socket)
+    } else if source.is_some() {
+        chat::protocol::create_for_terminal_handoff(&process_launch)
     } else {
         chat::protocol::create_for_start(&process_launch)
     }
@@ -5342,9 +5349,10 @@ fn process_inner(
             let snapshot = handle.snapshot(None).ok_or_else(|| {
                 unavailable("Exact native snapshot is unavailable; no replacement was started")
             })?;
-            let recipe = session.launch.terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref()).ok_or_else(|| unavailable(
-                "Wait for the provider's confirmed exact conversation before returning to terminal",
-            ))?;
+            let recipe = session
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+                .map_err(unavailable)?;
             if session.launch.provider == Provider::Codex
                 && (session.terminal.is_some()
                     || session
@@ -5406,6 +5414,64 @@ fn process_inner(
                 record.returning_terminal = true;
                 record.completion_observed = false;
                 state.inventory_changed();
+            }
+            // Closing interrupts active work and waits for confirmed teardown.
+            // Never start a second writer before teardown has been proved.
+            owners.close(host, &closing)?;
+            let snapshot = handle.snapshot(None).ok_or_else(|| {
+                unavailable(
+                    "Exact native final snapshot is unavailable; retirement remains unconfirmed",
+                )
+            })?;
+            if snapshot.session_id != session.launch.session_id {
+                return Err(unavailable(
+                    "Provider identity changed during shutdown; retry the exact terminal handoff",
+                ));
+            }
+            // Autonomous policy changes can arrive while the native writer
+            // shuts down. The final confirmed snapshot wins over launch flags.
+            let recipe = match session
+                .launch
+                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
+            {
+                Ok(recipe) => recipe,
+                Err(reason) => {
+                    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                    owners.require_locked(&state, &closing)?;
+                    state
+                        .chats
+                        .get_mut(&chat_id)
+                        .expect("checked actor")
+                        .returning_terminal = false;
+                    state.inventory_changed();
+                    drop(state);
+                    changed_owned(
+                        &Arc::downgrade(host),
+                        chat_id,
+                        owners.target.instance,
+                        Update::Observed {
+                            generation: snapshot.generation,
+                        },
+                    );
+                    return Err(unavailable(format!(
+                        "{reason} The chat stopped during the switch. Reopen it in chat to continue."
+                    )));
+                }
+            };
+            if directory.is_some() && recipe.working_directory != terminal.launch.working_directory
+            {
+                return Err(unavailable(
+                    "The terminal resume directory changed during handoff; retry the exact handoff",
+                ));
+            }
+            terminal.launch = recipe.clone();
+            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            };
+            {
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                owners.require_locked(&state, &closing)?;
                 state.recovery_independence.extend(chat_id, terminal_id);
                 // The terminal resumes this chat's conversation under its
                 // claim, which refuses any other's (see
@@ -5423,36 +5489,6 @@ fn process_inner(
                 }
             }
             let _handing_off = HandingOff(host, terminal_id);
-            // Closing interrupts active work and waits for confirmed teardown.
-            // Never start a second writer before teardown has been proved.
-            owners.close(host, &closing)?;
-            let snapshot = handle.snapshot(None).ok_or_else(|| {
-                unavailable(
-                    "Exact native final snapshot is unavailable; retirement remains unconfirmed",
-                )
-            })?;
-            if snapshot.session_id != session.launch.session_id {
-                return Err(unavailable(
-                    "Provider identity changed during shutdown; retry the exact terminal handoff",
-                ));
-            }
-            // Autonomous policy changes can arrive while the native writer
-            // shuts down. The final confirmed snapshot wins over launch flags.
-            let recipe = session
-                .launch
-                .terminal_recipe_with_permission_mode(snapshot.permission_mode.as_deref())
-                .ok_or_else(|| unavailable("Cannot form the confirmed terminal resume command"))?;
-            if directory.is_some() && recipe.working_directory != terminal.launch.working_directory
-            {
-                return Err(unavailable(
-                    "The terminal resume directory changed during handoff; retry the exact handoff",
-                ));
-            }
-            terminal.launch = recipe.clone();
-            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-                recipe,
-                last_exit: None,
-            };
             // Teardown is proved, so the terminal takes over the chat's lineage
             // and whatever agents it started, unless another of its sessions runs.
             owners.require_current(host, &closing)?;

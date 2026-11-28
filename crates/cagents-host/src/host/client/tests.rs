@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::*;
 use crate::model::TerminalId;
 
@@ -261,7 +263,7 @@ mod reconnect_output {
         .unwrap();
         let delivery = host.lock().unwrap().clients[&2].clone();
         let redraw = (0..delivery.queued())
-            .filter_map(|_| match delivery.pop().unwrap().message {
+            .filter_map(|_| match delivery.pop().unwrap().into_message() {
                 ServerMessage::Redraw { generation, .. } => Some(generation),
                 _ => None,
             })
@@ -3567,7 +3569,7 @@ fn spawning_announces_the_terminal_to_observers_but_never_to_its_creator() {
     let announced = |delivery: &Arc<DeliveryQueue>| {
         delivery.close_after_drain();
         std::iter::from_fn(|| delivery.pop())
-            .filter_map(|queued| match queued.message {
+            .filter_map(|queued| match queued.into_message() {
                 ServerMessage::TerminalCreated { terminal } => Some(terminal),
                 _ => None,
             })
@@ -3997,10 +3999,11 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     let mut editor = ModelSocket::connect(&host, 1);
     let mut watcher = ModelSocket::connect(&host, 2);
     let mut unsubscribed = ModelSocket::connect(&host, 3);
-    // Both windows watch, so the origin exclusion is exercised independently
-    // of subscription. Each reply is the new atomic snapshot with closed ids.
+    let mut peer = ModelSocket::connect(&host, 4);
+    // The editor also watches, so origin exclusion is independent of
+    // subscription. Each watcher starts from the same atomic snapshot.
     let mut identity = None;
-    for window in [&mut editor, &mut watcher] {
+    for window in [&mut editor, &mut watcher, &mut peer] {
         let ServerResponse::WorkspaceSnapshot { model, closed } =
             window.request(ClientRequest::WatchWorkspaceModel)
         else {
@@ -4085,6 +4088,7 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     assert_eq!(removed.effects.closed, [pane.id]);
 
     let observed = (0..4).map(|_| watcher.edge()).collect::<Vec<_>>();
+    assert_eq!(observed, (0..4).map(|_| peer.edge()).collect::<Vec<_>>());
     assert_eq!(observed[0].0, opened.sequence);
     assert_eq!(observed[0].1, open);
     assert_eq!(observed[0].2.projects, opened.projects);
@@ -4114,36 +4118,53 @@ fn editing_the_model_announces_to_watchers_but_never_to_its_originator() {
     }
 }
 
-/// #3388: a terminal's worker creates its transcript while the spawn is still
-/// reserved, before the inventory lists it, and a terminal returned from a
-/// conversation writes its predecessor's transcript. The resident census names
-/// both, so a window keeps those files.
-#[test]
-fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
-    use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
+pub(in crate::host) fn with_resident_census_client(
+    host: &SharedHost,
+    exercise: impl FnOnce(&mut crate::control::ControlClient),
+) {
+    thread::scope(|scope| {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        let host = Arc::clone(host);
+        scope.spawn(move || serve(peer, 2, host));
+        let mut client = crate::control::ControlClient::from_stream(stream).unwrap();
+        exercise(&mut client);
+    });
+}
 
+pub(in crate::host) fn terminal_with_transcript(
+    launch: crate::model::LaunchRecipe,
+    path: PathBuf,
+) -> crate::model::TerminalSession {
+    crate::model::TerminalSession {
+        owned_codex_listener: None,
+        recovery_origin: None,
+        predecessor: None,
+        id: TerminalId::new(),
+        launch: launch.clone(),
+        transcript_path: Some(path),
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: launch,
+            last_exit: None,
+        },
+    }
+}
+
+/// A writer creates its transcript before the inventory lists the terminal.
+/// The resident census covers the reserved path until the spawn settles.
+#[test]
+fn the_resident_census_tracks_spawning_and_inherited_transcripts() {
     let directory = tempfile::tempdir().unwrap();
-    let host = Arc::new(crate::host::state::HostLock::new(
-        super::super::state::HostState::new(HostSessionProof {
-            host_session_id: HostSessionId::new("resident-session"),
-            boot_id: BootId::new("boot"),
-            host_incarnation: HostIncarnation::new("incarnation"),
-        }),
-    ));
+    let (_, host) = panic_test_host("resident-census");
     host.lock().unwrap().register_client(1);
-    // A spawn still reserved, whose worker is about to open a transcript
-    // named for another terminal.
     let spawning = TerminalId::new();
-    let opening = directory.path().join(format!("{}.log", TerminalId::new()));
+    let opening = directory.path().join("opening.log");
     host.lock()
         .unwrap()
         .reserve_spawn_writing(spawning, &opening)
         .unwrap();
-    let inherited = directory.path().join(format!("{}.log", TerminalId::new()));
-    // The census does not depend on what the terminal runs. A login shell
-    // can exit on its own or leave session jobs (fish's first run starts a
-    // completion generator), and then teardown cannot confirm its cleanup.
-    // Run a root that waits for hangup and starts nothing else.
+
+    // A root that waits for hangup and starts no other jobs.
     let recipe = crate::model::LaunchRecipe {
         program: "/bin/sleep".into(),
         arguments: vec!["600".into()],
@@ -4151,43 +4172,21 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
         environment: Default::default(),
         unset_environment: Default::default(),
     };
-    let returned = crate::model::TerminalSession {
-        owned_codex_listener: None,
-        recovery_origin: None,
-        predecessor: None,
-        id: TerminalId::new(),
-        launch: recipe.clone(),
-        transcript_path: Some(inherited.clone()),
-        resume_hint: None,
-        continuity: TerminalContinuity::RelaunchAvailable {
-            recipe,
-            last_exit: None,
-        },
+    let inherited = directory.path().join("predecessor.log");
+    let returned = terminal_with_transcript(recipe.clone(), inherited.clone());
+    let spawn = |session| {
+        process_request(
+            &host,
+            1,
+            ClientRequest::Spawn {
+                session,
+                options: Default::default(),
+            },
+        )
     };
-    let (response, _, _) = process_request(
-        &host,
-        1,
-        ClientRequest::Spawn {
-            session: returned.clone(),
-            options: crate::terminal_ipc::TerminalSpawnOptions::default(),
-        },
-    )
-    .unwrap();
+    let (response, _, _) = spawn(returned.clone()).unwrap();
     assert!(matches!(response, ServerResponse::Spawned { .. }));
-
-    let (response, _, _) = process_request(&host, 1, ClientRequest::ListResidentTerminals).unwrap();
-
-    let mut terminals = vec![spawning, returned.id];
-    terminals.sort();
-    let mut transcripts = vec![opening, inherited];
-    transcripts.sort();
-    assert_eq!(
-        response,
-        ServerResponse::ResidentTerminals {
-            terminals,
-            transcripts,
-        }
-    );
+    let terminal = host.lock().unwrap().handle(1, returned.id).unwrap();
     let listed: Vec<_> = host
         .lock()
         .unwrap()
@@ -4196,10 +4195,37 @@ fn the_resident_census_names_spawning_terminals_and_inherited_transcripts() {
         .map(|terminal| terminal.session.id)
         .collect();
     assert_eq!(listed, [returned.id], "the inventory omits the spawn");
-    // shutdown() reports every failure as Closed, so accepting Closed would
-    // also hide a worker that never finished or a process it left running.
-    // The root above cannot end before this, so require confirmed cleanup.
-    let terminal = host.lock().unwrap().handle(1, returned.id).unwrap();
+
+    with_resident_census_client(&host, |client| {
+        let mut terminals = vec![spawning, returned.id];
+        terminals.sort();
+        let resident = client.resident_terminals().unwrap();
+        assert_eq!(resident.terminals, terminals);
+        assert_eq!(resident.transcripts, [opening, inherited.clone()]);
+
+        host.lock().unwrap().cancel_spawn(spawning);
+        let resident = client.resident_terminals().unwrap();
+        assert_eq!(resident.terminals, [returned.id]);
+        assert_eq!(resident.transcripts, std::slice::from_ref(&inherited));
+
+        let failed = terminal_with_transcript(
+            crate::model::LaunchRecipe {
+                program: directory
+                    .path()
+                    .join("missing-executable")
+                    .to_str()
+                    .unwrap()
+                    .to_owned(),
+                ..recipe
+            },
+            directory.path().join("failed.log"),
+        );
+        assert_eq!(
+            spawn(failed).unwrap_err().code,
+            ProtocolErrorCode::TerminalUnavailable
+        );
+        assert_eq!(client.resident_terminals().unwrap(), resident);
+    });
     assert_eq!(terminal.shutdown(), Ok(()), "shutdown must confirm cleanup");
 }
 

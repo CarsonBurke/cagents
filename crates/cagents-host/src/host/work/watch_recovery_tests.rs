@@ -55,31 +55,7 @@ fn git(root: &Path, arguments: &[&str]) -> String {
 }
 
 fn fixture_handle() -> Handle {
-    Handle(Arc::new(Inner {
-        host: Weak::new(),
-        shared: Mutex::new(Shared {
-            projects: BTreeMap::new(),
-            listings: forge::Listings::default(),
-            pins: BTreeMap::new(),
-            session_activity: HashMap::new(),
-            in_use: Arc::default(),
-            tickets: BTreeMap::new(),
-            linear_unavailable: None,
-            stale_after_days: crate::work::DEFAULT_STALE_AFTER_DAYS,
-            board_read_at: None,
-            watching: false,
-            restored: BTreeMap::new(),
-        }),
-        updated: Condvar::new(),
-        scanner: Signal::default(),
-        forge: Signal::default(),
-        publisher: Signal::default(),
-        publication: Mutex::new(Publication::default()),
-        jobs: Jobs::default(),
-        store: Mutex::new(None),
-        conversations: conversations::Conversations::default(),
-        cancellation: CancellationToken::new(),
-    }))
+    Handle::idle(Weak::new())
 }
 
 fn wait_until(mut ready: impl FnMut() -> bool) {
@@ -163,11 +139,7 @@ fn registration_catches_edits_since_the_initial_scan_in_metadata_only_worktrees(
     let project = handle.shared().track(&repository, "fixture").id;
     let mut scanner = Scanner {
         monitor: Some(git_watch::Monitor::start(|| {}).unwrap()),
-        configured: BTreeMap::new(),
-        stamped: HashMap::new(),
-        sessions: Vec::new(),
-        sampled: None,
-        refreshed: None,
+        ..Scanner::default()
     };
     let later = now_unix_ms() + crate::work::ACTIVE_WINDOW_MS + 1;
     complete_scan_at(&mut scanner, &handle, later);
@@ -264,11 +236,7 @@ fn uncovered_periodic_scans_retry_native_watches_without_a_topology_event() {
     };
     let mut scanner = Scanner {
         monitor: Some(monitor),
-        configured: BTreeMap::new(),
-        stamped: HashMap::new(),
-        sessions: Vec::new(),
-        sampled: None,
-        refreshed: None,
+        ..Scanner::default()
     };
     complete_scan(&mut scanner, &handle);
     let original = handle.shared().projects[&repository]
@@ -419,11 +387,7 @@ fn an_unwatched_change_is_read_while_a_watched_worktree_keeps_changing() {
     handle.shared().track(&repository, "fixture");
     let mut scanner = Scanner {
         monitor: None,
-        configured: BTreeMap::new(),
-        stamped: HashMap::new(),
-        sessions: Vec::new(),
-        sampled: None,
-        refreshed: None,
+        ..Scanner::default()
     };
     complete_scan(&mut scanner, &handle);
     let (primary, unwatched) = {
@@ -548,11 +512,7 @@ fn an_idle_board_runs_no_git_and_an_event_reads_only_its_worktree() {
     };
     let mut scanner = Scanner {
         monitor: Some(monitor),
-        configured: BTreeMap::new(),
-        stamped: HashMap::new(),
-        sessions: Vec::new(),
-        sampled: None,
-        refreshed: None,
+        ..Scanner::default()
     };
     let local = |handle: &Handle| handle.shared().projects[&repository].local.clone().unwrap();
     let worktree = |local: &scan::Local, path: &Path| {

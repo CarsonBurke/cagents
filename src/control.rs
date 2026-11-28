@@ -611,6 +611,12 @@ pub enum DaemonCommand {
         /// Permit active native turns and their background subagents to stop.
         #[arg(long)]
         interrupt: bool,
+        /// Require the signed release approved by the computer controlling this Mac.
+        #[arg(long, value_name = "SHA256", requires_all = ["version", "require_protocol"])]
+        require_release: Option<String>,
+        /// Require this daemon protocol in the signed release and the downloaded Mac build.
+        #[arg(long, value_name = "PROTOCOL", requires = "require_release")]
+        require_protocol: Option<u16>,
     },
     /// Stop the daemon.
     #[command(
@@ -5359,9 +5365,16 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             version,
             yes,
             interrupt,
+            require_release,
+            require_protocol,
         } => {
             let job = match version {
-                Some(version) => crate::update::upgrade_release(&version, yes, interrupt),
+                Some(version) => crate::update::upgrade_release(
+                    &version,
+                    yes,
+                    interrupt,
+                    require_release.as_deref().zip(require_protocol),
+                ),
                 None => crate::update::upgrade_installed(yes, interrupt),
             }
             .map_err(|error| AppError::new("update", error))?;
@@ -7773,7 +7786,7 @@ mod tests {
         assert!(!super::routes_to_staged_owner(&command));
         assert!(
             matches!(command, super::TopCommand::Daemon { command: super::DaemonCommand::Upgrade {
-            version: Some(version), yes: true, interrupt: true,
+            version: Some(version), yes: true, interrupt: true, ..
         }} if version == "0.2.3")
         );
     }

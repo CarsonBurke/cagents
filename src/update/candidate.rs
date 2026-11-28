@@ -335,6 +335,7 @@ esac
             url: String::new(),
             notes: String::new(),
             metadata: [1; 32],
+            required_protocol: None,
             archive: asset.clone(),
             installer: asset.clone(),
             checksums: asset,

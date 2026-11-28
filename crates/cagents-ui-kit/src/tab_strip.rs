@@ -160,28 +160,28 @@ mod tests {
             horizontal(
                 widget::Id::new("fixture-native-tabs"),
                 vec![
-                    crate::ui_controls::view_tab(
-                        crate::ui_controls::ViewTab {
-                            label: "Conversation".into(),
+                    crate::ui_controls::quiet_tab(
+                        crate::ui_controls::QuietTab {
+                            label: "Main".into(),
+                            limit: None,
+                            suffix: None,
                             description: "Main conversation".into(),
-                            count: None,
                             selected: true,
                             id: None,
                             on_press: Some(0),
                         },
-                        true,
                         None,
                     ),
-                    crate::ui_controls::view_tab(
-                        crate::ui_controls::ViewTab {
+                    crate::ui_controls::quiet_tab(
+                        crate::ui_controls::QuietTab {
                             label: "Native · Reviewer".into(),
+                            limit: Some(24),
+                            suffix: None,
                             description: "Native child".into(),
-                            count: None,
                             selected: false,
                             id: None,
                             on_press: Some(1),
                         },
-                        true,
                         Some(crate::ui_controls::passive_icon(
                             crate::ui_controls::Icon::AgentWaiting,
                             design::COMPACT_ICON_SIZE,

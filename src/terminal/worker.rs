@@ -20,7 +20,10 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Read, Write},
-    os::fd::{AsRawFd, OwnedFd},
+    os::{
+        fd::{AsRawFd, OwnedFd},
+        unix::fs::FileExt,
+    },
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -48,11 +51,11 @@ use crate::{
         agent_recovery::{AgentProcess, AgentProcessIdentity},
     },
     pinned_process::PinnedProcess,
-    secure_file::open_private_append_file,
+    secure_file::open_private_read_append_file,
 };
 
 use super::{
-    TerminalTheme,
+    TRANSCRIPT_TRUNCATED_MARKER, TerminalTheme,
     snapshot::{RenderSnapshot, VisualResources},
     types::{
         KeyAction, KeyInput, KeyModifiers, MouseAction, MouseButton, MouseInput, PasteOrigin,
@@ -66,8 +69,6 @@ const PTY_BATCH_LIMIT: usize = 256 * 1024;
 /// Encoded ordinary input plus pre-reserved physical-release capacity.
 const PTY_WRITE_CAPACITY: usize = admission::ORDINARY_BYTES + admission::CLEANUP_LIMIT * 512 + 128;
 const PTY_WRITE_RETRY: Duration = Duration::from_millis(10);
-/// Marker appended once when a transcript hits its size cap.
-const TRANSCRIPT_TRUNCATED_MARKER: &[u8] = b"\n[cagents transcript truncated: size cap reached]\n";
 /// Foreground observation cadence. Every tick descends `/proc` over the PTY
 /// foreground subtree, so it is only worth paying while that group is moving:
 /// an unchanged group backs the interval off, any change resets it, and a
@@ -7308,26 +7309,20 @@ impl TranscriptWriter {
         capacity: usize,
         max_bytes: u64,
     ) -> Result<Self, String> {
-        let file = open_private_append_file(&path)
+        let file = open_private_read_append_file(&path)
             .map_err(|error| format!("open transcript {}: {error}", path.display()))?;
         let location = crate::transcript_location::capture(terminal, &path, &file);
-        let written = file.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        let (written, capped) = transcript_write_position(&file, max_bytes)
+            .map_err(|error| format!("inspect transcript {}: {error}", path.display()))?;
         let (sender, receiver) = crossbeam_channel::bounded(capacity);
-        let capped_flag = Arc::new(AtomicBool::new(false));
+        let capped_flag = Arc::new(AtomicBool::new(capped));
         let published_cap = Arc::clone(&capped_flag);
         let worker = thread::Builder::new()
             .name("terminal-transcript-writer".into())
             .spawn(move || {
                 let mut writer = BufWriter::new(file);
                 let mut written = written;
-                // Already over cap (e.g. an older uncapped session): the file
-                // stays as-is and nothing more is recorded.
-                let mut capped = written >= max_bytes;
-                if capped {
-                    published_cap.store(true, Ordering::Relaxed);
-                    let _ = writer.write_all(TRANSCRIPT_TRUNCATED_MARKER);
-                    let _ = writer.flush();
-                }
+                let mut capped = capped;
                 while let Ok(message) = receiver.recv() {
                     match message {
                         TranscriptMessage::Bytes(bytes) => {
@@ -7390,6 +7385,20 @@ impl TranscriptWriter {
         drop(self.sender);
         let _ = self.worker.join();
     }
+}
+
+/// A rejected batch can leave a marked transcript below the PTY byte cap.
+fn transcript_write_position(file: &File, max_bytes: u64) -> std::io::Result<(u64, bool)> {
+    let written = file.metadata()?.len();
+    if written > max_bytes {
+        return Ok((written, true));
+    }
+    let mut tail = [0; TRANSCRIPT_TRUNCATED_MARKER.len()];
+    let Some(offset) = written.checked_sub(tail.len() as u64) else {
+        return Ok((written, false));
+    };
+    file.read_exact_at(&mut tail, offset)?;
+    Ok((written, tail.as_slice() == TRANSCRIPT_TRUNCATED_MARKER))
 }
 
 fn encode_key_input(

@@ -1145,6 +1145,52 @@ mod tests {
     }
 
     #[test]
+    fn the_resident_census_names_transcripts_held_by_close_and_handoff() {
+        use crate::host::client::tests::{terminal_with_transcript, with_resident_census_client};
+        use std::path::PathBuf;
+
+        let host = host();
+        let mut source = session();
+        let original_path = PathBuf::from("/transcripts/original.log");
+        let current_path = PathBuf::from("/transcripts/current.log");
+        let replacement_path = PathBuf::from("/transcripts/replacement.log");
+        let recipe = source.launch.recipe.clone();
+        let mut paired = terminal_with_transcript(recipe.clone(), original_path.clone());
+        paired.id = source.id;
+        source.terminal = Some(Box::new(paired));
+        let mut current = source.clone();
+        current.terminal.as_mut().unwrap().transcript_path = Some(current_path.clone());
+        let close =
+            Reservation::removing(&host, &mut host.lock().unwrap(), &source, current).unwrap();
+
+        with_resident_census_client(&host, |client| {
+            let resident = client.resident_terminals().unwrap();
+            assert_eq!(resident.terminals, [source.id]);
+            assert_eq!(resident.transcripts, [current_path, original_path.clone()]);
+
+            drop(close);
+            let resident = client.resident_terminals().unwrap();
+            assert!(resident.terminals.is_empty());
+            assert!(resident.transcripts.is_empty());
+
+            let replacement = terminal_with_transcript(recipe, replacement_path.clone());
+            host.lock().unwrap().chat_handoffs.insert(
+                source.id,
+                TerminalHandoff::new(
+                    source.clone(),
+                    replacement,
+                    0,
+                    Default::default(),
+                    Instant::now() + ACKNOWLEDGEMENT_GRACE,
+                ),
+            );
+            let resident = client.resident_terminals().unwrap();
+            assert_eq!(resident.terminals, [source.id]);
+            assert_eq!(resident.transcripts, [original_path, replacement_path]);
+        });
+    }
+
+    #[test]
     fn shared_chat_removal_allows_exact_cleanup_but_fences_identical_startup() {
         use crate::{
             host::{model::Registry, workspace},

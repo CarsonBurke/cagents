@@ -405,7 +405,7 @@ fn a_landed_worktree_goes_with_its_branch() {
     } = watcher
         .pop()
         .expect("compacted view was not announced")
-        .message
+        .into_message()
     else {
         panic!("expected a workspace model edit");
     };

@@ -577,6 +577,19 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
         .map(|created| pinned(launch, created))
 }
 
+/// Prepare a native writer from the live terminal's observed launch. If ACP
+/// needs to bypass Muse's launcher, its extra options are unverified. Refuse
+/// before the daemon gives up the terminal.
+pub fn create_for_terminal_handoff(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
+    let (spec, adapter) = create_for_start(launch)?;
+    if launch.provider == crate::agent::Provider::Muse && spec.program != launch.recipe.program {
+        return Err("Switching to chat would bypass the Muse launcher. Its approval and sandbox options cannot be verified. Resume this conversation directly with muse-upstream and the options you want, then switch to chat.".into());
+    }
+    Ok((spec, adapter))
+}
+
 pub fn create_for_start(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
         crate::agent::Provider::Codex => codex::create_for_start(launch),

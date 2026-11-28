@@ -482,8 +482,16 @@ release as a draft, which is published only once its update has been
 rehearsed. The security key stays listed in `release-keys.pub` as the
 recovery key, and signs locally whatever Actions may not:
 
-1. `mise run release -- cut --actions` picks the commit as above and tags it
-   `vVERSION` locally. It copies and signs nothing.
+1. To qualify Linux before pushing a release tag, run
+   `gh workflow run release.yml --ref main -R CarsonBurke/cagents` while
+   fw16 tests the candidate. The run builds and smoke-tests
+   the commit at dispatch and keeps its bundle for seven days. Once it
+   succeeds, take the run's commit SHA and use
+   `mise run release -- cut --actions --commit SHA` to tag that commit
+   `vVERSION` locally, even if main has moved. The cut requires the exact
+   passing fw16 verdict and asks the sentinel to test that SHA if no verdict
+   exists. A cut without `--commit` selects the commit as above. The cut
+   copies and signs nothing.
 2. `mise run release -- publish VERSION --actions` checks the tag as the
    workflow's admission will. If eligible, it requires the tagged commit's
    passing test verdict on fw16 and records it as the `cagents/fw16-tests`
@@ -528,8 +536,15 @@ The workflow's jobs:
 
   The release is cut, signed and published locally for 0.2.4, for any change
   of trusted keys or generation, and when no Actions key is configured.
-- **build** has no secrets. It builds, packages and smoke-tests the tagged
-  source with `scripts/build-release-linux`, as fw16 does.
+- **build** has no signing secrets. It uses the qualified bundle of a
+  successful manual Release run from this repository's `main` branch at the
+  exact tagged commit. It selects the unexpired artifact of that run attempt
+  by ID, verifies the files, and generates the notes from the current tags.
+  When no prepared bundle matches, it builds, packages and smoke-tests the
+  tag with `scripts/build-release-linux`, as fw16 does. That cold build and
+  smoke took 96 minutes in a workflow rehearsal. Prepare the bundle before
+  pushing the tag to move that time off the signing path.
+  [November 24 rehearsal](https://github.com/CarsonBurke/cagents/actions/runs/45322015183)
 - **sign** is the only job that can read the key: the environment secret
   `RELEASE_SIGNING_KEY` of the `release` environment, which deploys only from
   `v*` tags. It checks this run's bundle against its metadata, version and
@@ -540,8 +555,8 @@ The workflow's jobs:
   the release and the bridges it carries, uploads the release as a draft,
   compares the bytes GitHub serves, and publishes nothing.
 
-Run by hand (`gh workflow run release.yml --ref main`), the workflow only
-builds that commit, to rehearse a release build; nothing is signed.
+Manual Release runs build and smoke-test without signing. Only a run on
+`refs/heads/main` can supply a bundle for a later release tag.
 
 One-time setup, by the repository owner. First make a fine-grained personal
 access token at <https://github.com/settings/personal-access-tokens/new>:

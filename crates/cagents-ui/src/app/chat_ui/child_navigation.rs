@@ -46,7 +46,7 @@ pub(super) struct Picker {
     order: Vec<(String, Section)>,
 }
 
-/// Tabs mounted beside the Conversation tab, apart from a selected or
+/// Tabs mounted beside the Main tab, apart from a selected or
 /// focused child pinned to the strip. The chooser is the complete catalog.
 const MAX_DIRECT_TABS: usize = 24;
 
@@ -105,18 +105,58 @@ fn child_icon(child: &chat::Subagent) -> Icon {
 }
 
 /// The small mark beside a child's name. Work in progress moves, the way the
-/// Conversation tab's own mark does; every other state is a still glyph, in
+/// Main tab's own mark does; every other state is a still glyph, in
 /// its attention tone when it is a failure or asks something of the reader.
 pub(super) fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
     crate::sidebar::status_glyph(child_icon(child), design::COMPACT_ICON_SIZE)
 }
+
+/// The tabs a strip showed, in order, when the pointer came over it.
+///
+/// The strip sorts working children first and folds finished ones into one
+/// control, so a child that finishes, or a new one that starts, moves every
+/// tab after it. Under the pointer that would slide another tab beneath a
+/// click aimed at the first, so the strip holds its tabs where they were
+/// until the pointer leaves, and only then settles. A held child that
+/// finished keeps its slot and shows its new state; nothing else moves.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Hold(Vec<String>);
 
 /// Keep metadata scanning cheap and mounted controls bounded. The chooser is
 /// the complete catalog; its selected child always keeps a direct tab.
 /// Finished children get no tab of their own, so the strip holds what is
 /// still live; a finished child keeps one only while it is selected or
 /// focused.
+///
+/// While the pointer is over the strip, `hold` keeps the tabs it showed when
+/// the pointer arrived where they were, whatever state they have reached
+/// since, and a child that arrives or is opened meanwhile takes a slot after
+/// them. See [`Hold`].
 fn direct_tabs<'a>(
+    children: &'a [chat::Subagent],
+    selected: Option<&str>,
+    focused: Option<&str>,
+    hold: Option<&Hold>,
+) -> Vec<&'a chat::Subagent> {
+    let live = live_tabs(children, selected, focused);
+    let Some(Hold(held)) = hold else {
+        return live;
+    };
+    let listed: HashMap<&str, &chat::Subagent> = children
+        .iter()
+        .map(|child| (child.id.as_str(), child))
+        .collect();
+    let mut rows: Vec<_> = held
+        .iter()
+        .filter_map(|id| listed.get(id.as_str()).copied())
+        .collect();
+    rows.extend(live.into_iter().filter(|child| !held.contains(&child.id)));
+    rows
+}
+
+/// The tabs the strip shows as its children stand: live work by rank, and
+/// a selected or focused child pinned after them.
+fn live_tabs<'a>(
     children: &'a [chat::Subagent],
     selected: Option<&str>,
     focused: Option<&str>,
@@ -155,6 +195,13 @@ fn direct_tabs<'a>(
     rows.sort_unstable_by_key(|(index, child)| (rank(child), *index));
     rows.into_iter().map(|(_, child)| child).collect()
 }
+
+/// The visible name of the strip's tab for the conversation itself.
+pub(super) const MAIN_TAB: &str = "Main";
+/// The control IDs of the chooser's toggle and of the control finished
+/// subagents fold into.
+pub(super) const PICKER_TOGGLE: &str = "chat-subagent-picker";
+pub(super) const FINISHED_CONTROL: &str = "chat-subagent-finished";
 
 /// How many characters of its name a child's tab shows.
 pub(super) const TAB_CHARS: usize = 24;
@@ -577,12 +624,60 @@ impl Runtime {
         }
     }
 
+    /// How many finished children the finished control counts: those
+    /// without a tab of their own in the strip.
+    fn finished_beyond_tabs(&self) -> usize {
+        let focused = self.child_tab_focus.borrow();
+        let tabs = direct_tabs(
+            &self.snapshot.subagents,
+            self.selected_subagent.as_deref(),
+            focused.as_deref(),
+            self.child_strip_hold.as_ref(),
+        );
+        self.snapshot
+            .subagents
+            .iter()
+            .filter(|child| finished(child))
+            .count()
+            - tabs.into_iter().filter(|child| finished(child)).count()
+    }
+
+    /// The tabs the strip shows now, held as they stand; see [`Hold`].
+    pub(super) fn child_strip_now(&self) -> Hold {
+        let focused = self.child_tab_focus.borrow();
+        Hold(
+            direct_tabs(
+                &self.snapshot.subagents,
+                self.selected_subagent.as_deref(),
+                focused.as_deref(),
+                self.child_strip_hold.as_ref(),
+            )
+            .into_iter()
+            .map(|child| child.id.clone())
+            .collect(),
+        )
+    }
+
+    /// The strip above the composer: the Main tab, a quiet tab for each
+    /// live subagent, the control finished ones fold into, and the chooser.
+    /// Tabs are words with their state's mark, and the shown one carries an
+    /// accent line, so the strip reads as a row of names rather than of
+    /// buttons. Past what fits, the tabs scroll under a fade at the strip's
+    /// edge, and the chooser lists every subagent.
     pub(super) fn child_navigation(&self, _width: f32) -> Element<'_, Message> {
         let target = self.target;
         let children = &self.snapshot.subagents;
         let selected = self.selected_subagent.as_deref();
         let focused = self.child_tab_focus.borrow().clone();
-        let shown = direct_tabs(children, selected, focused.as_deref());
+        let shown = direct_tabs(
+            children,
+            selected,
+            focused.as_deref(),
+            self.child_strip_hold.as_ref(),
+        );
+        // A finished child the pointer holds in the strip is counted there,
+        // by its tab, rather than again in the finished control.
+        let finished_tabs = shown.iter().filter(|child| finished(child)).count();
         let identities: HashMap<_, _> = shown
             .iter()
             .map(|child| (child_key(&child.id), child.id.clone()))
@@ -591,11 +686,15 @@ impl Runtime {
             .into_iter()
             .map(|child| {
                 let description = self.child_description(child, &self.child_label(child, 80));
-                let tab = crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: self.child_label(child, TAB_CHARS),
+                let ordinal = self.child_ordinal(child);
+                let tab = crate::ui_controls::quiet_tab(
+                    crate::ui_controls::QuietTab {
+                        // Whole, to fade past the tab's budget; the number
+                        // that tells namesakes apart stays whole after it.
+                        label: Self::native_child_name(child).into(),
+                        limit: Some(TAB_CHARS),
+                        suffix: (ordinal > 1).then(|| ordinal.to_string().into()),
                         description: description.into(),
-                        count: None,
                         selected: selected == Some(child.id.as_str()),
                         id: Some(card_control_id(
                             target.card,
@@ -606,7 +705,6 @@ impl Runtime {
                             Some(child.id.clone()),
                         ))),
                     },
-                    true,
                     Some(status_mark(child)),
                 );
                 (child_key(&child.id), tab)
@@ -652,7 +750,7 @@ impl Runtime {
             "All subagents: {} total, {working} working, {attention} need attention",
             children.len()
         ))
-        .id(card_control_id(target.card, "chat-subagent-picker"))
+        .id(card_control_id(target.card, PICKER_TOGGLE))
         .padding([space::XS, space::S])
         .class(crate::ui_controls::control_style(
             self.child_picker.is_some(),
@@ -665,25 +763,25 @@ impl Runtime {
 
         // Finished children share one control that opens the chooser on
         // them, so finished work stays reachable without crowding the strip.
-        let done = children.iter().filter(|child| finished(child)).count();
+        let done = children.iter().filter(|child| finished(child)).count() - finished_tabs;
         let done = (done > 0).then(|| {
-            crate::ui_controls::view_tab(
-                crate::ui_controls::ViewTab {
+            crate::ui_controls::quiet_tab(
+                crate::ui_controls::QuietTab {
                     label: format!("{done} finished").into(),
+                    limit: None,
+                    suffix: None,
                     description: format!(
                         "Choose from {done} finished {}",
                         if done == 1 { "subagent" } else { "subagents" }
                     )
                     .into(),
-                    count: None,
                     // A toggle like the chooser's own, so never the selected
                     // tab, which would take its press away; the chooser's
                     // filter row says what it shows.
                     selected: false,
-                    id: Some(card_control_id(target.card, "chat-subagent-finished")),
+                    id: Some(card_control_id(target.card, FINISHED_CONTROL)),
                     on_press: Some(action(Action::SubagentChooser(target, Section::Finished))),
                 },
-                true,
                 Some(crate::ui_controls::passive_icon(
                     Icon::Check,
                     design::COMPACT_ICON_SIZE,
@@ -703,18 +801,18 @@ impl Runtime {
             Some((mark, label)) => (Some(mark), format!("Main conversation: {label}").into()),
             None => (None, "Main conversation".into()),
         };
-        widget::container(
+        let strip = widget::container(
             widget::row::with_children(vec![
-                crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: "Conversation".into(),
+                crate::ui_controls::quiet_tab(
+                    crate::ui_controls::QuietTab {
+                        label: MAIN_TAB.into(),
+                        limit: None,
+                        suffix: None,
                         description,
-                        count: None,
                         selected: selected.is_none(),
-                        id: None,
+                        id: Some(card_control_id(target.card, "chat-subagent-main")),
                         on_press: Some(action(Action::SelectSubagent(target, None))),
                     },
-                    true,
                     mark,
                 ),
                 crate::interaction::overflow_fade_x(crate::interaction::horizontal_wheel(tabs)),
@@ -725,9 +823,43 @@ impl Runtime {
             .align_y(Alignment::Center),
         )
         .width(Length::Fill)
-        .clip(true)
-        .into()
+        .clip(true);
+        widget::mouse_area(strip)
+            .on_enter(action(Action::SubagentStripHover(target, true)))
+            .on_exit(action(Action::SubagentStripHover(target, false)))
+            .into()
     }
+
+    /// Where focus goes when the chooser closes: back to the control that
+    /// opened it, while that control is still there, else to the chooser's
+    /// own toggle. The "N finished" control opens it on the finished
+    /// section, and the closing line's failed-subagents control on the
+    /// section that needs attention.
+    pub(super) fn child_picker_opener(&self) -> widget::Id {
+        let target = self.target;
+        let opener = match self
+            .child_picker
+            .as_ref()
+            .and_then(|picker| picker.opened_on)
+        {
+            Some(Section::Finished) if self.finished_beyond_tabs() > 0 => {
+                Some(card_control_id(target.card, FINISHED_CONTROL))
+            }
+            // The failures control sits on the closing line, so it is there
+            // only while that line is; one failure opens its own transcript
+            // rather than the chooser.
+            Some(Section::Attention)
+                if self.selected_subagent.is_none()
+                    && self.closing_activity(false, None).is_some() =>
+            {
+                let failed = self.snapshot.subagent_activity().failed;
+                (failed.len() > 1).then(|| Self::agent_failures_id(target, &failed))
+            }
+            _ => None,
+        };
+        opener.unwrap_or_else(|| card_control_id(target.card, PICKER_TOGGLE))
+    }
+
     /// Where the open chooser's list shows `section`, when it lists any
     /// child there.
     pub(super) fn child_section_offset(&self, section: Section) -> Option<f32> {
@@ -1069,8 +1201,11 @@ mod tests {
         assert_eq!(row_time(&child, None, 60_000), None);
         assert_eq!(child_icon(&child), Icon::History);
         let children = [child.clone()];
-        assert!(direct_tabs(&children, None, None).is_empty());
-        assert_eq!(direct_tabs(&children, Some(&child.id), None), [&child]);
+        assert!(direct_tabs(&children, None, None, None).is_empty());
+        assert_eq!(
+            direct_tabs(&children, Some(&child.id), None, None),
+            [&child]
+        );
         assert_eq!(
             super::super::view::AgentWork::default().caption(&child),
             chat::UNLOADED_CHILD_RUNNING
@@ -1368,7 +1503,7 @@ mod tests {
         ];
         let mut ordinals = Ordinals::default();
         ordinals.observe(&children);
-        assert_eq!(ids(direct_tabs(&children, None, None)), ["a", "b"]);
+        assert_eq!(ids(direct_tabs(&children, None, None, None)), ["a", "b"]);
         assert_eq!(
             labels(&children, &ordinals),
             ["Explore", "Explore 2", "Explore 3"]
@@ -1376,9 +1511,9 @@ mod tests {
         children[0].status = Succeeded;
         children[2].status = Running;
         ordinals.observe(&children);
-        assert_eq!(ids(direct_tabs(&children, None, None)), ["b", "c"]);
+        assert_eq!(ids(direct_tabs(&children, None, None, None)), ["b", "c"]);
         assert_eq!(
-            ids(direct_tabs(&children, Some("a"), None)),
+            ids(direct_tabs(&children, Some("a"), None, None)),
             ["b", "c", "a"]
         );
         assert_eq!(
@@ -1551,7 +1686,7 @@ mod tests {
                 )
             })
             .collect();
-        let visible = direct_tabs(&children, Some("999"), None);
+        let visible = direct_tabs(&children, Some("999"), None, None);
         assert_eq!(visible.len(), MAX_DIRECT_TABS + 1);
         assert_eq!(visible.first().unwrap().id, "0");
         assert_eq!(visible.last().unwrap().id, "999");
@@ -1609,7 +1744,7 @@ mod tests {
                 })
                 .map(|(_, child)| child.id.as_str())
                 .collect();
-            let visible = direct_tabs(&children, selected, focused);
+            let visible = direct_tabs(&children, selected, focused, None);
             assert!(visible.len() <= MAX_DIRECT_TABS + 2);
             assert_eq!(ids(visible), expected);
         }
@@ -1859,5 +1994,231 @@ mod tests {
             Some("No problem found.\nDetails follow.")
         );
         assert_eq!(report_text(&late), Some("Agent \"late\" finished"));
+    }
+
+    /// #3642: a subagent finishing while the pointer is over the strip
+    /// moves no tab; the strip settles once the pointer leaves.
+    #[test]
+    fn tabs_hold_still_under_the_pointer_as_subagents_finish() {
+        use chat::ToolStatus::*;
+        use iced::advanced::clipboard;
+        use iced::runtime::user_interface::{Cache, UserInterface};
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        runtime.target.card = app.workspace.focused().unwrap();
+        let target = runtime.target;
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+            named("a", "Alpha", Running, false),
+            named("b", "Bravo", Running, false),
+            named("c", "Charlie", Running, false),
+        ];
+        let places = |runtime: &Runtime| {
+            mounted_buttons(
+                runtime,
+                ["a", "b", "c"].map(|id| (id, format!("chat-subagent-tab-{id}"))),
+            )
+            .into_iter()
+            .map(|(x, id, _)| (id, x))
+            .collect::<Vec<_>>()
+        };
+        let before = places(&runtime);
+        assert_eq!(before.len(), 3);
+        // The pointer comes over the strip, which says so.
+        let mut renderer = crate::app::tests::headless_renderer();
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(800.0),
+            iced::Size::new(800.0, 100.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        let pointer = iced::Point::new(before[2].1 as f32 + 4.0, 10.0);
+        let mut messages = Vec::new();
+        ui.update(
+            &[iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                position: pointer,
+            })],
+            iced::mouse::Cursor::Available(pointer),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        drop(ui);
+        let entered = messages
+            .into_iter()
+            .find_map(|message| match message {
+                Message::ChatUi(action @ Action::SubagentStripHover(_, true)) => Some(action),
+                _ => None,
+            })
+            .expect("the strip reports the pointer coming over it");
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        drop(app.handle_chat_ui(entered));
+        // Bravo finishes under the pointer: Charlie, beneath it, stays put,
+        // and Bravo keeps its slot, now with its finished mark, counted by
+        // that tab rather than again in a finished control.
+        let finish = |app: &mut crate::app::Cagents, id: &str| {
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            std::sync::Arc::make_mut(&mut runtime.snapshot)
+                .subagents
+                .iter_mut()
+                .find(|child| child.id == id)
+                .unwrap()
+                .status = Succeeded;
+        };
+        finish(&mut app, "b");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(places(runtime), before);
+        assert_eq!(mounted_finished(runtime), None);
+        // A newcomer takes a slot after the held tabs.
+        std::sync::Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .push(named("d", "Delta", Running, false));
+        let held = ids(direct_tabs(
+            &runtime.snapshot.subagents,
+            None,
+            None,
+            runtime.child_strip_hold.as_ref(),
+        ));
+        assert_eq!(held, ["a", "b", "c", "d"]);
+        // Once the pointer leaves, the strip settles.
+        drop(app.handle_chat_ui(Action::SubagentStripHover(target, false)));
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert_eq!(runtime.child_strip_hold, None);
+        let settled = places(runtime);
+        assert_eq!(
+            settled.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            ["a", "c"]
+        );
+        assert!(settled[1].1 < before[2].1, "Charlie moves up once free");
+        assert_eq!(
+            mounted_finished(runtime).as_deref(),
+            Some("Choose from 1 finished subagent")
+        );
+    }
+
+    /// #3642: Escape, or the chooser's Close, returns focus to the control
+    /// that opened it.
+    #[test]
+    fn closing_the_chooser_returns_to_the_control_that_opened_it() {
+        use chat::ToolStatus::*;
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        let card = runtime.target.card;
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+            named("live", "Explore", Running, false),
+            named("done", "Reviewer", Succeeded, false),
+            named("broken", "Builder", Failed, false),
+            named("broken-2", "Builder", Failed, false),
+        ];
+        let open = |runtime: &mut Runtime, section: Option<Section>| {
+            runtime.child_picker = Some(Picker {
+                opened_on: section,
+                ..runtime.child_picker_for_now()
+            });
+        };
+        open(&mut runtime, None);
+        assert_eq!(
+            runtime.child_picker_opener(),
+            card_control_id(card, PICKER_TOGGLE)
+        );
+        open(&mut runtime, Some(Section::Finished));
+        assert_eq!(
+            runtime.child_picker_opener(),
+            card_control_id(card, FINISHED_CONTROL)
+        );
+        open(&mut runtime, Some(Section::Attention));
+        let failed = runtime.snapshot.subagent_activity().failed;
+        assert_eq!(
+            runtime.child_picker_opener(),
+            Runtime::agent_failures_id(runtime.target, &failed)
+        );
+        // A control that has gone since hands focus to the chooser's toggle.
+        std::sync::Arc::make_mut(&mut runtime.snapshot)
+            .subagents
+            .retain(|child| child.id == "live");
+        for section in [Section::Finished, Section::Attention] {
+            open(&mut runtime, Some(section));
+            assert_eq!(
+                runtime.child_picker_opener(),
+                card_control_id(card, PICKER_TOGGLE)
+            );
+        }
+    }
+
+    /// Every tab and menu row that does something shows the pointer.
+    #[test]
+    fn tabs_and_chooser_rows_show_the_pointer() {
+        use chat::ToolStatus::*;
+        use cosmic::iced::advanced::{Layout, layout, widget::Tree};
+        let (mut runtime, _handle) = super::super::view::prepared_runtime_for_test(&[]);
+        std::sync::Arc::make_mut(&mut runtime.snapshot).subagents = vec![
+            named("live", "Explore", Running, false),
+            named("done", "Reviewer", Succeeded, false),
+        ];
+        runtime.selected_subagent = Some("live".into());
+        let renderer = crate::app::tests::headless_renderer();
+        let viewport = iced::Rectangle::with_size(iced::Size::new(800.0, 600.0));
+        let pointer_over = |element: &mut Element<'_, Message>, controls: &[String]| {
+            let mut tree = Tree::new(element.as_widget());
+            let node = element.as_widget_mut().layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(iced::Size::ZERO, viewport.size()),
+            );
+            let accessible = element.as_widget().a11y_nodes(
+                Layout::new(&node),
+                &tree,
+                iced::mouse::Cursor::Unavailable,
+            );
+            for control in controls {
+                let id = iced_accessibility::A11yId::Widget(card_control_id(
+                    runtime.target.card,
+                    control,
+                ));
+                let bounds = accessible
+                    .root()
+                    .iter()
+                    .chain(accessible.children())
+                    .find(|node| node.id() == &id)
+                    .and_then(|node| node.node().bounds())
+                    .unwrap_or_else(|| panic!("{control} is mounted"));
+                let centre = iced::Point::new(
+                    (bounds.x0 + bounds.x1) as f32 / 2.0,
+                    (bounds.y0 + bounds.y1) as f32 / 2.0,
+                );
+                assert_eq!(
+                    element.as_widget().mouse_interaction(
+                        &tree,
+                        Layout::new(&node),
+                        iced::mouse::Cursor::Available(centre),
+                        &viewport,
+                        &renderer,
+                    ),
+                    iced::mouse::Interaction::Pointer,
+                    "{control}"
+                );
+            }
+        };
+        pointer_over(
+            &mut runtime.child_navigation(800.0),
+            &[
+                "chat-subagent-main".to_owned(),
+                FINISHED_CONTROL.to_owned(),
+                PICKER_TOGGLE.to_owned(),
+            ],
+        );
+        runtime.child_picker = Some(runtime.child_picker_for_now());
+        pointer_over(
+            &mut runtime.child_picker_view().unwrap(),
+            &[
+                "chat-subagent-live".to_owned(),
+                "chat-subagent-done".to_owned(),
+            ],
+        );
+        // The shown tab is inert, the one tab without the pointer.
+        runtime.selected_subagent = None;
+        pointer_over(
+            &mut runtime.child_navigation(800.0),
+            &["chat-subagent-tab-live".to_owned()],
+        );
     }
 }

@@ -193,7 +193,7 @@ fn replay(delivery: &DeliveryQueue, id: TerminalId, mut snapshot_pending: bool) 
     };
     while let Some(message) = delivery.pop() {
         let reply = message.wire().request_id.is_some();
-        let snapshot = match message.message {
+        let snapshot = match message.into_message() {
             ServerMessage::Snapshot {
                 terminal_id,
                 snapshot,
@@ -442,6 +442,52 @@ fn a_frame_planned_before_a_resize_is_replaced_by_a_redraw() {
     assert_eq!(replay.pending_redraw, Some(resized));
 }
 
+#[test]
+fn a_frame_planned_for_a_recreated_viewport_is_replaced_by_a_redraw() {
+    let mut fixture = Fixture::new();
+    let id = fixture.id;
+    // Start with no recorded base, so a base mismatch cannot detect reattachment.
+    {
+        let mut state = fixture.shared.lock().unwrap();
+        state.detach(1, id).unwrap();
+        state.attach(1, id).unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
+    }
+    let generation = fixture.change(0, "late");
+    let planned = fixture.plan(generation);
+    assert_eq!(planned.len(), 1);
+    {
+        let mut state = fixture.shared.lock().unwrap();
+        state.detach(1, id).unwrap();
+        state.attach(1, id).unwrap();
+        state
+            .resize_client(
+                1,
+                id,
+                crate::terminal::TerminalSize {
+                    columns: 4,
+                    rows: ROWS + 2,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                },
+            )
+            .unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
+        let view = &state.subscriptions.viewports[&(1, id)];
+        assert_eq!(view.revision, planned[0].revision);
+    }
+
+    fixture.commit(planned);
+    assert_eq!(fixture.acknowledged_source(), 0);
+    let replay = replay(&fixture.delivery, fixture.id, false);
+    assert_eq!(replay.frames, [1]);
+    assert_eq!(replay.pending_redraw, Some(generation));
+}
+
 /// A `ClientRequest::Snapshot` reply is recorded under the lock but queued by
 /// its connection after the lock is released, so a broadcast can be queued
 /// first. The client still holds its old screen then. A delta against the
@@ -453,9 +499,9 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
     for reply_queued_first in [false, true] {
         let mut fixture = Fixture::new();
         fixture.change(0, "reply");
-        let reply = fixture.reply(1);
+        let mut reply = Some(fixture.reply(1));
         if reply_queued_first {
-            fixture.delivery.push(reply.clone()).unwrap();
+            fixture.delivery.push(reply.take().unwrap()).unwrap();
         }
         let generation = fixture.change(1, "push");
         broadcast_redraw(
@@ -464,7 +510,7 @@ fn a_broadcast_racing_a_snapshot_reply_still_applies_and_releases_credit() {
             generation,
             &fixture.stream.handle,
         );
-        if !reply_queued_first {
+        if let Some(reply) = reply {
             fixture.delivery.push(reply).unwrap();
         }
         let replay = replay(&fixture.delivery, fixture.id, true);
@@ -549,7 +595,7 @@ fn a_frame_encoded_for_a_retired_worker_never_reaches_a_same_id_successor() {
     fixture.delivery.close_after_drain();
     let mut after_successor = None;
     while let Some(message) = fixture.delivery.pop() {
-        match message.message {
+        match message.into_message() {
             ServerMessage::Snapshot { terminal_id, .. } if terminal_id == fixture.id => {
                 after_successor = Some(Vec::new());
             }
@@ -799,8 +845,8 @@ fn a_redraw_overflowing_a_slow_client_frees_nothing_under_the_host_lock() {
     );
     let notice = fixture.delivery.pop().unwrap();
     assert!(matches!(
-        notice.message,
-        ServerMessage::Error(ref error) if error.code == ProtocolErrorCode::QueueFull
+        notice.wire().message,
+        ServerMessage::Error(error) if error.code == ProtocolErrorCode::QueueFull
     ));
     drop(notice);
     assert!(fixture.delivery.pop().is_none());

@@ -3535,7 +3535,7 @@ fn edges_through(
         while let Some(queued) = queue.pop() {
             if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited {
                 sequence, edit, ..
-            } = queued.message
+            } = queued.into_message()
                 && sender.send((sequence, edit)).is_err()
             {
                 return;
@@ -3617,7 +3617,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     finish_failure(&host, accepted.run.id, State::Failed, "again".into());
     watcher.close_after_drain();
     let edges = std::iter::from_fn(|| watcher.pop())
-        .filter_map(|queued| match queued.message {
+        .filter_map(|queued| match queued.into_message() {
             crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
                 Some((sequence, edit))
             }
@@ -5834,7 +5834,7 @@ fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
         std::thread::spawn(move || {
             while let Some(outbound) = queue.pop() {
                 if let crate::terminal_ipc::ServerMessage::ChatLimit { chat_id, limit } =
-                    outbound.message
+                    outbound.into_message()
                 {
                     limits.send((chat_id, limit)).unwrap();
                 }

@@ -150,12 +150,19 @@ fn unverified_owned_image_history_never_reads_or_replays_a_coincident_device_pat
                 {"type":"text","text":marker},
                 {"type":"localImage","path":image.path.to_str().unwrap()}
             ]);
-            let items = parse_item(
-                &json!({"type":"userMessage","id":"foreign","content":inputs}),
-                true,
-                "turn",
-            )
-            .unwrap();
+            let mut receiver = adapter();
+            let step = receive_completed_item(
+                &mut receiver,
+                json!({"type":"userMessage","id":"foreign","content":inputs}),
+            );
+            let items = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(item),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
             assert_eq!(items.len(), 2, "unverified marker remains literal");
             assert!(matches!(&items[0].content, ItemContent::Text { text, .. } if text == &marker));
             assert!(
@@ -1979,6 +1986,45 @@ fn native_queue_is_confirmed_paginated_and_refreshed_after_consumption() {
             .events
             .iter()
             .any(|event| matches!(event, Event::QueueChanged(messages) if messages.is_empty()))
+    );
+}
+
+#[test]
+fn native_queue_names_remote_images_only_when_the_url_has_a_file_name() {
+    let mut adapter = adapter();
+    let changed = adapter
+        .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
+        .unwrap();
+    let page = adapter
+        .receive(json!({
+            "id":changed.writes[0]["id"],
+            "result":{"data":[
+                {"id":"named","input":[
+                    {"type":"text","text":"Compare"},
+                    {"type":"image","url":"https://example.test/a/after.png?x=1#preview"}
+                ]},
+                {"id":"unnamed","input":[
+                    {"type":"text","text":"Describe"},
+                    {"type":"image","url":"https://example.test/?x=1"}
+                ]}
+            ],"nextCursor":null}
+        }))
+        .unwrap();
+    let messages = page
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::QueueChanged(messages) => Some(messages),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0].text, "Compare\nafter.png");
+    assert_eq!(messages[1].text, "Describe");
+    assert!(
+        messages
+            .iter()
+            .all(|message| !message.editable && message.attachments.is_empty())
     );
 }
 
@@ -6366,6 +6412,67 @@ fn codex_events_read_as_what_happened() {
         .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":"@@ -1 +1 @@\n-a\n+b\n"}}))
         .unwrap();
     assert!(diff.events.is_empty());
+}
+
+fn receive_completed_item(adapter: &mut Codex, item: Value) -> Step {
+    adapter
+        .receive(json!({"method":"item/completed","params":{
+            "threadId":"thread-exact","turnId":"turn","item":item
+        }}))
+        .unwrap()
+}
+
+#[test]
+fn user_image_descriptions_use_only_a_path_or_url_file_name() {
+    let mut adapter = adapter();
+    let step = receive_completed_item(
+        &mut adapter,
+        json!({
+            "id":"images","type":"userMessage","content":[
+                {"type":"localImage","path":"/work/shots/before.png"},
+                {"type":"image","url":"https://example.test/a/after.png?x=1#preview"},
+                {"type":"image","url":"https://example.test/"},
+                {"type":"image","url":"https://example.test/a/"},
+                {"type":"image","url":"data:image/png;base64,cGl4ZWxz"},
+                {"type":"localImage","path":"/"}
+            ]
+        }),
+    );
+    let descriptions = step
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            Event::Item(Item {
+                role: Role::User,
+                content: ItemContent::Image { description, .. },
+                ..
+            }) => Some(description.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(descriptions, ["before.png", "after.png", "", "", "", ""]);
+}
+
+#[test]
+fn viewed_images_use_the_file_name_or_leave_the_description_empty() {
+    let mut adapter = adapter();
+    for (index, (path, expected)) in [("/work/shot.png", "shot.png"), ("", ""), ("/", "")]
+        .into_iter()
+        .enumerate()
+    {
+        let step = receive_completed_item(
+            &mut adapter,
+            json!({
+                "id":format!("view-{index}"),"type":"imageView","path":path
+            }),
+        );
+        assert!(step.events.iter().any(|event| matches!(
+            event,
+            Event::Item(Item { role: Role::Assistant,
+                content: ItemContent::Image { path: source, description, .. }, ..
+            }) if source == path && description == expected
+        )));
+    }
 }
 
 /// A tool result's structured content follows its text when it says

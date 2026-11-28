@@ -29,6 +29,7 @@ use crate::{
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
     },
+    terminal::{DEFAULT_TRANSCRIPT_MAX_BYTES, TRANSCRIPT_TRUNCATED_MARKER},
 };
 
 mod refusal;
@@ -2784,9 +2785,9 @@ impl StateStore {
     ///    orphaned and removed, but only when every window database was read
     ///    ([`TranscriptOwners::every_window_read`]);
     /// 3. one larger than [`TranscriptRetention::max_file_bytes`] is removed;
-    /// 4. if what remains still exceeds
-    ///    [`TranscriptRetention::max_total_bytes`], the oldest go until they
-    ///    fit or only resident ones are left.
+    /// 4. if the remaining non-resident files exceed
+    ///    [`TranscriptRetention::max_total_bytes`], the oldest of those go
+    ///    until they fit.
     ///
     /// Nothing outside the listed directory can be touched: candidates come
     /// from one `read_dir` of it, each is a single path component joined onto
@@ -2799,18 +2800,16 @@ impl StateStore {
         mut owners: TranscriptOwners,
         retention: TranscriptRetention,
     ) -> Result<TranscriptPruneReport> {
-        owners.saved.extend(self.claimed_transcript_names()?);
+        owners.add_window(self.claimed_transcript_names()?);
         Ok(listing.prune(&owners, retention))
     }
 
-    /// The name of every transcript this store's terminals and conversations
-    /// still claim; see [`read_claimed_transcript_names`].
-    pub fn claimed_transcript_names(&self) -> Result<HashSet<String>> {
+    /// The transcript claims from this store's terminals and conversations.
+    /// See [`read_claimed_transcript_names`].
+    pub fn claimed_transcript_names(&self) -> Result<TranscriptClaims> {
         let inner = self.lock_inner()?;
         ensure_open(&inner)?;
-        let mut claimed = HashSet::new();
-        collect_claimed_transcript_names(&inner.connection, &mut claimed)?;
-        Ok(claimed)
+        collect_claimed_transcript_names(&inner.connection, &self.path)
     }
 
     #[cfg(any(test, feature = "test-support"))]
@@ -2901,23 +2900,22 @@ pub fn transcript_name(path: &Path) -> Option<&str> {
 }
 
 /// The transcript names a window database still claims, read without opening
-/// a second writable store: every terminal's and conversation's id, and the
-/// name of every transcript path it records.
+/// a second writable store: terminal IDs and the names of transcript paths
+/// recorded by terminals and chats. An unreadable row leaves the claims
+/// incomplete, while the claims from other rows remain available.
 ///
 /// Every window has its own database and they all share one transcript
 /// directory, so pruning has to ask every database before it can call a
 /// transcript orphaned. The connection is read-only and `NOFOLLOW`, exactly
 /// like [`StateStore::copy_snapshot`]: it never migrates, reconciles, or
 /// writes to a database another window owns.
-pub fn read_claimed_transcript_names(path: &Path) -> Result<HashSet<String>> {
+pub fn read_claimed_transcript_names(path: &Path) -> Result<TranscriptClaims> {
     let connection = Connection::open_with_flags(
         crate::secure_file::sqlite_path(path),
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
     )?;
     connection.busy_timeout(DEFAULT_BUSY_TIMEOUT)?;
-    let mut claimed = HashSet::new();
-    collect_claimed_transcript_names(&connection, &mut claimed)?;
-    Ok(claimed)
+    collect_claimed_transcript_names(&connection, path)
 }
 
 /// Read navigation identities without migrating or acquiring another window's
@@ -3579,47 +3577,70 @@ pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, Saved
     Ok(owners)
 }
 
-fn claim_transcript(claimed: &mut HashSet<String>, path: &Path) {
-    if let Some(name) = transcript_name(path) {
-        claimed.insert(name.to_owned());
-    }
+/// One window's transcript claims, including whether all rows could be read.
+#[derive(Debug, PartialEq, Eq)]
+pub struct TranscriptClaims {
+    names: HashSet<String>,
+    complete: bool,
 }
 
-/// A recipe row can outlive its transcript metadata and vice versa, and
-/// either is reason enough to keep the file.
+/// A recipe row can outlive its transcript metadata and vice versa. Read all
+/// claims in one SQLite snapshot because a file's claim can move between rows.
 fn collect_claimed_transcript_names(
     connection: &Connection,
-    claimed: &mut HashSet<String>,
-) -> Result<()> {
-    for sql in [
-        "SELECT terminal_id FROM terminal_recipes",
-        "SELECT terminal_id FROM transcript_metadata",
-    ] {
-        let mut statement = connection.prepare(sql)?;
-        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
-        for row in rows {
-            claimed.insert(row?);
-        }
-    }
-    let mut statement = connection.prepare("SELECT path_json FROM transcript_metadata")?;
-    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-        let path: PathBuf = from_json("transcript path", &row?)?;
-        claim_transcript(claimed, &path);
-    }
+    database: &Path,
+) -> Result<TranscriptClaims> {
+    let mut claims = TranscriptClaims {
+        names: HashSet::new(),
+        complete: true,
+    };
     let mut statement = connection.prepare(
-        "SELECT content_json FROM cards WHERE kind_tag = 'terminal' AND content_json IS NOT NULL",
+        "SELECT 'recipe', terminal_id, NULL FROM terminal_recipes
+         UNION ALL
+         SELECT 'metadata', terminal_id, path_json FROM transcript_metadata
+         UNION ALL
+         SELECT kind_tag, card_id, content_json FROM cards
+         WHERE kind_tag = 'chat' OR (kind_tag = 'terminal' AND content_json IS NOT NULL)",
     )?;
-    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-        let terminal: TerminalSession = from_json("archived terminal", &row?)?;
-        if let Some(path) = &terminal.transcript_path {
-            claim_transcript(claimed, path);
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        let kind: &str = row
+            .get_ref(0)?
+            .as_str()
+            .map_err(|error| StoreError::corrupt_row("transcript claim kind", error))?;
+        match claim_transcript_row(&mut claims.names, kind, row) {
+            Ok(Some(path)) => {
+                if let Some(name) = transcript_name(&path) {
+                    claims.names.insert(name.to_owned());
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                claims.complete = false;
+                let row_id = row.get::<_, String>(1).ok();
+                tracing::warn!(
+                    database = %database.display(),
+                    kind,
+                    ?row_id,
+                    "unreadable transcript claim; skipping orphan removal for this pass"
+                );
+            }
         }
-        claimed.insert(terminal.id.to_string());
     }
-    // A conversation started from a terminal keeps that terminal's transcript
-    // path, and a terminal returned from it appends to the same file. Only
-    // that path is read, so a conversation stored by another build still
-    // claims it.
+    Ok(claims)
+}
+
+fn claim_transcript_row(
+    claimed: &mut HashSet<String>,
+    kind: &str,
+    row: &rusqlite::Row<'_>,
+) -> Result<Option<PathBuf>> {
+    // Only decode ownership fields. Unrelated fields can differ across builds.
+    #[derive(serde::Deserialize)]
+    struct ArchivedTerminal {
+        id: TerminalId,
+        transcript_path: Option<PathBuf>,
+    }
     #[derive(serde::Deserialize)]
     struct ConversationTranscript {
         terminal: Option<TerminalTranscript>,
@@ -3628,39 +3649,50 @@ fn collect_claimed_transcript_names(
     struct TerminalTranscript {
         transcript_path: Option<PathBuf>,
     }
-    let mut statement = connection.prepare(
-        "SELECT content_json FROM cards WHERE kind_tag = 'chat' AND content_json IS NOT NULL",
-    )?;
-    for row in statement.query_map([], |row| row.get::<_, String>(0))? {
-        let conversation: ConversationTranscript = from_json("conversation", &row?)?;
-        if let Some(path) = conversation
-            .terminal
-            .and_then(|terminal| terminal.transcript_path)
-        {
-            claim_transcript(claimed, &path);
+    match kind {
+        "recipe" => {
+            claimed.insert(row.get(1)?);
+            Ok(None)
         }
+        "metadata" => {
+            claimed.insert(row.get(1)?);
+            Ok(Some(from_json_bytes(
+                "transcript path",
+                &column_bytes(row, 2)?,
+            )?))
+        }
+        "terminal" => {
+            let terminal: ArchivedTerminal =
+                from_json_bytes("archived terminal", &column_bytes(row, 2)?)?;
+            claimed.insert(terminal.id.to_string());
+            Ok(terminal.transcript_path)
+        }
+        "chat" => {
+            let conversation: ConversationTranscript =
+                from_json_bytes("conversation", &column_bytes(row, 2)?)?;
+            Ok(conversation
+                .terminal
+                .and_then(|terminal| terminal.transcript_path))
+        }
+        _ => unreachable!("the transcript claim query selects only these four kinds"),
     }
-    Ok(())
 }
 
 /// What pruning may keep on disk.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TranscriptRetention {
-    /// Largest single transcript kept, matching the 1 MiB cap the terminal
-    /// transcript writer enforces. A larger file was produced by a build that
-    /// predates the cap; the writer will never append to it again, so keeping
-    /// it only costs disk.
+    /// Largest non-resident transcript kept. The default covers the writer's
+    /// PTY byte cap plus one truncation marker.
     pub max_file_bytes: u64,
-    /// Ceiling on the whole transcript directory. Transcripts are diagnostics
-    /// for terminals the user still has open, so the budget is generous enough
-    /// to hold a hundred capped transcripts and no more.
+    /// Budget for transcripts the daemon does not hold. Resident transcripts
+    /// may still be written and do not compete with saved files for space.
     pub max_total_bytes: u64,
 }
 
 impl Default for TranscriptRetention {
     fn default() -> Self {
         Self {
-            max_file_bytes: 1 << 20,
+            max_file_bytes: DEFAULT_TRANSCRIPT_MAX_BYTES + TRANSCRIPT_TRUNCATED_MARKER.len() as u64,
             max_total_bytes: 128 << 20,
         }
     }
@@ -3680,6 +3712,15 @@ pub struct TranscriptOwners {
     /// one could not be read, a transcript nobody else claims may still belong
     /// to a terminal that window owns, and none is removed as orphaned.
     pub every_window_read: bool,
+}
+
+impl TranscriptOwners {
+    /// Adds a window's claims. An unreadable row can claim any filename in the
+    /// shared directory, so an incomplete census cannot prove orphanhood.
+    pub fn add_window(&mut self, claims: TranscriptClaims) {
+        self.saved.extend(claims.names);
+        self.every_window_read &= claims.complete;
+    }
 }
 
 /// What one pruning pass did.
@@ -3797,11 +3838,10 @@ impl TranscriptListing {
             refused: self.refused,
             ..TranscriptPruneReport::default()
         };
-        let mut resident_bytes = 0;
         let mut evictable = Vec::new();
         for transcript in self.candidates {
             if owners.resident.contains(&transcript.name) {
-                resident_bytes += transcript.bytes;
+                report.retained_bytes += transcript.bytes;
                 report.retained += 1;
                 continue;
             }
@@ -3824,24 +3864,23 @@ impl TranscriptListing {
             evictable.push(transcript);
         }
 
-        let mut total = resident_bytes + evictable.iter().map(|entry| entry.bytes).sum::<u64>();
+        let mut total = evictable.iter().map(|entry| entry.bytes).sum::<u64>();
         if total > retention.max_total_bytes {
             evictable.sort_by_key(|entry| entry.modified);
-            let mut index = 0;
-            while total > retention.max_total_bytes && index < evictable.len() {
-                let entry = &evictable[index];
+            for entry in &evictable {
+                if total <= retention.max_total_bytes {
+                    break;
+                }
                 if remove_transcript(&entry.path, "the transcript directory is over budget") {
                     total -= entry.bytes;
                     report.removed_for_budget += 1;
                 } else {
                     report.refused += 1;
                 }
-                index += 1;
             }
-            evictable.drain(..index);
         }
-        report.retained += evictable.len();
-        report.retained_bytes = total;
+        report.retained += evictable.len() - report.removed_for_budget;
+        report.retained_bytes += total;
         report
     }
 }
@@ -13448,11 +13487,9 @@ mod tests {
                 )
                 .unwrap();
         }
-        let inner = store.lock_inner().unwrap();
-        let mut claimed = HashSet::new();
-        collect_claimed_transcript_names(&inner.connection, &mut claimed).unwrap();
-        assert!(claimed.contains(&replacement.id.to_string()));
-        drop(inner);
+        let claimed = store.claimed_transcript_names().unwrap();
+        assert!(claimed.complete);
+        assert!(claimed.names.contains(&replacement.id.to_string()));
         // Save just the closed card: the active card has been deliberately
         // removed from this fixture's snapshot and becomes a tombstone.
         workspace.cards.remove(0);
@@ -15238,12 +15275,33 @@ mod tests {
 
         let claimed = store.claimed_transcript_names().unwrap();
 
-        assert!(claimed.contains(&returned_from.to_string()));
-        assert!(claimed.contains(&carried.to_string()));
+        assert!(claimed.complete);
+        assert!(claimed.names.contains(&returned_from.to_string()));
+        assert!(claimed.names.contains(&carried.to_string()));
         assert_eq!(
             read_claimed_transcript_names(&store_directory.path().join("state.sqlite3")).unwrap(),
             claimed,
             "another window reads the same claims"
+        );
+
+        // A chat row missing its payload cannot establish orphanhood, even
+        // when the remaining rows can account for all of their own files.
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE cards SET kind_tag = 'chat', content_json = NULL WHERE card_id = ?1",
+                [workspace.cards[0].id.to_string()],
+            )
+            .unwrap();
+
+        let incomplete = store.claimed_transcript_names().unwrap();
+        assert!(!incomplete.complete);
+        assert_eq!(incomplete.names, claimed.names);
+        assert_eq!(
+            read_claimed_transcript_names(&store.path).unwrap(),
+            incomplete,
         );
     }
 
@@ -15297,16 +15355,17 @@ mod tests {
     }
 
     #[test]
-    fn the_directory_budget_never_evicts_a_resident_transcript() {
+    fn pruning_budgets_only_nonresident_transcripts_but_reports_all_retained_bytes() {
         let (_root, directory) = transcript_directory();
-        let resident = TerminalId::new().to_string();
-        let saved = TerminalId::new().to_string();
-        for (id, age) in [(&resident, 1_000_u64), (&saved, 2_000)] {
-            let path = directory.join(format!("{id}.log"));
-            fs::write(&path, vec![b'y'; 512]).unwrap();
+        let resident = directory.join("resident.log");
+        let older = directory.join("older.log");
+        let newer = directory.join("newer.log");
+        fs::write(&resident, vec![b'r'; 2048]).unwrap();
+        for (path, age) in [(&older, 1_000), (&newer, 2_000)] {
+            fs::write(path, vec![b's'; 512]).unwrap();
             File::options()
                 .write(true)
-                .open(&path)
+                .open(path)
                 .unwrap()
                 .set_modified(UNIX_EPOCH + Duration::from_secs(age))
                 .unwrap();
@@ -15315,8 +15374,8 @@ mod tests {
         let report = prune_directory(
             &directory,
             TranscriptOwners {
-                resident: HashSet::from([resident.clone()]),
-                ..saved_by_every_window([resident.clone(), saved.clone()])
+                resident: HashSet::from(["resident".into()]),
+                ..saved_by_every_window(["older".into(), "newer".into()])
             },
             TranscriptRetention {
                 max_file_bytes: 1024,
@@ -15324,11 +15383,13 @@ mod tests {
             },
         );
 
+        assert_eq!(report.removed_oversized, 0);
         assert_eq!(report.removed_for_budget, 1);
-        assert_eq!(report.retained, 1);
-        assert_eq!(report.retained_bytes, 512);
-        assert!(directory.join(format!("{resident}.log")).is_file());
-        assert!(!directory.join(format!("{saved}.log")).exists());
+        assert_eq!(report.retained, 2);
+        assert_eq!(report.retained_bytes, 2560);
+        assert!(resident.is_file());
+        assert!(!older.exists());
+        assert!(newer.is_file());
     }
 
     #[test]

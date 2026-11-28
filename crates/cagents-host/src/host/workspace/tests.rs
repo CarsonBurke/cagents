@@ -639,7 +639,7 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     let applied = applied.unwrap();
     delivery.close_after_drain();
     let edges = std::iter::from_fn(|| delivery.pop())
-        .filter_map(|envelope| match envelope.message {
+        .filter_map(|envelope| match envelope.into_message() {
             ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => Some((sequence, edit)),
             _ => None,
         })
@@ -763,7 +763,7 @@ fn a_confirmed_project_close_cannot_take_a_channel_created_after_confirmation() 
     assert!(after.channel(late).is_none());
     delivery.close_after_drain();
     let last = std::iter::from_fn(|| delivery.pop())
-        .filter_map(|envelope| match envelope.message {
+        .filter_map(|envelope| match envelope.into_message() {
             ServerMessage::WorkspaceModelEdited { edit, effects, .. } => Some((edit, effects)),
             _ => None,
         })

@@ -105,7 +105,6 @@ fn a_pulled_capture_from_a_replaced_worker_is_not_accepted() {
     let handle_a = state.history_handle(1, id).unwrap();
     state.presentation_revision(1, id);
     let epoch = state.subscriptions.viewports[&(1, id)].epoch;
-    assert_eq!(epoch, 0);
     let source = handle_a.generation();
 
     let (successor, _, _) = stream(&shared, id);
@@ -143,13 +142,62 @@ fn a_pulled_capture_from_the_current_worker_is_accepted() {
     let handle = state.history_handle(1, id).unwrap();
     let revision = state.presentation_revision(1, id);
     let epoch = state.subscriptions.viewports[&(1, id)].epoch;
-    assert_eq!(epoch, 0);
     let source = handle.generation();
 
     assert_eq!(
         presentation::accept_pulled_capture(&mut state, 1, id, &handle, epoch, source).unwrap(),
         Some(revision)
     );
+}
+
+#[test]
+fn a_pulled_capture_for_a_recreated_viewport_retries_on_the_same_worker() {
+    let shared = host();
+    let id = TerminalId::new();
+    let (current, _, _) = stream(&shared, id);
+    current.publish(100);
+    let mut state = shared.lock().unwrap();
+    state.register_client(1);
+    state.reserve_spawn(id).unwrap();
+    state
+        .finish_spawn(1, session(id), current.handle.clone(), false)
+        .unwrap();
+    let size = crate::terminal::TerminalSize {
+        columns: 80,
+        rows: 24,
+        cell_width_px: 8,
+        cell_height_px: 16,
+    };
+    state.resize_client(1, id, size).unwrap();
+    let handle = state.history_handle(1, id).unwrap();
+    let source = handle.generation();
+    let epoch = state.subscriptions.viewports[&(1, id)].epoch;
+
+    state.detach(1, id).unwrap();
+    state.attach(1, id).unwrap();
+    state
+        .resize_client(1, id, crate::terminal::TerminalSize { rows: 30, ..size })
+        .unwrap();
+    assert!(state.history_handle(1, id).unwrap().same_worker(&handle));
+    assert_eq!(
+        presentation::accept_pulled_capture(&mut state, 1, id, &handle, epoch, source).unwrap(),
+        None
+    );
+
+    let view = &state.subscriptions.viewports[&(1, id)];
+    let (epoch, revision) = (view.epoch, view.revision);
+    assert_eq!(
+        presentation::accept_pulled_capture(&mut state, 1, id, &handle, epoch, source).unwrap(),
+        Some(revision)
+    );
+
+    state.detach(1, id).unwrap();
+    state.attach(1, id).unwrap();
+    assert_eq!(
+        presentation::accept_pulled_capture(&mut state, 1, id, &handle, epoch, source).unwrap(),
+        None
+    );
+    assert!(!state.subscriptions.viewports.contains_key(&(1, id)));
 }
 
 #[test]
@@ -258,7 +306,7 @@ fn held_old_completion_and_wake_cannot_advance_or_hide_a_same_id_successor() {
         delivery.close_after_drain();
         let mut frames = Vec::new();
         while let Some(message) = delivery.pop() {
-            if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+            if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
                 frames.push(snapshot.generation);
             }
         }
@@ -302,7 +350,7 @@ fn unbound_wake_never_borrows_a_resident_worker_and_binding_does_not_retain_it()
     delivery.close_after_drain();
     let mut frames = Vec::new();
     while let Some(message) = delivery.pop() {
-        if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+        if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
             frames.push(snapshot.generation);
         }
     }
@@ -332,7 +380,7 @@ fn a_busy_host_keeps_one_latest_redraw_without_granting_capture_credit() {
     delivery.close_after_drain();
     let mut generations = Vec::new();
     while let Some(message) = delivery.pop() {
-        if let ServerMessage::Snapshot { snapshot, .. } = message.message {
+        if let ServerMessage::Snapshot { snapshot, .. } = message.into_message() {
             generations.push(snapshot.generation);
         }
     }
@@ -389,7 +437,7 @@ fn retiring_events_follow_the_published_grid_even_with_a_pending_wake() {
 
         let mut order = Vec::new();
         while let Some(message) = delivery.pop() {
-            match message.message {
+            match message.into_message() {
                 ServerMessage::Snapshot { snapshot, .. } => {
                     assert_eq!(snapshot.generation, 3);
                     order.push("grid");
