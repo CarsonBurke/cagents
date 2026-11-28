@@ -78,8 +78,8 @@ Install the agent CLIs you want to use and sign in with your own accounts.
 
 ## Your first session
 
-Launch **cagents** from your application menu (on a Mac, open **Cagents** in
-`~/Applications`), or run:
+Launch **cagents** from your application menu (on a Mac, **Cagents** is in the
+Applications folder of your home folder), or run:
 
 ```sh
 cagents ui
@@ -93,9 +93,11 @@ Choose **New tab → Resume conversation** to reopen a saved chat, including
 conversations from configured provider history. Move between panes with
 `Alt+Q` and `Alt+R` (or `Ctrl+PageUp` and `Ctrl+PageDown`); resize the focused
 pane with `Alt+W`.
-On a Mac, Command takes Ctrl's place, and the command palette shows each
-action's shortcut. The [user guide](docs/user-guide.md#navigation) covers the
-rest of the workspace and its shortcuts.
+On a Mac, move between panes with `Cmd+Option+Left` and `Cmd+Option+Right`,
+and change the focused pane's width with `Cmd+Option+R`. The command palette
+shows each action's shortcut, and the
+[user guide](docs/user-guide.md#navigation) covers the rest of the workspace
+and its shortcuts.
 
 To inspect the daemon and its terminals:
 
