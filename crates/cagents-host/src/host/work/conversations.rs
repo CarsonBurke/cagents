@@ -25,7 +25,7 @@ use crate::{
     github_identity::{GitHubRepoKey, PullRequestKey},
     model::{ProjectId, TerminalId},
     pull_request_signals::{PullRequestKeyOrd, Reference, Relation, RepoKeyOrd},
-    terminal_ipc::ServerMessage,
+    terminal_ipc::{ProtocolError, ProtocolErrorCode, ServerMessage},
     work::{
         Check, ConversationPullRequest, ConversationPullRequests, ConversationWorktree, DiffStat,
         PullRequest, TranscriptCoverage,
@@ -729,14 +729,24 @@ impl Handle {
         client: ClientId,
         conversation: TerminalId,
         delivery: Weak<DeliveryQueue>,
-    ) -> Result<(u64, ConversationPullRequests), String> {
-        if !host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .contains_key(&conversation)
+    ) -> Result<(u64, ConversationPullRequests), ProtocolError> {
         {
-            return Err("No such conversation".into());
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if !state.chats.contains_key(&conversation) {
+                // A reservation can precede registration in `chats`.
+                if state.chat_spawning.contains_key(&conversation) {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::TerminalUnavailable,
+                        "The conversation is temporarily unavailable",
+                        true,
+                    ));
+                }
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "No such conversation",
+                    false,
+                ));
+            }
         }
         let projection = self.0.conversations.projection.load(Ordering::Acquire);
         let facts = self.facts(host, conversation, true).map(Arc::new);

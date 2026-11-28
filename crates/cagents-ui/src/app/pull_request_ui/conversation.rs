@@ -573,29 +573,20 @@ fn stream(conversation: TerminalId) -> impl cosmic::iced::futures::Stream<Item =
                     if let Some(hangup) = held.lock().unwrap_or_else(|p| p.into_inner()).take() {
                         hangup.hang_up();
                     }
-                    let delay = match watched {
-                        Ok(()) => crate::daemon_health::retry_delay(),
-                        Err(error) => {
-                            // A conversation this daemon does not host will
-                            // not appear on it soon.
-                            let delay = match &error {
-                                crate::control::ControlError::Remote { .. } => {
-                                    Duration::from_secs(30)
-                                }
-                                _ => crate::daemon_health::retry_delay(),
-                            };
-                            if sender
-                                .send_blocking(Watch::Lost {
-                                    conversation,
-                                    error: error.to_string(),
-                                })
-                                .is_err()
-                            {
-                                break;
-                            }
-                            delay
-                        }
-                    };
+                    let delay = watch_retry_delay(
+                        watched.as_ref().err(),
+                        crate::daemon_health::retry_delay(),
+                    );
+                    if let Err(error) = watched
+                        && sender
+                            .send_blocking(Watch::Lost {
+                                conversation,
+                                error: error.to_string(),
+                            })
+                            .is_err()
+                    {
+                        break;
+                    }
                     std::thread::sleep(delay);
                 }
             });
@@ -615,6 +606,18 @@ fn stream(conversation: TerminalId) -> impl cosmic::iced::futures::Stream<Item =
             }
         }
     })
+}
+
+fn watch_retry_delay(
+    error: Option<&crate::control::ControlError>,
+    daemon_delay: Duration,
+) -> Duration {
+    match error {
+        Some(crate::control::ControlError::Remote {
+            retryable: false, ..
+        }) => Duration::from_secs(30),
+        _ => daemon_delay,
+    }
 }
 
 fn watch(
@@ -1408,6 +1411,31 @@ fn tinted_icon<'a>((icon, tone): (Icon, fn(&cosmic::Theme) -> iced::Color)) -> E
 mod tests {
     use super::*;
     use crate::work::{CheckState, PullRequest, PullRequestState, Relation};
+
+    #[test]
+    fn work_watch_retries_a_temporary_refusal_on_the_daemon_health_delay() {
+        use crate::{control::ControlError, terminal::ipc::ProtocolErrorCode};
+
+        let pending = ControlError::Remote {
+            code: ProtocolErrorCode::TerminalUnavailable,
+            message: "The conversation is not hosted yet".into(),
+            retryable: true,
+        };
+        let unknown = ControlError::Remote {
+            code: ProtocolErrorCode::InvalidRequest,
+            message: "No such conversation".into(),
+            retryable: false,
+        };
+        let daemon_delay = Duration::from_secs(2);
+        assert_eq!(
+            watch_retry_delay(Some(&pending), daemon_delay),
+            daemon_delay
+        );
+        assert_eq!(
+            watch_retry_delay(Some(&unknown), daemon_delay),
+            Duration::from_secs(30)
+        );
+    }
 
     fn repo(owner: &str) -> GitHubRepoKey {
         GitHubRepoKey::new("github.com", None, owner, "repo").unwrap()
