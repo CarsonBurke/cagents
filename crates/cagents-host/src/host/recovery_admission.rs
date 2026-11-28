@@ -76,6 +76,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::CopyTerminalSelection { .. }
         | R::WatchTerminals
         | R::WatchMobile { .. }
+        | R::RegisterMobileBridge(_)
+        | R::ReadMobileBridges { .. }
         | R::WatchWorkspaceModel
         | R::ReadWorkspaceModel
         | R::ReadWorkspaceView { .. }
@@ -357,6 +359,11 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
                 | ClientRequest::List
                 | ClientRequest::ListPage { .. }
                 | ClientRequest::ChatList
+                // These only see this daemon's live bridge connections.
+                | ClientRequest::WatchMobile {
+                    topic: crate::terminal_ipc::MobileWatch::BridgePresence,
+                }
+                | ClientRequest::ReadMobileBridges { .. }
         )
     {
         return Err(restoring_terminals());

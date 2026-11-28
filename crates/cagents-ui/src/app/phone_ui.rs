@@ -7,12 +7,11 @@
 //! itself.
 
 mod host;
+mod presence;
 
 use super::*;
 use cagents::mobile::pairing::{self, Added, AuthorizedKeys, Outcome, Progress};
-use cosmic::iced::futures::{Stream, StreamExt, stream};
 use std::{
-    future::Future,
     sync::{Arc, Once},
     time::{Instant, SystemTime},
 };
@@ -21,8 +20,6 @@ use std::{
 const OPEN_PROBE: Duration = Duration::from_secs(2);
 /// How often the popover rereads addresses, Tailscale and sshd while open.
 const NETWORK_PROBE: Duration = Duration::from_secs(10);
-/// How often the closed control rereads whether a phone is connected.
-const CLOSED_PROBE: Duration = Duration::from_secs(15);
 /// The popover's content width.
 const WIDTH: f32 = 312.0;
 /// The connection details' label column, wide enough for "Tailscale".
@@ -116,36 +113,6 @@ fn sweep_stale_pairings() {
     });
 }
 
-fn watch_closed_connections(
-    &(generation, shown): &(u64, usize),
-) -> impl Stream<Item = Action> + use<> {
-    connection_count_changes(shown, || async {
-        tokio::time::sleep(CLOSED_PROBE).await;
-        tokio::task::spawn_blocking(|| {
-            sweep_stale_pairings();
-            host::connected_count()
-        })
-        .await
-        .ok()
-    })
-    .map(move |count| Action::ConnectionsObserved { generation, count })
-}
-
-fn connection_count_changes<F: Future<Output = Option<usize>> + Send>(
-    shown: usize,
-    probe: impl FnMut() -> F + Send,
-) -> impl Stream<Item = usize> {
-    stream::unfold((probe, shown), |(mut probe, previous)| async move {
-        loop {
-            if let Some(count) = probe().await
-                && count != previous
-            {
-                return Some((count, (probe, count)));
-            }
-        }
-    })
-}
-
 fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
     done: impl FnOnce(T) -> Action + Send + 'static,
@@ -168,12 +135,12 @@ impl Cagents {
 
     pub(super) fn phone_subscription(&self) -> Subscription<Message> {
         let state = &self.phone_ui;
-        // The closed control needs only the connection count. A sample that
-        // didn't change it stays in the worker and never wakes the window.
+        // The observer publishes only changes to the count. A detailed
+        // probe owns the badge while the popover is open.
         let connections = if self.watches_closed_phone_connections() {
             Subscription::run_with(
-                (state.connection_generation, state.connected),
-                watch_closed_connections,
+                presence::Source::new(state.connection_generation, state.connected),
+                presence::watch,
             )
             .map(Message::Phone)
         } else {
@@ -1126,19 +1093,6 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test]
-    async fn closed_connection_watch_only_emits_changed_counts() {
-        use cosmic::iced::futures::pin_mut;
-
-        let mut counts = [Some(0), Some(0), None, Some(2), Some(2), Some(0)].into_iter();
-        let updates =
-            connection_count_changes(0, move || std::future::ready(counts.next().unwrap()));
-        pin_mut!(updates);
-        for expected in [2, 0] {
-            assert_eq!(updates.next().await, Some(expected));
-        }
-    }
 
     #[test]
     fn a_detailed_probe_owns_the_badge_until_it_finishes() {

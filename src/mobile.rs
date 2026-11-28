@@ -98,8 +98,15 @@ fn serve(socket: &Path, input: &mut impl BufRead, outbox: &Outbox) -> Result<(),
         );
         return Ok(());
     };
-    let control = ControlClient::connect(socket)
+    let mut control = ControlClient::connect(socket)
         .map_err(|error| format!("Could not reach the computer's cagents daemon: {error}"))?;
+    if let Ok(connection) = std::env::var("SSH_CONNECTION")
+        && let Some(endpoints) = ssh_endpoints(&connection)
+    {
+        control
+            .register_mobile_bridge(endpoints)
+            .map_err(|error| format!("Could not register the phone connection: {error}"))?;
+    }
     outbox.send(api::ServerLine::Welcome(api::Welcome {
         api: api_version,
         server_version: crate::version().into(),
@@ -120,6 +127,24 @@ fn serve(socket: &Path, input: &mut impl BufRead, outbox: &Outbox) -> Result<(),
             return Err(stop);
         }
     }
+}
+
+fn ssh_endpoints(connection: &str) -> Option<crate::terminal::ipc::MobileBridgeEndpoints> {
+    fn address(text: &str) -> Option<std::net::IpAddr> {
+        // SSH can include an interface scope on a link-local IPv6 address.
+        let host = text.split_once('%').map_or(text, |(host, _)| host);
+        host.parse().ok()
+    }
+
+    let mut fields = connection.split_ascii_whitespace();
+    let from = address(fields.next()?)?;
+    fields.next()?.parse::<u16>().ok()?;
+    let to = address(fields.next()?)?;
+    fields.next()?.parse::<u16>().ok()?;
+    fields
+        .next()
+        .is_none()
+        .then_some(crate::terminal::ipc::MobileBridgeEndpoints { from, to })
 }
 
 fn read_hello(input: &mut impl BufRead, outbox: &Outbox) -> Result<Option<api::Hello>, String> {

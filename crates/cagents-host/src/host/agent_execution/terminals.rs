@@ -35,6 +35,9 @@ enum Access<'a> {
 fn access(request: &ClientRequest) -> Access<'_> {
     use ClientRequest as R;
     match request {
+        R::WatchMobile { topic: crate::terminal_ipc::MobileWatch::BridgePresence }
+        | R::ReadMobileBridges { .. }
+        | R::RegisterMobileBridge(_) => Access::Refused,
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo

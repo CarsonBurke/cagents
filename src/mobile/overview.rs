@@ -131,7 +131,9 @@ fn snapshot(control: &mut ControlClient, topic: MobileWatch) -> Result<api::Even
             let notices = translate::notices(&control.read_notifications()?);
             Ok(api::Event::Notifications(api::Notifications { notices }))
         }
-        MobileWatch::Conversation(_) => unreachable!("conversation watches own their projection"),
+        MobileWatch::Conversation(_) | MobileWatch::BridgePresence => {
+            unreachable!("only session and notification watches project an overview")
+        }
     }
 }
 

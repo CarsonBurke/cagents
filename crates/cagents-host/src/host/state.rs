@@ -28,10 +28,10 @@ use crate::{
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
-        MobileWatch, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
-        ServerMessage, ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
-        StartupState, TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions,
-        TerminalVisibility, WireTerminalEvent,
+        MobileBridgeEndpoints, MobileWatch, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+        ServerEnvelope, ServerMessage, ShutdownCapability, ShutdownOperation, ShutdownOutcome,
+        ShutdownPreflight, StartupState, TerminalDescriptor, TerminalSnapshot,
+        TerminalSpawnOptions, TerminalVisibility, WireTerminalEvent,
     },
     workspace_model::ModelEdit,
 };
@@ -435,6 +435,7 @@ pub(crate) struct HostState {
     pub(super) notification_closed: BTreeSet<TerminalId>,
     notification_watchers: BTreeMap<ClientId, crate::notifications::Presence>,
     mobile_watchers: BTreeMap<ClientId, MobileSubscription>,
+    mobile_bridges: BTreeMap<ClientId, MobileBridgeEndpoints>,
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
@@ -657,6 +658,7 @@ impl HostState {
             notification_closed: BTreeSet::new(),
             notification_watchers: BTreeMap::new(),
             mobile_watchers: BTreeMap::new(),
+            mobile_bridges: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
             last_viewport_epoch: 0,
@@ -757,7 +759,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
-        self.mobile_watchers.remove(&client_id);
+        self.forget_mobile_client(client_id);
         self.chat_resolutions.remove(&client_id);
         self.exited_queue_transfers.remove(client_id);
         if self.notification_watchers.remove(&client_id).is_some()
@@ -1009,6 +1011,37 @@ impl HostState {
                     ServerMessage::MobileChanged { topic },
                 ));
             }
+        }
+    }
+
+    pub(super) fn register_mobile_bridge(
+        &mut self,
+        client: ClientId,
+        endpoints: MobileBridgeEndpoints,
+    ) {
+        if self.mobile_bridges.insert(client, endpoints).is_none() {
+            self.mobile_changed(MobileWatch::BridgePresence);
+        }
+    }
+
+    pub(super) fn mobile_bridges(
+        &self,
+        client: ClientId,
+        include_endpoints: bool,
+    ) -> (usize, Vec<MobileBridgeEndpoints>) {
+        self.mobile_snapshot_started(client, MobileWatch::BridgePresence);
+        let endpoints = if include_endpoints {
+            self.mobile_bridges.values().copied().collect()
+        } else {
+            Vec::new()
+        };
+        (self.mobile_bridges.len(), endpoints)
+    }
+
+    fn forget_mobile_client(&mut self, client: ClientId) {
+        self.mobile_watchers.remove(&client);
+        if self.mobile_bridges.remove(&client).is_some() {
+            self.mobile_changed(MobileWatch::BridgePresence);
         }
     }
 
@@ -1387,7 +1420,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
-        self.mobile_watchers.remove(&client_id);
+        self.forget_mobile_client(client_id);
         let mut recheck_history = self
             .chat_resolutions
             .remove(&client_id)

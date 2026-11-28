@@ -45,7 +45,14 @@ impl Kernel {
 
     pub(super) fn add(&self, _: &mut Registry, file: &File) -> Option<Id> {
         let pinned = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd())).ok()?;
-        let events = libc::IN_MODIFY | libc::IN_ATTRIB | libc::IN_MOVE_SELF | libc::IN_DELETE_SELF;
+        let events = libc::IN_MODIFY
+            | libc::IN_ATTRIB
+            | libc::IN_MOVE_SELF
+            | libc::IN_DELETE_SELF
+            | libc::IN_CREATE
+            | libc::IN_DELETE
+            | libc::IN_MOVED_FROM
+            | libc::IN_MOVED_TO;
         // SAFETY: inotify is owned by self and pinned names the open file.
         let id = unsafe { libc::inotify_add_watch(self.0.as_raw_fd(), pinned.as_ptr(), events) };
         (id >= 0).then_some(id)
