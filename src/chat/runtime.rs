@@ -496,12 +496,42 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(Box<super::Session>, BTreeMap<String, String>),
+    New(
+        Box<super::Session>,
+        BTreeMap<String, String>,
+        Option<UpgradeRestoreQueueBudget>,
+    ),
     Adopted(
         Box<super::native_holder::Holder>,
         crate::daemon::holder_registry::Process,
     ),
 }
+
+/// File-lock wait shared by the daemon's entire upgrade restore. An actor
+/// charges each sample as it waits, even before it can publish a chat.
+#[derive(Clone)]
+pub struct UpgradeRestoreQueueBudget(Arc<AtomicU64>);
+
+impl Default for UpgradeRestoreQueueBudget {
+    fn default() -> Self {
+        const LIMIT: Duration = Duration::from_secs(60);
+        Self(Arc::new(AtomicU64::new(LIMIT.as_nanos() as u64)))
+    }
+}
+
+impl UpgradeRestoreQueueBudget {
+    fn exhausted_after(&self, waited: Duration) -> bool {
+        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        let before = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(nanos))
+            })
+            .expect("the lock queue budget debit always updates the counter");
+        nanos >= before
+    }
+}
+
 /// Why the provider actor did not queue a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueueRefusal {
@@ -567,6 +597,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         recovery_environment: BTreeMap<String, String>,
+        upgrade_queue_budget: Option<UpgradeRestoreQueueBudget>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -576,7 +607,11 @@ impl LocalHandle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(Box::new(source), recovery_environment)),
+            Some(NativeOwnership::New(
+                Box::new(source),
+                recovery_environment,
+                upgrade_queue_budget,
+            )),
             notify,
         )
     }
@@ -685,9 +720,11 @@ impl LocalHandle {
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
-        let recovery_environment = match &ownership {
-            Some(NativeOwnership::New(_, environment)) => environment.clone(),
-            _ => spec.environment.clone(),
+        let (recovery_environment, upgrade_queue_budget) = match &ownership {
+            Some(NativeOwnership::New(_, environment, budget)) => {
+                (environment.clone(), budget.clone())
+            }
+            _ => (spec.environment.clone(), None),
         };
         if !matches!(spec.transport, TransportSpec::History)
             && !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
@@ -747,7 +784,7 @@ impl LocalHandle {
         #[cfg(any(test, feature = "test-support"))]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
-            Some(NativeOwnership::New(source, _))
+            Some(NativeOwnership::New(source, _, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
                 Some(super::native_holder::spawn(spec.clone(), *source)?)
@@ -848,6 +885,7 @@ impl LocalHandle {
                     child: None,
                     native_holder,
                     startup_lock_wait,
+                    upgrade_queue_budget,
                     reconnect_only_reported: false,
                     command_stops: 0,
                     expected_native_peer,
@@ -2822,6 +2860,7 @@ struct Actor {
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
     startup_lock_wait: Arc<AtomicU64>,
+    upgrade_queue_budget: Option<UpgradeRestoreQueueBudget>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
     /// Commands memory exhaustion stopped while this actor ran.
