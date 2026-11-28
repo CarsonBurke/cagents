@@ -419,7 +419,7 @@ fn antigravity_agent_reopens_its_exact_conversation_after_a_daemon_crash() {
         "agent",
         "spawn",
         "--provider",
-        "antigravity",
+        "agy",
         "--repository",
         project,
         "--surface",
