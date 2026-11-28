@@ -19,6 +19,11 @@ pub mod readable;
 pub(crate) const INTERRUPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 pub(crate) const TERMINATE_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
 
+/// Time for each frame of a native holder's startup exchange.
+#[cfg(any(feature = "host", target_os = "macos", test))]
+pub(crate) const NATIVE_HOLDER_START_IO_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(30);
+
 #[cfg(feature = "host")]
 pub(crate) mod claude_metadata;
 #[cfg(any(

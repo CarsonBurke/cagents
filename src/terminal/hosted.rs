@@ -1575,7 +1575,7 @@ fn ensure_daemon_ready_at(
     let started = Instant::now();
     match crate::descriptor::connect_settled(socket) {
         Ok(stream) => {
-            let result = verify_existing_startup_stream(socket, stream, started);
+            let result = verify_existing_startup_stream(socket, stream, started, started);
             if application == crate::notifications::Application::Ceditor
                 && matches!(
                     result,
@@ -1668,10 +1668,11 @@ fn verify_existing_startup_stream(
     socket: &Path,
     stream: UnixStream,
     started: Instant,
+    deadline_floor: Instant,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     #[cfg(target_os = "macos")]
     let peer = crate::daemon::peer_credentials(&stream).ok();
-    verify_existing_startup_stream_with_allowance(socket, stream, started, || {
+    verify_existing_startup_stream_with_allowance(socket, stream, started, deadline_floor, || {
         #[cfg(target_os = "macos")]
         if let Some(peer) = peer {
             return crate::update::selected_listener_startup_allowance(socket, peer);
@@ -1684,6 +1685,7 @@ fn verify_existing_startup_stream_with_allowance(
     socket: &Path,
     stream: UnixStream,
     started: Instant,
+    deadline_floor: Instant,
     selected_allowance: impl FnOnce() -> Duration,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     use crate::upgrade::handoff::{STARTUP_BASE, StartupInventory};
@@ -1691,11 +1693,12 @@ fn verify_existing_startup_stream_with_allowance(
     let inventory = StartupInventory::capture();
     verify_startup_stream(socket, stream, |stream| {
         crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
-            started
+            let observed_deadline = started
                 + inventory
                     .and_then(StartupInventory::timeout)
                     .unwrap_or(STARTUP_BASE)
-                + selected_allowance()
+                + selected_allowance();
+            deadline_floor.max(observed_deadline)
         })
     })
 }
@@ -1732,7 +1735,8 @@ fn start_and_verify_daemon_at(
     scoped: bool,
     launch: impl FnMut(bool) -> io::Result<Child>,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
+    let deadline = started + timeout;
     start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
@@ -1742,6 +1746,13 @@ fn start_and_verify_daemon_at(
             source,
         }
     })?;
+    #[cfg(target_os = "macos")]
+    {
+        // The winner may be the selected recovery daemon while our own
+        // companion (for example Ceditor's) has no selected inventory.
+        verify_existing_startup_stream(socket, stream, started, deadline)
+    }
+    #[cfg(not(target_os = "macos"))]
     verify_startup_stream(socket, stream, |stream| {
         crate::control::ControlClient::from_stream_until(stream, deadline)
     })
@@ -3990,7 +4001,13 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
         const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
         let Ok(checkpoint) = std::env::var(CHILD) else {
-            for checkpoint in ["absent", "damaged", "consumed", "selected-reconnects"] {
+            for checkpoint in [
+                "absent",
+                "damaged",
+                "consumed",
+                "selected-reconnects",
+                "cold-deadline",
+            ] {
                 let root = tempfile::tempdir().unwrap();
                 std::fs::create_dir(root.path().join("tmp")).unwrap();
                 let mut command = Command::new(std::env::current_exe().unwrap());
@@ -4020,7 +4037,7 @@ mod tests {
             .join("daemon-upgrade");
         let checkpoint_path = upgrade.join("daemon-upgrade.json");
         let contents: &[u8] = match checkpoint.as_str() {
-            "absent" | "selected-reconnects" => b"",
+            "absent" | "selected-reconnects" | "cold-deadline" => b"",
             "damaged" => b"damaged checkpoint",
             "consumed" => br#"{"version":1,"terminals":[],"chats":[{}]}"#,
             _ => unreachable!("unknown checkpoint fixture"),
@@ -4073,26 +4090,37 @@ mod tests {
             let _ = stream.write_all(&reply[6..]);
         });
         // Spend the base budget before the fixture starts. After the ordinary
-        // hello times out, only the checkpoint or selected allowance can extend it.
+        // hello times out, let the checkpoint, actual listener, or captured
+        // cold deadline supply the rest of the wait.
         let started = Instant::now() - crate::upgrade::handoff::STARTUP_BASE;
+        let base_deadline = started + crate::upgrade::handoff::STARTUP_BASE;
         let result = match checkpoint.as_str() {
             "consumed" => verify_existing_startup_stream(
                 &socket,
                 UnixStream::connect(&socket).unwrap(),
+                started,
                 started,
             ),
             "selected-reconnects" => verify_existing_startup_stream_with_allowance(
                 &socket,
                 UnixStream::connect(&socket).unwrap(),
                 started,
+                base_deadline,
                 || crate::upgrade::handoff::selected_reconnect_allowance(3),
+            ),
+            "cold-deadline" => verify_existing_startup_stream_with_allowance(
+                &socket,
+                UnixStream::connect(&socket).unwrap(),
+                started,
+                base_deadline + Duration::from_secs(5),
+                || Duration::ZERO,
             ),
             _ => ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents),
         };
         server.join().unwrap();
         result.unwrap();
         match checkpoint.as_str() {
-            "absent" | "selected-reconnects" => assert!(
+            "absent" | "selected-reconnects" | "cold-deadline" => assert!(
                 !upgrade.exists(),
                 "budget estimation must not create upgrade storage"
             ),

@@ -1896,8 +1896,9 @@ pub mod handoff {
 
     #[cfg(any(target_os = "macos", test))]
     pub(crate) fn selected_reconnect_allowance(chats: usize) -> std::time::Duration {
-        // Opening a provider's claimed listener can take a further 15 seconds.
-        (std::time::Duration::from_secs(15) + CODEX_RECONNECT_CONFIRMATION)
+        // The spawn request and the holder's acknowledgement each get an
+        // I/O deadline before the actor starts its thread confirmation.
+        (2 * chat::NATIVE_HOLDER_START_IO_TIMEOUT + CODEX_RECONNECT_CONFIRMATION)
             * chats.min(MAX_CHATS) as u32
     }
 
@@ -3205,6 +3206,18 @@ pub mod handoff {
             std::fs::write(&path, b"malformed").unwrap();
             assert!(store.recovered_chats().is_err());
             assert_eq!(std::fs::read(path).unwrap(), b"malformed");
+        }
+
+        #[test]
+        fn selected_reconnect_budget_includes_both_holder_frames_and_thread_confirmation() {
+            use std::time::Duration;
+
+            assert_eq!(selected_reconnect_allowance(0), Duration::ZERO);
+            assert_eq!(selected_reconnect_allowance(5), Duration::from_secs(375));
+            assert_eq!(
+                selected_reconnect_allowance(MAX_CHATS + 1),
+                selected_reconnect_allowance(MAX_CHATS)
+            );
         }
 
         #[test]
