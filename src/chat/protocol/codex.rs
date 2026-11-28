@@ -1665,6 +1665,7 @@ impl Codex {
             let inputs = array(entry, "input")?;
             let mut parts = Vec::new();
             let mut attachments = Vec::new();
+            let mut has_unnamed_image = false;
             let mut synthetic = std::collections::HashSet::new();
             let mut references = std::collections::HashMap::new();
             let mut unverified = std::collections::HashSet::new();
@@ -1705,6 +1706,7 @@ impl Codex {
                     }
                     Some("image") => {
                         let Some(name) = input["url"].as_str().and_then(image_url_file_name) else {
+                            has_unnamed_image = true;
                             continue;
                         };
                         name
@@ -1719,7 +1721,15 @@ impl Codex {
                     _ => "Attachment".to_owned(),
                 });
             }
-            let mut message = chat::QueuedMessage::new(id, parts.join("\n"));
+            let preview = if has_unnamed_image
+                && attachments.is_empty()
+                && parts.iter().all(|part| part.trim().is_empty())
+            {
+                "Image".into()
+            } else {
+                parts.join("\n")
+            };
+            let mut message = chat::QueuedMessage::new(id, preview);
             // Only what the composer can hold again counts as the whole
             // message: one text, the skills that text names again when it is
             // sent, and local images.
