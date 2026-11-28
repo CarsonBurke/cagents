@@ -1149,6 +1149,20 @@ class Evidence(unittest.TestCase):
         self.assertEqual(missing.returncode, 2)
         self.assertIn("--daemon-trace needs a RUST_LOG filter", missing.stderr)
 
+    def test_workspace_and_daemon_trace_share_a_filter(self) -> None:
+        self.built()
+        daemon_filter = "cagents::chat::runtime=debug,warn"
+        self.run_tool("start", "after", "--workspace-trace", "--daemon-trace", daemon_filter)
+        self.assertEqual(
+            (self.logs / "ui-rust-log").read_text(),
+            "cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,"
+            f"cagents::workspace_projection=trace,warn,{daemon_filter}\n",
+        )
+        arguments = shlex.split((self.logs / "runner").read_text().splitlines()[-1])
+        self.assertEqual(arguments[arguments.index("--daemon-log") + 1], str(self.task / "logs/daemon-after.log"))
+        self.assertNotIn("RUST_LOG=", self.run_tool("cli", "print-env").stdout)
+        self.run_tool("stop")
+
     def test_startup_timeout_rejects_invalid_or_missing_seconds_before_launch(self) -> None:
         for value in ("0", "-1", "+1", "01", "1.5", "3601", "10000", "99999999999999999999", "", "1+2", "1\n2"):
             with self.subTest(value=value):

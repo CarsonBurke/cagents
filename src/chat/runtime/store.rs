@@ -221,6 +221,8 @@ pub struct Store {
     pub presentation: Option<crate::chat::presentation::Presentation>,
     pub presented_children: std::collections::HashMap<String, Vec<std::sync::Arc<Item>>>,
     pending_text: Option<(String, Role, bool, String)>,
+    /// A reader can flush a delta. The next successful apply publishes its warning.
+    pending_text_warning: Option<String>,
     naming_session: Option<String>,
     opening_title: Option<crate::chat::OpeningTitle>,
     opening_history_complete: bool,
@@ -585,6 +587,7 @@ impl Store {
                 presentation: None,
                 presented_children: Default::default(),
                 pending_text: None,
+                pending_text_warning: None,
                 naming_session: None,
                 opening_title: None,
                 opening_history_complete: false,
@@ -1197,7 +1200,15 @@ impl Store {
         }
     }
 
-    fn apply_inner(&mut self, mut event: Event) -> Result<Vec<Event>, StoreError> {
+    fn apply_inner(&mut self, event: Event) -> Result<Vec<Event>, StoreError> {
+        let mut events = self.apply_event(event)?;
+        if let Some(warning) = self.pending_text_warning.take() {
+            events.insert(0, nonfatal(warning));
+        }
+        Ok(events)
+    }
+
+    fn apply_event(&mut self, mut event: Event) -> Result<Vec<Event>, StoreError> {
         self.diagnostics.observe(&mut event);
         if let Some(seal) = &self.messages {
             match &mut event {
@@ -1221,10 +1232,8 @@ impl Store {
         let mut out = Vec::new();
         self.observe_opening(&event, &mut out);
         let earlier = matches!(&event, Event::History { .. });
-        if !matches!(&event, Event::TextDelta { .. })
-            && let Some(warning) = self.flush_text()?
-        {
-            out.push(nonfatal(warning));
+        if !matches!(&event, Event::TextDelta { .. }) {
+            self.flush_text()?;
         }
         // Another request starts, so no error of the fill's can follow.
         if self.fill == Fill::Ended
@@ -1349,9 +1358,8 @@ impl Store {
                         || pending.1 != role
                         || pending.2 != thinking
                         || pending.3.len() + delta.len() > 64 * 1024
-                }) && let Some(warning) = self.flush_text()?
-                {
-                    out.push(nonfatal(warning));
+                }) {
+                    self.flush_text()?;
                 }
                 if delta.len() > 64 * 1024 {
                     if let Some(warning) = self.append(&id, role, thinking, &delta)? {
@@ -1470,16 +1478,21 @@ impl Store {
         self.trim_wal();
         Ok(out)
     }
-    fn flush_text(&mut self) -> Result<Option<String>, StoreError> {
-        match self.pending_text.take() {
-            Some(pending) => match self.append(&pending.0, pending.1, pending.2, &pending.3) {
-                Ok(warning) => Ok(warning),
-                Err(error) => {
-                    self.pending_text = Some(pending);
-                    Err(error)
-                }
-            },
-            None => Ok(None),
+    fn flush_text(&mut self) -> Result<(), StoreError> {
+        let Some(pending) = self.pending_text.take() else {
+            return Ok(());
+        };
+        match self.append(&pending.0, pending.1, pending.2, &pending.3) {
+            Ok(warning) => {
+                // Only a successful apply can buffer new text, and it takes
+                // any previous warning before returning.
+                self.pending_text_warning = warning;
+                Ok(())
+            }
+            Err(error) => {
+                self.pending_text = Some(pending);
+                Err(error)
+            }
         }
     }
     fn append(
@@ -1814,7 +1827,7 @@ impl Store {
         &mut self,
         previous: &mut Vec<std::sync::Arc<Item>>,
     ) -> Result<Window, String> {
-        let _ = self.flush_text()?;
+        self.flush_text()?;
         let mut copy_projection = Vec::new();
         let old_copy: std::collections::HashMap<_, _> = previous
             .iter()
@@ -2623,11 +2636,53 @@ mod tests {
             })
             .unwrap();
         assert_eq!(wal_bytes(&store), held);
-        assert_eq!(store.flush_text().unwrap(), None);
+        store.flush_text().unwrap();
+        assert!(store.pending_text_warning.is_none());
         assert!(wal_bytes(&store) <= WAL_LIMIT);
         pinned.push_str(" more");
         assert_copy(&store, "large", &large);
         assert_copy(&store, "pinned", &pinned);
+    }
+
+    #[test]
+    fn buffered_text_warning_is_published_once_regardless_of_who_flushes() {
+        let reloaded = Store::at(std::env::temp_dir()).unwrap();
+        let readers: [fn(&mut Store, &Store); 4] = [
+            |_, _| {}, // The next apply flushes the text.
+            |store, _| {
+                store.unread(&[]).unwrap();
+            },
+            |store, _| {
+                store.window().unwrap();
+            },
+            |store, reloaded| {
+                store.is_covered_by(reloaded).unwrap();
+            },
+        ];
+        for read in readers {
+            let mut store = Store::at(std::env::temp_dir()).unwrap();
+            let delta = Event::TextDelta {
+                id: "x".repeat(METADATA_LIMIT + 1),
+                role: Role::Assistant,
+                thinking: false,
+                delta: "text".into(),
+            };
+            assert!(store.apply(delta).unwrap().is_empty());
+            read(&mut store, &reloaded);
+
+            let events = store.apply(Event::OpeningHistoryComplete).unwrap();
+            assert!(matches!(
+                events.as_slice(),
+                [Event::Error { message, fatal: false }]
+                    if message.ends_with("exceeds the 64 KiB identity budget and was not cached")
+            ));
+            assert!(
+                store
+                    .apply(Event::OpeningHistoryComplete)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]

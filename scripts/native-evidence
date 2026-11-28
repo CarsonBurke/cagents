@@ -90,7 +90,8 @@ both use the same fixture data and selected providers.
                   --daemon-trace FILTER writes the daemon's tracing to
                   logs/daemon-SIDE.log, at FILTER, a RUST_LOG directive such
                   as cagents::chat::runtime=debug,warn. The app takes the same
-                  filter. It persists like the traces.
+                  filter. The filter is combined with --workspace-trace when
+                  both are supplied. It persists like the traces.
                   --projection-oracle has every update that projects less than
                   the whole workspace check that against the full projection,
                   logging what it left stale (cagents::projection_oracle) to
@@ -1256,15 +1257,16 @@ run_app() {
         fi
         [ -z "$scoped_ui" ] || stage_environment+=(CAGENTS_AGENT_AUTHORITY=native-evidence-invalid-session)
     fi
-    [ "$(cat "$state/workspace-trace" 2>/dev/null)" != 1 ] || stage_environment+=(
-        RUST_LOG=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
-    )
-    local daemon_trace runner_daemon_log=()
+    local trace_filter= daemon_trace runner_daemon_log=()
+    if [ "$(cat "$state/workspace-trace" 2>/dev/null)" = 1 ]; then
+        trace_filter=cagents=debug,cagentsd=debug,cagents::workspace_pipeline=debug,cagents::workspace_projection=trace,warn
+    fi
     daemon_trace=$(cat "$state/daemon-trace" 2>/dev/null) || daemon_trace=
     if [ -n "$daemon_trace" ]; then
-        stage_environment+=("RUST_LOG=$daemon_trace")
+        trace_filter="${trace_filter:+$trace_filter,}$daemon_trace"
         runner_daemon_log=(--daemon-log "$logs/daemon-$side.log")
     fi
+    [ -z "$trace_filter" ] || stage_environment+=("RUST_LOG=$trace_filter")
     fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_SCOPE=0 CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development "${runner_lane[@]}" "${runner_instance[@]}" "${runner_lifecycle[@]}" \
