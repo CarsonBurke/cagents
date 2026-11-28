@@ -3202,15 +3202,24 @@ impl Runtime {
                     select_notices(&mut builder, 0);
                     let mut rows = 0;
                     self.for_each_turn_part(turn, |placement| match placement {
+                        // An item with no row yet, such as one still being
+                        // prepared, is selected as its part of the exchange
+                        // is: a prompt or prose always, a step only while the
+                        // steps are open.
                         Placement::Unplaced(item) => {
-                            let prompt = turn
-                                .prompt
-                                .iter()
-                                .any(|index| items.get(*index).is_some_and(|it| it.id == item.id));
-                            if prompt {
-                                self.selection_item(&mut builder, item, turn::Slot::Prose, true);
-                            } else if steps_shown {
-                                self.selection_item(&mut builder, item, turn::slot_of(item), true);
+                            let is =
+                                |index: usize| items.get(index).is_some_and(|it| it.id == item.id);
+                            let slot = if turn.prompt.iter().any(|index| is(*index)) {
+                                Some(turn::Slot::Prose)
+                            } else if let Some(placed) =
+                                turn.prose.iter().find(|placed| is(placed.index))
+                            {
+                                Some(placed.slot)
+                            } else {
+                                steps_shown.then(|| turn::slot_of(item))
+                            };
+                            if let Some(slot) = slot {
+                                self.selection_item(&mut builder, item, slot, true);
                             }
                         }
                         Placement::Row(part, _) => {
@@ -6232,8 +6241,8 @@ impl Runtime {
         })
     }
 
-    /// The first item, in the transcript's order, that a row of `turn`
-    /// draws.
+    /// Every item a row of `turn` draws, with its slot, in drawing order.
+    /// A closed strip of steps draws none of its items' text.
     fn turn_part_items(
         &self,
         turn: &turn::Turn,
