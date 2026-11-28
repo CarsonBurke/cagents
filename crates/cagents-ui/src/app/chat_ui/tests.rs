@@ -8966,7 +8966,8 @@ fn a_chooser_refusal_survives_a_deferred_account_change() {
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
     );
-    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert_eq!(task.units(), 2, "only skills and permission are refreshed");
+    assert!(runtime.draft_permission.pending.is_some());
     assert!(runtime.attachments.is_empty());
     assert_eq!(runtime.pastes_pending, 0);
     assert!(!ticket.active());
@@ -9012,7 +9013,8 @@ fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
     );
-    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert_eq!(task.units(), 2, "only skills and permission are refreshed");
+    assert!(runtime.draft_permission.pending.is_some());
     assert!(runtime.attachments.is_empty());
     assert_eq!(runtime.pastes_pending, 0);
     assert!(!ticket.active());
@@ -15077,7 +15079,9 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
 }
 
 #[test]
-fn draft_permission_preview_reads_config_once_per_recipe() {
+fn draft_permission_preview_resolves_once_and_discards_superseded_reads() {
+    use iced::futures::StreamExt;
+
     let home = tempfile::tempdir().unwrap();
     let account = home.path().join(".codex");
     std::fs::create_dir_all(&account).unwrap();
@@ -15087,7 +15091,10 @@ fn draft_permission_preview_reads_config_once_per_recipe() {
         "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
     )
     .unwrap();
-    let mut recipe = LaunchRecipe {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, home.path());
+    let target = chat_runtime(&app, card).target;
+    let recipe = LaunchRecipe {
         unset_environment: Default::default(),
         program: "codex".into(),
         arguments: Vec::new(),
@@ -15098,36 +15105,96 @@ fn draft_permission_preview_reads_config_once_per_recipe() {
         ]
         .into(),
     };
-    let mut preview = DraftPermissionPreview::default();
+    app.chat_runtime_mut(target).unwrap().session.launch.recipe = recipe.clone();
+    let first = app.load_draft_permission(target);
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    assert_eq!(app.load_draft_permission(target).units(), 0);
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let read = |task| {
+        executor.block_on(async move {
+            let mut outputs = iced::runtime::task::into_stream(task).unwrap();
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(message))) =
+                outputs.next().await
+            else {
+                panic!("the worker must answer");
+            };
+            message
+        })
+    };
+    let first = read(first);
+
+    // A recipe can change twice while a read is in flight. The equal recipe
+    // after the second change must require its own receipt.
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .arguments = vec!["--yolo".into()];
+    assert_eq!(app.load_draft_permission(target).units(), 0);
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
         Some("yolo")
     );
     std::fs::write(
-        &config,
+        config,
         "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
     )
     .unwrap();
+    app.chat_runtime_mut(target).unwrap().session.launch.recipe = recipe;
+    let latest = app.load_draft_permission(target);
+    let _ = app.update(first);
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    let _ = app.update(read(latest));
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("yolo"),
-        "an unchanged recipe keeps its preview"
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
+        Some("readOnly")
     );
-    recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
-        .map(String::from)
-        .into();
+    assert_eq!(app.load_draft_permission(target).units(), 0);
+}
+
+#[test]
+fn a_returned_draft_can_restart_a_preview_in_flight_during_first_send() {
+    let home = tempfile::tempdir().unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, home.path());
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .working_directory = home.path().join("changed");
+    let _ = app.load_draft_permission(target);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let old_read = runtime.draft_permission.pending.expect("a pending read");
+    let new_target = Target {
+        generation: target.generation + 1,
+        ..target
+    };
+    runtime.retarget(new_target);
+    // Simulate restoring the draft after an unsuccessful first send. The
+    // recipe is the same, but Ready retargeted the runtime.
+    assert!(app.load_draft_permission(new_target).units() > 0);
+    let new_read = chat_runtime(&app, card).draft_permission.pending.unwrap();
+    assert_ne!(old_read, new_read);
+
+    let _ = app.update(action(Action::DraftPermissionResolved(
+        target,
+        old_read,
+        Some("yolo".into()),
+    )));
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    let _ = app.update(action(Action::DraftPermissionResolved(
+        new_target,
+        new_read,
+        Some("manual".into()),
+    )));
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("workspaceWrite")
-    );
-    assert_eq!(
-        preview.get(&recipe, Provider::Omp),
-        None,
-        "the provider is part of the key"
-    );
-    assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("workspaceWrite")
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
+        Some("manual")
     );
 }
 
