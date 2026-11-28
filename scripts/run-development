@@ -109,7 +109,7 @@ Options:
   --fresh-daemon   Stop development sessions and background subagents after building
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
   --hot-integrated  Explicit embedded-browser hot reload
-  --log-file PATH  Write UI tracing output to PATH (relative to caller)
+  --log-file PATH  Append UI tracing output to PATH (relative to caller)
   --daemon-log PATH
                    Append the development daemon's tracing output to PATH
                    (relative to caller); implies --debug. Works with --instance.
@@ -869,6 +869,7 @@ if [ "$hot" = true ]; then
 fi
 
 # The flags choose the daemon's log, never an inherited environment.
+unset CAGENTS_DEVELOPMENT_UI_LOG
 if [ -n "$daemon_log" ]; then
     export CAGENTS_DEVELOPMENT_DAEMON_LOG="$daemon_log"
 else
@@ -1489,7 +1490,7 @@ if [ -n "$log_file" ]; then
     # Only the app's output goes there: a person watching this terminal needs to
     # hear from the memory limit if it stops the app.
     # shellcheck disable=SC2016 # expanded by the inner shell
-    set -- sh -c 'log_file=$1; shift; exec "$@" >"$log_file" 2>&1' run-ui "$log_file" "$products/cagents-ui" "$@"
+    set -- sh -c 'export CAGENTS_DEVELOPMENT_UI_LOG=$1; shift; exec "$@" >>"$CAGENTS_DEVELOPMENT_UI_LOG" 2>&1' run-ui "$log_file" "$products/cagents-ui" "$@"
 else
     set -- "$products/cagents-ui" "$@"
 fi

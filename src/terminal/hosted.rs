@@ -1856,7 +1856,8 @@ fn daemon_launch_command(
         // A scope executes locally, preserving this exact sanitized environment
         // instead of inheriting stale variables from the user service manager.
         .env_remove(crate::instance::UI_LAUNCH_HANDSHAKE_ENV)
-        .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV);
+        .env_remove(crate::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .env_remove(crate::instance::DEVELOPMENT_UI_LOG_ENV);
     command
 }
 

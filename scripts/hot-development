@@ -160,7 +160,10 @@ def main():
         command[position:position] = ["--unsetenv", "CAGENTS_HOT_FRESH_DAEMON"]
     print("Experimental hot reload: body-only edits in crates/cagents-ui; shared-library, type, dependency, startup and daemon changes need a cold restart.", file=sys.stderr)
     if args.log_file:
-        with open(args.log_file, "w") as output:
+        log = os.path.abspath(args.log_file)
+        position = command.index("--chdir")
+        command[position:position] = ["--setenv", "CAGENTS_DEVELOPMENT_UI_LOG", log]
+        with open(log, "a") as output:
             return subprocess.run(command, stdout=output, stderr=subprocess.STDOUT).returncode
     os.execvp(command[0], command)
 
