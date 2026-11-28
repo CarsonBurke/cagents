@@ -1010,6 +1010,36 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(list(bundle.parent.glob(".dry-run-*")), [])
         self.assertFalse(any(line.startswith(("sign ", "publish ")) for line in self.log("calls.log")))
 
+    def test_dry_and_normal_cuts_use_the_same_remote_only_previous_tag(self):
+        # The feature was in the last release, whose annotated tag the
+        # checkout has never fetched. A newer local draft must not hide the fix.
+        self.git("tag", "-a", "v0.2.2", "-m", "earlier release", self.base)
+        self.git("push", "-q", "origin", "v0.2.2")
+        self.git("tag", "-d", "v0.2.3")
+        self.git("-c", "user.email=fixture@example.invalid", "-c", "user.name=fixture",
+                 "tag", "-f", "-a", "v0.2.3", "-m", "last release", self.feature, cwd=self.origin)
+        self.git("tag", "-a", "v0.2.99", "-m", "local draft", self.fix)
+        candidate = self.commit("perf(release): qualify bundles faster")
+        self.git("push", "-q", "origin", "main")
+        self.git("update-ref", "refs/remotes/origin/main", self.fix)
+        self.bundle(candidate)
+        self.git("config", "remote.origin.tagOpt", "--tags")
+        local_refs = self.git("show-ref")
+        remote_refs = self.git("show-ref", cwd=self.origin)
+        dry = self.release("cut", "--commit", candidate, "--dry-run")
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        refs_after_dry_run = self.git("show-ref")
+        self.assertEqual(self.git("show-ref", cwd=self.origin), remote_refs)
+        normal = self.release("cut", "--commit", candidate)
+        self.assertEqual(normal.returncode, 0, normal.stderr)
+        metadata = json.loads((self.root / "bundles/0.2.4/release-metadata.json").read_text())
+        self.assertEqual(metadata["notes"], "### Fixed\n- Something that broke\n\n### Faster\n- Qualify bundles faster\n")
+        dry_notes = dry.stdout.split(". Its notes:\n\n", 1)[1]
+        self.assertEqual(dry_notes.splitlines()[:len(metadata["notes"].splitlines())],
+                         [f"  {line}" for line in metadata["notes"].splitlines()])
+        self.assertEqual(refs_after_dry_run, local_refs)
+        self.assertEqual(self.git("show-ref", cwd=self.origin), remote_refs)
+
     def test_prepare_macos_resolves_the_zig_shim_before_packaging(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
         (self.repo / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
