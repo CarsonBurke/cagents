@@ -1302,6 +1302,7 @@ impl Acp {
             step.events.push(Event::History {
                 items,
                 has_earlier: false,
+                unfetched: None,
             });
         }
         self.segment = None;
@@ -2175,6 +2176,9 @@ impl Adapter for Acp {
                 "{label} loads a resumed conversation completely when it opens."
             )),
             Command::LoadLater => Err("Newer history is served by the transcript cache".into()),
+            Command::Seek { .. } => {
+                Err("History positions are served by the transcript cache".into())
+            }
             Command::ReadTextCopy { .. } => {
                 Err("Text copies are served by the transcript cache".into())
             }

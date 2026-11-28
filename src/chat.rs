@@ -2131,6 +2131,12 @@ pub struct Snapshot {
         skip_serializing_if = "crate::terminal_ipc::before_acp_reasoning_observations"
     )]
     pub reasoning_observed_at: Option<std::sync::Arc<std::collections::BTreeMap<String, u64>>>,
+    /// Where the presented window sits in the whole conversation.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_history_extents"
+    )]
+    pub history: HistoryExtent,
 }
 
 impl Serialize for Snapshot {
@@ -2142,13 +2148,17 @@ impl Serialize for Snapshot {
 impl<'de> Deserialize<'de> for Snapshot {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         use crate::terminal_ipc::{
-            ACP_REASONING_OBSERVATIONS, SEND_QUEUED_NOW, WithoutTrailing, decoding_before,
+            ACP_REASONING_OBSERVATIONS, HISTORY_EXTENTS, SEND_QUEUED_NOW, WithoutTrailing,
+            decoding_before,
         };
 
         if decoding_before(SEND_QUEUED_NOW) {
-            return Self::deserialize(WithoutTrailing::new(deserializer, 2));
+            return Self::deserialize(WithoutTrailing::new(deserializer, 3));
         }
         if decoding_before(ACP_REASONING_OBSERVATIONS) {
+            return Self::deserialize(WithoutTrailing::new(deserializer, 2));
+        }
+        if decoding_before(HISTORY_EXTENTS) {
             return Self::deserialize(WithoutTrailing::new(deserializer, 1));
         }
         Self::deserialize(deserializer)
@@ -2178,6 +2188,34 @@ impl SendNow {
     /// only repeat it.
     pub fn in_flight(self) -> bool {
         self != Self::Declined
+    }
+}
+
+/// How many transcript items lie on each side of the presented window.
+///
+/// An item the window shows only some parts of counts as inside it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HistoryExtent {
+    /// Cached items before the window.
+    pub before: u64,
+    /// Cached items after the window.
+    pub after: u64,
+    /// Items before the cached ones that the provider has not handed over,
+    /// as it reported them: `None` when it cannot tell how many, although
+    /// `has_earlier` then still says that there are some.
+    pub unfetched: Option<u64>,
+}
+
+impl HistoryExtent {
+    /// How many items the whole cached conversation holds, given how many
+    /// the window holds. That is items, not rows: a long message the window
+    /// shows as several parts is one item.
+    pub fn total(self, window_items: usize) -> u64 {
+        self.before + window_items as u64 + self.after
+    }
+    /// How many items, cached or not, are known to come before the window.
+    pub fn earlier(self) -> u64 {
+        self.before + self.unfetched.unwrap_or(0)
     }
 }
 
@@ -2703,6 +2741,7 @@ impl Command {
             | Self::ReadTextCopy { .. }
             // The messages it hurries gave their work when they were queued,
             // and asking twice changes nothing.
+            | Self::Seek { .. }
             | Self::SendQueuedNow => false,
         }
     }
@@ -2736,6 +2775,7 @@ impl Command {
             | Self::ListBranches
             | Self::LoadLater
             | Self::ReadTextCopy { .. }
+            | Self::Seek { .. }
             | Self::SendQueuedNow => false,
         }
     }
@@ -2830,6 +2870,11 @@ pub enum Command {
     /// [`Capabilities::send_queued_now`] says so; [`Snapshot::send_now`]
     /// says how it went.
     SendQueuedNow,
+    /// Present the cached window around the item at `index`, counted from the
+    /// start of the cached conversation; never asks the provider for history.
+    Seek {
+        index: u64,
+    },
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Answer {
@@ -4136,6 +4181,12 @@ pub enum Event {
     History {
         items: Vec<Item>,
         has_earlier: bool,
+        /// How many items the provider holds before this page and has not
+        /// handed over: exact when it knows its length, an estimate when it
+        /// can only tell roughly, and `None` when it cannot tell at all.
+        /// Meaningless once `has_earlier` is false, when there are none.
+        #[serde(default)]
+        unfetched: Option<u64>,
     },
     TextDelta {
         id: String,
@@ -4227,6 +4278,9 @@ pub enum Event {
     LatestHistory {
         items: Vec<Item>,
         has_earlier: bool,
+        /// See [`Event::History`].
+        #[serde(default)]
+        unfetched: Option<u64>,
     },
     /// Establish the cached/live boundary before an asynchronous newest-page
     /// request. Its response may arrive after newer live items.

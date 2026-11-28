@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 224,
+    proven_at: 225,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -232,6 +232,15 @@ impl<'de, D: serde::Deserializer<'de>> serde::Deserializer<'de> for WithoutTrail
     }
 }
 
+/// The first protocol whose chat snapshots say how much history lies outside
+/// their window. A client from before it is sent snapshots without it, and an
+/// update source from before it is read without it.
+pub const HISTORY_EXTENTS: u16 = 225;
+
+pub fn before_history_extents<T>(_: &T) -> bool {
+    encoding_before(HISTORY_EXTENTS)
+}
+
 /// Fields a later protocol added to a struct, which a client from before it is
 /// sent without, as is a request to a daemon from before it: the struct's type
 /// name, the fields, and the protocol that added them. The wire format proofs
@@ -270,6 +279,7 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
         &["reasoning_observed_at"],
         ACP_REASONING_OBSERVATIONS,
     ),
+    ("cagents::chat::Snapshot", &["history"], HISTORY_EXTENTS),
     (
         "cagents::chat::Capabilities",
         &["send_queued_now"],
@@ -331,6 +341,7 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         &["reasoning_observed_at"],
         ACP_REASONING_OBSERVATIONS,
     ),
+    ("cagents::chat::Snapshot", &["history"], HISTORY_EXTENTS),
     (
         "cagents::chat::Capabilities",
         &["send_queued_now"],
@@ -389,6 +400,8 @@ const WITHHELD_VARIANTS: &[(&str, &str, u16)] = &[
 thread_local! {
     /// The older protocol this thread is encoding a message for.
     static ENCODING_FOR: Cell<Option<u16>> = const { Cell::new(None) };
+    /// The older protocol this thread is decoding a message from.
+    static DECODING_FROM: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
 /// Runs `encode` with this thread encoding for a client of `protocol`, so that
@@ -415,12 +428,6 @@ pub fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
 /// Whether the value being encoded goes to a client from before `protocol`.
 pub fn encoding_before(protocol: u16) -> bool {
     ENCODING_FOR.get().is_some_and(|older| older < protocol)
-}
-
-thread_local! {
-    /// The older protocol of the daemon this thread is decoding a message
-    /// from.
-    static DECODING_FROM: Cell<Option<u16>> = const { Cell::new(None) };
 }
 
 /// Runs `decode` with this thread decoding a message from a peer of
@@ -951,6 +958,62 @@ mod tests {
             encoding_for(PLAN_AND_RESET_READINGS, || postcard::to_stdvec(&readings)
                 .unwrap()),
             current
+        );
+    }
+
+    #[test]
+    fn snapshot_history_extents_preserve_older_layouts_and_following_fields() {
+        use crate::chat::{HistoryExtent, SendNow, Snapshot};
+        let snapshot = Snapshot {
+            has_earlier: true,
+            history: HistoryExtent {
+                before: 40,
+                after: 7,
+                unfetched: Some(300),
+            },
+            composer: Some("draft".into()),
+            history_loading: true,
+            send_now: Some(SendNow::Requested),
+            reasoning_observed_at: Some(std::sync::Arc::new(
+                [("model".into(), 5)].into_iter().collect(),
+            )),
+            ..Snapshot::default()
+        };
+        for protocol in [
+            SEND_QUEUED_NOW - 1,
+            ACP_REASONING_OBSERVATIONS - 1,
+            HISTORY_EXTENTS - 1,
+            HISTORY_EXTENTS,
+        ] {
+            let bytes = encoding_for(protocol, || {
+                postcard::to_stdvec(&(&snapshot, 42_u8)).unwrap()
+            });
+            let (read, following) = decoding_from(protocol, || {
+                postcard::from_bytes::<(Snapshot, u8)>(&bytes).unwrap()
+            });
+            let mut expected = snapshot.clone();
+            if protocol < HISTORY_EXTENTS {
+                expected.history = HistoryExtent::default();
+            }
+            if protocol < ACP_REASONING_OBSERVATIONS {
+                expected.reasoning_observed_at = None;
+            }
+            if protocol < SEND_QUEUED_NOW {
+                expected.send_now = None;
+            }
+            assert_eq!(following, 42);
+            assert_eq!(read, expected, "protocol {protocol}");
+        }
+        // Retained helpers can still supply a JSON snapshot without an extent.
+        let mut json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(json.clone()).unwrap(),
+            snapshot
+        );
+        json.as_object_mut().unwrap().remove("history");
+        assert_eq!(
+            serde_json::from_value::<Snapshot>(json).unwrap().history,
+            HistoryExtent::default()
         );
     }
 

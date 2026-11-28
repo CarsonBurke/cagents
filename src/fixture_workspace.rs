@@ -697,7 +697,10 @@ mod tests {
             loop {
                 let mut earlier = false;
                 for event in step.events {
-                    if let Event::History { items, has_earlier } = event {
+                    if let Event::History {
+                        items, has_earlier, ..
+                    } = event
+                    {
                         pages.push(items);
                         earlier = has_earlier;
                     }
