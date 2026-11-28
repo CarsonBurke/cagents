@@ -41,7 +41,8 @@ fn read_stage(state: &Path, job: &str) -> Result<Stage, UpdateError> {
 
 fn extraction_directory(state: &Path) -> io::Result<tempfile::TempDir> {
     tempfile::Builder::new()
-        .prefix(".release-stage-")
+        .prefix(retention::RELEASE_STAGE_PREFIX)
+        .rand_bytes(retention::RELEASE_STAGE_RANDOM_BYTES)
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(state)
 }
@@ -129,9 +130,11 @@ pub(super) fn extract_and_exec(
         ));
     }
     let stage_dir = extraction_directory(state)?;
+    let lease = retention::lease_extraction(stage_dir.path())?;
     extract(
         &installation.prefix,
         stage_dir.path(),
+        &lease,
         release,
         assets,
         cancellation,
@@ -178,7 +181,13 @@ pub(super) fn extract_and_exec(
         },
     )?;
     confirmation::check_cancelled(state, job)?;
-    drop(stage_dir);
+    let lease_path = retention::extraction_lease_path(stage_dir.path());
+    if let Err(error) = stage_dir.close().and_then(|()| {
+        File::open(state)?.sync_all()?;
+        fs::remove_file(lease_path)
+    }) {
+        tracing::warn!(%error, "could not clean release extraction files");
+    }
 
     let mut command = Command::new(root.join("bin/cagents"));
     command.args(["update-worker", &job.id]);
@@ -221,6 +230,7 @@ fn programs_digest(root: &Path) -> Result<String, UpdateError> {
 fn extract(
     prefix: &Path,
     directory: &Path,
+    lease: &File,
     release: &Release,
     assets: &feed::VerifiedAssets,
     cancellation: &CancellationToken,
@@ -239,6 +249,8 @@ fn extract(
     for asset in [&assets.installer, &assets.archive, &assets.checksums] {
         candidate::inherit(&mut command, asset.as_raw_fd());
     }
+    // An installer child can still drain after this worker exits.
+    candidate::inherit(&mut command, lease.as_raw_fd());
     bounded_command_with_stderr(
         &mut command,
         "Staging the verified Apple Silicon release",
@@ -360,6 +372,7 @@ test "$(cat "$CAGENTS_ARCHIVE")" = exact-archive
 test "$(cat "$CAGENTS_CHECKSUMS")" = exact-checksums
 test "$(readlink "$2/current")" = versions/0.2.3
 test "${6%/*}" = "$2/.update"
+test -z "$(ls -A "$6")"
 mkdir "$6/cagents-0.2.4"
 printf 'staged\n' > "$6/cagents-0.2.4/receipt"
 "#,
@@ -367,9 +380,11 @@ printf 'staged\n' > "$6/cagents-0.2.4/receipt"
             archive: sealed(b"exact-archive"),
             checksums: sealed(b"exact-checksums"),
         };
+        let lease = retention::lease_extraction(stage.path()).unwrap();
         extract(
             &prefix,
             stage.path(),
+            &lease,
             &release,
             &assets,
             &CancellationToken::new(),
