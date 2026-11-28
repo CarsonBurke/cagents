@@ -330,6 +330,54 @@ class SmokeBoundary(unittest.TestCase):
         self.environment.update(CAGENTS_RELEASE_CACHE=str(cache), CARGO_BUILD_JOBS="1")
         return cache
 
+    def test_release_source_cache_checks_out_only_the_requested_tree(self):
+        cache = self.build_cache()
+        source = self.directory / "repository"
+        checkout = cache / "source"
+        checkout.mkdir()
+        source.mkdir()
+
+        def git(*args):
+            return subprocess.check_output(
+                ["git", "-C", str(source), "-c", "user.name=fixture",
+                 "-c", "user.email=fixture@example.invalid", *args],
+                text=True, timeout=HANG_GUARD,
+            ).strip()
+
+        def materialize(commit):
+            subprocess.run(
+                ["bash", "-ec", 'source "$1"; CACHE=$2 checkout_release_source "$3" "$4"',
+                 "checkout", str(ROOT / "scripts/release-build-cache"), str(cache), str(source), commit],
+                check=True, timeout=HANG_GUARD,
+            )
+
+        git("init", "-q")
+        (source / "unchanged").write_text("shared file\n")
+        (source / "changed").write_text("before\n")
+        git("add", ".")
+        git("commit", "-qm", "first tree")
+        before = git("rev-parse", "HEAD")
+        (source / "changed").write_text("after\n")
+        git("commit", "-qam", "second tree")
+        after = git("rev-parse", "HEAD")
+
+        materialize(after)
+        self.assertEqual((checkout / "changed").read_text(), "after\n")
+        self.assertFalse((checkout / ".git").exists())
+        exported_history = subprocess.check_output(
+            ["git", "--git-dir", str(cache / "source.git"), "rev-list", "--count", "HEAD"],
+            text=True, timeout=HANG_GUARD,
+        )
+        self.assertEqual(exported_history.strip(), "1")
+        unchanged = checkout / "unchanged"
+        unchanged_mtime = unchanged.stat().st_mtime_ns
+        (checkout / "untracked").write_text("left by the build\n")
+
+        materialize(before)
+        self.assertEqual((checkout / "changed").read_text(), "before\n")
+        self.assertEqual(unchanged.stat().st_mtime_ns, unchanged_mtime)
+        self.assertFalse((checkout / "untracked").exists())
+
     def test_release_builder_reclaims_only_recognized_scratch_in_its_marked_cache(self):
         cache = self.build_cache()
         abandoned = cache / "run.ABC123"
