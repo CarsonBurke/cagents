@@ -19,6 +19,8 @@ pub struct Detached {
     pub source: super::super::Session,
     pub proof: HostSessionProof,
     pub(crate) original_role: Option<registry::OriginalRole>,
+    #[cfg(target_os = "linux")]
+    pub(super) server_process: Option<Process>,
     /// The receipt keeps its publishing lease; current cleanup authority is separate.
     pub(super) receipt_proof: HostSessionProof,
 }
@@ -168,6 +170,8 @@ impl Detached {
             source,
             proof,
             original_role,
+            #[cfg(target_os = "linux")]
+            server_process: None,
             receipt_proof: receipt.proof,
         })
     }
@@ -186,13 +190,7 @@ impl Detached {
     }
 
     pub(crate) fn close_with(&self, retain: bool, detached: DetachedWork) -> Result<(), String> {
-        let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
-        if crate::daemon::lease_owner(&paths.lock, &self.proof)
-            .map_err(|error| error.to_string())?
-            != std::process::id()
-        {
-            return Err("Native cleanup caller no longer owns the daemon lease".into());
-        }
+        self.require_cleanup_lease()?;
         if self.receipt(retain, detached)? || self.retire_exited() {
             return Ok(());
         }
@@ -204,6 +202,34 @@ impl Detached {
         }
         let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)?;
         holder.close_inner(retain, detached)
+    }
+
+    fn require_cleanup_lease(&self) -> Result<(), String> {
+        let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+        if crate::daemon::lease_owner(&paths.lock, &self.proof)
+            .map_err(|error| error.to_string())?
+            != std::process::id()
+        {
+            return Err("Native cleanup caller no longer owns the daemon lease".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::chat) fn retire_after_transport_loss(&self) -> Result<bool, String> {
+        let Some(server) = self.server_process.as_ref() else {
+            return Ok(false);
+        };
+        let record = &self.record;
+        if record.application != crate::instance::APPLICATION_ID
+            || record.boot != self.proof.boot_id
+            || !crate::chat::runtime::native_holder_abandoned(&record.holder, &record.root, server)?
+        {
+            return Ok(false);
+        }
+        self.require_cleanup_lease()?;
+        record.remove(&registry::directory(Kind::Native)?);
+        Ok(true)
     }
 
     /// Settles cleanup of an owner that ended without its receipt - killed,
@@ -688,6 +714,8 @@ mod tests {
             source,
             proof: successor.clone(),
             original_role: None,
+            #[cfg(target_os = "linux")]
+            server_process: None,
             receipt_proof: original,
         };
         assert_ne!(detached.proof, detached.receipt_proof);

@@ -402,6 +402,10 @@ impl Actor {
                     "Retained Codex endpoint belongs to a different app-server process".into(),
                 );
             }
+            #[cfg(target_os = "linux")]
+            if let Some(holder) = self.native_holder.as_mut() {
+                holder.observe_server(peer.clone());
+            }
             self.native_peer = Some(peer);
         }
         let config = WebSocketConfig::default()

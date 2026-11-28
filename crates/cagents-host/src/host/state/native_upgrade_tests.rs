@@ -46,10 +46,8 @@ fn run_darwin_native_fixture(test: &str, mode: &str) {
     );
 }
 
-#[cfg(target_os = "macos")]
 struct CloseFixtureChat<'a>(&'a SharedHost, ClientId, Option<TerminalId>);
 
-#[cfg(target_os = "macos")]
 impl Drop for CloseFixtureChat<'_> {
     fn drop(&mut self) {
         if let Some(chat_id) = self.2 {
@@ -60,6 +58,157 @@ impl Drop for CloseFixtureChat<'_> {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
+    use crate::pinned_process::PinnedProcess;
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use crate::update::impact::{Disposition, Policy, SessionCause};
+
+    let (provider_alive, durable) = match std::env::var(MODE).as_deref() {
+        Ok("lost-holder-live") => (true, false),
+        Ok("lost-durable-holder-live") => (true, true),
+        Ok("lost-holder-ended") => (false, false),
+        Ok("lost-durable-holder-ended") => (false, true),
+        _ => {
+            let test = thread::current().name().unwrap().to_owned();
+            run_isolated(&test, "lost-holder-ended");
+            run_isolated(&test, "lost-durable-holder-ended");
+            run_isolated(&test, "lost-holder-live");
+            run_isolated(&test, "lost-durable-holder-live");
+            return;
+        }
+    };
+    // The isolated test owns the orphan's wait and holds the zombie until
+    // after impact has been reviewed.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("lost-holder-fixture"),
+        host_incarnation: HostIncarnation::new("source"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+    host.lock().unwrap().register_client(0);
+    let mut source = provider_session(&root, &program, &proof);
+    if !durable {
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_UPGRADE_CODEX_VERSION".into(), "0.169.0".into());
+    }
+    if provider_alive {
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_UPGRADE_DROP_SOCKET".into(), "1".into());
+    }
+    let chat_id = source.id;
+    super::super::chat::start_execution(
+        &host,
+        0,
+        source,
+        Arc::new(crate::chat::protocol::ExecutionContext::default()),
+    )
+    .unwrap();
+    let _close = CloseFixtureChat(&host, 0, Some(chat_id));
+    let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
+    wait_until(
+        || {
+            handle.confirmed_session_id().as_deref() == Some(THREAD)
+                && handle.check_update_readiness()
+                    == Ok(crate::chat::runtime::UpdateReadiness::Idle)
+        },
+        "the original chat did not become idle",
+    );
+    assert_eq!(handle.native_continuity().retains_provider(), durable);
+    let directory = registry::directory(Kind::Native).unwrap();
+    let socket = registry::socket(&directory, chat_id);
+    let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+    let pin = |identity: &registry::Process| {
+        let pin = PinnedProcess::open(identity.pid as u32).unwrap();
+        assert_eq!(registry::Process::read(identity.pid).unwrap(), *identity);
+        pin
+    };
+    let holder = pin(&record.holder);
+    let provider = pin(&record.root);
+    assert!(holder.signal(libc::SIGKILL).unwrap());
+    wait_until(|| holder.exited().unwrap(), "the holder did not exit");
+    struct Orphan(PinnedProcess, i32);
+    impl Drop for Orphan {
+        fn drop(&mut self) {
+            let _ = self.0.signal(libc::SIGKILL);
+            while unsafe { libc::waitpid(self.1, std::ptr::null_mut(), 0) } < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
+        }
+    }
+    let provider = Orphan(provider, record.root.pid);
+    let review = || {
+        let (response, _, _) = super::super::client::process_request(
+            &host,
+            0,
+            ClientRequest::UpgradeImpact {
+                policy: Policy::WhenIdle,
+            },
+        )
+        .unwrap();
+        let ServerResponse::UpgradeImpact(impact) = response else {
+            panic!("unexpected upgrade impact response: {response:?}");
+        };
+        let [session] = impact.sessions.as_slice() else {
+            panic!("expected one conversation: {impact:?}");
+        };
+        assert_eq!(session.id, chat_id);
+        (session.disposition, session.reason.clone())
+    };
+    if provider_alive {
+        handle
+            .command(crate::chat::Command::Prompt {
+                text: "Disconnect the fixture socket".into(),
+                attachments: Vec::new(),
+                mode: crate::chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait_until(
+            || {
+                handle
+                    .snapshot(None)
+                    .is_some_and(|snapshot| snapshot.exited)
+            },
+            "the chat worker did not stop after its socket closed",
+        );
+        assert_eq!(
+            review(),
+            (Disposition::Blocked, SessionCause::UnsettledProvider)
+        );
+        assert!(!provider.0.exited().unwrap());
+        assert_eq!(
+            registry::execution_record(&socket).unwrap().as_ref(),
+            Some(&record)
+        );
+    }
+    assert!(provider.0.signal(libc::SIGKILL).unwrap());
+    wait_until(|| provider.0.exited().unwrap(), "the provider did not exit");
+    wait_until(
+        || review() == (Disposition::Resumes, SessionCause::ProviderEnded),
+        "update impact never settled the exact exited provider",
+    );
+    assert!(handle.is_completed());
+    assert_eq!(handle.native_continuity(), NativeContinuity::ReconnectOnly);
+    assert_eq!(
+        registry::Process::read(record.root.pid).unwrap(),
+        record.root
+    );
+    assert!(registry::execution_record(&socket).unwrap().is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -2428,6 +2577,10 @@ fn provider() {
                     json!({"thread":{"id":thread,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "turn/start" => {
+                    if std::env::var_os("CAGENTS_UPGRADE_DROP_SOCKET").is_some() {
+                        websocket.close(None).unwrap();
+                        break;
+                    }
                     assert_eq!(frame["params"]["threadId"], thread);
                     turns += 1;
                     let turn = format!("{}-{turns}", std::process::id());

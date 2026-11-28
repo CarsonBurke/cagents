@@ -40,6 +40,8 @@ pub use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
 pub use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
+#[cfg(target_os = "linux")]
+pub(super) use retained_actor::execution_exit::native_holder_abandoned;
 #[cfg(any(test, feature = "test-support"))]
 pub use retained_actor::journal::ContinuityLoss;
 pub use retained_actor::journal::OutboxEntry;
@@ -971,6 +973,17 @@ impl LocalHandle {
                         || (unexpected_loss && native_installed.load(Ordering::Acquire)))
                         && !release_native.load(Ordering::Acquire)
                         || (adopted_native && !native_installed.load(Ordering::Acquire)));
+                #[cfg(target_os = "linux")]
+                let abandoned_holder = preserve_holder
+                    && unexpected_loss
+                    && native_installed.load(Ordering::Acquire)
+                    && !preserve_native.load(Ordering::Acquire)
+                    && actor.native_holder.as_mut().is_some_and(|holder| {
+                        holder.retire_after_transport_loss().unwrap_or(false)
+                    });
+                #[cfg(target_os = "macos")]
+                let abandoned_holder = false;
+                let preserve_holder = preserve_holder && !abandoned_holder;
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
@@ -998,7 +1011,8 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
-                let had_provider = actor.child.is_some() || actor.native_holder.is_some();
+                let had_native_holder = actor.native_holder.is_some();
+                let had_provider = actor.child.is_some() || had_native_holder;
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -1039,7 +1053,9 @@ impl LocalHandle {
                     code
                 });
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
-                    if preserve_holder {
+                    if abandoned_holder {
+                        true
+                    } else if preserve_holder {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
@@ -1077,6 +1093,9 @@ impl LocalHandle {
                         tracing::warn!(%error, "steps left running could not be marked stopped");
                     }
                     let mut state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if had_native_holder && native_closed {
+                        state.native_continuity = super::NativeContinuity::ReconnectOnly;
+                    }
                     stop_snapshot_subagents(&mut state);
                     if !shared_websocket {
                         stop_snapshot_steps(&mut state);
@@ -1852,6 +1871,61 @@ impl LocalHandle {
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settle_lost_native_owner(&self) {
+        if !self.0.native_installed.load(Ordering::Acquire)
+            || self.0.stop.load(Ordering::Acquire)
+            || self.0.preserve_native.load(Ordering::Acquire)
+        {
+            return;
+        }
+        // Keep explicit Close serialized with the retry and let the worker
+        // publish its own result first if it is still finalizing the exit.
+        let Ok(worker) = self.0.worker.try_lock() else {
+            return;
+        };
+        if !worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return;
+        }
+        let mut retained = self
+            .0
+            .retained_native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut detached = self
+            .0
+            .detached_native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let settled = match (retained.as_mut(), detached.as_ref()) {
+            (Some(holder), None) => holder.retire_after_transport_loss(),
+            (None, Some(owner)) => owner.retire_after_transport_loss(),
+            _ => return,
+        };
+        if !matches!(settled, Ok(true)) {
+            return;
+        }
+        retained.take();
+        detached.take();
+        let generation = {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.native_continuity = super::NativeContinuity::ReconnectOnly;
+            state.generation += 1;
+            state.generation
+        };
+        // A provider that outlived its worker might have consumed its queue.
+        // Do not recover the actor's last unconfirmed copy of that input.
+        self.0.completed.store(true, Ordering::Release);
+        drop(detached);
+        drop(retained);
+        drop(worker);
+        (self.0.notify)(Update::Observed { generation });
+        if self.0.visible.load(Ordering::Acquire) {
+            (self.0.notify)(Update::Presentation);
+        }
+    }
+
     fn exited_recovery_queue(&self) -> Option<Arc<[super::QueuedMessage]>> {
         self.0
             .exited_recovery_queue
