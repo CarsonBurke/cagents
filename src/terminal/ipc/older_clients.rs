@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 220,
+    proven_at: 221,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -482,6 +482,13 @@ impl OlderClient {
             && !self.cannot_read_the_firing_for(request)
             && !self.cannot_read_model_edges_for(request)
             && !self.cannot_read_work_checks_for(request)
+            && !matches!(
+                request,
+                ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Compact(_),
+                    ..
+                }
+            )
     }
 
     /// Refuse before execution: an older CLI must not pin a card and then
@@ -1691,7 +1698,7 @@ mod tests {
     #[test]
     fn an_agent_reply_after_the_older_protocol_is_refused() {
         use crate::agent_execution::{
-            Reply,
+            Authority, Operation, Reply,
             directory::{Directory, Members, Scope, Sessions},
         };
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
@@ -1704,6 +1711,10 @@ mod tests {
             sessions: Vec::new(),
         }))));
         assert!(client.admits_message(&reply(Reply::InboxAcknowledged)));
+        assert!(!client.admits_request(&ClientRequest::Agent {
+            authority: Authority::default(),
+            operation: Operation::Compact("1234".into()),
+        }));
         assert!(!client.admits_message(&reply(Reply::Members(Members {
             channel: crate::model::ChannelId::new(),
             caller: None,

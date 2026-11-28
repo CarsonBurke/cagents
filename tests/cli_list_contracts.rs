@@ -102,6 +102,10 @@ impl Listing {
                         limit: None,
                         account: None,
                         cache: None,
+                        context: Some(agent_execution::directory::ContextUsage {
+                            tokens: 42_000,
+                            budget: Some(168_000),
+                        }),
                     }]
                 } else {
                     vec![]
@@ -1135,7 +1139,8 @@ fn session_listings_report_compact_rows_and_selected_fields() {
                 "title": "Fixture session",
                 "project": "Fixture",
                 "directory": "/fixture",
-                "no_pane": true
+                "no_pane": true,
+                "context": {"tokens": 42_000, "budget": 168_000, "used_fraction": 0.25}
             }]
         })
     );
@@ -1143,14 +1148,14 @@ fn session_listings_report_compact_rows_and_selected_fields() {
         Listing::Sessions,
         true,
         false,
-        &["--fields", "id,state"],
+        &["--fields", "id,context"],
     ))
     .unwrap();
     assert_eq!(
         selected["data"],
         serde_json::json!({"sessions": [{
             "id": "00000000-0000-4000-8000-000000000001",
-            "state": "working"
+            "context": {"tokens": 42_000, "budget": 168_000, "used_fraction": 0.25}
         }]})
     );
 }

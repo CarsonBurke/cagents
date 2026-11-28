@@ -9,8 +9,8 @@ use crate::{
     agent_execution::{
         Authority, Lineage, Origin,
         directory::{
-            Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope, SessionAccount,
-            Sessions, Surface, UsageLimit,
+            ContextUsage, Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope,
+            SessionAccount, Sessions, Surface, UsageLimit,
         },
     },
     model::{ChannelId, TerminalId},
@@ -435,6 +435,11 @@ pub(super) fn list(
             limit,
             account,
             cache,
+            context: live
+                .chat
+                .as_ref()
+                .filter(|_| standing)
+                .and_then(|chat| ContextUsage::from_usage(&chat.usage())),
             failure: live.failure.map(|failure| {
                 let mut failure = match live.provider {
                     Some(provider) => {

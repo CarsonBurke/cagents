@@ -253,7 +253,8 @@ fn agent_access(operation: &AgentOperation) -> Access<'static> {
         | O::Send(_)
         | O::Prompt { .. }
         | O::Deliver(_)
-        | O::Resume(_) => Access::Held,
+        | O::Resume(_)
+        | O::Compact(_) => Access::Held,
     }
 }
 

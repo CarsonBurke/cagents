@@ -890,6 +890,7 @@ mod tests {
                     }),
                     account: None,
                     cache: None,
+                    context: None,
                 }),
             },
             agent: None,

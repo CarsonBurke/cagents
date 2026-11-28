@@ -145,6 +145,7 @@ enum ActorCommand {
         text: String,
         mailbox: Option<crate::agent_execution::mailbox::FrameEvidence>,
     },
+    IdleCompact,
     CloseIfIdle {
         generation: u64,
         /// What a granted close leaves running, decided as it is granted.
@@ -210,6 +211,21 @@ pub enum Rejection {
     /// The actor did not answer in time, or failed after effects became possible;
     /// the provider may still receive it. Never replay automatically.
     Unacknowledged(String),
+}
+
+/// Retained actors carry admission refusals as strings in their input receipts.
+const COURIER_BUSY: &str = "The conversation is no longer idle for courier delivery, or the person's queued message goes first";
+const COMPACT_UNSUPPORTED: &str = "This conversation does not support compaction";
+const COMPACTION_PENDING: &str = "A compaction request is still waiting for the provider";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdleCompaction {
+    Submitted,
+    Busy,
+    /// The command was refused before any effect and admission may recover
+    /// without emitting an idle edge.
+    Retry,
+    Unsupported,
 }
 
 impl From<Rejection> for String {
@@ -408,6 +424,7 @@ struct Inner {
     confirmed_session: Arc<Mutex<Option<String>>>,
     agent_addresses: AgentAddresses,
     prompt_cache: PromptCache,
+    compaction_pending: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     record_observer: Option<Arc<AtomicBool>>,
@@ -458,13 +475,18 @@ pub(super) enum QueueRefusal {
     /// Its command queue is full for now.
     Full,
 }
+impl QueueRefusal {
+    const fn message(self) -> &'static str {
+        match self {
+            Self::Closed => "Provider actor is no longer accepting commands",
+            Self::Full => "Chat command queue is full",
+        }
+    }
+}
+
 impl From<QueueRefusal> for String {
     fn from(refusal: QueueRefusal) -> Self {
-        match refusal {
-            QueueRefusal::Closed => "Provider actor is no longer accepting commands",
-            QueueRefusal::Full => "Chat command queue is full",
-        }
-        .into()
+        refusal.message().into()
     }
 }
 
@@ -722,6 +744,7 @@ impl LocalHandle {
         let store = Arc::new(Mutex::new(store));
         let agent_addresses = AgentAddresses::default();
         let prompt_cache = PromptCache::default();
+        let compaction_pending = Arc::new(AtomicBool::new(false));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -738,6 +761,7 @@ impl LocalHandle {
             confirmed_session: confirmed_session.clone(),
             agent_addresses: agent_addresses.clone(),
             prompt_cache: prompt_cache.clone(),
+            compaction_pending: compaction_pending.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             record_observer: record_observer.clone(),
@@ -796,6 +820,7 @@ impl LocalHandle {
                     confirmed_session,
                     agent_addresses,
                     prompt_cache,
+                    compaction_pending,
                     store,
                     visible,
                     observe_next,
@@ -1141,6 +1166,15 @@ impl LocalHandle {
         })
     }
 
+    pub(crate) fn try_idle_compact(&self) -> Result<(), Rejection> {
+        self.submit_actor_command(ActorCommand::IdleCompact)
+    }
+
+    pub(crate) fn compact_support(&self) -> Option<bool> {
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.ready.then_some(state.capabilities.compact)
+    }
+
     pub(crate) fn command_for_run(
         &self,
         run: crate::model::RunId,
@@ -1244,7 +1278,14 @@ impl LocalHandle {
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
+            .map_err(|error| {
+                let refusal = if error.is_full() {
+                    QueueRefusal::Full
+                } else {
+                    QueueRefusal::Closed
+                };
+                Rejection::Refused(refusal.into())
+            })?;
         self.wake();
         Ok(response)
     }
@@ -1834,13 +1875,19 @@ impl LocalHandle {
     /// a turn or passing over a question it put to the user.
     pub(crate) fn is_idle(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        accepts_prompt(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+        accepts_prompt(&state) && self.can_admit_work()
+    }
+
+    fn can_admit_work(&self) -> bool {
+        !self.is_completed()
+            && !self.0.draining.load(Ordering::Acquire)
+            && !self.0.compaction_pending.load(Ordering::Acquire)
     }
     /// [`Self::is_idle`], and the provider holds nothing the person queued:
     /// whether the courier may start a turn now.
     pub(crate) fn takes_courier(&self) -> bool {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        accepts_courier(&state) && !self.is_completed() && !self.0.draining.load(Ordering::Acquire)
+        accepts_courier(&state) && self.can_admit_work()
     }
     /// Pending questions and approvals, read without loading the transcript.
     pub(crate) fn requests(&self) -> Vec<super::Request> {
@@ -2724,6 +2771,7 @@ struct Actor {
     confirmed_session: Arc<Mutex<Option<String>>>,
     agent_addresses: AgentAddresses,
     prompt_cache: PromptCache,
+    compaction_pending: Arc<AtomicBool>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3596,6 +3644,14 @@ impl Actor {
                 let _ = refuse("Chat is closing".into());
                 continue;
             }
+            if matches!(
+                command,
+                ActorCommand::IdlePrompt { .. } | ActorCommand::IdleCompact
+            ) && self.adapter.compaction_pending()
+            {
+                let _ = refuse(COMPACTION_PENDING.into());
+                continue;
+            }
             let (run, command) = match command {
                 ActorCommand::RetainedProvider { .. } => {
                     unreachable!("retained inputs normalized above")
@@ -3666,13 +3722,23 @@ impl Actor {
                     mailbox: evidence,
                 } => {
                     if !accepts_courier(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
-                        let _ = refuse(
-                            "The conversation is no longer idle for courier delivery, or the person's queued message goes first".into(),
-                        );
+                        let _ = refuse(COURIER_BUSY.into());
                         continue;
                     }
                     mailbox = evidence;
                     (None, handle::mailbox_command(text))
+                }
+                ActorCommand::IdleCompact => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if !accepts_courier(&state) {
+                        let _ = refuse(COURIER_BUSY.into());
+                        continue;
+                    }
+                    if !state.capabilities.compact {
+                        let _ = refuse(COMPACT_UNSUPPORTED.into());
+                        continue;
+                    }
+                    (None, Command::Compact)
                 }
                 ActorCommand::UpdateSource(update) => {
                     let SourceUpdate {
@@ -3836,7 +3902,7 @@ impl Actor {
             if run.is_some() {
                 let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                 if matches!(&command, Command::Prompt { .. })
-                    && (!state.ready || state.busy || state.waiting || !state.requests.is_empty())
+                    && (!accepts_prompt(&state) || self.adapter.compaction_pending())
                 {
                     let _ = refuse("The provider is no longer idle for the accepted run".into());
                     continue;
@@ -3978,7 +4044,12 @@ impl Actor {
         }
     }
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
-        if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
+        if !state.ready
+            || state.exited
+            || !self.pending.is_empty()
+            || !self.output.is_empty()
+            || self.adapter.compaction_pending()
+        {
             UpdateReadiness::Unready
         } else if state.holds_work() {
             UpdateReadiness::Busy
@@ -4504,7 +4575,10 @@ impl Actor {
         self.waiting_fingerprint = waiting_fingerprint;
         let became_ready = state.ready && !self.ready;
         self.ready = state.ready;
-        let prompt_available = accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
+        let compacting = self.adapter.compaction_pending();
+        self.compaction_pending.store(compacting, Ordering::Release);
+        let prompt_available =
+            !compacting && accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
         // The person's queue can empty while the conversation stays idle,

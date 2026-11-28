@@ -21,6 +21,8 @@
 //! until when, so the daemon gives one account of a limit everywhere.
 
 mod account_watch;
+mod compact;
+pub(super) use compact::compact;
 mod wait;
 
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
@@ -535,17 +537,7 @@ fn leave(
     let (message, reach, recipient) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let model = registry.model()?;
-        // An agent's session can be named while its process is stopped.
-        let bound = model
-            .agents
-            .iter()
-            .filter_map(|agent| agent.session.as_ref().map(|session| session.id()));
-        let lineages = registry.session_lineages(
-            live.iter()
-                .map(|entry| entry.id)
-                .chain(session)
-                .chain(bound),
-        )?;
+        let lineages = routing_lineages(&registry, &model.agents, &live, session)?;
         let lineage_of = |id: TerminalId| lineages.get(&id).copied().unwrap_or(Lineage(id));
         // As in a directory listing, a delegated agent without a title of its
         // own is named by the channel its prompt titled.
@@ -828,6 +820,19 @@ fn terminal_attention(
         .collect()
 }
 
+fn routing_lineages(
+    registry: &super::Registry,
+    agents: &[crate::agent_execution::Agent],
+    live: &[directory::Live],
+    caller: Option<TerminalId>,
+) -> Result<BTreeMap<TerminalId, Lineage>, String> {
+    // An agent's session can be named while its process is stopped.
+    let bound = agents
+        .iter()
+        .filter_map(|agent| agent.session.as_ref().map(|session| session.id()));
+    registry.session_lineages(live.iter().map(|entry| entry.id).chain(caller).chain(bound))
+}
+
 /// The one lineage `handle` names among live agent sessions and the open
 /// agents cagents hosts, including one whose process stopped: by session ID,
 /// lineage, or delegated agent ID, whole or a prefix.
@@ -939,6 +944,7 @@ struct WakeState {
     generation: u64,
     stopped: bool,
     update: UpdateWait,
+    compactions: BTreeMap<TerminalId, compact::Pending>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -1342,6 +1348,7 @@ impl Handle {
             .min();
         self.forget_yields(host);
         let (queued_failed, deferred) = self.start_queued(host);
+        let compaction_due = self.deliver_compactions(host, &limits);
         let (released, delivery_failed) = self.deliver_messages(host, &limits)?;
         let update = {
             let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -1357,7 +1364,7 @@ impl Handle {
             || update == UpdateWait::Retry
             || !watching_accounts && !limits.is_empty())
         .then(|| super::now().saturating_add(RETRY.as_millis() as u64));
-        Ok([released, reset, retry, deferred]
+        Ok([released, reset, retry, deferred, compaction_due]
             .into_iter()
             .flatten()
             .min())
@@ -1954,8 +1961,8 @@ mod tests {
                 .unwrap()
         };
         let mut actor = RequestRaceFixture::new();
-        // This is the courier's real eligibility observation. Compact's gated
-        // adapter step will publish a request before the queued prompt runs.
+        // This is the courier's real eligibility observation. The gated adapter
+        // step will publish a request before the queued prompt runs.
         assert!(actor.handle.is_idle());
         actor.begin_request();
         let delivery_courier = courier.clone();
@@ -2487,6 +2494,110 @@ mod tests {
         actor: crate::chat::runtime::courier_tests::RequestRaceFixture,
         messages: Vec<Message>,
         _directory: tempfile::TempDir,
+    }
+
+    #[test]
+    fn compaction_waits_behind_person_input_and_coalesces_queued_requests() {
+        use crate::agent_execution::{Compaction, CompactionState, Operation, Reply};
+        let fixture = Delivering::new(&[]);
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.execution_registry = Some(fixture.registry.clone());
+            state.mailbox = Some(fixture.courier.clone());
+        }
+        let target = fixture.session.to_string();
+        let operation = || Operation::Compact(target[..8].into());
+        let compact = |authority| super::super::process(&fixture.host, authority, operation());
+        assert!(compact(Authority::session("invalid".into())).is_err());
+
+        let Reply::Sessions(sessions) = super::super::process(
+            &fixture.host,
+            Authority::default(),
+            Operation::Sessions(Scope::All),
+        )
+        .unwrap() else {
+            panic!("expected sessions")
+        };
+        let context = sessions.sessions[0].context.unwrap();
+        assert_eq!(context.tokens, 42_000);
+        assert_eq!(context.budget, Some(168_000));
+        assert_eq!(context.used_fraction(), Some(0.25));
+
+        let expect = |state| {
+            Reply::Compact(Compaction {
+                session: fixture.session,
+                state,
+            })
+        };
+        let pass = || {
+            fixture
+                .courier
+                .deliver_compactions(&fixture.host, &BTreeMap::new())
+        };
+        assert_eq!(
+            compact(Authority::default()).unwrap(),
+            expect(CompactionState::Submitted)
+        );
+        fixture.actor.finish_compaction();
+
+        fixture.actor.set_persons_queue(true);
+        for _ in 0..2 {
+            assert_eq!(
+                compact(Authority::default()).unwrap(),
+                expect(CompactionState::Queued)
+            );
+        }
+        pass();
+        assert_eq!(fixture.actor.compaction_count(), 1);
+        fixture.actor.set_persons_queue(false);
+        pass();
+        pass();
+        assert_eq!(fixture.actor.compaction_count(), 2);
+        assert_eq!(fixture.actor.prompt_count(), 0);
+    }
+
+    #[test]
+    fn compaction_queue_never_transfers_to_a_replacement_actor() {
+        use crate::agent_execution::{Compaction, CompactionState, Operation, Reply};
+        use crate::chat::runtime::courier_tests::RequestRaceFixture;
+        let fixture = Delivering::new(&[]);
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.execution_registry = Some(fixture.registry.clone());
+            state.mailbox = Some(fixture.courier.clone());
+        }
+        let compact = || {
+            super::super::process(
+                &fixture.host,
+                Authority::default(),
+                Operation::Compact(fixture.session.to_string()),
+            )
+            .unwrap()
+        };
+        let expect = |state| {
+            Reply::Compact(Compaction {
+                session: fixture.session,
+                state,
+            })
+        };
+        fixture.actor.set_persons_queue(true);
+        assert_eq!(compact(), expect(CompactionState::Queued));
+
+        let replacement = RequestRaceFixture::without_compaction();
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .chats
+            .get_mut(&fixture.session)
+            .unwrap()
+            .handle = replacement.handle.clone();
+        fixture
+            .courier
+            .deliver_compactions(&fixture.host, &BTreeMap::new());
+        assert_eq!(compact(), expect(CompactionState::Unsupported));
+        assert_eq!(replacement.compaction_count(), 0);
+        assert_eq!(fixture.actor.compaction_count(), 0);
     }
 
     impl Delivering {

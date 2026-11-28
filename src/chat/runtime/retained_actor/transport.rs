@@ -116,6 +116,7 @@ enum InputPayload {
     IdlePrompt {
         text: String,
     },
+    IdleCompact,
     Command {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -202,6 +203,9 @@ pub struct Resident {
     /// before the courier's. A helper that predates it reports none.
     #[serde(default)]
     pub queued_input: bool,
+    /// Absent on helpers without the idle-checked compaction command.
+    #[serde(default)]
+    pub compact: Option<bool>,
     pub failure: Option<String>,
     /// When the latest turn finished, in Unix milliseconds. A helper that
     /// predates it reports none.
@@ -609,6 +613,7 @@ impl RemoteActor {
             attention_turn: None,
             idle: true,
             queued_input: false,
+            compact: Some(false),
             failure: None,
             finished_at: None,
             confirmed_session: None,
@@ -2632,8 +2637,14 @@ impl RemoteActor {
     /// The courier tries again later on its own, so it does not wait behind
     /// an unconfirmed input; one waiting courier would hold every delivery.
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
+        self.try_idle_input(InputPayload::IdlePrompt { text })
+    }
+    pub(crate) fn try_idle_compact(&self) -> Result<(), Rejection> {
+        self.try_idle_input(InputPayload::IdleCompact)
+    }
+    fn try_idle_input(&self, payload: InputPayload) -> Result<(), Rejection> {
         let receiver = self
-            .enqueue_payload_within(InputPayload::IdlePrompt { text }, Duration::ZERO)
+            .enqueue_payload_within(payload, Duration::ZERO)
             .map_err(Rejection::Refused)?;
         receiver
             .recv_timeout(ACKNOWLEDGEMENT_WAIT)
@@ -3382,8 +3393,8 @@ impl Server {
         let work_hold = state.work_hold();
         let background_tasks = state.background_tasks;
         let queued_input = !state.queued_messages.is_empty();
-        let prompt_eligible =
-            super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
+        let compact = state.capabilities.compact;
+        let prompt_eligible = super::super::accepts_prompt(&state) && self.actor.can_admit_work();
         use crate::notifications::Kind;
         let notification_content = [
             Kind::Succeeded,
@@ -3469,6 +3480,7 @@ impl Server {
             completed,
             idle,
             queued_input,
+            compact: Some(compact),
             failure,
             finished_at: self.actor.finished_at(),
             confirmed_session,
@@ -4012,6 +4024,9 @@ impl Server {
                         None,
                         None,
                     ),
+                    InputPayload::IdleCompact => {
+                        (super::super::ActorCommand::IdleCompact, None, None)
+                    }
                     InputPayload::Command {
                         run,
                         command,

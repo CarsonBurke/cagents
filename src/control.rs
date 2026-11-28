@@ -41,6 +41,7 @@ mod gh;
 pub use agents::{AgentCommand, PlacedIn};
 pub use gh::GhCommand;
 mod automations;
+mod compact;
 mod completions;
 pub use automations::AutomationCommand;
 #[cfg(all(test, feature = "host"))]
@@ -342,7 +343,7 @@ pub enum TopCommand {
     /// List live agent sessions in this project, or your channel's with --channel.
     #[command(
         visible_alias = "ls",
-        after_help = "Includes every session in scope, whoever started it."
+        after_help = "Includes every session in scope, whoever started it. Use --fields id,context to see context tokens, the compaction budget and the fraction used."
     )]
     Sessions(SessionsArgs),
     /// Read a session's conversation, newest last.
@@ -364,6 +365,11 @@ pub enum TopCommand {
     /// Message another session.
     #[command(after_help = "A live conversation receives the message once it is idle.")]
     Send(SendArgs),
+    /// Compact one or more live conversations.
+    #[command(
+        after_help = "A busy conversation compacts after its turn and any queued follow-ups. Submitted means the daemon handed off the command. Queued requests apply to the current live conversation and expire if it or the daemon stops."
+    )]
+    Compact(compact::CompactArgs),
     /// Message another session and wait for its reply.
     Ask(AskArgs),
     /// Answer a message this session received.
@@ -4535,6 +4541,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Transcript(_)
         | TopCommand::Resume(_)
         | TopCommand::Send(_)
+        | TopCommand::Compact(_)
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
         | TopCommand::Inbox(_) => true,
@@ -4671,6 +4678,7 @@ fn execute_with_model_context(
         TopCommand::Transcript(arguments) => transcript::read(arguments),
         TopCommand::Resume(arguments) => resume::resume(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
+        TopCommand::Compact(arguments) => compact::execute(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
         TopCommand::Reply(arguments) => messages::reply(arguments),
         TopCommand::Inbox(arguments) => messages::inbox(arguments),

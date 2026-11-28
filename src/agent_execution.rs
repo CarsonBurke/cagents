@@ -730,6 +730,8 @@ pub enum Operation {
     /// Reopen the conversation of a session whose provider stopped, named by
     /// session, lineage or agent ID or a prefix of one, as its pane would.
     Resume(String),
+    /// Compact a live conversation when it can take the command.
+    Compact(String),
 }
 
 /// What became of a prompt accepted for an existing agent.
@@ -820,6 +822,23 @@ pub enum Reply {
     Context(directory::Context),
     Stopped(resume::StoppedSessions),
     Resumed(resume::Resumed),
+    Compact(Compaction),
+}
+
+/// Admission of a compaction request. The provider finishes compaction
+/// asynchronously after the command is submitted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Compaction {
+    pub session: TerminalId,
+    pub state: CompactionState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionState {
+    Submitted,
+    Queued,
+    Unsupported,
+    Unconfirmed(String),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late
