@@ -150,6 +150,7 @@ fn pending_uninstalled_adoption_publishes_one_retained_authority_tuple() {
     original.lock().unwrap().native_actor_startups.insert(
         id,
         retained_actor::Startup {
+            local: false,
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),

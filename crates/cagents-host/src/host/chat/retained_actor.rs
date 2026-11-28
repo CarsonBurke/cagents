@@ -17,9 +17,25 @@ pub(in crate::host) struct Startup {
     pub(super) source: Session,
     pub(super) requested: Session,
     pub(super) context: Arc<chat::protocol::ExecutionContext>,
+    /// A failed in-process startup needs teardown before any holder adoption.
+    pub(super) local: bool,
     /// An initial named resume failed after installation. Only this exact
     /// attachment may finish its normal semantic close before a retry starts.
     pub(super) failed_close: Option<super::CloseTarget>,
+}
+
+impl Startup {
+    pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
+        &self.source.launch.recipe.working_directory
+    }
+}
+
+pub(super) fn local_startup_conflicts(state: &HostState, source: &Session) -> bool {
+    state.native_actor_startups.values().any(|pending| {
+        pending.local
+            && (pending.source.id == source.id
+                || same_conversation(&pending.source.launch, &source.launch))
+    })
 }
 
 /// Unit-only HostState fixtures intentionally exercise local transports without
@@ -1169,21 +1185,46 @@ pub(super) fn reconcile_startup_for_start(
     host: &SharedHost,
     source: &Session,
 ) -> Result<bool, chat::protocol::SetupError> {
-    use chat::protocol::SetupError;
     if prepare_failed_start_for_start(host, source)?.is_some() {
         return Ok(true);
     }
+    reconcile_unpublished_startup(host, source, false)
+}
+
+pub(in crate::host) fn reconcile_local_startup_for_close(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), String> {
+    reconcile_unpublished_startup(host, source, true)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+fn reconcile_unpublished_startup(
+    host: &SharedHost,
+    source: &Session,
+    local_only: bool,
+) -> Result<bool, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
+        if local_only && !pending.local {
+            return Ok(false);
+        }
         if &pending.source != source && &pending.requested != source {
             return Err(SetupError::Invalid(
                 "The retained startup belongs to another exact descriptor".into(),
             ));
         }
-        if state.chats.contains_key(&source.id) || state.chat_spawning.contains_key(&source.id) {
+        if state.chat_spawning.contains_key(&source.id)
+            || state
+                .chats
+                .get(&source.id)
+                .is_some_and(|record| !pending.local || record.handle.owns_work())
+        {
             return Err(SetupError::Unavailable(
                 "The exact retained startup is still transitioning".into(),
             ));
@@ -1319,6 +1360,7 @@ mod startup_retryability_tests {
                 source: source.clone(),
                 requested: source.clone(),
                 context: context.clone(),
+                local: false,
                 failed_close: None,
             },
         );

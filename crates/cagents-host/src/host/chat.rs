@@ -1357,6 +1357,7 @@ fn reserve_unhosted_allocation(
 /// conversation an earlier boot left, with no owner, agent or launch, has
 /// nothing to close. Everything else needs its exact close receipt.
 pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
+    retained_actor::reconcile_local_startup_for_close(host, session)?;
     if super::agent_execution::close_lost_agent_from_pane(host, session)? {
         return Ok(());
     }
@@ -2387,7 +2388,8 @@ fn start_publishing(
             .native_actor_startups
             .get(&session.id)
             .filter(|pending| {
-                (pending.source == session || pending.requested == session)
+                !pending.local
+                    && (pending.source == session || pending.requested == session)
                     && !state.chats.contains_key(&session.id)
                     && !state.chat_spawning.contains_key(&session.id)
             })
@@ -2969,7 +2971,8 @@ fn start_publishing(
         }
         if state.chat_spawning.iter().any(|(id, pending)| {
             *id != session.id && same_conversation(&pending.launch, &session.launch)
-        }) {
+        }) || retained_actor::local_startup_conflicts(&state, &session)
+        {
             return Err(retryable_unavailable(
                 "This exact conversation is already starting",
             ));
@@ -3037,6 +3040,7 @@ fn start_publishing(
         state.inventory_changed();
         (source_handle, replacing)
     };
+    let mut managed_startup = None;
     let result = (|| {
         if let Some((previous, current)) = &replacing {
             previous.require_current(host)?;
@@ -3266,9 +3270,18 @@ fn start_publishing(
                     source: startup_source.clone(),
                     requested: requested_source.clone(),
                     context,
+                    local: false,
                     failed_close: None,
                 },
             );
+        } else if let Some(context) = execution.as_ref().filter(|_| agent_directory.is_some()) {
+            managed_startup = Some(retained_actor::Startup {
+                source: startup_source.clone(),
+                requested: requested_source.clone(),
+                context: context.clone(),
+                local: true,
+                failed_close: None,
+            });
         }
         let handle = if let Some(prepared_identity) = prepared_identity {
             // The helper creates and owns the sole live reducer and Store.
@@ -3281,7 +3294,7 @@ fn start_publishing(
                 notify,
             )
         } else {
-            Handle::start_owned(
+            let handle = Handle::start_owned(
                 spec,
                 adapter,
                 initial,
@@ -3289,24 +3302,12 @@ fn start_publishing(
                 session.clone(),
                 recovery_environment,
                 notify,
-            )
+            );
+            #[cfg(test)]
+            let handle = startup_tests::fail_managed_start_after_spawn(&execution, handle);
+            handle
         }
         .map_err(|message| {
-            // A start in an agent's directory owns its launch as an agent's
-            // run does: a provider it left starting is ended here, since no
-            // run holds it to end later.
-            let message = match (&agent_directory, &execution) {
-                (Some(_), Some(context)) if !remote => match context.reconcile_cleanup() {
-                    Ok(
-                        chat::protocol::LaunchOutcome::NoProvider
-                        | chat::protocol::LaunchOutcome::TeardownProved,
-                    ) => message,
-                    cleanup => format!(
-                        "{message}. The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
-                    ),
-                },
-                _ => message,
-            };
             check_launch_account(&session.launch)
                 .err()
                 .unwrap_or_else(|| retryable_unavailable(message))
@@ -3619,6 +3620,26 @@ fn start_publishing(
             unavailable("The saved conversation did not publish its confirmed attachment")
         })
     })();
+    let result = result.map_err(|mut failure| {
+        if let Some(pending) = managed_startup {
+            let cleanup = pending.context.reconcile_cleanup();
+            if !matches!(
+                cleanup,
+                Ok(chat::protocol::LaunchOutcome::NoProvider
+                    | chat::protocol::LaunchOutcome::TeardownProved)
+            ) {
+                // Keep ownership before releasing admission, including when
+                // startup failed after returning a handle but before publication.
+                let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+                state.native_actor_startups.insert(pending.source.id, pending);
+                state.inventory_changed();
+                failure.message.push_str(&format!(
+                    ". The provider may still be starting ({cleanup:?}); close the conversation before starting it again"
+                ));
+            }
+        }
+        failure
+    });
     drop(admission);
     result
 }
@@ -5781,6 +5802,7 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
+    retained_actor::reconcile_local_startup_for_close(host, &source).map_err(unavailable)?;
     let closing = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state

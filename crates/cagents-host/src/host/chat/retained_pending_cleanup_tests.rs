@@ -292,6 +292,7 @@ fn cleanup_after_publication(installed: bool, unknown_installed: bool) {
     original.lock().unwrap().native_actor_startups.insert(
         id,
         retained_actor::Startup {
+            local: false,
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),

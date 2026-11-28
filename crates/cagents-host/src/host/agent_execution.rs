@@ -1996,6 +1996,9 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
             store.agent_process_ended(id)?,
         )
     };
+    if let Some(HostedSession::Chat(session)) = agent.session.as_ref().or(pending.as_ref()) {
+        super::chat::retained_actor::reconcile_local_startup_for_close(host, session)?;
+    }
     if ended {
         super::chat::codex_reconnect::reconcile_startup(host, &registry, id)?;
     }

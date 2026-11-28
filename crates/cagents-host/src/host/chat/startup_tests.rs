@@ -1,6 +1,140 @@
 use super::*;
+use crate::chat::protocol::{ExecutionContext, LaunchCleanup, LaunchOutcome};
 use crate::model::{HostIncarnation, HostSessionId, LaunchRecipe};
-use std::os::unix::fs::PermissionsExt;
+use std::{
+    cell::RefCell,
+    os::unix::fs::PermissionsExt,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+};
+
+#[derive(Default)]
+struct StartupFailure {
+    provider: Mutex<Option<Handle>>,
+    attempts: AtomicUsize,
+    ready: AtomicBool,
+}
+
+impl LaunchCleanup for StartupFailure {
+    fn cleanup(&self) -> Result<LaunchOutcome, String> {
+        let attempt = self.attempts.fetch_add(1, Ordering::Relaxed);
+        if self.ready.load(Ordering::Relaxed) {
+            self.provider.lock().unwrap().as_ref().unwrap().cleanup()
+        } else if attempt == 0 {
+            Ok(LaunchOutcome::Uncertain)
+        } else {
+            Err("fixture cleanup has not settled".into())
+        }
+    }
+}
+
+thread_local! {
+    static FAIL_AFTER_SPAWN: RefCell<Option<Arc<StartupFailure>>> = const { RefCell::new(None) };
+}
+
+pub(super) fn fail_managed_start_after_spawn(
+    execution: &Option<Arc<ExecutionContext>>,
+    handle: Result<Handle, String>,
+) -> Result<Handle, String> {
+    let Some(failure) = FAIL_AFTER_SPAWN.take() else {
+        return handle;
+    };
+    let handle = handle?;
+    assert!(
+        handle.provider_process().is_some(),
+        "fixture must spawn a provider"
+    );
+    *failure.provider.lock().unwrap() = Some(handle);
+    execution.as_ref().unwrap().claim_owner(failure);
+    Err("fixture startup failed after spawning".into())
+}
+
+#[test]
+fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
+    use super::super::agent_execution;
+    use crate::agent_execution::{HostedSession, Origin};
+
+    if agent_execution::tests::isolated(
+        "host::chat::startup_tests::managed_pane_retries_the_original_cleanup_before_replacing_its_provider",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, request, path) = agent_execution::tests::fixture();
+    let registry = agent_execution::registry(&host).unwrap();
+    let agent = registry
+        .lock()
+        .unwrap()
+        .submit_agent(&Origin::User, &request, 0)
+        .unwrap()
+        .agent;
+    let mut source = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        agent.spec.target.directory,
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    source.proof = Some(host.lock().unwrap().proof().clone());
+    source.launch.recipe.program = path
+        .parent()
+        .unwrap()
+        .join("bin/claude")
+        .to_str()
+        .unwrap()
+        .into();
+    registry
+        .lock()
+        .unwrap()
+        .bind_agent(agent.id, None, HostedSession::Chat(source.clone()))
+        .unwrap();
+    let start = || {
+        start(
+            &host,
+            1,
+            source.clone(),
+            None,
+            false,
+            None,
+            Default::default(),
+        )
+    };
+    let failure = Arc::new(StartupFailure::default());
+    FAIL_AFTER_SPAWN.set(Some(failure.clone()));
+    assert!(
+        start()
+            .unwrap_err()
+            .message
+            .contains("fixture startup failed after spawning")
+    );
+    assert!(
+        start()
+            .unwrap_err()
+            .message
+            .contains("fixture cleanup has not settled")
+    );
+    assert_eq!(failure.attempts.load(Ordering::Relaxed), 2);
+    let original = failure.provider.lock().unwrap().as_ref().unwrap().clone();
+    assert!(!original.is_completed());
+    assert!(!host.lock().unwrap().chats.contains_key(&source.id));
+
+    failure.ready.store(true, Ordering::Relaxed);
+    assert!(matches!(
+        start().unwrap(),
+        ServerResponse::ChatAttached { .. }
+    ));
+    assert!(original.is_completed());
+    assert_eq!(failure.attempts.load(Ordering::Relaxed), 3);
+    let state = host.lock().unwrap();
+    assert!(state.native_actor_startups.is_empty());
+    let replacement = state.chats[&source.id].handle.clone();
+    assert_ne!(original.provider_process(), replacement.provider_process());
+    drop(state);
+    replacement.close().unwrap();
+}
 
 #[test]
 fn managed_codex_start_releases_bundle_lease_before_provider_spawn() {
