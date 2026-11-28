@@ -2029,6 +2029,51 @@ fn native_queue_names_remote_images_only_when_the_url_has_a_file_name() {
 }
 
 #[test]
+fn native_queue_describes_image_only_messages_without_a_filename() {
+    let mut adapter = adapter();
+    let changed = adapter
+        .receive(json!({"method":"thread/queue/changed","params":{"threadId":"thread-exact"}}))
+        .unwrap();
+    let page = adapter
+        .receive(json!({
+            "id":changed.writes[0]["id"],
+            "result":{"data":[
+                {"id":"unnamed","input":[
+                    {"type":"image","url":"https://example.test/"}
+                ]},
+                {"id":"inline","input":[
+                    {"type":"text","text":" "},
+                    {"type":"image","url":"data:image/png;base64,cGl4ZWxz"}
+                ]},
+                {"id":"mixed","input":[
+                    {"type":"image","url":"https://example.test/"},
+                    {"type":"localImage","path":"/work/shot.png"}
+                ]}
+            ],"nextCursor":null}
+        }))
+        .unwrap();
+    let messages = page
+        .events
+        .iter()
+        .find_map(|event| match event {
+            Event::QueueChanged(messages) => Some(messages),
+            _ => None,
+        })
+        .unwrap();
+    assert_eq!(messages.len(), 3);
+    for message in &messages[..2] {
+        assert_eq!(message.text, "Image");
+        assert!(message.attachments.is_empty());
+    }
+    assert!(messages[2].text.is_empty());
+    assert_eq!(
+        messages[2].attachments[0].path,
+        std::path::Path::new("/work/shot.png")
+    );
+    assert!(messages.iter().all(|message| !message.editable));
+}
+
+#[test]
 fn native_queue_rejection_and_stale_pages_never_publish_false_previews() {
     let mut adapter = adapter();
     let prompt = adapter

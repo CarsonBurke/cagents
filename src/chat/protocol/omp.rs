@@ -1,4 +1,5 @@
 use super::{Adapter, ProcessSpec, Step};
+use crate::agent_execution::CompactionOutcome;
 use crate::chat::{
     self, Answer, ChangeKind, Choice, Command, CommandAction, Event, Field, FileChange, Item,
     ItemContent, Launch, Model, Phase, PromptMode, Request, Role, ToolStatus,
@@ -146,6 +147,8 @@ struct Omp {
     branch_draft: Option<String>,
     branch_request: Option<String>,
     compact_request: Option<String>,
+    /// Whether the outstanding request should publish an outcome.
+    track_compaction: bool,
     configured_reasoning: Option<String>,
     active_model: Option<chat::ActiveModel>,
 }
@@ -845,6 +848,12 @@ impl Omp {
     }
 }
 impl Adapter for Omp {
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let step = self.command(Command::Compact)?;
+        self.track_compaction = true;
+        Ok(step)
+    }
+
     fn compaction_pending(&self) -> bool {
         self.compact_request.is_some()
     }
@@ -1145,7 +1154,8 @@ impl Adapter for Omp {
                 }
                 // Replies may arrive after a local extension has switched sessions.
                 // Only the current state request and current page may mutate the view.
-                let pending = match text(&frame, "command") {
+                let command = text(&frame, "command");
+                let pending = match command {
                     "get_state" => Some(&mut self.state_request),
                     "get_messages_page" => Some(&mut self.history_request),
                     "get_subagents" => Some(&mut self.children_request),
@@ -1160,22 +1170,39 @@ impl Adapter for Omp {
                     }
                     *pending = None;
                 }
-                if frame["success"].as_bool() != Some(true) {
+                let tracked_compaction =
+                    command == "compact" && std::mem::take(&mut self.track_compaction);
+                let success = frame["success"].as_bool();
+                if success != Some(true) {
+                    let error = text(&frame, "error");
+                    if tracked_compaction {
+                        step.compaction = Some(if success == Some(false) {
+                            CompactionOutcome::Failed(if error.is_empty() {
+                                "OMP compaction failed".into()
+                            } else {
+                                error.into()
+                            })
+                        } else {
+                            CompactionOutcome::Unconfirmed(
+                                "OMP did not report whether compaction succeeded".into(),
+                            )
+                        });
+                    }
                     // The conversation takes commands only once these have
                     // answered, so one that fails leaves it never ready; it
                     // ends with the reason rather than waiting on nothing.
                     let fatal = !self.started
                         && matches!(
-                            text(&frame, "command"),
+                            command,
                             "negotiate_protocol" | "get_state" | "get_messages_page"
                         );
                     step.events.push(Event::Error {
-                        message: text(&frame, "error").into(),
+                        message: error.into(),
                         fatal,
                     });
                     // A refused prompt started no turn, so the conversation is
                     // idle again rather than waiting for one.
-                    if text(&frame, "command") == "prompt" && !self.busy {
+                    if command == "prompt" && !self.busy {
                         step.events.push(Event::Status {
                             busy: false,
                             detail: "Ready".into(),
@@ -1189,14 +1216,14 @@ impl Adapter for Omp {
                     return Ok(step);
                 }
                 let data = &frame["data"];
-                if text(&frame, "command") == "prompt"
+                if command == "prompt"
                     && let Some(execution) = self.execution.as_mut().filter(|execution| {
                         frame["id"].as_str() == Some(execution.request.as_str())
                     })
                 {
                     execution.accepted = true;
                 }
-                match text(&frame, "command") {
+                match command {
                     "negotiate_protocol" => step = self.refresh(),
                     "follow_up" => {
                         step.writes.push(self.request("get_state"));
@@ -1484,7 +1511,13 @@ impl Adapter for Omp {
                             .map(|n| (n * 1_000_000.0) as u64);
                         step.events.push(Event::Usage(self.usage.clone()));
                     }
-                    "set_model" | "set_thinking_level" | "compact" => step = self.refresh(),
+                    "set_model" | "set_thinking_level" | "compact" => {
+                        step = self.refresh();
+                        if tracked_compaction {
+                            // OMP replies after its manual compaction completes.
+                            step.compaction = Some(CompactionOutcome::Completed);
+                        }
+                    }
                     "prompt" if data["agentInvoked"].as_bool() == Some(false) => {
                         step = self.refresh();
                         self.finish_execution(
@@ -3897,6 +3930,7 @@ mod tests {
             .receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}}))
             .unwrap();
         assert!(!adapter.compaction_pending());
+        assert!(step.compaction.is_none());
         let kinds = step
             .writes
             .iter()
@@ -3907,6 +3941,47 @@ mod tests {
                 kinds.contains(&expected.to_owned()),
                 "the compacted session's {expected} is never asked for: {kinds:?}"
             );
+        }
+    }
+
+    #[test]
+    fn tracked_compaction_settles_only_on_its_matching_omp_reply() {
+        let mut adapter = Omp {
+            ready: true,
+            ..Omp::default()
+        };
+        for (success, expected) in [
+            (json!(true), CompactionOutcome::Completed),
+            (
+                json!(false),
+                CompactionOutcome::Failed("Conversation is already compacted".into()),
+            ),
+            (
+                Value::Null,
+                CompactionOutcome::Unconfirmed(
+                    "OMP did not report whether compaction succeeded".into(),
+                ),
+            ),
+        ] {
+            let request = adapter.tracked_compaction().unwrap();
+            assert!(request.compaction.is_none());
+            let id = request.writes[0]["id"].as_str().unwrap();
+            let reply = |id: &str| {
+                json!({
+                    "type": "response", "id": id, "command": "compact",
+                    "success": success, "error": "Conversation is already compacted",
+                })
+            };
+
+            let stale = adapter.receive(reply("previous-request")).unwrap();
+            assert!(stale.compaction.is_none());
+            assert!(stale.writes.is_empty());
+            assert!(adapter.compaction_pending());
+
+            let settled = adapter.receive(reply(id)).unwrap();
+            assert_eq!(settled.compaction, Some(expected));
+            assert!(!adapter.compaction_pending());
+            assert!(adapter.receive(reply(id)).unwrap().compaction.is_none());
         }
     }
 
