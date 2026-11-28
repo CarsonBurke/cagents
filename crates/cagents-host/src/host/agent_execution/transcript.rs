@@ -14,7 +14,7 @@ use crate::{
         directory::{Member, Relation, Scope},
         transcript::{Builder, MAX_LIMIT, Page, Query},
     },
-    chat::{self, Item, Launch, protocol::codex::rollout::Rollout},
+    chat::{self, Item, ItemContent, Launch, protocol::codex::rollout::Rollout},
     model::TerminalId,
 };
 use std::{
@@ -361,7 +361,7 @@ impl Rollouts {
         const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
         // Short records, such as compactions, still allocate a complete Item
         // and its strings. Bound that expansion separately from source bytes.
-        const MAX_ITEMS_PER_ENTRY: usize = 16_384;
+        const MAX_ROWS_PER_ENTRY: usize = 16_384;
 
         let Some(revision) = FileRevision::of(rollout.metadata()).filter(|revision| {
             revision.len <= MAX_SOURCE_BYTES && rollout.supports_revision_cache()
@@ -393,8 +393,16 @@ impl Rollouts {
             return items.clone();
         }
         let (items, closing) = rollout.read();
+        let rows = items.iter().fold(items.capacity(), |total, item| {
+            total
+                + match &item.content {
+                    ItemContent::Changes { changes, .. } => changes.capacity(),
+                    ItemContent::WebSearch { results, .. } => results.capacity(),
+                    _ => 0,
+                }
+        });
         let items = Arc::new(items);
-        if items.capacity() <= MAX_ITEMS_PER_ENTRY
+        if rows <= MAX_ROWS_PER_ENTRY
             && closing.as_ref().and_then(FileRevision::of) == Some(revision)
         {
             *cached = Some(items.clone());
