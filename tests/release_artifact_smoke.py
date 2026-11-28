@@ -2,6 +2,7 @@
 """Exercise the real smoke wrapper at its sandbox boundary; no host installs."""
 import json
 import fcntl
+import importlib.util
 import os
 from pathlib import Path
 import select
@@ -21,8 +22,15 @@ BUILD = ROOT / "scripts/build-release-linux"
 SMOKE = ROOT / "scripts/smoke-release-artifacts"
 PREPARE = ROOT / "scripts/prepare-release-smoke-rootfs"
 ENTRYPOINT = ROOT / "packaging/smoke-release-artifact"
+_custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT / "tests/fixture_custody.py")
+fixture_custody = importlib.util.module_from_spec(_custody_spec)
+_custody_spec.loader.exec_module(fixture_custody)
 TMP_DIR = os.environ.get("TMPDIR", "/var/tmp")
 VERSION = "1.2.3"
+BUILD_CACHE_ID = (
+    "cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 "
+    "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a\n"
+)
 SMOKE_CACHE_ID = (
     "cagents-release-smoke-v4 ubuntu-24.04.3 amd64 "
     "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9\n"
@@ -277,6 +285,142 @@ class SmokeBoundary(unittest.TestCase):
         self.assertFalse(self.network_calls.exists())
         self.assertEqual(self.recorded(), [])
         self.assertEqual(list(output.iterdir()), [])
+
+    def build_cache(self):
+        cache = self.directory / "build-cache"
+        cache.mkdir(mode=0o700)
+        (cache / ".cagents-release-cache").write_text(BUILD_CACHE_ID)
+        self.environment.update(CAGENTS_RELEASE_CACHE=str(cache), CARGO_BUILD_JOBS="1")
+        return cache
+
+    def test_release_builder_reclaims_only_recognized_scratch_in_its_marked_cache(self):
+        cache = self.build_cache()
+        abandoned = cache / "run.ABC123"
+        (abandoned / "build-tmp").mkdir(parents=True, mode=0o700)
+        abandoned.chmod(0o700)
+        (abandoned / "build-tmp/link").symlink_to(self.base, target_is_directory=True)
+        (cache / "run.DEF456").mkdir(mode=0o700)  # Interrupted just after mktemp.
+        unrelated = cache / "run.GHI789"
+        unrelated.mkdir(mode=0o700)
+        (unrelated / ".unknown").write_text("unrelated")
+        link = cache / "run.JKL012"
+        link.symlink_to(self.base, target_is_directory=True)
+        other = cache / "run.manual"
+        other.write_text("user data")
+        pinned = cache / "ubuntu-base.tar.gz"
+        pinned.write_text("pinned archive")
+        for directory in ("rootfs", "cargo", "target", "source", "source.git"):
+            (cache / directory).mkdir()
+        smoke_cache = self.directory / "wrong-smoke-cache"
+        smoke_cache.mkdir(mode=0o700)
+        (smoke_cache / ".cagents-release-smoke-cache").write_text("unexpected marker")
+        self.environment["CAGENTS_RELEASE_SMOKE_CACHE"] = str(smoke_cache)
+        published = self.directory / "published"
+        published.mkdir()
+        (published / "archive").write_text("verified asset")
+        command = ["--ref", "HEAD", "--output", str(self.directory / "out")]
+
+        with (cache / ".lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.invoke(BUILD, command)
+            self.assertIn("another release build", result.stderr)
+            self.assertTrue(abandoned.is_dir())
+        marker = cache / ".cagents-release-cache"
+        marker.write_text("other cache format")
+        self.assertIn("cache marker does not match this builder", self.invoke(BUILD, command).stderr)
+        self.assertTrue(abandoned.is_dir())
+        marker.write_text(BUILD_CACHE_ID)
+
+        result = self.invoke(BUILD, command)
+
+        self.assertIn("cache marker does not match this runtime", result.stderr)
+        self.assertFalse(abandoned.exists())
+        self.assertFalse((cache / "run.DEF456").exists())
+        self.assertEqual((unrelated / ".unknown").read_text(), "unrelated")
+        self.assertEqual(other.read_text(), "user data")
+        self.assertTrue(link.is_symlink())
+        self.assertEqual((self.base / "base-sentinel").read_text(), "untouched\n")
+        self.assertEqual(pinned.read_text(), "pinned archive")
+        for directory in ("rootfs", "cargo", "target", "source", "source.git"):
+            self.assertTrue((cache / directory).is_dir())
+        self.assertEqual((published / "archive").read_text(), "verified asset")
+        self.assertFalse(self.network_calls.exists())
+
+    def test_killed_build_group_keeps_cache_locked_while_sandbox_descendant_drains(self):
+        self.addCleanup(fixture_custody.settle)
+        cache = self.build_cache()
+        (cache / "ubuntu-base.tar.gz").touch()
+        (cache / "rootfs").mkdir()
+        smoke_cache = self.directory / "smoke-cache"
+        smoke_cache.mkdir(mode=0o700)
+        marker = smoke_cache / ".cagents-release-smoke-cache"
+        marker.write_text(SMOKE_CACHE_ID)
+        (smoke_cache / "ubuntu-base.tar.gz").touch()
+        (smoke_cache / "rootfs/opt").mkdir(parents=True)
+        (smoke_cache / "rootfs/opt/.cagents-release-smoke-provisioned-v4").write_text(SMOKE_CACHE_ID)
+        checksum = self.bin / "sha256sum"
+        checksum.write_text("#!/bin/sh\nexit 0\n")
+        checksum.chmod(0o755)
+        # Simulate a sandbox child that leaves the launcher's session and
+        # keeps using scratch after the launcher receives TERM. Neither
+        # process inherits the cache lock from the supervisor.
+        boundary = self.bin / "bwrap"
+        boundary.write_text(f"#!{sys.executable}\n" + r"""
+import fcntl
+import os
+from pathlib import Path
+import signal
+import sys
+
+scratch = Path(next(sys.argv[i - 1] for i, arg in enumerate(sys.argv) if arg == "/tmp"))
+if os.fork():
+    signal.pause()
+    sys.exit(1)
+os.setsid()
+assert not Path("/proc/self/fd/9").exists()
+lock = open(scratch.parent.parent / ".lock", "rb")
+
+def draining(*_):
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        assert (scratch / "live").is_file()
+        print("locked through sandbox teardown", flush=True)
+        sys.exit(0)
+    print("cache unlocked before sandbox teardown", flush=True)
+    sys.exit(1)
+
+signal.signal(signal.SIGTERM, draining)
+(scratch / "live").touch()
+print("sandbox ready", flush=True)
+signal.pause()
+""")
+        self.environment["CAGENTS_RELEASE_SMOKE_CACHE"] = str(smoke_cache)
+        command = [str(BUILD), "--ref", "HEAD", "--output", str(self.directory / "out")]
+        with subprocess.Popen(command, env=self.environment, stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True, start_new_session=True) as builder:
+            try:
+                deadline = time.monotonic() + HANG_GUARD
+                while not tuple(cache.glob("run.*/provision-tmp/live")):
+                    self.assertIsNone(builder.poll(), "builder exited before the sandbox started")
+                    self.assertLess(time.monotonic(), deadline, "sandbox did not start")
+                    time.sleep(0.05)
+                (scratch,) = cache.glob("run.*")
+                os.killpg(builder.pid, signal.SIGKILL)
+                output, _ = builder.communicate(timeout=HANG_GUARD)
+            finally:
+                if builder.poll() is None:
+                    os.killpg(builder.pid, signal.SIGKILL)
+        self.assertEqual(builder.returncode, -signal.SIGKILL, output)
+        self.assertIn("locked through sandbox teardown", output)
+        self.assertTrue(scratch.is_dir())
+        marker.write_text("wrong smoke cache marker")
+
+        result = self.invoke(BUILD, command[1:])
+
+        self.assertIn("cache marker does not match this runtime", result.stderr)
+        self.assertFalse(scratch.exists())
+        self.assertEqual(list((self.directory / "out").iterdir()), [])
 
     def test_preparation_respects_existing_cache_lock_before_fetching(self):
         cache = self.directory / "locked-cache"

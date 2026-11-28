@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+set +m  # Keep the async launcher in our group until setsid moves it.
 
 PROGRAM=build-release-linux
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
@@ -8,8 +9,7 @@ OUTPUT=${CAGENTS_DIST_DIR:-"$ROOT_DIR/dist"}
 REF=
 NOTES=
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04.5-base-amd64.tar.gz
-BASE_SHA256=242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a
-CACHE_ID="cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 $BASE_SHA256"
+source "$ROOT_DIR/scripts/release-build-cache"
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -33,7 +33,7 @@ while (($#)); do
                 'fixes and speedups committed since the previous release tag.' \
                 'DIR also receives release-metadata.json, which must be signed before publishing.' \
                 'Requires Linux x86_64, unprivileged user namespaces, bubblewrap, Bash,' \
-                'Git, curl, GNU tar/coreutils, flock, network access, and ample disk space.' \
+                'Git, curl, GNU tar/coreutils, flock, setsid, network access, and ample disk space.' \
                 'CAGENTS_RELEASE_CACHE selects a private, marked cache (default:' \
                 '~/.cache/cagents-release/ubuntu-22.04-amd64). CARGO_BUILD_JOBS defaults to one per CPU and 2 GiB available memory.' \
                 'No root, Docker, host toolchain, credentials, or publication is used.'
@@ -47,7 +47,7 @@ done
 CALLER_UID=$(id -u)
 CALLER_GID=$(id -g)
 [[ $CALLER_UID != 0 ]] || fail 'run as your ordinary nonroot user, not root'
-for command in bwrap git curl tar sha256sum flock realpath stat mktemp install; do
+for command in bwrap git curl tar sha256sum flock setsid realpath stat mktemp install; do
     command -v "$command" >/dev/null || fail "required command not found: $command"
 done
 # scripts/release-metadata runs on the system Python.
@@ -111,30 +111,7 @@ while read -r mode type object path; do
     [[ $mode != 160000 ]] || fail 'source ref contains submodules; source-only export is unsupported'
 done < <(git -C "$ROOT_DIR" ls-tree -r "$SOURCE_COMMIT")
 
-umask 077
-[[ ! -L $CACHE ]] || fail 'cache root must not be a symlink'
-mkdir -p -- "$CACHE"
-CACHE=$(realpath -- "$CACHE")
-[[ $(stat -c %u "$CACHE") == "$CALLER_UID" && $(stat -c %a "$CACHE") == 700 ]] \
-    || fail 'cache root must be owned by the caller with mode 0700'
-[[ ! -L $CACHE/.lock && ( ! -e $CACHE/.lock || -f $CACHE/.lock ) ]] \
-    || fail 'cache lock must be a regular file'
-if [[ -e $CACHE/.cagents-release-cache ]]; then
-    [[ ! -L $CACHE/.cagents-release-cache && $(cat "$CACHE/.cagents-release-cache") == "$CACHE_ID" ]] \
-        || fail 'cache marker does not match this builder; use a different cache directory'
-else
-    shopt -s nullglob dotglob
-    contents=("$CACHE"/*)
-    ((${#contents[@]} == 0)) \
-        || fail 'refusing to adopt an unmarked nonempty cache'
-    # Never create even a lock file in an unmarked, nonempty directory.
-    shopt -u nullglob dotglob
-fi
-exec 9>"$CACHE/.lock"
-flock -n 9 || fail 'another release build is using this cache'
-if [[ ! -e $CACHE/.cagents-release-cache ]]; then
-    printf '%s\n' "$CACHE_ID" > "$CACHE/.cagents-release-cache"
-fi
+open_release_cache
 [[ ! -L $OUTPUT ]] || fail 'output directory must not be a symlink'
 mkdir -p -- "$OUTPUT"
 OUTPUT=$(realpath -- "$OUTPUT")
@@ -143,6 +120,7 @@ shopt -s nullglob dotglob
 assets=("$OUTPUT"/*)
 ((${#assets[@]} == 0)) || fail 'output directory must be empty; existing assets are never overwritten'
 shopt -u nullglob dotglob
+reclaim_release_runs "$NOTES"
 
 # Validate or provision the smoke runtime before starting the build. Runtime
 # preparation can use the network; artifact execution below runs offline.
@@ -152,12 +130,34 @@ printf '%s: smoke runtime ready in %ss\n' "$PROGRAM" "$((SECONDS - stage_started
 
 stage_started=$SECONDS
 WORK=$(mktemp -d "$CACHE/run.XXXXXX")
-mkdir "$WORK/provision-tmp" "$WORK/build-tmp" "$WORK/build-var-tmp"
+phase_running=
 cleanup() {
-    rm -rf -- "$WORK"
+    # On interruption during a phase, its supervisor still owns the lock.
+    # Leave scratch for the next build to reclaim once teardown has finished.
+    if [[ -z $phase_running ]]; then
+        rm -rf --one-file-system -- "$WORK"
+    fi
 }
 trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
+
+run_release_phase() {
+    # Bubblewrap can report the command's exit before its PID namespace is
+    # empty. Hold the cache lock in a subreaper outside the sandbox until it
+    # has drained the entire phase. Its own session lets it drain after the
+    # builder's foreground process group is killed.
+    local status=0
+    phase_running=1
+    setsid /usr/bin/python3 -I "$ROOT_DIR/scripts/cargo-gate-command.py" \
+        --wrapper "$PROGRAM" --parent "$$" --drain-on-exit --hold-fd 9 /dev/null "$@" &
+    wait "$!" || status=$?
+    # SIGKILL of the supervisor itself does not certify teardown.
+    if ((status != 128 + 9)); then
+        phase_running=
+    fi
+    return "$status"
+}
+mkdir "$WORK/provision-tmp" "$WORK/build-tmp" "$WORK/build-var-tmp"
 # Freeze the entrypoint for this run, including its provisioning phase.
 cp -- "$ROOT_DIR/packaging/release-build" "$WORK/release-build"
 # Copy only DNS configuration, never host HOME, Git configuration or credentials.
@@ -180,7 +180,7 @@ fi
 # Ubuntu fakeroot handles package ownership for otherwise unmapped system users.
 # A separate namespace below maps that same caller to their ordinary nonzero UID.
 if [[ ! -f $CACHE/rootfs/opt/.cagents-release-provisioned-v5 ]]; then
-    bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
+    run_release_phase bwrap --unshare-user --uid 0 --gid 0 --unshare-pid --unshare-ipc --unshare-uts \
         --die-with-parent --new-session --clearenv \
         --bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/provision-tmp" /tmp --tmpfs /run \
         --ro-bind "$WORK/resolv.conf" /etc/resolv.conf \
@@ -227,7 +227,7 @@ printf 'root:x:0:\nbuilder:x:%s:\n' "$CALLER_GID" > "$WORK/group"
 printf '%s: build environment and source ready in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 printf 'Building %s (%s) locally in Ubuntu 22.04; assets: %s\n' "$REF" "$SOURCE_COMMIT" "$OUTPUT"
 stage_started=$SECONDS
-bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
+run_release_phase bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
     --unshare-pid --unshare-ipc --unshare-uts --die-with-parent --new-session --clearenv \
     --ro-bind "$CACHE/rootfs" / --proc /proc --dev /dev --bind "$WORK/build-tmp" /tmp --bind "$WORK/build-var-tmp" /var/tmp --tmpfs /run \
     --tmpfs /home --dir /home/builder \
@@ -252,7 +252,7 @@ bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
 printf '%s: artifacts built and checked in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 stage_started=$SECONDS
 VERSION=$version
-"$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
+run_release_phase "$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
 printf '%s: artifact smoke completed in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 # The signed metadata names every asset with its size and digest, so an
 # installed cagents trusts the release through one signature.
