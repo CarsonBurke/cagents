@@ -2839,7 +2839,7 @@ fn settled_prepared_is_read_only_history_without_active_update_authority() {
             .unwrap()
             .unwrap();
         assert_eq!(classified.source, record.source);
-        assert_eq!(classified.census, *record.census);
+        assert!(classified.census.same_bytes(&record.census).unwrap());
         assert_eq!(classified.paused_terminals, record.paused_terminals);
         assert!(classified.paused_chats.is_empty());
         assert_eq!(
