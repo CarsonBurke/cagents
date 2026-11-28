@@ -4060,9 +4060,7 @@ mod tests {
                     let result = verify_startup_stream(
                         &socket,
                         UnixStream::connect(&socket).unwrap(),
-                        |stream| {
-                            crate::control::ControlClient::from_stream_until(stream, Instant::now())
-                        },
+                        crate::control::ControlClient::from_stream,
                     );
                     assert_eq!(result.is_ok(), answer, "{result:?}");
                     server.join()
@@ -4399,10 +4397,14 @@ mod tests {
             thread::sleep(restore);
             answer_ready_hello(&mut stream);
         });
-        let started = Instant::now();
-        let client =
-            join_selected_daemon(&socket, &owner, started, started + Duration::from_secs(5))
-                .unwrap();
+        let now = Instant::now();
+        let client = join_selected_daemon(
+            &socket,
+            &owner,
+            now - STARTUP_BASE,
+            now + Duration::from_secs(5),
+        )
+        .unwrap();
         assert_eq!(client.proof(), &proof("restored"));
         server.join().unwrap();
     }
