@@ -1804,30 +1804,33 @@ fn start_and_verify_daemon_at(
     let deadline = started + timeout;
     let connection = start_daemon_at(socket, timeout, daemon_binary, scoped, launch);
     #[cfg(target_os = "macos")]
-    let connection = connection.or_else(|error| {
-        let HostedTerminalStartError::HostReadyTimeout { .. } = error else {
-            return Err(error);
-        };
+    if matches!(
+        &connection,
+        Err(HostedTerminalStartError::HostReadyTimeout { .. })
+    ) {
         refuse_update_launch(socket)?;
-        let Some((owner, allowance)) = crate::update::selected_listener_startup(socket, None)
-        else {
-            return Err(error);
-        };
-        let deadline = deadline.max(started + STARTUP_BASE + allowance);
-        connect_until_with_owner(socket, deadline, &owner).map_err(|source| {
-            if source.kind() == io::ErrorKind::TimedOut {
-                HostedTerminalStartError::HostReadyTimeout {
-                    path: socket.to_owned(),
-                    timeout: deadline.duration_since(started),
+        if let Some((owner, allowance)) = crate::update::selected_listener_startup(socket, None) {
+            let deadline = deadline.max(started + STARTUP_BASE + allowance);
+            let stream = connect_until_with_owner(socket, deadline, &owner).map_err(|source| {
+                if source.kind() == io::ErrorKind::TimedOut {
+                    HostedTerminalStartError::HostReadyTimeout {
+                        path: socket.to_owned(),
+                        timeout: deadline.duration_since(started),
+                    }
+                } else {
+                    HostedTerminalStartError::HostSocket {
+                        path: socket.to_owned(),
+                        source,
+                    }
                 }
-            } else {
-                HostedTerminalStartError::HostSocket {
-                    path: socket.to_owned(),
-                    source,
-                }
-            }
-        })
-    });
+            })?;
+            // The selected daemon can consume its recovery evidence before
+            // accepting the connection. Carry the admitted deadline into hello.
+            return verify_startup_stream(socket, stream, |stream| {
+                crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
+            });
+        }
+    }
     let stream = connection?;
     #[cfg(target_os = "macos")]
     let allowance = startup_allowance_for_stream(socket, &stream);
