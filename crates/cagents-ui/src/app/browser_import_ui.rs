@@ -821,7 +821,7 @@ impl Cagents {
                     if state.found.is_empty() {
                         content.push(notice_body(SUPPORTED_NONE_FOUND));
                     }
-                    content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Only SameSite=None cookies are supported; restricted, container, and partitioned cookies are skipped. Some logins may still need signing in."));
+                    content.push(notice_body("Choose sites to import. If profiles overlap, the first selected profile wins. Container and partitioned cookies are skipped. Some logins may still need signing in."));
                     content.push(
                         crate::ui_controls::field::search("Filter sites or profiles", &state.query)
                             .id(widget::Id::new("dialog.browser-import.filter"))

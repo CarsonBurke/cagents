@@ -75,12 +75,12 @@ impl Pending {
             }
             cookie.set_secure(imported.secure);
             cookie.set_http_only(imported.http_only);
-            match imported.same_site {
-                SameSite::None => cookie.set_same_site(cookie::SameSite::None),
-                SameSite::Lax => cookie.set_same_site(cookie::SameSite::Lax),
-                SameSite::Strict => cookie.set_same_site(cookie::SameSite::Strict),
-                SameSite::Unspecified => {}
-            }
+            // The engine enforces Lax and Strict at request time.
+            cookie.set_same_site(match imported.same_site {
+                SameSite::None => cookie::SameSite::None,
+                SameSite::Lax => cookie::SameSite::Lax,
+                SameSite::Strict => cookie::SameSite::Strict,
+            });
             if let Some(expires) = imported.expires_unix {
                 match cookie::time::OffsetDateTime::from_unix_timestamp(expires) {
                     Ok(expires) => cookie.set_expires(expires),
