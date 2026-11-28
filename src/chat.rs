@@ -319,6 +319,15 @@ mod acp_permission_tests {
             .push("--disable-shell".into());
         assert!(!launch.resumes_in_terminal(&issued_by_older_daemon));
 
+        launch.recipe.arguments[0] = "--approval-mode=untrusted".into();
+        let mut issued_by_older_daemon = launch.terminal_recipe().unwrap();
+        assert!(apply_acp_permission_mode(
+            &mut issued_by_older_daemon,
+            Provider::Muse,
+            "manual"
+        ));
+        assert!(launch.resumes_in_terminal(&issued_by_older_daemon));
+
         // The live policy can also be stricter than the original launch.
         launch.recipe.arguments[0] = "--approval-mode=never".into();
         assert!(
@@ -630,6 +639,7 @@ pub fn apply_terminal_permission_mode(
 ) -> Result<(), &'static str> {
     if provider == Provider::Muse {
         let acp = provider.acp().expect("Muse has an ACP adapter");
+        let confirmed = mode.is_some();
         let Some(mode) = mode.or_else(|| named_acp_permission_modes(recipe, acp).last()) else {
             return Ok(());
         };
@@ -646,7 +656,7 @@ pub fn apply_terminal_permission_mode(
         }
         // A confirmed mode must be explicit even when it is the default.
         // Muse can otherwise take its policy from configuration or switches.
-        if !named_acp_permission_modes(recipe, acp).eq([terminal]) {
+        if confirmed || !named_acp_permission_modes(recipe, acp).eq([terminal]) {
             write_acp_permission_mode(recipe, provider, acp, Some(terminal));
         }
     } else if let Some(mode) = mode {
