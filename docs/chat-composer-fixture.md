@@ -242,10 +242,10 @@ For subagent tab checks, create `fixture-subagents` before spawning the agent
 (`touch "$fixture_root/home/.claude/fixture-subagents"`). Each turn starts
 five Agent calls before its answer: Scout keeps working in the background,
 Planner hits a rate limit in the background and says so on its tab, Builder
-fails, and two unnamed Explore agents finish. The tabs beside Conversation must read Scout,
-Planner, Builder, Explore and Explore 2, in that order, each with its state's
-mark; hovering a tab shows its state and task. A selected agent's Stop ends
-just that agent.
+fails, and two unnamed Explore agents finish. The tabs beside Main must read
+Scout, Planner and Builder, in that order, each with its state's mark, and the
+two Explore agents fold into "2 finished"; hovering a tab shows its state and
+task. A selected agent's Stop ends just that agent.
 
 Select Builder and focus its tab. The first turn stays busy, so stop it
 before sending another prompt: because Stop also ends Scout and Planner, the

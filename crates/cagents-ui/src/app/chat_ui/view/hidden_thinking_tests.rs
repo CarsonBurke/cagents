@@ -106,19 +106,23 @@ fn an_open_group_says_how_long_it_spent_thinking_between_its_steps() {
 }
 
 #[test]
-fn a_subagent_that_has_only_thought_says_it_is_working() {
+fn a_subagent_that_has_only_thought_is_said_to_work_once() {
     let mut agent = chat::Subagent {
         items: vec![Arc::new(thought("child-thought", 1_000, 2_000))],
         status: chat::ToolStatus::Running,
         ..super::tests::native_child_fixture()
     };
+    // The closing line's spinner says it works; nothing above it waits.
+    assert_eq!(child_placeholder(&agent, true), None);
+    // Where nothing closes the transcript, such as while disconnected, the
+    // empty transcript still says it has nothing yet.
     assert_eq!(
-        child_placeholder(&agent),
-        Some("Waiting for subagent activity…")
+        child_placeholder(&agent, false),
+        Some("Nothing from this subagent yet.")
     );
     agent.status = chat::ToolStatus::Succeeded;
     assert_eq!(
-        child_placeholder(&agent),
+        child_placeholder(&agent, false),
         Some("No recent subagent activity is available here.")
     );
     // Its first row replaces the placeholder.
@@ -126,12 +130,12 @@ fn a_subagent_that_has_only_thought_says_it_is_working() {
     agent
         .items
         .push(Arc::new(command("child-command", 2_000, 3_000)));
-    assert_eq!(child_placeholder(&agent), None);
+    assert_eq!(child_placeholder(&agent, false), None);
     // A failure with its own detail says what happened instead.
     agent.items.truncate(1);
     agent.status = chat::ToolStatus::Failed;
     agent.detail = "The provider stopped.".into();
-    assert_eq!(child_placeholder(&agent), None);
+    assert_eq!(child_placeholder(&agent, false), None);
 }
 
 #[test]
