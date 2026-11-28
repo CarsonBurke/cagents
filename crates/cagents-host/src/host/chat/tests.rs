@@ -4160,7 +4160,7 @@ fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories()
 
 #[cfg(target_os = "linux")]
 #[test]
-fn linux_provider_path_uses_current_shell_order_and_keeps_caller_tools() {
+fn linux_provider_path_preserves_recorded_and_relative_order() {
     let mut recipe = crate::model::LaunchRecipe {
         program: "codex".into(),
         arguments: Vec::new(),
@@ -4180,8 +4180,13 @@ fn linux_provider_path_uses_current_shell_order_and_keeps_caller_tools() {
     );
     assert_eq!(
         recipe.environment["PATH"],
-        "./tools:/ui-only:/node:/usr/bin"
+        "./tools:/ui-only:/usr/bin:/node"
     );
+
+    for launcher in ["/usr/bin:./tools", "/usr/bin:./tools:/node"] {
+        resolve_provider_path(&mut recipe, Some(launcher), Some(launcher), shell_path);
+        assert_eq!(recipe.environment["PATH"], "/node:/usr/bin:./tools");
+    }
 
     let old = Some("./tools:/old-node:/usr/bin");
     resolve_provider_path(&mut recipe, old, old, shell_path).unwrap();

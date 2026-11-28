@@ -6186,8 +6186,7 @@ fn daemon_shell_search_path(caller: Option<&str>, refresh: bool) -> Option<std::
     ))
 }
 
-/// Supply the shell's current order for shared directories and keep
-/// launcher-only directories first. Return the baseline for upgrade checks.
+/// Resolve the launch search path and return its baseline for upgrade checks.
 #[cfg(target_os = "linux")]
 fn resolve_provider_path(
     recipe: &mut crate::model::LaunchRecipe,
@@ -6198,14 +6197,7 @@ fn resolve_provider_path(
     if recipe.unset_environment.contains("PATH") {
         return None;
     }
-    // The client's launcher PATH was already used for shell discovery.
-    // Keep project-relative entries and distinct recorded selections too.
-    let selected = recorded.or(launcher);
-    let caller_directories = selected
-        .into_iter()
-        .flat_map(std::env::split_paths)
-        .filter(|directory| selected != launcher || !directory.is_absolute());
-    let path = crate::account::probe::login_path::merge_provider_path(caller_directories, shell)?;
+    let path = crate::account::probe::login_path::merge_provider_path(recorded, launcher, shell)?;
     if recipe.environment.get("PATH") == Some(&path) {
         return None;
     }
@@ -6241,7 +6233,8 @@ pub(super) fn record_agent_search_path(launch: &mut chat::Launch) {
         return;
     }
     let path = daemon_shell_search_path(None, true).and_then(|shell| {
-        crate::account::probe::login_path::merge_provider_path(std::iter::empty(), &shell)
+        let launcher = launch.recipe.environment.get("PATH").map(String::as_str);
+        crate::account::probe::login_path::merge_provider_path(None, launcher, &shell)
     });
     if let Some(path) = path
         && crate::model::agent_recovery::fresh_environment_key(launch.provider, "PATH", &path, true)
