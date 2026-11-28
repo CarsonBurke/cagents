@@ -14301,6 +14301,34 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
     }
 }
 
+#[test]
+fn unchanged_history_reuses_row_descriptors_and_preserves_spacing() {
+    let (runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(3));
+    let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
+    let width = super::super::layout::READING_COLUMN;
+    let build = |width, dark| {
+        let mut rows = VirtualRows::new();
+        rows.push(widget::Space::new().into());
+        runtime.push_history_rows(&mut rows, width, settings, dark, None);
+        rows.body.unwrap().rows
+    };
+
+    let history = build(width, true);
+    assert!(std::rc::Rc::ptr_eq(&history, &build(width, false)));
+    let mut ordinary = VirtualRows::new();
+    ordinary.push(widget::Space::new().into());
+    for turn in &runtime.turns {
+        runtime.push_turn_rows(&mut ordinary, turn, width, settings, true);
+    }
+    assert_eq!(ordinary.children.len() - 1, history.len());
+    for (expected, actual) in ordinary.children[1..].iter().zip(history.iter()) {
+        assert_eq!(expected.key, actual.key);
+        assert_eq!(expected.estimate, actual.estimate);
+        assert_eq!(expected.aliases, actual.aliases);
+    }
+    assert!(!std::rc::Rc::ptr_eq(&history, &build(width - 100.0, true)));
+}
+
 /// A transcript row is kept for as long as its fingerprint holds, and it is
 /// built with the accent its links are drawn in. An accent change keeps the
 /// theme's darkness, so it has to change the fingerprint itself (#3583).

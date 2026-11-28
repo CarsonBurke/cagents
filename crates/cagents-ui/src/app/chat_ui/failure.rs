@@ -1670,6 +1670,37 @@ impl Runtime {
         evidence
     }
 
+    fn failure_notice_policy(
+        &self,
+        incident: &Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) -> (
+        Option<crate::app::account_ui::resets::Controls>,
+        bool,
+        Option<super::blocked_recovery::Reopen>,
+    ) {
+        let reset_controls = reset_controls
+            .map(|controls| controls.for_incident(&self.reset_incident_evidence(incident)));
+        let cleared = incident.kind == Some(FailureKind::AccountLimit)
+            && reset_controls
+                .as_ref()
+                .is_some_and(|controls| controls.limit_cleared(&incident.summary));
+        let current_local_error = incident.sources.iter().any(|source| {
+            matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
+        });
+        let blocked_start = self.start_blocked.filter(|_| current_local_error);
+        (reset_controls, cleared, blocked_start)
+    }
+
+    pub(super) fn failure_notice_is_card(
+        &self,
+        incident: &Incident,
+        reset_controls: Option<&crate::app::account_ui::resets::Controls>,
+    ) -> bool {
+        let (_, cleared, blocked_start) = self.failure_notice_policy(incident, reset_controls);
+        notice_blocks(incident, cleared, blocked_start.is_some())
+    }
+
     /// An incident's notice, and whether it is drawn as a card set apart
     /// from the timeline rather than as one of its lines.
     pub(super) fn failure_notice(
@@ -1677,12 +1708,8 @@ impl Runtime {
         incident: &Incident,
         reset_controls: Option<&crate::app::account_ui::resets::Controls>,
     ) -> (Element<'static, Message>, bool) {
-        let reset_controls = reset_controls
-            .map(|controls| controls.for_incident(&self.reset_incident_evidence(incident)));
-        let cleared = incident.kind == Some(FailureKind::AccountLimit)
-            && reset_controls
-                .as_ref()
-                .is_some_and(|controls| controls.limit_cleared(&incident.summary));
+        let (reset_controls, cleared, blocked_start) =
+            self.failure_notice_policy(incident, reset_controls);
         let summary = if cleared {
             let label = incident
                 .summary
@@ -1692,10 +1719,6 @@ impl Runtime {
         } else {
             incident.summary.clone()
         };
-        let current_local_error = incident.sources.iter().any(|source| {
-            matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
-        });
-        let blocked_start = self.start_blocked.filter(|_| current_local_error);
         if !notice_blocks(incident, cleared, blocked_start.is_some()) {
             return (self.notice_line(incident, summary, cleared), false);
         }

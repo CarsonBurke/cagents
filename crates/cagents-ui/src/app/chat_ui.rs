@@ -3871,6 +3871,7 @@ pub(super) struct Runtime {
     /// use its own cache, even when a child uses the same opaque item IDs.
     child_cache: HashMap<String, CachedItem>,
     child_cache_context: Option<String>,
+    history_rows: std::cell::RefCell<Option<view::HistoryRows>>,
     presentation_revision: u64,
     presentation_evicted: bool,
     /// Small tail identity survives body eviction so rehydrating an unchanged
@@ -5678,6 +5679,7 @@ impl Runtime {
             cache: HashMap::new(),
             child_cache: HashMap::new(),
             child_cache_context: None,
+            history_rows: Default::default(),
             presentation_revision: 0,
             presentation_evicted: false,
             last_presented_tail: None,
@@ -5802,6 +5804,7 @@ impl Runtime {
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
         self.selection_document.get_mut().clear();
+        self.history_rows.get_mut().take();
         self.selection_bookmarks.get_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
@@ -7540,6 +7543,22 @@ impl Runtime {
         let same_ids = |old: &[Arc<chat::Item>], new: &[Arc<chat::Item>]| {
             old.len() == new.len() && old.iter().zip(new).all(|(old, new)| old.id == new.id)
         };
+        if self.history_rows.get_mut().is_some()
+            && self
+                .snapshot
+                .items
+                .iter()
+                .zip(&snapshot.items)
+                .any(|(old, new)| {
+                    !Arc::ptr_eq(old, new)
+                        && CachedItem::prose(&old.content).map(str::len)
+                            != CachedItem::prose(&new.content).map(str::len)
+                })
+        {
+            // The worker may still present the old prepared prefix while
+            // scrollbar estimates already follow the latest raw lengths.
+            self.history_rows.get_mut().take();
+        }
         if !same_ids(&self.snapshot.items, &snapshot.items)
             || !same_ids(
                 previous_selected.map_or(&[], |agent| agent.items.as_slice()),
@@ -8072,6 +8091,7 @@ impl Runtime {
         self.child_cache = HashMap::new();
         self.child_cache_context = None;
         self.selection_document.get_mut().clear();
+        self.history_rows.get_mut().take();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.presentation_evicted = true;
