@@ -32,6 +32,10 @@ impl Startup {
     pub(in crate::host) fn local_source(&self) -> Option<&Session> {
         self.local.then_some(&self.source)
     }
+
+    pub(super) fn matches(&self, source: &Session) -> bool {
+        &self.source == source || &self.requested == source
+    }
 }
 
 pub(super) fn local_startup_conflicts(state: &HostState, source: &Session) -> bool {
@@ -1198,7 +1202,7 @@ pub(super) fn reconcile_startup_for_start(
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
-        if &pending.source != source && &pending.requested != source {
+        if !pending.matches(source) {
             return Err(SetupError::Invalid(
                 "The retained startup belongs to another exact descriptor".into(),
             ));
@@ -1248,10 +1252,7 @@ pub(super) fn prove_local_startup_closed(
         .filter(|startup| startup.local)
         .cloned();
     if let Some(pending) = &pending {
-        if ![source, named]
-            .into_iter()
-            .any(|source| &pending.source == source || &pending.requested == source)
-        {
+        if !pending.matches(source) && !pending.matches(named) {
             return Err("The retained startup belongs to another exact descriptor".into());
         }
         prove_startup_cleanup(&pending.context)?;

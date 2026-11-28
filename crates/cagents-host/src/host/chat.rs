@@ -1456,17 +1456,22 @@ fn settle_lost_execution_after_startup(
         return Err("This conversation's Close lost its claim; it was not closed".into());
     }
     refuse_scheduled_agent(host, session)?;
-    if let Some(holds) = what_holds_after_startup(host, session, proof, startup)? {
-        return Err(lost_execution_refusal(session, holds));
-    }
-    let _ = return_listener_allocation(session);
-    let Ok(registry) = super::agent_execution::registry(host) else {
-        return Ok(());
-    };
+    let registry = super::agent_execution::registry(host)?;
     let sources = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .retained_agent_sources(session.id)?;
+    if let Some(startup) = startup
+        && sources.iter().any(|source| {
+            !matches!(source, crate::agent_execution::HostedSession::Chat(source) if startup.matches(source))
+        })
+    {
+        return Err("The retained startup belongs to another exact descriptor".into());
+    }
+    if let Some(holds) = what_holds_after_startup(host, session, proof, startup)? {
+        return Err(lost_execution_refusal(session, holds));
+    }
+    let _ = return_listener_allocation(session);
     for source in sources {
         let crate::agent_execution::HostedSession::Chat(source) = source else {
             return Err("Retained execution ownership changed to another surface".into());
@@ -1862,11 +1867,15 @@ fn what_holds_after_startup(
     }
     // A proved teardown for this daemon's exact unpublished local provider
     // suffices when the descriptor cannot also name an independent owner.
-    if settled_startup.is_some_and(|startup| &startup.source == session)
-        && session.proof.as_ref() == Some(proof)
-        && session.terminal.is_none()
-        && !session.native_continuity.retains_provider()
-        && session.owned_codex_listener.is_none()
+    if settled_startup.is_some_and(|startup| {
+        startup.matches(session)
+            && startup.source.proof.as_ref() == Some(proof)
+            && [session, &startup.source].into_iter().all(|source| {
+                source.terminal.is_none()
+                    && !source.native_continuity.retains_provider()
+                    && source.owned_codex_listener.is_none()
+            })
+    }) && session.proof.as_ref().is_none_or(|issued| issued == proof)
         && agent.as_ref().is_none_or(|agent| agent.console.is_none())
         && owners.as_ref().is_ok_and(Vec::is_empty)
     {
@@ -2423,7 +2432,7 @@ fn start_publishing(
             .get(&session.id)
             .filter(|pending| {
                 !pending.local
-                    && (pending.source == session || pending.requested == session)
+                    && pending.matches(&session)
                     && !state.chats.contains_key(&session.id)
                     && !state.chat_spawning.contains_key(&session.id)
             })

@@ -81,7 +81,7 @@ fn failed_managed_pane() -> (
         &crate::account::Account::system(Provider::Claude),
     )
     .unwrap();
-    source.proof = Some(host.lock().unwrap().proof().clone());
+    assert!(source.proof.is_none(), "a fresh pane has no daemon proof");
     source.launch.recipe.program = path
         .parent()
         .unwrap()
@@ -224,6 +224,49 @@ fn both_close_paths_retire_a_failed_managed_pane_after_proving_cleanup() {
                 .contains_key(&source.id)
         );
     }
+}
+
+#[test]
+fn a_startup_receipt_cannot_retire_a_different_durable_source() {
+    use super::super::agent_execution;
+    use crate::agent_execution::HostedSession;
+
+    if agent_execution::tests::isolated(
+        "host::chat::startup_tests::a_startup_receipt_cannot_retire_a_different_durable_source",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, source, id, failure) = failed_managed_pane();
+    let original = HostedSession::Chat(source.clone());
+    let mut other = source.clone();
+    other
+        .launch
+        .recipe
+        .arguments
+        .push("--another-launch".into());
+    let other = HostedSession::Chat(other);
+    let registry = agent_execution::registry(&host).unwrap();
+    registry
+        .lock()
+        .unwrap()
+        .bind_agent(id, Some(&original), other.clone())
+        .unwrap();
+
+    failure.ready.store(true, Ordering::Relaxed);
+    assert!(
+        close_retained_from_pane(&host, &source)
+            .unwrap_err()
+            .contains("another exact descriptor")
+    );
+    let mut store = registry.lock().unwrap();
+    assert!(!store.agent(id).unwrap().closed);
+    store.bind_agent(id, Some(&other), original).unwrap();
+    drop(store);
+
+    close_retained_from_pane(&host, &source).unwrap();
+    assert!(registry.lock().unwrap().agent(id).unwrap().closed);
 }
 
 #[test]
