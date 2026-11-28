@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 228,
+    proven_at: 229,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -1558,6 +1558,41 @@ mod tests {
             };
             assert!(current.admits_message(&capacity), "{provider:?}");
             assert_eq!(client.admits_message(&capacity), known, "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn older_cli_peers_do_not_register_or_receive_mobile_bridge_presence() {
+        use crate::terminal::ipc::{MobileBridgeEndpoints, MobileWatch};
+
+        let peer = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let endpoints = MobileBridgeEndpoints {
+            from: std::net::Ipv4Addr::LOCALHOST.into(),
+            to: std::net::Ipv4Addr::LOCALHOST.into(),
+        };
+        for request in [
+            ClientRequest::RegisterMobileBridge(endpoints),
+            ClientRequest::ReadMobileBridges {
+                include_endpoints: false,
+            },
+            ClientRequest::WatchMobile {
+                topic: MobileWatch::BridgePresence,
+            },
+        ] {
+            assert!(!peer.admits_request(&request));
+        }
+        for message in [
+            ServerMessage::MobileChanged {
+                topic: MobileWatch::BridgePresence,
+            },
+            ServerMessage::Response {
+                response: ServerResponse::MobileBridges {
+                    count: 0,
+                    endpoints: vec![],
+                },
+            },
+        ] {
+            assert!(!peer.admits_message(&message));
         }
     }
 

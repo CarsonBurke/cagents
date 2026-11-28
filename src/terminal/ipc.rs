@@ -391,7 +391,10 @@ use crate::{
 /// Version 227 appends the mobile relay test request.
 ///
 /// Version 228 adds manual provider CLI installation and update requests.
-pub const PROTOCOL_VERSION: u16 = 228;
+///
+/// Version 229 appends registration and snapshots of live SSH mobile bridges.
+/// A presence observer receives the existing mobile invalidation for a new topic.
+pub const PROTOCOL_VERSION: u16 = 229;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -989,15 +992,29 @@ pub enum ClientRequest {
     ProviderManage {
         provider: crate::agent::Provider,
     },
+    /// Count this SSH mobile bridge until its control connection closes.
+    RegisterMobileBridge(MobileBridgeEndpoints),
+    /// Read local bridge presence, including the endpoints for an open popover.
+    ReadMobileBridges {
+        include_endpoints: bool,
+    },
 }
 
-/// Read-only invalidations for the SSH bridge. They do not confer window
+/// Read-only invalidations for the SSH bridge and the desktop's phone control. They do not confer window
 /// presence, assign notification destinations or make a surface visible.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum MobileWatch {
     Sessions,
     Notifications,
     Conversation(TerminalId),
+    BridgePresence,
+}
+
+/// The two SSH addresses used to describe a connected phone's route.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MobileBridgeEndpoints {
+    pub from: std::net::IpAddr,
+    pub to: std::net::IpAddr,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1545,6 +1562,11 @@ pub enum ServerResponse {
     DeviceStats {
         revision: u64,
         stats: Option<crate::device_stats::DeviceStats>,
+    },
+    /// The current count and the endpoints, if requested.
+    MobileBridges {
+        count: usize,
+        endpoints: Vec<MobileBridgeEndpoints>,
     },
 }
 

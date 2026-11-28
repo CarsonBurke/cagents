@@ -246,3 +246,19 @@ fn an_answer_must_choose_an_offered_action_and_known_fields() {
         chat::Command::Interrupt
     );
 }
+
+#[test]
+fn bridge_presence_reads_an_openssh_connection_without_pairing_metadata() {
+    let endpoints = ssh_endpoints("100.101.102.103 4000 fe80::1%en0 22").unwrap();
+    assert_eq!(endpoints.from.to_string(), "100.101.102.103");
+    assert_eq!(endpoints.to.to_string(), "fe80::1");
+    for malformed in [
+        "",
+        "127.0.0.1 4000 127.0.0.1",
+        "localhost 4000 127.0.0.1 22",
+        "127.0.0.1 invalid 127.0.0.1 22",
+        "127.0.0.1 4000 127.0.0.1 22 comment",
+    ] {
+        assert!(ssh_endpoints(malformed).is_none(), "{malformed}");
+    }
+}

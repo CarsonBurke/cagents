@@ -1,15 +1,13 @@
 //! What a phone needs to know to reach this computer, and whether one is
 //! connected: read from the system, off the UI thread.
 //!
-//! Nothing here needs the daemon. A connected phone is a running
-//! `cagents daemon bridge --mobile` of this user's, and `SSH_CONNECTION` in
-//! its environment says where it connected from and to.
+//! The daemon keeps the addresses of its live SSH mobile bridges. The
+//! network and pairing probes read this computer's own settings.
 
 use std::{
     ffi::CStr,
     fs,
     net::Ipv4Addr,
-    os::unix::ffi::OsStrExt,
     path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
@@ -124,7 +122,10 @@ pub(crate) fn probe(network: bool) -> Status {
         Some(fixture) => fixture.network(),
         None => read_network(),
     });
-    let connections = read_connections(fixture.as_ref(), network.as_ref());
+    let connections = fixture
+        .as_ref()
+        .and_then(|fixture| fixture.connections(network.as_ref()))
+        .unwrap_or_else(|| read_connections(network.as_ref()));
     Status {
         phones,
         unwritable,
@@ -133,17 +134,30 @@ pub(crate) fn probe(network: bool) -> Status {
     }
 }
 
-pub(super) fn connected_count() -> usize {
-    read_connections(fixture::read().as_ref(), None).len()
+pub(super) fn fixture_connection_count() -> Option<usize> {
+    fixture::read()?
+        .connections(None)
+        .map(|connections| connections.len())
 }
 
-fn read_connections(
-    fixture: Option<&fixture::Fixture>,
-    network: Option<&Network>,
-) -> Vec<Connection> {
-    fixture
-        .and_then(|fixture| fixture.connections(network))
-        .unwrap_or_else(|| connections(mobile_bridge_environments(), network))
+fn read_connections(network: Option<&Network>) -> Vec<Connection> {
+    let endpoints = cagents::terminal::ipc::local_daemon_socket_path()
+        .ok()
+        .and_then(|socket| cagents::control::ControlClient::connect(&socket).ok())
+        .and_then(|mut client| client.mobile_bridges(true).ok())
+        .map_or_else(Vec::new, |(_, endpoints)| endpoints);
+    let mut connections: Vec<_> = endpoints
+        .into_iter()
+        .map(|endpoint| {
+            let from = endpoint.from.to_string();
+            Connection {
+                route: route(&endpoint.to.to_string(), &from, network),
+                from,
+            }
+        })
+        .collect();
+    connections.sort_by(|a, b| a.from.cmp(&b.from));
+    connections
 }
 
 fn read_network() -> Network {
@@ -493,88 +507,6 @@ fn interface_addresses() -> Vec<(String, Ipv4Addr)> {
 // Connected phones
 // ---------------------------------------------------------------------------
 
-/// The phones connected through `bridges`, the environments of this user's
-/// running mobile bridges, with where each connected from.
-fn connections(bridges: Vec<Vec<u8>>, network: Option<&Network>) -> Vec<Connection> {
-    let mut connections: Vec<Connection> = bridges
-        .iter()
-        .filter_map(|environ| {
-            let (from, to) = ssh_connection(environ)?;
-            Some(Connection {
-                route: route(&to, &from, network),
-                from,
-            })
-        })
-        .collect();
-    connections.sort_by(|a, b| a.from.cmp(&b.from));
-    connections
-}
-
-#[cfg(target_os = "linux")]
-fn mobile_bridge_environments() -> Vec<Vec<u8>> {
-    mobile_bridge_environments_in(Path::new("/proc"))
-}
-
-/// The environments of this user's running mobile bridges under `proc`.
-#[cfg(target_os = "linux")]
-fn mobile_bridge_environments_in(proc: &Path) -> Vec<Vec<u8>> {
-    use std::os::unix::fs::MetadataExt;
-    // SAFETY: geteuid has no preconditions.
-    let uid = unsafe { libc::geteuid() };
-    let Ok(entries) = fs::read_dir(proc) else {
-        return Vec::new();
-    };
-    entries
-        .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
-        })
-        .filter(|entry| entry.metadata().is_ok_and(|meta| meta.uid() == uid))
-        .filter(|entry| {
-            fs::read(entry.path().join("cmdline")).is_ok_and(|cmdline| is_mobile_bridge(&cmdline))
-        })
-        .filter_map(|entry| fs::read(entry.path().join("environ")).ok())
-        .collect()
-}
-
-/// The environments of this user's running mobile bridges. The kernel shows
-/// a process's arguments and environment only to its own user, so the
-/// bridges of others are never read.
-#[cfg(target_os = "macos")]
-fn mobile_bridge_environments() -> Vec<Vec<u8>> {
-    use cagents::process::{inspect, table};
-    // SAFETY: geteuid has no preconditions.
-    table::list(unsafe { libc::geteuid() })
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|pid| inspect::arguments(pid).ok())
-        .filter(|process| is_mobile_bridge(&process.command_line()))
-        .map(|process| process.environ())
-        .collect()
-}
-
-fn is_mobile_bridge(cmdline: &[u8]) -> bool {
-    let words: Vec<&[u8]> = cmdline.split(|byte| *byte == 0).collect();
-    words.len() >= 4
-        && Path::new(std::ffi::OsStr::from_bytes(words[0]))
-            .file_name()
-            .is_some_and(|name| name == "cagents")
-        && words[1..4] == [b"daemon".as_slice(), b"bridge", b"--mobile"]
-}
-
-/// `SSH_CONNECTION`'s client and server addresses.
-fn ssh_connection(environ: &[u8]) -> Option<(String, String)> {
-    let value = environ
-        .split(|byte| *byte == 0)
-        .find_map(|variable| variable.strip_prefix(b"SSH_CONNECTION="))?;
-    let text = std::str::from_utf8(value).ok()?;
-    let words: Vec<&str> = text.split_whitespace().collect();
-    Some((words.first()?.to_string(), words.get(2)?.to_string()))
-}
-
 fn route(server: &str, client: &str, network: Option<&Network>) -> Route {
     let in_tailscale_range = |address: &str| {
         address
@@ -804,53 +736,6 @@ mod tests {
         assert_eq!(host_key(&config), Some(key.fingerprint()));
         fs::write(&config, format!("HostKey {}\n", rsa.display())).unwrap();
         assert_eq!(host_key(&config), None);
-    }
-
-    #[test]
-    #[cfg(target_os = "linux")] // Reads a `/proc` fixture; Darwin has no procfs.
-    fn connected_bridges_are_found_with_their_addresses() {
-        let proc = tempfile::tempdir().unwrap();
-        let process = |pid: &str, cmdline: &[u8], environ: &[u8]| {
-            let directory = proc.path().join(pid);
-            fs::create_dir(&directory).unwrap();
-            fs::write(directory.join("cmdline"), cmdline).unwrap();
-            fs::write(directory.join("environ"), environ).unwrap();
-        };
-        process(
-            "100",
-            b"/home/a/.local/bin/cagents\0daemon\0bridge\0--mobile\0",
-            b"HOME=/home/a\0SSH_CONNECTION=100.88.1.4 50000 100.101.1.2 22\0",
-        );
-        process(
-            "101",
-            b"/x/cagents\0daemon\0bridge\0--mobile\0",
-            b"SSH_CONNECTION=10.0.0.249 41000 10.0.0.113 22\0",
-        );
-        // A desktop device bridge, and a bridge started without SSH.
-        process(
-            "102",
-            b"/x/cagents\0daemon\0bridge\0",
-            b"SSH_CONNECTION=10.0.0.5 1 10.0.0.113 22\0",
-        );
-        process(
-            "103",
-            b"/x/cagents\0daemon\0bridge\0--mobile\0",
-            b"HOME=/\0",
-        );
-        fs::create_dir(proc.path().join("self")).unwrap();
-        assert_eq!(
-            connections(mobile_bridge_environments_in(proc.path()), None),
-            [
-                Connection {
-                    from: "10.0.0.249".into(),
-                    route: Route::Lan,
-                },
-                Connection {
-                    from: "100.88.1.4".into(),
-                    route: Route::Tailscale,
-                },
-            ]
-        );
     }
 
     #[test]

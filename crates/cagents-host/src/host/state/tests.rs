@@ -984,6 +984,62 @@ fn mobile_watches_are_scoped_coalesced_and_do_not_register_window_presence() {
 }
 
 #[test]
+fn phone_presence_belongs_only_to_the_registered_control_connection() {
+    let mut host = test_host();
+    let observer = 1;
+    let bridge = 2;
+    let auxiliary_watch = 3;
+    let replacement = 4;
+    let delivery = host.register_client(observer);
+    host.register_client(bridge);
+    host.register_client(auxiliary_watch);
+    host.watch_mobile(observer, MobileWatch::BridgePresence)
+        .unwrap();
+    host.watch_mobile(auxiliary_watch, MobileWatch::Sessions)
+        .unwrap();
+    let endpoints = MobileBridgeEndpoints {
+        from: "100.101.102.103".parse().unwrap(),
+        to: "100.101.102.104".parse().unwrap(),
+    };
+
+    assert_eq!(host.mobile_bridges(observer, false), (0, vec![]));
+    assert!(!host.mobile_watchers[&observer].pending.get());
+    host.register_mobile_bridge(bridge, endpoints);
+    assert!(host.mobile_watchers[&observer].pending.get());
+    assert_eq!(host.mobile_bridges(observer, false), (1, vec![]));
+    assert_eq!(host.mobile_bridges(observer, true), (1, vec![endpoints]));
+
+    host.register_mobile_bridge(bridge, endpoints);
+    host.unregister_client(auxiliary_watch);
+    assert!(!host.mobile_watchers[&observer].pending.get());
+    assert_eq!(host.mobile_bridges(observer, false).0, 1);
+
+    host.unregister_client(bridge);
+    assert!(host.mobile_watchers[&observer].pending.get());
+    assert_eq!(host.mobile_bridges(observer, false).0, 0);
+    host.register_client(replacement);
+    host.register_mobile_bridge(replacement, endpoints);
+    assert!(host.mobile_watchers[&observer].pending.get());
+    assert_eq!(host.mobile_bridges(observer, false).0, 1);
+    host.forget_client_delivery(replacement);
+    assert!(host.mobile_watchers[&observer].pending.get());
+    assert_eq!(host.mobile_bridges(observer, false).0, 0);
+    host.unregister_client(replacement);
+    assert!(!host.mobile_watchers[&observer].pending.get());
+    assert_eq!(test_host().mobile_bridges(observer, false).0, 0);
+
+    // Edges still in the delivery slot coalesce until the observer reads it.
+    delivery.close_after_drain();
+    assert!(matches!(
+        delivery.pop().unwrap().into_message(),
+        ServerMessage::MobileChanged {
+            topic: MobileWatch::BridgePresence
+        }
+    ));
+    assert!(delivery.pop().is_none());
+}
+
+#[test]
 fn run_notification_routes_only_to_a_cagents_window_without_a_provider_pane() {
     let mut host = test_host();
     let delivery = host.register_client(1);

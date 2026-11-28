@@ -1066,6 +1066,15 @@ impl Hangup {
     }
 }
 
+/// Arms an inode watch on a directory that can contain a control socket. The
+/// returned descriptor becomes readable when an entry changes.
+pub fn watch_control_directory(path: &Path) -> io::Result<impl AsFd> {
+    let directory = fs::File::open(path)?;
+    crate::fs_watch::FileWatches::shared()
+        .and_then(|watches| watches.watch(&directory))
+        .ok_or_else(|| io::Error::other("could not watch the control directory"))
+}
+
 /// One shared-model edit another client applied, as a watcher receives it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ModelEdge {
@@ -1170,6 +1179,15 @@ impl ControlClient {
     /// Connect and complete a proof-pinning handshake with no expected proof.
     pub fn connect(socket_path: &Path) -> Result<Self, ControlError> {
         Self::connect_observing_socket(socket_path, |_| Ok(()))
+    }
+
+    /// Let a blocking observer hand its owner the cancellation handle before
+    /// the daemon handshake starts.
+    pub fn connect_with_hangup(
+        socket_path: &Path,
+        connected: impl FnOnce(Hangup) -> io::Result<()>,
+    ) -> Result<Self, ControlError> {
+        Self::connect_observing_socket(socket_path, |stream| connected(Hangup(stream.try_clone()?)))
     }
 
     /// Make the socket available for cancellation before the handshake.
@@ -1681,6 +1699,34 @@ impl ControlClient {
         match self.request_strict(ClientRequest::ApplyWorkspaceEdit { edit })? {
             ServerResponse::WorkspaceEdit(receipt) => Ok(receipt),
             response => Err(unexpected_response("a workspace edit receipt", &response)),
+        }
+    }
+
+    pub(crate) fn register_mobile_bridge(
+        &mut self,
+        endpoints: crate::terminal::ipc::MobileBridgeEndpoints,
+    ) -> Result<(), ControlError> {
+        self.accepted(ClientRequest::RegisterMobileBridge(endpoints))
+    }
+
+    pub fn watch_mobile_bridges(&mut self) -> Result<(), ControlError> {
+        self.watch_mobile(crate::terminal::ipc::MobileWatch::BridgePresence)
+    }
+
+    pub fn next_mobile_bridge_change(&mut self) -> Result<(), ControlError> {
+        self.next_mobile_change()
+    }
+
+    pub fn mobile_bridges(
+        &mut self,
+        include_endpoints: bool,
+    ) -> Result<(usize, Vec<crate::terminal::ipc::MobileBridgeEndpoints>), ControlError> {
+        self.stream
+            .set_read_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        match self.request_strict(ClientRequest::ReadMobileBridges { include_endpoints })? {
+            ServerResponse::MobileBridges { count, endpoints } => Ok((count, endpoints)),
+            response => Err(unexpected_response("a mobile bridge snapshot", &response)),
         }
     }
 
@@ -3770,6 +3816,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatExitedQueuePage { .. } => "chat_exited_queue_page",
         ServerResponse::ChatExitedQueue { .. } => "chat_exited_queue",
         ServerResponse::DeviceStats { .. } => "device_stats",
+        ServerResponse::MobileBridges { .. } => "mobile_bridges",
         ServerResponse::ChatUpdate { .. } => "chat_update",
         ServerResponse::ChatFileChanges { .. } => "chat_file_changes",
         ServerResponse::ChatFileChangePatches { .. } => "chat_file_change_patches",

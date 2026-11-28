@@ -241,6 +241,16 @@ mod tests {
     }
 
     #[test]
+    fn directory_watch_wakes_when_a_socket_appears() {
+        let directory = tempfile::tempdir().unwrap();
+        let watch = watch(directory.path());
+        assert!(!ready(&watch, 0));
+        let _listener =
+            std::os::unix::net::UnixListener::bind(directory.path().join("daemon.sock")).unwrap();
+        assert!(ready(&watch, 2000));
+    }
+
+    #[test]
     fn one_kernel_watch_dispatches_to_each_subscriber_of_its_inode() {
         let mut first = tempfile::NamedTempFile::new().unwrap();
         let mut second = tempfile::NamedTempFile::new().unwrap();

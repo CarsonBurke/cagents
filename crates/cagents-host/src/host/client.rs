@@ -205,6 +205,8 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ReadCapturedTerminalRemovalBasis { .. }
             | ClientRequest::ReadNotifications
             | ClientRequest::WatchMobile { .. }
+            | ClientRequest::RegisterMobileBridge(_)
+            | ClientRequest::ReadMobileBridges { .. }
             | ClientRequest::WatchDeviceStats
             | ClientRequest::ProviderStatus
     )
@@ -2419,6 +2421,23 @@ fn process_admitted_request(
                 .unwrap_or_else(|p| p.into_inner())
                 .watch_mobile(client_id, topic)?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::RegisterMobileBridge(endpoints) => {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .register_mobile_bridge(client_id, endpoints);
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ReadMobileBridges { include_endpoints } => {
+            let (count, endpoints) = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mobile_bridges(client_id, include_endpoints);
+            Ok((
+                ServerResponse::MobileBridges { count, endpoints },
+                Vec::new(),
+                false,
+            ))
         }
         ClientRequest::WatchTerminals => {
             host.lock()
