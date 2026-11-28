@@ -969,9 +969,18 @@ impl Card {
         if let Some(unrenderable) = session.unrenderable.take()
             && session.webview.url().as_ref() == Some(&unrenderable.url)
         {
-            self.events.semantic(BrowserEvent::Unrenderable(
-                unrenderable.into_document(servo),
-            ));
+            // Reading the cookie jar calls into the engine outside the spin's
+            // guard. A panic there costs only the offer, not the thread.
+            let _recovered = crate::instance::recovered_panic_scope();
+            match std::panic::catch_unwind(AssertUnwindSafe(|| unrenderable.into_document(servo))) {
+                Ok(document) => {
+                    self.events.semantic(BrowserEvent::Unrenderable(document));
+                }
+                Err(payload) => tracing::error!(
+                    "the browser engine panicked reading a document's cookies: {}",
+                    panic_detail(payload.as_ref())
+                ),
+            }
         }
         if session.restore_scroll_ready.replace(false) {
             let x = self.restore.scroll_x;
