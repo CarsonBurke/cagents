@@ -2626,7 +2626,7 @@ fn fixture_with_codex_listener() -> (tempfile::TempDir, SharedHost, Submit, std:
 
 #[test]
 fn fresh_codex_execution_survives_a_long_caller_tmpdir() {
-    let caller = tempfile::tempdir_in("/var/tmp").unwrap();
+    let caller = tempfile::tempdir().unwrap();
     let long_tmpdir = caller
         .path()
         .join("a".repeat(crate::chat::protocol::codex::OWNED_LISTENER_PATH_CAPACITY));
@@ -2640,7 +2640,10 @@ fn fresh_codex_execution_survives_a_long_caller_tmpdir() {
         .env("TMPDIR", long_tmpdir)
         .status()
         .unwrap();
-    assert!(status.success(), "Codex execution failed under a long TMPDIR");
+    assert!(
+        status.success(),
+        "Codex execution failed under a long TMPDIR"
+    );
 }
 
 #[test]
