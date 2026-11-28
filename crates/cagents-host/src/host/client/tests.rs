@@ -448,12 +448,9 @@ fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences()
     }
 }
 
-/// The daemon's admission refuses an automatic account switch before it
-/// changes anything, so the switch is marked as refused before any effect
-/// and keeps the sentence; an explicit recovery keeps the refusal as is.
-#[test]
-fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
-    let (proof, host) = panic_test_host("automatic-switch-admission");
+fn account_switch_sessions(
+    proof: HostSessionProof,
+) -> (crate::chat::Session, crate::chat::Session) {
     let source = crate::chat::Session {
         id: TerminalId::new(),
         proof: Some(proof),
@@ -476,6 +473,16 @@ fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
     let mut replacement = source.clone();
     replacement.id = TerminalId::new();
     replacement.proof = None;
+    (source, replacement)
+}
+
+/// The daemon's admission refuses an automatic account switch before it
+/// changes anything, so the switch is marked as refused before any effect
+/// and keeps the sentence; an explicit recovery keeps the refusal as is.
+#[test]
+fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
+    let (proof, host) = panic_test_host("automatic-switch-admission");
+    let (source, replacement) = account_switch_sessions(proof);
     host.lock().unwrap().request_shutdown();
     for (idle_generation, code) in [
         (Some(3), ProtocolErrorCode::NotAdmitted),
@@ -502,6 +509,143 @@ fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
         assert!(state.chats.is_empty());
         assert!(state.chat_spawning.is_empty());
     }
+}
+
+fn wire_control_request(
+    stream: &mut UnixStream,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) {
+    crate::terminal_ipc::write_frame(
+        stream,
+        &ClientEnvelope {
+            version: PROTOCOL_VERSION,
+            proof: Some(proof.clone()),
+            request_id: id,
+            request,
+        },
+    )
+    .unwrap();
+}
+
+fn await_exclusive_queue(gate: &ControlGate) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gate.try_shared().is_some() {
+        assert!(
+            Instant::now() < deadline,
+            "the exclusive request never queued"
+        );
+        thread::sleep(Duration::from_millis(2));
+    }
+}
+
+#[test]
+fn a_queued_account_switch_can_be_withdrawn_while_the_daemon_is_busy() {
+    let (proof, host) = panic_test_host("withdraw-account-switch");
+    let (client, server) = UnixStream::pair().unwrap();
+    let server_host = Arc::clone(&host);
+    let server = thread::spawn(move || serve(server, 1, server_host));
+    let (mut stream, _) = crate::control::ControlClient::from_stream(client)
+        .unwrap()
+        .into_handshaken_stream();
+    let gate = control_gate(&host);
+    let slow = gate.shared();
+    let (source, replacement) = account_switch_sessions(proof.clone());
+    wire_control_request(
+        &mut stream,
+        &proof,
+        2,
+        ClientRequest::ChatRecoverAccount {
+            source,
+            replacement,
+            idle_generation: Some(3),
+            execution_environment: Default::default(),
+        },
+    );
+    await_exclusive_queue(&gate);
+    stream.shutdown(Shutdown::Write).unwrap();
+
+    let reply: ServerEnvelope = FrameCodec::new(MAX_FRAME_BYTES)
+        .read(&mut stream)
+        .unwrap()
+        .expect("the peer kept its read half open for the withdrawal reply");
+    assert_eq!(reply.request_id, Some(2));
+    let ServerMessage::Error(error) = reply.message else {
+        panic!("the switch was not refused");
+    };
+    assert_eq!(error.code, ProtocolErrorCode::NotAdmitted);
+    assert!(!error.retryable);
+    assert!(gate.try_shared().is_some());
+    drop(slow);
+    server.join().unwrap();
+    let state = host.lock().unwrap();
+    assert!(state.chats.is_empty());
+    assert!(state.chat_spawning.is_empty());
+}
+
+#[test]
+fn a_dropped_exclusive_client_releases_the_queue_even_with_buffered_input() {
+    let (proof, host) = panic_test_host("abandon-queued-shutdown");
+    let (client, server) = UnixStream::pair().unwrap();
+    let server_host = Arc::clone(&host);
+    let (dispatched, requests) = std::sync::mpsc::channel();
+    let server = thread::spawn(move || {
+        serve_connection(server, 1, server_host, |host, client, request, stream| {
+            if matches!(&request, ClientRequest::Shutdown) {
+                dispatched.send(()).unwrap();
+            }
+            process_wire_request(host, client, request, Some(stream))
+        });
+    });
+    let (mut stream, _) = crate::control::ControlClient::from_stream(client)
+        .unwrap()
+        .into_handshaken_stream();
+    let gate = control_gate(&host);
+    let slow = gate.shared();
+    wire_control_request(
+        &mut stream,
+        &proof,
+        2,
+        ClientRequest::ShutdownV1 {
+            version: SHUTDOWN_VERSION,
+            operation: ShutdownOperation::Preflight,
+        },
+    );
+    await_exclusive_queue(&gate);
+    wire_control_request(&mut stream, &proof, 3, ClientRequest::Shutdown);
+    drop(stream);
+
+    let (entered, ordinary) = std::sync::mpsc::channel();
+    thread::scope(|scope| {
+        scope.spawn(|| {
+            drop(gate.shared());
+            let _ = entered.send(());
+        });
+        let result = ordinary.recv_timeout(Duration::from_secs(2));
+        drop(slow);
+        result.expect("the departed peer held ordinary requests back");
+    });
+    server.join().unwrap();
+    assert_eq!(
+        requests.try_recv(),
+        Err(std::sync::mpsc::TryRecvError::Disconnected)
+    );
+    assert!(!host.lock().unwrap().shutting_down);
+}
+
+#[test]
+fn the_peer_check_preserves_buffered_input_and_only_a_switch_cancels_on_write_eof() {
+    use std::io::Write;
+    let (mut client, mut server) = UnixStream::pair().unwrap();
+    client.write_all(b"next frame").unwrap();
+    assert!(!request_abandoned(&server, true));
+    client.shutdown(Shutdown::Write).unwrap();
+    assert!(!request_abandoned(&server, false));
+    let mut input = [0; 10];
+    server.read_exact(&mut input).unwrap();
+    assert_eq!(&input, b"next frame");
+    assert!(request_abandoned(&server, true));
 }
 
 fn wait_client_retirement(mut ready: impl FnMut() -> bool) {
