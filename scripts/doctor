@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tomllib
@@ -191,14 +192,19 @@ def check_codex_watcher(report, system_directory):
     if sys.platform != "linux" or shutil.which("codex") is None:
         return
     try:
-        system_directory.stat()
+        metadata = system_directory.stat()
     except FileNotFoundError:
-        report.warn("codex", f"{system_directory} is missing. Idle Codex app-servers can wake "
-                    "on unrelated file opens under /etc. "
-                    "See docs/performance.md#idle-codex-app-servers")
+        problem = "is missing"
     except OSError:
         # An unreadable path may still exist. Leave it to the administrator.
         return
+    else:
+        if stat.S_ISDIR(metadata.st_mode):
+            return
+        problem = "must be a directory"
+    report.warn("codex", f"{system_directory} {problem}. Idle Codex app-servers can wake "
+                "on unrelated file opens under /etc. "
+                "See docs/performance.md#idle-codex-app-servers")
 
 
 def main():

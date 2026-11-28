@@ -932,7 +932,8 @@ every app-server watches `/etc`. Opens of files such as `/etc/ld.so.cache`
 then wake each server even with no turn in progress. Codex discards these
 events after its watcher has received them. [Upstream Codex issue #49881](https://github.com/openai/codex/issues/49881)
 
-`mise run doctor` flags a missing local `/etc/codex` when Codex is on PATH.
+`mise run doctor` checks that local `/etc/codex` resolves to a directory when
+Codex is on PATH.
 On a machine you administer, create the directory if it is absent:
 
 ```sh
