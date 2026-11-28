@@ -1993,20 +1993,18 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
         unset_environment: Default::default(),
     };
     let spec = ProcessSpec::from(&recipe);
+    let mode = if changes_during_close {
+        "auto"
+    } else {
+        "dontAsk"
+    };
     let mut initial = Step {
         events: vec![
             Event::Session {
                 id: session_id.into(),
                 title: None,
             },
-            Event::PermissionMode(Some(
-                if changes_during_close {
-                    "auto"
-                } else {
-                    "dontAsk"
-                }
-                .into(),
-            )),
+            Event::PermissionMode(Some(mode.into())),
             Event::Status {
                 busy: changes_during_close,
                 detail: "Muse".into(),
@@ -2024,6 +2022,12 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
         |_| {},
     )
     .unwrap();
+    completion_wait_until(|| {
+        handle.snapshot(None).is_some_and(|snapshot| {
+            snapshot.session_id.as_deref() == Some(session_id)
+                && snapshot.permission_mode.as_deref() == Some(mode)
+        })
+    });
     completion_wake_record(
         &host,
         chat_id,

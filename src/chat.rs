@@ -330,6 +330,24 @@ mod acp_permission_tests {
             launch.terminal_recipe_with_permission_mode(None).is_ok(),
             "an existing terminal spelling is valid before the chat reports a mode"
         );
+
+        launch
+            .recipe
+            .arguments
+            .insert(0, "--approval-mode=dontAsk".into());
+        let terminal = launch.terminal_recipe_with_permission_mode(None).unwrap();
+        assert_eq!(
+            terminal.arguments,
+            [
+                "resume",
+                id,
+                "--disable-write",
+                "--model",
+                "m",
+                "--approval-mode",
+                "never"
+            ]
+        );
     }
 }
 
