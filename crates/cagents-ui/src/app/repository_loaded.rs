@@ -200,20 +200,10 @@ impl Cagents {
                     pull_requests,
                 )
                 .with_kind(loaded.project.kind);
-                if let GitHubAvailability::Ready {
-                    pull_requests: recent,
-                    ..
-                } = &loaded.github
-                {
-                    let recent = recent.iter().map(|(pr, _)| pr.clone()).collect::<Vec<_>>();
-                    apply_attached_worktree_prs(
-                        &mut sidebar_project,
-                        &loaded.worktrees,
-                        &recent,
-                        &[],
-                    );
-                }
                 sidebar_project.github_ready = loaded.github.repository_key().is_some();
+                if matches!(loaded.github, GitHubAvailability::Ready { .. }) {
+                    apply_attached_worktree_prs(&mut sidebar_project, &loaded.worktrees, &[]);
+                }
                 if !sidebar_project.github_ready {
                     sidebar_project.revoke_github();
                 }
