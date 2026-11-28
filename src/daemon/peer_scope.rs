@@ -16,6 +16,44 @@ pub fn peer_requires_session_authority(socket: &UnixStream, peer: PeerCredential
     !matches!(hosted_peer(socket, peer), Ok(false))
 }
 
+enum Ancestor {
+    Pinned(PinnedProcess),
+    #[cfg(target_os = "macos")]
+    Foreign(crate::pinned_process::ForeignAncestor),
+}
+
+impl Ancestor {
+    fn open(
+        pid: u32,
+        #[cfg_attr(target_os = "linux", allow(unused_variables))] uid: u32,
+    ) -> io::Result<Self> {
+        match PinnedProcess::open(pid) {
+            Ok(process) => Ok(Self::Pinned(process)),
+            #[cfg(target_os = "macos")]
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                crate::pinned_process::ForeignAncestor::open(pid, uid).map(Self::Foreign)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn parent_pid(&self) -> io::Result<u32> {
+        match self {
+            Self::Pinned(process) => process.parent_pid(),
+            #[cfg(target_os = "macos")]
+            Self::Foreign(process) => process.parent_pid(),
+        }
+    }
+
+    fn is_host(&self, uid: u32) -> io::Result<bool> {
+        match self {
+            Self::Pinned(process) => Ok(process.uid()? == uid && is_host(process)?),
+            #[cfg(target_os = "macos")]
+            Self::Foreign(_) => Ok(false),
+        }
+    }
+}
+
 fn hosted_peer(socket: &UnixStream, peer: PeerCredentials) -> io::Result<bool> {
     let uid = super::current_uid();
     if peer.uid != uid || peer.pid <= 1 {
@@ -27,7 +65,7 @@ fn hosted_peer(socket: &UnixStream, peer: PeerCredentials) -> io::Result<bool> {
             "procfs is not in the daemon's PID namespace",
         ));
     }
-    let mut process = PinnedProcess::socket_peer(socket, peer.pid)?;
+    let process = PinnedProcess::socket_peer(socket, peer.pid)?;
     if process.exited()? {
         return Err(io::ErrorKind::NotFound.into());
     }
@@ -36,6 +74,7 @@ fn hosted_peer(socket: &UnixStream, peer: PeerCredentials) -> io::Result<bool> {
         return Ok(true);
     }
 
+    let mut process = Ancestor::Pinned(process);
     for _ in 0..MAX_ANCESTORS {
         let parent = process.parent_pid()?;
         if parent == std::process::id() {
@@ -45,11 +84,11 @@ fn hosted_peer(socket: &UnixStream, peer: PeerCredentials) -> io::Result<bool> {
             return Ok(false);
         }
         // A peer with invisible ancestry cannot prove that it is external.
-        let ancestor = PinnedProcess::open(parent)?;
+        let ancestor = Ancestor::open(parent, uid)?;
         if process.parent_pid()? != parent {
             return Err(io::Error::other("the peer's ancestry changed"));
         }
-        if ancestor.uid()? == uid && is_host(&ancestor)? {
+        if ancestor.is_host(uid)? {
             return Ok(true);
         }
         process = ancestor;
