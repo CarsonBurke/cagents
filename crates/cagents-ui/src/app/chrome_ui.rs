@@ -25,6 +25,9 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
 #[derive(Debug, Default)]
 pub(super) struct State {
     pub(super) hovered_tab: Option<CardId>,
+    /// Where `hovered_tab` sits in the strip, so the tab that takes its
+    /// place under the pointer when it closes can be hovered in its stead.
+    hovered_slot: Option<usize>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
     /// Accepted spawn labels, read without loading a provider conversation.
@@ -322,6 +325,27 @@ mod tests {
                 app.workspace.shown()
             ))
         );
+    }
+
+    #[test]
+    fn the_tab_that_slides_under_the_pointer_is_hovered_in_the_closed_ones_place() {
+        for held in [true, false] {
+            let mut app = tab_fixture(5, 1100.0);
+            let order: Vec<_> = app.workspace.shown().collect();
+            if held {
+                drop(app.update_chrome(Action::TabsHover(true)));
+            }
+            drop(app.update_chrome(Action::HoverTab(Some(order[1]))));
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.retain(|card| card.id != order[1]);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.workspace.resize_viewport(1100.0);
+            drop(app.sync_chrome());
+            // Held, the next tab's close button comes to rest under the
+            // pointer and shows; otherwise the tabs resized and nothing in
+            // particular is under it.
+            assert_eq!(app.chrome_ui.hovered_tab, held.then_some(order[2]));
+        }
     }
 
     #[test]
@@ -2817,6 +2841,8 @@ impl Cagents {
         match action {
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
+                self.chrome_ui.hovered_slot =
+                    card.and_then(|card| self.workspace.shown().position(|id| id == card));
                 Task::none()
             }
             Action::UnhoverTab(card) => {
@@ -3769,6 +3795,35 @@ impl Cagents {
             width.min(self.workspace.viewport_width())
         } else {
             width
+        }
+    }
+
+    /// Keeps the hovered tab the one under the pointer as tabs close.
+    ///
+    /// A tab hears the pointer come over it only when the pointer moves, so
+    /// the tab that slides into a closed one's place, where the held width
+    /// puts it under the resting pointer, would otherwise show no close
+    /// button until the pointer moved: closing tabs one after another
+    /// stalled after the first.
+    pub(super) fn follow_hovered_tab(&mut self) {
+        let Some(hovered) = self.chrome_ui.hovered_tab else {
+            self.chrome_ui.hovered_slot = None;
+            return;
+        };
+        let shown: Vec<_> = self.workspace.shown().collect();
+        if let Some(slot) = shown.iter().position(|id| *id == hovered) {
+            self.chrome_ui.hovered_slot = Some(slot);
+            return;
+        }
+        // Without a hold the tabs have resized, so nothing in particular
+        // came to rest under the pointer.
+        self.chrome_ui.hovered_tab = self
+            .tabs_held()
+            .then(|| self.chrome_ui.hovered_slot.and_then(|slot| shown.get(slot)))
+            .flatten()
+            .copied();
+        if self.chrome_ui.hovered_tab.is_none() {
+            self.chrome_ui.hovered_slot = None;
         }
     }
 

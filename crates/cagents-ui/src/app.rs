@@ -9917,6 +9917,7 @@ impl Cagents {
     fn sync_chrome(&mut self) -> Task<Message> {
         #[cfg(test)]
         terminal_output_tests::record_chrome();
+        self.follow_hovered_tab();
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
