@@ -2491,17 +2491,16 @@ impl UiUpdateGuard {
         slots: &[String],
         executable: &Path,
     ) -> io::Result<Option<String>> {
-        let running = running_window_slots(&self.runtime)?;
+        require_owned_runtime_directory(&self.runtime)?;
         self.relaunch_selected_windows(slots, executable, |guard, slot| {
-            if running.iter().any(|running| running == slot) {
+            validate_window_slot(slot)?;
+            if private_lock_is_held(&guard.runtime.join(slot_lock_name(slot)))? {
                 return Ok(false);
             }
             #[cfg(target_os = "linux")]
             if guard.reconnecting_slot(slot, executable)? {
                 return Ok(false);
             }
-            #[cfg(not(target_os = "linux"))]
-            let _ = guard;
             Ok(true)
         })
     }
@@ -5200,23 +5199,40 @@ mod tests {
                     .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
             );
 
-            #[cfg(target_os = "linux")]
-            {
-                let broken = crate::device::scoped_window_slot("unavailable", PRIMARY_WINDOW);
-                let lock = device_reconnect_lock_path(&broken).unwrap();
-                fs::create_dir(&lock).unwrap();
-                fs::remove_file(&arguments).unwrap();
-                let mut guard = UiUpdateGuard::acquire().unwrap();
-                guard.set_recovery_restore_only();
-                let failure = guard
-                    .relaunch_missing_windows(&[broken.clone(), PRIMARY_WINDOW.into()], &executable)
-                    .unwrap_err();
-                assert!(failure.to_string().contains(&broken));
-                let arguments = fs::read_to_string(&arguments).unwrap();
-                assert!(arguments.contains("--window\nprimary\n"));
-                assert!(arguments.contains(RESTORE_EXISTING_ONLY_ARGUMENT));
+            fs::remove_file(&arguments).unwrap();
+            let mut guard = UiUpdateGuard::acquire().unwrap();
+            guard.set_recovery_restore_only();
+            let broken_locks = [
+                (
+                    "broken-lease".to_owned(),
+                    guard.runtime.join(slot_lock_name("broken-lease")),
+                ),
+                #[cfg(target_os = "linux")]
+                {
+                    let slot = crate::device::scoped_window_slot("unavailable", PRIMARY_WINDOW);
+                    let lock = device_reconnect_lock_path(&slot).unwrap();
+                    (slot, lock)
+                },
+            ];
+            for (_, lock) in &broken_locks {
+                fs::create_dir(lock).unwrap();
+            }
+            let slots = broken_locks
+                .iter()
+                .map(|(slot, _)| slot.clone())
+                .chain([PRIMARY_WINDOW.into()])
+                .collect::<Vec<_>>();
+            let failure = guard
+                .relaunch_missing_windows(&slots, &executable)
+                .unwrap_err()
+                .to_string();
+            for (slot, lock) in &broken_locks {
+                assert!(failure.contains(slot));
                 assert!(lock.is_dir(), "failed ownership evidence must be preserved");
             }
+            let recovery_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(recovery_arguments.contains("--window\nprimary\n"));
+            assert!(recovery_arguments.contains(RESTORE_EXISTING_ONLY_ARGUMENT));
 
             // A later ordinary launch from this same process has no recovery
             // argv or environment policy to inherit.
