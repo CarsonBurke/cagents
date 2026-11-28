@@ -56,16 +56,26 @@ pub(super) fn fail_managed_start_after_spawn(
     Err("fixture startup failed after spawning".into())
 }
 
-fn failed_managed_pane() -> (
-    SharedHost,
-    Session,
-    crate::model::AgentId,
-    Arc<StartupFailure>,
-) {
+struct FailedPane {
+    host: SharedHost,
+    source: Session,
+    agent: crate::model::AgentId,
+    failure: Arc<StartupFailure>,
+    lease: crate::daemon::HostLease,
+}
+
+fn failed_managed_pane() -> FailedPane {
     use super::super::agent_execution;
     use crate::agent_execution::{HostedSession, Origin};
+    use crate::daemon::holder_registry::{self, Kind};
 
     let (host, mut request, path) = agent_execution::tests::fixture();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, host.lock().unwrap().proof()).unwrap();
+    crate::secure_file::prepare_private_directory(
+        &holder_registry::directory(Kind::Native).unwrap(),
+    )
+    .unwrap();
     request.idempotency_key = uuid::Uuid::new_v4().to_string();
     let registry = agent_execution::registry(&host).unwrap();
     let agent = registry
@@ -110,7 +120,13 @@ fn failed_managed_pane() -> (
         .message
         .contains("fixture startup failed after spawning")
     );
-    (host, source, agent.id, failure)
+    FailedPane {
+        host,
+        source,
+        agent: agent.id,
+        failure,
+        lease,
+    }
 }
 
 #[test]
@@ -122,7 +138,13 @@ fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
     {
         return;
     }
-    let (host, source, _, failure) = failed_managed_pane();
+    let FailedPane {
+        host,
+        source,
+        failure,
+        lease: _lease,
+        ..
+    } = failed_managed_pane();
     let start = || {
         start(
             &host,
@@ -190,7 +212,13 @@ fn both_close_paths_retire_a_failed_managed_pane_after_proving_cleanup() {
         return;
     }
     for from_pane in [true, false] {
-        let (host, source, id, failure) = failed_managed_pane();
+        let FailedPane {
+            host,
+            source,
+            agent: id,
+            failure,
+            lease: _lease,
+        } = failed_managed_pane();
         let close = || {
             if from_pane {
                 close_retained_from_pane(&host, &source)
@@ -238,7 +266,13 @@ fn a_startup_receipt_cannot_retire_a_different_durable_source() {
     {
         return;
     }
-    let (host, source, id, failure) = failed_managed_pane();
+    let FailedPane {
+        host,
+        source,
+        agent: id,
+        failure,
+        lease: _lease,
+    } = failed_managed_pane();
     let original = HostedSession::Chat(source.clone());
     let mut other = source.clone();
     other
