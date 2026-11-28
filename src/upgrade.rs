@@ -2383,6 +2383,15 @@ pub mod handoff {
                         }
                     }
                 }
+                // The journal already issues these exact pairs from its
+                // primary fields. Keep aliases with a distinct launch.
+                entry.aliases.retain(|alias| {
+                    *alias != entry.evidence.source
+                        && *alias != entry.replacement
+                        && !entry.evidence.previous_sources.iter().any(|previous| {
+                            previous.source == *alias && previous.launch == entry.evidence.launch
+                        })
+                });
                 previous.retain(|old| old.replacement.id != entry.replacement.id);
                 previous.push(entry);
             }
@@ -3139,6 +3148,76 @@ pub mod handoff {
                     store.load().unwrap().is_none(),
                     "reading lineage cannot mint a replay checkpoint"
                 );
+            }
+        }
+
+        #[test]
+        fn recovered_journal_omits_duplicate_pairs_without_losing_old_panes() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            let mut entry = recovered_fixture(crate::agent::Provider::Claude);
+            let mut earlier = entry.evidence.source.clone();
+            earlier.proof.as_mut().unwrap().host_incarnation = "earlier".into();
+            let confirmed = earlier.clone();
+            earlier.launch.session_id = None;
+            let mut distinct = earlier.clone();
+            distinct.proof.as_mut().unwrap().host_incarnation = "other-launch".into();
+            let mut distinct_launch = entry.evidence.launch.clone();
+            distinct_launch
+                .recipe
+                .arguments
+                .push("--saved-resume".into());
+            let mut distinct_confirmed = distinct.clone();
+            distinct_confirmed.launch.session_id = distinct_launch.session_id.clone();
+            entry.evidence.previous_sources = vec![
+                ChatSource {
+                    source: earlier.clone(),
+                    launch: entry.evidence.launch.clone(),
+                },
+                ChatSource {
+                    source: distinct.clone(),
+                    launch: distinct_launch,
+                },
+            ];
+            entry.aliases = vec![
+                confirmed.clone(),
+                distinct.clone(),
+                distinct_confirmed.clone(),
+            ];
+            store
+                .record_recovered(std::slice::from_ref(&entry))
+                .unwrap();
+            let path = store.path.with_file_name(RECOVERED_FILE);
+            let first = std::fs::read(&path).unwrap();
+            let written = store.read_recovered().unwrap().pop().unwrap();
+            assert!(written.aliases.contains(&distinct));
+            store
+                .record_recovered(std::slice::from_ref(&entry))
+                .unwrap();
+            let repeated = std::fs::read(&path).unwrap();
+            assert_eq!(repeated.len(), first.len());
+            assert!(
+                repeated == first,
+                "repeating the recovered write must be byte-idempotent"
+            );
+
+            let mut next = entry.clone();
+            next.evidence.source = entry.replacement.clone();
+            next.evidence.previous_sources.clear();
+            next.aliases.clear();
+            next.replacement.proof.as_mut().unwrap().host_incarnation = "later".into();
+            store.record_recovered(std::slice::from_ref(&next)).unwrap();
+            let recovered = store.recovered_chats().unwrap();
+            let serving = next.replacement.proof.as_ref().unwrap();
+            for saved_pane in [
+                &earlier,
+                &confirmed,
+                &distinct,
+                &distinct_confirmed,
+                &entry.evidence.source,
+                &entry.replacement,
+            ] {
+                assert!(recovered.proves(saved_pane, &next.replacement, serving));
             }
         }
 
