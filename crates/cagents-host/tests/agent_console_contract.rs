@@ -64,6 +64,16 @@ impl Fixture {
     }
 
     fn with_provider(script: &str) -> Self {
+        Self::with_programs(|root| Self::install_program(root, "claude", script))
+    }
+
+    fn install_program(root: &Path, name: &str, script: &str) {
+        let program = root.join("bin").join(name);
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn with_programs(install: impl FnOnce(&Path)) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
         fs::create_dir_all(root.path().join("bin/lib")).unwrap();
@@ -110,9 +120,7 @@ impl Fixture {
                 .unwrap();
             assert!(output.status.success(), "private Git setup: {output:?}");
         }
-        let provider = root.path().join("bin/claude");
-        fs::write(&provider, script).unwrap();
-        fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+        install(root.path());
         let daemon = Self::spawn_daemon(root.path());
         let fixture = Self {
             root,
@@ -299,6 +307,165 @@ impl Drop for Fixture {
             if !panicking {
                 panic!("private fixture cleanup failed: {error}");
             }
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
+fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    let fixture = Fixture::with_programs(|root| {
+        for (directory, name, source) in [
+            (
+                "libexec/acp",
+                "fake-acp-agent.py",
+                include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+            ),
+            (
+                "scripts",
+                "fixture_home.py",
+                include_str!("../../../scripts/fixture_home.py"),
+            ),
+            ("config/muse", "auth.json", r#"{"fixture":true}"#),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(name), source).unwrap();
+        }
+        fs::create_dir(root.join("home/.gemini")).unwrap();
+        let provider = include_str!("../../../tests/fixtures/fixture-acp.sh");
+        Fixture::install_program(root, "agy", provider);
+        Fixture::install_program(root, "muse-upstream", provider);
+        Fixture::install_program(root, "muse", "#!/bin/sh\nexec muse-upstream \"$@\"\n");
+    });
+
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let consult =
+        "Review this checkout and outline possible improvements without editing anything.";
+    let followup = "Describe the tradeoffs without making changes.";
+    let agy = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "agy",
+        "--repository",
+        project,
+        "--model",
+        "gemini-4-neon",
+        "--reasoning-effort",
+        "high",
+        "--permission-mode",
+        "plan",
+        "--wait",
+        "--timeout",
+        "15",
+        consult,
+    ]);
+    assert_eq!(agy["run"]["state"], "Succeeded", "{agy}");
+    let agy_id = agy["agent"]["id"].as_str().unwrap();
+    let sent = fixture.cli(&[
+        "agent",
+        "send",
+        agy_id,
+        "--wait",
+        "--timeout",
+        "15",
+        followup,
+    ]);
+    assert_eq!(sent["run"]["state"], "Succeeded", "{sent}");
+
+    let muse_prompt = "Summarize this checkout.";
+    let muse = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "muse",
+        "--repository",
+        project,
+        "--permission-mode",
+        "manual",
+        "--wait",
+        "--timeout",
+        "15",
+        muse_prompt,
+    ]);
+    assert_eq!(muse["run"]["state"], "Succeeded", "{muse}");
+
+    for (provider, settings, prompts) in [
+        (
+            "agy",
+            &[
+                ("model", "gemini-4-neon"),
+                ("thought_level", "high"),
+                ("mode", "plan"),
+            ][..],
+            &[consult, followup][..],
+        ),
+        (
+            "muse",
+            &[("mode", "promptUnmatched")][..],
+            &[muse_prompt][..],
+        ),
+    ] {
+        let log = fixture
+            .root
+            .path()
+            .join("acp")
+            .join(provider)
+            .join("frames.log");
+        let frames: Vec<Value> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        // A reload would reset the fixture's controls even for the same session ID.
+        let traffic: Vec<_> = frames
+            .iter()
+            .filter(|frame| {
+                matches!(
+                    frame["method"].as_str(),
+                    Some(
+                        "session/set_config_option"
+                            | "session/set_mode"
+                            | "session/set_model"
+                            | "session/load"
+                            | "session/resume"
+                            | "session/prompt"
+                    )
+                )
+            })
+            .collect();
+        assert_eq!(
+            traffic.len(),
+            settings.len() + prompts.len(),
+            "{log:?}: {traffic:?}"
+        );
+        let (configuration, turns) = traffic.split_at(settings.len());
+        let session = turns[0]["params"]["sessionId"].as_str().unwrap();
+        for (frame, (option, value)) in configuration.iter().zip(settings) {
+            assert_eq!(frame["method"], "session/set_config_option", "{frame}");
+            assert_eq!(frame["params"]["sessionId"], session, "{frame}");
+            assert_eq!(frame["params"]["configId"], *option, "{frame}");
+            assert_eq!(frame["params"]["value"], *value, "{frame}");
+        }
+        for (frame, text) in turns.iter().zip(prompts) {
+            assert_eq!(frame["method"], "session/prompt", "{frame}");
+            assert_eq!(frame["params"]["sessionId"], session, "{frame}");
+            let blocks = frame["params"]["prompt"].as_array().unwrap();
+            assert!(
+                blocks.iter().any(|block| block["text"]
+                    .as_str()
+                    .is_some_and(|body| body.contains(text))),
+                "{frame}"
+            );
         }
     }
 }
