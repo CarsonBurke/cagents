@@ -8,7 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crossbeam_channel::{Receiver, Sender, bounded, select_biased};
+use crossbeam_channel::{Receiver, Sender, after, bounded, never, select_biased};
+use notify::{EventKindMask, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::Serialize;
 use ureq::{
     config::Config,
@@ -31,6 +32,7 @@ use crate::{
 };
 
 const POLL: Duration = Duration::from_secs(1);
+const WATCH_RETRY: Duration = Duration::from_secs(60);
 const COALESCE: Duration = Duration::from_secs(2);
 const MIN_INTERVAL: Duration = Duration::from_secs(5);
 const MAX_AGE: Duration = Duration::from_secs(30);
@@ -112,6 +114,36 @@ impl Drop for Worker {
     }
 }
 
+fn settings_watch_root(path: &Path) -> Option<&Path> {
+    path.ancestors().skip(1).find(|path| path.is_dir())
+}
+
+fn watch_settings(path: &Path, wake: &Sender<()>) -> Option<RecommendedWatcher> {
+    // Watch the directory because saving settings replaces the file. If the
+    // first configuration has not been created, watch its nearest ancestor.
+    let root = settings_watch_root(path)?;
+    let file = path.to_owned();
+    let changed = wake.clone();
+    let mut watcher = RecommendedWatcher::new(
+        move |event: notify::Result<notify::Event>| {
+            if event.as_ref().map_or(true, |event| {
+                event.need_rescan() || event.paths.iter().any(|changed| file.starts_with(changed))
+            }) {
+                let _ = changed.try_send(());
+            }
+        },
+        notify::Config::default()
+            .with_event_kinds(EventKindMask::CORE - EventKindMask::MODIFY_META),
+    )
+    .ok()?;
+    watcher.watch(root, RecursiveMode::NonRecursive).ok()?;
+    // The parent may have appeared while we were attaching to its ancestor.
+    if settings_watch_root(path) != Some(root) {
+        let _ = wake.try_send(());
+    }
+    Some(watcher)
+}
+
 fn run(
     settings_path: &Path,
     journal_path: &Path,
@@ -122,8 +154,19 @@ fn run(
     let mut settings = None;
     let mut journal = None;
     let mut delivery = Delivery::new(Instant::now());
+    let (wake, changed) = bounded(1);
+    let watch = || {
+        (
+            watch_settings(settings_path, &wake),
+            Instant::now() + WATCH_RETRY,
+        )
+    };
+    let (mut watching, mut watch_retry) = watch();
     loop {
         let now = Instant::now();
+        if watching.is_none() && now >= watch_retry {
+            (watching, watch_retry) = watch();
+        }
         let next = Settings::load(settings_path)
             .ok()
             .filter(|settings| settings.enabled);
@@ -155,8 +198,20 @@ fn run(
                 journal = None;
             }
         }
+        // A healthy, disabled relay parks until a settings change, test, or
+        // shutdown. Poll only for active attention or to recover a lost watch.
+        let tick = if settings.is_some() {
+            after(POLL)
+        } else if watching.is_some() {
+            never()
+        } else {
+            after(watch_retry.saturating_duration_since(Instant::now()))
+        };
         select_biased! {
             recv(stopping) -> _ => return,
+            recv(changed) -> _ => {
+                (watching, watch_retry) = watch();
+            }
             recv(commands) -> command => {
                 let Ok(answer) = command else { return };
                 let now = Instant::now();
@@ -184,7 +239,7 @@ fn run(
                 };
                 let _ = answer.send(outcome);
             }
-            default(POLL) => {}
+            recv(tick) -> _ => {}
         }
     }
 }

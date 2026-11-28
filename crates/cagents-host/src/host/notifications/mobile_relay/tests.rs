@@ -447,3 +447,37 @@ fn an_opt_out_and_reenable_discards_a_pending_retry() {
     stop.send(()).unwrap();
     worker.join().unwrap();
 }
+
+#[test]
+fn settings_watch_wakes_for_initial_creation_and_atomic_opt_out() {
+    let root = tempfile::tempdir().unwrap();
+    let config = root
+        .path()
+        .join("config")
+        .join("cagents")
+        .join("notify.json");
+    assert!(!Settings::load(&config).unwrap().enabled);
+    let (wake, changes) = bounded(1);
+    let watching = watch_settings(&config, &wake).expect("watch the existing ancestor");
+
+    Settings::update(&config, |settings| {
+        settings.enabled = true;
+        Ok(())
+    })
+    .unwrap();
+    changes.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(Settings::load(&config).unwrap().enabled);
+
+    // The worker reattaches to the newly created settings directory after
+    // the ancestor wakes it. Use a fresh channel to discard that first edge.
+    drop(watching);
+    let (wake, changes) = bounded(1);
+    let _watching = watch_settings(&config, &wake).expect("watch the settings directory");
+    Settings::update(&config, |settings| {
+        settings.enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    changes.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(!Settings::load(&config).unwrap().enabled);
+}
