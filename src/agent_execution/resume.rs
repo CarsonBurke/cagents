@@ -29,8 +29,7 @@ pub struct StoppedSessions {
     /// each lineage, the most recently active first.
     pub sessions: Vec<Stopped>,
     /// Stopped chats in scope that only their pane in the app can reopen,
-    /// such as one paired with a terminal or one whose conversation the
-    /// daemon never learned.
+    /// such as one whose provider never recorded a conversation.
     pub in_app_only: usize,
 }
 

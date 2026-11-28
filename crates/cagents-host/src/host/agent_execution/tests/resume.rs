@@ -658,63 +658,147 @@ fn a_conversation_this_boot_ran_is_not_resumed_by_itself() {
     assert_eq!(stopped_ids(&host), [before.id]);
 }
 
-/// The fixture's agent shown in a pane paired with its provider's terminal,
-/// which only the app reopens, stopped with its daemon, then a new daemon on
-/// `boot`.
-fn stopped_paired_chat(boot: BootId) -> SharedHost {
+#[test]
+fn a_history_reader_is_listed_and_upgraded_to_a_provider() {
+    if in_child("a_history_reader_is_listed_and_upgraded_to_a_provider") {
+        return;
+    }
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap();
+    let project = root.join("project");
+    let cwd = project.join("removed");
+    let mut saved = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        cwd.clone(),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let conversation = uuid::Uuid::new_v4().to_string();
+    saved.launch.session_id = Some(conversation.clone());
+    let live_proof = host.lock().unwrap().proof().clone();
+    let mut old_proof = live_proof.clone();
+    old_proof.boot_id = BootId::new("earlier-boot");
+    saved.proof = Some(old_proof);
+    let sanitized: String = cwd
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let history = root.join("home/.claude/projects").join(sanitized);
+    std::fs::create_dir_all(&history).unwrap();
+    std::fs::write(
+        history.join(format!("{conversation}.jsonl")),
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "type": "user", "uuid": "u1", "sessionId": conversation,
+                "message": { "role": "user", "content": "Saved question" }
+            })
+        ),
+    )
+    .unwrap();
+    pane_in_a_new_channel(&host, &project, crate::model::CardId::new(), saved.clone());
+
+    let mut requested = saved.clone();
+    requested.proof = Some(live_proof.clone());
+    let response =
+        crate::host::chat::process(&host, 7, ClientRequest::ChatAttach { session: requested })
+            .unwrap();
+    assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+    let reader = host.lock().unwrap().chats[&saved.id].handle.clone();
+    assert!(reader.is_read_only_history());
+    assert!(!reader.is_completed(), "the reader itself is still open");
+    assert_eq!(stopped_ids(&host), [saved.id]);
+    let error = resume(&host, saved.id.to_string()).unwrap_err();
+    assert!(
+        error.contains("working directory") && error.contains("missing"),
+        "{error}"
+    );
+    assert!(!root.join("spawns").exists());
+    assert!(
+        host.lock().unwrap().chats[&saved.id]
+            .handle
+            .same_attachment(&reader)
+    );
+
+    std::fs::create_dir(&cwd).unwrap();
+    opt_in(true);
+    let pass = ran(after_boot(&host));
+    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    assert_eq!(pass.resumed.len(), 1, "{pass:?}");
+    assert_eq!(pass.resumed[0].session, saved.id);
+    assert!(!pass.resumed[0].already_running);
+    let current = host.lock().unwrap().chats[&saved.id].current_session();
+    assert_eq!(
+        current.launch.session_id.as_deref(),
+        Some(conversation.as_str())
+    );
+    assert!(host.lock().unwrap().chats[&saved.id].provider_running());
+    assert_eq!(panes(&host).pop().unwrap().proof, Some(live_proof));
+    assert!(resume(&host, saved.id.to_string()).unwrap().already_running);
+    assert_eq!(
+        std::fs::read_to_string(root.join("spawns"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
+    );
+    assert!(!root.join("prompts").exists());
+    crate::host::finish_chat_shutdown(&host).unwrap();
+}
+
+/// Legacy chat conversion kept the descriptor of the retired provider CLI.
+#[test]
+fn an_earlier_boots_converted_claude_chat_reopens_only_its_native_writer() {
+    if in_child("an_earlier_boots_converted_claude_chat_reopens_only_its_native_writer") {
+        return;
+    }
+    opt_in(true);
     let (host, request, path) = fixture();
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let (mut chat, _) = confirmed_conversation(&host, &path, &accepted);
     let recipe = chat.launch.recipe.clone();
-    chat.terminal = Some(Box::new(crate::model::TerminalSession {
-        id: crate::model::TerminalId::new(),
-        owned_codex_listener: None,
-        recovery_origin: None,
-        predecessor: None,
-        launch: recipe.clone(),
-        transcript_path: None,
-        resume_hint: None,
-        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
-            recipe,
-            last_exit: None,
-        },
-    }));
+    chat.terminal = Some(Box::new(
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(chat.id, recipe, None).session,
+    ));
     pane_in_a_new_channel(
         &host,
         &path.parent().unwrap().join("project"),
         crate::model::CardId::from_uuid(accepted.agent.id.as_uuid()),
-        chat,
+        chat.clone(),
     );
     crate::host::finish_chat_shutdown(&host).unwrap();
     drop(host);
-    daemon_on(boot)
-}
 
-/// A chat paired with its provider's terminal is left to its pane, and
-/// counted as left untried only when an earlier boot ran it: one this boot
-/// ran, as before an interrupted resume runs again, is not.
-#[test]
-fn a_paired_chat_is_left_untried_only_when_an_earlier_boot_ran_it() {
-    if in_child("a_paired_chat_is_left_untried_only_when_an_earlier_boot_ran_it") {
-        return;
-    }
-    opt_in(true);
-    let host = stopped_paired_chat(crate::daemon::read_boot_id().unwrap());
+    let host = daemon_on(crate::daemon::read_boot_id().unwrap());
     let pass = ran(after_boot(&host));
     assert!(
         pass.resumed.is_empty() && pass.failed.is_empty() && pass.left.is_empty(),
         "{pass:?}"
     );
+    assert_eq!(stopped_ids(&host), [chat.id]);
     drop(host);
+
     let host = daemon_on(BootId::new("a-later-boot"));
     let pass = ran(after_boot(&host));
-    assert!(
-        pass.resumed.is_empty() && pass.failed.is_empty(),
-        "{pass:?}"
+    assert!(pass.failed.is_empty() && pass.left.is_empty(), "{pass:?}");
+    assert_eq!(pass.resumed.len(), 1, "{pass:?}");
+    assert_eq!(pass.resumed[0].session, chat.id);
+    assert!(host.lock().unwrap().terminals.is_empty());
+    assert!(panes(&host)[0].terminal.is_none());
+    assert_eq!(
+        std::fs::read_to_string(path.with_file_name("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
-    assert_eq!(pass.left.len(), 1, "{pass:?}");
-    assert!(pass.left[0].terminal.is_some(), "{pass:?}");
+    crate::host::finish_chat_shutdown(&host).unwrap();
 }
 
 /// Once a boot's resume ran, here with the setting off, a daemon restarted

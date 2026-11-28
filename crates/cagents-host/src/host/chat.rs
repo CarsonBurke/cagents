@@ -96,6 +96,12 @@ pub(super) struct Record {
 }
 
 impl Record {
+    /// Whether this attachment still runs a provider. A history reader stays
+    /// resident to page saved text without running one.
+    pub(super) fn provider_running(&self) -> bool {
+        !self.handle.is_read_only_history() && !self.handle.is_completed()
+    }
+
     /// Only the last visible subscriber leaving changes the actor's visibility.
     pub(super) fn detach(&mut self, client: ClientId) {
         self.observations.remove(&client);
@@ -1117,6 +1123,17 @@ fn confirm_fresh_session(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Start the exact provider first. The resume caller publishes the new
+/// pane and agent binding after the paired terminal starts successfully.
+pub(super) fn start_for_paired_resume(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+) -> Result<ServerResponse, ProtocolError> {
+    let session = normalize_start_session(host, session)?;
+    start(host, client, session, None, false, None, Default::default())
 }
 
 fn start(
@@ -3590,6 +3607,139 @@ fn start_publishing(
     result
 }
 
+/// A named Codex conversation can share its server with a CLI view. The
+/// terminal must use a remote transport so it never opens its own writer.
+pub(super) fn can_reopen_codex_terminal(session: &Session) -> bool {
+    session.launch.provider == Provider::Codex
+        && session.launch.terminal_recipe().is_some()
+        && session
+            .launch
+            .recipe
+            .arguments
+            .iter()
+            .any(|arg| arg == "--remote" || arg.starts_with("--remote="))
+}
+
+pub(super) fn reopen_codex_terminal(
+    host: &SharedHost,
+    client: ClientId,
+    started: &Session,
+) -> Result<Session, ProtocolError> {
+    super::account_lifecycle::ensure_idle(host)?;
+    let (owners, closing, session, recipe) = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .chats
+            .get_mut(&started.id)
+            .ok_or_else(|| retryable_unavailable("The resumed Codex provider is unavailable"))?;
+        if !crate::agent_execution::same_chat_process(&record.session, started)
+            || !record.provider_running()
+            || record.handle.is_close_only()
+            || record.handle.confirmed_session_id() != started.launch.session_id
+        {
+            return Err(retryable_unavailable(
+                "The exact resumed Codex provider is unavailable",
+            ));
+        }
+        record.subscribers.entry(client).or_insert(false);
+        let record = &state.chats[&started.id];
+        let session = record.current_session();
+        if !can_reopen_codex_terminal(&session) {
+            return Err(unavailable(
+                "The resumed Codex conversation has no shared server for its terminal",
+            ));
+        }
+        let recipe = session
+            .launch
+            .terminal_recipe()
+            .expect("checked terminal recipe");
+        let owners = paired_close::Owners::capture(&state, record)?;
+        let closing = capacity::Reservation::closing(host, &mut state, &session)?;
+        (owners, closing, session, recipe)
+    };
+    let ServerResponse::ChatTerminal {
+        session: terminal, ..
+    } = codex_terminal_view(host, client, started.id, owners, &closing, session, recipe)?
+    else {
+        unreachable!("opening a Codex CLI view returns its paired terminal");
+    };
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let record = attached(&state, client, started.id)?;
+    if !crate::agent_execution::same_chat_process(&record.session, started)
+        || !record.session.terminal.as_ref().is_some_and(|source| {
+            matches_paired_terminal(&terminal, source, state.proof())
+                && state.terminals.get(&source.id).is_some_and(|live| {
+                    !live.handle.is_completed()
+                        && record
+                            .paired_terminal
+                            .as_ref()
+                            .is_some_and(|worker| worker.same_worker(&live.handle))
+                })
+        })
+    {
+        return Err(retryable_unavailable(
+            "The resumed Codex terminal changed while it was attached",
+        ));
+    }
+    Ok(record.current_session())
+}
+
+/// Verify that a converted terminal cannot still write the conversation
+/// before restarting its native provider. A reconnect-only chat has no
+/// holder retirement to prove this for it.
+pub(super) fn require_ended_resume_terminal(
+    host: &SharedHost,
+    terminal: &crate::model::TerminalSession,
+    proof: &HostSessionProof,
+    earlier_boot: bool,
+) -> Result<(), String> {
+    use crate::{daemon::holder_registry as registry, model::TerminalContinuity};
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.is_live(&terminal.id) {
+            return Err(format!(
+                "Terminal {} still holds this conversation",
+                terminal.id
+            ));
+        }
+    }
+    let directory = registry::directory(registry::Kind::Terminal)?;
+    let socket = registry::socket(&directory, terminal.id);
+    if registry::execution_record(&socket)
+        .map_err(|error| error.to_string())?
+        .is_some_and(|record| {
+            record.kind != registry::Kind::Terminal || record.boot == proof.boot_id
+        })
+    {
+        return Err(format!(
+            "The holder for terminal {} is still available for recovery",
+            terminal.id
+        ));
+    }
+    let earlier_terminal = terminal
+        .continuity
+        .live_proof()
+        .map_or(earlier_boot, |saved| {
+            saved.is_complete() && saved.boot_id != proof.boot_id
+        });
+    if earlier_terminal
+        || matches!(
+            terminal.continuity,
+            TerminalContinuity::Exited { .. }
+                | TerminalContinuity::RelaunchAvailable {
+                    last_exit: Some(_),
+                    ..
+                }
+        )
+    {
+        return Ok(());
+    }
+    Err(format!(
+        "The previous process in terminal {} has no confirmed exit. Close or recover that terminal before resuming",
+        terminal.id
+    ))
+}
+
 /// Attach a CLI view without stopping the server-owned thread or its native
 /// connection. Both descriptors retain the same daemon-owned session ID.
 fn codex_terminal_view(
@@ -3899,6 +4049,16 @@ fn codex_terminal_view(
         return Err(error);
     }
     result
+}
+
+fn normalize_start_session(host: &SharedHost, session: Session) -> Result<Session, ProtocolError> {
+    // Keep the exact old alias, including its allocation provenance. A
+    // window can mount before the provider confirms durable support.
+    if has_native_owner(&session)? {
+        Ok(session)
+    } else {
+        Ok(client_session(host, session))
+    }
 }
 
 /// Client descriptors cannot expand allocation authority beyond this daemon's
@@ -4914,15 +5074,7 @@ fn process_inner(
             terminate_source,
             execution_environment,
         } => {
-            // Keep the exact old alias, including its allocation provenance.
-            // A client can mount before the provider confirms durable support;
-            // normalizing that saved ReconnectOnly descriptor would destroy the
-            // holder's immutable evidence before recovery can authenticate it.
-            let session = if has_native_owner(&session)? {
-                session
-            } else {
-                client_session(host, session)
-            };
+            let session = normalize_start_session(host, session)?;
             let id = session.id;
             let response = start(
                 host,
