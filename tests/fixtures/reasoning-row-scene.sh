@@ -144,12 +144,12 @@ narrow_layout() {
     evidence drive click 390,22 >/dev/null
     sleep 1
     for _ in 1 2 3; do
-        evidence drive key alt+shift+r >/dev/null
+        evidence drive key alt+w >/dev/null
         sleep 1
     done
     evidence drive click 650,22 >/dev/null
     sleep 1
-    evidence drive key alt+shift+r >/dev/null
+    evidence drive key alt+w >/dev/null
     sleep 1
     evidence drive click 390,22 >/dev/null
     sleep 1

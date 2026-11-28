@@ -110,13 +110,13 @@ relaunch_agents_on_upgrade = true
 resume_sessions_after_reboot = false
 check_for_updates = true
 work_stale_after_days = 7
-shortcut_defaults_revision = 7
+shortcut_defaults_revision = 8
 preference_defaults_revision = 4
 
 [keyboard_shortcuts]
 new_terminal = ["Ctrl+Shift+T"]
 new_native_thread = ["Ctrl+T", "Ctrl+Shift+N"]
-chat_account = ["Ctrl+Shift+A"]
+chat_account = ["Ctrl+U"]
 chat_model = ["Ctrl+M"]
 chat_permissions = ["Ctrl+O"]
 new_channel = ["Ctrl+Shift+G"]
@@ -125,7 +125,7 @@ close_focused_column = ["Ctrl+W"]
 search_projects = ["Ctrl+F"]
 previous_column = ["Alt+Q", "Ctrl+PageUp"]
 next_column = ["Alt+R", "Ctrl+PageDown"]
-cycle_pane_width = ["Alt+Shift+R"]
+cycle_pane_width = ["Alt+W"]
 previous_workspace = ["Alt+Shift+Tab"]
 next_workspace = ["Alt+Tab"]
 review_toggle_viewed = ["Alt+V"]
@@ -229,8 +229,9 @@ modifiers, joined by `+`. Names are case-insensitive.
   be bound. Other keys a shell uses, such as `Ctrl+W`, `Ctrl+T`, and `Alt`
   with a letter or arrow, can be bound but then no longer reach a terminal.
   The defaults bind **Ctrl+W** to close the focused pane, **Alt+Q** and
-  **Alt+R** to move to the previous and next pane, **Alt+Shift+R** to cycle
-  pane width, and **Ctrl+T** to create a native thread tab.
+  **Alt+R** to move to the previous and next pane, **Alt+W** to cycle pane
+  width, **Alt+I** to toggle the inspector, and **Ctrl+T** to create a native
+  thread tab.
 - The `search_projects` chords reach terminal programs, except **Ctrl+F**,
   which opens terminal scrollback find. The same key finds in the focused
   editor or chat transcript, and otherwise searches projects.
@@ -387,7 +388,9 @@ them back as version 3 the next time it saves.
   | `close_focused_column` | `Ctrl+Shift+W` (revisions 2–3) | `Ctrl+W` |
   | `previous_column` | `Alt+Q`, `Alt+Left`; `Ctrl+PageUp` (revisions 2–6) | `Alt+Q`, `Ctrl+PageUp` |
   | `next_column` | `Alt+W`, `Alt+Right`; `Ctrl+PageDown` (revisions 2–6) | `Alt+R`, `Ctrl+PageDown` |
-  | `cycle_pane_width` | `Alt+R` (revisions 1 and 4–6), `Ctrl+Shift+R` (revisions 2–3) | `Alt+Shift+R` |
+  | `cycle_pane_width` | `Alt+R` (revisions 1 and 4–6), `Ctrl+Shift+R` (revisions 2–3), `Alt+Shift+R` (revision 7) | `Alt+W` |
+  | `chat_account` | `Ctrl+Shift+A` (revisions 1–7) | `Ctrl+U` |
+  | `toggle_inspector` | `Ctrl+Shift+I` (revisions 1–7) | `Alt+I` |
   | `new_native_thread` | `Ctrl+Shift+N` | `Ctrl+T`, `Ctrl+Shift+N` |
 
   An action the table leaves out counts as on its old default. A version-2
@@ -396,7 +399,7 @@ them back as version 3 the next time it saves.
   changed, extended, or emptied keeps your chords. A new chord
   another action already uses is not taken from it; if that leaves an action
   with no new chord, it keeps its old default. The next save records
-  `shortcut_defaults_revision = 7`, after which an old default you choose
+  `shortcut_defaults_revision = 8`, after which an old default you choose
   again is kept.
 - **New preference defaults:** a file at an older `preference_defaults_revision`
   (one without it is at revision 1) may hold a preference cagents wrote out
@@ -409,7 +412,7 @@ them back as version 3 the next time it saves.
   which an old default chosen again is kept.
 - **Newer shortcuts:** a `[keyboard_shortcuts]` table that lacks a newer action
   gets its default chord. These actions are `new_channel` (Ctrl+Shift+G),
-  `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+Shift+R),
+  `clone_pane` (Ctrl+Shift+D), `cycle_pane_width` (Alt+W),
   `previous_workspace` (Alt+Shift+Tab), `next_workspace` (Alt+Tab),
   `review_toggle_viewed` (Alt+V), `review_next_file` (Alt+Down),
   `review_previous_file` (Alt+Up), `review_next_unviewed` (Alt+Shift+Down),

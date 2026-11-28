@@ -88,7 +88,7 @@ for a native chat.
 Choose **New tab → Resume conversation** to reopen a saved chat, including
 conversations from configured provider history. Move between panes with
 `Alt+Q` and `Alt+R` (or `Ctrl+PageUp` and `Ctrl+PageDown`); resize the focused
-pane with `Alt+Shift+R`.
+pane with `Alt+W`.
 The [user guide](docs/user-guide.md#navigation) covers the rest of the workspace
 and its shortcuts.
 

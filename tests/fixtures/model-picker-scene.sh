@@ -48,7 +48,7 @@ locate() {
 }
 dismiss_inspector() {
     if "$ne" drive observe | rg -F 'Source control' >/dev/null; then
-        "$ne" drive key ctrl+shift+i
+        "$ne" drive key alt+i
     fi
     "$ne" drive wait 'Source control' --gone --timeout 20
 }

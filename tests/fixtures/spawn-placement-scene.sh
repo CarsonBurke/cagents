@@ -63,7 +63,7 @@ sleep 3
 spawn --name jitter --prompt 'Check the jitter range against the spec.' >/dev/null
 sleep 5
 evidence drive observe
-evidence drive key ctrl+shift+i
+evidence drive key alt+i
 sleep 2
 evidence drive click 'Backoff implementation'
 sleep 2

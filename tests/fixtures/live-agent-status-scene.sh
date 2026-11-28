@@ -94,7 +94,7 @@ search=$(locate 'titles')
 "$ne" drive key Return
 "$ne" drive wait 'archived' --timeout 30
 # Keep the task focused on the transcript at both viewport widths.
-"$ne" drive key ctrl+shift+i
+"$ne" drive key alt+i
 sleep 2
 # The loaded history is part of the evidence, before a new prompt confirms
 # the live phase. An unknown historical run must not look live forever.

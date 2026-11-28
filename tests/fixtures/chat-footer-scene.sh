@@ -90,7 +90,7 @@ dismiss_inspector() {
         "$ne" drive key Escape
         observed=$("$ne" drive observe)
         if rg -F 'Source control' <<<"$observed" >/dev/null; then
-            "$ne" drive key ctrl+shift+i
+            "$ne" drive key alt+i
         fi
     fi
     "$ne" drive wait 'Source control' --gone --timeout 20
@@ -120,7 +120,7 @@ for provider in claude codex; do
     # Separate channels keep the tested footer at the full conversation pane
     # width instead of adding the second provider as a neighbouring column.
     open_new_channel
-    "$ne" drive key ctrl+shift+m
+    "$ne" drive key ctrl+m
     "$ne" drive wait models --timeout 20
     "$ne" drive type "$provider"
     # A provider search puts its default first. Enter selects that native
@@ -144,7 +144,7 @@ for provider in claude codex; do
         "$ne" drive wait 'Offline' --timeout 30
     fi
     shot "$provider-running"
-    "$ne" drive key ctrl+shift+m
+    "$ne" drive key ctrl+m
     sleep 1
     shot "$provider-model-menu"
 

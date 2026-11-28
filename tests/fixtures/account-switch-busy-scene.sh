@@ -137,13 +137,13 @@ peer_exits() { # End the conversation's own Codex process on the first account.
 "$ne" cli project open "$CAGENTS_EVIDENCE_TASK/fixture/project" >/dev/null
 "$ne" drive wait main --timeout 30 >/dev/null
 "$ne" drive click main >/dev/null
-"$ne" drive key ctrl+shift+m >/dev/null
+"$ne" drive key ctrl+m >/dev/null
 "$ne" drive wait models --timeout 20 >/dev/null
 "$ne" drive type codex >/dev/null
 "$ne" drive key Return >/dev/null
 "$ne" drive wait models --gone --timeout 20 >/dev/null
 if "$ne" drive observe 2>/dev/null | rg -F 'Source control' >/dev/null; then
-    "$ne" drive key ctrl+shift+i >/dev/null
+    "$ne" drive key alt+i >/dev/null
 fi
 step draft
 composer

@@ -170,7 +170,7 @@ split_three() {
     for tab in 330,22 450,22 565,22; do
         evidence drive click "$tab" >/dev/null
         sleep 1
-        evidence drive key alt+shift+r >/dev/null
+        evidence drive key alt+w >/dev/null
         sleep 1
     done
     evidence drive click 330,22 >/dev/null
@@ -181,7 +181,7 @@ narrowest() {
     evidence drive click 330,22 >/dev/null
     sleep 1
     for _ in 1 2; do
-        evidence drive key alt+shift+r >/dev/null
+        evidence drive key alt+w >/dev/null
         sleep 1
     done
 }

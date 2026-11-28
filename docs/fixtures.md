@@ -199,10 +199,10 @@ evidence drive wait 'Locale' --timeout 30 >/dev/null
 evidence drive click 'Locale' >/dev/null
 evidence drive wait 'Picking' --timeout 30 >/dev/null
 evidence drive hover 1,1 >/dev/null
-# Open the pane's inspector (Ctrl+Shift+I) unless it already is.
+# Open the pane's inspector (Alt+I) unless it already is.
 observed=$(evidence drive observe)
 if ! grep -Eq 'Source control|Work [0-9]' <<<"$observed"; then
-    evidence drive key ctrl+shift+i >/dev/null
+    evidence drive key alt+i >/dev/null
 fi
 evidence shot work-loading
 grep -q 'Bound the retry budget' <<<"$(evidence drive observe)" &&
@@ -1267,7 +1267,7 @@ scripts/native-evidence stop
 `wide` captures empty active, expanded and updated live reasoning, followed by
 expanded mixed tools and failed/running commands. `narrow` reuses that
 conversation, adds an unsent blank thread with Ctrl+T, focuses its native tabs,
-and uses Alt+Shift+R to select one-third width preferences (three cycles on the
+and uses Alt+W to select one-third width preferences (three cycles on the
 hosted chat, one on the draft). The panes share the docked workspace at roughly
 270px each. It captures reasoning and the expanded mixed tools at that width.
 The blank draft sends no prompt and starts no provider.

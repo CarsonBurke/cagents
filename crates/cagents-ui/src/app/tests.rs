@@ -6233,7 +6233,7 @@ fn the_inspector_shortcut_toggles_the_focused_pane_and_honors_bindings_and_modal
         repeat,
     };
     let default = match settings::ShortcutPlatform::CURRENT {
-        settings::ShortcutPlatform::Linux => keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT,
+        settings::ShortcutPlatform::Linux => keyboard::Modifiers::ALT,
         settings::ShortcutPlatform::MacOs => keyboard::Modifiers::LOGO | keyboard::Modifiers::ALT,
     };
     for captured in [false, true] {
