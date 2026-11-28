@@ -1676,7 +1676,7 @@ pub(crate) fn bridge_socket() -> io::Result<PathBuf> {
 /// bytes; diagnostics stay on stderr. EOF detaches the UI, leaving jobs alive.
 pub fn serve_stdio() -> io::Result<()> {
     let path = bridge_socket()?;
-    let stream = match crate::descriptor::connect_settled(&path) {
+    let stream = match crate::control::connect_control_socket(&path, Duration::from_secs(5)) {
         Ok(stream) => stream,
         Err(error)
             if crate::control::daemon_autostart_disabled()
