@@ -37,7 +37,18 @@ pub(super) struct Backing {
 }
 
 pub(super) fn marked(item: &Item) -> bool {
-    crate::chat::failure::provider_error_text(Provider::Codex, item).is_some()
+    diagnostic_text(item).is_some()
+}
+
+fn diagnostic_text(item: &Item) -> Option<&str> {
+    use crate::chat::failure::{is_preview, provider_error_text};
+    provider_error_text(Provider::Codex, item).or_else(|| {
+        // OMP's ordinary reasons fit in the child transcript. Only an
+        // oversized original or its resident preview needs separate custody.
+        provider_error_text(Provider::Omp, item).filter(|body| {
+            item.content.byte_len() > super::MAX_SUBAGENT_HISTORY_BYTES || is_preview(body)
+        })
+    })
 }
 
 pub(super) fn project(item: &mut Item) {
@@ -88,7 +99,7 @@ impl Backing {
             return Ok(());
         }
         self.remove(child, &item.id)?;
-        let Some(body) = crate::chat::failure::provider_error_text(Provider::Codex, item) else {
+        let Some(body) = diagnostic_text(item) else {
             return Ok(());
         };
         // Charge duplicate identity/scope strings and fixed map/descriptor
@@ -270,6 +281,10 @@ mod tests {
     use super::*;
 
     fn notice(child: &str, id: &str, body: &str) -> Event {
+        notice_for(Provider::Codex, child, id, body)
+    }
+
+    fn notice_for(provider: Provider, child: &str, id: &str, body: &str) -> Event {
         let mut item = Item {
             id: id.into(),
             role: crate::chat::Role::System,
@@ -282,8 +297,7 @@ mod tests {
             started_at: None,
         };
         assert!(crate::chat::failure::mark_provider_error(
-            Provider::Codex,
-            &mut item
+            provider, &mut item
         ));
         Event::SubagentItem {
             id: child.into(),
@@ -324,6 +338,40 @@ mod tests {
                 return Err("No page progress".into());
             }
         }
+    }
+
+    #[test]
+    fn omp_child_failure_keeps_a_bounded_preview_and_a_scoped_original() {
+        let body = format!("API quota exhausted\n{}", "λ".repeat(36 * 1024));
+        let mut backing = Backing::default();
+        let mut state = Snapshot::default();
+        apply(
+            &mut backing,
+            &mut state,
+            notice_for(Provider::Omp, "child", "omp-error", &body),
+        );
+        let item = &state.subagents[0].items[0];
+        let preview = crate::chat::failure::provider_error_text(Provider::Omp, item).unwrap();
+        assert!(preview.starts_with("API quota exhausted\n"));
+        assert!(crate::chat::failure::is_preview(preview));
+        let source = source(&state, "child", 0);
+        assert_eq!(
+            full(&mut backing, "child", "omp-error", &source).unwrap(),
+            body
+        );
+        assert!(full(&mut backing, "another-child", "omp-error", &source).is_err());
+
+        apply(
+            &mut backing,
+            &mut state,
+            notice_for(Provider::Omp, "child", "omp-error", "API quota exhausted"),
+        );
+        assert!(backing.is_empty());
+        let item = &state.subagents[0].items[0];
+        assert_eq!(
+            crate::chat::failure::provider_error_text(Provider::Omp, item),
+            Some("API quota exhausted")
+        );
     }
 
     #[test]

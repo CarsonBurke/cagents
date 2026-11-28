@@ -5301,17 +5301,18 @@ fn subagent<'a>(state: &'a mut Snapshot, id: &str) -> &'a mut Subagent {
     state.subagents.last_mut().expect("subagent was inserted")
 }
 
+const MAX_SUBAGENT_HISTORY_BYTES: usize = 64 * 1024;
+
 fn trim_subagent(agent: &mut Subagent) {
-    const MAX_BYTES: usize = 64 * 1024;
     const MAX_ITEMS: usize = 64;
     if let Some(last) = agent.items.last_mut()
-        && last.content.byte_len() > MAX_BYTES
+        && last.content.byte_len() > MAX_SUBAGENT_HISTORY_BYTES
         && child_diagnostics::marked(last)
     {
         child_diagnostics::project(Arc::make_mut(last));
     }
     if let Some(last) = agent.items.last_mut()
-        && last.content.byte_len() > MAX_BYTES
+        && last.content.byte_len() > MAX_SUBAGENT_HISTORY_BYTES
     {
         Arc::make_mut(last).content = ItemContent::Text {
             text: "[This large item is available in the provider transcript.]".into(),
@@ -5324,7 +5325,7 @@ fn trim_subagent(agent: &mut Subagent) {
         .iter()
         .map(|item| item.content.byte_len())
         .sum::<usize>();
-    while agent.items.len() > MAX_ITEMS || bytes > MAX_BYTES {
+    while agent.items.len() > MAX_ITEMS || bytes > MAX_SUBAGENT_HISTORY_BYTES {
         let removed = agent.items.remove(0);
         bytes = bytes.saturating_sub(removed.content.byte_len());
     }
