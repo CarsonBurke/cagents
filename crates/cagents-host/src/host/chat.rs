@@ -5802,6 +5802,7 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
+    target.require_current(host)?;
     retained_actor::reconcile_local_startup_for_close(host, &source).map_err(unavailable)?;
     let closing = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
