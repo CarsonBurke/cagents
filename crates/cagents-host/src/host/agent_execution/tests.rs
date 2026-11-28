@@ -2796,6 +2796,7 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
     };
     spec.provider = Provider::Codex;
     let server_root = root.clone();
+    let (pane_saved, confirm_thread) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(20);
         let socket = loop {
@@ -2828,21 +2829,18 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
                     json!({"userAgent":"codex/0.157.1", "codexHome":server_root.join("home/.codex")})
                 }
                 "thread/start" => {
+                    // Keep the provider's identity unconfirmed until the test
+                    // has saved the undisplayed pane.
+                    confirm_thread
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("pane was not saved before confirming the thread");
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}}})
                 }
                 // The adapter reads Codex's effective configuration for where it compacts.
                 "config/read" => json!({"config":{}}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
-                "turn/start" => {
-                    // Hold the turn until the test has saved the pane, so the
-                    // run's outcome is what reports the confirmed thread.
-                    while !server_root.join("release-turn").exists() {
-                        assert!(Instant::now() < deadline, "turn was never released");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    json!({"turn":{"id":"owned-turn"}})
-                }
+                "turn/start" => json!({"turn":{"id":"owned-turn"}}),
                 "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
                 method => panic!("unexpected Codex request {method}"),
             };
@@ -2901,7 +2899,7 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
             }],
         })
         .unwrap();
-    std::fs::write(root.join("release-turn"), "").unwrap();
+    pane_saved.send(()).unwrap();
     let run = settled(&host, accepted.run.id);
     assert_eq!(run.state, State::Succeeded, "{run:?}");
     let db = rusqlite::Connection::open(&path).unwrap();
