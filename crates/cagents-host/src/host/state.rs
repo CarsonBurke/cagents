@@ -432,6 +432,7 @@ pub(crate) struct HostState {
     notification_activation:
         BTreeMap<crate::notifications::Destination, crate::notifications::Target>,
     subscriptions: Subscriptions,
+    last_viewport_epoch: u64,
     pub(super) shutting_down: bool,
     shutdown_requested: bool,
     /// Ordinary exit has closed new child reservations but still owns exact
@@ -616,6 +617,7 @@ impl HostState {
             mobile_watchers: BTreeMap::new(),
             notification_activation: BTreeMap::new(),
             subscriptions: Subscriptions::default(),
+            last_viewport_epoch: 0,
             shutting_down: false,
             shutdown_requested: false,
             ordinary_exit_cleanup_pending: false,
@@ -6784,9 +6786,10 @@ fn broadcast_redraw(
 struct PlannedFrame {
     client_id: ClientId,
     delivery: Arc<DeliveryQueue>,
-    /// The subscriber's presentation revision when planned. Every resize,
-    /// scroll, snapshot reply and frame that presents the view advances it,
-    /// so a commit that finds it changed knows the frame is stale.
+    /// The viewport's identity and geometry when planned. Presentation
+    /// revisions can repeat across attachments to the same worker.
+    viewport_epoch: u64,
+    /// The subscriber's presentation revision when planned.
     revision: u64,
     /// The worker generation `projected` was captured at.
     source: u64,
@@ -6907,6 +6910,7 @@ fn plan_redraw(
         planned.push(PlannedFrame {
             client_id,
             delivery,
+            viewport_epoch: view.epoch,
             revision,
             source: capture.generation,
             projected: Arc::new(projected),
@@ -6979,17 +6983,18 @@ fn commit_redraw(
             (None, None) => true,
             _ => false,
         };
-        let current_revision = subscriptions
+        let current_view = subscriptions
             .viewports
-            .get(&key)
-            .filter(|_| still_visible && same_connection)
-            .map(|view| view.revision);
-        match current_revision {
-            Some(revision) if revision == planned.revision && unchanged_base => {
+            .get_mut(&key)
+            .filter(|_| still_visible && same_connection);
+        match current_view {
+            Some(view)
+                if view.epoch == planned.viewport_epoch
+                    && view.revision == planned.revision
+                    && unchanged_base =>
+            {
                 let EncodedFrame { planned, wire } = frame;
-                if let Some(view) = subscriptions.viewports.get_mut(&key) {
-                    view.acknowledged_source = planned.source;
-                }
+                view.acknowledged_source = planned.source;
                 subscriptions.record_sent(planned.client_id, terminal_id, planned.projected, true);
                 let _ = planned.delivery.push(Outbound::broadcast(
                     &proof,
@@ -7001,12 +7006,12 @@ fn commit_redraw(
                 committed.queued += 1;
                 committed.bases.push(planned.recorded);
             }
-            Some(revision) => {
+            Some(view) => {
                 let _ = planned.delivery.push(Outbound::broadcast(
                     &proof,
                     ServerMessage::Redraw {
                         terminal_id,
-                        generation: revision,
+                        generation: view.revision,
                     },
                 ));
                 committed.refused.push(frame);

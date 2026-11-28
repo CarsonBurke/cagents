@@ -17,8 +17,43 @@ impl Viewport {
         self.source_generation = source;
         self.revision = source.max(self.revision.saturating_add(1));
     }
+
+    fn observe(&mut self, source: u64) -> u64 {
+        if source > self.source_generation || self.revision == 0 {
+            self.advance(source);
+        }
+        self.revision
+    }
 }
+
+/// Allocate across all attachments so a capture can never match a recreated
+/// viewport, even if its worker and source generation have stayed the same.
+fn allocate_viewport_epoch(last: &mut u64) -> u64 {
+    *last = last.checked_add(1).expect("viewport epoch exhausted");
+    *last
+}
+
 impl HostState {
+    fn viewport_mut(&mut self, client: ClientId, id: TerminalId) -> &mut Viewport {
+        self.subscriptions
+            .viewports
+            .entry((client, id))
+            .or_insert_with(|| Viewport {
+                epoch: allocate_viewport_epoch(&mut self.last_viewport_epoch),
+                ..Viewport::default()
+            })
+    }
+
+    fn viewport_changed(&mut self, client: ClientId, id: TerminalId, source: u64) {
+        let view = self
+            .subscriptions
+            .viewports
+            .get_mut(&(client, id))
+            .expect("existing viewport");
+        view.epoch = allocate_viewport_epoch(&mut self.last_viewport_epoch);
+        view.advance(source);
+    }
+
     pub(in crate::host) fn presentation_revision(
         &mut self,
         client: ClientId,
@@ -28,15 +63,7 @@ impl HostState {
             .terminals
             .get(&id)
             .map_or(0, |record| record.handle.generation());
-        let view = self
-            .subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default();
-        if view.source_generation < source || view.revision == 0 {
-            view.advance(source);
-        }
-        view.revision
+        self.presentation_observed(client, id, source)
     }
     pub(in crate::host) fn presentation_observed(
         &mut self,
@@ -44,15 +71,7 @@ impl HostState {
         id: TerminalId,
         source: u64,
     ) -> u64 {
-        let view = self
-            .subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default();
-        if source > view.source_generation || view.revision == 0 {
-            view.advance(source);
-        }
-        view.revision
+        self.viewport_mut(client, id).observe(source)
     }
     pub(in crate::host) fn resume_presentation(
         &mut self,
@@ -77,11 +96,7 @@ impl HostState {
         } else {
             after
         };
-        let view = self
-            .subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default();
+        let view = self.viewport_mut(client, id);
         view.revision = view.revision.max(after.saturating_add(1));
     }
     pub(super) fn retain_presentation_watermark(&mut self, client: ClientId, id: TerminalId) {
@@ -99,11 +114,7 @@ impl HostState {
     ) -> Result<(), ProtocolError> {
         let record = self.attached_terminal(client, id)?;
         let snapshot = record.handle.snapshot();
-        let view = self
-            .subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default();
+        let view = self.viewport_mut(client, id);
         let rows = view.size.map_or(snapshot.rows, |size| size.rows);
         let maximum = snapshot.scroll.total.saturating_sub(u64::from(rows));
         let current = view.offset.unwrap_or(maximum).min(maximum);
@@ -118,8 +129,7 @@ impl HostState {
                 Some(current.saturating_add(delta as u64).min(maximum))
             }
         };
-        view.epoch = view.epoch.saturating_add(1);
-        view.advance(snapshot.generation);
+        self.viewport_changed(client, id, snapshot.generation);
         self.notify_viewport(client, id);
         Ok(())
     }
@@ -131,15 +141,10 @@ impl HostState {
     ) -> Result<(), ProtocolError> {
         self.attached_terminal(client, id)?;
         let source = self.terminals[&id].handle.generation();
-        let view = self
-            .subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default();
+        let view = self.viewport_mut(client, id);
         if view.size != Some(size) {
             view.size = Some(size);
-            view.epoch = view.epoch.saturating_add(1);
-            view.advance(source);
+            self.viewport_changed(client, id, source);
         }
         self.refresh_presentation_owner(id);
         self.notify_viewport(client, id);
@@ -152,11 +157,7 @@ impl HostState {
         focused: bool,
     ) -> Result<(), ProtocolError> {
         self.attached_terminal(client, id)?;
-        self.subscriptions
-            .viewports
-            .entry((client, id))
-            .or_default()
-            .focused = focused;
+        self.viewport_mut(client, id).focused = focused;
         self.refresh_presentation_owner(id);
         Ok(())
     }
@@ -264,9 +265,8 @@ impl HostState {
 }
 
 /// Validates a capture taken outside the lock, once the lock is held again.
-/// `Ok(None)` asks the caller to capture again. Like `plan_redraw`, this checks
-/// worker identity under the lock: a same-ID replacement can reattach the
-/// client at epoch 0, which the epoch and generation checks alone would accept.
+/// `Ok(None)` asks the caller to capture again. Check worker and viewport
+/// identity before updating the viewport's presentation state.
 pub(super) fn accept_pulled_capture(
     state: &mut HostState,
     client: ClientId,
@@ -289,12 +289,13 @@ pub(super) fn accept_pulled_capture(
     {
         return Ok(None);
     }
-    let revision = state.presentation_observed(client, id, source);
-    let view = &state.subscriptions.viewports[&(client, id)];
+    let Some(view) = state.subscriptions.viewports.get_mut(&(client, id)) else {
+        return Ok(None);
+    };
     if view.epoch != epoch || view.source_generation > source {
         return Ok(None);
     }
-    Ok(Some(revision))
+    Ok(Some(view.observe(source)))
 }
 
 /// Worker queries wait outside the host mutex: a worker's publication callback
