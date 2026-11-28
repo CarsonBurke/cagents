@@ -4624,9 +4624,12 @@ impl Runtime {
         let key_suggestion = suggestion.cloned();
         let placeholder = suggestion.map_or(placeholder, |suggestion| suggestion.text.as_str());
         let suggestion_hint: Element<'_, Message> = if suggestion.is_some() {
-            widget::container(widget::text("Tab to use suggestion").size(design::TEXT_CAPTION))
-                .padding(iced::Padding::from([0.0, COMPOSER_PADDING]).bottom(space::XS))
-                .into()
+            widget::container(crate::interaction::key_hints([(
+                &["Tab"][..],
+                "use suggestion",
+            )]))
+            .padding(iced::Padding::from([0.0, COMPOSER_PADDING]).bottom(space::XS))
+            .into()
         } else {
             iced::widget::Space::new().height(0).into()
         };

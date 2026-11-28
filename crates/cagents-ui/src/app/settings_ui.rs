@@ -1737,14 +1737,22 @@ fn keyboard_groups<'a>(
                 design::body(fixed.label)
                     .width(Length::FillPortion(3))
                     .into(),
+                // The keys end where a bound row's do, before the Record
+                // and Reset buttons a fixed chord has no use for, so the
+                // Keys column keeps one edge.
                 widget::container(crate::interaction::chords_caps(
                     fixed
                         .chords
                         .iter()
                         .map(|chord| crate::interaction::KeyChord::new(*chord)),
                 ))
+                .padding([0.0, space::S])
+                .align_x(Alignment::End)
                 .width(Length::FillPortion(4))
                 .into(),
+                iced::widget::Space::new()
+                    .width(2.0 * design::COMPACT_CONTROL_SIZE + 2.0)
+                    .into(),
                 design::caption("Fixed").width(64).into(),
             ])
             .spacing(space::S)
@@ -1793,12 +1801,15 @@ fn shortcut_input<'a>(
             remaining.remove(index);
             let keys = crate::interaction::KeyChord::new(chord.as_str());
             widget::button::custom(
-                widget::row::with_children(vec![
-                    crate::interaction::key_caps(&keys),
-                    design::body("×").into(),
-                ])
-                .spacing(space::XS)
-                .align_y(Alignment::Center),
+                widget::container(
+                    widget::row::with_children(vec![
+                        crate::interaction::key_caps(&keys),
+                        design::body("×").into(),
+                    ])
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .center_y(Length::Fill),
             )
             .name(format!("Remove {keys} shortcut for {label}"))
             .class(crate::ui_controls::button::quiet_class())

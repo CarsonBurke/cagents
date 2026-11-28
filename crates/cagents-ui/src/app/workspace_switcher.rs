@@ -192,16 +192,6 @@ fn key_outline<'a>(
         }))
 }
 
-fn keycap<'a>(key: &'a str, label: &'a str) -> Element<'a, Message> {
-    widget::row::with_children(vec![
-        key_outline(design::caption(key), false).into(),
-        design::caption(label).into(),
-    ])
-    .spacing(space::XS)
-    .align_y(Alignment::Center)
-    .into()
-}
-
 /// The number key that opens row `index`, for the first [`DIGITS`] rows.
 /// Later rows keep the room it takes, so every name starts at one edge.
 fn row_number<'a>(index: usize, selected: bool) -> Element<'a, Message> {
@@ -934,15 +924,14 @@ impl Cagents {
             list.into()
         };
         let footer = widget::container(crate::interaction::fade_overflow(
-            widget::row::with_children(vec![
-                keycap("Tab", "next"),
-                keycap("Shift Tab", "previous"),
-                keycap("1–9", "open that row"),
-                keycap("Release", "open"),
-                keycap("Esc", "cancel"),
-            ])
-            .spacing(space::L)
-            .align_y(Alignment::Center),
+            // "1–9" and "Release" name no single chord; they show as written.
+            crate::interaction::key_hints([
+                (&["Tab"][..], "next"),
+                (&["Shift+Tab"][..], "previous"),
+                (&["1–9"][..], "open that row"),
+                (&["Release"][..], "open"),
+                (&["Escape"][..], "cancel"),
+            ]),
             panel_color,
         ))
         .padding([0.0, space::M])
