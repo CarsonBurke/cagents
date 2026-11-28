@@ -1639,7 +1639,7 @@ fn agent_status_counts_only_active_states_and_identifies_the_current_failure() {
         "1 subagent working · 1 waiting · 1 waiting on background work · 1 failed: Check restart safety"
     );
     assert_eq!(
-        runtime.conversation_status_with_failures(false, false).1,
+        runtime.conversation_statuses(false).timeline.1,
         "1 subagent working · 1 waiting · 1 waiting on background work"
     );
     let snapshot = Arc::make_mut(&mut runtime.snapshot);
