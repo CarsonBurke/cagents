@@ -23,7 +23,7 @@ use std::{
 
 #[path = "support/repository_scale.rs"]
 mod scale_support;
-use scale_support::{fixture_git_environment, isolated_large_pathspec_test, phase};
+use scale_support::{isolated_git::fixture_git_environment, isolated_large_pathspec_test, phase};
 
 struct IsolatedExecutor;
 

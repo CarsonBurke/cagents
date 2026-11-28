@@ -1803,12 +1803,12 @@ mod tests {
 
     #[test]
     fn worktree_creation_uses_the_exact_device_branch_tip() {
-        if crate::repository::isolated_git_test(concat!(
+        let Some(_git_fixture) = crate::repository::isolated_git_test(concat!(
             module_path!(),
             "::worktree_creation_uses_the_exact_device_branch_tip"
-        )) {
+        )) else {
             return;
-        }
+        };
         let directory = crate::repository::retained_managed_fixture_directory();
         let root = directory.path().to_owned();
         let git = |args: &[&str]| {
@@ -1885,12 +1885,12 @@ mod tests {
             CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
         };
 
-        if crate::repository::isolated_git_test(concat!(
+        let Some(_git_fixture) = crate::repository::isolated_git_test(concat!(
             module_path!(),
             "::final_device_worktree_removal_preserves_a_new_untracked_file"
-        )) {
+        )) else {
             return;
-        }
+        };
         let directory = crate::repository::retained_managed_fixture_directory();
         let root = directory.path();
         git_output(root, &["init", "-q", "-b", "main"]);
@@ -1928,12 +1928,12 @@ mod tests {
 
     #[test]
     fn git_operations_and_worktrees_target_the_daemon_directory() {
-        if crate::repository::isolated_git_test(concat!(
+        let Some(_git_fixture) = crate::repository::isolated_git_test(concat!(
             module_path!(),
             "::git_operations_and_worktrees_target_the_daemon_directory"
-        )) {
+        )) else {
             return;
-        }
+        };
         let directory = crate::repository::retained_managed_fixture_directory();
         let root = directory.path().to_owned();
         let run = |arguments: &[&str]| {

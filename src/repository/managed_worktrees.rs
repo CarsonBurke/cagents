@@ -325,114 +325,36 @@ impl<E: ProcessExecutor> RepositoryService<E> {
 }
 
 #[cfg(any(test, feature = "test-support"))]
+#[path = "../../tests/support/isolated_git.rs"]
+mod isolated_git;
+
+#[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub fn isolated_git_test(name: &str) -> bool {
-    use std::{
-        io::Write,
-        os::unix::fs::{OpenOptionsExt, PermissionsExt},
-    };
-    let name = name
-        .strip_prefix(concat!(env!("CARGO_CRATE_NAME"), "::"))
-        .unwrap_or(name);
-    if std::env::var("CAGENTS_MANAGED_DIRECTORY_TEST").as_deref() == Ok(name) {
-        return false;
+pub use isolated_git::IsolatedGitChild;
+
+/// Runs the named test in a private Git environment. The worker must keep
+/// the returned guard until its test body and local resources have finished.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn isolated_git_test(name: &str) -> Option<IsolatedGitChild> {
+    if let Some(child) = IsolatedGitChild::begin(name) {
+        return Some(child);
     }
-    let directory = tempfile::Builder::new()
-        .prefix("cagents-managed-contract-")
-        .permissions(fs::Permissions::from_mode(0o700))
-        .tempdir()
-        .unwrap()
-        .keep();
-    let mut command = CommandSpec::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            name,
-            "--nocapture",
-            "--test-threads=1",
-            "--color=never",
-        ])
-        .timeout(Duration::from_secs(120))
-        .output_limits(1024 * 1024, 1024 * 1024);
-    for (key, _) in std::env::vars_os() {
-        if key.as_encoded_bytes().starts_with(b"GIT_") {
-            command = command.env_remove(key);
-        }
-    }
-    command = command
-        .env("CAGENTS_MANAGED_DIRECTORY_TEST", name)
-        .env("CAGENTS_MANAGED_DIRECTORY_ROOT", &directory)
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_SYSTEM", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env("GIT_CONFIG_COUNT", "4")
-        .env("GIT_CONFIG_KEY_0", "core.fsmonitor")
-        .env("GIT_CONFIG_VALUE_0", "false")
-        .env("GIT_CONFIG_KEY_1", "core.hooksPath")
-        .env("GIT_CONFIG_VALUE_1", "/dev/null")
-        .env("GIT_CONFIG_KEY_2", "commit.gpgsign")
-        .env("GIT_CONFIG_VALUE_2", "false")
-        .env("GIT_CONFIG_KEY_3", "init.templateDir")
-        .env("GIT_CONFIG_VALUE_3", "");
-    let (success, stdout, stderr, status) =
-        match SystemProcessExecutor.execute(&command, &CancellationToken::new()) {
-            Ok(output) => (
-                output.success,
-                output.stdout,
-                output.stderr,
-                format!("exit {:?}, signal {:?}", output.exit_code, output.signal),
-            ),
-            Err(failure) => (
-                false,
-                failure.stdout,
-                failure.stderr,
-                format!("{:?}: {}", failure.kind, failure.message),
-            ),
-        };
-    for (name, bytes) in [("stdout", &stdout), ("stderr", &stderr)] {
-        fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(directory.join(name))
-            .unwrap()
-            .write_all(bytes)
-            .unwrap();
-    }
-    eprintln!(
-        "Retained managed-directory contract root: {}",
-        directory.display()
-    );
-    let stdout = String::from_utf8_lossy(&stdout);
-    let stderr = String::from_utf8_lossy(&stderr);
-    assert!(success, "{status}\n{stdout}\n{stderr}");
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.contains(&format!("test {name} ... ok"))),
-        "{stdout}"
-    );
-    assert!(
-        stdout
-            .lines()
-            .any(|line| line.starts_with("test result: ok. 1 passed; 0 failed;")),
-        "{stdout}"
-    );
-    print!("{stdout}");
-    eprint!("{stderr}");
-    true
+    let directory = crate::test_fixture::tempdir_with_prefix("cagents-managed-contract-").unwrap();
+    isolated_git::run(name, directory, Duration::from_secs(120));
+    None
 }
 
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub fn retained_managed_fixture_directory() -> tempfile::TempDir {
     use std::os::unix::fs::PermissionsExt;
-    let parent = std::env::var_os("CAGENTS_MANAGED_DIRECTORY_ROOT")
-        .expect("owning private managed-directory contract namespace");
+    let parent = isolated_git::child_root();
     let mut directory = tempfile::Builder::new()
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(parent)
         .unwrap();
-    // Child completion alone cannot retire the original repositories/journals.
+    // The owner retires the entire namespace after the worker and its descendants finish.
     directory.disable_cleanup(true);
     directory
 }
@@ -440,6 +362,54 @@ pub fn retained_managed_fixture_directory() -> tempfile::TempDir {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn isolated_git_fixture_removes_passing_roots_and_retains_failed_roots() {
+        const OUTCOME: &str = "CAGENTS_MANAGED_DIRECTORY_CLEANUP_CASE";
+        let thread = std::thread::current();
+        let name = thread.name().unwrap();
+        if let Ok(outcome) = std::env::var(OUTCOME) {
+            let Some(_git_fixture) = isolated_git_test(name) else {
+                return;
+            };
+            let directory = retained_managed_fixture_directory();
+            fs::write(directory.path().join("evidence"), "fixture ran").unwrap();
+            assert_eq!(outcome, "pass", "deliberate fixture failure");
+            return;
+        }
+
+        for outcome in ["pass", "fail"] {
+            let parent = crate::test_fixture::tempdir().unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", name, "--nocapture"])
+                .env(OUTCOME, outcome)
+                .env("TMPDIR", parent.path())
+                .output()
+                .unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let roots: Vec<_> = fs::read_dir(parent.path())
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect();
+            if outcome == "pass" {
+                assert!(output.status.success(), "{stderr}");
+                assert!(roots.is_empty(), "leaked passing fixture: {roots:?}");
+            } else {
+                assert!(!output.status.success());
+                let [root] = roots.as_slice() else {
+                    panic!("expected one retained fixture, found {roots:?}");
+                };
+                assert!(stderr.contains(&*root.to_string_lossy()), "{stderr}");
+                let log = fs::read_to_string(root.join("stderr")).unwrap();
+                assert!(log.contains("deliberate fixture failure"), "{log}");
+                let evidence = fs::read_dir(root)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().path().join("evidence"))
+                    .find_map(|file| fs::read_to_string(file).ok());
+                assert_eq!(evidence.as_deref(), Some("fixture ran"));
+            }
+        }
+    }
 
     fn git(root: &Path, args: &[&str]) -> Vec<u8> {
         let command = CommandSpec::new("git")
@@ -476,12 +446,12 @@ mod tests {
 
     #[test]
     fn exclusion_is_idempotent_preserves_rules_and_skips_external_or_ignored_roots() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::exclusion_is_idempotent_preserves_rules_and_skips_external_or_ignored_roots"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (_directory, root) = fixture();
         let service = RepositoryService::system("git");
         let cancel = CancellationToken::new();
@@ -530,12 +500,12 @@ mod tests {
 
     #[test]
     fn exclusion_refuses_oversized_or_symlinked_metadata_without_truncation() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::exclusion_refuses_oversized_or_symlinked_metadata_without_truncation"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (directory, root) = fixture();
         let service = RepositoryService::system("git");
         let cancel = CancellationToken::new();
@@ -566,12 +536,12 @@ mod tests {
 
     #[test]
     fn legacy_worktrees_are_excluded_without_moving_them() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::legacy_worktrees_are_excluded_without_moving_them"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (_directory, root) = fixture();
         let legacy = root.join("worktrees/old");
         git(
@@ -593,12 +563,12 @@ mod tests {
 
     #[test]
     fn effective_ignore_repairs_later_exclude_negation_and_preserves_tracked_rules() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::effective_ignore_repairs_later_exclude_negation_and_preserves_tracked_rules"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (_directory, root) = fixture();
         fs::create_dir_all(root.join(".git/info")).unwrap();
         let exclude = root.join(".git/info/exclude");
@@ -630,12 +600,12 @@ mod tests {
 
     #[test]
     fn separate_git_directory_excludes_the_actual_primary_checkout() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::separate_git_directory_excludes_the_actual_primary_checkout"
-        )) {
+        )) else {
             return;
-        }
+        };
         let directory = retained_managed_fixture_directory();
         let root = directory.path().join("checkout");
         let metadata = directory.path().join("metadata");
@@ -681,12 +651,12 @@ mod tests {
 
     #[test]
     fn linked_checkout_uses_its_own_relative_ignore_pattern() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::linked_checkout_uses_its_own_relative_ignore_pattern"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (directory, root) = fixture();
         let linked = directory.path().join("external-linked");
         git(
@@ -710,12 +680,12 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn journaled_default_creates_two_clean_worktrees_and_migrates_legacy_location() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::journaled_default_creates_two_clean_worktrees_and_migrates_legacy_location"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (directory, root) = fixture();
         let legacy = root.join("worktrees/old");
         git(
@@ -794,12 +764,12 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn journaled_overrides_ignore_only_the_destination_and_preserve_legacy_requests() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::journaled_overrides_ignore_only_the_destination_and_preserve_legacy_requests"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (directory, root) = fixture();
         let service = RepositoryService::system("git");
         let cancel = CancellationToken::new();
@@ -880,12 +850,12 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn journaled_checkout_root_parents_ignore_only_created_destinations() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::journaled_checkout_root_parents_ignore_only_created_destinations"
-        )) {
+        )) else {
             return;
-        }
+        };
         for variant in 0..3 {
             let (directory, root) = fixture();
             let service = RepositoryService::system("git");
@@ -970,12 +940,12 @@ mod tests {
     #[cfg(feature = "ui")]
     #[test]
     fn journaled_creation_refuses_effectively_unignored_destination() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::journaled_creation_refuses_effectively_unignored_destination"
-        )) {
+        )) else {
             return;
-        }
+        };
         let (directory, root) = fixture();
         let service = RepositoryService::system("git");
         let cancel = CancellationToken::new();

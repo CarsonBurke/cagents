@@ -1414,9 +1414,9 @@ mod tests {
         };
         use cosmic::iced::futures::StreamExt;
         const TEST: &str = "app::worktree_dialog::tests::branch_menu_creation_keeps_ref_looking_and_hex_short_names_through_the_real_journal";
-        if crate::repository::isolated_git_test(TEST) {
+        let Some(_git_fixture) = crate::repository::isolated_git_test(TEST) else {
             return;
-        }
+        };
         fn git(root: &Path, args: &[&str]) -> String {
             let output = SystemProcessExecutor
                 .execute(

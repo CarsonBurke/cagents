@@ -10,7 +10,9 @@ mod managed_worktrees;
 pub use ignored_worktree_files::default_disposable_ignored_directories;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
+pub use managed_worktrees::{
+    IsolatedGitChild, isolated_git_test, retained_managed_fixture_directory,
+};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
@@ -10290,16 +10292,16 @@ mod tests {
 
         #[test]
         fn explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote() {
-            if isolated_git_test(concat!(
+            let Some(_git_fixture) = isolated_git_test(concat!(
                 module_path!(),
                 "::explicit_local_worktree_base_never_falls_back_to_a_tag_or_remote"
-            )) {
+            )) else {
                 return;
-            }
+            };
 
             let mut unexpected_fallbacks = Vec::new();
             for decoy in ["tag", "remote"] {
-                let directory = tempfile::tempdir().unwrap();
+                let directory = retained_managed_fixture_directory();
                 let root = directory.path();
                 git(root, &["init", "-b", "main"]);
                 git(root, &["commit", "--allow-empty", "-m", "initial"]);

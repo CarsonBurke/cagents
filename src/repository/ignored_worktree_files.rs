@@ -208,13 +208,13 @@ mod tests {
 
     #[test]
     fn ignored_user_data_blocks_but_disposable_directories_and_nested_files_do_not() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::ignored_user_data_blocks_but_disposable_directories_and_nested_files_do_not"
-        )) {
+        )) else {
             return;
-        }
-        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        };
+        let fixture = super::super::retained_managed_fixture_directory();
         let root = fixture.path();
         git(root, &["init", "-b", "main"]);
         fs::write(
@@ -298,19 +298,19 @@ mod tests {
 
     #[test]
     fn unreadable_inventory_warnings_never_authorize_removal() {
-        if isolated_git_test(concat!(
+        let Some(_git_fixture) = isolated_git_test(concat!(
             module_path!(),
             "::unreadable_inventory_warnings_never_authorize_removal"
-        )) {
+        )) else {
             return;
-        }
+        };
         use std::os::unix::fs::PermissionsExt;
         // Root bypasses directory permissions. The fw16 validation runs as
         // the ordinary user and exercises each real Git warning below.
         if unsafe { libc::geteuid() } == 0 {
             return;
         }
-        let fixture = tempfile::tempdir_in("/var/tmp").unwrap();
+        let fixture = super::super::retained_managed_fixture_directory();
         let root = fixture.path();
         git(root, &["init", "-b", "main"]);
         fs::write(root.join(".gitignore"), "ignored/\n").unwrap();
