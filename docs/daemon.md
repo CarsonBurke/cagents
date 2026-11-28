@@ -616,8 +616,9 @@ still running.
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The
 allowlist is `VERIFIED_CODEX_VERSIONS` in `chat/native_holder.rs`, currently
-Codex **0.157.1**, **0.160.1**, **0.161.0** and **0.162.0**. It names exact versions, so every Codex
-update leaves it behind until that version is qualified.
+Codex **0.157.1**, **0.160.1**, **0.161.0**, **0.162.0**, and **0.172.0**.
+It names exact versions, so every Codex update leaves it behind until that
+version is qualified.
 
 A Codex conversation on any other version does not acquire this claim, and its
 server does not outlive the daemon. When the daemon crashes, is killed, or
