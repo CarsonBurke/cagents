@@ -617,6 +617,7 @@ pub enum Action {
     /// The whole picture the viewer the host shows, opened as the given
     /// serial, read for the entry the string names.
     ViewerLoaded(images::ViewerHost, u64, String, images::Loaded),
+    ResumeImageViewer(Target, u64),
     ImageFit(images::ViewerHost),
     ImageExternal(images::ViewerHost),
     /// A context menu, viewer control or shortcut acting on displayed pixels.
@@ -1152,6 +1153,7 @@ impl Action {
             Self::CloseImage(..) => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
             Self::ViewerLoaded(..) => "ViewerLoaded",
+            Self::ResumeImageViewer(..) => "ResumeImageViewer",
             Self::ImageFit(..) => "ImageFit",
             Self::ImageExternal(..) => "ImageExternal",
             Self::Image(..) => "Image",
@@ -1326,6 +1328,7 @@ impl Action {
                 | Self::Image(images::ImageRef::Viewer(images::ViewerHost::Dialog, _), _)
                 // A read finishing is no input, so it lands in any viewer.
                 | Self::ViewerLoaded(..)
+                | Self::ResumeImageViewer(..)
                 | Self::ImageCopied(..)
         )
     }
@@ -18811,6 +18814,7 @@ impl Cagents {
             | Action::CloseImage(_)
             | Action::ImageNext(..)
             | Action::ViewerLoaded(..)
+            | Action::ResumeImageViewer(..)
             | Action::ImageFit(_)
             | Action::ImageExternal(_) => {
                 return self.image_viewer_action(&action).unwrap_or_else(Task::none);
@@ -19258,7 +19262,7 @@ impl Cagents {
                         // so the composer stays usable while it shows.
                         runtime.show_image(images::Gallery::attachment(
                             runtime.selected_subagent.clone(),
-                            attachment.label(),
+                            attachment,
                             handle,
                         ));
                         return self.focus_image_viewer(target);

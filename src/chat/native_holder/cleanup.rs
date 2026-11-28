@@ -216,20 +216,24 @@ impl Detached {
     }
 
     #[cfg(target_os = "linux")]
-    pub(in crate::chat) fn retire_after_transport_loss(&self) -> Result<bool, String> {
+    pub(in crate::chat) fn retire_after_transport_loss(&self) -> Result<super::NativeExit, String> {
+        use super::NativeExit;
+
         let Some(server) = self.server_process.as_ref() else {
-            return Ok(false);
+            return Ok(NativeExit::Unobservable);
         };
         let record = &self.record;
         if record.application != crate::instance::APPLICATION_ID
             || record.boot != self.proof.boot_id
-            || !crate::chat::runtime::native_holder_abandoned(&record.holder, &record.root, server)?
         {
-            return Ok(false);
+            return Ok(NativeExit::Unobservable);
         }
-        self.require_cleanup_lease()?;
-        record.remove(&registry::directory(Kind::Native)?);
-        Ok(true)
+        let exit = crate::chat::runtime::native_holder_exit(&record.holder, &record.root, server)?;
+        if matches!(exit, NativeExit::Exited) {
+            self.require_cleanup_lease()?;
+            record.remove(&registry::directory(Kind::Native)?);
+        }
+        Ok(exit)
     }
 
     /// Settles cleanup of an owner that ended without its receipt - killed,

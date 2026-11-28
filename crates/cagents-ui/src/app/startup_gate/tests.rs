@@ -669,17 +669,128 @@ async fn saved_output(task: Task<Message>) -> Message {
     tokio::time::timeout(Duration::from_secs(25), async {
         let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("save task");
         while let Some(action) = stream.next().await {
-            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                message @ Message::StartupPanesSaved(..),
-            )) = action
-            {
-                return message;
+            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                match message {
+                    Message::StartupPanesSaved(..) => return message,
+                    #[cfg(target_os = "linux")]
+                    Message::UiUpdateRechecked(..) => return message,
+                    _ => {}
+                }
             }
         }
         panic!("the original save Task emitted no completion");
     })
     .await
     .expect("private workspace save did not complete")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, cards) = waiting(1);
+    let (session, _) = SessionRuntime::open(
+        directory.path().join("state.sqlite3"),
+        crate::model::BootId::new("window-recheck-fixture"),
+    )
+    .unwrap();
+    app.session = Some(session);
+    app.settings_path = Some(directory.path().join("settings.toml"));
+    app.settings_write_blocked = false;
+
+    let answer = inspection(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    );
+    drop(app.startup_state_inspected(answer));
+    assert!(app.startup_gate.reported);
+    assert_eq!(reported(&app), Some(RETAINED_NOTICE));
+
+    let startup = app.status.take().unwrap();
+    assert_eq!(startup.key, Some(NoticeKey::StartupRecovery));
+    app.notices.record(startup);
+    let job_id = uuid::Uuid::new_v4();
+    let mut job = crate::update::UpdateJob {
+        id: job_id.to_string(),
+        version: "0.2.4".into(),
+        phase: crate::update::UpdatePhase::Failed,
+        message: "Original workspace verification failed.".into(),
+        log_path: directory.path().join("update.log"),
+        confirmation: None,
+        refusal: None,
+        in_flight: Vec::new(),
+        recorded_by: Some("0.2.4".into()),
+    };
+    let poll =
+        |expected, job| Message::UpdateUi(update_ui::Action::Polled(expected, Ok(Some(job))));
+    drop(app.update(poll(None, job.clone())));
+    let verification = NoticeKey::UpdateVerification(job.id.clone());
+    assert!(app.notices.has(verification.clone()));
+
+    let request = || {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Recheck(job_id),
+                response,
+            },
+            receiver,
+        )
+    };
+    let (check, answer) = request();
+    assert_eq!(app.recheck_startup(check).units(), 0);
+    assert!(answer.try_recv().unwrap().starts_with("error: "));
+    let card = cards[0];
+    app.startup_gate.retries.expire_window();
+    let pane_failure = app
+        .startup_terminal_latest(card)
+        .expect("the first startup scan recorded this pane's wait")
+        .to_owned();
+    assert!(app.startup_terminal_gave_up(card));
+    assert_eq!(app.startup_gave_up_caption(card), RETAINED_TERMINAL_CAPTION);
+
+    let (check, answer) = request();
+    let save = app.recheck_startup(check);
+    assert!(
+        answer.try_recv().is_err(),
+        "readiness must wait for the flush"
+    );
+    let Message::UiUpdateRechecked(check, settings, saved) = saved_message(save) else {
+        panic!("rechecking did not flush the workspace");
+    };
+    assert!(settings.is_ok() && saved.is_ok());
+    app.finish_startup_recheck(check, settings, saved);
+    let report = answer.try_recv().unwrap();
+    assert!(report.starts_with("ready-with-pane-notes: "), "{report}");
+    assert!(report.contains(&pane_failure), "{report}");
+    let pane_note = app.status.take().unwrap();
+    app.notices.record(pane_note.clone());
+    assert!(app.card_state(card).is_some());
+    assert!(app.startup_gate.reported);
+    assert!(app.notices.has(NoticeKey::StartupRecovery));
+    assert!(!app.resolve_startup_recheck(&uuid::Uuid::new_v4().to_string()));
+    assert!(app.notices.has(NoticeKey::StartupRecovery));
+    assert_eq!(app.startup_gave_up_caption(card), RETAINED_TERMINAL_CAPTION);
+
+    job.phase = crate::update::UpdatePhase::Complete;
+    job.message = "Update installed; saved windows reopened after retry".into();
+    drop(app.update(poll(Some(job.id.clone()), job)));
+    assert!(!app.notices.has(NoticeKey::StartupRecovery));
+    assert!(!app.notices.has(verification));
+    assert_eq!(app.startup_gate.reported_notice(), None);
+    assert!(app.startup_terminal_gave_up(card));
+    assert_eq!(
+        app.startup_gave_up_caption(card),
+        unavailable_terminal_caption(Some(&pane_failure))
+    );
+    assert!(app.notices.recent().any(|entry| entry.notice == pane_note));
+    assert!(
+        app.notices
+            .recent()
+            .any(|entry| entry.notice.severity == NoticeSeverity::Success)
+    );
 }
 
 #[test]

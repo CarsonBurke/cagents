@@ -159,6 +159,26 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertIn("does not match the two APKs", self.write(check=False).stderr)
         self.assertFalse((self.release / "release-metadata.json").exists())
 
+    def test_a_linux_appimage_needs_its_identical_versioned_and_stable_names(self):
+        image = self.release / f"cagents-{VERSION}-x86_64.AppImage"
+        alias = self.release / "cagents-x86_64.AppImage"
+        image.write_bytes(b"AppImage fixture")
+        refused = self.write(check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(alias.name, refused.stderr)
+
+        alias.write_bytes(b"another image")
+        refused = self.write(check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("differs from the versioned AppImage", refused.stderr)
+
+        alias.write_bytes(image.read_bytes())
+        self.write()
+        written = json.loads((self.release / "release-metadata.json").read_bytes())
+        self.assertEqual(written["assets"][image.name], written["assets"][alias.name])
+        self.assertEqual(written["targets"][0]["products"]["cagents"]["archive"], ARCHIVE)
+        self.assertEqual(run("check", "--dir", str(self.release)).returncode, 0)
+
     def test_check_refuses_a_changed_added_or_removed_file(self):
         self.write()
         for change, message in (

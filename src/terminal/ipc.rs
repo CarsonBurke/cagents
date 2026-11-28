@@ -387,7 +387,8 @@ use crate::{
 /// snapshots without the count, and an older update source is read without it.
 ///
 /// Version 226 adds exact Work card pins and a publication watermark for replies.
-pub const PROTOCOL_VERSION: u16 = 226;
+/// Version 227 appends the mobile relay test request.
+pub const PROTOCOL_VERSION: u16 = 227;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -975,6 +976,8 @@ pub enum ClientRequest {
     /// figure a window shows moves. The device is read only while some
     /// connection watches.
     WatchDeviceStats,
+    /// Ask the daemon mobile relay worker for a test notification.
+    SendTestMobileNotification,
 }
 
 /// Read-only invalidations for the SSH bridge. They do not confer window

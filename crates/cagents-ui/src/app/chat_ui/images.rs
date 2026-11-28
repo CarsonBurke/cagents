@@ -753,8 +753,11 @@ impl Runtime {
     /// Opens `gallery` in this pane's viewer. It is what the reader asked
     /// for last, so a draft image still loading from an earlier press on
     /// its tile stays closed when it arrives.
-    pub(super) fn show_image(&mut self, gallery: Gallery) {
+    pub(super) fn show_image(&mut self, mut gallery: Gallery) {
         self.opening_attachment = None;
+        if !self.is_visible() {
+            gallery.suspend();
+        }
         self.image_viewer = Some(gallery);
     }
 }
@@ -770,7 +773,11 @@ pub(super) fn sync_viewer(runtime: &mut Runtime) {
     if let Some(mut gallery) = runtime.image_viewer.take()
         && gallery.transcript == runtime.selected_subagent
     {
-        gallery.refresh(runtime);
+        if !runtime.is_visible() {
+            gallery.suspend();
+        } else if !gallery.suspended {
+            gallery.refresh(runtime);
+        }
         runtime.image_viewer = Some(gallery);
     }
 }
@@ -1044,6 +1051,11 @@ fn pixel_size(handle: &iced::widget::image::Handle) -> Option<(u32, u32)> {
     }
 }
 pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
+    let resume = runtime
+        .image_viewer
+        .as_ref()
+        .filter(|gallery| runtime.is_visible() && gallery.suspended)
+        .map(|gallery| Subscription::run_with((runtime.target, gallery.serial), resume_viewer));
     interest(runtime)
         .into_iter()
         .find_map(|item| {
@@ -1062,7 +1074,16 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
             ))
         })
         .into_iter()
+        .chain(resume)
         .collect()
+}
+
+fn resume_viewer(
+    (target, serial): &(Target, u64),
+) -> iced::futures::stream::Once<std::future::Ready<Message>> {
+    iced::futures::stream::once(std::future::ready(action(Action::ResumeImageViewer(
+        *target, *serial,
+    ))))
 }
 
 struct Entry {
@@ -1116,7 +1137,7 @@ impl Entry {
             full: preview.clone().filter(|_| whole),
             preview,
             error: None,
-            source: (!whole).then(|| item.clone()),
+            source: Some(item.clone()),
         })
     }
     /// The entry's literal file path, for Copy image path. Managed snapshot
@@ -1132,11 +1153,36 @@ impl Entry {
         self.full.as_ref().or(self.preview.as_ref())
     }
 }
+#[derive(Clone)]
+enum ViewerSource {
+    Transcript(Arc<chat::Item>, Origin),
+    Attachment(chat::Attachment),
+    File(PathBuf, Origin),
+}
+
+impl ViewerSource {
+    fn read(&self) -> Loaded {
+        match self {
+            Self::Transcript(item, origin) => load(item, origin, Fit::Full),
+            Self::Attachment(attachment) => attachment_preview(attachment),
+            Self::File(path, origin) => {
+                load_file_with_request(path, origin, Fit::Full, crate::device_service::request)
+            }
+        }
+    }
+}
+
+fn next_viewer_serial() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(in crate::app) struct Gallery {
     entries: Vec<Entry>,
     selected: usize,
     remote: bool,
     pub(super) reset: u64,
+    geometry: canvas::Geometry,
     /// The subagent whose transcript the images came from, `None` for the
     /// conversation's own. A pane viewer belongs to that transcript and
     /// closes when the pane shows another ([`sync`]).
@@ -1146,10 +1192,12 @@ pub(in crate::app) struct Gallery {
     from_transcript: bool,
     /// Where the conversation's pictures are read from.
     origin: Option<Origin>,
-    /// Tells this gallery's reads from those of one opened before it.
+    /// The pending read or reveal ticket. Zero accepts no completion.
     serial: u64,
     /// The read of the shown entry's whole picture, stopped with the gallery.
     reading: Option<iced::task::Handle>,
+    reload: Option<ViewerSource>,
+    suspended: bool,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -1175,19 +1223,36 @@ impl Gallery {
             selected: 0,
             remote: device.is_some(),
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
             origin: None,
             serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         }
     }
+    /// A decoded figure opened from this transcript, with its resolved read
+    /// source kept for a reveal after the pane releases its pixels.
+    fn figure(
+        transcript: Option<String>,
+        path: PathBuf,
+        origin: Origin,
+        handle: iced::widget::image::Handle,
+    ) -> Self {
+        let mut gallery = Self::file(path.clone(), origin.device.as_deref(), handle);
+        gallery.transcript = transcript;
+        gallery.reload = Some(ViewerSource::File(path, origin));
+        gallery
+    }
+
     /// An image the draft holds, opened from the composer's tray over the
     /// transcript the pane shows (`transcript`, as [`Self::new`] records it).
     /// Its path is the draft's, never handed to another application.
     pub(in crate::app) fn attachment(
         transcript: Option<String>,
-        label: String,
+        attachment: chat::Attachment,
         handle: iced::widget::image::Handle,
     ) -> Self {
         Self {
@@ -1196,7 +1261,7 @@ impl Gallery {
                 row: None,
                 managed: true,
                 path: String::new(),
-                label,
+                label: attachment.label(),
                 preview: None,
                 full: Some(handle),
                 error: None,
@@ -1205,11 +1270,14 @@ impl Gallery {
             selected: 0,
             remote: crate::device::is_remote(),
             reset: 0,
+            geometry: Default::default(),
             transcript,
             from_transcript: false,
             origin: None,
             serial: 0,
             reading: None,
+            reload: Some(ViewerSource::Attachment(attachment)),
+            suspended: false,
         }
     }
     /// The gallery the picture `id` names is drawn in, opened at it. Its
@@ -1241,11 +1309,14 @@ impl Gallery {
             selected,
             remote: crate::device::is_remote(),
             reset: 0,
+            geometry: Default::default(),
             transcript: runtime.selected_subagent.clone(),
             from_transcript: true,
             origin: Some(Origin::of(runtime)),
             serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         })
     }
     /// The items of the transcript `runtime` shows, `None` when the selected
@@ -1276,7 +1347,7 @@ impl Gallery {
         if !self.from_transcript {
             return;
         }
-        if Self::transcript(runtime).is_none() {
+        if Self::transcript(runtime).is_none_or(<[_]>::is_empty) {
             return;
         }
         let mut old: Vec<_> = std::mem::take(&mut self.entries)
@@ -1350,6 +1421,37 @@ impl Gallery {
         }
         self.entries = entries;
     }
+    /// Keep the source and selection while returning the pane's pixel budget.
+    fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        self.serial = next_viewer_serial();
+        self.reading = None;
+        for entry in &mut self.entries {
+            entry.preview = None;
+            entry.full = None;
+            entry.error = None;
+        }
+    }
+
+    fn resume(&mut self, serial: u64, visible: bool) -> bool {
+        if !self.suspended || self.serial != serial {
+            return false;
+        }
+        if !visible {
+            // A reveal can be followed by a hide in the same update batch.
+            // The one-shot subscription has answered, so the next reveal
+            // needs a fresh subscription identity.
+            self.serial = next_viewer_serial();
+            return false;
+        }
+        self.suspended = false;
+        self.serial = 0;
+        true
+    }
+
     /// Read the whole of the shown picture, unless it is already. The viewer
     /// `host` shows is told when it is, or, the first time, that the read
     /// waits for memory, so previews can make room for it.
@@ -1358,19 +1460,23 @@ impl Gallery {
     }
     fn read_whole(&mut self, host: ViewerHost, patient: bool) -> Task<Message> {
         let entry = &self.entries[self.selected];
-        let (Some(item), Some(origin), None, None) =
-            (&entry.source, &self.origin, &entry.full, &entry.error)
-        else {
+        if self.suspended || entry.full.is_some() || entry.error.is_some() {
+            return Task::none();
+        }
+        let source = if let Some(source) = &self.reload {
+            source.clone()
+        } else if let (Some(item), Some(origin)) = (&entry.source, &self.origin) {
+            ViewerSource::Transcript(item.clone(), origin.clone())
+        } else {
             return Task::none();
         };
-        static NEXT_READ: AtomicU64 = AtomicU64::new(1);
-        self.serial = NEXT_READ.fetch_add(1, Ordering::Relaxed);
-        let (item, origin, serial, id) =
-            (item.clone(), origin.clone(), self.serial, entry.id.clone());
+        let serial = next_viewer_serial();
+        self.serial = serial;
+        let id = entry.id.clone();
         let (task, handle) = cosmic::task::future(async move {
             let loaded = loop {
-                let (item, origin) = (item.clone(), origin.clone());
-                match worker(move || load(&item, &origin, Fit::Full)).await {
+                let source = source.clone();
+                match worker(move || source.read()).await {
                     // Once previews have made what room they can, the reader
                     // asked for it, so it waits for the rest.
                     Loaded::Deferred(pressure) if patient => pressure.available().await,
@@ -1391,7 +1497,10 @@ impl Gallery {
     /// Whether the read of the entry `id`, as this gallery opened `serial`,
     /// is for the picture it shows now: one it has moved on from is not kept.
     fn awaits(&self, serial: u64, id: &str) -> bool {
-        serial != 0 && serial == self.serial && self.entries[self.selected].id == id
+        !self.suspended
+            && serial != 0
+            && serial == self.serial
+            && self.entries[self.selected].id == id
     }
     /// The whole picture of the entry `id`, read for this gallery.
     pub(in crate::app) fn loaded(&mut self, serial: u64, id: &str, loaded: Loaded) {
@@ -1416,7 +1525,7 @@ impl Gallery {
     pub(in crate::app) fn next(&mut self, host: ViewerHost, forward: bool) -> Task<Message> {
         // A lone picture has nowhere to go; moving "to" it again would drop
         // its pixels and the reader's zoom only to read it back.
-        if self.entries.len() < 2 {
+        if self.suspended || self.entries.len() < 2 {
             return Task::none();
         }
         // Only the shown picture is held whole, unless it is all there is.
@@ -1431,11 +1540,16 @@ impl Gallery {
         } else {
             (self.selected + self.entries.len() - 1) % self.entries.len()
         };
-        self.reset = self.reset.wrapping_add(1);
+        self.reset_view();
         // A picture that could not be read is tried again on return.
         self.entries[self.selected].error = None;
         self.read(host)
     }
+    fn reset_view(&mut self) {
+        self.reset = self.reset.wrapping_add(1);
+        self.geometry.set(Default::default());
+    }
+
     pub(super) fn url(&self) -> Option<Url> {
         self.entry_url(&self.entries[self.selected])
     }
@@ -1647,7 +1761,7 @@ impl Gallery {
                     .max_scale(20.0)
                     .into();
                 crate::interaction::context_menu(
-                    canvas::resettable(self.reset, viewer),
+                    canvas::resettable(self.reset, self.geometry.clone(), viewer),
                     clipboard::menu(
                         image,
                         entry.file_path().is_some(),
@@ -1750,6 +1864,18 @@ impl Cagents {
                 // would leave it, unless the pane doesn't hold it.
                 Some(Task::batch([read, self.focus_image_viewer(target)]))
             }
+            Action::ResumeImageViewer(target, serial) => {
+                let runtime = self.chat_card_runtime_mut(target)?;
+                let mut gallery = runtime.image_viewer.take()?;
+                let read = if gallery.resume(serial, runtime.is_visible()) {
+                    gallery.refresh(runtime);
+                    gallery.read(ViewerHost::Pane(target))
+                } else {
+                    Task::none()
+                };
+                runtime.image_viewer = Some(gallery);
+                Some(read)
+            }
             Action::FocusImage(target) => Some(self.focus_image_viewer(target)),
             Action::CloseImage(host) => {
                 match host {
@@ -1829,7 +1955,7 @@ impl Cagents {
             }
             Action::ImageFit(host) => {
                 if let Some(gallery) = self.image_viewer_mut(host) {
-                    gallery.reset = gallery.reset.wrapping_add(1);
+                    gallery.reset_view();
                 }
                 Some(Task::none())
             }
@@ -2739,11 +2865,14 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
             origin: None,
             serial: 1,
             reading: None,
+            reload: None,
+            suspended: false,
         };
         gallery.entries[1].id = gallery.entries[0].id.clone();
         drop(gallery.next(ViewerHost::Dialog, false));
@@ -2765,6 +2894,79 @@ mod tests {
             "a remote path must never open a local file URL"
         );
     }
+    #[test]
+    fn a_suspended_attachment_returns_pixels_and_rejects_an_older_read() {
+        let bytes = png();
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(pixels) = bounded_handle(bytes.clone(), &budget) else {
+            panic!("the fixture fits the pixel budget");
+        };
+        let attachment = chat::Attachment::file("/fixture/picture.png");
+        let mut gallery = Gallery::attachment(None, attachment.clone(), pixels);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        gallery.suspend();
+        assert_eq!(budget.pixels.available_permits(), 4);
+        assert!(
+            matches!(&gallery.reload, Some(ViewerSource::Attachment(source)) if source == &attachment)
+        );
+        assert_eq!(gallery.position(), (1, 1));
+
+        let (resume, _) = gallery.awaiting();
+        assert!(
+            !gallery.resume(resume, false),
+            "the pane hid before the reply"
+        );
+        let (next_resume, _) = gallery.awaiting();
+        assert_ne!(resume, next_resume);
+        assert!(!gallery.resume(resume, true));
+        assert!(gallery.resume(next_resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (previous_read, id) = gallery.awaiting();
+
+        gallery.suspend();
+        let (resume, _) = gallery.awaiting();
+        assert!(gallery.resume(resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        assert_ne!(gallery.awaiting().0, previous_read);
+        gallery.loaded(previous_read, &id, bounded_handle(bytes.clone(), &budget));
+        assert!(gallery.selected_image(ViewerHost::Dialog).is_none());
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let (serial, id) = gallery.awaiting();
+        gallery.loaded(serial, &id, bounded_handle(bytes, &budget));
+        assert!(gallery.selected_image(ViewerHost::Dialog).is_some());
+    }
+
+    #[test]
+    fn a_figure_viewer_reloads_its_file_after_suspension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("figure.png");
+        let bytes = png();
+        std::fs::write(&path, &bytes).unwrap();
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("the fixture fits the pixel budget");
+        };
+        let origin = Origin {
+            root: directory.path().to_owned(),
+            child: false,
+            device: None,
+        };
+        let mut gallery = Gallery::figure(None, path, origin, handle);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        gallery.suspend();
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let (resume, _) = gallery.awaiting();
+        assert!(gallery.resume(resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (serial, id) = gallery.awaiting();
+        let result = gallery.reload.as_ref().unwrap().read();
+        gallery.loaded(serial, &id, result);
+        assert_eq!(
+            pixel_size(gallery.entries[0].shown().unwrap()),
+            Some((1, 1))
+        );
+    }
+
     #[test]
     fn the_viewer_keeps_only_the_shown_pictures_whole_read() {
         let pixels = || iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
@@ -2794,6 +2996,7 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
             origin: Some(Origin {
@@ -2803,6 +3006,8 @@ mod tests {
             }),
             serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         };
         // A read the viewer has moved on from, or one for an earlier viewer,
         // is not kept.

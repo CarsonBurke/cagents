@@ -6,30 +6,49 @@ use iced::advanced::{
     Clipboard, Layout, Shell, Widget, layout, renderer,
     widget::{Operation, Tree, tree},
 };
+use iced::widget::image::viewer;
 use iced::{Event, Rectangle, Size, mouse};
+use std::{cell::Cell, rc::Rc};
 
-pub(super) fn resettable<'a>(revision: u64, content: Element<'a, Message>) -> Element<'a, Message> {
-    Element::new(Canvas { revision, content })
+pub(super) type Geometry = Rc<Cell<viewer::State>>;
+
+pub(super) fn resettable<'a>(
+    revision: u64,
+    geometry: Geometry,
+    content: Element<'a, Message>,
+) -> Element<'a, Message> {
+    Element::new(Canvas {
+        revision,
+        geometry,
+        content,
+    })
 }
 struct Canvas<'a> {
     revision: u64,
+    geometry: Geometry,
     content: Element<'a, Message>,
 }
-struct Revision(u64);
+struct Revision(u64, Geometry);
 impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
     fn tag(&self) -> tree::Tag {
         tree::Tag::of::<Revision>()
     }
     fn state(&self) -> tree::State {
-        tree::State::new(Revision(self.revision))
+        tree::State::new(Revision(self.revision, self.geometry.clone()))
     }
     fn children(&self) -> Vec<Tree> {
-        vec![Tree::new(self.content.as_widget())]
+        let mut viewer = Tree::new(self.content.as_widget());
+        *viewer.state.downcast_mut::<viewer::State>() = self.geometry.get();
+        vec![viewer]
     }
     fn diff(&mut self, tree: &mut Tree) {
         let revision = tree.state.downcast_mut::<Revision>();
-        if revision.0 != self.revision {
-            revision.0 = self.revision;
+        let same_viewer = Rc::ptr_eq(&revision.1, &self.geometry);
+        if !same_viewer || revision.0 != self.revision {
+            if same_viewer {
+                self.geometry.set(viewer::State::default());
+            }
+            *revision = Revision(self.revision, self.geometry.clone());
             tree.children = self.children();
         } else {
             tree.children[0].diff(self.content.as_widget_mut());
@@ -80,6 +99,12 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Canvas<'_> {
             shell,
             viewport,
         );
+        let geometry = *tree.children[0].state.downcast_ref::<viewer::State>();
+        // A gesture owns its grab only while a native canvas is drawn.
+        // Remember the completed zoom/pan, without keeping any image pixels.
+        if !geometry.is_cursor_grabbed() {
+            self.geometry.set(geometry);
+        }
     }
     fn mouse_interaction(
         &self,
@@ -137,9 +162,11 @@ mod tests {
             ))
             .unwrap();
         let handle = Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
+        let geometry = Geometry::default();
         let element = |revision| {
             resettable(
                 revision,
+                geometry.clone(),
                 Viewer::new(handle.clone())
                     .width(Length::Fill)
                     .height(Length::Fill)
@@ -190,6 +217,14 @@ mod tests {
         assert_eq!(scale(&tree), zoomed);
         assert!(
             tree.children[0]
+                .state
+                .downcast_ref::<viewer::State>()
+                .is_cursor_grabbed()
+        );
+        let reloaded = Tree::new(element(0).as_widget());
+        assert_eq!(scale(&reloaded), zoomed);
+        assert!(
+            !reloaded.children[0]
                 .state
                 .downcast_ref::<viewer::State>()
                 .is_cursor_grabbed()
