@@ -37,8 +37,8 @@
 //!   they never hold anyone back; under steady traffic they may refuse at
 //!   their deadline instead.
 //!
-//! Every wait but daemon exit's, which has no client to ask to retry, ends at
-//! a deadline.
+//! Client requests have deadlines. Daemon exit and history retirement have
+//! no client to ask to retry.
 //!
 //! The gate sits first in the daemon's lock order: control gate, agent gate,
 //! registry, HostState. Its own mutex is held only to update the counts, never
@@ -173,6 +173,12 @@ impl ControlGate {
         self.enter_exclusive(Some(deadline), false)
     }
 
+    /// Background retirement waits for a gap without delaying new requests.
+    pub(super) fn exclusive_when_free(&self) -> Exclusive<'_> {
+        self.enter_exclusive(None, false)
+            .expect("an exclusive wait without a deadline cannot expire")
+    }
+
     /// Queued exclusive admission without a deadline. Only for daemon exit,
     /// which must win and has no client to ask to retry.
     pub(super) fn exclusive(&self) -> Exclusive<'_> {
@@ -191,7 +197,7 @@ impl ControlGate {
         let mut counts = self.counts();
         *counts.waiters(queue) += 1;
         loop {
-            if counts.admits_exclusive() {
+            if counts.admits_exclusive() && (queue || counts.queued == 0) {
                 *counts.waiters(queue) -= 1;
                 counts.exclusive = true;
                 return Some(Exclusive(self));

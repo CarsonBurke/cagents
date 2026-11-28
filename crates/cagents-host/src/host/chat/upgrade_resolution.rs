@@ -44,6 +44,11 @@ pub(super) fn expire_for_test(host: &SharedHost, client: ClientId) {
 
 pub(in crate::host) enum Attempt {
     Ready(Box<Grant>),
+    History {
+        attempt: uuid::Uuid,
+        chat: TerminalId,
+        execution: uuid::Uuid,
+    },
     Spent(uuid::Uuid),
     RestartRefused(Box<RestartRefusal>),
 }
@@ -52,9 +57,18 @@ impl Attempt {
     fn id(&self) -> uuid::Uuid {
         match self {
             Self::Ready(grant) => grant.attempt,
+            Self::History { attempt, .. } => *attempt,
             Self::Spent(id) => *id,
             Self::RestartRefused(refusal) => refusal.attempt,
         }
+    }
+
+    pub(super) fn pins_history(&self, id: TerminalId, instance: uuid::Uuid) -> bool {
+        matches!(self, Self::History { chat, execution, .. } if *chat == id && *execution == instance)
+    }
+
+    pub(in crate::host) fn is_history(&self) -> bool {
+        matches!(self, Self::History { .. })
     }
 }
 
@@ -145,9 +159,12 @@ pub(in crate::host) fn resolve(
         }
         // Invalidate first, including when source admission or the RPC fails.
         // One slot per registered connection bounds both handles and markers.
-        state
+        let previous = state
             .chat_resolutions
             .insert(client, Attempt::Spent(attempt));
+        if previous.as_ref().is_some_and(Attempt::is_history) {
+            state.recheck_history_readers();
+        }
     }
     // Startup discovery can miss an unvisited retained owner. Resolve its
     // exact issued source through ordinary authenticated adoption before
@@ -223,7 +240,24 @@ pub(in crate::host) fn resolve(
             ) {
                 return Err(unavailable("Retained recovery lost its exact remote actor"));
             }
-            state.chat_resolutions.remove(&client);
+            if record.handle.is_read_only_history() {
+                if state.chat_spawning.contains_key(&source.id) {
+                    return Err(retryable_unavailable(
+                        "Native history ownership is changing; retry after the transition finishes",
+                    ));
+                }
+                let execution = record.execution_instance;
+                state.chat_resolutions.insert(
+                    client,
+                    Attempt::History {
+                        attempt,
+                        chat: source.id,
+                        execution,
+                    },
+                );
+            } else {
+                state.chat_resolutions.remove(&client);
+            }
             return Ok(resolved);
         }
         Grant {
@@ -264,6 +298,13 @@ pub(in crate::host) fn attach(
         let Some(attempt) = state.chat_resolutions.get_mut(&client) else {
             return Ok(None);
         };
+        if attempt.is_history() {
+            // The shared request gate covers the ordinary Attach path below.
+            // Retirement cannot observe the pin gone before subscription.
+            state.chat_resolutions.remove(&client);
+            state.recheck_history_readers();
+            return Ok(None);
+        }
         let id = attempt.id();
         let Attempt::Ready(grant) = std::mem::replace(attempt, Attempt::Spent(id)) else {
             return Err(retryable_unavailable(
