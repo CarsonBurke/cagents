@@ -13,8 +13,8 @@ use crate::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, LIST_PAGE_BYTES,
         MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS,
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION,
-        ServerEnvelope, ServerMessage, ServerResponse, ShutdownOperation, ShutdownOutcome,
-        TerminalDescriptor, TerminalScroll, TerminalSnapshot, TerminalVisibility,
+        ServerEnvelope, ServerEnvelopeRef, ServerMessage, ServerResponse, ShutdownOperation,
+        ShutdownOutcome, TerminalDescriptor, TerminalScroll, TerminalSnapshot, TerminalVisibility,
         WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit, validate_proof,
     },
 };
@@ -411,7 +411,14 @@ fn serve_connection_inner<R: Into<crate::terminal_ipc::PreparedResponse>>(
             // A resumed terminal's live events follow its handshake and replay.
             // Held messages are not coalesced, so hold only to resume.
             let hold = (!resume.is_empty()).then(|| delivery.hold_broadcasts());
-            let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
+            let (resumed, replay) = match prepare_resume(
+                &host,
+                client_id,
+                resume,
+                &proof,
+                envelope.request_id,
+                envelope.version,
+            ) {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     let _ = push_error(&delivery, &host, envelope.request_id, error);
@@ -3085,10 +3092,21 @@ fn process_admitted_request(
     }
 }
 
+fn oversized_resume() -> ProtocolError {
+    ProtocolError::new(
+        ProtocolErrorCode::InvalidRequest,
+        "The terminal resume reply exceeds a frame; reconnect and attach terminals separately",
+        false,
+    )
+}
+
 fn prepare_resume(
     host: &SharedHost,
     client_id: ClientId,
     cursors: Vec<ResumeCursor>,
+    proof: &HostSessionProof,
+    request_id: u64,
+    version: u16,
 ) -> Result<
     (
         Vec<crate::terminal_ipc::TerminalDescriptor>,
@@ -3118,6 +3136,23 @@ fn prepare_resume(
     }
     let mut resumed = Vec::new();
     let mut replay = Vec::new();
+    // Measure both copies of the proof and the actual request ID. A large
+    // single descriptor must still be resumable whenever its frame fits.
+    let envelope = ServerEnvelopeRef {
+        version,
+        request_id: Some(request_id),
+        proof,
+        message: &ServerMessage::Response {
+            response: ServerResponse::Connected {
+                proof: proof.clone(),
+                resumed: Vec::new(),
+            },
+        },
+    };
+    let mut remaining = postcard::experimental::serialized_size(&envelope)
+        .ok()
+        .and_then(|size| MAX_FRAME_BYTES.checked_sub(size))
+        .ok_or_else(oversized_resume)?;
     for cursor in cursors {
         if super::account_lifecycle::ensure_terminal(host, cursor.terminal_id).is_err() {
             continue;
@@ -3127,6 +3162,18 @@ fn prepare_resume(
             let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
                 continue;
             };
+            let size = crate::terminal_ipc::encoding_for(version, || {
+                postcard::experimental::serialized_size(&terminal)
+            })
+            .map_err(|_| oversized_resume())?;
+            // The empty encoding already paid one byte for the vector length.
+            let count_extra = postcard::experimental::serialized_size(&(resumed.len() + 1))
+                .map_err(|_| oversized_resume())?
+                - 1;
+            remaining = remaining
+                .checked_sub(size)
+                .filter(|remaining| *remaining >= count_extra)
+                .ok_or_else(oversized_resume)?;
             state.resume_presentation(client_id, cursor.terminal_id, cursor.generation);
             let events = state
                 .replay_events(cursor.terminal_id, cursor.event_sequence)

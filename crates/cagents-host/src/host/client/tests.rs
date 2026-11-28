@@ -123,6 +123,9 @@ mod reconnect_output {
                     generation: cursor,
                     event_sequence: 0,
                 }],
+                &current_proof(&host),
+                1,
+                PROTOCOL_VERSION,
             )
             .unwrap();
             assert_eq!(resumed.len(), 1);
@@ -227,6 +230,9 @@ mod reconnect_output {
                     generation: client.cursor(),
                     event_sequence: 0,
                 }],
+                &current_proof(&host),
+                1,
+                PROTOCOL_VERSION,
             )
             .unwrap()
             .1
@@ -538,6 +544,81 @@ fn await_exclusive_queue(gate: &ControlGate) {
         );
         thread::sleep(Duration::from_millis(2));
     }
+}
+
+#[test]
+fn oversized_resume_returns_a_correlated_refusal_without_replay() {
+    use crate::{model::LaunchRecipe, terminal::RenderStreamFixture};
+
+    let (proof, host) = panic_test_host("wire-resume-budget");
+    let recipe = LaunchRecipe {
+        environment: (0..8)
+            .map(|index| (format!("FIXTURE_VALUE_{index}"), "x".repeat(127 * 1024)))
+            .collect(),
+        ..LaunchRecipe::shell("/".into()).unwrap()
+    };
+    let mut cursors = Vec::new();
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        for _ in 0..9 {
+            let id = TerminalId::new();
+            state.reserve_spawn(id).unwrap();
+            state
+                .finish_spawn(
+                    1,
+                    TerminalDescriptor::relaunchable(id, recipe.clone(), None).session,
+                    RenderStreamFixture::new(|_| {}).handle,
+                    false,
+                )
+                .unwrap();
+            cursors.push(ResumeCursor {
+                terminal_id: id,
+                generation: crate::terminal_ipc::SUPPRESS_GRID_REPLAY,
+                event_sequence: 0,
+            });
+        }
+    }
+    let id = cursors[0].terminal_id;
+    // Eight descriptors fit just below the wire ceiling. The old inventory
+    // reply's fixed headroom would refuse this valid handshake.
+    let (resumed, _) =
+        prepare_resume(&host, 3, cursors[..8].to_vec(), &proof, 7, PROTOCOL_VERSION).unwrap();
+    assert_eq!(resumed.len(), 8);
+    disconnect_client(&host, 3);
+
+    let (mut stream, peer) = UnixStream::pair().unwrap();
+    stream.set_read_timeout(Some(HANDSHAKE_TIMEOUT)).unwrap();
+    thread::scope(|scope| {
+        scope.spawn(|| serve_fixture_user(peer, 2, host.clone()));
+        crate::terminal_ipc::write_frame(
+            &mut stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: 7,
+                proof: None,
+                request: ClientRequest::Connect {
+                    expected_host: Some(proof.clone()),
+                    resume: cursors,
+                },
+            },
+        )
+        .unwrap();
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let reply: ServerEnvelope = codec.read(&mut stream).unwrap().unwrap();
+        assert_eq!(reply.request_id, Some(7));
+        assert_eq!(reply.proof, proof);
+        assert!(matches!(
+            reply.message,
+            ServerMessage::Error(ProtocolError {
+                code: ProtocolErrorCode::InvalidRequest,
+                message,
+                retryable: false,
+            }) if message.contains("attach terminals separately")
+        ));
+        assert!(codec.read::<ServerEnvelope>(&mut stream).unwrap().is_none());
+    });
+    assert!(!host.lock().unwrap().descriptor(2, id).unwrap().attached);
 }
 
 #[test]
@@ -2765,7 +2846,17 @@ pub(in crate::host) fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdo
     let error = process_request(&host, 2, ClientRequest::List).unwrap_err();
     assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
     assert!(!error.retryable);
-    assert!(prepare_resume(&host, 2, Vec::new()).is_err());
+    assert!(
+        prepare_resume(
+            &host,
+            2,
+            Vec::new(),
+            &current_proof(&host),
+            1,
+            PROTOCOL_VERSION,
+        )
+        .is_err()
+    );
 }
 
 #[test]
