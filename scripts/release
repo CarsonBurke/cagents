@@ -620,10 +620,35 @@ HOST
     exec {output}>&-
 }
 
-# The versions tagged on origin, as a JSON array.
-released_versions() {
-    repository_git ls-remote --tags --refs origin 'v*' | sed -n 's#.*refs/tags/v##p' | jq -R . | jq -sc .
+# Fetch advertised objects without updating FETCH_HEAD, remote-tracking refs
+# or tags. Both modes can qualify a commit the caller has not fetched yet.
+fetch_cut_objects() {
+    local missing
+    missing=$(repository_git cat-file --batch-check='%(objecttype)' | awk '$2 == "missing" {print $1}') || return
+    [[ -z $missing ]] || repository_git fetch --quiet --no-tags --no-write-fetch-head --refmap= --stdin origin <<< "$missing"
 }
+
+cut_notes() (
+    local sha=$1 tags=$2 view previous objects format
+    if [[ -n $tags ]]; then
+        cut -f1 <<< "$tags" | fetch_cut_objects || fail 'cannot fetch the release tag objects'
+        view=$(mktemp -d)
+        trap 'rm -rf -- "$view"' EXIT
+        format=$(repository_git rev-parse --show-object-format)
+        repository_git init --quiet --bare --template= --object-format="$format" "$view"
+        objects=$(repository_git rev-parse --path-format=absolute --git-path objects)
+        printf '%s\n' "$objects" > "$view/objects/info/alternates"
+        # Use only advertised release tags, including annotated tags. Keep
+        # Git's ancestry and tie-breaking rules for selecting the prior tag.
+        awk '{print "update", $2, $1}' <<< "$tags" | repository_git --git-dir="$view" update-ref --stdin
+        previous=$(repository_git --git-dir="$view" describe --tags --abbrev=0 \
+            --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) || previous=
+        if [[ -n $previous ]]; then
+            previous=$(repository_git --git-dir="$view" rev-parse --verify "refs/tags/$previous^{commit}")
+        fi
+    fi
+    "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} --to "$sha"
+)
 
 # The newest bundle main contains whose tests passed and whose version is not
 # released yet, as "SHA BEHIND", where BEHIND counts the main commits after it.
@@ -676,21 +701,23 @@ cut_cleanup() {
 
 # Named apart from the cut command, which it would otherwise shadow.
 cut_release() {
-    local status released selected sha behind tip answer bundle protocol previous key building
+    local status released selected sha behind tip answer bundle protocol key building remote_refs tags
     local prebuild_status=0 tip_version
-    local -a fetch_options=()
     trap cut_cleanup EXIT
     trap 'exit 129' HUP
     trap 'exit 130' INT
     trap 'exit 143' TERM
-    [[ $DRY_RUN == false ]] || fetch_options+=(--no-tags)
-    repository_git fetch --quiet "${fetch_options[@]}" origin main
-    MAIN=$(repository_git rev-parse --verify origin/main)
+    remote_refs=$(repository_git ls-remote --refs origin refs/heads/main 'refs/tags/v*') \
+        || fail 'cannot read main and release tags on origin'
+    MAIN=$(awk '$2 == "refs/heads/main" {print $1}' <<< "$remote_refs")
+    [[ -n $MAIN ]] || fail 'main does not exist on origin'
+    fetch_cut_objects <<< "$MAIN" || fail 'cannot fetch main from origin'
+    tags=$(awk '$2 ~ /^refs\/tags\/v/ {print}' <<< "$remote_refs")
     tip=$MAIN
     if [[ $ACTIONS == false || -z $COMMIT ]]; then
         status=$(prebuilt "$tip") || fail "cannot read the prebuilt bundles on $BUILD_HOST"
     fi
-    released=$(released_versions) || fail 'cannot read the tags on origin'
+    released=$(sed -n 's#.*refs/tags/v##p' <<< "$tags" | jq -R . | jq -sc .)
     if [[ -n $COMMIT ]]; then
         sha=$(repository_git rev-parse --verify "$COMMIT^{commit}") || fail "unknown commit: $COMMIT"
         repository_git merge-base --is-ancestor "$sha" "$MAIN" || fail "$sha is not on main"
@@ -776,10 +803,7 @@ cut_release() {
         repository_git tag -a "$TAG" -m "$TAG" "$sha" 2>/dev/null \
             || [[ $(repository_git rev-parse "refs/tags/$TAG^{commit}") == "$sha" ]] || fail "cannot tag $sha as $TAG"
         printf '\nTagged %s at %s for GitHub Actions to qualify and sign. Its notes will be:\n\n' "$TAG" "$sha"
-        previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) \
-            || previous=
-        "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
-            --to "$sha" | sed 's/^/  /'
+        cut_notes "$sha" "$tags" | sed 's/^/  /'
         printf '\nPush it, which has the release workflow leave a signed draft; rehearse that draft; then publish it:\n  scripts/release publish %s --actions\n  scripts/release rehearse %s --from-draft\n  scripts/release publish %s --actions\n' \
             "$VERSION" "$VERSION" "$VERSION"
         return
@@ -815,11 +839,8 @@ cut_release() {
         --source-commit "$sha" >/dev/null || fail 'the copied bundle does not match what was built'
     protocol=$(jq -r .protocol "$bundle.partial/release-metadata.json")
     if [[ -z $NOTES ]]; then
-        previous=$(repository_git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$sha^" 2>/dev/null) \
-            || previous=
         NOTES_FILE=$(mktemp)
-        "$ROOT_DIR/scripts/release-metadata" notes --repository "$ROOT_DIR" ${previous:+--from "$previous"} \
-            --to "$sha" > "$NOTES_FILE"
+        cut_notes "$sha" "$tags" > "$NOTES_FILE"
         NOTES=$NOTES_FILE
     fi
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
