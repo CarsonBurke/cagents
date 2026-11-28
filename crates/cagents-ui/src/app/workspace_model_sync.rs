@@ -2405,7 +2405,7 @@ impl Cagents {
     /// registry request failed or a local conversation still waiting to
     /// publish; every edge until it settles then reconciles, as before edges
     /// could skip, and the trace gives the reason.
-    fn reconciliation_owed(&self) -> Option<&'static str> {
+    fn reconciliation_owed(&mut self) -> Option<&'static str> {
         if !self.pending_repository_reconciliation.is_empty() {
             Some("a repository reconciliation is deferred")
         } else if self.holds_unpublished_local_chat() {
@@ -2416,8 +2416,8 @@ impl Cagents {
             Some("a channel name suggestion is waiting")
         } else if self.channel_ui.deletion_unsettled() {
             Some("a channel deletion is unsettled")
-        } else if self.shared_views.reconciled_roots != self.worktree_roots_digest() {
-            Some("the worktree roots changed")
+        } else if self.shared_views.reconciled_topology != self.view_topology_revision() {
+            Some("the worktree topology changed")
         } else {
             None
         }
@@ -3103,10 +3103,8 @@ impl Cagents {
         }
         phase.mark("reconcile_naming");
         if repositories.is_none() {
-            // Which worktree a card belongs to reads these roots, so a change
-            // to them owes the next edge a reconciliation. Read after the
-            // pass, which can adopt projects and their worktrees.
-            self.shared_views.reconciled_roots = self.worktree_roots_digest();
+            // Read after the pass, which can adopt projects and worktrees.
+            self.shared_views.reconciled_topology = self.view_topology_revision();
         }
         Task::batch(tasks)
     }

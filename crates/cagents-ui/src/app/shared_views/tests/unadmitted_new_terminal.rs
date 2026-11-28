@@ -586,7 +586,7 @@ fn an_unqueued_new_terminal_is_owed_reconciliation() {
     drop(window.app.reconcile_shared_views());
     assert!(window.app.holds_unqueued_creation());
     window.app.workspace_model_tx = open;
-    window.app.shared_views.reconciled_roots = window.app.worktree_roots_digest();
+    window.app.shared_views.reconciled_topology = window.app.view_topology_revision();
     assert!(!window.app.holds_unpublished_local_chat());
     let identity = window.app.workspace_model.identity;
     let sequence = window.app.workspace_model.sequence;
