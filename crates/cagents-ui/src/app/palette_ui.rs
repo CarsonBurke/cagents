@@ -72,11 +72,24 @@ struct Entry {
 #[derive(Debug, Clone, PartialEq)]
 enum Detail {
     Text(String),
-    /// The chord that runs the command, drawn as key caps.
-    Shortcut(String),
+    /// The chords that run the command, drawn as key caps, and as written,
+    /// for a search to read.
+    Shortcut {
+        chords: Vec<String>,
+        text: String,
+    },
     /// A pane's activity, read when the row is drawn: it changes as agents
     /// work, without a projection.
     PaneStatus(CardId),
+}
+
+impl Detail {
+    fn shortcut(chords: &[String]) -> Self {
+        Self::Shortcut {
+            chords: chords.to_vec(),
+            text: cagents::settings::format_chords(chords),
+        }
+    }
 }
 
 impl From<String> for Detail {
@@ -913,7 +926,7 @@ impl Cagents {
 
     fn palette_detail<'a>(&self, detail: &'a Detail) -> &'a str {
         match detail {
-            Detail::Text(text) | Detail::Shortcut(text) => text,
+            Detail::Text(text) | Detail::Shortcut { text, .. } => text,
             Detail::PaneStatus(card) => self.palette_pane_status(*card),
         }
     }
@@ -1105,12 +1118,10 @@ impl Cagents {
             .map(|descriptor| {
                 (
                     descriptor.label.to_owned(),
-                    // The chord a tooltip shows; Settings lists the rest.
-                    workspace_widget::primary_shortcut(
+                    Detail::shortcut(workspace_widget::shortcut_keys(
                         descriptor.action,
                         &self.settings.keyboard_shortcuts,
-                    )
-                    .map_or_else(|| Detail::Text(String::new()), Detail::Shortcut),
+                    )),
                     Message::RunCommand(descriptor.action),
                 )
             })
@@ -1124,7 +1135,7 @@ impl Cagents {
             ] {
                 entries.push((
                     label.into(),
-                    Detail::Shortcut(chord.into()),
+                    Detail::shortcut(&[chord.to_owned()]),
                     Message::Repository(RepositoryAction::Language {
                         card,
                         action: repository_widget::EditorLspAction::Diagnostic(forward),
@@ -1282,8 +1293,10 @@ impl Cagents {
                 let identity = entry.identity.clone()?;
                 let label = entry.label.as_str();
                 let detail: Element<'_, Message> = match &entry.detail {
-                    Detail::Shortcut(chord) => crate::interaction::key_caps(
-                        &crate::interaction::KeyChord::new(chord.as_str()),
+                    Detail::Shortcut { chords, .. } => crate::interaction::chords_caps(
+                        chords
+                            .iter()
+                            .map(|chord| crate::interaction::KeyChord::new(chord.as_str())),
                     ),
                     detail => design::caption(self.palette_detail(detail))
                         .wrapping(iced::widget::text::Wrapping::None)
