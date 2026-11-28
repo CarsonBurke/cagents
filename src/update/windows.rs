@@ -1,6 +1,7 @@
 //! Prove native presentation before changing daemon ownership, and retain the
 //! window slots separately from daemon recovery.
 use super::*;
+use crate::model::HostSessionProof;
 use std::os::unix::fs::PermissionsExt;
 
 pub const PROBE_ARGUMENT: &str = "--internal-first-frame-probe";
@@ -26,6 +27,8 @@ pub(super) const PRIVATE_PATHS: &[(&str, &str)] = &[
 struct SavedWindows {
     version: String,
     slots: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    retained_daemon: Option<HostSessionProof>,
     #[serde(default)]
     restore_failed: bool,
 }
@@ -65,6 +68,7 @@ pub(super) fn remember_slots(
     state: &Path,
     job: &UpdateJob,
     slots: Vec<String>,
+    retained_daemon: Option<HostSessionProof>,
 ) -> Result<(), UpdateError> {
     if slots.is_empty() {
         return Ok(());
@@ -75,6 +79,7 @@ pub(super) fn remember_slots(
         &SavedWindows {
             version: job.version.clone(),
             slots,
+            retained_daemon,
             restore_failed: false,
         },
     )
@@ -288,24 +293,60 @@ pub(crate) fn reopen(id: &str) -> Result<Option<String>, UpdateError> {
     }
     let daemon = selected.join("bin/cagentsd");
     let timeout = crate::install_guard::daemon_start_timeout()?;
-    let confirm_owner = || installed::confirm_daemon_ready(&daemon, None, timeout);
-    confirm_owner()?;
+    let retained = saved.retained_daemon.as_ref();
+    if census.transaction != id
+        || retained.is_some_and(|proof| census.source.as_ref() != Some(proof))
+    {
+        return Err(invalid(
+            "The saved windows and daemon inventory belong to different updates",
+        ));
+    }
+    let confirm_owner = || installed::confirm_window_retry_daemon_ready(&daemon, retained, timeout);
+    let serving = confirm_owner()?;
     guard.set_recovery_restore_only();
     let ui = selected.join("bin/cagents-ui");
     let launched = guard.relaunch_missing_windows_with_notes(&saved.slots, &ui);
     let guard = crate::instance::UiUpdateGuard::acquire_for_cutover()?;
-    let verified = guard.verify_cutover_windows(&saved.slots, &ui);
+    let verified = guard.recheck_cutover_windows(&saved.slots, &ui);
     let notes = match (launched, verified) {
-        (Ok(notes), Ok(())) => notes,
-        (Err(_), Ok(())) => None,
+        (Ok(launched), Ok(verified)) => Some(
+            launched
+                .into_iter()
+                .chain(verified)
+                .collect::<Vec<_>>()
+                .join("\n\n"),
+        )
+        .filter(|notes| !notes.is_empty()),
+        (Err(_), Ok(notes)) => notes,
         (Err(error), Err(_)) | (Ok(_), Err(error)) => return Err(error.into()),
     };
-    confirm_owner()?;
-    let receipt = census.verify_with_target_retiring(&selected, &state, id)?;
-    if !receipt.usable() {
-        return Err(receipt.failure());
+    if confirm_owner()? != serving {
+        return Err(invalid(
+            "The terminal service changed during window verification",
+        ));
     }
-    receipt.save(&recovery::outcome_path(&state, id))?;
+    let receipt = census.verify_with_target_retiring(&selected, &state, id)?;
+    let recovery::Outcome::Usable {
+        serving: verified, ..
+    } = &receipt.outcome
+    else {
+        return Err(receipt.failure());
+    };
+    let outcome = recovery::outcome_path(&state, id);
+    let confirmed = confirm_owner().and_then(|current| {
+        if *verified == serving && current == serving {
+            Ok(())
+        } else {
+            Err(invalid(
+                "The terminal service changed during window verification",
+            ))
+        }
+    });
+    if let Err(error) = confirmed {
+        census.unobserved(&error)?.save(&outcome)?;
+        return Err(error);
+    }
+    receipt.save(&outcome)?;
     job.phase = UpdatePhase::Complete;
     job.message = match &notes {
         Some(notes) => format!("Update installed; saved windows reopened after retry\n\n{notes}"),
@@ -435,7 +476,7 @@ printf 'first-frame-v1\n'
             Ok(candidate("printf 'first-frame-v1\\n'"))
         })
         .unwrap();
-        remember_slots(state.path(), &job, slots.clone()).unwrap();
+        remember_slots(state.path(), &job, slots.clone(), None).unwrap();
         let saved = load(state.path(), &job.id).unwrap();
         assert_eq!(saved.version, job.version);
         assert!(!saved.restore_failed);
@@ -449,7 +490,7 @@ printf 'first-frame-v1\n'
         let state = prefix.join(".update");
         fs::create_dir(&state).unwrap();
         let job = job();
-        remember_slots(&state, &job, vec!["main".into()]).unwrap();
+        remember_slots(&state, &job, vec!["main".into()], None).unwrap();
         let error = || reopen_failure(&state, &job, "workspace initialization failed").to_string();
         let target = Path::new("versions").join(&job.version);
         fs::create_dir_all(prefix.join(&target)).unwrap();

@@ -669,17 +669,75 @@ async fn saved_output(task: Task<Message>) -> Message {
     tokio::time::timeout(Duration::from_secs(25), async {
         let mut stream = cosmic::iced::runtime::task::into_stream(task).expect("save task");
         while let Some(action) = stream.next().await {
-            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
-                message @ Message::StartupPanesSaved(..),
-            )) = action
-            {
-                return message;
+            if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(message)) = action {
+                match message {
+                    Message::StartupPanesSaved(..) => return message,
+                    #[cfg(target_os = "linux")]
+                    Message::UiUpdateRechecked(..) => return message,
+                    _ => {}
+                }
             }
         }
         panic!("the original save Task emitted no completion");
     })
     .await
     .expect("private workspace save did not complete")
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, cards) = waiting(1);
+    let (session, _) = SessionRuntime::open(
+        directory.path().join("state.sqlite3"),
+        crate::model::BootId::new("window-recheck-fixture"),
+    )
+    .unwrap();
+    app.session = Some(session);
+    app.settings_path = Some(directory.path().join("settings.toml"));
+    app.settings_write_blocked = false;
+
+    let answer = inspection(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    );
+    drop(app.startup_state_inspected(answer));
+    assert!(app.startup_gate.reported);
+    assert_eq!(reported(&app), Some(RETAINED_NOTICE));
+
+    let request = || {
+        let (response, receiver) = std::sync::mpsc::sync_channel(1);
+        (
+            instance::UiUpdateRequest {
+                action: instance::UiUpdateAction::Recheck,
+                response,
+            },
+            receiver,
+        )
+    };
+    let (check, answer) = request();
+    assert_eq!(app.recheck_startup(check).units(), 0);
+    assert!(answer.try_recv().unwrap().starts_with("error: "));
+    assert!(app.card_state(cards[0]).is_some());
+
+    end_terminals(&mut app, &cards);
+    let (check, answer) = request();
+    let save = app.recheck_startup(check);
+    assert!(
+        answer.try_recv().is_err(),
+        "readiness must wait for the flush"
+    );
+    let Message::UiUpdateRechecked(check, settings, saved) = saved_message(save) else {
+        panic!("rechecking did not flush the workspace");
+    };
+    assert!(settings.is_ok() && saved.is_ok());
+    app.finish_startup_recheck(check, settings, saved);
+    assert_eq!(answer.try_recv().unwrap(), instance::UI_LAUNCH_READY);
+    assert!(app.card_state(cards[0]).is_some());
+    assert!(app.startup_gate.reported);
 }
 
 #[test]

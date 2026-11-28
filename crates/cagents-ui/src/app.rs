@@ -5294,6 +5294,12 @@ pub enum Message {
     StartupStateInspected(startup_gate::Inspection),
     StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
+    #[cfg(target_os = "linux")]
+    UiUpdateRechecked(
+        instance::UiUpdateRequest,
+        Result<SettingsSaved, String>,
+        Result<(), String>,
+    ),
     UiUpdateWatchdog(u64),
     UiUpdateFlushed {
         generation: u64,
@@ -19666,7 +19672,14 @@ impl Cagents {
                 self.refresh_settings_feedback();
                 Task::none()
             }
+            #[cfg(target_os = "linux")]
+            Message::UiUpdateRechecked(request, settings, saved) => {
+                self.finish_startup_recheck(request, settings, saved);
+                Task::none()
+            }
             Message::UiUpdate(request) => match request.action {
+                #[cfg(target_os = "linux")]
+                instance::UiUpdateAction::Recheck => self.recheck_startup(request),
                 instance::UiUpdateAction::Prepare => {
                     if self.update_prepared {
                         let _ = request

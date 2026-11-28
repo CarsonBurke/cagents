@@ -1249,6 +1249,57 @@ impl Cagents {
         report(result)
     }
 
+    // An earlier failure belongs to the first launch. Check the panes this
+    // window holds now and flush the workspace without reenacting startup.
+    #[cfg(target_os = "linux")]
+    pub(super) fn recheck_startup(&mut self, request: instance::UiUpdateRequest) -> Task<Message> {
+        if let Err(reason) = self.current_startup_verdict() {
+            request.answer_recheck(Err(&reason));
+            return Task::none();
+        }
+        self.persist();
+        let save = self.capture_workspace_save();
+        cosmic::task::future(async move {
+            let (settings, saved) = flush_workspace(save).await;
+            Message::UiUpdateRechecked(request, settings, saved)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn finish_startup_recheck(
+        &mut self,
+        request: instance::UiUpdateRequest,
+        settings: Result<SettingsSaved, String>,
+        saved: Result<(), String>,
+    ) {
+        let result = settings
+            .map(|settings| self.acknowledge_settings_save(settings))
+            .and(saved)
+            .map_err(bounded_report)
+            .and_then(|()| self.current_startup_verdict());
+        request.answer_recheck(
+            result
+                .as_ref()
+                .map(|notes| notes.as_deref())
+                .map_err(String::as_str),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_startup_verdict(&self) -> Result<Option<String>, String> {
+        if self.update_prepared || self.exit.is_some() || !self.startup_gate.reported {
+            return Err("the window is still changing its update state".into());
+        }
+        match self.inspect_startup_panes() {
+            Ok(None) => Ok(None),
+            Err(StartupReport::PaneNotes(notes)) => Ok(Some(bounded_report(notes))),
+            Err(StartupReport::Incomplete(reason)) => Err(bounded_report(reason)),
+            Ok(Some(pending)) => Err(bounded_report(
+                self.reconnecting_report(&pending).message().to_owned(),
+            )),
+        }
+    }
+
     pub(super) fn startup_report_failed(&mut self) {
         self.startup_gate.retire_inspections();
         self.startup_gate.reported = true;

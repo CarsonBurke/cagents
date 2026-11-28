@@ -2845,7 +2845,12 @@ fn perform_update(
     confirmation::check_cancelled(state, job)?;
     let prepared_slots = guard.prepare_windows(Duration::from_secs(45))?;
     if native_startup_verified {
-        windows::remember_slots(state, job, prepared_slots)?;
+        windows::remember_slots(
+            state,
+            job,
+            prepared_slots,
+            recovery.retained_source(confirmed.replaces_daemon),
+        )?;
     }
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
