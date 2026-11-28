@@ -14615,3 +14615,82 @@ fn compact_rail_rows_hold_still_under_the_pointer() {
     state.hover_list(&model, true, false);
     assert!(!shows(&model, &state));
 }
+
+fn progress_hold_fixture() -> (SidebarModel, SidebarState, SelectionRow) {
+    let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+    let id = CardId::from_uuid(Uuid::from_u128(96));
+    model.projects[0].panes.push(SidebarCard::new(
+        id,
+        "Working pane".into(),
+        false,
+        None,
+        AttentionSummary {
+            working: 1,
+            ..AttentionSummary::default()
+        },
+    ));
+    let mut state = expanded_worktree_state();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+    (model, state, SelectionRow::Card(id))
+}
+
+#[test]
+fn an_unreachable_project_loses_its_held_progress_rows() {
+    let (mut model, mut state, row) = progress_hold_fixture();
+    state.hover_list(&model, false, true);
+    assert!(visible_selection_rows(&model, &state, false).contains(&row));
+
+    model.projects[0].unreachable = Some("Device did not answer".into());
+    assert!(!visible_selection_rows(&model, &state, false).contains(&row));
+    assert!(in_progress_rows(&model, &state, false).is_empty());
+}
+
+#[test]
+fn folding_in_progress_releases_its_rows_and_the_folded_section_does_not_hold_them() {
+    let (mut model, mut state, row) = progress_hold_fixture();
+    state.hover_list(&model, false, true);
+    assert!(state.held_in_progress(row));
+
+    assert!(state.toggle_in_progress());
+    assert!(state.fold_in_progress());
+    assert!(state.list_held(), "the untouched sections keep their holds");
+    state.follow_list(&model, false);
+    assert!(!state.held_in_progress(row));
+
+    model.projects[0].panes[0].attention = AttentionSummary::default();
+    assert!(in_progress_rows(&model, &state, false).is_empty());
+    assert!(!state.toggle_in_progress(), "unfolds immediately");
+    assert!(state.list_held());
+    assert!(!visible_selection_rows(&model, &state, false).contains(&row));
+}
+
+#[test]
+fn sidebar_hover_preserves_hide_read_visibility_and_releases_when_search_closes() {
+    let (mut model, mut state, _) = progress_hold_fixture();
+    let id = CardId::from_uuid(Uuid::from_u128(97));
+    model.projects[0].panes.push(SidebarCard::new(
+        id,
+        "Already read".into(),
+        false,
+        None,
+        AttentionSummary::default(),
+    ));
+    state
+        .retained_attention
+        .insert(SelectionRow::Card(id), Listing::Read);
+    assert!(lists_kept_attention_rows(&filtered_projects(
+        &model, &state, true
+    )));
+
+    state.apply(&SidebarAction::ToggleControls);
+    state.apply(&SidebarAction::SearchChanged("Working pane".into()));
+    assert!(!lists_kept_attention_rows(&filtered_projects(
+        &model, &state, true
+    )));
+    state.hover_list(&model, true, true);
+    let hold = state.list_hold.get().unwrap();
+    assert!(!hold.hide_read);
+    assert!(!hold.listed.contains(&SelectionRow::Card(id)));
+    state.apply(&SidebarAction::CloseControls);
+    assert!(!state.list_held());
+}

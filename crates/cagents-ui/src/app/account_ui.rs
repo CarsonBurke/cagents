@@ -2382,7 +2382,7 @@ fn account_gauge(
         .map(row)
         .collect();
     // Each kind of reset is a row of its own: what it clears, how many, and
-    // when the first expires or why it can't be spent.
+    // when the first expires and whether it can be spent.
     rows.extend(
         account::resets::inventory_groups(&snapshot.resets, now_seconds)
             .into_iter()
@@ -2399,10 +2399,15 @@ fn account_gauge(
                     if group.count == 1 { "" } else { "s" }
                 );
                 let row = TipRow::new(label, group.count.to_string());
+                let expiry = account::resets::inventory_expiry(&group, now_seconds);
                 if account::resets::inventory_usable(&group) {
-                    row.detail_maybe(account::resets::inventory_expiry(&group, now_seconds))
+                    row.detail_maybe(expiry)
                 } else {
-                    row.detail("not usable now").secondary()
+                    let detail = expiry.map_or_else(
+                        || "not usable now".to_owned(),
+                        |expiry| format!("not usable now · {expiry}"),
+                    );
+                    row.detail(detail).secondary()
                 }
             }),
     );
@@ -8901,6 +8906,29 @@ mod tests {
                 AccountUsageDisplay::Left
             ),
             None
+        );
+    }
+
+    #[test]
+    fn the_account_gauge_gives_the_expiry_of_a_paused_reset() {
+        let now = unix_seconds(NOW);
+        let mut usage = snapshot(vec![window(0.5, Some(now + 3_600))], NOW);
+        usage.resets = vec![account::resets::UsageReset {
+            id: "paused".into(),
+            kind: account::resets::ResetKind::Granted,
+            scopes: vec![account::resets::ResetScope::AccountWeekly],
+            available_count: 1,
+            expires_at: Some(now + 7200),
+            usable: false,
+            unused_limit_hold: None,
+        }];
+        let gauge =
+            account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
+        let text = gauge.text();
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("Weekly reset: 1, not usable now · expires ")),
+            "{text}"
         );
     }
 
