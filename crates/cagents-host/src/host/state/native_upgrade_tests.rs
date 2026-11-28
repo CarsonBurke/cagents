@@ -63,7 +63,7 @@ impl Drop for CloseFixtureChat<'_> {
 #[cfg(target_os = "linux")]
 #[test]
 fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
-    use crate::pinned_process::PinnedProcess;
+    use crate::daemon::PinnedProcess;
     use crate::terminal_ipc::{ClientRequest, ServerResponse};
     use crate::update::impact::{Disposition, Policy, SessionCause};
 
