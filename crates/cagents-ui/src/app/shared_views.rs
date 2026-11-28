@@ -1001,13 +1001,31 @@ impl Cagents {
         card: CardId,
         error: &str,
     ) {
-        let kept = self
+        let Some(kept) = self
             .workspace_model
             .views
             .iter()
-            .any(|view| view.panes.iter().any(|pane| pane.id == card));
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == card)
+        else {
+            tracing::debug!(?scope, %operation, %error, %card, "a refused close's pane is already gone");
+            return;
+        };
+        if let CardKind::Chat(session) = &kept.kind
+            && (self.chat_close_can_retry_removal(card, session)
+                || self.shared_views.pending.iter().any(|(_, _, change)| {
+                    matches!(change, Change::RemoveSource { before, .. }
+                        if before.id == card && matches!(&before.kind, CardKind::Chat(source)
+                            if super::chat_ui::shares_conversation(source, session)))
+                }))
+        {
+            // The close is still settling, or reconciliation has already
+            // sent the removal of a pane whose conversation stopped.
+            tracing::debug!(?scope, %operation, %error, %card, "the registry kept a pane whose close is still settling");
+            return;
+        }
         self.index_cards();
-        if kept && self.closed_here(card) {
+        if self.closed_here(card) {
             // The pane stays closed here whatever the registry kept: storage
             // holds its tombstone, and the view does not bring it back.
             tracing::warn!(?scope, %operation, %error, %card, "the registry kept a pane closed here");
@@ -1015,13 +1033,7 @@ impl Cagents {
                 self.closed_pane_notice_title(card, scope).as_deref(),
             );
             self.notices.record(TransientNotice::warning(notice));
-            return;
-        }
-        if kept && self.closes_in_background(card) {
-            // Its removal was judged against the conversation still running,
-            // which is stopping; the pane, out of sight, goes once it has.
-            tracing::debug!(?scope, %operation, %error, %card, "the registry kept a closed pane while its conversation stops");
-        } else if kept {
+        } else {
             tracing::warn!(?scope, %operation, %error, %card, "the registry refused a close and kept its pane");
             let shown = self.workspace.order().any(|id| id == card);
             self.notices.record(TransientNotice::warning(if shown {
@@ -1029,8 +1041,6 @@ impl Cagents {
             } else {
                 PANE_KEPT_ELSEWHERE
             }));
-        } else {
-            tracing::debug!(?scope, %operation, %error, %card, "a refused close's pane is already gone");
         }
     }
 
