@@ -666,3 +666,114 @@ fn another_machines_pairing_lines_are_left_to_it() {
     );
     assert_eq!(scene.keys.read().unwrap(), elsewhere);
 }
+
+#[test]
+fn pairing_topics_stay_private_and_rotate_after_revocation() {
+    let scene = scene();
+    let key = phone_key();
+    let request = Request {
+        key: key.clone(),
+        name: "Fixture phone".into(),
+    };
+    let command = "/x/cagents daemon bridge --mobile";
+    let fingerprint = key.fingerprint();
+    let server = url::Url::parse("https://ntfy.sh").unwrap();
+    let other = url::Url::parse("https://relay.example.org").unwrap();
+    assert!(
+        scene
+            .keys
+            .notification_topic(&fingerprint, &server)
+            .is_err()
+    );
+    assert_eq!(scene.pairing.allow(&request, command), Ok(Added::Added));
+    let topic = scene
+        .keys
+        .notification_topic(&fingerprint, &server)
+        .unwrap();
+    assert_eq!(topic.len(), 32);
+    assert!(
+        scene
+            .keys
+            .notification_topic(&fingerprint, &other)
+            .is_ok_and(|actual| actual != topic)
+    );
+    let path = scene.keys.topic_path(&key).unwrap();
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+        0o700
+    );
+    assert!(!scene.keys.read().unwrap().contains(&topic));
+    assert!(
+        !fs::read_to_string(scene.pairing.directory.join(DECISION))
+            .unwrap()
+            .contains(&topic)
+    );
+
+    assert_eq!(
+        scene.pairing.allow(&request, command),
+        Ok(Added::AlreadyPaired)
+    );
+    assert!(
+        scene
+            .keys
+            .notification_topic(&fingerprint, &server)
+            .is_ok_and(|actual| actual == topic)
+    );
+    scene.keys.remove_phone(&key).unwrap();
+    assert!(
+        scene
+            .keys
+            .notification_topic(&fingerprint, &server)
+            .is_err()
+    );
+    assert!(!path.exists());
+
+    let new_pairing = Pairing::start(
+        scene.keys.clone(),
+        Path::new("/x/cagents"),
+        scene.runtime.path(),
+        scene.now,
+    )
+    .unwrap();
+    assert_eq!(new_pairing.allow(&request, command), Ok(Added::Added));
+    assert!(
+        scene
+            .keys
+            .notification_topic(&fingerprint, &server)
+            .is_ok_and(|actual| actual != topic)
+    );
+}
+
+#[test]
+fn private_topic_refuses_a_symlink_or_world_readable_file() {
+    let scene = scene();
+    let key = phone_key();
+    let request = Request {
+        key: key.clone(),
+        name: "Fixture phone".into(),
+    };
+    scene
+        .pairing
+        .allow(&request, "/x/cagents daemon bridge --mobile")
+        .unwrap();
+    let path = scene.keys.topic_path(&key).unwrap();
+    let server = url::Url::parse("https://ntfy.sh").unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        scene
+            .keys
+            .notification_topic(&key.fingerprint(), &server)
+            .is_err()
+    );
+    let moved = path.with_extension("moved");
+    fs::rename(&path, &moved).unwrap();
+    fs::set_permissions(&moved, fs::Permissions::from_mode(0o600)).unwrap();
+    std::os::unix::fs::symlink(moved, path).unwrap();
+    assert!(
+        scene
+            .keys
+            .notification_topic(&key.fingerprint(), &server)
+            .is_err()
+    );
+}
