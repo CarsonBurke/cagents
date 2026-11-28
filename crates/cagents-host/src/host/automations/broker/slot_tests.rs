@@ -353,6 +353,116 @@ fn scheduler_ends_a_wait_for_a_slot_on_the_wake_after_a_resume_or_a_cancel() {
 }
 
 #[test]
+fn an_update_defers_manual_and_scheduled_automation_admission() {
+    use crate::{
+        agent_execution::Authority,
+        automations::{Request, Response, SchedulePattern},
+        host::{agent_execution::tests::isolated, client::process_request},
+        terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
+    };
+
+    if isolated(
+        "host::automations::broker::slot_tests::an_update_defers_manual_and_scheduled_automation_admission",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let fixture = SlotFixture::new();
+    fixture.host.lock().unwrap().automations = Some(fixture.handle.clone());
+    let manual = fixture.create("Manual after update");
+    let scheduled = fixture.create("Scheduled after update");
+    let mut definition = scheduled.definition;
+    definition.schedule.pattern = SchedulePattern::Cron {
+        expression: "* * * * *".into(),
+    };
+    let scheduled =
+        service::edit(&fixture.host, scheduled.id, scheduled.revision, definition).unwrap();
+    let now = service::now().unwrap();
+    let occurrence = Compiled::new(&scheduled.definition.schedule)
+        .unwrap()
+        .next_after(now - 60_000)
+        .unwrap();
+    let scheduled = fixture
+        .registry
+        .lock()
+        .unwrap()
+        .set_automation_enabled(
+            scheduled.id,
+            scheduled.revision,
+            Some(occurrence.clone()),
+            true,
+            now,
+        )
+        .unwrap();
+    let request = Uuid::new_v4();
+    let run_now = || {
+        process_request(
+            &fixture.host,
+            0,
+            ClientRequest::Automation {
+                authority: Authority::default(),
+                operation: Request::RunNow {
+                    id: manual.id,
+                    execution_revision: manual.execution_revision,
+                    request,
+                    confirmed: true,
+                },
+            },
+        )
+    };
+
+    let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let error = run_now().expect_err("manual automation was admitted during the update");
+    assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(error.retryable);
+    assert_eq!(
+        fixture.handle.tick(&fixture.host).unwrap(),
+        Some(Duration::from_millis(250))
+    );
+    {
+        let registry = fixture.registry.lock().unwrap();
+        assert!(registry.active_automation_firings().unwrap().is_empty());
+        assert_eq!(
+            registry.automation(scheduled.id).unwrap().next,
+            Some(occurrence.clone())
+        );
+        assert!(
+            registry
+                .previous_manual_automation_firing(manual.id, manual.execution_revision, request)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    drop(update);
+    // The held agent slot keeps execution offline while still exercising the
+    // durable claims and the ordinary advance of the schedule.
+    fixture.handle.tick(&fixture.host).unwrap();
+    let after = fixture
+        .registry
+        .lock()
+        .unwrap()
+        .automation(scheduled.id)
+        .unwrap();
+    assert!(
+        after
+            .next
+            .is_some_and(|next| next.due_ms > occurrence.due_ms)
+    );
+    let ServerResponse::Automation(Response::Firing(accepted)) = run_now().unwrap().0 else {
+        panic!("the same manual request was not accepted after the update");
+    };
+    assert_eq!(accepted.trigger, Trigger::Manual { request });
+    let update = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let ServerResponse::Automation(Response::Firing(replayed)) = run_now().unwrap().0 else {
+        panic!("the existing manual receipt was not returned during the update");
+    };
+    assert_eq!(replayed.id, accepted.id);
+    drop(update);
+}
+
+#[test]
 fn claim_time_dispatch_refusal_fails_the_firing_and_frees_the_slot() {
     use crate::{agent_execution::State, host::agent_execution::tests::isolated};
     if isolated(
