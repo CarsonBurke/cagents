@@ -1954,18 +1954,46 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
     assert_eq!(recorded.terminal.unwrap().source, terminal.source);
     fs::remove_file(refused).unwrap();
 
-    let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    let serving = {
+    let connect = |client, refuse_publication| {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let host = reopened_host.clone();
-        thread::spawn(move || super::super::client::serve_fixture_user(peer, 1, host))
+        let serving = thread::spawn(move || {
+            REFUSE_NEXT_TERMINAL_PUBLICATION.set(refuse_publication);
+            super::super::client::serve_fixture_user(peer, client, host)
+        });
+        let reopened = crate::chat::client::ClientHandle::fixture_connect(
+            stream,
+            source.clone(),
+            crate::chat::Intent::Start,
+            None,
+        );
+        (reopened, serving)
     };
-    let reopened = crate::chat::client::ClientHandle::fixture_connect(
-        stream,
-        source,
-        crate::chat::Intent::Start,
-        None,
-    )
-    .unwrap();
+
+    let refuse_thread = root.join(format!("refuse-resume-{THREAD}"));
+    fs::write(&refuse_thread, "").unwrap();
+    let (failed, serving) = connect(1, false);
+    assert!(failed.is_err(), "provider rejected the saved thread");
+    serving.join().unwrap();
+    assert!(reopened_host.lock().unwrap().chats.is_empty());
+    assert!(store.stopped_chat(&source).unwrap().is_some());
+    fs::remove_file(refuse_thread).unwrap();
+
+    let (failed, serving) = connect(2, true);
+    assert!(
+        failed.is_err(),
+        "publication failed after creating the paired PTY"
+    );
+    serving.join().unwrap();
+    let original_worker = {
+        let state = reopened_host.lock().unwrap();
+        assert!(state.paired_restart(source.id).is_some());
+        state.terminals[&source.id].handle.clone()
+    };
+    assert!(store.stopped_chat(&source).unwrap().is_some());
+
+    let (reopened, serving) = connect(3, false);
+    let reopened = reopened.unwrap();
     let session = reopened.session();
     assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));
     {
@@ -1981,6 +2009,7 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
             session.terminal.as_deref().map(|source| &source.launch),
             Some(&terminal.source.launch)
         );
+        assert!(actual.handle.same_worker(&original_worker));
         assert_eq!(actual.options.columns, 117);
         assert_eq!(actual.options.rows, 36);
     }
@@ -2832,7 +2861,8 @@ fn provider() {
                 writeln!(log, "{}", frame["method"].as_str().unwrap_or_default()).unwrap();
             }
             if frame["method"] == "thread/resume"
-                && !std::path::Path::new(&std::env::var("CODEX_HOME").unwrap()).is_dir()
+                && (!std::path::Path::new(&std::env::var("CODEX_HOME").unwrap()).is_dir()
+                    || root.join(format!("refuse-resume-{thread}")).exists())
             {
                 // Codex's own refusal once account storage no longer holds the rollout.
                 let message = format!("no rollout found for thread id {thread}");

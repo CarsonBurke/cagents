@@ -2322,6 +2322,7 @@ fn publication_refusal(
 struct UpgradeRestart<'a> {
     launch: &'a chat::Launch,
     queue_budget: &'a UpgradeRestoreQueueBudget,
+    paired_reopen: bool,
 }
 
 fn start_with_execution(
@@ -3333,6 +3334,27 @@ fn start_publishing(
         {
             return Err(retryable_unavailable(failure));
         }
+        if let Some(restart) = upgrade_restart.filter(|restart| restart.paired_reopen) {
+            let expected = restart.launch.session_id.as_deref().ok_or_else(|| {
+                unavailable("The stopped Codex conversation has no confirmed identity")
+            })?;
+            let confirmed = confirm_saved_conversation(
+                &handle,
+                expected,
+                true,
+                Instant::now() + Duration::from_secs(15),
+                || {
+                    crate::daemon::termination_requested()
+                        || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down
+                },
+            );
+            if let Err(failure) = confirmed {
+                handle.close().map_err(|close| {
+                    retryable_unavailable(format!("{failure}; provider teardown failed: {close}"))
+                })?;
+                return Err(retryable_unavailable(failure));
+            }
+        }
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
                 &handle,
@@ -3495,6 +3517,9 @@ fn start_publishing(
         }
         let installed_handle = record.handle.clone();
         let retired = state.chats.insert(id, record);
+        if upgrade_restart.is_some_and(|restart| restart.paired_reopen) {
+            state.paired_restarts.insert(id, execution_instance);
+        }
         if let Some(previous) = &retired {
             state
                 .exited_queue_archive
@@ -3649,15 +3674,15 @@ pub(super) fn reopen_codex_terminal(
     client: ClientId,
     started: &Session,
 ) -> Result<Session, ProtocolError> {
-    reopen_codex_terminal_view(host, client, started, None)
+    reopen_codex_terminal_view(host, client, started, None).map(|(session, _)| session)
 }
 
 fn reopen_codex_terminal_view(
     host: &SharedHost,
     client: ClientId,
     started: &Session,
-    saved_view: Option<&crate::upgrade::handoff::Terminal>,
-) -> Result<Session, ProtocolError> {
+    saved_view: Option<(&crate::upgrade::handoff::Terminal, &CloseTarget)>,
+) -> Result<(Session, capacity::Reservation), ProtocolError> {
     super::account_lifecycle::ensure_idle(host)?;
     let (owners, closing, session, recipe) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3669,6 +3694,7 @@ fn reopen_codex_terminal_view(
             || !record.provider_running()
             || record.handle.is_close_only()
             || record.handle.confirmed_session_id() != started.launch.session_id
+            || saved_view.is_some_and(|(_, owner)| !owner.matches(record))
         {
             return Err(retryable_unavailable(
                 "The exact resumed Codex provider is unavailable",
@@ -3693,7 +3719,14 @@ fn reopen_codex_terminal_view(
     let ServerResponse::ChatTerminal {
         session: terminal, ..
     } = codex_terminal_view(
-        host, client, started.id, owners, &closing, session, recipe, saved_view,
+        host,
+        client,
+        started.id,
+        owners,
+        &closing,
+        session,
+        recipe,
+        saved_view.map(|(terminal, _)| terminal),
     )?
     else {
         unreachable!("opening a Codex CLI view returns its paired terminal");
@@ -3716,7 +3749,7 @@ fn reopen_codex_terminal_view(
             "The resumed Codex terminal changed while it was attached",
         ));
     }
-    Ok(record.current_session())
+    Ok((record.current_session(), closing))
 }
 
 /// Verify that a converted terminal cannot still write the conversation
@@ -3788,6 +3821,35 @@ fn codex_terminal_view(
     saved_view: Option<&crate::upgrade::handoff::Terminal>,
 ) -> Result<ServerResponse, ProtocolError> {
     let handle = owners.target.handle.clone();
+    let (terminal, options, execution_recipe) = if let Some(saved) = saved_view {
+        let mut terminal = saved.source.clone();
+        terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe: terminal.launch.clone(),
+            last_exit: None,
+        };
+        (terminal, saved.options.clone(), Some(saved.recipe.clone()))
+    } else {
+        (
+            crate::model::TerminalSession {
+                owned_codex_listener: session.owned_codex_listener.clone(),
+                recovery_origin: None,
+                predecessor: None,
+                id: chat_id,
+                launch: recipe.clone(),
+                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                    recipe,
+                    last_exit: None,
+                },
+                resume_hint: None,
+                transcript_path: None,
+            },
+            crate::terminal_ipc::TerminalSpawnOptions {
+                initially_visible: false,
+                ..Default::default()
+            },
+            None,
+        )
+    };
     let completed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_unreserved_terminals(&state, &session)?;
@@ -3811,9 +3873,20 @@ fn codex_terminal_view(
                     "The CLI view was replaced; it is not owned by this thread.",
                 ));
             }
+            let descriptor = state.descriptor(client, terminal.id)?.session;
+            if saved_view.is_some() {
+                let mut paired = record.current_session();
+                let holder = live.handle.holder_identity().cloned();
+                drop(state);
+                chat::protocol::align_resume_identity(&mut paired.launch).map_err(unavailable)?;
+                handle
+                    .update_native_source(paired, None, holder)
+                    .map_err(unavailable)?;
+                owners.require_current(host, closing)?;
+            }
             return Ok(ServerResponse::ChatTerminal {
                 chat_id,
-                session: state.descriptor(client, terminal.id)?.session,
+                session: descriptor,
                 snapshot: handle.snapshot(None).ok_or_else(|| {
                     unavailable("Exact native snapshot is unavailable; no replacement was started")
                 })?,
@@ -3822,7 +3895,15 @@ fn codex_terminal_view(
         if record.returning_terminal {
             return Err(unavailable("The CLI view is already opening."));
         }
-        let completed = if let Some(terminal) = state.terminals.get(&chat_id) {
+        let repairing = state.pending_codex_view(
+            &terminal,
+            execution_recipe.as_ref().unwrap_or(&terminal.launch),
+            &options,
+            owners.target.instance,
+        );
+        let completed = if repairing {
+            None
+        } else if let Some(terminal) = state.terminals.get(&chat_id) {
             if !terminal.handle.is_completed()
                 || !record
                     .paired_terminal
@@ -3910,35 +3991,6 @@ fn codex_terminal_view(
             return Err(error);
         }
     }
-    let (terminal, options, execution_recipe) = if let Some(saved) = saved_view {
-        let mut terminal = saved.source.clone();
-        terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
-            recipe: terminal.launch.clone(),
-            last_exit: None,
-        };
-        (terminal, saved.options.clone(), Some(saved.recipe.clone()))
-    } else {
-        (
-            crate::model::TerminalSession {
-                owned_codex_listener: session.owned_codex_listener.clone(),
-                recovery_origin: None,
-                predecessor: None,
-                id: chat_id,
-                launch: recipe.clone(),
-                continuity: crate::model::TerminalContinuity::RelaunchAvailable {
-                    recipe,
-                    last_exit: None,
-                },
-                resume_hint: None,
-                transcript_path: None,
-            },
-            crate::terminal_ipc::TerminalSpawnOptions {
-                initially_visible: false,
-                ..Default::default()
-            },
-            None,
-        )
-    };
     owners.require_current(host, closing)?;
     let spawned = super::state::spawn_codex_view_reserved(
         host,
@@ -5708,6 +5760,13 @@ impl TerminalViewReservation<'_> {
         }
     }
 
+    pub(super) fn codex_instance(&self) -> Option<uuid::Uuid> {
+        match &self.kind {
+            TerminalViewKind::Codex { owners, .. } => Some(owners.target.instance),
+            TerminalViewKind::RetainedConsole { .. } => None,
+        }
+    }
+
     pub(super) fn authorizes(&self, state: &HostState, terminal_id: TerminalId) -> bool {
         match &self.kind {
             TerminalViewKind::Codex { owners, closing } => {
@@ -6392,6 +6451,15 @@ pub(super) fn restore_upgrade_with_queue_budget(
     saved: &crate::upgrade::handoff::Chat,
     queue_budget: &UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
+    restore_upgrade_chat(host, saved, queue_budget, false)
+}
+
+fn restore_upgrade_chat(
+    host: &SharedHost,
+    saved: &crate::upgrade::handoff::Chat,
+    queue_budget: &UpgradeRestoreQueueBudget,
+    paired_reopen: bool,
+) -> Result<(), String> {
     if saved.source.native_continuity.retains_provider() {
         native_recovery::restore(host, 0, &saved.source)?;
         return Ok(());
@@ -6406,6 +6474,7 @@ pub(super) fn restore_upgrade_with_queue_budget(
     let upgrade_restart = Some(UpgradeRestart {
         launch: &saved.launch,
         queue_budget,
+        paired_reopen,
     });
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -6465,6 +6534,11 @@ pub(super) fn restore_upgrade_with_queue_budget(
         ServerResponse::ChatAttached { session, .. } => session.id,
         _ => return Err("Native restore did not attach its exact session".into()),
     };
+    // The interactive restart confirmed the exact thread before publication.
+    // The pane's pairing owns the rest of its installation.
+    if paired_reopen {
+        return Ok(());
+    }
     let handle = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state.chats.get(&id) else {
@@ -6546,7 +6620,7 @@ fn reopen_stopped_upgrade_pair(
     {
         issued.proof = Some(old);
     }
-    let Some(stopped) = store.stopped_chat(&issued).ok().flatten() else {
+    let Some(stopped) = store.stopped_chat(&issued).map_err(retryable_unavailable)? else {
         return Ok(None);
     };
     let Some(terminal) = stopped.terminal else {
@@ -6564,40 +6638,37 @@ fn reopen_stopped_upgrade_pair(
     let id = issued.id;
     let available = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chats.contains_key(&id)
-            && !state.upgrade_chats.get(&id).is_some_and(|sources| {
-                sources.iter().any(|source| {
-                    (source.source == unpaired.source || source.source == saved.source)
-                        && source.launch == saved.launch
-                })
-            })
-        {
-            return Err(unavailable(
+        if state.chats.contains_key(&id) && state.paired_restart(id).is_none() {
+            return Err(retryable_unavailable(
                 "The exact resumed Codex provider is unavailable",
             ));
         }
         state.chats.contains_key(&id)
     };
     if !available {
-        restore_upgrade(host, &unpaired).map_err(unavailable)?;
+        restore_upgrade_chat(host, &unpaired, &UpgradeRestoreQueueBudget::default(), true)
+            .map_err(retryable_unavailable)?;
     }
-    let started = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&id)
-        .map(Record::current_session)
-        .ok_or_else(|| retryable_unavailable("The resumed Codex provider is unavailable"))?;
+    let (started, expected_owner) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let record = state
+            .paired_restart(id)
+            .ok_or_else(|| retryable_unavailable("The resumed Codex provider is unavailable"))?;
+        (record.current_session(), CloseTarget::from_record(record))
+    };
     if started.launch.session_id != saved.launch.session_id {
         return Err(unavailable(
             "The exact resumed Codex provider is unavailable",
         ));
     }
-    let paired = reopen_codex_terminal_view(host, client, &started, Some(&view))?;
+    let (paired, _closing) =
+        reopen_codex_terminal_view(host, client, &started, Some((&view, &expected_owner)))?;
     let (session, handle, execution_instance) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = attached(&state, client, id)?;
-        if record.current_session() != paired {
+        if record.current_session() != paired
+            || record.execution_instance != expected_owner.instance
+        {
             return Err(retryable_unavailable(
                 "The resumed Codex terminal changed while it was attached",
             ));
@@ -6623,6 +6694,12 @@ fn reopen_stopped_upgrade_pair(
     super::state::restore_relaunched_execution_authority(host, id);
     let response = current_session_snapshot(host, session, handle, execution_instance)?;
     super::state::retire_unattached_upgrade_chat(host, id);
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(record) = state.chats.get_mut(&id) {
+        record.subscribers.remove(&0);
+        record.observations.remove(&0);
+    }
+    state.paired_restarts.remove(&id);
     Ok(Some(response))
 }
 
