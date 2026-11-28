@@ -33,7 +33,6 @@ INCLUDED = (
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
     "tests/support/iced_tree.rs",
-    "tests/support/repository_scale.rs",
 )
 
 
@@ -693,7 +692,6 @@ edition = "2024"
         self.write("src/gated.rs", """pub fn gated() {}
 include!("terminal/worker/bounded_input_tests.rs");
 include!("../tests/support/iced_tree.rs");
-include!("../tests/support/repository_scale.rs");
 """)
         clean = self.run_checker(env)
         self.assertEqual(clean.returncode, 0, clean.stdout + clean.stderr)

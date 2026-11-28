@@ -38,8 +38,7 @@ set -- --edition 2024 ${check:+"$check"} \
     crates/cagents-ui/src/app/repository_clone_lsp_ownership_tests.rs \
     src/control/handshake_deadline_tests.rs \
     src/terminal/worker/bounded_input_tests.rs \
-    tests/support/iced_tree.rs \
-    tests/support/repository_scale.rs
+    tests/support/iced_tree.rs
 if [ -n "$check" ] && [ "$cargo_status" -eq 0 ] && [ -x /usr/bin/python3 ]; then
     # A successful check of identical source and formatter inputs can be reused.
     # The helper falls back to rustfmt whenever it cannot prove that identity.
