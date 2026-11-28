@@ -1841,6 +1841,24 @@ fn process_admitted_request(
             let providers = super::provider_status::snapshot()?;
             Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
         }
+        ClientRequest::ProviderUpdate { provider } => {
+            drop(_shared);
+            let providers = super::provider_update::request(
+                host,
+                provider,
+                super::provider_update::Operation::Update,
+            )?;
+            Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
+        ClientRequest::ProviderManage { provider } => {
+            drop(_shared);
+            let providers = super::provider_update::request(
+                host,
+                provider,
+                super::provider_update::Operation::Manage,
+            )?;
+            Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and
             // GitHub for its bound, which must not hold the fence that

@@ -117,6 +117,8 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maintenance can download and verify a full provider binary before replying.
+const PROVIDER_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // Match the window's attachment budget, which gives the daemon time to
 // publish and acknowledge a newly started holder.
 const TERMINAL_SPAWN_REPLY_TIMEOUT: Duration =
@@ -349,7 +351,7 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// Inspect the provider CLIs this daemon uses.
+    /// Inspect and update the provider CLIs this daemon uses.
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
@@ -2725,10 +2727,37 @@ impl ControlClient {
     pub fn provider_status(
         &mut self,
     ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
-        match self.request_with_deadline(
-            ClientRequest::ProviderStatus,
-            Instant::now() + Duration::from_secs(20),
-        )? {
+        self.provider_operation(ClientRequest::ProviderStatus, Duration::from_secs(20))
+    }
+
+    /// Check the official release channel and update an eligible installation.
+    pub fn provider_update(
+        &mut self,
+        provider: crate::agent::Provider,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        self.provider_operation(
+            ClientRequest::ProviderUpdate { provider },
+            PROVIDER_MAINTENANCE_TIMEOUT,
+        )
+    }
+
+    /// Provision a managed install without replacing an existing external CLI.
+    pub fn provider_manage(
+        &mut self,
+        provider: crate::agent::Provider,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        self.provider_operation(
+            ClientRequest::ProviderManage { provider },
+            PROVIDER_MAINTENANCE_TIMEOUT,
+        )
+    }
+
+    fn provider_operation(
+        &mut self,
+        request: ClientRequest,
+        timeout: Duration,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        match self.request_with_deadline(request, Instant::now() + timeout)? {
             ServerResponse::ProviderStatus(providers) => Ok(providers),
             response => Err(unexpected_response("provider status", &response)),
         }
