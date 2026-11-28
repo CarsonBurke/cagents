@@ -447,6 +447,24 @@ impl Handle {
             }
         }
     }
+
+    pub fn compaction_owner(&self) -> CompactionOwner {
+        CompactionOwner(match &self.0 {
+            Owner::Local(local) => WeakOwner::Local(std::sync::Arc::downgrade(&local.0)),
+            Owner::Remote(remote) => WeakOwner::Remote(remote.downgrade()),
+        })
+    }
+
+    pub fn compaction_outcome(
+        &self,
+        request: uuid::Uuid,
+    ) -> Result<Option<crate::agent_execution::CompactionOutcome>, String> {
+        match &self.0 {
+            Owner::Local(local) => Ok(local.compaction_outcome(request)),
+            Owner::Remote(remote) => remote.compaction_outcome(request),
+        }
+    }
+
     /// At the actor, recheck the same idle admission used for courier prompts.
     pub fn try_idle_compact(&self) -> Result<super::IdleCompaction, Rejection> {
         self.submit_idle_compact(None)
@@ -499,23 +517,6 @@ impl Handle {
             Err(error) => Err(error),
         }
     }
-    pub fn compaction_owner(&self) -> CompactionOwner {
-        CompactionOwner(match &self.0 {
-            Owner::Local(local) => WeakOwner::Local(std::sync::Arc::downgrade(&local.0)),
-            Owner::Remote(remote) => WeakOwner::Remote(remote.downgrade()),
-        })
-    }
-
-    pub fn compaction_outcome(
-        &self,
-        request: uuid::Uuid,
-    ) -> Result<Option<crate::agent_execution::CompactionOutcome>, String> {
-        match &self.0 {
-            Owner::Local(local) => Ok(local.compaction_outcome(request)),
-            Owner::Remote(remote) => remote.compaction_outcome(request),
-        }
-    }
-
     /// Exact source recognition is checked by the helper under this attachment epoch.
     pub fn recognize_retained_sources(&self, sources: &[chat::Session]) -> Result<(), String> {
         match &self.0 {
