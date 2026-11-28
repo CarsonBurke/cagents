@@ -933,6 +933,94 @@ fn retained_close_uses_exact_completed_receipt_for_an_issued_alias() {
     assert!(!state.terminals.contains_key(&terminal.id));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn pending_paired_close_settles_after_native_holder_exits_without_receipt() {
+    if isolated("pending_paired_close_settles_after_native_holder_exits_without_receipt")
+        || crate::retained_fixture::run_isolated()
+    {
+        return;
+    }
+    crate::host::upgrade_inspect::wait_out_starting_processes_for_test();
+    let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+    fs::write(root.join("server-own-session"), []).unwrap();
+    let fixture = Fixture::new();
+    let source = fixture.acknowledged_for_retained_close();
+    let terminal = source.terminal.as_deref().unwrap();
+    let pair = fixture.worker.holder_identity().unwrap().clone();
+    let (holder, recovery) =
+        crate::chat::native_holder::adopt(&fixture.native, &source, &fixture.proof).unwrap();
+    let server = recovery.server_process.as_ref().unwrap();
+    assert_ne!(*server, fixture.native.root);
+    assert_eq!(unsafe { libc::getsid(server.pid) }, server.pid);
+    let pending = native_cleanup::NativeClose::adopted(source.clone(), holder.preserve(), false)
+        .with_pair(&fixture.host, &recovery);
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .native_closing
+        .insert(source.id, pending);
+    let close = || {
+        crate::host::client::process_request(
+            &fixture.host,
+            CLIENT,
+            crate::terminal::ipc::ClientRequest::ChatCloseRetained {
+                session: source.clone(),
+            },
+        )
+    };
+    let kill = |process: &registry::Process| {
+        let pinned = crate::daemon::PinnedProcess::open(process.pid as u32).unwrap();
+        assert!(process.is_current());
+        assert!(pinned.signal(libc::SIGKILL).unwrap());
+        wait_until(|| !process.is_current(), "fixture process did not exit");
+    };
+    kill(&fixture.native.holder);
+    kill(&fixture.native.root);
+    assert!(server.is_current(), "the app-server outlived its launcher");
+    let refusal = close().unwrap_err();
+    assert!(
+        refusal
+            .message
+            .contains("is still running for this conversation")
+    );
+    assert!(pair.root.is_current());
+    kill(server);
+    assert_eq!(
+        crate::chat::native_holder::closed_source_for_stop(&source, &fixture.proof).unwrap(),
+        None
+    );
+    fs::remove_dir_all(registry::directory(Kind::Native).unwrap()).unwrap();
+
+    let (response, _, _) = close().unwrap();
+    assert!(matches!(response, ServerResponse::Accepted));
+    assert!(!pair.root.is_current());
+    assert!(
+        crate::terminal::holder::cleanup::confirmed_with_role(
+            terminal,
+            &pair,
+            &fixture.proof,
+            None
+        )
+        .unwrap()
+    );
+    let state = fixture.host.lock().unwrap();
+    assert!(!state.chats.contains_key(&source.id));
+    assert!(!state.native_closing.contains_key(&source.id));
+    assert!(!state.terminals.contains_key(&terminal.id));
+    drop(state);
+    assert!(
+        crate::host::agent_execution::registry(&fixture.host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .retained_agent_sources(source.id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
 #[test]
 fn paired_projection_requires_exact_holder_launch_listener_and_current_proof() {
     if isolated("paired_projection_requires_exact_holder_launch_listener_and_current_proof") {
@@ -1980,6 +2068,11 @@ for arg in "$@"; do
 done
 echo launch >> "${ROOT}/provider-launches"
 export {MODE}=provider
+if [ -f "${ROOT}/server-own-session" ]; then
+  /usr/bin/setsid "${EXE}" --exact "${SELECTOR}" --nocapture --test-threads=1 &
+  wait "$!"
+  exit
+fi
 exec "${EXE}" --exact "${SELECTOR}" --nocapture --test-threads=1
 "#
         ),
