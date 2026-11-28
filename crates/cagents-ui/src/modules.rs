@@ -9,6 +9,8 @@ use cagents::*;
 pub mod app;
 #[cfg(feature = "integrated-browser")]
 pub mod browser;
+#[cfg(target_os = "linux")]
+pub mod gpu_wake;
 
 // The widgets and views live in cagents-ui-kit, so that editing the
 // application does not recompile them. They keep their paths here, as
