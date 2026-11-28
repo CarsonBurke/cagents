@@ -22,13 +22,15 @@ the next generation (see docs/releasing.md#trust-generations).
         features and fixes, with their pull request numbers
   feed --dir DIR --feed FEED [--generation G] [--bridge BRIDGE]
         lay out DIR as a file feed: FEED/download/vV/* and, when V is the
-        newest there, FEED/latest/download/* (copies; DIR is unchanged). The
+        newest there, FEED/latest/download points to it. DIR is unchanged. The
         metadata appears under the names of generation G (default 2) and every
         older one; BRIDGE holds, under their published names, older releases'
         metadata to carry instead under some of those names
 """
 
 import argparse
+import fcntl
+import filecmp
 import hashlib
 import json
 import os
@@ -222,6 +224,41 @@ def notes(repository: Path, start: str | None, end: str) -> str:
     return "\n".join(lines).strip() + "\n" if lines else ""
 
 
+def files_match(directory: Path, sources: dict[str, Path]) -> bool:
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    if {path.name for path in directory.iterdir()} != sources.keys():
+        return False
+    for name, source in sources.items():
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or not filecmp.cmp(path, source, shallow=False):
+            return False
+    return True
+
+
+def select_latest(latest: Path, target: Path) -> None:
+    latest.parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".staging-", dir=latest.parent) as directory:
+        staged = Path(directory) / "download"
+        staged.symlink_to(target, target_is_directory=True)
+        if latest.is_symlink() or not latest.is_dir():
+            staged.replace(latest)
+            return
+
+        # Older feeds kept a real directory here. Preserve its contents if
+        # converting the selector fails before it can commit.
+        retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest.parent))
+        legacy = retired / "download"
+        latest.rename(legacy)
+        try:
+            staged.replace(latest)
+        except OSError:
+            legacy.rename(latest)
+            retired.rmdir()
+            raise
+        shutil.rmtree(retired)
+
+
 def feed(directory: Path, destination: Path, generation: int, bridge: Path | None) -> None:
     metadata = json.loads((directory / METADATA).read_bytes())
     check(directory, None, None)
@@ -246,38 +283,36 @@ def feed(directory: Path, destination: Path, generation: int, bridge: Path | Non
         published_names[name], published_names[f"{name}.sig"] = source
     downloads = destination / "download"
     release = downloads / f"v{version}"
-    if release.exists():
-        raise Refused(f"{release} already exists; a feed never replaces a release")
+    latest = destination / "latest/download"
+    target = Path(os.path.relpath(release, latest.parent))
+    files = {path.name: path for path in payloads(directory)} | published_names
     downloads.mkdir(parents=True, exist_ok=True)
-    # Each directory appears whole, so a reader never sees half a release.
-    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
-    for path in payloads(directory):
-        shutil.copyfile(path, staging / path.name)
-    for name, path in published_names.items():
-        shutil.copyfile(path, staging / name)
-    staging.chmod(0o755)
-    staging.rename(release)
-    published = sorted(
-        (path.name[1:] for path in downloads.iterdir()
-         if path.name.startswith("v") and VERSION.match(path.name[1:])),
-        key=version_key,
-    )
-    if published[-1] == version:
-        latest = destination / "latest"
-        latest.mkdir(exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
-        for name in published_names:
-            shutil.copyfile(release / name, staging / name)
-        staging.chmod(0o755)
-        previous = latest / "download"
-        if previous.exists():
-            retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest))
-            previous.rename(retired / "download")
-            staging.rename(previous)
-            shutil.rmtree(retired)
+    lock = os.open(downloads / ".feed.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, "rb+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        newest = max(
+            (path.name[1:] for path in downloads.iterdir() if path.name.startswith("v")
+             and VERSION.fullmatch(path.name[1:]) and not path.is_symlink() and path.is_dir()),
+            key=version_key, default=version,
+        )
+        newest = max(newest, version, key=version_key)
+        if release.exists() or release.is_symlink():
+            # A failed latest update may already have published the tag.
+            # Resume only the selector change and keep the tagged bytes.
+            selected = (latest.is_symlink() and latest.readlink() == target
+                        or files_match(latest, published_names))
+            if newest != version or selected or not files_match(release, files):
+                raise Refused(f"{release} already exists; a feed never replaces a release")
         else:
-            staging.rename(previous)
-    print(f"Feed {destination} now offers {published[-1]}")
+            with tempfile.TemporaryDirectory(prefix=".staging-", dir=downloads) as directory:
+                staging = Path(directory)
+                for name, source in files.items():
+                    shutil.copyfile(source, staging / name)
+                staging.chmod(0o755)
+                staging.rename(release)
+        if newest == version:
+            select_latest(latest, target)
+    print(f"Feed {destination} now offers {newest}")
 
 
 def main() -> int:
