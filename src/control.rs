@@ -3438,6 +3438,7 @@ impl ControlClient {
             | ServerMessage::ChatLimit { chat_id, .. }
             | ServerMessage::ChatAgentAddresses { chat_id, .. }
             | ServerMessage::ChatActiveModel { chat_id, .. }
+            | ServerMessage::ChatSideAnswer { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::ChatQueueEnded { source, .. }
                 if self.attached_chats.contains(&source.id) => {}
@@ -3728,6 +3729,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::ChatAgentAddresses { .. }
         | ServerMessage::AutomationProposalsChanged { .. }
         | ServerMessage::ChatActiveModel { .. }
+        | ServerMessage::ChatSideAnswer { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -3752,6 +3754,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::ChatAgentAddresses { .. } => "chat_agent_addresses",
         ServerMessage::ChatActiveModel { .. } => "chat_active_model",
+        ServerMessage::ChatSideAnswer { .. } => "chat_side_answer",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::MobileChanged { .. } => "mobile_changed",
         ServerMessage::ChatQueueEnded { .. } => "chat_queue_ended",

@@ -32,6 +32,15 @@ const ASYNC_INPUT_SINCE: semver::Version = semver::Version::new(2, 1, 286);
 fn supports_async_input(version: &str) -> bool {
     semver::Version::parse(version).is_ok_and(|version| version >= ASYNC_INPUT_SINCE)
 }
+
+/// The first Claude Code release with the `side_question` control request,
+/// the native form of `/btw`: an answer from the conversation's context, with
+/// no tools, that neither enters the transcript nor waits for a running turn.
+const SIDE_QUESTIONS_SINCE: semver::Version = semver::Version::new(2, 1, 268);
+
+fn supports_side_questions(version: &str) -> bool {
+    semver::Version::parse(version).is_ok_and(|version| version >= SIDE_QUESTIONS_SINCE)
+}
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
 /// Skill calls still waiting for their instructions; see `skill_loads`.
@@ -871,6 +880,56 @@ struct ManualCompaction {
     boundary: bool,
 }
 
+/// What became of a side question Claude answered. Claude Code marks an
+/// answer it wrote itself, such as an API error, as synthetic, and answers
+/// nothing when the model gave no text.
+fn side_answer(id: &str, response: &Value) -> chat::SideAnswer {
+    match response["response"].as_str().map(str::trim) {
+        Some(text) if !text.is_empty() && response["synthetic"] != true => {
+            chat::SideAnswer::answered(id, text)
+        }
+        // Claude Code's own "no answer" note is a parenthesised sentence;
+        // anything else synthetic is an API error.
+        Some(text) if text.starts_with('(') && text.ends_with(')') => {
+            chat::SideAnswer::failed(id, text[1..text.len() - 1].trim())
+        }
+        Some(text) if !text.is_empty() => chat::SideAnswer::failed(
+            id,
+            format!(
+                "Claude couldn't answer: {}",
+                chat::failure::summary(Provider::Claude, text)
+            ),
+        ),
+        _ => chat::SideAnswer::failed(id, "Claude didn't answer. Try asking another way."),
+    }
+}
+
+/// Why Claude refused a side question, in words for the person who asked.
+/// The CLI's own refusals name its request plumbing, so the known ones are
+/// said plainly and anything else is reduced to its one-line summary.
+fn side_failure(response: &Value) -> String {
+    let error = response["error"].as_str().unwrap_or_default().trim();
+    if response["code"] == "side_question_busy" || error.contains("side_question_busy") {
+        return "Claude is already answering as many side questions as it can. Ask again when one finishes.".into();
+    }
+    if error.contains("timed out") {
+        return "Claude took too long to answer. Try again.".into();
+    }
+    if error.contains("not supported in this context") {
+        return "Claude Code can't answer side questions in this session.".into();
+    }
+    if error.is_empty() || error.starts_with("side_question") {
+        if !error.is_empty() {
+            tracing::debug!(error, "Claude refused a side question");
+        }
+        return "Claude couldn't answer this side question.".into();
+    }
+    format!(
+        "Claude couldn't answer: {}",
+        chat::failure::summary(Provider::Claude, error)
+    )
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -884,6 +943,8 @@ struct Claude {
     busy: bool,
     /// Only advertised for a CLI whose async input contract we have verified.
     async_input: bool,
+    /// The CLI answers `side_question`; see [`SIDE_QUESTIONS_SINCE`].
+    side_questions: bool,
     /// The CLI's `system/init` advertises `interrupt_send_now_v1`. Any other
     /// CLI reads the same request as a plain interrupt, which would stop the
     /// turn and its background agents.
@@ -1203,6 +1264,7 @@ impl Claude {
         wire.remove("_cagents_permissions");
         wire.remove("_cagents_permission_update");
         wire.remove("_cagents_automatic");
+        wire.remove("_cagents_side");
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
@@ -1210,6 +1272,29 @@ impl Claude {
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
         })
+    }
+    /// Ask `/btw` the way the CLI does: a control request beside the
+    /// conversation, which Claude answers without tools, from the
+    /// conversation's cached context, even during a turn.
+    fn side_question(&mut self, question: chat::SideQuestion) -> Result<Step, String> {
+        if !self.side_questions {
+            return Err(chat::SideQuestion::unavailable(crate::agent::Provider::Claude).into());
+        }
+        question.validate()?;
+        let history: Vec<Value> = question
+            .history
+            .iter()
+            .map(|exchange| json!({"question": exchange.question, "response": exchange.answer}))
+            .collect();
+        let mut request = json!({
+            "subtype": "side_question",
+            "question": question.question,
+            "_cagents_side": question.id,
+        });
+        if !history.is_empty() {
+            request["history"] = Value::Array(history);
+        }
+        self.control(request)
     }
     fn observe_context_model(&mut self, model: &str, step: &mut Step) {
         if model.is_empty() || model == "<synthetic>" {
@@ -1321,6 +1406,7 @@ impl Claude {
             // background agents run under, so it stops them with the turn.
             interrupt_stops_background: true,
             send_queued_now: self.async_input && self.send_now_advertised,
+            side_questions: self.side_questions,
             ..Capabilities::default()
         }
     }
@@ -2144,6 +2230,7 @@ impl Claude {
     fn metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(version) = data["claude_code_version"].as_str() {
             self.async_input = supports_async_input(version);
+            self.side_questions = supports_side_questions(version);
         }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
@@ -2223,7 +2310,9 @@ impl Claude {
         }
         let terminal = data["terminal_slash_commands"].as_array();
         self.commands.retain(|c| {
-            !matches!(c.name.as_str(), "resume" | "fork")
+            // The CLI refuses `/btw` as a prompt here; cagents asks it with
+            // the native side question instead.
+            !matches!(c.name.as_str(), "resume" | "fork" | "btw")
                 && !terminal.is_some_and(|commands| {
                     commands.iter().any(|v| v.as_str() == Some(c.name.as_str()))
                 })
@@ -4467,6 +4556,7 @@ impl Adapter for Claude {
                 self.control(json!({"subtype":"cancel_async_message", "message_uuid":id}))
             }
             Command::SendQueuedNow => self.request_send_now(),
+            Command::SideQuestion(question) => self.side_question(question),
             Command::StartQueued { .. }
             | Command::SetInterruptMode { .. }
             | Command::ListBranches
@@ -4987,7 +5077,12 @@ impl Claude {
                     // CLI may not offer; its absence leaves the figure the
                     // turns report, which is nothing the reader has to act
                     // on. A refresh the reader asked for still says why not.
-                    if request["_cagents_automatic"] != true {
+                    if let Some(side) = request["_cagents_side"].as_str() {
+                        step.events.push(Event::SideAnswer(chat::SideAnswer::failed(
+                            side,
+                            side_failure(response),
+                        )));
+                    } else if request["_cagents_automatic"] != true {
                         let what = if request["send_now"] == true {
                             "send now"
                         } else {
@@ -5002,6 +5097,11 @@ impl Claude {
                     return Err("Unsupported Claude control response subtype".into());
                 } else {
                     match string(&request, "subtype") {
+                        "side_question" => {
+                            let id = string(&request, "_cagents_side");
+                            step.events
+                                .push(Event::SideAnswer(side_answer(id, &response["response"])));
+                        }
                         "initialize" => {
                             self.ready = true;
                             step.events.push(Event::Ready(true));
@@ -8915,6 +9015,8 @@ impl Claude {
             | "hook_progress"
             | "hook_response"
             | "api_retry"
+            // A side question's progress; its answer is the control response.
+            | "control_request_progress"
             | "thinking_tokens"
             | "vcs_state_changed"
             | "elicitation_complete" => {}
@@ -10700,6 +10802,9 @@ mod tests;
 
 #[cfg(test)]
 mod send_now_tests;
+
+#[cfg(test)]
+mod side_question_tests;
 
 #[cfg(test)]
 mod startup_history_retryability_tests {

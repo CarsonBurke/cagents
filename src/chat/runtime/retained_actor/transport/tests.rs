@@ -590,6 +590,7 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             prompt_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             pending: Vec::new(),
             account_reports: Arc::new(Mutex::new(Vec::new())),
+            side_answers: Arc::new(Mutex::new(Vec::new())),
             environment: crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),
             recovery_environment: BTreeMap::new(),
             listener,

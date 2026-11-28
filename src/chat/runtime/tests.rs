@@ -4320,6 +4320,89 @@ fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
     assert!(handle.snapshot(None).unwrap().items.is_empty());
     handle.close().unwrap();
 }
+/// A side question's answer, or its refusal, is its asker's alone: the
+/// surfaces get the answer, and the conversation's snapshot, error and
+/// transcript never learn of either.
+#[test]
+fn a_side_answer_reaches_the_surfaces_without_touching_the_conversation() {
+    struct Answerer;
+    impl Adapter for Answerer {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            let Command::SideQuestion(question) = command else {
+                return Err("fixture takes only side questions".into());
+            };
+            if question.id == "refused" {
+                return Err("Side questions are unavailable".into());
+            }
+            Ok(Step {
+                events: vec![Event::SideAnswer(crate::chat::SideAnswer::answered(
+                    question.id,
+                    "the answer",
+                ))],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+    };
+    let mut adapter: Box<dyn Adapter> = Box::new(Answerer);
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let (notify, notified) = crossbeam_channel::unbounded();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+        let _ = notify.send(update);
+    })
+    .unwrap();
+    let ask = |id: &str| {
+        Command::SideQuestion(crate::chat::SideQuestion {
+            id: id.into(),
+            question: "why?".into(),
+            history: Vec::new(),
+        })
+    };
+    let before = handle.snapshot(None).unwrap();
+    while notified.recv_timeout(Duration::from_millis(200)).is_ok() {}
+    handle.command(ask("answered")).unwrap();
+    let mut answered = None;
+    while let Ok(update) = notified.recv_timeout(Duration::from_secs(2)) {
+        match update {
+            Update::SideAnswer(answer) => {
+                answered = Some(answer);
+                break;
+            }
+            Update::Presentation | Update::Observed { .. } => {
+                panic!("a side answer must not present the conversation")
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        answered,
+        Some(crate::chat::SideAnswer::answered("answered", "the answer"))
+    );
+    assert!(handle.command(ask("refused")).is_err());
+    let after = handle.snapshot(None).unwrap();
+    assert_eq!(after.generation, before.generation);
+    assert!(after.items.is_empty());
+    assert!(after.error.is_none());
+    handle.close().unwrap();
+}
 /// How the provider addresses a subagent reaches the surfaces as every
 /// address known so far, once each is learned, and never the snapshot,
 /// whose layout older peers share.
@@ -4880,6 +4963,7 @@ fn real_unix_websocket_preserves_hidden_history_pongs_and_interrupts_before_clos
             | Update::RecordChanged
             | Update::FailureChanged
             | Update::TurnStarted { .. }
+            | Update::SideAnswer(_)
             | Update::Execution { .. } => None,
         })
         .collect();

@@ -273,6 +273,9 @@ pub enum Wake {
     /// The daemon said how the provider addresses more of the conversation's
     /// subagents; read them with `agent_addresses`.
     AgentAddresses,
+    /// The answer to a side question. Only the surface that asked knows its
+    /// identifier; any other leaves it alone.
+    SideAnswer(super::SideAnswer),
     Disconnected(String),
     ExitedQueue(TerminalId, Vec<super::QueuedMessage>),
     /// The authenticated source and whole queue of an attached or archived
@@ -3506,6 +3509,9 @@ impl ClientHandle {
                             addresses,
                         );
                         if learned { wake(Wake::AgentAddresses); }
+                    },
+                    ServerMessage::ChatSideAnswer { chat_id, answer } if chat_id == id => {
+                        wake(Wake::SideAnswer(answer));
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;

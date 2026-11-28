@@ -539,6 +539,9 @@ fn create_inner(
             suggestion_turn: None,
             prediction_turn: None,
             predictions_unsupported: false,
+            latest_turn: None,
+            latest_turn_live: false,
+            samples_unsupported: false,
             subagent_status: None,
             subagent_waiting: false,
             subagent_detail: String::new(),
@@ -573,6 +576,115 @@ fn create_inner(
             repo_root: None,
         }),
     ))
+}
+
+/// A side question named a turn that is no longer the thread's newest.
+const SIDE_TURN_MOVED: &str = "The conversation moved on before Codex could answer. Ask again.";
+
+const CODEX_SAMPLES_UNSUPPORTED: &str =
+    "This version of Codex can't answer side questions. Update Codex to ask one.";
+
+/// Why a side question failed, from a `thread/sample` error. Codex reports an
+/// upstream refusal as `sample failed: http 400 Bad Request: Some("{...}")`,
+/// so this prefers that payload's own message and otherwise keeps the text
+/// before it, never the escaped payload itself.
+fn side_failure(message: &str) -> String {
+    let message = message.trim();
+    // Codex's own refusals of a sample, said for the person who asked.
+    for (refusal, said) in [
+        ("sample source turn must be the latest", SIDE_TURN_MOVED),
+        ("sample source changed", SIDE_TURN_MOVED),
+        ("expectedTurnId", SIDE_TURN_MOVED),
+        ("sample canceled", "The side question was canceled."),
+        (
+            "sample turn stopped",
+            "Codex stopped before it answered. Try again.",
+        ),
+        (
+            "sample turn requires client interaction",
+            "Codex wanted to use a tool or ask for approval instead of answering. Try asking another way.",
+        ),
+        (
+            "sample turn was not admitted",
+            "Codex couldn't start answering. Try again in a moment.",
+        ),
+    ] {
+        if message.contains(refusal) {
+            tracing::debug!(message, "Codex refused a side question");
+            return said.to_owned();
+        }
+    }
+    let message = message
+        .strip_prefix("sample failed:")
+        .map_or(message, str::trim_start);
+    let Some(start) = message.find('{') else {
+        return format!("Codex couldn't answer: {message}");
+    };
+    let payload = message[start..].trim_end_matches([')', '"', ' ']);
+    let reason = [payload.to_owned(), unescape_debug(payload)]
+        .iter()
+        .filter_map(|candidate| serde_json::from_str::<Value>(candidate).ok())
+        .find_map(|value| {
+            [&value["error"]["message"], &value["message"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|reason| !reason.is_empty())
+                .map(str::to_owned)
+        });
+    match reason {
+        Some(reason) => format!("Codex couldn't answer: {reason}"),
+        None => {
+            let before = message[..start].trim_end_matches(['"', '(', ':', ' ']);
+            let before = before.strip_suffix("Some").unwrap_or(before);
+            match before.trim_end_matches([':', ' ']) {
+                "" => "Codex couldn't answer this side question.".to_owned(),
+                before => format!("Codex couldn't answer: {before}"),
+            }
+        }
+    }
+}
+
+/// Undo Rust's `Debug` quoting of a string, which is how Codex embeds an
+/// upstream response body in its error text.
+fn unescape_debug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
+/// What Codex samples for a side question. A sample that reaches for a tool
+/// answers nothing, so the prompt asks for an answer from what the thread
+/// already holds.
+fn side_prompt(question: &chat::SideQuestion) -> String {
+    let mut prompt = String::from(
+        "<side_question>\nThe person asks this on the side, while the conversation continues. \
+         Answer directly and briefly from what this conversation already contains. \
+         Do not use tools. Your answer will not become part of the conversation.\n",
+    );
+    for exchange in &question.history {
+        prompt.push_str("\nEarlier side question: ");
+        prompt.push_str(&exchange.question);
+        prompt.push_str("\nYour answer: ");
+        prompt.push_str(&exchange.answer);
+        prompt.push('\n');
+    }
+    prompt.push_str("\nQuestion: ");
+    prompt.push_str(&question.question);
+    prompt.push_str("\n</side_question>");
+    prompt
 }
 
 #[derive(Clone)]
@@ -612,6 +724,8 @@ enum Pending {
     /// history/context refresh. The provider reports the turn separately.
     Compact,
     Other,
+    /// A side question, by its [`chat::SideQuestion::id`].
+    SideQuestion(String),
     FastMode {
         enabled: bool,
         revision: u64,
@@ -808,6 +922,14 @@ struct Codex {
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
     predictions_unsupported: bool,
+    /// The thread's newest turn, finished or not, which `thread/sample`
+    /// requires its caller to name.
+    latest_turn: Option<String>,
+    /// A live `turn/started` named `latest_turn` after the latest page was
+    /// last requested, so that page, when it arrives, is older than it.
+    latest_turn_live: bool,
+    /// The server answered `thread/sample` as an unknown method.
+    samples_unsupported: bool,
     subagent_status: Option<ToolStatus>,
     subagent_waiting: bool,
     subagent_detail: String,
@@ -1833,8 +1955,44 @@ impl Codex {
             queue_remove: self.queue_available && self.direct_input,
             queue_start: self.queue_available && self.direct_input,
             stop_subagent: self.ready,
+            side_questions: self.ready
+                && self.direct_input
+                && !self.is_child
+                && !self.samples_unsupported,
             ..Capabilities::default()
         }
+    }
+    /// Ask `/btw` with Codex's own side sample: the model reads the thread as
+    /// it stands, even mid-turn, and answers without the reply entering it.
+    fn side_question(
+        &mut self,
+        question: chat::SideQuestion,
+        step: &mut Step,
+    ) -> Result<(), String> {
+        if !self.capabilities().side_questions {
+            return Err(if self.samples_unsupported {
+                CODEX_SAMPLES_UNSUPPORTED
+            } else {
+                "This Codex conversation can't answer side questions"
+            }
+            .into());
+        }
+        question.validate()?;
+        let Some(turn) = self.latest_turn.clone() else {
+            return Err("Codex can answer side questions once the conversation has started".into());
+        };
+        let id = question.id.clone();
+        self.call(
+            step,
+            "thread/sample",
+            json!({
+                "threadId": self.thread,
+                "expectedTurnId": turn,
+                "prompt": side_prompt(&question),
+                "allowInProgressTurn": true,
+            }),
+            Pending::SideQuestion(id),
+        )
     }
     /// Ask the account's server which skills apply to this conversation's
     /// directory.
@@ -1934,6 +2092,9 @@ impl Codex {
         .then_some((self.lifecycle_revision, self.notification_revision));
         let adoption_binding =
             (!earlier).then_some((self.lifecycle_revision, self.notification_revision));
+        if !earlier {
+            self.latest_turn_live = false;
+        }
         self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding, adoption_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
@@ -2048,6 +2209,16 @@ impl Codex {
     ) -> Result<Option<String>, String> {
         let mut items = Vec::new();
         let turns = array(page, "data")?;
+        // The page lists newest first; a latest page names the thread's
+        // newest turn, unless a live start since it was requested named a
+        // newer one. Turns may have run elsewhere since the last page, so
+        // an older name never stands against it.
+        if !earlier
+            && !self.latest_turn_live
+            && let Some(newest) = turns.first()
+        {
+            self.latest_turn = Some(string(newest, "id")?.to_owned());
+        }
         // Children whose nickname this page set. The page is read oldest
         // first, so a later call on it may advance that name. A name known
         // before the page stands: it came from a listing, a live
@@ -2706,6 +2877,7 @@ impl Adapter for Codex {
             }
             Command::SetInterruptMode { .. } => return Err("Codex uses explicit steer and queue operations".into()),
             Command::SendQueuedNow => return Err("Codex cannot hand its queue to the running turn".into()),
+            Command::SideQuestion(question) => self.side_question(question, &mut step)?,
             Command::ListBranches => self.history(&mut step, None)?,
             Command::Branch { id } => {
                 if self.busy || !self.direct_input { return Err("Fork requires an idle writable Codex conversation".into()); }
@@ -2984,6 +3156,28 @@ impl Codex {
                     self.child_read_failed(id, message, &mut step)?;
                     return Ok(step);
                 }
+                if let Pending::SideQuestion(id) = &pending {
+                    let reason = if error["code"].as_i64() == Some(-32601) {
+                        self.samples_unsupported = true;
+                        step.events.push(Event::Capabilities(self.capabilities()));
+                        CODEX_SAMPLES_UNSUPPORTED.to_owned()
+                    } else {
+                        match error["message"].as_str().map(str::trim) {
+                            Some(message) if !message.is_empty() => side_failure(message),
+                            _ => "Codex couldn't answer this side question.".to_owned(),
+                        }
+                    };
+                    // Turns ran that this adapter never saw, so the next
+                    // question needs the thread's own newest turn.
+                    if reason == SIDE_TURN_MOVED {
+                        self.reread(&mut step)?;
+                    }
+                    step.events.push(Event::SideAnswer(chat::SideAnswer::failed(
+                        id.clone(),
+                        reason,
+                    )));
+                    return Ok(step);
+                }
                 if matches!(pending, Pending::Prediction) {
                     if error["code"].as_i64() == Some(-32601) {
                         self.predictions_unsupported = true;
@@ -3136,6 +3330,7 @@ impl Codex {
                         .push(json!({"method":"initialized","params":{}}));
                     let pending = Pending::Attach { renamed: None };
                     if self.thread.is_some() {
+                        self.latest_turn_live = false;
                         self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), pending)?;
                     } else {
                         self.call(&mut step, "thread/start", self.start.clone(), pending)?;
@@ -3886,6 +4081,18 @@ impl Codex {
                 Pending::ChildRpc { .. } => unreachable!("child responses routed above"),
                 // The child's own turn completion reports how it ended.
                 Pending::StopChild | Pending::Prediction => {}
+                Pending::SideQuestion(id) => {
+                    let answer = match result["text"].as_str().map(str::trim) {
+                        Some(text) if !text.is_empty() => chat::SideAnswer::answered(id, text),
+                        // Codex gives no text when the model reached for a
+                        // tool, which a side question cannot use.
+                        _ => chat::SideAnswer::failed(
+                            id,
+                            "Codex tried to use a tool instead of answering. Side questions can't use tools, so try asking another way.",
+                        ),
+                    };
+                    step.events.push(Event::SideAnswer(answer));
+                }
                 Pending::ReadThread { name_revision } => {
                     if result["thread"].is_object() {
                         self.thread_state(
@@ -4232,6 +4439,8 @@ impl Codex {
                         });
                     self.remember_turn_pricing(turn_id, model, tier);
                     self.prediction_turn = Some(turn_id.into());
+                    self.latest_turn = Some(turn_id.into());
+                    self.latest_turn_live = true;
                 }
                 let prediction_turn =
                     method == "turn/completed" && self.prediction_turn.as_deref() == Some(turn_id);

@@ -799,6 +799,12 @@ fn changed_for_instance(
                 revision: *revision,
                 model: model.clone(),
             }),
+            // Only the window that asked knows the question's identifier;
+            // the rest set the answer aside.
+            Update::SideAnswer(answer) => Some(ServerMessage::ChatSideAnswer {
+                chat_id: id,
+                answer: answer.clone(),
+            }),
             _ => None,
         };
         if let Some(message) = message {

@@ -332,6 +332,7 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             })
             .filter(|(name, _)| {
                 !name.eq_ignore_ascii_case(RESUME_COMMAND)
+                    && !name.eq_ignore_ascii_case(super::side_question::COMMAND)
                     && !(permissions_available(snapshot)
                         && name.eq_ignore_ascii_case(PERMISSIONS_COMMAND))
             })
@@ -353,7 +354,16 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             PERMISSIONS_COMMAND,
             "Resolve blocked tools and manage permissions",
         ));
-        for (name, description) in commands.chain(compact).chain(permissions) {
+        // The composer asks `/btw` itself, where the provider can answer one.
+        let side_question = snapshot.capabilities.side_questions.then_some((
+            super::side_question::COMMAND,
+            super::side_question::DESCRIPTION,
+        ));
+        for (name, description) in commands
+            .chain(compact)
+            .chain(permissions)
+            .chain(side_question)
+        {
             if let Some(rank) = rank(name) {
                 ranked.push((
                     rank,

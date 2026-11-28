@@ -330,6 +330,9 @@ pub enum Update {
     TurnStarted {
         generation: u64,
     },
+    /// The answer to a side question, for the surfaces showing the
+    /// conversation. It changes nothing in the snapshot or the store.
+    SideAnswer(super::SideAnswer),
 }
 
 pub struct ConversationNaming {
@@ -4005,6 +4008,8 @@ impl Actor {
                 | Command::Branch { .. }
                 | Command::SetPermissionMode { .. } => true,
                 Command::UpdatePermissionSettings { .. } => true,
+                // No turn, but the provider still spends the account on it.
+                Command::SideQuestion(_) => true,
                 Command::Answer {
                     request_id, action, ..
                 } => !self.adapter.answer_declines(request_id, action),
@@ -4025,6 +4030,9 @@ impl Actor {
                 continue;
             }
             let loads_earlier = command == Command::LoadEarlier;
+            // A side question's refusal is its asker's to show beside the
+            // composer, not the conversation's error.
+            let side_question = matches!(command, Command::SideQuestion(_));
             let was_selecting_first_model = self.adapter.first_model_pending();
             let prepared = if tracked_compaction.is_some() {
                 self.adapter.tracked_compaction()
@@ -4081,10 +4089,12 @@ impl Actor {
                             .unwrap_or_else(|p| p.into_inner())
                             .history_failed();
                     }
-                    self.apply(Event::Error {
-                        message: message.clone(),
-                        fatal: false,
-                    });
+                    if !side_question {
+                        self.apply(Event::Error {
+                            message: message.clone(),
+                            fatal: false,
+                        });
+                    }
                     let _ = refuse(message);
                 }
             }
@@ -4178,7 +4188,10 @@ impl Actor {
         let observed = step.events.iter().any(|event| {
             !matches!(
                 event,
-                Event::AccountUsage(_) | Event::AgentAddress(_) | Event::PromptCache(_)
+                Event::AccountUsage(_)
+                    | Event::AgentAddress(_)
+                    | Event::PromptCache(_)
+                    | Event::SideAnswer(_)
             )
         });
         let identity = step.events.iter().rev().find_map(|event| match event {
@@ -4371,6 +4384,13 @@ impl Actor {
                 } else {
                     execution_events.push((run, event));
                 }
+                continue;
+            }
+            // An answer beside the conversation is not part of it: the
+            // surfaces get it, and the store, snapshot and any automation run
+            // never do.
+            if let Event::SideAnswer(answer) = event {
+                (self.notify)(Update::SideAnswer(answer));
                 continue;
             }
             if let Some(run) = execution_scope {
@@ -5093,6 +5113,7 @@ fn apply_projected_event(
         Event::AccountUsage(_)
         | Event::AgentAddress(_)
         | Event::PromptCache(_)
+        | Event::SideAnswer(_)
         | Event::LoginRecovered { .. }
         | Event::LoginVerificationFailed { .. } => {}
         Event::Capabilities(value) => state.capabilities = value,

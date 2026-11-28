@@ -224,6 +224,10 @@ pub struct Resident {
     #[serde(default)]
     work_hold: Option<chat::WorkHold>,
     pub account_reports: Vec<Update>,
+    /// The latest answers to side questions, which a poll hands on once.
+    /// A helper that predates them reports none.
+    #[serde(default)]
+    pub side_answers: Vec<chat::SideAnswer>,
     /// How the provider addresses the conversation's subagents. A helper
     /// that predates them reports none.
     #[serde(default)]
@@ -635,6 +639,7 @@ impl RemoteActor {
             background_tasks: Some(0),
             work_hold: None,
             account_reports: Vec::new(),
+            side_answers: Vec::new(),
             agent_addresses: Vec::new(),
             active_model: None,
             active_model_revision: 0,
@@ -1855,6 +1860,19 @@ impl RemoteActor {
                     .iter()
                     .filter(|report| !state.account_reports.contains(report))
                     .cloned(),
+            );
+            updates.extend(
+                resident
+                    .side_answers
+                    .iter()
+                    .filter(|answer| {
+                        !state
+                            .side_answers
+                            .iter()
+                            .any(|previous| previous.id == answer.id)
+                    })
+                    .cloned()
+                    .map(Update::SideAnswer),
             );
             if resident.agent_addresses != state.agent_addresses {
                 updates.push(Update::AgentAddresses(resident.agent_addresses.clone()));
@@ -3127,6 +3145,7 @@ struct Server {
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
+    side_answers: Arc<Mutex<SideAnswers>>,
     environment: crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment: BTreeMap<String, String>,
     listener: UnixListener,
@@ -3236,6 +3255,8 @@ impl Server {
         let outcomes = journal.clone();
         let account_reports = Arc::new(Mutex::new(Vec::<Update>::new()));
         let reported = account_reports.clone();
+        let side_answers = Arc::new(Mutex::new(SideAnswers::new()));
+        let answered = side_answers.clone();
         if disconnected(control)? {
             return Err("Retained actor launch cancelled before process creation".into());
         }
@@ -3263,6 +3284,8 @@ impl Server {
                     if reports.len() < 16 {
                         reports.push(update);
                     }
+                } else if let Update::SideAnswer(answer) = update {
+                    remember_side_answer(&answered, answer);
                 }
                 published.fetch_add(1, Ordering::Release);
                 published_watcher.notify();
@@ -3343,6 +3366,7 @@ impl Server {
                 prompt_revision,
                 pending: Vec::new(),
                 account_reports,
+                side_answers,
                 environment,
                 recovery_environment: startup.recovery_environment,
                 listener,
@@ -3408,6 +3432,7 @@ impl Server {
         let changed = self.changed.clone();
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
+        let answered = self.side_answers.clone();
         let watcher = self.watcher.clone();
         let confirmed = self.actor.0.confirmed_session.clone();
         move |update| {
@@ -3428,6 +3453,8 @@ impl Server {
                 if entries.len() < 16 {
                     entries.push(update);
                 }
+            } else if let Update::SideAnswer(answer) = update {
+                remember_side_answer(&answered, answer);
             }
             changed.fetch_add(1, Ordering::Release);
             watcher.notify();
@@ -3509,6 +3536,7 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
+        let side_answers = pending_side_answers(&self.side_answers);
         // Metadata can become a public descriptor through ChatList without
         // hydrating a snapshot. Retain the exact sampled IDs before sending
         // them, even if the reducer concurrently advances to another thread.
@@ -3561,6 +3589,7 @@ impl Server {
             background_tasks: Some(background_tasks),
             work_hold: Some(work_hold),
             account_reports,
+            side_answers,
             agent_addresses: self.actor.agent_addresses(),
             active_model,
             active_model_revision,
@@ -5127,6 +5156,34 @@ fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
 /// builds and names. A daemon built with `test-support` takes that name too
 /// when it is given, and is itself otherwise, as when an integration test runs
 /// it with a cleared environment.
+/// Answers to side questions waiting for the daemon's next poll, each with
+/// when it arrived.
+type SideAnswers = Vec<(Instant, chat::SideAnswer)>;
+
+/// How long an answer stays in what the helper reports. The daemon polls on
+/// every change, an answer's arrival included, and hands each on once, so an
+/// answer is only repeated until it ages out rather than in every later poll.
+const SIDE_ANSWER_KEPT_FOR: Duration = Duration::from_secs(30);
+
+/// Keep the latest few answers for the daemon's next poll. A window that is
+/// still waiting needs only its own.
+fn remember_side_answer(answers: &Mutex<SideAnswers>, answer: chat::SideAnswer) {
+    const KEPT: usize = 8;
+    let mut answers = answers.lock().unwrap_or_else(|p| p.into_inner());
+    answers.retain(|(_, previous)| previous.id != answer.id);
+    if answers.len() >= KEPT {
+        answers.remove(0);
+    }
+    answers.push((Instant::now(), answer));
+}
+
+/// The answers a poll reports, after forgetting those it has had long enough.
+fn pending_side_answers(answers: &Mutex<SideAnswers>) -> Vec<chat::SideAnswer> {
+    let mut answers = answers.lock().unwrap_or_else(|p| p.into_inner());
+    answers.retain(|(arrived, _)| arrived.elapsed() < SIDE_ANSWER_KEPT_FOR);
+    answers.iter().map(|(_, answer)| answer.clone()).collect()
+}
+
 fn helper_executable() -> Result<PathBuf, String> {
     #[cfg(any(test, feature = "test-support"))]
     if let Some(path) = std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER") {

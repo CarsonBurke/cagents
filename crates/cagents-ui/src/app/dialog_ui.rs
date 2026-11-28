@@ -114,6 +114,14 @@ impl Cagents {
         if let Some((_, dismiss)) = self.pane_question() {
             return Some(dismiss);
         }
+        if let Some(target) = self
+            .focused_side_question()
+            .filter(|target| !self.pane_content_inputs_blocked(target.card))
+        {
+            return Some(Message::ChatUi(chat_ui::Action::DismissSideQuestion(
+                target,
+            )));
+        }
         self.review_popover_escape()
             .or_else(|| self.usage_reset_question(false).map(|(_, dismiss)| dismiss))
     }

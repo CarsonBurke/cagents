@@ -4677,6 +4677,7 @@ impl Runtime {
             let take_back =
                 !recall_newer && (self.newest_take_back().is_some() || !self.recalling.is_empty());
             let viewing = self.image_viewer.is_some() && self.child_picker.is_none();
+            let side_question = self.side_question.is_some();
             // Finishing counts too: an Escape pressed again while the last
             // words arrive must not fall through and interrupt the turn.
             let dictating = self
@@ -4773,6 +4774,16 @@ impl Runtime {
                         return Some(text_editor::Binding::Custom(action(Action::CloseImage(
                             images::ViewerHost::Pane(target),
                         ))));
+                    }
+                    // A side question's card is above the draft too, and
+                    // goes before the turn it was asked beside.
+                    if side_question
+                        && !picking
+                        && matches!(completion_key(&press), Some(CompletionKey::Dismiss))
+                    {
+                        return Some(text_editor::Binding::Custom(action(
+                            Action::DismissSideQuestion(target),
+                        )));
                     }
                     if snapshot.busy
                         && available
@@ -4906,6 +4917,7 @@ impl Runtime {
                             .into_iter()
                             .chain(self.restored_waiting_notice())
                             .chain(self.dictation_view())
+                            .chain(self.side_question_view())
                             .chain(self.composer_note_view(provider_note))
                             // Above the draft, so the row with Stop keeps
                             // its place for the second press.

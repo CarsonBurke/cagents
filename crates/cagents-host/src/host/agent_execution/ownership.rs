@@ -30,7 +30,12 @@ pub(in crate::host) fn interactive(
             chat_id, command, ..
         } => (
             *chat_id,
-            !matches!(command, Command::Refresh | Command::LoadEarlier),
+            // A side question reads the conversation without joining it, so
+            // asking one takes no agent over from its owner.
+            !matches!(
+                command,
+                Command::Refresh | Command::LoadEarlier | Command::SideQuestion(_)
+            ),
         ),
         ClientRequest::ChatReturnTerminal { chat_id } => (*chat_id, true),
         ClientRequest::ChatCommitTerminal { terminal_id } => (*terminal_id, false),

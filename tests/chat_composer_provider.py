@@ -48,6 +48,41 @@ class Provider(unittest.TestCase):
         return [block.get("text") for frame in output if frame.get("type") == "assistant"
                 for block in frame["message"]["content"] if block.get("type") == "text"]
 
+    def test_side_question_is_answered_beside_a_running_turn_and_never_recorded(self):
+        def side(request_id, question, history=()):
+            return {"type": "control_request", "request_id": request_id,
+                    "request": {"subtype": "side_question", "question": question,
+                                "history": list(history)}}
+
+        def answer(output, request_id):
+            return next(frame["response"] for frame in output
+                        if frame.get("type") == "control_response"
+                        and frame["response"]["request_id"] == request_id)
+
+        interrupt = {"type": "control_request", "request_id": "stop",
+                     "request": {"subtype": "interrupt"}}
+        earlier = [{"question": "first?", "response": "yes"}]
+        result, output, _ = self.run_provider(
+            frames=(prompt(1), side("side-1", "Which file?", earlier), interrupt))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        reply = answer(output, "side-1")
+        self.assertEqual(reply["subtype"], "success")
+        self.assertIn("Which file?", reply["response"]["response"])
+        self.assertIn("1 earlier side question", reply["response"]["response"])
+        # Asked while the first turn ran, which the interrupt still ends.
+        self.assertTrue(any(frame.get("type") == "result" for frame in output))
+        history = next(self.config.glob("projects/*/*.jsonl")).read_text()
+        self.assertNotIn("Which file?", history)
+
+        (self.config / "fixture-side-answer.md").write_text("**Fixture** answer\n")
+        result, output, _ = self.run_provider(frames=(side("side-2", "Again?"),))
+        self.assertEqual(answer(output, "side-2")["response"]["response"], "**Fixture** answer\n")
+
+        (self.config / "fixture-side-error").write_text("Overloaded\n")
+        result, output, _ = self.run_provider(frames=(side("side-3", "Again?"),))
+        self.assertEqual(answer(output, "side-3"), {"subtype": "error", "request_id": "side-3",
+                                                    "error": "Overloaded"})
+
     def test_auth_status_uses_each_accounts_explicit_config_with_the_fixture_default(self):
         def status(config=None):
             environment = {"HOME": str(self.root / "home"),
