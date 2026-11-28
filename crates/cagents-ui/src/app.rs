@@ -11983,6 +11983,9 @@ impl Cagents {
         self.settings_blur_pending()
             || !self.queued_card_closes.is_empty()
             || self.workspace.pending_close().is_some()
+            || self.held_close_answer.is_some()
+            || !self.hidden_closes.is_empty()
+            || self.chat_ui.returns_await_removal
             || !self.kept_panes.is_empty()
     }
 
@@ -21076,6 +21079,11 @@ impl Cagents {
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DeviceLoad(load) => {
                 self.device_ui.load = load;
+                // The status bar draws the reading directly. Keep any
+                // projection owed by the update's settings and close tail.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
                 Task::none()
             }
             Message::CursorBlink(blink) => {
