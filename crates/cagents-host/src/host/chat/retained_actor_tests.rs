@@ -3340,6 +3340,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     host.lock().unwrap().native_actor_startups.insert(
         source.id,
         retained_actor::Startup {
+            local: false,
             source: source.clone(),
             requested: source.clone(),
             context: original.clone(),
@@ -3424,6 +3425,7 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
     host.lock().unwrap().native_actor_startups.insert(
         source.id,
         retained_actor::Startup {
+            local: false,
             source: source.clone(),
             requested: source.clone(),
             context: successor.clone(),

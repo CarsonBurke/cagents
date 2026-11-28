@@ -1947,7 +1947,18 @@ impl HostState {
                 true,
             ));
         }
+        let local_startups = self
+            .native_actor_startups
+            .values()
+            .filter_map(super::chat::retained_actor::Startup::local_source);
         if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
+            || local_startups.clone().any(|source| {
+                source.id == terminal_id
+                    || source
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|paired| paired.id == terminal_id)
+            })
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
                     && !paired.is_some_and(|terminal| {
@@ -1970,22 +1981,26 @@ impl HostState {
         // is returning to. Adopting a holder launches nothing.
         let handoff = self.handoff_terminals.get(&terminal_id);
         if let Some(spawned) = spawned.filter(|_| !adopting)
-            && self.chat_spawning.iter().any(|(id, claim)| {
-                *id != terminal_id
-                    && Some(id) != handoff
-                    && claim
-                        .terminal
-                        .as_ref()
-                        .is_none_or(|terminal| terminal.id != terminal_id)
-                    && claim.launch.provider == crate::agent::Provider::Codex
-                    && claim
-                        .launch
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|conversation| {
-                            super::chat::terminal_runs_codex_conversation(spawned, conversation)
-                        })
-            })
+            && self
+                .chat_spawning
+                .iter()
+                .chain(local_startups.map(|source| (&source.id, source)))
+                .any(|(id, claim)| {
+                    *id != terminal_id
+                        && Some(id) != handoff
+                        && claim
+                            .terminal
+                            .as_ref()
+                            .is_none_or(|terminal| terminal.id != terminal_id)
+                        && claim.launch.provider == crate::agent::Provider::Codex
+                        && claim
+                            .launch
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|conversation| {
+                                super::chat::terminal_runs_codex_conversation(spawned, conversation)
+                            })
+                })
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
