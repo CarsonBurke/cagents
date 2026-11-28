@@ -406,17 +406,26 @@ def keep_main_build(repository, directory, state):
     builds.mkdir(exist_ok=True)
     (builds / ".lock").touch()
     checkout = repository / ".worktrees" / "main-build-sentinel"
+    cached = (builds / sha).is_dir()
+    if not cached and git(checkout, "rev-parse", "HEAD") != sha:
+        # A bisection may have moved the worktree to an older revision.
+        checkout = checkout_commit(repository, sha)
     tool = checkout / "scripts/native-evidence"
-    if not (builds / sha).is_dir() and tool.exists() and git(checkout, "rev-parse", "HEAD") == sha:
+    if not cached and tool.exists():
         # The commit's own tool, which says what its builds compile; one
         # older than that builds nothing here.
         listed = subprocess.run([str(tool), "__build-arguments"], cwd=checkout, text=True,
                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
         if listed.returncode == 0 and listed.stdout.strip():
             print(f"main-build-sentinel: {sha} native-evidence build", flush=True)
+            # This cache is optional. Leave the next tick a chance to check
+            # main even when all build slots are busy.
+            environment = os.environ.copy()
+            environment.setdefault("CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS", "120")
             with (directory / "logs" / f"{sha}-evidence.log").open("w") as log:
                 built = subprocess.run([str(tool), "--task", str(EVIDENCE_TASK), "build", "before", str(checkout)],
-                                       cwd=checkout, stdout=log, stderr=subprocess.STDOUT).returncode
+                                       cwd=checkout, env=environment, stdout=log,
+                                       stderr=subprocess.STDOUT).returncode
             staging = builds / f".{sha}.new"
             try:
                 if built == 0:
@@ -874,12 +883,15 @@ def tick_locked(repository, directory, github_repository):
         # Before the tests, which take long enough to bundle the commit beside.
         start_prebuild()
         test_main(repository, directory, state)
-        # Neither release gate needs a development-runtime build. Keep it
-        # before bisecting moves the checkout off the checked commit.
-        keep_main_build(repository, directory, state)
         if state.get("bisect"):
             bisect(repository, directory, state)
-        report_pending_tests(directory, state)
+        # A build-slot wait for optional evidence must not hide a verdict.
+        # A GitHub notification failure still leaves the exact cache build
+        # available while the saved verdict waits for a retry.
+        try:
+            report_pending_tests(directory, state)
+        finally:
+            keep_main_build(repository, directory, state)
 
 
 def main():

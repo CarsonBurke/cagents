@@ -967,13 +967,13 @@ across commits. It records the fourth such failure and names the stray marker
 as a possible cause in the issue. A recorded verdict or a change in the marker
 set starts a new count. Other outside-code stops preserve the count.
 
-After the test lanes finish, the sentinel builds the three executables
-[native evidence](#native-evidence) runs and keeps them under `builds/` for the
-six newest built commits, about 0.6 GiB each. Native evidence copies these
-executables when available. A build that fails is logged to
-`logs/SHA-evidence.log`, and native evidence builds that commit when needed.
-The sentinel builds this evidence and bisects check failures before sending
-test notifications to GitHub.
+After the test lanes finish, the sentinel bisects any check failures and
+reports the test verdict. It then builds the three executables
+[native evidence](#native-evidence) uses and keeps them under `builds/` for the
+six newest built commits, about 0.6 GiB each. This optional build waits up to
+two minutes for admission by default. A build that fails or cannot start is
+logged to `logs/SHA-evidence.log`. Native evidence copies a cached build when
+available and builds the requested commit when needed.
 
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
