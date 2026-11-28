@@ -72,3 +72,15 @@ after each consecutive failure up to a minute, as it already did when the
 proxy could not be created. Reading a setting resets the wait. Without the
 `tokio` feature there is no timer, so the subscription stops there instead, as
 the proxy failure path already did.
+
+# Menu shortcut hints read as the application's chords
+
+`KeyBind`'s `Display`, which a menu prints beside each item, wrote every
+modifier by its `Debug` name joined with ` + ` in the order they were listed,
+so Command read as `Super` on macOS and arrows as `ArrowLeft`. It now writes
+the text form of the key caps the application draws for the same chord:
+`Ctrl+Shift+T` with modifiers in a fixed order, arrows as `←`, and on macOS
+the menu symbols in Apple's order, `⇧⌘T`.
+
+The application's `menu_hints_name_keys_as_their_key_caps_do` regression
+compares each hint with the label of the chord it was built from.

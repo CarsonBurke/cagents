@@ -13214,6 +13214,12 @@ fn changes_footer<'a>(
     } else {
         commit_label
     };
+    // The subject and description fields commit on the platform's command
+    // modifier with Enter.
+    let commit_chord = crate::interaction::KeyChord::new(format!(
+        "{}+Enter",
+        cagents::settings::ModifierNames::CURRENT.primary
+    ));
     let commit = crate::interaction::tooltip(
         // Ticking Amend relabels Commit in place, as a rebase does.
         crate::ui_controls::button::primary(if continuing {
@@ -13223,10 +13229,11 @@ fn changes_footer<'a>(
         })
         .instead("Amend commit", amending)
         .icon(Icon::Commit)
-        .name(format!("{commit_label} (Ctrl+Enter)"))
+        .name(commit_label)
+        .description(format!("Shortcut: {commit_chord}"))
         .id(chrome.commit_id.clone())
         .on_press_maybe(can_commit.then_some(commit_action)),
-        crate::interaction::RichTip::new(commit_hint).shortcut("Ctrl+Enter"),
+        crate::interaction::RichTip::new(commit_hint).shortcut(commit_chord),
     );
 
     if has_subject {

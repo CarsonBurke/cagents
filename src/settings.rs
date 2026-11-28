@@ -1109,83 +1109,14 @@ pub enum ShortcutKey {
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
-    let mut control = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut logo = false;
-    let mut key = None;
-    for token in raw.trim().split('+').map(str::trim) {
-        if token.eq_ignore_ascii_case("ctrl") || token.eq_ignore_ascii_case("control") {
-            if std::mem::replace(&mut control, true) {
-                return Err("keyboard shortcut repeats a modifier");
-            }
-        } else if token.eq_ignore_ascii_case("alt")
-            || token.eq_ignore_ascii_case("option")
-            || token.eq_ignore_ascii_case("opt")
-        {
-            if std::mem::replace(&mut alt, true) {
-                return Err("keyboard shortcut repeats a modifier");
-            }
-        } else if token.eq_ignore_ascii_case("shift") {
-            if std::mem::replace(&mut shift, true) {
-                return Err("keyboard shortcut repeats a modifier");
-            }
-        } else if ["super", "meta", "cmd", "command"]
-            .iter()
-            .any(|name| token.eq_ignore_ascii_case(name))
-        {
-            if std::mem::replace(&mut logo, true) {
-                return Err("keyboard shortcut repeats a modifier");
-            }
-        } else {
-            if key.is_some() {
-                return Err("keyboard shortcut must contain exactly one key");
-            }
-            key = if token.eq_ignore_ascii_case("left") {
-                Some(ShortcutKey::ArrowLeft)
-            } else if token.eq_ignore_ascii_case("right") {
-                Some(ShortcutKey::ArrowRight)
-            } else if token.eq_ignore_ascii_case("up") {
-                Some(ShortcutKey::ArrowUp)
-            } else if token.eq_ignore_ascii_case("down") {
-                Some(ShortcutKey::ArrowDown)
-            } else if token.eq_ignore_ascii_case("tab") {
-                Some(ShortcutKey::Tab)
-            } else if token.eq_ignore_ascii_case("space") {
-                Some(ShortcutKey::Space)
-            } else if token.eq_ignore_ascii_case("pageup") {
-                Some(ShortcutKey::PageUp)
-            } else if token.eq_ignore_ascii_case("pagedown") {
-                Some(ShortcutKey::PageDown)
-            } else if token.eq_ignore_ascii_case("comma") {
-                Some(ShortcutKey::Character(','))
-            } else if token.eq_ignore_ascii_case("plus") {
-                Some(ShortcutKey::Character('+'))
-            } else if token
-                .to_ascii_lowercase()
-                .strip_prefix('f')
-                .and_then(|number| number.parse::<u8>().ok())
-                .is_some_and(|number| (1..=12).contains(&number))
-            {
-                Some(ShortcutKey::Function(
-                    token[1..].parse().expect("validated function key"),
-                ))
-            } else {
-                let mut characters = token.chars();
-                match (characters.next(), characters.next()) {
-                    (Some(character), None) if character.is_ascii_graphic() => {
-                        Some(ShortcutKey::Character(character.to_ascii_lowercase()))
-                    }
-                    _ => {
-                        return Err(
-                            "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, Space, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)",
-                        );
-                    }
-                }
-            };
-        }
-    }
-    if !(control || alt || logo) && !matches!(key, Some(ShortcutKey::Function(_))) {
+    let (chord, key) = lex_chord(raw, true)?;
+    let key = match key {
+        Some(ShownKey::Bound(key)) => Some(key),
+        Some(_) => return Err(UNBINDABLE_KEY),
+        None => None,
+    };
+    if !(chord.control || chord.alt || chord.logo) && !matches!(key, Some(ShortcutKey::Function(_)))
+    {
         return Err(if cfg!(target_os = "macos") {
             "keyboard shortcut must include Cmd, Ctrl, or Option"
         } else {
@@ -1193,12 +1124,256 @@ pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
         });
     }
     Ok(ShortcutBinding {
+        control: chord.control,
+        alt: chord.alt,
+        shift: chord.shift,
+        logo: chord.logo,
+        key: key.ok_or("keyboard shortcut must contain a key")?,
+    })
+}
+
+const UNBINDABLE_KEY: &str = "keyboard shortcut key must be a letter, digit, punctuation, arrow, Tab, Space, PageUp, PageDown, or F1-F12 (use Comma and Plus for separator keys)";
+
+/// Reads a chord in the grammar shortcuts are written in, without asking
+/// whether a binding could take it: `Shift+Enter` is a find field's chord,
+/// though no action may be bound to it.
+fn parse_chord(raw: &str) -> Result<ShownChord, &'static str> {
+    let (chord, key) = lex_chord(raw, false)?;
+    Ok(ShownChord {
+        key: key.ok_or("keyboard shortcut must contain a key")?,
+        ..chord
+    })
+}
+
+/// [`parse_chord`]'s modifiers, with its key where it names one; the chord
+/// returned holds a placeholder key. With `bindable`, a key no binding takes
+/// is refused where it is read, ahead of any later error in the chord.
+fn lex_chord(raw: &str, bindable: bool) -> Result<(ShownChord, Option<ShownKey>), &'static str> {
+    let mut control = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut logo = false;
+    let mut key = None;
+    for token in raw.trim().split('+').map(str::trim) {
+        let modifier =
+            if token.eq_ignore_ascii_case("ctrl") || token.eq_ignore_ascii_case("control") {
+                Some(&mut control)
+            } else if token.eq_ignore_ascii_case("alt")
+                || token.eq_ignore_ascii_case("option")
+                || token.eq_ignore_ascii_case("opt")
+            {
+                Some(&mut alt)
+            } else if token.eq_ignore_ascii_case("shift") {
+                Some(&mut shift)
+            } else if ["super", "meta", "cmd", "command"]
+                .iter()
+                .any(|name| token.eq_ignore_ascii_case(name))
+            {
+                Some(&mut logo)
+            } else {
+                None
+            };
+        if let Some(held) = modifier {
+            if std::mem::replace(held, true) {
+                return Err("keyboard shortcut repeats a modifier");
+            }
+            continue;
+        }
+        if key.is_some() {
+            return Err("keyboard shortcut must contain exactly one key");
+        }
+        key = match parse_key(token) {
+            Some(ShownKey::Bound(key)) => Some(ShownKey::Bound(key)),
+            Some(key) if !bindable => Some(key),
+            _ => return Err(UNBINDABLE_KEY),
+        };
+    }
+    let chord = ShownChord {
         control,
         alt,
         shift,
         logo,
-        key: key.ok_or("keyboard shortcut must contain a key")?,
-    })
+        key: ShownKey::Escape,
+    };
+    Ok((chord, key))
+}
+
+/// One key of a chord by the name it is written with.
+fn parse_key(token: &str) -> Option<ShownKey> {
+    let named = |name: &str| token.eq_ignore_ascii_case(name);
+    let bound = if named("left") {
+        ShortcutKey::ArrowLeft
+    } else if named("right") {
+        ShortcutKey::ArrowRight
+    } else if named("up") {
+        ShortcutKey::ArrowUp
+    } else if named("down") {
+        ShortcutKey::ArrowDown
+    } else if named("tab") {
+        ShortcutKey::Tab
+    } else if named("space") {
+        ShortcutKey::Space
+    } else if named("pageup") {
+        ShortcutKey::PageUp
+    } else if named("pagedown") {
+        ShortcutKey::PageDown
+    } else if named("comma") {
+        ShortcutKey::Character(',')
+    } else if named("plus") {
+        ShortcutKey::Character('+')
+    } else if named("enter") || named("return") {
+        return Some(ShownKey::Enter);
+    } else if named("escape") || named("esc") {
+        return Some(ShownKey::Escape);
+    } else if named("backspace") {
+        return Some(ShownKey::Backspace);
+    } else if named("delete") {
+        return Some(ShownKey::Delete);
+    } else if let Some(number) = token
+        .to_ascii_lowercase()
+        .strip_prefix('f')
+        .and_then(|number| number.parse::<u8>().ok())
+        .filter(|number| (1..=12).contains(number))
+    {
+        ShortcutKey::Function(number)
+    } else {
+        let mut characters = token.chars();
+        match (characters.next(), characters.next()) {
+            (Some(character), None) if character.is_ascii_graphic() => {
+                ShortcutKey::Character(character.to_ascii_lowercase())
+            }
+            _ => return None,
+        }
+    };
+    Some(ShownKey::Bound(bound))
+}
+
+/// A chord as people read it: the modifiers held and the key pressed with
+/// them. Beside every chord a binding can take, it covers the fixed ones
+/// controls answer, such as Enter or Escape in a find field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShownChord {
+    pub control: bool,
+    pub alt: bool,
+    pub shift: bool,
+    pub logo: bool,
+    pub key: ShownKey,
+}
+
+/// The key of a [`ShownChord`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShownKey {
+    /// A key a shortcut can be bound to.
+    Bound(ShortcutKey),
+    Enter,
+    Escape,
+    Backspace,
+    Delete,
+}
+
+impl ShownChord {
+    /// Reads `raw` in the grammar shortcuts are written in, such as
+    /// `Ctrl+Shift+T`, `cmd+comma` or `Shift+Enter`.
+    pub fn parse(raw: &str) -> Option<Self> {
+        parse_chord(raw).ok()
+    }
+
+    /// The keys as `platform`'s keyboards print them, one per key cap, in the
+    /// order its menus give them: `Ctrl`, `Shift`, `T` on Linux, and `⇧`,
+    /// `⌘`, `T` on macOS.
+    pub fn keys(self, platform: ShortcutPlatform) -> Vec<&'static str> {
+        let mut keys: Vec<&'static str> = match platform {
+            ShortcutPlatform::Linux => [
+                (self.control, "Ctrl"),
+                (self.alt, "Alt"),
+                (self.logo, "Super"),
+                (self.shift, "Shift"),
+            ]
+            .into_iter()
+            .filter_map(|(held, name)| held.then_some(name))
+            .collect(),
+            // Apple's order: Control, Option, Shift, Command.
+            ShortcutPlatform::MacOs => [
+                (self.control, "⌃"),
+                (self.alt, "⌥"),
+                (self.shift, "⇧"),
+                (self.logo, "⌘"),
+            ]
+            .into_iter()
+            .filter_map(|(held, name)| held.then_some(name))
+            .collect(),
+        };
+        keys.push(self.key.name(platform));
+        keys
+    }
+
+    /// The chord as one line of text, as a menu prints it: `Ctrl+Shift+T` on
+    /// Linux and `⇧⌘T` on macOS.
+    pub fn label(self, platform: ShortcutPlatform) -> String {
+        let keys = self.keys(platform);
+        match platform {
+            ShortcutPlatform::Linux => keys.join("+"),
+            ShortcutPlatform::MacOs => keys.concat(),
+        }
+    }
+}
+
+impl From<ShortcutBinding> for ShownChord {
+    fn from(binding: ShortcutBinding) -> Self {
+        Self {
+            control: binding.control,
+            alt: binding.alt,
+            shift: binding.shift,
+            logo: binding.logo,
+            key: ShownKey::Bound(binding.key),
+        }
+    }
+}
+
+impl ShownKey {
+    /// The key as `platform`'s keyboards print it.
+    pub fn name(self, platform: ShortcutPlatform) -> &'static str {
+        let mac = platform == ShortcutPlatform::MacOs;
+        match self {
+            Self::Bound(ShortcutKey::Character(character)) => character_name(character),
+            Self::Bound(ShortcutKey::ArrowLeft) => "←",
+            Self::Bound(ShortcutKey::ArrowRight) => "→",
+            Self::Bound(ShortcutKey::ArrowUp) => "↑",
+            Self::Bound(ShortcutKey::ArrowDown) => "↓",
+            Self::Bound(ShortcutKey::Tab) if mac => "⇥",
+            Self::Bound(ShortcutKey::Tab) => "Tab",
+            Self::Bound(ShortcutKey::Space) => "Space",
+            Self::Bound(ShortcutKey::PageUp) if mac => "⇞",
+            Self::Bound(ShortcutKey::PageUp) => "Page Up",
+            Self::Bound(ShortcutKey::PageDown) if mac => "⇟",
+            Self::Bound(ShortcutKey::PageDown) => "Page Down",
+            Self::Bound(ShortcutKey::Function(number)) => FUNCTION_KEYS
+                .get(usize::from(number).wrapping_sub(1))
+                .copied()
+                .unwrap_or("F?"),
+            Self::Enter if mac => "↩",
+            Self::Enter => "Enter",
+            Self::Escape => "Esc",
+            Self::Backspace if mac => "⌫",
+            Self::Backspace => "Backspace",
+            Self::Delete if mac => "⌦",
+            Self::Delete => "Delete",
+        }
+    }
+}
+
+const FUNCTION_KEYS: [&str; 12] = [
+    "F1", "F2", "F3", "F4", "F5", "F6", "F7", "F8", "F9", "F10", "F11", "F12",
+];
+
+/// A printable ASCII key as its key cap prints it: letters in capitals.
+fn character_name(character: char) -> &'static str {
+    const PRINTABLE: &str =
+        "!\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`{|}~";
+    let character = character.to_ascii_uppercase();
+    PRINTABLE
+        .find(character)
+        .map_or("?", |index| &PRINTABLE[index..index + character.len_utf8()])
 }
 
 /// Canonical keys for searching bindings accepted with aliases, whitespace or
@@ -2340,9 +2515,12 @@ fn free_defaults(chords: Vec<String>, bound: &[ShortcutBinding]) -> Vec<String> 
 /// have moved to.
 ///
 /// An action the table lacks was on its default too, and the user chose the
-/// table's chords around it, so it takes part as if it held its old default.
-/// One introduced after the table was written never had one; it is left to
-/// `preserve_existing_shortcut`.
+/// table's chords around it, so it takes part as if it held its old default:
+/// it moves where its new chords are free and keeps the old ones where they
+/// are not, rather than ending up unbound. It is not implied onto a chord the
+/// table gives another action, and one whose old chords the table gives away
+/// entirely, like one the build that wrote the table may not have had, is
+/// left to `preserve_existing_shortcut`.
 fn adopt_shortcut_defaults(
     shortcuts: &mut toml::Table,
     revision: u32,
@@ -2359,19 +2537,31 @@ fn adopt_shortcut_defaults(
             && left.iter().all(|chord| right.contains(chord))
             && right.iter().all(|chord| left.contains(chord))
     };
+    let listed = bound_chords(shortcuts, &[]);
     let mut implied = Vec::new();
     for action in SHORTCUT_ACTIONS {
         if !shortcuts.contains_key(action)
-            && !INTRODUCED_SHORTCUT_ACTIONS.contains(&action)
+            && every_table_had(action, revision)
             && let Some(retired) = retired_default(action, revision)
         {
-            shortcuts.insert(action.into(), retired.to_vec().into());
-            implied.push(action);
+            // A chord the table gives another action was the user's choice
+            // over this default, so it is not implied back.
+            let free = free_defaults(
+                retired.iter().map(|chord| (*chord).to_owned()).collect(),
+                &listed,
+            );
+            if !free.is_empty() {
+                shortcuts.insert(action.into(), free.into());
+                implied.push(action);
+            }
         }
     }
     let mut moving: Vec<&str> = SHORTCUT_ACTIONS
         .into_iter()
         .filter(|action| {
+            if implied.contains(action) {
+                return true;
+            }
             let Some(chords) = shortcuts.get(*action).and_then(parsed_chords) else {
                 return false;
             };
@@ -2463,6 +2653,29 @@ const INTRODUCED_SHORTCUT_ACTIONS: [&str; 35] = [
     "open_worktrees",
     "dictate",
 ];
+
+/// Introduced actions that every build writing a table at the paired
+/// revision or later had: the revision after the one their builds started at.
+/// A table there that lacks one left it on that revision's default.
+const SHORTCUT_ACTIONS_IN_EVERY_TABLE_FROM: &[(&str, u32)] = &[
+    ("cycle_pane_width", 2),
+    ("clone_pane", 2),
+    ("new_channel", 2),
+    ("new_native_thread", 3),
+    ("toggle_inspector", 3),
+    ("chat_permissions", 5),
+    ("chat_model", 5),
+    ("chat_account", 5),
+];
+
+/// Whether every build that wrote a table at `revision` had `action`, so one
+/// the table lacks was on its default rather than unknown to it.
+fn every_table_had(action: &str, revision: u32) -> bool {
+    !INTRODUCED_SHORTCUT_ACTIONS.contains(&action)
+        || SHORTCUT_ACTIONS_IN_EVERY_TABLE_FROM
+            .iter()
+            .any(|(name, from)| *name == action && revision >= *from)
+}
 
 fn preserve_introduced_shortcuts(shortcuts: &mut toml::Table) {
     for action in INTRODUCED_SHORTCUT_ACTIONS {
@@ -5468,6 +5681,115 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(shortcuts.open_settings, ["Alt+I"]);
         assert_eq!(shortcuts.toggle_inspector, ["Ctrl+Shift+I"]);
         assert_eq!(shortcuts.cycle_pane_width, ["Alt+W"]);
+    }
+
+    /// Key caps come from the parsed chord: aliases and case read alike, and
+    /// each platform names and orders the keys as its keyboards and menus do.
+    #[test]
+    fn a_chord_shows_as_the_keys_its_platform_prints() {
+        let keys = |raw: &str, platform| ShownChord::parse(raw).unwrap().keys(platform);
+        let label = |raw: &str, platform| ShownChord::parse(raw).unwrap().label(platform);
+        let linux = ShortcutPlatform::Linux;
+        let mac = ShortcutPlatform::MacOs;
+        assert_eq!(keys("Ctrl+M", linux), ["Ctrl", "M"]);
+        assert_eq!(
+            keys("shift+control+space", linux),
+            ["Ctrl", "Shift", "Space"]
+        );
+        assert_eq!(keys("Super+Alt+t", linux), ["Alt", "Super", "T"]);
+        assert_eq!(keys("Ctrl+Comma", linux), ["Ctrl", ","]);
+        assert_eq!(keys("Ctrl+Plus", linux), ["Ctrl", "+"]);
+        assert_eq!(keys("Alt+PageUp", linux), ["Alt", "Page Up"]);
+        assert_eq!(keys("Alt+Shift+Down", linux), ["Alt", "Shift", "↓"]);
+        assert_eq!(keys("Shift+F8", linux), ["Shift", "F8"]);
+        assert_eq!(keys("Escape", linux), ["Esc"]);
+        assert_eq!(keys("Shift+Enter", linux), ["Shift", "Enter"]);
+        assert_eq!(label("Ctrl+Shift+T", linux), "Ctrl+Shift+T");
+        assert_eq!(label("Option+Shift+Tab", linux), "Alt+Shift+Tab");
+
+        assert_eq!(keys("Cmd+Shift+P", mac), ["⇧", "⌘", "P"]);
+        assert_eq!(
+            keys("ctrl+option+cmd+shift+k", mac),
+            ["⌃", "⌥", "⇧", "⌘", "K"]
+        );
+        assert_eq!(keys("Cmd+Enter", mac), ["⌘", "↩"]);
+        assert_eq!(keys("Option+Tab", mac), ["⌥", "⇥"]);
+        assert_eq!(label("Cmd+Shift+T", mac), "⇧⌘T");
+        assert_eq!(label("Cmd+Comma", mac), "⌘,");
+
+        assert_eq!(ShownChord::parse("Hyper+X"), None);
+        assert_eq!(ShownChord::parse("Ctrl+Shift"), None);
+        // A key a binding can't take still parses as a chord, but no
+        // shortcut may hold it.
+        assert!(ShownChord::parse("Ctrl+Enter").is_some());
+        assert!(parse_shortcut("Ctrl+Enter").is_err());
+        assert_eq!(
+            ShownChord::from(parse_shortcut("alt+q").unwrap()),
+            ShownChord::parse("Alt+Q").unwrap()
+        );
+    }
+
+    /// A hand-written revision-7 table that lists only some actions leaves the
+    /// rest on their revision-7 defaults, so revision 8 moves those as it
+    /// moves listed ones: onto the new chord when it is free, and otherwise
+    /// keeping the old one rather than losing the shortcut.
+    #[cfg(target_os = "linux")] // Linux's defaults history
+    #[test]
+    fn revision_8_moves_the_shortcuts_a_sparse_revision_7_table_leaves_out() {
+        let load_sparse = |listed: &[(&str, &[&str])]| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut shortcuts = toml::Table::new();
+            for (action, chords) in listed {
+                shortcuts.insert((*action).into(), chords.to_vec().into());
+            }
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 7.into());
+            document.insert("keyboard_shortcuts".into(), shortcuts.into());
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+            loaded
+        };
+
+        // Nothing holds the new chords: every omitted action moves.
+        let loaded = load_sparse(&[("chat_model", &["Alt+M"])]);
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.chat_model, ["Alt+M"]);
+        assert_eq!(shortcuts.chat_account, ["Ctrl+U"]);
+        assert_eq!(shortcuts.toggle_inspector, ["Alt+I"]);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+W"]);
+        assert_eq!(
+            loaded.shortcut_defaults_revision,
+            SHORTCUT_DEFAULTS_REVISION
+        );
+
+        // A listed action holds the new chords: the omitted actions keep the
+        // chords they had at revision 7 rather than ending up unbound.
+        let loaded = load_sparse(&[
+            ("new_terminal", &["Ctrl+U"]),
+            ("open_settings", &["Alt+I"]),
+            ("next_workspace", &["Alt+W"]),
+        ]);
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Ctrl+U"]);
+        assert_eq!(shortcuts.open_settings, ["Alt+I"]);
+        assert_eq!(shortcuts.next_workspace, ["Alt+W"]);
+        assert_eq!(shortcuts.chat_account, ["Ctrl+Shift+A"]);
+        assert_eq!(shortcuts.toggle_inspector, ["Ctrl+Shift+I"]);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+Shift+R"]);
+
+        // A listed action holds the old chord too: the user's choice stands,
+        // and the omitted action takes no chord rather than share it.
+        let loaded = load_sparse(&[
+            ("new_terminal", &["Alt+I"]),
+            ("open_settings", &["Ctrl+Shift+I"]),
+        ]);
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Alt+I"]);
+        assert_eq!(shortcuts.open_settings, ["Ctrl+Shift+I"]);
+        assert!(shortcuts.toggle_inspector.is_empty());
     }
 
     #[test]

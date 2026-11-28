@@ -69,12 +69,39 @@ struct Entry {
 }
 
 /// What a result shows beside its label.
-#[derive(Debug, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 enum Detail {
     Text(String),
+    /// The chords that run the command, drawn as key caps, and as written,
+    /// for a search to read.
+    Shortcut {
+        chords: Vec<String>,
+        text: String,
+    },
     /// A pane's activity, read when the row is drawn: it changes as agents
     /// work, without a projection.
     PaneStatus(CardId),
+}
+
+impl Detail {
+    fn shortcut(chords: &[String]) -> Self {
+        Self::Shortcut {
+            chords: chords.to_vec(),
+            text: cagents::settings::format_chords(chords),
+        }
+    }
+}
+
+impl From<String> for Detail {
+    fn from(text: String) -> Self {
+        Self::Text(text)
+    }
+}
+
+impl From<&str> for Detail {
+    fn from(text: &str) -> Self {
+        Self::Text(text.to_owned())
+    }
 }
 #[derive(Debug, Clone)]
 pub enum Action {
@@ -841,7 +868,7 @@ impl Cagents {
 
     fn palette_entry(
         &self,
-        (label, detail, message): (String, String, Message),
+        (label, detail, message): (String, Detail, Message),
         moving: bool,
         live_status: bool,
     ) -> Entry {
@@ -866,7 +893,7 @@ impl Cagents {
                 Message::Palette(Action::FocusPane(card)) if live_status => {
                     Detail::PaneStatus(card)
                 }
-                _ => Detail::Text(detail),
+                _ => detail,
             },
             identity: EntryIdentity::capture(&message),
             category: entry_category(&message),
@@ -899,7 +926,7 @@ impl Cagents {
 
     fn palette_detail<'a>(&self, detail: &'a Detail) -> &'a str {
         match detail {
-            Detail::Text(text) => text,
+            Detail::Text(text) | Detail::Shortcut { text, .. } => text,
             Detail::PaneStatus(card) => self.palette_pane_status(*card),
         }
     }
@@ -916,7 +943,7 @@ impl Cagents {
             })
     }
 
-    fn palette_pane_entries(&self) -> Vec<(String, String, Message)> {
+    fn palette_pane_entries(&self) -> Vec<(String, Detail, Message)> {
         // All lookups live for this immutable entry build. Preserve each
         // resolver's first match without scanning memberships for every pane.
         let mut cards = HashMap::new();
@@ -1075,7 +1102,7 @@ impl Cagents {
     }
 
     /// Everything the palette can offer, unranked.
-    fn palette_candidates(&self) -> Vec<(String, String, Message)> {
+    fn palette_candidates(&self) -> Vec<(String, Detail, Message)> {
         // The projection oracle's own full projection builds them too.
         #[cfg(test)]
         if !super::projection_oracle::verifying() {
@@ -1091,10 +1118,10 @@ impl Cagents {
             .map(|descriptor| {
                 (
                     descriptor.label.to_owned(),
-                    workspace_widget::shortcut_chords(
+                    Detail::shortcut(workspace_widget::shortcut_keys(
                         descriptor.action,
                         &self.settings.keyboard_shortcuts,
-                    ),
+                    )),
                     Message::RunCommand(descriptor.action),
                 )
             })
@@ -1108,7 +1135,7 @@ impl Cagents {
             ] {
                 entries.push((
                     label.into(),
-                    chord.into(),
+                    Detail::shortcut(&[chord.to_owned()]),
                     Message::Repository(RepositoryAction::Language {
                         card,
                         action: repository_widget::EditorLspAction::Diagnostic(forward),
@@ -1136,7 +1163,7 @@ impl Cagents {
             if project.kind == ProjectKind::Folder {
                 entries.push((
                     format!("Open workspace: {}", project.name),
-                    String::new(),
+                    String::new().into(),
                     Message::Sidebar(SidebarAction::OpenRepository {
                         project_id: project.id,
                         repository: project.repository.clone(),
@@ -1146,7 +1173,7 @@ impl Cagents {
             for channel in &project.channels {
                 entries.push((
                     format!("Open channel: {} · {}", channel.title, project.name),
-                    String::new(),
+                    String::new().into(),
                     Message::Sidebar(SidebarAction::OpenChannel {
                         channel_id: channel.id,
                     }),
@@ -1155,7 +1182,7 @@ impl Cagents {
             for worktree in &project.worktrees {
                 entries.push((
                     format!("Open workspace: {} · {}", worktree.label(), project.name),
-                    String::new(),
+                    String::new().into(),
                     Message::Sidebar(SidebarAction::OpenWorktree {
                         project_id: project.id,
                         worktree_id: worktree.id,
@@ -1167,7 +1194,7 @@ impl Cagents {
         entries
     }
 
-    fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, String, Message)> {
+    fn pane_move_palette_entries(&self, card: CardId) -> Vec<(String, Detail, Message)> {
         self.pane_move_destinations(card)
             .into_iter()
             .map(|channel| {
@@ -1176,7 +1203,7 @@ impl Cagents {
                         "Move pane to channel: {}",
                         self.pane_move_destination_label(channel)
                     ),
-                    String::new(),
+                    String::new().into(),
                     Message::MovePaneToChannel {
                         card,
                         channel: channel.id,
@@ -1188,7 +1215,7 @@ impl Cagents {
 
     fn filter_palette_entries(
         &self,
-        entries: Vec<(String, String, Message)>,
+        entries: Vec<(String, Detail, Message)>,
     ) -> Vec<(String, String, Message)> {
         let moving = self.palette.move_pane.is_some();
         let entries: Vec<_> = entries
@@ -1209,8 +1236,15 @@ impl Cagents {
 
     pub(super) fn palette_surface(&self) -> Option<Element<'_, Message>> {
         if self.palette.recording.is_some() || self.palette.filtering_key {
-            let mut children: Vec<Element<'_, Message>> =
-                vec![design::body("Press a shortcut · Escape cancels").into()];
+            let mut children: Vec<Element<'_, Message>> = vec![
+                widget::row::with_children(vec![
+                    design::body("Press a shortcut").width(Length::Fill).into(),
+                    crate::interaction::key_hints([(&["Escape"][..], "cancel")]),
+                ])
+                .spacing(space::M)
+                .align_y(Alignment::Center)
+                .into(),
+            ];
             if let Some(reason) = &self.palette.recording_error {
                 children.push(
                     design::body(reason)
@@ -1258,11 +1292,19 @@ impl Cagents {
             .filter_map(|(index, entry)| {
                 let identity = entry.identity.clone()?;
                 let label = entry.label.as_str();
-                let row = widget::row::with_children(vec![
-                    highlighted_label(label, needle, moving),
-                    design::caption(self.palette_detail(&entry.detail))
+                let detail: Element<'_, Message> = match &entry.detail {
+                    Detail::Shortcut { chords, .. } => crate::interaction::chords_caps(
+                        chords
+                            .iter()
+                            .map(|chord| crate::interaction::KeyChord::new(chord.as_str())),
+                    ),
+                    detail => design::caption(self.palette_detail(detail))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
+                };
+                let row = widget::row::with_children(vec![
+                    highlighted_label(label, needle, moving),
+                    detail,
                 ])
                 .spacing(space::M)
                 .align_y(Alignment::Center);
@@ -1310,7 +1352,11 @@ impl Cagents {
                     ))
                     .max_height(360)
                     .into(),
-                    design::caption("↑ ↓ choose · Enter run · Escape close").into(),
+                    crate::interaction::key_hints([
+                        (&["Up", "Down"][..], "choose"),
+                        (&["Enter"][..], "run"),
+                        (&["Escape"][..], "close"),
+                    ]),
                 ])
                 .spacing(space::S),
             )
@@ -2118,7 +2164,7 @@ mod tests {
         let entry = |label: &str| {
             (
                 label.into(),
-                String::new(),
+                String::new().into(),
                 Message::RunCommand(Command::OpenSettings),
             )
         };
@@ -2168,7 +2214,7 @@ mod tests {
         let other = CardId::new();
         let channel = crate::model::ChannelId::new();
         let other_channel = crate::model::ChannelId::new();
-        let entry = |label: &str, message| (label.to_owned(), String::new(), message);
+        let entry = |label: &str, message| (label.to_owned(), String::new().into(), message);
         let entries = vec![
             entry("Settings", Message::RunCommand(Command::OpenSettings)),
             entry("Settings", Message::RunCommand(Command::ToggleInspector)),
@@ -2247,7 +2293,14 @@ mod tests {
                 });
                 assert_eq!(
                     identities(app.filter_palette_entries(entries.clone())),
-                    identities(expected),
+                    identities(
+                        expected
+                            .into_iter()
+                            .map(|(label, hint, message)| {
+                                (label, app.palette_detail(&hint).to_owned(), message)
+                            })
+                            .collect()
+                    ),
                     "query {raw_query:?}, moving {moving}"
                 );
             }
@@ -2536,7 +2589,7 @@ mod tests {
         let entry = |label: &str, channel| {
             (
                 format!("Move pane to channel: {label}"),
-                String::new(),
+                String::new().into(),
                 Message::MovePaneToChannel { card, channel },
             )
         };

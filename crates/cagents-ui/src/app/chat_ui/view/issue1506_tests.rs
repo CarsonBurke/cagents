@@ -1439,7 +1439,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
         cache = next_cache;
         if let Some(picker) = &live.child_picker {
             assert_eq!(live.focus_control(), "chat-subagent-search");
-            assert!(current.iter().any(|label| label == "Close subagents (Esc)"));
+            assert!(current.iter().any(|label| label == "Close subagents"));
             assert!(
                 !current.iter().any(|label| label == &diagnostic_copy),
                 "covered transcript actions must be absent from AX"
@@ -1473,7 +1473,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     app.chat_runtime_mut(target).unwrap().refresh();
     let (empty, _) = labels(&app, target, cache);
     assert!(
-        empty.iter().any(|label| label == "Close subagents (Esc)"),
+        empty.iter().any(|label| label == "Close subagents"),
         "{empty:?}"
     );
     assert!(

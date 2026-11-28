@@ -1544,7 +1544,7 @@ impl Gallery {
             toolbar.extend([
                 icon(
                     Icon::ChevronLeft,
-                    "Previous image (Left)",
+                    crate::interaction::RichTip::new("Previous image").shortcut("Left"),
                     true,
                     Action::ImageNext(host, false),
                 ),
@@ -1553,7 +1553,7 @@ impl Gallery {
                     .into(),
                 icon(
                     Icon::ChevronRight,
-                    "Next image (Right)",
+                    crate::interaction::RichTip::new("Next image").shortcut("Right"),
                     true,
                     Action::ImageNext(host, true),
                 ),
@@ -1565,11 +1565,7 @@ impl Gallery {
                 Icon::Copy,
                 "Copy",
                 crate::interaction::RichTip::new("Copy image")
-                    .shortcut(if cfg!(target_os = "macos") {
-                        "Cmd+C"
-                    } else {
-                        "Ctrl+C"
-                    })
+                    .shortcut(copy_chord())
                     .into(),
                 image.map(|image| Action::Image(image, ImageCommand::Copy)),
             ),
@@ -1629,23 +1625,29 @@ impl Gallery {
             }
             _ => design::caption(entry.label.as_str()).into(),
         };
-        [
-            toolbar.into(),
-            label,
-            canvas,
-            design::caption(match (self.entries.len() > 1, cfg!(target_os = "macos")) {
-                (true, true) => {
-                    "Scroll to zoom · Drag to pan · Left / Right to browse · Cmd+C to copy"
-                }
-                (true, false) => {
-                    "Scroll to zoom · Drag to pan · Left / Right to browse · Ctrl+C to copy"
-                }
-                (false, true) => "Scroll to zoom · Drag to pan · Cmd+C to copy",
-                (false, false) => "Scroll to zoom · Drag to pan · Ctrl+C to copy",
-            })
-            .into(),
-        ]
+        [toolbar.into(), label, canvas, {
+            let copy = copy_chord();
+            let copy = [copy.as_str()];
+            let browse = ["Left", "Right"];
+            let mut hints: Vec<(&[&str], &str)> = Vec::with_capacity(2);
+            if self.entries.len() > 1 {
+                hints.push((&browse, "browse"));
+            }
+            hints.push((&copy, "copy"));
+            widget::row::with_children(vec![
+                design::caption("Scroll to zoom · Drag to pan").into(),
+                crate::interaction::key_hints(hints),
+            ])
+            .spacing(space::M)
+            .align_y(iced::Alignment::Center)
+            .into()
+        }]
     }
+}
+
+/// The chord that copies the image: the platform's command key with C.
+fn copy_chord() -> String {
+    format!("{}+C", crate::settings::ModifierNames::CURRENT.primary)
 }
 
 /// Below this width of its row the viewer's toolbar names its commands by

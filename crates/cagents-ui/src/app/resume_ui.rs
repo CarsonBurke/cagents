@@ -2863,7 +2863,12 @@ impl Cagents {
         } else if state.loading {
             design::caption("Opening the conversation…").into()
         } else {
-            design::caption("↑↓ choose · Enter resume · Tab where to look · Esc close").into()
+            crate::interaction::key_hints([
+                (&["Up", "Down"][..], "choose"),
+                (&["Enter"][..], "resume"),
+                (&["Tab"][..], "where to look"),
+                (&["Escape"][..], "close"),
+            ])
         };
         content
             .push(

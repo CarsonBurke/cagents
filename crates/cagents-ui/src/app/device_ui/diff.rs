@@ -764,16 +764,17 @@ impl Cagents {
             } else {
                 "Stage"
             };
-            let binding = if cfg!(target_os = "macos") {
-                "Cmd+Shift+S"
-            } else {
-                "Ctrl+Shift+S"
-            };
-            let hint = format!("{label} ({binding})");
+            let chord = crate::interaction::KeyChord::new(format!(
+                "{}+Shift+S",
+                cagents::settings::ModifierNames::CURRENT.primary
+            ));
             let button = crate::ui_controls::button::primary(label)
-                .name(hint.clone())
+                .description(format!("Shortcut: {chord}"))
                 .on_press_maybe(can_stage.then(|| action(Action::Stage)));
-            actions.push(crate::interaction::tooltip(button, hint));
+            actions.push(crate::interaction::tooltip(
+                button,
+                crate::interaction::RichTip::new(label).shortcut(chord),
+            ));
         }
         // A stage can finish after the dialog advances. Keep its result
         // above the patch so it remains visible while reading the next file.

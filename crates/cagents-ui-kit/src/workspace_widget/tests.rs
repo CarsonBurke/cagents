@@ -3559,7 +3559,10 @@ fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
     // list every one.
     let tip = shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts);
     assert_eq!(tip.title(), "Search projects");
-    assert_eq!(tip.shortcut_chord(), Some("Alt+S"));
+    assert_eq!(
+        tip.shortcut_chord(),
+        Some(&crate::interaction::KeyChord::new("Alt+S"))
+    );
     shortcuts.close_focused_column.clear();
     let tip = shortcut_tooltip_named(
         GlobalShortcut::CloseFocusedCard,

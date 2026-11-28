@@ -140,14 +140,52 @@ fn physical_key_to_latin(physical_key: &Physical) -> Option<Key> {
     Some(Key::Character(ch.into()))
 }
 
+/// The hint a menu prints beside an item: `Ctrl+Shift+T`, with modifiers in
+/// a fixed order, and on macOS the symbols its menus use in Apple's order,
+/// `⇧⌘T`. This is the text form of the key caps the application draws for a
+/// chord, so a menu's hint reads as the same shortcut its tooltips show.
 impl fmt::Display for KeyBind {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        for modifier in self.modifiers.iter() {
-            write!(f, "{:?} + ", modifier)?;
+        let held = |modifier| self.modifiers.contains(&modifier);
+        let mac = cfg!(target_os = "macos");
+        let modifiers: &[(Modifier, &str)] = if mac {
+            &[
+                (Modifier::Ctrl, "⌃"),
+                (Modifier::Alt, "⌥"),
+                (Modifier::Shift, "⇧"),
+                (Modifier::Super, "⌘"),
+            ]
+        } else {
+            &[
+                (Modifier::Ctrl, "Ctrl"),
+                (Modifier::Alt, "Alt"),
+                (Modifier::Super, "Super"),
+                (Modifier::Shift, "Shift"),
+            ]
+        };
+        let separator = if mac { "" } else { "+" };
+        for (modifier, name) in modifiers {
+            if held(*modifier) {
+                write!(f, "{name}{separator}")?;
+            }
         }
+        use iced_core::keyboard::key::Named;
         match &self.key {
             Key::Character(c) if c.as_str() == " " => write!(f, "Space"),
             Key::Character(c) => write!(f, "{}", c.to_uppercase()),
+            Key::Named(Named::ArrowLeft) => write!(f, "←"),
+            Key::Named(Named::ArrowRight) => write!(f, "→"),
+            Key::Named(Named::ArrowUp) => write!(f, "↑"),
+            Key::Named(Named::ArrowDown) => write!(f, "↓"),
+            Key::Named(Named::Tab) if mac => write!(f, "⇥"),
+            Key::Named(Named::PageUp) if mac => write!(f, "⇞"),
+            Key::Named(Named::PageUp) => write!(f, "Page Up"),
+            Key::Named(Named::PageDown) if mac => write!(f, "⇟"),
+            Key::Named(Named::PageDown) => write!(f, "Page Down"),
+            Key::Named(Named::Enter) if mac => write!(f, "↩"),
+            Key::Named(Named::Escape) => write!(f, "Esc"),
+            Key::Named(Named::Backspace) if mac => write!(f, "⌫"),
+            Key::Named(Named::Delete) if mac => write!(f, "⌦"),
             Key::Named(named) => write!(f, "{:?}", named),
             other => write!(f, "{:?}", other),
         }

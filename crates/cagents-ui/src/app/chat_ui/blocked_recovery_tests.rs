@@ -1837,9 +1837,15 @@ fn blocked_send_says_why_it_cannot_send() {
             .collect::<Vec<_>>();
         assert_eq!(send.len(), 1, "{reopen:?}");
         assert!(send[0].node().is_disabled());
-        assert_eq!(
-            send[0].node().label(),
-            Some(format!("Send message — {}", expected.reason).as_str())
+        assert_eq!(send[0].node().label(), Some("Send message"));
+        // The reason it can't send is read with it, and no chord is offered.
+        assert!(
+            send[0]
+                .node()
+                .description()
+                .is_some_and(|description| description.to_lowercase().contains(expected.reason)),
+            "{:?}",
+            send[0].node().description()
         );
     }
 }

@@ -10893,7 +10893,12 @@ pub fn selected_file_toolbar_mapped_with<'a, M: 'a>(
         document_actions.push(
             icon_button(
                 Icon::RevertFile,
-                "Discard unsaved edits (Ctrl+Z restores them)",
+                crate::interaction::RichTip::new("Discard unsaved edits").row(
+                    crate::interaction::TipRow::shortcut(
+                        "Undo restores them",
+                        format!("{}+Z", cagents::settings::ModifierNames::CURRENT.primary),
+                    ),
+                ),
             )
             .on_press_maybe(
                 runtime

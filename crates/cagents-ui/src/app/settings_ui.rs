@@ -1737,8 +1737,21 @@ fn keyboard_groups<'a>(
                 design::body(fixed.label)
                     .width(Length::FillPortion(3))
                     .into(),
-                design::caption(keys.clone())
-                    .width(Length::FillPortion(4))
+                // The keys end where a bound row's do, before the Record
+                // and Reset buttons a fixed chord has no use for, so the
+                // Keys column keeps one edge.
+                widget::container(crate::interaction::chords_caps(
+                    fixed
+                        .chords
+                        .iter()
+                        .map(|chord| crate::interaction::KeyChord::new(*chord)),
+                ))
+                .padding([0.0, space::S])
+                .align_x(Alignment::End)
+                .width(Length::FillPortion(4))
+                .into(),
+                iced::widget::Space::new()
+                    .width(2.0 * design::COMPACT_CONTROL_SIZE + 2.0)
                     .into(),
                 design::caption("Fixed").width(64).into(),
             ])
@@ -1786,13 +1799,27 @@ fn shortcut_input<'a>(
         .map(|(index, chord)| {
             let mut remaining = chords.clone();
             remaining.remove(index);
-            crate::ui_controls::button::quiet(format!("{chord} ×"))
-                .name(format!("Remove {chord} shortcut for {label}"))
-                .on_press(Message::SettingsDraftChanged {
-                    field,
-                    value: settings::format_chords(&remaining),
-                })
-                .into()
+            let keys = crate::interaction::KeyChord::new(chord.as_str());
+            widget::button::custom(
+                widget::container(
+                    widget::row::with_children(vec![
+                        crate::interaction::key_caps(&keys),
+                        design::body("×").into(),
+                    ])
+                    .spacing(space::XS)
+                    .align_y(Alignment::Center),
+                )
+                .center_y(Length::Fill),
+            )
+            .name(format!("Remove {keys} shortcut for {label}"))
+            .class(crate::ui_controls::button::quiet_class())
+            .padding([0.0, space::S])
+            .height(design::DENSE_ROW_HEIGHT)
+            .on_press(Message::SettingsDraftChanged {
+                field,
+                value: settings::format_chords(&remaining),
+            })
+            .into()
         })
         .collect();
     // Record, Reset and Source end the row as one unit: they never part
