@@ -9,6 +9,7 @@ returns, before any native-evidence command or scene action can run.
 
 from __future__ import annotations
 
+from contextlib import chdir
 from dataclasses import dataclass
 import hashlib
 import json
@@ -22,6 +23,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests/fixtures"
@@ -152,6 +154,36 @@ def fixture_scripts(root):
     return found
 
 
+def node_executable():
+    directories = [Path(os.path.realpath(entry)) for entry in os.get_exec_path()]
+    node = shutil.which("node", path=os.pathsep.join(map(str, directories)))
+    if node is None:
+        return None
+
+    data_dir = os.environ.get("MISE_DATA_DIR")
+    configured_shims = Path(os.path.realpath(Path(data_dir) / "shims")) if data_dir else None
+
+    def mise_shims(directory):
+        return directory == configured_shims or directory.parts[-2:] == ("mise", "shims")
+
+    if not mise_shims(Path(node).parent):
+        return node
+
+    # The fixture replaces HOME, so resolve the caller's selected tool before
+    # starting it. A stale shim does not mean Node is available.
+    if mise := shutil.which("mise"):
+        result = subprocess.run([mise, "which", "node"], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, check=False)
+        if result.returncode == 0:
+            resolved = Path(result.stdout.rstrip("\n"))
+            directory = Path(os.path.realpath(resolved.parent))
+            if resolved.is_absolute() and not mise_shims(directory) and shutil.which(resolved):
+                return str(resolved)
+
+    path = os.pathsep.join(str(directory) for directory in directories if not mise_shims(directory))
+    return shutil.which("node", path=path) if path else None
+
+
 class Home(unittest.TestCase):
     def setUp(self):
         self.scratch = tempfile.TemporaryDirectory(prefix="fixture-home-contract-", dir="/var/tmp")
@@ -201,6 +233,12 @@ class Home(unittest.TestCase):
         return subprocess.run(command, input="", text=True, capture_output=True,
                               env=self.env if env is None else env,
                               cwd=self.home if cwd is None else cwd, timeout=15)
+
+    def node(self):
+        node = node_executable()
+        if node is None:
+            self.skipTest("Node.js is unavailable")
+        return node
 
     def assert_refusal(self, result, variable, path):
         self.assertNotEqual(result.returncode, 0, result.stdout)
@@ -523,6 +561,62 @@ class Inventory(unittest.TestCase):
         self.assertIn("FIXTURE_ROOT_MARKER", (ROOT / "scripts/fixture_workspace/generate.py").read_text())
 
 
+class NodeLookupContracts(Home):
+    def tool(self, directory, name, body):
+        directory.mkdir(parents=True, exist_ok=True)
+        executable = directory / name
+        executable.write_text("#!/bin/sh\n" + body)
+        executable.chmod(0o700)
+        return executable
+
+    def test_mise_selects_node_before_the_fixture_replaces_home(self):
+        shim = self.tool(self.base / "mise/shims", "node", "exit 99\n")
+        tools = self.base / "tools"
+        self.tool(tools, "mise",
+                  '[ "$*" = "which node" ] && [ "$HOME" = "$NODE_CALLER_HOME" ] || exit 1\n'
+                  'printf "%s\\n" "$NODE_CALLER_EXECUTABLE"\n')
+        selected = self.tool(self.base / "selected", "node", 'printf "%s\\n" "$HOME"\n')
+        path = os.pathsep.join(map(str, (shim.parent, tools)))
+        self.env["PATH"] = path
+        with mock.patch.dict(os.environ, PATH=path, HOME=str(self.account),
+                             NODE_CALLER_HOME=str(self.account), NODE_CALLER_EXECUTABLE=str(selected)):
+            node = self.node()
+            self.assertEqual(node, str(selected))
+            result = self.run_command([node])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), self.env["HOME"])
+
+    def test_a_stale_shim_falls_back_to_regular_node_or_skips(self):
+        shim = self.tool(self.base / "mise/shims", "node", "exit 99\n")
+        tools = self.base / "tools"
+        self.tool(tools, "mise", "exit 1\n")
+        system = self.tool(self.base / "bin", "node", "exit 0\n")
+        with mock.patch.dict(os.environ, PATH=os.pathsep.join(map(str, (shim.parent, tools, system.parent)))):
+            self.assertEqual(self.node(), str(system))
+            system.unlink()
+            with self.assertRaisesRegex(unittest.SkipTest, "Node.js is unavailable"):
+                self.node()
+
+    def test_a_relative_node_path_is_resolved_before_entering_the_fixture(self):
+        system = self.tool(self.base / "bin", "node", "exit 0\n")
+        with mock.patch.dict(os.environ, PATH=os.path.relpath(system.parent)):
+            node = self.node()
+        self.assertEqual(node, str(system))
+        result = self.run_command([node])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_mise_shims_are_recognized_from_relative_and_custom_paths(self):
+        system = self.tool(self.base / "bin", "node", "exit 0\n")
+        for name, custom in (("mise", False), ("custom-data", True)):
+            with self.subTest(data_dir=name):
+                data_dir = self.base / name
+                self.tool(data_dir / "shims", "node", "exit 99\n")
+                path = os.pathsep.join(("shims", str(system.parent)))
+                with chdir(data_dir), mock.patch.dict(os.environ, PATH=path,
+                                                      MISE_DATA_DIR=str(data_dir) if custom else ""):
+                    self.assertEqual(self.node(), str(system))
+
+
 class SharedHelperContracts(Home):
     def command(self, language, variable="CLAUDE_CONFIG_DIR", explicit=None):
         if language == "sh":
@@ -535,13 +629,10 @@ class SharedHelperContracts(Home):
                       "print(require_fixture_home(sys.argv[2],*sys.argv[3:]))")
             return [sys.executable, "-I", "-B", "-c", script, str(PYTHON_HELPER.parent), variable,
                     *([] if explicit is None else [str(explicit)])]
-        node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is unavailable; JavaScript helper needs Node.js")
         script = ("const helper=require(process.argv[1]);"
                   "const requireHome=helper.requireFixtureHome || helper.require_fixture_home;"
                   "console.log(requireHome(process.argv[2], process.argv[3]));")
-        return [node, "-e", script, str(JS_HELPER), variable,
+        return [self.node(), "-e", script, str(JS_HELPER), variable,
                 *([] if explicit is None else [str(explicit)])]
 
     def helper(self, language, scenario):
@@ -698,12 +789,9 @@ class NewWriterContracts(Home):
         self.assertEqual(snapshot(self.base), before)
 
     def test_terminal_claude_checks_its_effective_home_before_starting(self):
-        node = shutil.which("node")
-        if node is None:
-            self.skipTest("node is unavailable")
         self.marked()
         self.env["CLAUDE_CONFIG_DIR"] = str(self.account)
-        command = [node, str(FIXTURES / "claude-terminal.js")]
+        command = [self.node(), str(FIXTURES / "claude-terminal.js")]
         self.assert_untouched(command, "CLAUDE_CONFIG_DIR", self.account)
         self.env["CLAUDE_CONFIG_DIR"] = str(self.home / "home/.claude")
         result = self.run_command(command)
