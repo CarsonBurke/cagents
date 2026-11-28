@@ -23,7 +23,7 @@ pub(in crate::host) fn inspect(
             .unwrap_or_else(|p| p.into_inner())
             .chats
             .values()
-            .filter(|record| record.session.owns_codex_listener() && record.handle.worker_stopped())
+            .filter(|record| record.handle.native_exit_pending())
             .map(|record| record.handle.clone())
             .collect::<Vec<_>>();
         // Exit proofs and the resulting notification must run without HostState.

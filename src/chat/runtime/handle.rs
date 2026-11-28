@@ -802,9 +802,14 @@ impl Handle {
         }
     }
     #[cfg(target_os = "linux")]
-    pub fn settle_lost_native_owner(&self) {
-        if let Owner::Local(local) = &self.0 {
-            local.settle_lost_native_owner();
+    pub fn native_exit_pending(&self) -> bool {
+        matches!(&self.0, Owner::Local(local) if local.native_exit_pending())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn settle_lost_native_owner(&self) -> super::NativeExit {
+        match &self.0 {
+            Owner::Local(local) => local.settle_lost_native_owner(),
+            Owner::Remote(_) => super::NativeExit::Unobservable,
         }
     }
     /// Provider-owned input observed at verified exit. The live snapshot

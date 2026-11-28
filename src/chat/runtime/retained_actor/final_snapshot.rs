@@ -461,7 +461,7 @@ fn inspect_retirement_with_proof(
         );
     }
     let _exit = match execution_exit::observe(&record.holder)? {
-        execution_exit::Observation::Running => return Ok(RetirementInspection::Running),
+        execution_exit::Observation::Running { .. } => return Ok(RetirementInspection::Running),
         execution_exit::Observation::Exited(exit) => exit,
     };
     if !execution_exit::identity_absent(&record.root)? {
@@ -1386,7 +1386,7 @@ os.waitpid(pid,0)
         let deadline = Instant::now() + Duration::from_secs(5);
         while matches!(
             execution_exit::observe(&helper).unwrap(),
-            execution_exit::Observation::Running
+            execution_exit::Observation::Running { .. }
         ) {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
