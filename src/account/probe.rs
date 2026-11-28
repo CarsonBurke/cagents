@@ -1444,6 +1444,7 @@ pub async fn refresh_claude_catalog(
     program: &Path,
     search_path: Option<&OsStr>,
     cache: &Cache,
+    version: &str,
 ) -> Result<(), String> {
     let result = tokio::time::timeout(TIMEOUT, async {
         let _lock = loop {
@@ -1461,7 +1462,7 @@ pub async fn refresh_claude_catalog(
         let (_, catalog) = after_close(catalog, session.close()).await?;
         let catalog = catalog.ok_or("Claude Code did not list available models")?;
         cache
-            .store_catalog(Provider::Claude, catalog)
+            .store_managed_claude_catalog(catalog, version)
             .map_err(|error| error.to_string())
     })
     .await;

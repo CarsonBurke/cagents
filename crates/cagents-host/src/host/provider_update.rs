@@ -26,7 +26,7 @@ use crate::{
 };
 
 use super::state::{HostLock, SharedHost};
-use install::Install;
+use install::{Install, Materialized};
 use policy::Policy;
 use release::{Source, parse_version};
 
@@ -200,10 +200,6 @@ async fn update(
     if reported != version.to_string() {
         return Err(format!("Claude Code {version} reported version {reported}"));
     }
-    let binary = install
-        .materialize(stage.path(), &staged, &version)
-        .map_err(detail)?;
-
     // Policy and launch selection may change while downloading. The only
     // operation under the daemon's admission fence is publishing the link.
     let refreshed = probe::refresh_search_path().await;
@@ -220,9 +216,12 @@ async fn update(
             Some("The daemon's Claude Code launcher changed during the check".into()),
         ));
     }
-    activate(host, install, stage.path(), &binary, operation)?;
+    let mut binary = install
+        .materialize(stage.path(), &staged, &version)
+        .map_err(detail)?;
+    activate(host, install, stage.path(), &mut binary, operation)?;
 
-    *status = install.status(binary);
+    *status = install.status(binary.path.clone());
     let detail = ensure_catalog(host, install, path, &reported).await;
     status.version = Some(reported);
     Ok((Updated, detail))
@@ -246,7 +245,7 @@ fn activate(
     host: &SharedHost,
     install: &Install,
     stage: &Path,
-    binary: &Path,
+    binary: &mut Materialized,
     operation: Operation,
 ) -> Result<(), String> {
     let gate = Arc::clone(&host.lock().unwrap_or_else(|p| p.into_inner()).control_gate);
@@ -268,6 +267,8 @@ async fn refresh_catalog(
     host: &SharedHost,
     program: &Path,
     path: Option<&OsStr>,
+    cache: &Cache,
+    version: &str,
 ) -> Result<(), String> {
     let account = Store::installation()
         .ok_or("Accounts are unavailable")?
@@ -276,8 +277,7 @@ async fn refresh_catalog(
         .default_account(Provider::Claude, Homes::installation().as_ref());
     super::account_lifecycle::ensure_paths(host, account.resolved_home())
         .map_err(|error| error.message)?;
-    let cache = Cache::installation().ok_or("The model catalog cache is unavailable")?;
-    probe::refresh_claude_catalog(&account, program, path, &cache).await
+    probe::refresh_claude_catalog(&account, program, path, cache, version).await
 }
 
 async fn ensure_catalog(
@@ -293,12 +293,12 @@ async fn ensure_catalog(
             launcher.parent().unwrap().display()
         ));
     }
-    if install.catalog_is_current(version) {
-        return None;
-    }
     let result = async {
-        refresh_catalog(host, &launcher, path).await?;
-        install.record_catalog_version(version).map_err(detail)
+        let cache = Cache::installation().ok_or("The model catalog cache is unavailable")?;
+        if cache.managed_claude_catalog_is_current(version) {
+            return Ok(());
+        }
+        refresh_catalog(host, &launcher, path, &cache, version).await
     }
     .await;
     result

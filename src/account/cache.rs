@@ -228,6 +228,10 @@ struct Document {
     /// build that predates it reads the rest, and drops it when it writes.
     #[serde(default, deserialize_with = "readable_catalogs")]
     catalogs: BTreeMap<Provider, CatalogObservation>,
+    /// The installed version that produced the cached Claude model list.
+    /// Replacing that list through another writer invalidates this receipt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_claude_catalog_version: Option<String>,
     /// Added after the first version, like `catalogs`: each account's
     /// settled disagreement between two records of its login, by account
     /// key. A build that predates it drops it when it writes, which only
@@ -306,7 +310,11 @@ impl Document {
         catalog: CatalogObservation,
         now: u64,
     ) -> bool {
-        CatalogObservation::record(&mut self.catalogs, provider, catalog, now)
+        let changed = CatalogObservation::record(&mut self.catalogs, provider, catalog, now);
+        if changed && provider == Provider::Claude {
+            self.managed_claude_catalog_version = None;
+        }
+        changed
     }
 }
 
@@ -597,6 +605,48 @@ impl Cache {
         catalog: impl Into<CatalogObservation>,
     ) -> io::Result<()> {
         self.publish(|document, now| document.record_catalog(provider, catalog.into(), now))
+    }
+
+    /// Whether the current cache contains a readable list from this installed
+    /// Claude Code version.
+    #[cfg(feature = "host")]
+    pub fn managed_claude_catalog_is_current(&self, version: &str) -> bool {
+        let Some(now) = crate::chat::now_ms() else {
+            return false;
+        };
+        read_document(&self.path()).is_some_and(|document| {
+            document.managed_claude_catalog_version.as_deref() == Some(version)
+                && document
+                    .catalogs
+                    .get(&Provider::Claude)
+                    .is_some_and(|catalog| {
+                        !catalog.models.is_empty()
+                            && catalog.observed_at <= now.saturating_add(CLOCK_SLACK)
+                    })
+        })
+    }
+
+    /// Publish the list and its installed version in the same cache write.
+    #[cfg(feature = "host")]
+    pub(crate) fn store_managed_claude_catalog(
+        &self,
+        catalog: CatalogObservation,
+        version: &str,
+    ) -> io::Result<()> {
+        let mut stored = false;
+        self.publish(|document, now| {
+            stored = document.record_catalog(Provider::Claude, catalog, now);
+            if stored {
+                document.managed_claude_catalog_version = Some(version.into());
+            }
+            stored
+        })?;
+        if !stored {
+            return Err(io::Error::other(
+                "A newer Claude Code model list was saved during the refresh",
+            ));
+        }
+        Ok(())
     }
 
     fn publish(&self, record: impl FnOnce(&mut Document, u64) -> bool) -> io::Result<()> {

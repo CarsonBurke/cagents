@@ -292,9 +292,12 @@ impl Fixture {
         command
     }
 
+    fn cache(&self) -> Cache {
+        Cache::at(self.path("cache").join(STORAGE_NAME))
+    }
+
     fn catalog_id(&self) -> String {
-        let cache = Cache::at(self.path("cache").join(STORAGE_NAME));
-        cache.catalogs(cagents::chat::now_ms().unwrap())[&Provider::Claude].models[0]
+        self.cache().catalogs(cagents::chat::now_ms().unwrap())[&Provider::Claude].models[0]
             .id
             .clone()
     }
@@ -375,11 +378,23 @@ fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
             Some(Deferred)
         );
         assert_eq!(fixture.status(), managed);
+        let settings = fixture.path("home/.claude/settings.json");
+        fs::create_dir_all(settings.parent().unwrap()).unwrap();
+        fs::write(&settings, r#"{"requiredMaximumVersion":"1.0.0"}"#).unwrap();
         fs::write(fixture.path("releases/proceed"), "").unwrap();
-        let updated = update.join().unwrap();
-        assert_eq!(updated.last_result, Some(Updated), "{updated:?}");
-        assert_eq!(updated.version.as_deref(), Some("2.0.0"));
+        let deferred = update.join().unwrap();
+        assert_eq!(deferred.last_result, Some(Deferred), "{deferred:?}");
+        assert_eq!(deferred.version.as_deref(), Some("1.0.0"));
+        assert!(
+            deferred.error.unwrap().contains("settings changed"),
+            "expected the eligibility decision to defer publication"
+        );
+        assert!(!fixture.install().join("versions/2.0.0").exists());
+        fs::remove_file(settings).unwrap();
     });
+    let updated = fixture.maintain(Operation::Update);
+    assert_eq!(updated.last_result, Some(Updated), "{updated:?}");
+    assert_eq!(updated.version.as_deref(), Some("2.0.0"));
 
     running
         .0
@@ -436,6 +451,15 @@ fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
     assert_eq!(repaired.error, None);
     assert_eq!(fixture.catalog_id(), "fixture-4.0.0");
 
+    // The install and its last successful check stay while the cache is
+    // evicted. Checking the same release must rebuild the missing catalog.
+    fs::remove_file(fixture.cache().path()).unwrap();
+    assert_eq!(fixture.status(), repaired);
+    let rediscovered = fixture.maintain(Operation::Update);
+    assert_eq!(rediscovered.last_result, Some(Current), "{rediscovered:?}");
+    assert_eq!(rediscovered.error, None);
+    assert_eq!(fixture.catalog_id(), "fixture-4.0.0");
+
     drop(daemon);
     fixture.expose("5.0.0", "5.0.0");
     fs::remove_file(
@@ -447,10 +471,7 @@ fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
     .unwrap();
     let _daemon = fixture.start();
     until(
-        || {
-            fs::read_to_string(fixture.install().join("catalog-version"))
-                .is_ok_and(|version| version == "5.0.0")
-        },
+        || fixture.cache().managed_claude_catalog_is_current("5.0.0"),
         "scheduled provider activation and catalog refresh",
     );
     assert_eq!(fixture.status().version.as_deref(), Some("5.0.0"));

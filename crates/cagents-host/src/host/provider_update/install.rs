@@ -25,6 +25,30 @@ pub(super) struct Install {
     pub(super) root: PathBuf,
 }
 
+/// Removes only a newly linked candidate that no launcher could resolve yet.
+pub(super) struct Materialized {
+    pub(super) path: PathBuf,
+    unpublished_inode: Option<(u64, u64)>,
+}
+
+impl Drop for Materialized {
+    fn drop(&mut self) {
+        let Some(inode) = self.unpublished_inode else {
+            return;
+        };
+        let Ok(metadata) = fs::symlink_metadata(&self.path) else {
+            return;
+        };
+        if (metadata.dev(), metadata.ino()) == inode {
+            if let Err(error) = fs::remove_file(&self.path) {
+                tracing::warn!(%error, "could not discard unpublished Claude Code");
+                return;
+            }
+            let _ = fs::remove_dir(self.path.parent().unwrap());
+        }
+    }
+}
+
 impl Install {
     pub(super) fn discover() -> Option<Self> {
         crate::instance::project_dirs().map(|dirs| Self {
@@ -107,19 +131,26 @@ impl Install {
         stage: &Path,
         verified: &Path,
         version: &Version,
-    ) -> io::Result<PathBuf> {
+    ) -> io::Result<Materialized> {
         secure_file::prepare_private_directory(&self.versions())?;
         let release = self.versions().join(version.to_string());
         secure_file::prepare_private_directory(&release)?;
-        let binary = release.join("claude");
-        File::open(verified)?.sync_all()?;
-        match fs::hard_link(verified, &binary) {
-            Ok(()) => {}
+        let mut binary = Materialized {
+            path: release.join("claude"),
+            unpublished_inode: None,
+        };
+        let file = File::open(verified)?;
+        file.sync_all()?;
+        let metadata = file.metadata()?;
+        match fs::hard_link(verified, &binary.path) {
+            Ok(()) => {
+                binary.unpublished_inode = Some((metadata.dev(), metadata.ino()));
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                owned_executable(&binary)?;
+                owned_executable(&binary.path)?;
                 // An earlier check may have stopped after staging. Reuse
                 // exactly the verified bytes, with no in-place replacement.
-                if !same_file(verified, &binary)? {
+                if !same_file(verified, &binary.path)? {
                     return Err(io::Error::other(format!(
                         "Managed Claude Code {version} already exists with different bytes"
                     )));
@@ -152,7 +183,7 @@ impl Install {
     /// Begin exposing the first installation only after the new link is valid.
     /// Later updates only rename the selector. A new invocation reads a whole
     /// version path and the binaries behind prior invocations stay on disk.
-    pub(super) fn activate(&self, stage: &Path, binary: &Path) -> io::Result<()> {
+    pub(super) fn activate(&self, stage: &Path, binary: &mut Materialized) -> io::Result<()> {
         let bin = self.root.join("bin");
         secure_file::prepare_private_directory(&bin)?;
         let launcher = self.launcher();
@@ -181,11 +212,14 @@ impl Install {
             Err(error) if error.kind() == io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
-        symlink(binary, &pending_link)?;
+        symlink(&binary.path, &pending_link)?;
         let bin = File::open(bin)?;
         File::open(&self.root)?.sync_all()?;
         File::open(stage)?.sync_all()?;
         fs::rename(pending_link, &selection)?;
+        // An existing launcher can read the new selection now, even if what
+        // follows fails and restores the previous link.
+        binary.unpublished_inode = None;
 
         let mut published_launcher = false;
         let synced = (|| {
@@ -245,23 +279,6 @@ impl Install {
             status.error = history.detail;
         }
         Ok(())
-    }
-
-    pub(super) fn catalog_is_current(&self, version: &str) -> bool {
-        let stamp = self.root.join("catalog-version");
-        let mut stored = String::new();
-        secure_file::open_existing_private_file_readonly(&stamp)
-            .and_then(|file| file.take(65).read_to_string(&mut stored))
-            .is_ok()
-            && stored == version
-    }
-
-    pub(super) fn record_catalog_version(&self, version: &str) -> io::Result<()> {
-        let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
-        file.write_all(version.as_bytes())?;
-        file.as_file().sync_all()?;
-        file.persist(self.root.join("catalog-version"))?;
-        File::open(&self.root)?.sync_all()
     }
 
     pub(super) fn save(&self, status: &ProviderStatus) -> io::Result<()> {
@@ -327,15 +344,28 @@ mod tests {
     use super::*;
     use std::process::Command;
 
-    fn materialize(install: &Install, stage: &Path, version: Version, script: &str) -> PathBuf {
-        let staged = stage.join("claude");
-        fs::write(&staged, script).unwrap();
-        fs::set_permissions(&staged, fs::Permissions::from_mode(0o500)).unwrap();
-        install.materialize(stage, &staged, &version).unwrap()
+    fn staged(stage: &Path, script: &str) -> PathBuf {
+        let binary = stage.join("claude");
+        fs::write(&binary, script).unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o500)).unwrap();
+        binary
+    }
+
+    fn materialize(
+        install: &Install,
+        stage: &Path,
+        version: &Version,
+        script: &str,
+    ) -> Materialized {
+        install
+            .materialize(stage, &staged(stage, script), version)
+            .unwrap()
     }
 
     #[test]
     fn interrupted_staging_preserves_launches_and_never_overwrites_a_version() {
+        const FIRST: &str = "#!/bin/sh\necho first\n";
+        const SECOND: &str = "#!/bin/sh\necho second\n";
         let root = crate::fixture_tempdir().unwrap();
         let install = Install {
             root: root.path().join("managed space"),
@@ -348,13 +378,9 @@ mod tests {
         let stage = install.stage().unwrap();
         let v1 = Version::new(1, 0, 0);
         let v2 = Version::new(2, 0, 0);
-        let first = materialize(
-            &install,
-            stage.path(),
-            v1.clone(),
-            "#!/bin/sh\necho first\n",
-        );
-        install.activate(stage.path(), &first).unwrap();
+        let mut first = materialize(&install, stage.path(), &v1, FIRST);
+        install.activate(stage.path(), &mut first).unwrap();
+        let first = first.path.clone();
         drop(stage);
 
         let launch = || {
@@ -364,12 +390,7 @@ mod tests {
         };
         assert_eq!(launch(), b"first\n");
         let stage = install.stage().unwrap();
-        let second = materialize(
-            &install,
-            stage.path(),
-            v2.clone(),
-            "#!/bin/sh\necho second\n",
-        );
+        staged(stage.path(), SECOND);
         let abandoned = stage.keep();
         drop(lock);
 
@@ -378,12 +399,48 @@ mod tests {
         assert!(!abandoned.exists());
         assert_eq!(install.active().unwrap(), Some(first.clone()));
         assert_eq!(launch(), b"first\n");
-        assert_eq!(
-            materialize(&install, stage.path(), v2, "#!/bin/sh\necho second\n"),
-            second
-        );
-        install.activate(stage.path(), &second).unwrap();
+
+        let mut second = materialize(&install, stage.path(), &v2, SECOND);
+        install.activate(stage.path(), &mut second).unwrap();
         assert_eq!(launch(), b"second\n");
         assert_eq!(Command::new(first).output().unwrap().stdout, b"first\n");
+        assert!(
+            install
+                .materialize(stage.path(), &staged(stage.path(), SECOND), &v1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_failed_publication_discards_only_the_new_candidate() {
+        let root = crate::fixture_tempdir().unwrap();
+        let install = Install {
+            root: root.path().join("managed"),
+        };
+        let _lock = install.lock().unwrap();
+        let stage = install.stage().unwrap();
+        let version = Version::new(1, 0, 0);
+        let contents = "#!/bin/sh\necho first\n";
+        let mut old = materialize(&install, stage.path(), &version, contents);
+        install.activate(stage.path(), &mut old).unwrap();
+        let active = old.path.clone();
+
+        // Occupying the private pending link makes activation fail before
+        // the public selector can change.
+        fs::write(stage.path().join("selection"), b"blocked").unwrap();
+        let mut candidate = materialize(&install, stage.path(), &Version::new(2, 0, 0), contents);
+        let unpublished = candidate.path.clone();
+        assert!(install.activate(stage.path(), &mut candidate).is_err());
+        drop(candidate);
+        assert!(!unpublished.exists());
+        drop(stage);
+
+        let stage = install.stage().unwrap();
+        fs::write(stage.path().join("selection"), b"blocked").unwrap();
+        let mut candidate = materialize(&install, stage.path(), &version, contents);
+        assert!(install.activate(stage.path(), &mut candidate).is_err());
+        drop(candidate);
+        assert_eq!(install.active().unwrap(), Some(active.clone()));
+        assert_eq!(Command::new(active).output().unwrap().stdout, b"first\n");
     }
 }
