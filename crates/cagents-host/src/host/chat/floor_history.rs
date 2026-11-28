@@ -603,14 +603,29 @@ mod flow_tests {
         collect();
         assert!(
             host.lock().unwrap().chats.contains_key(&id),
-            "Resolve pins its reader until Attach"
+            "A pending Resolve pins its reader"
         );
+        upgrade_resolution::expire_for_test(host, 1);
+        collect();
+        {
+            let state = host.lock().unwrap();
+            assert!(state.clients.contains_key(&1));
+            assert!(
+                !state.chats.contains_key(&id),
+                "an abandoned Resolve expires"
+            );
+        }
+        assert!(handle.is_completed());
+
+        // A delayed Attach can reopen the durable source, even if the original
+        // reader has already been released.
         request(
             1,
             ClientRequest::ChatAttach {
                 session: resolved.clone(),
             },
         );
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
         host.lock().unwrap().register_client(2);
         request(
             2,

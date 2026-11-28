@@ -669,11 +669,12 @@ fn inspected_record(
 }
 
 pub(super) fn history_resolution_pending(state: &HostState, record: &Record) -> bool {
+    let now = Instant::now();
     record.handle.is_read_only_history()
         && state
             .chat_resolutions
             .values()
-            .any(|attempt| attempt.pins_history(record.session.id, record.execution_instance))
+            .any(|attempt| attempt.pins_history(record.session.id, record.execution_instance, now))
 }
 
 fn release_kind(handle: &Handle) -> super::super::model::ResidentRelease {

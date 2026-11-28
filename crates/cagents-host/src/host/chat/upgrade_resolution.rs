@@ -36,10 +36,12 @@ pub(super) fn after_snapshot_for_test(action: impl FnOnce() + 'static) -> Snapsh
 #[cfg(test)]
 pub(super) fn expire_for_test(host: &SharedHost, client: ClientId) {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    let Some(Attempt::Ready(grant)) = state.chat_resolutions.get_mut(&client) else {
-        panic!("expiry fixture requires an actual resolved grant");
+    let expires = match state.chat_resolutions.get_mut(&client) {
+        Some(Attempt::Ready(grant)) => &mut grant.expires,
+        Some(Attempt::History { expires, .. }) => expires,
+        _ => panic!("expiry fixture requires an actual resolved grant"),
     };
-    grant.expires = Instant::now() - Duration::from_secs(1);
+    *expires = Instant::now() - Duration::from_secs(1);
 }
 
 pub(in crate::host) enum Attempt {
@@ -48,6 +50,7 @@ pub(in crate::host) enum Attempt {
         attempt: uuid::Uuid,
         chat: TerminalId,
         execution: uuid::Uuid,
+        expires: Instant,
     },
     Spent(uuid::Uuid),
     RestartRefused(Box<RestartRefusal>),
@@ -63,8 +66,16 @@ impl Attempt {
         }
     }
 
-    pub(super) fn pins_history(&self, id: TerminalId, instance: uuid::Uuid) -> bool {
-        matches!(self, Self::History { chat, execution, .. } if *chat == id && *execution == instance)
+    pub(super) fn pins_history(&self, id: TerminalId, instance: uuid::Uuid, now: Instant) -> bool {
+        matches!(self, Self::History { chat, execution, expires, .. }
+            if *chat == id && *execution == instance && now < *expires)
+    }
+
+    pub(super) fn history_expiry(&self) -> Option<Instant> {
+        match self {
+            Self::History { expires, .. } => Some(*expires),
+            _ => None,
+        }
     }
 
     pub(in crate::host) fn is_history(&self) -> bool {
@@ -253,8 +264,10 @@ pub(in crate::host) fn resolve(
                         attempt,
                         chat: source.id,
                         execution,
+                        expires: Instant::now() + LIFETIME,
                     },
                 );
+                state.recheck_history_readers();
             } else {
                 state.chat_resolutions.remove(&client);
             }
