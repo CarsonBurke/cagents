@@ -289,6 +289,15 @@ impl Config {
             .is_some_and(|select| select.name_of(mode).is_some())
     }
 
+    pub fn confirms_mode(&self, setter: &Setter, mode: &str) -> bool {
+        let select = match setter {
+            Setter::Option(id) => self.mode.as_ref().filter(|select| select.id == *id),
+            Setter::Mode if self.mode.is_none() => self.legacy_modes.as_ref(),
+            _ => None,
+        };
+        select.is_some_and(|select| select.current == mode && select.name_of(mode).is_some())
+    }
+
     pub fn current_mode(&self) -> Option<&str> {
         self.modes().map(|select| select.current.as_str())
     }

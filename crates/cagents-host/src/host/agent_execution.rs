@@ -798,9 +798,9 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
             Provider::Codex => crate::agent_execution::permission::codex_launch(mode),
             _ => (mode, None),
         };
-        if acp.is_none_or(|acp| mode != acp.default_mode) {
-            arguments.extend([flag.into(), mode.to_owned()]);
-        }
+        // The ACP adapter consumes this option even when the terminal
+        // command would ordinarily leave its default implicit.
+        arguments.extend([flag.into(), mode.to_owned()]);
         if let Some(sandbox) = sandbox {
             arguments.extend(["--sandbox".into(), sandbox.to_owned()]);
         }
@@ -920,7 +920,9 @@ fn await_provider_ready_until(
             }
         };
         if snapshot.exited || handle.is_completed() {
-            return Err(before("Provider exited before accepting the prompt".into()));
+            return Err(before(handle.failure().or(snapshot.error).unwrap_or_else(
+                || "Provider exited before accepting the prompt".into(),
+            )));
         }
         if snapshot.ready {
             if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
@@ -1286,7 +1288,10 @@ fn dispatch(
                 mode: PromptMode::Send,
             },
         )
-        .map_err(|error| (State::Interrupted, error))?;
+        .map_err(|rejection| match rejection {
+            chat::runtime::Rejection::Refused(error) => before(error),
+            chat::runtime::Rejection::Unacknowledged(error) => (State::Interrupted, error),
+        })?;
     let _ = session;
     Ok(())
 }

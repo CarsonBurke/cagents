@@ -97,6 +97,10 @@ Files under FAKE_ACP_STATE switch states that last across processes:
                   before cagents kept it in a file: an `agy` that keeps it in
                   a file is refused as signed out until it signs in again
   version         Antigravity's `initialize` reports this version
+  initial-mode    starts a new session in the named mode
+  unavailable-mode omits the named mode from the advertised choices
+  reject-mode     rejects a request to set the mode
+  ignore-mode     returns its current config without changing mode
 
 Run with `--app-data-dir DIR`, as cagents' Antigravity probe runs `agy acp`,
 it saves each new session's files under ~/.gemini/DIR the way agy does
@@ -290,6 +294,8 @@ class Session:
             self.mode, self.model, self.level = "onRequest", "muse-spark-1.2", None
         else:
             self.mode, self.model, self.level = "default", "gemini-3.8-flash", "low"
+        if marked("initial-mode"):
+            self.mode = (Path(MARKS) / "initial-mode").read_text().strip()
         self.title = None
         self.lock = None
 
@@ -328,7 +334,11 @@ class Session:
                 saved.write(json.dumps(update) + "\n")
 
     def modes(self):
-        return AGY_MODES if SHAPE == "agy" else MUSE_MODES
+        modes = AGY_MODES if SHAPE == "agy" else MUSE_MODES
+        if marked("unavailable-mode"):
+            omitted = (Path(MARKS) / "unavailable-mode").read_text().strip()
+            return [mode for mode in modes if mode[0] != omitted]
+        return modes
 
     def config_options(self):
         mode = {"id": "mode", "name": "Mode", "category": "mode", "type": "select",
@@ -612,7 +622,10 @@ class Agent:
         if option not in known or value not in known[option]:
             return fail(id, -32602, f"Invalid value {value!r} for {option!r}")
         if option == "mode":
-            session.mode = value
+            if marked("reject-mode"):
+                return fail(id, -32603, "Mode change refused by fixture")
+            if not marked("ignore-mode"):
+                session.mode = value
         elif option == "model":
             session.model = value
         else:

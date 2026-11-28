@@ -276,8 +276,10 @@ class Home(unittest.TestCase):
             command.append("status" if mode == "registry" else "forget")
         elif mode == "conversation":
             (self.home / "project/.git").rmdir()
+            # The snapshot must see a quiet repository after fixture setup.
             for arguments in (("init", "--quiet", "--initial-branch=main"),
-                              ("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                              ("-c", "maintenance.auto=false", "-c", "user.name=Fixture",
+                               "-c", "user.email=fixture@example.invalid",
                                "commit", "--quiet", "--allow-empty", "--message", "Fixture project")):
                 result = self.run_command(["git", *arguments], cwd=self.home / "project")
                 self.assertEqual(result.returncode, 0, result.stderr)

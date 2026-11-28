@@ -442,6 +442,52 @@ fn a_frame_planned_before_a_resize_is_replaced_by_a_redraw() {
     assert_eq!(replay.pending_redraw, Some(resized));
 }
 
+#[test]
+fn a_frame_planned_for_a_recreated_viewport_is_replaced_by_a_redraw() {
+    let mut fixture = Fixture::new();
+    let id = fixture.id;
+    // Start with no recorded base, so a base mismatch cannot detect reattachment.
+    {
+        let mut state = fixture.shared.lock().unwrap();
+        state.detach(1, id).unwrap();
+        state.attach(1, id).unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
+    }
+    let generation = fixture.change(0, "late");
+    let planned = fixture.plan(generation);
+    assert_eq!(planned.len(), 1);
+    {
+        let mut state = fixture.shared.lock().unwrap();
+        state.detach(1, id).unwrap();
+        state.attach(1, id).unwrap();
+        state
+            .resize_client(
+                1,
+                id,
+                crate::terminal::TerminalSize {
+                    columns: 4,
+                    rows: ROWS + 2,
+                    cell_width_px: 8,
+                    cell_height_px: 16,
+                },
+            )
+            .unwrap();
+        state
+            .set_visibility(1, id, TerminalVisibility::Visible)
+            .unwrap();
+        let view = &state.subscriptions.viewports[&(1, id)];
+        assert_eq!(view.revision, planned[0].revision);
+    }
+
+    fixture.commit(planned);
+    assert_eq!(fixture.acknowledged_source(), 0);
+    let replay = replay(&fixture.delivery, fixture.id, false);
+    assert_eq!(replay.frames, [1]);
+    assert_eq!(replay.pending_redraw, Some(generation));
+}
+
 /// A `ClientRequest::Snapshot` reply is recorded under the lock but queued by
 /// its connection after the lock is released, so a broadcast can be queued
 /// first. The client still holds its old screen then. A delta against the

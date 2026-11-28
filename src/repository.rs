@@ -3426,6 +3426,15 @@ fn measure_untracked(
     }
 }
 
+/// Resolve the checkout locator once for operations that mix Git and direct
+/// file access. If resolution fails, let Git report its usual path error.
+fn physical_worktree(worktree: &Path) -> Cow<'_, Path> {
+    match worktree.canonicalize() {
+        Ok(path) => Cow::Owned(path),
+        Err(_) => Cow::Borrowed(worktree),
+    }
+}
+
 fn untracked_line_count(
     root: &fs_safety::Root,
     path: &RepoPath,
@@ -4639,6 +4648,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         options: SnapshotOptions,
         cancellation: &CancellationToken,
     ) -> Result<RepositorySnapshot, RepositoryError> {
+        let worktree = physical_worktree(worktree);
+        let worktree = worktree.as_ref();
         let listing = self.snapshot_listing(worktree, options, cancellation)?;
         self.complete_snapshot(worktree, listing, cancellation)
     }
@@ -4683,6 +4694,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         racy_after: std::time::SystemTime,
         cancellation: &CancellationToken,
     ) -> Result<SnapshotRead, RepositoryError> {
+        let worktree = physical_worktree(worktree);
+        let worktree = worktree.as_ref();
         let listing = self.snapshot_listing(worktree, options, cancellation)?;
         let digest = snapshot_digest(worktree, options, &listing, racy_after);
         if digest.is_some() && digest.as_ref() == previous {
@@ -5311,6 +5324,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let old_path = request.old_path.as_ref().unwrap_or(&request.path);
         match &request.basis {
             DiffBasis::IndexToWorktree => {
+                let worktree = physical_worktree(worktree);
+                let worktree = worktree.as_ref();
                 // Keep the filesystem side on the root observed before Git's
                 // index read, even if that pathname is replaced afterward.
                 let root = fs_safety::Root::open(worktree);
@@ -5611,12 +5626,14 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         refuse_markers: bool,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
+        let worktree = physical_worktree(&request.worktree);
+        let worktree = worktree.as_ref();
         // Keep the actual mutation protected even if its UI task is dropped.
-        let _protection = crate::worktree_cleanup::protect(&request.worktree)
+        let _protection = crate::worktree_cleanup::protect(worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let worktree = &request.worktree;
         if refuse_markers {
-            let paths = self.conflict_marker_paths(worktree, &request.selection, cancellation)?;
+            let paths =
+                self.scan_worktree_conflict_markers(worktree, &request.selection, cancellation)?;
             if !paths.is_empty() {
                 return Ok(MutationOutcome::NotApplied {
                     failure: MutationFailure::ConflictMarkers { paths },
@@ -6151,9 +6168,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         request: &DiscardRequest,
         cancellation: &CancellationToken,
     ) -> Result<MutationOutcome, RepositoryError> {
-        // Keep the actual mutation protected even if its UI task is dropped.
-        let _protection = crate::worktree_cleanup::protect(&request.worktree)
-            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        use std::os::unix::fs::MetadataExt;
+
         if !request.confirmed {
             return Err(ValidationError::ConfirmationRequired.into());
         }
@@ -6162,8 +6178,23 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 ValidationError::InvalidWorktree(request.worktree.display().to_string()).into(),
             );
         }
-        let tracked =
-            self.matchable_pathspecs(&request.worktree, &request.tracked, cancellation)?;
+        if request.tracked.is_empty() && request.untracked.is_empty() {
+            return Err(ValidationError::EmptySelection.into());
+        }
+        // Bind protection, Git and unlink to one checkout before mutating
+        // anything. Retargeting the input symlink cannot redirect a later step.
+        let root = request
+            .worktree
+            .canonicalize()
+            .and_then(|path| fs_safety::Root::open(&path))
+            .map_err(|error| {
+                ValidationError::Io(format!("{}: {error}", request.worktree.display()))
+            })?;
+        let worktree = root.path();
+        // Keep the actual mutation protected even if its UI task is dropped.
+        let _protection = crate::worktree_cleanup::protect(worktree)
+            .map_err(|error| ValidationError::Io(error.to_string()))?;
+        let tracked = self.matchable_pathspecs(worktree, &request.tracked, cancellation)?;
         let mut untracked: Vec<RepoPath> = Vec::with_capacity(request.untracked.len());
         let mut seen = HashSet::new();
         for path in &request.untracked {
@@ -6171,14 +6202,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 untracked.push(path.clone());
             }
         }
-        if tracked.is_empty() && untracked.is_empty() {
-            return Err(ValidationError::EmptySelection.into());
-        }
-
         let mut applied = Vec::new();
         if !tracked.is_empty() {
-            let command =
-                self.git_pathspec_mutation(&request.worktree, ["restore", "--worktree"], &tracked);
+            let command = self.git_pathspec_mutation(worktree, ["restore", "--worktree"], &tracked);
             // A `restore` that reports a refusal changed nothing, and one that
             // failed inside its write loop changed an amount only the user can
             // establish. Neither leaves a half of the request that this may
@@ -6202,7 +6228,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // This is Git's actual worktree index, including linked worktrees.
         // Hold its standard lock while classifying and unlinking: otherwise a
         // terminal's `git add` can make a selected path tracked after the read.
-        let mut index_lock = match self.discard_index_lock(&request.worktree, cancellation) {
+        let mut index_lock = match self.discard_index_lock(worktree, cancellation) {
             Ok(lock) => lock,
             Err(error) => {
                 return Ok(report_discard(
@@ -6214,8 +6240,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let mut failures = (|| {
             // The confirmation may have outlived the snapshot. Re-establish
             // tracking under the lock, before deleting any untracked file.
-            let tracked_now = match self.indexed_paths(&request.worktree, &untracked, cancellation)
-            {
+            let tracked_now = match self.indexed_paths(worktree, &untracked, cancellation) {
                 Ok(paths) => paths.into_iter().collect::<HashSet<_>>(),
                 Err(error) => {
                     return discard_failures(
@@ -6224,15 +6249,18 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     );
                 }
             };
-            let root = match fs_safety::Root::open(&request.worktree) {
-                Ok(root) => root,
-                Err(error) => {
-                    return discard_failures(
-                        &untracked,
-                        format!("{}: {error}", request.worktree.display()),
-                    );
-                }
-            };
+            // A moved or replaced checkout may have given Git a different
+            // index. Keep the selected files if the original root moved.
+            let same_root = root.metadata().and_then(|held| {
+                let named = fs::symlink_metadata(worktree)?;
+                Ok((held.dev(), held.ino()) == (named.dev(), named.ino()))
+            });
+            if !matches!(same_root, Ok(true)) {
+                return discard_failures(
+                    &untracked,
+                    format!("{}: the checkout moved or was replaced", worktree.display()),
+                );
+            }
             // A refused directory does not prevent independent selected files
             // being attempted. Cancellation or loss of the index lock ends the
             // remaining batch, whose paths are still known untouched.
@@ -6561,6 +6589,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// is scanned for markers of the width its `conflict-marker-size`
     /// attribute gives, which is the width Git wrote.
     pub fn conflict_marker_paths(
+        &self,
+        worktree: &Path,
+        selection: &[PathSelection],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<RepoPath>, RepositoryError> {
+        let worktree = physical_worktree(worktree);
+        self.scan_worktree_conflict_markers(&worktree, selection, cancellation)
+    }
+
+    fn scan_worktree_conflict_markers(
         &self,
         worktree: &Path,
         selection: &[PathSelection],
