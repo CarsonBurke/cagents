@@ -758,14 +758,7 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<Reply, String> {
             );
             create_worktree_command(command, &name, &branch, Some(&base))?
         }
-        GitOperation::RemoveWorktree { name } => {
-            let root = command
-                .current_dir
-                .as_ref()
-                .ok_or("repository directory unavailable")?;
-            let destination = removable_worktree(root, &name)?;
-            command.args(["worktree", "remove", "--"]).arg(destination)
-        }
+        GitOperation::RemoveWorktree { name } => remove_worktree_command(command, &name)?,
         GitOperation::CheckWorktreeRemoval { name } => {
             let root = command
                 .current_dir
@@ -906,6 +899,29 @@ fn create_worktree_command(
         command = command.arg(start);
     }
     Ok(command)
+}
+
+#[cfg(feature = "host")]
+fn remove_worktree_command(
+    command: crate::process::CommandSpec,
+    name: &str,
+) -> Result<crate::process::CommandSpec, String> {
+    let root = command
+        .current_dir
+        .as_ref()
+        .ok_or("repository directory unavailable")?;
+    let destination = removable_worktree(root, name)?;
+    // Git checks again before removing the checkout. Count files created
+    // after our own check even when the repository hides untracked files.
+    Ok(command
+        .args([
+            "-c",
+            "status.showUntrackedFiles=all",
+            "worktree",
+            "remove",
+            "--",
+        ])
+        .arg(destination))
 }
 
 /// Where worktree `name` of the repository at `root` is, when the device
@@ -1861,6 +1877,53 @@ mod tests {
             "derived\n"
         );
         assert_eq!(git(&["branch", "--show-current"]), "main\n");
+    }
+
+    #[test]
+    fn final_device_worktree_removal_preserves_a_new_untracked_file() {
+        use crate::process::{
+            CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+        };
+
+        if crate::repository::isolated_git_test(concat!(
+            module_path!(),
+            "::final_device_worktree_removal_preserves_a_new_untracked_file"
+        )) {
+            return;
+        }
+        let directory = crate::repository::retained_managed_fixture_directory();
+        let root = directory.path();
+        git_output(root, &["init", "-q", "-b", "main"]);
+        git_output(root, &["config", "user.name", "Test"]);
+        git_output(root, &["config", "user.email", "test@example.invalid"]);
+        git_output(root, &["commit", "--allow-empty", "-m", "initial"]);
+        git_output(
+            root,
+            &["worktree", "add", "-b", "feature", ".worktrees/feature"],
+        );
+        git_output(root, &["config", "status.showUntrackedFiles", "no"]);
+
+        let command =
+            remove_worktree_command(CommandSpec::new("git").cwd(root), "feature").unwrap();
+        let draft = root.join(".worktrees/feature/notes.txt");
+        // An editor can save new work after the preflight census.
+        std::fs::write(&draft, "unsaved in Git\n").unwrap();
+        let output = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        assert!(!output.success);
+        assert_eq!(std::fs::read_to_string(&draft).unwrap(), "unsaved in Git\n");
+        assert_eq!(
+            git_output(root, &["config", "--get", "status.showUntrackedFiles"]),
+            b"no\n"
+        );
+        std::fs::remove_file(draft).unwrap();
+        assert!(
+            SystemProcessExecutor
+                .execute(&command, &CancellationToken::new())
+                .unwrap()
+                .success
+        );
     }
 
     #[test]
