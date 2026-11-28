@@ -70,9 +70,16 @@ limited to one per 2 GiB of available memory; set it lower on a shared host.
 Download and build temporary files stay in its private
 disk cache. The next build reclaims recognized scratch left by interrupted
 runs after taking the cache lock. A supervisor keeps that lock through
-sandbox teardown. The cache also keeps one checkout of the source. Each build
-rewrites only the files that changed, so Cargo
-recompiles only the crates they belong to.
+sandbox teardown. The cache keeps a source-only checkout of the selected
+commit. Each build rewrites only changed files so Cargo can reuse unaffected
+crates. Use a full checkout for automatic release notes, or pass
+`--notes FILE` to build from a shallow checkout.
+
+Add `--timings` to `release:build` to retain Cargo's unit reports for each
+product and variant. The builder prints their directory inside its private
+build cache. The build log also gives the archive packaging and offline smoke
+times. Keep the Cargo job count and toolchain the same when comparing an
+empty target directory with a build after switching commits.
 
 ## Native integrated browser capability smoke
 
