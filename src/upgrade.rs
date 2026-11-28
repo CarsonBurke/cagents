@@ -362,7 +362,6 @@ impl SurvivorEvidence {
         observed == Some(provider) && self.has_conversation_selector(arguments)
     }
 
-    #[cfg(target_os = "linux")]
     fn may_own_conversation<'a>(
         &self,
         mut arguments: impl Iterator<Item = &'a [u8]> + Clone,
