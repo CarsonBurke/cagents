@@ -42,7 +42,11 @@ class MacosInstaller(unittest.TestCase):
         self.executable(tools / "uname", 'case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) exit 1 ;; esac')
         self.executable(tools / "ditto", 'exec /usr/bin/cp -a -- "$@"')
         self.executable(tools / "mv", 'if [ "$1" = -fh ]; then shift; set -- -fT "$@"; fi\nexec /usr/bin/mv "$@"')
-        self.executable(tools / "stat", '[ "$1" = -f ] && [ "$2" = %u ] || exit 1\nexec /usr/bin/stat -c %u -- "$3"')
+        self.executable(tools / "stat", '''[ "$1" = -f ] || exit 1
+case "$2" in
+    %u|%d:%i) exec /usr/bin/stat -c "$2" -- "$3" ;;
+    *) exit 1 ;;
+esac''')
 
         for program in ("cagents", "cagentsd", "cagents-ui", "cagents-dictate"):
             self.executable(self.stage / "bin" / program, f'''case "$*" in
@@ -67,14 +71,18 @@ esac''')
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def reinstall(self):
+    def run_installer(self, *options, check=True):
         result = subprocess.run(
-            ["/bin/sh", str(self.installer), "--no-start", "--prefix", str(self.prefix),
-             "--version", VERSION, "--publish-tree", str(self.stage),
-             "--publisher", str(self.stage / "bin/cagents")],
+            ["/bin/sh", str(self.installer), "--prefix", str(self.prefix), *options],
             env=self.environment, cwd=self.root, text=True, capture_output=True, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
+
+    def reinstall(self):
+        self.run_installer("--no-start", "--version", VERSION, "--publish-tree", str(self.stage),
+                           "--publisher", str(self.stage / "bin/cagents"))
 
     def test_reinstall_repairs_a_non_executable_program(self):
         program = self.tree / "bin/cagents-ui"
@@ -93,6 +101,49 @@ esac''')
         before = [tree.stat().st_ino for tree in trees]
         self.reinstall()
         self.assertEqual([tree.stat().st_ino for tree in trees], before)
+
+    def test_uninstall_can_reinstall_in_a_prefix_with_user_files(self):
+        notes = self.prefix / "notes.txt"
+        notes.write_text("user file\n")
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.tree.exists())
+        self.assertEqual(notes.read_text(), "user file\n")
+        self.reinstall()
+        self.assertTrue(self.tree.is_dir())
+        self.assertEqual(notes.read_text(), "user file\n")
+
+    def test_uninstall_removes_an_empty_prefix(self):
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_can_reinstall_with_a_file_added_during_prefix_removal(self):
+        self.environment["FIXTURE_PREFIX"] = str(self.prefix)
+        self.executable(self.root / "tools/rmdir", r'''
+if [ "$1" = "$FIXTURE_PREFIX" ]; then
+    printf 'late user file\n' > "$1/late.txt"
+fi
+exec /usr/bin/rmdir "$@"
+''')
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.tree.exists())
+        self.reinstall()
+        self.assertEqual((self.prefix / "late.txt").read_text(), "late user file\n")
+
+    def test_uninstall_keeps_a_directory_added_at_the_marker_path(self):
+        self.environment["FIXTURE_PREFIX"] = str(self.prefix)
+        self.executable(self.root / "tools/rmdir", r'''
+if [ "$1" = "$FIXTURE_PREFIX" ]; then
+    mkdir "$1/.cagents-install-root"
+    printf 'user file\n' > "$1/.cagents-install-root/sentinel"
+fi
+exec /usr/bin/rmdir "$@"
+''')
+        result = self.run_installer("--uninstall", "--publish-removal", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not restore the installation marker", result.stderr)
+        marker = self.prefix / ".cagents-install-root"
+        self.assertEqual(list(marker.iterdir()), [marker / "sentinel"])
+        self.assertEqual((marker / "sentinel").read_text(), "user file\n")
 
 
 if __name__ == "__main__":
