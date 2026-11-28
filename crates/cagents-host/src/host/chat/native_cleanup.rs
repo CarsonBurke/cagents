@@ -12,6 +12,7 @@ pub(in crate::host) struct NativeClose {
     /// pane may name instead.
     named: Session,
     owner: chat::native_holder::Detached,
+    server: Option<registry::Process>,
     closed: bool,
     paired: Option<RetainedPair>,
 }
@@ -37,6 +38,7 @@ impl NativeClose {
             named: source.clone(),
             source,
             owner,
+            server: None,
             closed,
             paired: None,
         }
@@ -47,6 +49,48 @@ impl NativeClose {
     pub(in crate::host) fn named_as(mut self, named: Session) -> Self {
         self.named = named;
         self
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(super) fn with_pair(
+        mut self,
+        host: &SharedHost,
+        recovery: &chat::native_holder::Recovery,
+    ) -> Self {
+        self.server = recovery.server_process.clone();
+        self.paired = retained_pair(
+            host,
+            &recovery.source,
+            recovery.source.terminal.as_deref(),
+            recovery.paired_holder.as_ref(),
+            &self.owner.proof,
+        )
+        .unwrap();
+        assert!(self.paired.is_some());
+        self
+    }
+
+    fn retire_abandoned(&self) -> Result<bool, String> {
+        // An authenticated server may have started a separate session from
+        // its launcher, where the holder's process group scan cannot see it.
+        if let Some(server) = &self.server
+            && *server != self.owner.record.root
+        {
+            match registry::Process::read(server.pid) {
+                Ok(current) if current == *server => {
+                    return Err(super::lost_execution_refusal(
+                        &self.source,
+                        super::Holds::Running,
+                    ));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(format!("Cannot establish native server absence: {error}"));
+                }
+            }
+        }
+        chat::native_holder::retire_abandoned(&self.owner.record)
     }
 
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
@@ -217,7 +261,7 @@ fn close_retained_inner(
     };
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
-        let receipt = match &pending {
+        let mut receipt = match &pending {
             Some(pending) => chat::native_holder::closed_source_for_owner(
                 source,
                 &proof,
@@ -239,34 +283,61 @@ fn close_retained_inner(
                 _ => return super::settle_lost_execution(host, source, &proof),
             },
         };
-        preflight_current_retirements(host, source, &owner, &proof)?;
+        let read_owned_receipt =
+            || chat::native_holder::closed_source_for_owner(source, &proof, &owner, require_exact);
+        // A retry may have no live holder left to authenticate the current
+        // agent descriptors. In that case retirement uses allocation-wide
+        // absence evidence, while the pair still uses its captured identity.
+        let abandoned = if let Some(pending) = &pending
+            && receipt.is_none()
+            && !owner.holder.is_current()
+        {
+            pending.retire_abandoned()?
+        } else {
+            false
+        };
+        if abandoned {
+            // Publication precedes discovery retirement. An exited holder may
+            // have left a receipt that only became usable after retirement.
+            receipt = read_owned_receipt()?;
+        }
+        // A holder that died while its provider runs on can no longer be
+        // asked to stop it, and nothing else may: say so, rather than fail
+        // reaching the holder. Linux receipts do not distinguish Stop from
+        // Spare, so an unfinished pair still needs the survivor check there.
+        let check_survivors =
+            receipt.is_none() || cfg!(target_os = "linux") && matches!(&receipt, Some((_, false)));
+        if check_survivors
+            && !abandoned
+            && let Some(refusal) = super::holder_lost_refusal(source, &owner)?
+        {
+            return Err(refusal);
+        }
+        if !abandoned || receipt.is_some() {
+            preflight_current_retirements(host, source, &owner, &proof)?;
+        }
         if let Some((record, true)) = &receipt {
             debug_assert_eq!(*record, owner);
             retire_closed_execution(host, source, &owner, &proof, require_exact)?;
             return Ok(());
         }
-        // A holder that died while its provider runs on can no longer be
-        // asked to stop it, and nothing else may: say so, rather than fail
-        // reaching the holder.
-        if let Some(refusal) = super::holder_lost_refusal(source, &owner)? {
-            return Err(refusal);
-        }
         let mut pending = match pending {
             Some(pending) => pending,
             None if receipt.is_some() => {
-                let (record, _) = receipt.unwrap();
+                let (record, _) = receipt.as_ref().unwrap();
                 let pending = NativeClose {
                     source: source.clone(),
                     named: named.clone(),
                     owner: chat::native_holder::Detached::from_receipt(
                         record.clone(), source.clone(), proof.clone(), require_exact,
                     )?,
+                    server: None,
                     closed: true,
                     paired: retained_pair(
                         host,
                         source,
                         source.terminal.as_deref(),
-                        Some(&chat::native_holder::closed_pair_holder(source, &proof, &record, require_exact)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
+                        Some(&chat::native_holder::closed_pair_holder(source, &proof, record, require_exact)?.ok_or("The native cleanup receipt lacks its original paired holder identity")?),
                         &proof,
                     )?,
                 };
@@ -277,9 +348,7 @@ fn close_retained_inner(
                 pending
             }
             None => {
-                let record = registry::recovery_candidate(&socket, Kind::Native)?
-                    .ok_or("No exact native holder or confirmed close receipt is available")?;
-                let (recovery, _) = chat::native_holder::inspect(&record, &proof)?;
+                let (recovery, _) = chat::native_holder::inspect(&owner, &proof)?;
                 if &recovery.source != source && !recovery.previous_sources.contains(source) {
                     return Err(
                         "Native holder does not recognize this exact issued descriptor".into(),
@@ -292,11 +361,12 @@ fn close_retained_inner(
                     recovery.paired_holder.as_ref(),
                     &proof,
                 )?;
-                let (holder, _) = chat::native_holder::adopt(&record, source, &proof)?;
+                let (holder, recovery) = chat::native_holder::adopt(&owner, source, &proof)?;
                 let pending = NativeClose {
                     source: source.clone(),
                     named: named.clone(),
                     owner: holder.preserve(),
+                    server: recovery.server_process,
                     closed: false,
                     paired,
                 };
@@ -328,7 +398,7 @@ fn close_retained_inner(
                 .require_current(host)
                 .map_err(|error| error.message)?;
         }
-        if !pending.closed {
+        if !pending.closed && !abandoned && receipt.is_none() {
             #[cfg(target_os = "linux")]
             pending.owner.close_retaining_receipt()?;
             #[cfg(target_os = "macos")]
@@ -344,27 +414,23 @@ fn close_retained_inner(
                 .require_current(host)
                 .map_err(|error| error.message)?;
         }
-        // An owner that ended before its Release, or with its provider during
-        // it, settled this close without a receipt, so there is none to
-        // confirm. Its close stays pending until the loss is proved; an owner
-        // still running keeps its record, which refuses the loss.
-        let owned_receipt = chat::native_holder::closed_source_for_owner(
-            source,
-            &proof,
-            &pending.owner.record,
-            require_exact,
-        )?;
-        if pending.paired.is_none() && owned_receipt.is_none() {
-            chat::native_holder::retire_abandoned(&pending.owner.record)?;
-            return super::settle_lost_execution(host, source, &proof);
+        let mut has_receipt = (!abandoned || receipt.is_some()) && read_owned_receipt()?.is_some();
+        if !has_receipt && !abandoned {
+            if !pending.retire_abandoned()? {
+                return Err("The native cleanup receipt is unavailable and the original holder's exit is unconfirmed".into());
+            }
+            has_receipt = read_owned_receipt()?.is_some();
         }
-        if let Some(pair) = &pending.paired {
-            #[cfg(target_os = "macos")]
-            if owned_receipt.is_none() {
+        if !has_receipt {
+            if registry::recovery_candidate(&socket, Kind::Native)?.is_some() {
                 return Err(
-                    "The native close receipt for the paired terminal is unavailable".into(),
+                    "A native holder still claims this conversation. Its close remains pending."
+                        .into(),
                 );
             }
+            super::refuse_scheduled_agent(host, source)?;
+        }
+        if let Some(pair) = &pending.paired {
             if let Some(source) = &pair.source {
                 let handle = pair.handle.as_ref().expect("captured worker source");
                 handle.close_with_receipt(source, &proof)?;
@@ -393,6 +459,11 @@ fn close_retained_inner(
                 );
             }
             state.retire_terminal(pair.holder.terminal);
+        }
+        if !has_receipt {
+            // The paired holder has its own close proof. It must be gone
+            // before the lost-execution check scans for remaining writers.
+            return super::settle_lost_execution(host, source, &proof);
         }
         chat::native_holder::confirm_pair_closed(
             source,
