@@ -7295,6 +7295,91 @@ fn a_message_to_a_settled_agent_starts_a_run_with_it() {
 }
 
 #[test]
+fn an_update_keeps_a_sent_message_pending_until_delivery_can_resume() {
+    use crate::{
+        agent_execution::mailbox::{Handoff, Outgoing, State as Delivery, To},
+        terminal_ipc::{ClientRequest, ProtocolErrorCode, ServerResponse},
+    };
+    if isolated("an_update_keeps_a_sent_message_pending_until_delivery_can_resume").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = submit(&host, &Authority::default(), request.clone()).unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    let courier = mailbox::Courier::start_with_update_fence(&host).unwrap();
+    let agent_request = |operation| {
+        crate::host::client::process_request(
+            &host,
+            0,
+            ClientRequest::Agent {
+                authority: Authority::default(),
+                operation,
+            },
+        )
+    };
+
+    let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let ServerResponse::Agent(Reply::Handed(handed)) =
+        agent_request(Operation::Deliver(Outgoing {
+            to: To::Session(first.agent.id.to_string()),
+            body: "Review the result after the update".into(),
+            wait_ms: None,
+        }))
+        .unwrap()
+        .0
+    else {
+        panic!("expected a sent message receipt");
+    };
+    assert!(matches!(handed.agent, Some(Handoff::Held { agent, .. }) if agent == first.agent.id));
+    let error = agent_request(Operation::Prompt {
+        request: Submit {
+            destination: Destination::Existing(first.agent.id),
+            prompt: "A direct follow-up".into(),
+            idempotency_key: "during-update".into(),
+            ..request
+        },
+        interrupt: false,
+    })
+    .expect_err("new agent work was accepted during the update");
+    assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(error.retryable);
+
+    let registry = registry(&host).unwrap();
+    let message = || {
+        registry
+            .lock()
+            .unwrap()
+            .message(handed.delivery.sent.message.id)
+            .unwrap()
+            .unwrap()
+    };
+    let latest = || {
+        status(&host, &Authority::default(), first.agent.id)
+            .unwrap()
+            .1
+    };
+    courier.wake_and_wait_for_scan();
+    assert_eq!(message().state, Delivery::Pending);
+    assert_eq!(latest().id, first.run.id);
+    assert_eq!(prompts(root), 1);
+
+    drop(guard);
+    eventually(
+        || latest().id != first.run.id,
+        "the saved message did not start a run",
+    );
+    assert_eq!(settled(&host, latest().id).state, State::Succeeded);
+    courier.wake_and_wait_for_scan();
+    assert_eq!(message().state, Delivery::Delivered);
+    assert_eq!(
+        prompts(root),
+        2,
+        "the saved message reached its provider once"
+    );
+}
+
+#[test]
 fn a_message_to_a_busy_agent_becomes_its_next_run_when_the_run_settles() {
     use crate::agent_execution::{
         Start,

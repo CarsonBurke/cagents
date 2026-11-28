@@ -1747,6 +1747,13 @@ fn process_admitted_request(
                     crate::agent_execution::AcceptanceError::StoreBusy(message) => {
                         ProtocolError::new(ProtocolErrorCode::StoreBusy, message, true)
                     }
+                    crate::agent_execution::AcceptanceError::UpdateInProgress => {
+                        ProtocolError::new(
+                            ProtocolErrorCode::TerminalUnavailable,
+                            error.to_string(),
+                            true,
+                        )
+                    }
                     crate::agent_execution::AcceptanceError::MailboxFull(message) => {
                         ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
                     }

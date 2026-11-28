@@ -259,6 +259,10 @@ trait FloorSource {
     ) -> Result<(), UpdateError> {
         Ok(())
     }
+    fn observe_before_window_close(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+    ) -> Result<Option<impact::Preview>, UpdateError>;
     fn close_saved_windows(&mut self) -> Result<bool, UpdateError>;
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), source::PrepareError>;
     fn begin_interrupts(
@@ -486,6 +490,19 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         }
         self.preparing_client = Some(client);
         Ok(())
+    }
+    fn observe_before_window_close(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+    ) -> Result<Option<impact::Preview>, UpdateError> {
+        if self.guard.prepared_window_slots().is_empty() {
+            return Ok(None);
+        }
+        // The launch fence holds back new agent work on the source. Use the
+        // control writer to drain work admitted before that fence, then check
+        // consent again while the windows can still cancel their preparation.
+        source_client_for(daemon)?.inventory_generation()?;
+        self.observe_policy(daemon.policy).map(Some)
     }
     fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
         self.guard
@@ -866,6 +883,16 @@ fn quiesce_inner(
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
     if !daemon.blocked() {
         source.begin_preparation(state, job, daemon)?;
+        confirmation::check_cancelled(state, job)?;
+        if let Some(current) = source.observe_before_window_close(daemon)?
+            && (!preview.preserves_consent(&current)
+                || current.daemon.as_ref().is_none_or(|daemon| !daemon.ready()))
+        {
+            return Err(invalid(
+                "Session ownership or work changed before closing windows. Review the update again. Existing windows were kept open.",
+            ));
+        }
+        confirmation::check_cancelled(state, job)?;
         // A mixed-protocol successor cannot start until the old windows
         // release their leases. Prove that while the source still serves.
         let drained_windows = source.close_saved_windows()?;

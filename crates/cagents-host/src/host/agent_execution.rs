@@ -253,6 +253,9 @@ fn accept(
 ) -> Result<(Accepted, Result<Start, String>), crate::agent_execution::AcceptanceError> {
     request.validate_client()?;
     let origin = origin(host, authority)?;
+    if mailbox::defers_for_update(host) {
+        return Err(crate::agent_execution::AcceptanceError::UpdateInProgress);
+    }
     let registry = registry(host)?;
     let previous = registry
         .lock()

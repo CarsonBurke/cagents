@@ -44,6 +44,7 @@ struct FakeSource {
     predicted_service: bool,
     fail_inventory: bool,
     existing_checkpoint: bool,
+    work_arrives_during_preparation: bool,
     window_close_refused: bool,
     windows_drained: bool,
     close_attempts: usize,
@@ -137,7 +138,21 @@ impl FloorSource for FakeSource {
                 "A checkpoint already exists; it was kept without preparing the source",
             ));
         }
+        if self.work_arrives_during_preparation {
+            let item = &mut self.preview.daemon.as_mut().unwrap().sessions[0];
+            item.disposition = impact::Disposition::WaitsForIdle;
+            item.reason = impact::SessionCause::PendingDelivery;
+        }
         Ok(())
+    }
+    fn observe_before_window_close(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+    ) -> Result<Option<impact::Preview>, UpdateError> {
+        if self.windows_drained || self.window_close_refused {
+            return self.observe_policy(daemon.policy).map(Some);
+        }
+        Ok(None)
     }
     fn close_saved_windows(&mut self) -> Result<bool, UpdateError> {
         if self.window_close_refused {
@@ -461,6 +476,7 @@ fn fixture() -> FakeSource {
         predicted_service: false,
         fail_inventory: false,
         existing_checkpoint: false,
+        work_arrives_during_preparation: false,
         window_close_refused: false,
         windows_drained: false,
         close_attempts: 0,
@@ -2165,6 +2181,29 @@ fn recovery_report_keeps_completed_floor_actions_for_failures_after_quiescence()
         items: Vec::new(),
     });
     assert_eq!(survivors.recovery_report(), report);
+}
+
+#[test]
+fn work_accepted_during_preparation_keeps_the_reviewed_windows_open() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut job = job(directory.path());
+    let mut source = fixture();
+    source.preview.daemon.as_mut().unwrap().sessions[0].kind = impact::SessionKind::NativeChat;
+    source.preview.daemon.as_mut().unwrap().sessions[0].disposition = impact::Disposition::Resumes;
+    source.work_arrives_during_preparation = true;
+    source.window_close_refused = true;
+    let preview = source.preview.clone();
+
+    let error =
+        quiesce_source(directory.path(), &mut job, &preview, false, &mut source).unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("Existing windows were kept open")
+    );
+    assert!(source.events.lock().unwrap().is_empty());
+    source.assert_running_panes_are_unmarked();
 }
 
 #[test]

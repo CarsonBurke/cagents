@@ -93,16 +93,27 @@ pub(in crate::host) fn post(
 /// which must see every prompt its readiness check admitted. `None`, without
 /// running it, once the daemon no longer takes work.
 pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Option<T> {
-    let (gate, courier) = {
-        let host = host.lock().unwrap_or_else(|p| p.into_inner());
-        (host.control_gate.clone(), host.mailbox.clone())
-    };
+    let gate = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .control_gate
+        .clone();
     let _control = gate.shared();
     crate::host::client::ensure_control_open(host).ok()?;
-    if courier.is_some_and(|courier| courier.defers_for_update()) {
+    if defers_for_update(host) {
         return None;
     }
     Some(work())
+}
+
+/// Check under control admission before claiming or starting provider work.
+pub(super) fn defers_for_update(host: &SharedHost) -> bool {
+    let courier = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .mailbox
+        .clone();
+    courier.is_some_and(|courier| courier.defers_for_update())
 }
 
 /// Leaves a message as `post` does, and has an agent cagents hosts take it as
@@ -119,6 +130,12 @@ pub(in crate::host) fn hand(
         .as_ref()
         .is_some_and(|member| member.limit.is_some());
     let handoff = (|| {
+        // The RPC already holds control admission. Leave the posted message
+        // pending just as the courier would, including when it could reopen
+        // an agent whose provider exited.
+        if defers_for_update(host) {
+            return Err("message delivery is paused while cagents updates".into());
+        }
         let registry = registry(host)?;
         let seal = host
             .lock()
@@ -882,17 +899,22 @@ impl Handle {
         self.0.wait.wake();
     }
 
-    /// Keep unclaimed inputs durable during approved interruption. Follow the
+    /// Keep unclaimed inputs durable during an update. Follow the
     /// fence without holding daemon control or joining its waiter at shutdown.
-    pub(super) fn defers_for_update(&self) -> bool {
+    fn defers_for_update(&self) -> bool {
         let Some(runtime) = &self.0.update_runtime else {
             return false;
         };
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        if state.update != UpdateWait::Open {
+        // Only a verified lease can defer work until the courier wakes. A
+        // failed probe leaves a retry deadline for delivery, but a new request
+        // can check the fence again even if no delivery is pending.
+        if state.update == UpdateWait::Held {
             return true;
         }
         let release = match crate::instance::UpdateFenceRelease::observe(runtime) {
+            // Only the courier consumes Retry. It may already have skipped
+            // a delivery in this pass, even though this request can proceed.
             Ok(None) => return false,
             Ok(Some(release)) => release,
             Err(error) => {
@@ -1645,26 +1667,34 @@ mod tests {
     #[test]
     fn courier_defers_new_dispatch_and_wakes_when_the_update_releases_its_fence() {
         let directory = tempfile::tempdir().unwrap();
-        let runtime = directory.path();
+        let runtime = directory.path().join("run");
         let filename = if crate::instance::IS_DEVELOPMENT {
             "cagents-development-ui.lock.update"
         } else {
             "cagents-ui.lock.update"
         };
+        let host = crate::host::service::test_host();
+        {
+            let mut state = host.lock().unwrap();
+            state.execution_registry = Some(Arc::new(Mutex::new(
+                crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+            )));
+            state.mailbox_seal = Some(Arc::new(Seal::new([7; 32])));
+        }
+        let courier = Courier::start_in(&host, Some(runtime.clone())).unwrap();
+        courier.wait_for_scan(0);
+        assert!(defers_for_update(&host), "a failed probe must defer work");
+        std::fs::create_dir(&runtime).unwrap();
+        assert!(
+            !defers_for_update(&host),
+            "a new request rechecks the fence"
+        );
+
         let fence = crate::instance::owned_file_lock(
             std::fs::File::create(runtime.join(filename)).unwrap(),
             libc::LOCK_EX,
         )
         .unwrap();
-        let host = crate::host::service::test_host();
-        {
-            let mut state = host.lock().unwrap();
-            state.execution_registry = Some(Arc::new(Mutex::new(
-                crate::host::model::Registry::at(&runtime.join("model.sqlite3")).unwrap(),
-            )));
-            state.mailbox_seal = Some(Arc::new(Seal::new([7; 32])));
-        }
-        let courier = Courier::start_in(&host, Some(runtime.into())).unwrap();
         for _ in 0..2 {
             assert!(with_control(&host, || panic!("started during the update")).is_none());
         }
