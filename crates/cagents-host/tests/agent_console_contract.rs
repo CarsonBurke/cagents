@@ -123,6 +123,33 @@ impl Fixture {
         fixture
     }
 
+    #[cfg(target_os = "linux")]
+    fn install_antigravity(&self) -> std::path::PathBuf {
+        let root = self.root.path();
+        let state = root.join("acp/agy");
+        fs::create_dir_all(&state).unwrap();
+        fs::create_dir_all(root.join("libexec/acp")).unwrap();
+        fs::create_dir_all(root.join("scripts")).unwrap();
+        fs::write(
+            root.join("scripts/fixture_home.py"),
+            include_str!("../../../scripts/fixture_home.py"),
+        )
+        .unwrap();
+        fs::write(
+            root.join("libexec/acp/fake-acp-agent.py"),
+            include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+        )
+        .unwrap();
+        let executable = root.join("bin/agy");
+        fs::write(
+            &executable,
+            include_str!("../../../tests/fixtures/fixture-acp.sh"),
+        )
+        .unwrap();
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+        state
+    }
+
     fn spawn_daemon(root: &Path) -> Child {
         let log = fs::OpenOptions::new()
             .create(true)
@@ -375,6 +402,107 @@ impl ChatWire {
             ServerResponse::Accepted
         ));
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn antigravity_agent_reopens_its_exact_conversation_after_a_daemon_crash() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let provider = fixture.install_antigravity();
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let accepted = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "agy",
+        "--repository",
+        project,
+        "--surface",
+        "chat",
+        "--prompt",
+        "Initialize the conversation",
+        "--idempotency-key",
+        "antigravity-daemon-crash",
+    ]);
+    let agent = accepted["agent"]["id"].as_str().unwrap();
+    let run = accepted["run"]["id"].as_str().unwrap();
+    fixture.wait(&["agent", "wait", run, "--timeout", "10"], 0);
+
+    let status = fixture.cli(&["daemon", "status"]);
+    let socket = Path::new(status["socket"].as_str().unwrap());
+    let session = |socket| {
+        let ServerResponse::ChatListed { mut sessions } =
+            ChatWire::connect(socket).request(ClientRequest::ChatList)
+        else {
+            panic!("expected the private daemon's conversation inventory");
+        };
+        assert_eq!(sessions.len(), 1, "{sessions:?}");
+        sessions.pop().unwrap()
+    };
+    let original = session(socket);
+    let thread = original.launch.session_id.as_ref().unwrap();
+    let id = original.id.to_string();
+
+    fixture.restart_daemon();
+    let listing = fixture.cli(&["resume", "--list"]);
+    assert_eq!(listing["stopped"][0]["session"], id, "{listing}");
+    let resumed = fixture.cli(&["resume", &id]);
+    assert_eq!(resumed["sessions"][0]["state"], "resumed", "{resumed}");
+    assert_eq!(resumed["sessions"][0]["agent"], agent, "{resumed}");
+    assert_eq!(resumed["sessions"][0]["running"], id, "{resumed}");
+    assert!(resumed["sessions"][0]["note"].is_null(), "{resumed}");
+    let restored = session(socket);
+    assert_ne!(restored.proof, original.proof);
+    assert_eq!(restored.id, original.id);
+    assert_eq!(restored.launch.session_id.as_ref(), Some(thread));
+
+    let again = fixture.cli(&["resume", &id]);
+    assert_eq!(again["sessions"][0]["state"], "already_running", "{again}");
+    let sent = fixture.cli(&[
+        "agent",
+        "send",
+        agent,
+        "Continue the same conversation",
+        "--wait",
+        "--timeout",
+        "10",
+    ]);
+    assert_eq!(sent["run"]["state"], "Succeeded", "{sent}");
+    fixture.cli(&["agent", "close", agent]);
+
+    let log = fs::read_to_string(provider.join("frames.log")).unwrap();
+    let relevant: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|frame| frame["params"]["sessionId"] == thread.as_str())
+        .filter(|frame| {
+            matches!(
+                frame["method"].as_str(),
+                Some("session/prompt" | "session/load")
+            )
+        })
+        .collect();
+    let methods: Vec<_> = relevant
+        .iter()
+        .map(|frame| frame["method"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        methods,
+        ["session/prompt", "session/load", "session/prompt"]
+    );
+    assert_eq!(
+        relevant[0]["params"]["prompt"][0]["text"],
+        "Initialize the conversation"
+    );
+    assert_eq!(
+        relevant[2]["params"]["prompt"][0]["text"],
+        "Continue the same conversation"
+    );
 }
 
 #[test]

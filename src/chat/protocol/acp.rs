@@ -59,7 +59,6 @@ const MAX_TURN_TITLE_LIST_PAGES: u8 = 4;
 const PROTOCOL_VERSION: u64 = 1;
 const MAX_COMMANDS: usize = 256;
 const MAX_PLAN_STEPS: usize = 256;
-const MAX_SESSION_ID: usize = 256;
 /// The message identifiers remembered for naming items, about a long
 /// conversation's worth.
 const MAX_SEGMENT_IDS: usize = 4096;
@@ -213,7 +212,7 @@ fn prepare(profile: &'static Profile, launch: &Launch) -> Result<(ProcessSpec, A
         })?
         .to_owned();
     if let Some(id) = &launch.session_id
-        && (id.is_empty() || id.len() > MAX_SESSION_ID || id.contains(char::is_control))
+        && !chat::valid_acp_session_id(id)
     {
         return Err(format!(
             "{} cannot resume a conversation without its exact session ID.",
@@ -1280,7 +1279,7 @@ impl Acp {
         if self.resume.is_none() {
             let Some(id) = result["sessionId"]
                 .as_str()
-                .filter(|id| !id.is_empty() && id.len() <= MAX_SESSION_ID)
+                .filter(|id| chat::valid_acp_session_id(id))
             else {
                 return self.fail(
                     format!("{} did not name its new conversation.", self.profile.label),

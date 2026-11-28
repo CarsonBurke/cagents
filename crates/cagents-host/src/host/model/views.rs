@@ -1104,7 +1104,7 @@ pub(super) fn learn_saved_chat_pane_identity(
         return Ok(false);
     }
     match chat_pane_session(db, saved.id)? {
-        Some(current) if crate::chat::is_first_codex_identity_update(&current, saved) => {
+        Some(current) if crate::chat::is_first_stable_identity_update(&current, saved) => {
             learn_chat_pane_identity(db, &current, saved)
         }
         _ => Ok(false),
@@ -1122,7 +1122,7 @@ pub(super) fn learn_saved_chat_pane_identity(
 /// the rest of the write still applies, and a refused seed or insert would
 /// leave the agent with no pane at all. Only panes `view` changes from
 /// `stored` are checked, and only the exact identity-learning shape is
-/// restored ([`crate::chat::is_first_codex_identity_update`]); a write that
+/// restored ([`crate::chat::is_first_stable_identity_update`]); a write that
 /// changes the chat, its proof or its launch is not this and stands. Returns
 /// whether any pane kept its ID.
 fn keep_confirmed_chat_identities(
@@ -1159,7 +1159,7 @@ fn keep_confirmed_chat_identities(
             }),
         };
         if let Some(saved) = saved
-            && crate::chat::is_first_codex_identity_update(next, &saved)
+            && crate::chat::is_first_stable_identity_update(next, &saved)
         {
             pane.kind = CardKind::Chat(saved);
             kept = true;

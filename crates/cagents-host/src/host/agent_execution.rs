@@ -1366,8 +1366,8 @@ pub(super) fn observed(
     }
 }
 
-/// Saves the conversation ID a daemon-hosted Codex thread's provider
-/// confirmed to its agent and pane, whether or not any window shows it.
+/// Saves a daemon-hosted Codex or ACP conversation's provider-confirmed ID
+/// to its agent and pane, including when no window shows it.
 ///
 /// The thread is named only after its descriptor was bound, and without the
 /// saved ID nothing can resume it once this actor is gone: a restart that does
@@ -1411,7 +1411,12 @@ pub(super) fn persist_confirmed_identity(
     let Some(confirmed) = confirmed else {
         return Ok(false);
     };
-    if hosted.launch.provider != crate::agent::Provider::Codex {
+    if !matches!(
+        hosted.launch.provider,
+        crate::agent::Provider::Codex
+            | crate::agent::Provider::Antigravity
+            | crate::agent::Provider::Muse
+    ) {
         return Ok(false);
     }
     let Some(agent) = store.agent_for_session(hosted.id)? else {
@@ -1436,7 +1441,7 @@ pub(super) fn persist_confirmed_identity(
     let mut learned = bound.clone();
     learned.launch.session_id = Some(confirmed);
     learned.native_continuity = continuity;
-    if !super::model::confirmed_identity_update(&bound, &learned) {
+    if !chat::is_first_stable_identity_update(&bound, &learned) {
         return Ok(false);
     }
     store.adopt_authenticated_agent_session(
