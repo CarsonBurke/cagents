@@ -185,9 +185,17 @@ fn merge_paths(
 fn read(shell: &Path, home: &Path, timeout: Duration) -> Option<OsString> {
     let deadline = Instant::now() + timeout;
     let inherited = std::env::var_os("PATH");
-    ["-il", "-i"]
-        .into_iter()
-        .find_map(|mode| read_in_mode(shell, mode, home, inherited.as_deref(), deadline))
+    let config_home = std::env::var_os("XDG_CONFIG_HOME");
+    ["-il", "-i"].into_iter().find_map(|mode| {
+        read_in_mode(
+            shell,
+            mode,
+            home,
+            inherited.as_deref(),
+            config_home.as_deref(),
+            deadline,
+        )
+    })
 }
 
 /// Accounts and native starts begin with the original launcher PATH, so
@@ -201,13 +209,17 @@ pub(super) fn launcher_path() -> Option<OsString> {
 }
 
 #[cfg(target_os = "linux")]
-pub(super) fn discovery_path(inherited: Option<&OsStr>) -> Option<OsString> {
+pub(super) fn discovery_path(
+    inherited: Option<&OsStr>,
+    config_home: Option<&OsStr>,
+) -> Option<OsString> {
     let shell = crate::model::login_shell().ok()?;
     let home = std::env::var_os("HOME")?;
     discover(
         Path::new(&shell),
         Path::new(&home),
         inherited,
+        config_home,
         SHELL_TIMEOUT,
     )
 }
@@ -217,18 +229,27 @@ fn discover(
     shell: &Path,
     home: &Path,
     inherited: Option<&OsStr>,
+    config_home: Option<&OsStr>,
     timeout: Duration,
 ) -> Option<OsString> {
     // Start where a login leaves off, then let interactive startup make
     // its own changes. Each mode keeps its original time budget so a slow
     // but successful profile or interactive setup still supplies its PATH.
-    let login = read_in_mode(shell, "-il", home, inherited, Instant::now() + timeout)
-        .and_then(|path| merged(inherited, &path));
+    let login = read_in_mode(
+        shell,
+        "-il",
+        home,
+        inherited,
+        config_home,
+        Instant::now() + timeout,
+    )
+    .and_then(|path| merged(inherited, &path));
     let interactive = read_in_mode(
         shell,
         "-i",
         home,
         login.as_deref().or(inherited),
+        config_home,
         Instant::now() + timeout,
     );
     interactive.or(login)
@@ -239,6 +260,7 @@ fn read_in_mode(
     mode: &str,
     home: &Path,
     inherited: Option<&OsStr>,
+    config_home: Option<&OsStr>,
     deadline: Instant,
 ) -> Option<OsString> {
     if Instant::now() >= deadline {
@@ -249,10 +271,12 @@ fn read_in_mode(
         .args([mode, "-c", SHELL_PATH_COMMAND])
         .env("HOME", home)
         .current_dir(home);
-    match inherited {
-        Some(path) => command.env("PATH", path),
-        None => command.env_remove("PATH"),
-    };
+    for (key, value) in [("PATH", inherited), ("XDG_CONFIG_HOME", config_home)] {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
     for name in SCRUBBED_ENVIRONMENT
         .iter()
         .chain(SHELL_SCRUBBED_ENVIRONMENT)
@@ -399,6 +423,7 @@ case "$1" in
         case "$PATH" in *"$HOME/login/bin"*) ;; *) exit 2 ;; esac
         printf 'startup message\0'
         PATH="$HOME/interactive/bin:$PATH"
+        [ -z "$XDG_CONFIG_HOME" ] || PATH="$XDG_CONFIG_HOME/tools:$PATH"
         ;;
     *) exit 3 ;;
 esac
@@ -410,8 +435,9 @@ eval "$3"
             .unwrap();
         let root = home.path();
         let launcher = OsStr::new("/usr/bin:/bin");
-        let discover = || discover(&shell, root, Some(launcher), Duration::from_secs(5)).unwrap();
-        let before: Vec<_> = std::env::split_paths(&discover()).collect();
+        let default_discovery =
+            || discover(&shell, root, Some(launcher), None, Duration::from_secs(5)).unwrap();
+        let before: Vec<_> = std::env::split_paths(&default_discovery()).collect();
         assert_eq!(
             before,
             [
@@ -427,7 +453,7 @@ eval "$3"
         std::fs::write(&cli, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let after = discover();
+        let after = default_discovery();
         assert_eq!(
             super::super::find_executable("claude", Some(&after)),
             Some(cli)
@@ -441,6 +467,19 @@ eval "$3"
                 "/usr/bin".into(),
                 "/bin".into(),
             ]
+        );
+        let profile = root.join("window-config");
+        let configured = discover(
+            &shell,
+            root,
+            Some(launcher),
+            Some(profile.as_os_str()),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(
+            std::env::split_paths(&configured).next(),
+            Some(profile.join("tools")),
         );
     }
 

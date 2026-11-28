@@ -2767,14 +2767,18 @@ fn start_publishing(
         // The same refresh Accounts uses, on the connection's worker and
         // before constructors or preflight inspect the provider executable.
         // A checkpoint batch can share its successor's first shell read.
-        let caller = execution_environment.0.get("PATH").map(String::as_str);
-        daemon_shell_search_path(caller, restart_launch.is_none()).and_then(|shell_path| {
+        // Use the request's user-scoped launcher settings here. A saved or
+        // project recipe can set provider environment, but cannot select the
+        // profile the daemon's discovery shell runs.
+        let caller = &execution_environment.0;
+        daemon_shell_search_path(Some(caller), restart_launch.is_none()).and_then(|shell_path| {
             let selected = recorded_process_launch
                 .recipe
                 .environment
                 .get("PATH")
                 .map(String::as_str);
-            resolve_provider_path(&mut process_launch.recipe, selected, caller, &shell_path)
+            let launcher = caller.get("PATH").map(String::as_str);
+            resolve_provider_path(&mut process_launch.recipe, selected, launcher, &shell_path)
         })
     } else {
         None
@@ -6255,7 +6259,10 @@ fn prepare_native_process_launch(
 }
 
 #[cfg(target_os = "linux")]
-fn daemon_shell_search_path(caller: Option<&str>, refresh: bool) -> Option<std::ffi::OsString> {
+fn daemon_shell_search_path(
+    caller: Option<&BTreeMap<String, String>>,
+    refresh: bool,
+) -> Option<std::ffi::OsString> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

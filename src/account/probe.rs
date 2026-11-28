@@ -646,7 +646,11 @@ pub async fn refresh_search_path() -> Option<OsString> {
 
 async fn read_search_path() -> Option<OsString> {
     #[cfg(target_os = "linux")]
-    return read_linux_search_path(login_path::launcher_path()).await;
+    return read_linux_search_path(
+        login_path::launcher_path(),
+        std::env::var_os("XDG_CONFIG_HOME"),
+    )
+    .await;
     #[cfg(not(target_os = "linux"))]
     {
         let shell = crate::model::login_shell().ok()?;
@@ -655,22 +659,44 @@ async fn read_search_path() -> Option<OsString> {
 }
 
 #[cfg(target_os = "linux")]
-async fn read_linux_search_path(inherited: Option<OsString>) -> Option<OsString> {
-    tokio::task::spawn_blocking(move || login_path::discovery_path(inherited.as_deref()))
-        .await
-        .ok()
-        .flatten()
+async fn read_linux_search_path(
+    inherited: Option<OsString>,
+    config_home: Option<OsString>,
+) -> Option<OsString> {
+    tokio::task::spawn_blocking(move || {
+        login_path::discovery_path(inherited.as_deref(), config_home.as_deref())
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
-/// A local client can have a different launcher PATH from the daemon. Use it
-/// as the input to the same shell read Accounts makes in that client. Keep the
-/// daemon's shared discovery cache scoped to its own launcher environment.
+/// Use the local client's launcher PATH and XDG profile as Accounts does.
+/// Remote windows and daemon-owned launches supply no caller environment.
+/// Preserve the daemon cache for its own profile only.
 #[cfg(all(feature = "host", target_os = "linux"))]
-pub async fn launch_shell_search_path(caller: Option<&str>, refresh: bool) -> Option<OsString> {
-    if let Some(path) = caller.map(OsStr::new)
-        && Some(path) != login_path::launcher_path().as_deref()
-    {
-        return read_linux_search_path(Some(path.to_owned())).await;
+pub async fn launch_shell_search_path(
+    caller: Option<&std::collections::BTreeMap<String, String>>,
+    refresh: bool,
+) -> Option<OsString> {
+    let daemon_path = login_path::launcher_path();
+    let daemon_config = std::env::var_os("XDG_CONFIG_HOME");
+    if let Some(caller) = caller {
+        let caller_path = caller.get("PATH").map(OsStr::new);
+        let caller_config = caller.get("XDG_CONFIG_HOME").map(OsStr::new);
+        let path = caller_path.or(daemon_path.as_deref());
+        // A launcher snapshot can select the shell's default XDG profile by
+        // leaving the variable unset. A request supplying only credentials
+        // does not carry a launcher snapshot.
+        let config = if caller_path.is_some() || caller_config.is_some() {
+            caller_config
+        } else {
+            daemon_config.as_deref()
+        };
+        if path != daemon_path.as_deref() || config != daemon_config.as_deref() {
+            return read_linux_search_path(path.map(OsStr::to_owned), config.map(OsStr::to_owned))
+                .await;
+        }
     }
     if refresh {
         refresh_search_path().await;
