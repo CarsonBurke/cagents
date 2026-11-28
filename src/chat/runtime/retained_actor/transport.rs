@@ -2859,6 +2859,38 @@ fn acknowledge_late(
     });
     receiver
 }
+fn validate_attachment(
+    request: &Invocation,
+    epoch: uuid::Uuid,
+    proof: &HostSessionProof,
+    close_only: bool,
+) -> Result<(), String> {
+    if request.epoch != Some(epoch) || &request.proof != proof {
+        return Err(
+            "Retained actor attachment was superseded; stale input and ACKs are refused".into(),
+        );
+    }
+    if close_only && !close_only_method(&request.method) {
+        return Err(close_only_refusal());
+    }
+    Ok(())
+}
+
+fn presentation_metadata(response: &crate::terminal_ipc::ServerResponse) -> Option<&Snapshot> {
+    match response {
+        crate::terminal_ipc::ServerResponse::ChatSnapshot { snapshot, .. } => snapshot.as_ref(),
+        crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. } => Some(&update.metadata),
+        _ => None,
+    }
+}
+
+fn validate_presentation_codec(version: u16) -> Result<(), String> {
+    if version != crate::terminal_ipc::PROTOCOL_VERSION {
+        return Err("Retained binary presentation requires a matching wire version".into());
+    }
+    Ok(())
+}
+
 fn close_only_refusal() -> String {
     "This retained actor attachment is close-only; provider input and ownership preservation are refused".into()
 }
@@ -2981,6 +3013,7 @@ struct Server {
     environment: crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment: BTreeMap<String, String>,
     listener: UnixListener,
+    reads: Option<Arc<reads::Reads>>,
     socket: PathBuf,
     socket_identity: (u64, u64),
     _directory: Option<Arc<File>>,
@@ -3174,6 +3207,7 @@ impl Server {
                 environment,
                 recovery_environment: startup.recovery_environment,
                 listener,
+                reads: None,
                 socket,
                 socket_identity,
                 _directory: directory,
@@ -3214,19 +3248,18 @@ impl Server {
         {
             return Err(loss.reason);
         }
+        let reset = self.actor.0.cache_reader.epoch();
         let response = self.actor.presentation(id, after);
-        let snapshot = match &response {
-            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                snapshot: Some(snapshot),
-                ..
-            }) => Some(snapshot),
-            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                Some(&update.metadata)
-            }
-            _ => None,
-        };
-        if let Some(snapshot) = snapshot {
+        if let Some(snapshot) = response.as_ref().and_then(presentation_metadata) {
             self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+            if let Some(reads) = &self.reads
+                && matches!(
+                    response,
+                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot { .. })
+                )
+            {
+                reads.cache_serial_snapshot(snapshot.clone(), reset);
+            }
         }
         Ok(response)
     }
@@ -3612,19 +3645,13 @@ impl Server {
             self.close_only = close_only;
             self.attachment_preserved = false;
             self.proof = request.proof;
+            self.publish_read_fence();
             if self.closed_snapshot.is_some() {
                 self.publish_close()?;
             }
             return serde_json::to_value(self.attached()?).map_err(|error| error.to_string());
         }
-        if request.epoch != Some(self.epoch) || request.proof != self.proof {
-            return Err(
-                "Retained actor attachment was superseded; stale input and ACKs are refused".into(),
-            );
-        }
-        if self.close_only && !close_only_method(&request.method) {
-            return Err(close_only_refusal());
-        }
+        validate_attachment(&request, self.epoch, &self.proof, self.close_only)?;
         macro_rules! decode {
             ($type:ty) => {
                 serde_json::from_value::<$type>(request.args).map_err(|error| error.to_string())?
@@ -3978,6 +4005,7 @@ impl Server {
             }
             "snapshot" => {
                 let (after,) = decode!((Option<u64>,));
+                let reset = self.actor.0.cache_reader.epoch();
                 let mut snapshot = self.actor.snapshot(after);
                 if let Some(snapshot) = &mut snapshot
                     && let Some(loss) = self
@@ -3994,6 +4022,9 @@ impl Server {
                         snapshot.session_id.as_deref(),
                         &snapshot.native_continuity,
                     )?;
+                }
+                if let (Some(reads), Some(snapshot)) = (&self.reads, &snapshot) {
+                    reads.cache_serial_snapshot(snapshot.clone(), reset);
                 }
                 value!(snapshot)
             }
@@ -4044,6 +4075,7 @@ impl Server {
                 confirm_installed_snapshot(
                     &mut self.actor.0.state.lock().unwrap_or_else(|p| p.into_inner()),
                 );
+                self.publish_read_fence();
                 self.changed.fetch_add(1, Ordering::Release);
                 Ok(Value::Null)
             }
@@ -4112,6 +4144,7 @@ impl Server {
                 self.source = source;
                 self.execution_console = console;
                 self.paired_holder = pair;
+                self.publish_read_fence();
                 Ok(Value::Null)
             }
             "close_if_idle" => {
@@ -4384,8 +4417,15 @@ impl Server {
             detached_cleanup_proved: self.actor.detached_cleanup_proved(),
         })
     }
+    fn publish_read_fence(&self) {
+        if let Some(reads) = &self.reads {
+            reads.publish(self);
+        }
+    }
+
     /// `children` wakes the loop to reap exited orphans; see [`OrphanSweep`].
     fn serve(&mut self, startup: UnixStream, children: Option<ChildEvents>) -> Result<(), String> {
+        let reads = Arc::new(reads::Reads::new(self, &startup)?);
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
@@ -4395,29 +4435,24 @@ impl Server {
             .set_nonblocking(true)
             .map_err(|error| error.to_string())?;
         let connections = connections::Connections::new()?;
+        let listening = connections.listen(&self.listener, reads.clone())?;
+        self.reads = Some(reads.clone());
         let mut orphans = OrphanSweep::new(children);
         let mut child_exited = false;
         'serve: loop {
             orphans.run_if_due(std::mem::take(&mut child_exited));
             self.finish_inputs();
+            reads.announce_when_readable(&self.actor);
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
                 self.reap_provider_orphans()?;
                 break;
             }
-            let accepting = connections.has_capacity();
             let mut events = vec![libc::pollfd {
                 fd: connections.wakeup(),
                 events: libc::POLLIN,
                 revents: 0,
             }];
-            if accepting {
-                events.push(libc::pollfd {
-                    fd: self.listener.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                });
-            }
             if !self.installed {
                 // Hangup is always reported; no other startup event matters.
                 events.push(libc::pollfd {
@@ -4434,10 +4469,10 @@ impl Server {
                 });
                 events.len() - 1
             });
-            // An admitted input's completion has no wakeup of its own, so
-            // poll for it only while some are pending.
+            // Input completion and the Store becoming available have no
+            // wakeup of their own. Poll only when a caller needs either.
             let mut wait = orphans.until_due();
-            if !self.pending.is_empty() {
+            if !self.pending.is_empty() || reads.needs_refresh() {
                 wait = Some(wait.map_or(INPUT_COMPLETION_POLL, |wait| {
                     wait.min(INPUT_COMPLETION_POLL)
                 }));
@@ -4455,14 +4490,7 @@ impl Server {
                 return Err(error.to_string());
             }
             child_exited = exits.is_some_and(|index| events[index].revents != 0);
-            while accepting && connections.has_capacity() {
-                match crate::descriptor::accept(&self.listener) {
-                    Ok((control, _)) => connections.admit(control),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    Err(error) => return Err(error.to_string()),
-                }
-            }
+            listening.check()?;
             while let Some(call) = connections.next() {
                 let _timing = call.timing();
                 // As before each accept: a hung-up uninstalled helper serves
@@ -4501,6 +4529,9 @@ impl Server {
                 // Only an explicit retirement after durable semantic ACK exits
                 // the helper; a lost provider-close reply retains its journal.
                 let finished = close && response.is_ok();
+                if finished {
+                    reads.stop();
+                }
                 let delivery = reply.send(connections::Answer::Value(response));
                 if finished {
                     // The client hears that retirement succeeded before the
@@ -4510,7 +4541,11 @@ impl Server {
                 }
                 orphans.run();
             }
+            // A queued call can share the wake for an acceptor failure.
+            listening.check()?;
         }
+        drop(listening);
+        self.reads = None;
         if std::fs::symlink_metadata(&self.socket)
             .is_ok_and(|metadata| (metadata.dev(), metadata.ino()) == self.socket_identity)
         {
@@ -4968,6 +5003,9 @@ mod identity_tests;
 #[cfg(test)]
 #[path = "transport_deadline_tests.rs"]
 mod deadline_tests;
+
+#[path = "transport_reads.rs"]
+mod reads;
 
 #[path = "transport_connections.rs"]
 mod connections;

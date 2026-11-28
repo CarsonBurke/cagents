@@ -5,11 +5,20 @@ mod file_changes;
 mod text_copy;
 mod unread;
 use super::observed_at;
-use crate::chat::{Event, Item, ItemContent, Phase, Role};
+use crate::chat::{Command, Event, Item, ItemContent, Phase, Role};
 use base64::Engine as _;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
-use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
+use std::{
+    fs,
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 pub use unread::Unread;
 
 /// Keep storage failures distinct from malformed provider events until the
@@ -167,6 +176,7 @@ enum Fill {
 
 pub struct Store {
     db: Connection,
+    reader: CacheReader,
     pub(super) diagnostics: super::child_diagnostics::Backing,
     copy_cache: uuid::Uuid,
     copy_revision: u64,
@@ -219,6 +229,75 @@ pub struct Store {
     messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
 }
 
+/// A reader of the live cache. Each request sees one committed WAL snapshot,
+/// including its cursor authority and the chunks it names.
+#[derive(Clone)]
+pub(super) struct CacheReader {
+    path: PathBuf,
+    epoch: Arc<AtomicU64>,
+}
+impl CacheReader {
+    pub(super) fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    pub(super) fn file_query(
+        &self,
+        command: &Command,
+    ) -> Result<Option<crate::chat::FileChangeReply>, String> {
+        self.read(|db| file_changes::FileIndex(db).query(command))
+    }
+
+    pub(super) fn text_copy(
+        &self,
+        source: &crate::chat::TextCopySource,
+        offset: u64,
+    ) -> Result<crate::chat::TextCopyPage, String> {
+        self.read(|db| {
+            let cache = db
+                .query_row("SELECT id FROM copy_cache", [], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                })
+                .map_err(|error| error.to_string())?;
+            let cache = uuid::Uuid::from_slice(&cache).map_err(|error| error.to_string())?;
+            text_copy::text_copy(db, cache, source, offset)
+        })
+    }
+
+    fn read<T>(&self, read: impl FnOnce(&Connection) -> Result<T, String>) -> Result<T, String> {
+        let mut db =
+            Connection::open_with_flags(&self.path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .map_err(|error| error.to_string())?;
+        // WAL readers normally proceed while persistence writes. Keep
+        // SQLite's own wait bounded if it needs to recover the WAL.
+        db.busy_timeout(std::time::Duration::from_millis(100))
+            .map_err(|error| error.to_string())?;
+        let snapshot = db.transaction().map_err(|error| error.to_string())?;
+        read(&snapshot)
+    }
+}
+
+fn read_field(
+    db: &Connection,
+    id: &str,
+    field: i64,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>, StoreError> {
+    if end <= start {
+        return Ok(Vec::new());
+    }
+    let mut statement = db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM chunks WHERE id=?1 AND field=?2 AND position>=COALESCE((SELECT MAX(position) FROM chunks WHERE id=?1 AND field=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position")?;
+    let rows = statement.query_map(params![id, field, start as i64, end as i64], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    let mut result = Vec::with_capacity(end - start);
+    for row in rows {
+        result.extend(row?);
+    }
+    Ok(result)
+}
+
 fn prefer_opening(
     earlier: Option<crate::chat::OpeningTitle>,
     later: Option<crate::chat::OpeningTitle>,
@@ -233,6 +312,14 @@ fn prefer_opening(
 }
 
 impl Store {
+    pub(super) fn invalidate_presentations(&self) {
+        self.reader.epoch.fetch_add(1, Ordering::AcqRel);
+    }
+
+    pub(super) fn reader(&self) -> CacheReader {
+        self.reader.clone()
+    }
+
     pub(super) fn directory(&self) -> &std::path::Path {
         &self.directory
     }
@@ -450,9 +537,15 @@ impl Store {
                 .map_err(|e| e.to_string())?;
             db.execute_batch(text_copy::SCHEMA)
                 .map_err(|e| e.to_string())?;
+            let copy_cache = uuid::Uuid::new_v4();
+            db.execute(
+                "INSERT INTO copy_cache VALUES(?1)",
+                [copy_cache.as_bytes().as_slice()],
+            )
+            .map_err(|e| e.to_string())?;
             Ok(Self {
                 diagnostics: Default::default(),
-                copy_cache: uuid::Uuid::new_v4(),
+                copy_cache,
                 copy_revision: 0,
                 copy_projection: Default::default(),
                 file_revision: 0,
@@ -464,6 +557,10 @@ impl Store {
                 file_cwd: None,
                 presented_file_changes: None,
                 db,
+                reader: CacheReader {
+                    path,
+                    epoch: Arc::default(),
+                },
                 directory: directory.clone(),
                 _lease: lease,
                 end: None,
@@ -501,7 +598,7 @@ impl Store {
     }
     /// A single large transaction can grow the WAL past the autocheckpoint
     /// size; truncate it now rather than at the next write. Best-effort: the
-    /// store is the file's only connection, so with no busy timeout a
+    /// writer has no busy timeout, so a
     /// checkpoint blocked by a reader returns at once and the next write
     /// retries it.
     fn trim_wal(&self) {
@@ -679,8 +776,10 @@ impl Store {
         }
         if metadata.len() > METADATA_LIMIT {
             if matches!(&item.content, ItemContent::Changes { .. }) {
-                self.file_index_incomplete = true;
-                self.files_removed(std::slice::from_ref(&item.id))?;
+                self.with_file_index(|store| {
+                    store.file_index_incomplete = true;
+                    store.files_removed(std::slice::from_ref(&item.id))
+                })?;
             }
             return Ok(Some(format!(
                 "Provider item {} exceeds the 64 KiB identity budget and was not cached",
@@ -706,34 +805,44 @@ impl Store {
             Some((_, body)) => self.copy_parent_prefix(&item.id, body)?,
             None => false,
         };
-        let transaction = self.db.transaction()?;
-        let index_spans = spans.clone();
-        let spans = postcard::to_stdvec(&spans)?;
-        transaction.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,spans])?;
-        if preserve_input {
-            transaction.execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])?;
-        } else {
-            transaction.execute("DELETE FROM chunks WHERE id=?1", [&item.id])?;
-            insert_body(&transaction, &item.id, 0, 0, &body0)?;
-        }
-        insert_body(&transaction, &item.id, 1, 0, &body1)?;
-        insert_body(&transaction, &item.id, 2, 0, &body2)?;
-        let copy_invalidated = Self::copy_parent_put(
-            &transaction,
-            &item.id,
-            copy_body.map(|(field, body)| (field, body.len())),
-            copy_prefix,
-        )?;
-        transaction.commit()?;
+        let (copy_invalidated, indexed) = self.with_file_index(|store| {
+            let db = &store.db;
+            let encoded_spans = postcard::to_stdvec(&spans)?;
+            db.execute("INSERT INTO items VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,len0=excluded.len0,len1=excluded.len1,len2=excluded.len2,spans=excluded.spans", params![item.id,ordinal,metadata,len0,body1.len() as i64,body2.len() as i64,encoded_spans])?;
+            if preserve_input {
+                db.execute("DELETE FROM chunks WHERE id=?1 AND field=1", [&item.id])?;
+            } else {
+                db.execute("DELETE FROM chunks WHERE id=?1", [&item.id])?;
+                insert_body(db, &item.id, 0, 0, &body0)?;
+            }
+            insert_body(db, &item.id, 1, 0, &body1)?;
+            insert_body(db, &item.id, 2, 0, &body2)?;
+            let copy_invalidated = Self::copy_parent_put(
+                db,
+                &item.id,
+                copy_body.map(|(field, body)| (field, body.len())),
+                copy_prefix,
+            )?;
+            let indexed = store.with_file_index(|store| {
+                if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
+                    store.file_index_incomplete = true;
+                    store.files_removed(std::slice::from_ref(&item.id))
+                } else {
+                    store.index_file_item(&item, "", ordinal, older, &body0, &spans)
+                }
+            });
+            if indexed.is_err() {
+                // Copy authority commits with its replacement body even
+                // when indexing fails. Do not serve old edit cursors over
+                // those new chunks.
+                store.db.execute("UPDATE file_metadata SET valid=0", [])?;
+            }
+            Ok((copy_invalidated, indexed))
+        })?;
         if copy_invalidated {
             self.copy_revision = self.copy_revision.wrapping_add(1);
         }
-        if shortened && matches!(&item.content, ItemContent::Changes { .. }) {
-            self.file_index_incomplete = true;
-            self.files_removed(std::slice::from_ref(&item.id))?;
-        } else {
-            self.index_file_item(&item, "", ordinal, older, &body0, &index_spans)?;
-        }
+        indexed?;
         self.changed(&item.id);
         self.dirty = true;
         Ok(warning)
@@ -916,8 +1025,10 @@ impl Store {
             "UPDATE file_totals SET revision=?1 WHERE source=''",
             [self.file_revision.saturating_add(1)],
         )?;
+        let revision = self.file_revision.saturating_add(1);
+        transaction.execute("UPDATE file_metadata SET revision=?1", [revision])?;
         transaction.commit()?;
-        self.file_revision = self.file_revision.saturating_add(1);
+        self.file_revision = revision;
         self.end = end;
         self.first = first;
         self.newest = newest;
@@ -1000,6 +1111,16 @@ impl Store {
         event: Event,
     ) -> Result<Vec<Event>, crate::chat::protocol::SetupError> {
         self.apply_inner(event).map_err(Into::into)
+    }
+
+    fn set_provider_earlier(&mut self, has_earlier: bool) -> Result<(), StoreError> {
+        if self.provider_earlier == has_earlier {
+            return Ok(());
+        }
+        self.with_file_index(|store| {
+            store.provider_earlier = has_earlier;
+            Ok(())
+        })
     }
 
     fn clear_opening(&mut self) {
@@ -1085,7 +1206,12 @@ impl Store {
                 _ => {}
             }
         }
-        self.index_child_event(&event)?;
+        if matches!(
+            event,
+            Event::SubagentItem { .. } | Event::SubagentItemsRemoved { .. }
+        ) {
+            self.with_file_index(|store| store.index_child_event(&event))?;
+        }
         let mut out = Vec::new();
         self.observe_opening(&event, &mut out);
         let earlier = matches!(&event, Event::History { .. });
@@ -1170,11 +1296,19 @@ impl Store {
                     self.pending_earlier = None;
                     self.pending_pivot = None;
                 }
-                self.provider_earlier = has_earlier;
+                // A newly incomplete history is visible from the start
+                // of ingestion. A final page becomes complete only after
+                // all its edits have committed.
+                if has_earlier {
+                    self.set_provider_earlier(true)?;
+                }
                 self.fill = Fill::Idle;
                 let mut seen = std::collections::BTreeSet::new();
                 items.retain(|item| seen.insert(item.id.clone()));
                 let warnings = self.merge_history(items, earlier)?;
+                if !has_earlier {
+                    self.set_provider_earlier(false)?;
+                }
                 if !earlier {
                     self.latest_boundary = None;
                 }
@@ -1227,22 +1361,40 @@ impl Store {
                 return Ok(out);
             }
             Event::ItemsRemoved { ids } => {
-                self.files_removed(&ids)?;
-                self.copy_remove(&ids)?;
-                let transaction = self.db.transaction()?;
-                for id in ids {
-                    transaction.execute("DELETE FROM items WHERE id=?1", [id])?;
+                let copy_invalidated = self.with_file_index(|store| {
+                    store.files_removed(&ids)?;
+                    let mut invalidated = false;
+                    for id in ids {
+                        invalidated |= store
+                            .db
+                            .execute("DELETE FROM copy_sources WHERE item=?1", [&id])?
+                            > 0;
+                        store.db.execute("DELETE FROM items WHERE id=?1", [&id])?;
+                    }
+                    Ok(invalidated)
+                })?;
+                if copy_invalidated {
+                    self.copy_revision = self.copy_revision.wrapping_add(1);
                 }
-                transaction.commit()?;
                 self.dirty = true;
             }
             Event::Reset { reason } => {
-                self.files_reset()?;
-                self.db.execute("DELETE FROM copy_sources", [])?;
-                self.copy_cache = uuid::Uuid::new_v4();
+                self.invalidate_presentations();
+                let copy_cache = uuid::Uuid::new_v4();
+                self.with_file_index(|store| {
+                    store.files_reset()?;
+                    store.provider_earlier = false;
+                    store.db.execute("DELETE FROM copy_sources", [])?;
+                    store.db.execute(
+                        "UPDATE copy_cache SET id=?1",
+                        [copy_cache.as_bytes().as_slice()],
+                    )?;
+                    store.db.execute("DELETE FROM items", [])?;
+                    Ok(())
+                })?;
+                self.copy_cache = copy_cache;
                 self.copy_revision = self.copy_revision.wrapping_add(1);
                 self.copy_projection.clear();
-                self.db.execute("DELETE FROM items", [])?;
                 self.end = None;
                 self.first = None;
                 self.newest = None;
@@ -1250,7 +1402,6 @@ impl Store {
                 self.forward = None;
                 self.slide = None;
                 self.paging = false;
-                self.provider_earlier = false;
                 self.cached_earlier = false;
                 self.pending_earlier = None;
                 self.pending_pivot = None;
@@ -1521,18 +1672,7 @@ impl Store {
         self.dirty = true;
     }
     fn field(&self, id: &str, field: i64, start: usize, end: usize) -> Result<Vec<u8>, StoreError> {
-        if end <= start {
-            return Ok(Vec::new());
-        }
-        let mut statement = self.db.prepare_cached("SELECT substr(data,MAX(?3-position,0)+1,MIN(position+length(data),?4)-MAX(position,?3)) FROM chunks WHERE id=?1 AND field=?2 AND position>=COALESCE((SELECT MAX(position) FROM chunks WHERE id=?1 AND field=?2 AND position<=?3),?3) AND position<?4 AND position+length(data)>?3 ORDER BY position")?;
-        let rows = statement.query_map(params![id, field, start as i64, end as i64], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?;
-        let mut result = Vec::with_capacity(end - start);
-        for row in rows {
-            result.extend(row?);
-        }
-        Ok(result)
+        read_field(&self.db, id, field, start, end)
     }
     /// Where the character at or before `target` in one field starts.
     fn boundary(&self, id: &str, field: i64, target: usize) -> Result<usize, StoreError> {
@@ -1636,6 +1776,11 @@ impl Store {
         let revision = self.file_revision.saturating_add(1);
         let files_stopped =
             file_changes::stop_running_edits(&transaction, revision).map_err(|e| e.to_string())?;
+        if files_stopped {
+            transaction
+                .execute("UPDATE file_metadata SET revision=?1", [revision])
+                .map_err(|e| e.to_string())?;
+        }
         transaction.commit().map_err(|e| e.to_string())?;
         if files_stopped {
             self.file_revision = revision;
@@ -2187,7 +2332,7 @@ fn layout(content: &ItemContent) -> &'static str {
     }
 }
 fn insert_body(
-    transaction: &rusqlite::Transaction<'_>,
+    transaction: &Connection,
     id: &str,
     field: i64,
     offset: i64,

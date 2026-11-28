@@ -3,7 +3,12 @@
 use super::super::Update;
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
-use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt, path::Path};
+use std::{
+    fs::OpenOptions,
+    os::unix::fs::OpenOptionsExt,
+    path::Path,
+    sync::{Arc, Mutex},
+};
 
 const DEFAULT_BUDGET: usize = 64 * 1024 * 1024;
 const MAX_ENTRIES: usize = 4096;
@@ -99,6 +104,14 @@ pub struct ContinuityLoss {
     pub reason: String,
     pub acknowledged: bool,
 }
+/// Publication facts that a presentation can inspect without holding the
+/// journal's writer lock across a transcript read.
+#[derive(Default)]
+pub(super) struct ReadPublication {
+    pub(super) sources: Arc<Vec<crate::chat::Session>>,
+    pub(super) loss: Option<Arc<str>>,
+}
+
 pub(super) struct Journal {
     db: Connection,
     retention: crate::transcript_cache::ActorJournalRetention,
@@ -116,7 +129,8 @@ pub(super) struct Journal {
     /// Real turn boundary and the last semantic outcome ordered before it.
     /// Lives with this exact helper, as do all unresolved publications.
     attention_turn: Option<(u64, u64)>,
-    published_sources: Vec<crate::chat::Session>,
+    published_sources: Arc<Vec<crate::chat::Session>>,
+    read_publication: Arc<Mutex<ReadPublication>>,
 }
 /// Context is optional enrichment. Invalid enrichment must not erase the
 /// independently authoritative evidence or block later execution settlements.
@@ -182,7 +196,8 @@ impl Journal {
             outcome_latest: 0,
             waiting_attention: Some(WaitingAttention::Unknown),
             attention_turn: None,
-            published_sources: Vec::new(),
+            published_sources: Arc::default(),
+            read_publication: Arc::default(),
         })
     }
     /// Exact descriptors issued by this live helper. This is not a provider
@@ -200,7 +215,7 @@ impl Journal {
         if self.published_sources.len() >= 1024 {
             return Err("Retained source lineage capacity reached".into());
         }
-        let mut sources = self.published_sources.clone();
+        let mut sources = self.published_sources.as_ref().clone();
         sources.push(source.clone());
         let bytes = serde_json::to_vec(&sources).map_err(|error| error.to_string())?;
         if bytes.len() > 4 * 1024 * 1024 {
@@ -215,12 +230,20 @@ impl Journal {
         )
         .map_err(|error| error.to_string())?;
         tx.commit().map_err(|error| error.to_string())?;
-        self.published_sources = sources;
+        self.published_sources = Arc::new(sources);
+        self.read_publication
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .sources = self.published_sources.clone();
         Ok(())
     }
 
     pub fn published_sources(&self) -> &[crate::chat::Session] {
         &self.published_sources
+    }
+
+    pub(super) fn read_publication(&self) -> Arc<Mutex<ReadPublication>> {
+        self.read_publication.clone()
     }
 
     pub fn continuity_loss(&self) -> Result<Option<ContinuityLoss>, String> {
@@ -238,6 +261,13 @@ impl Journal {
                 reason: reason.chars().take(4096).collect(),
                 acknowledged: false,
             });
+            self.read_publication
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .loss = self
+                .last_loss
+                .as_ref()
+                .map(|loss| Arc::from(loss.reason.as_str()));
         }
         let loss = self.last_loss.as_ref().unwrap();
         self.db
@@ -286,6 +316,10 @@ impl Journal {
             self.finished_runs.remove(&run);
         }
         self.last_loss = None;
+        self.read_publication
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .loss = None;
         Ok(())
     }
     /// Journal `update`, which followed the provider's `confirmed_session`.

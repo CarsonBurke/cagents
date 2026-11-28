@@ -5,13 +5,16 @@ use crate::chat::{
     FileChangeSummary, FileChangesCoverage, FileChangesSummary, FilePatchCursor, Item, ItemContent,
     Snapshot, ToolStatus,
 };
-use rusqlite::{OptionalExtension, Transaction, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
 const FILES: usize = 128;
 const PATCHES: usize = 32;
 const PATCH_BYTES: usize = 256 * 1024;
 
 pub(super) const SCHEMA: &str = "
+CREATE TABLE file_metadata(revision INTEGER NOT NULL, keys INTEGER NOT NULL, applied INTEGER NOT NULL,
+ earlier INTEGER NOT NULL, delegated INTEGER NOT NULL, incomplete INTEGER NOT NULL, valid INTEGER NOT NULL);
+INSERT INTO file_metadata VALUES(0,0,0,0,0,0,1);
 CREATE TABLE file_edits(source TEXT NOT NULL,item_id TEXT NOT NULL,file_index INTEGER NOT NULL,
  ordinal INTEGER NOT NULL,path TEXT NOT NULL,kind BLOB NOT NULL,status BLOB NOT NULL,
  imported INTEGER NOT NULL,additions INTEGER,deletions INTEGER,start INTEGER NOT NULL,len INTEGER NOT NULL,
@@ -253,36 +256,52 @@ impl Store {
         }
         Ok(!rows.is_empty())
     }
-    /// `body`/`spans` are the already-extracted main item patch body. Child
-    /// patches have their own chunks because child resident windows can evict.
-    pub(super) fn index_file_item(
+    /// Keep the file index and the transcript chunks it refers to in the
+    /// same committed view for readers on another SQLite connection.
+    pub(super) fn with_file_index<T>(
         &mut self,
-        item: &Item,
-        source: &str,
-        ordinal: i64,
-        imported: bool,
-        body: &str,
-        spans: &[usize],
-    ) -> Result<(), StoreError> {
+        write: impl FnOnce(&mut Self) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        let before = self.file_metadata();
         self.db.execute_batch("SAVEPOINT file_index")?;
-        let revision = self.file_revision;
-        let counts = (self.file_keys, self.applied_files);
-        match self.index_file_item_inner(item, source, ordinal, imported, body, spans) {
-            Ok(()) => self
-                .db
-                .execute_batch("RELEASE file_index")
-                .map_err(StoreError::from),
-            Err(error) => {
-                let _ = self
-                    .db
-                    .execute_batch("ROLLBACK TO file_index; RELEASE file_index");
-                self.file_revision = revision;
-                (self.file_keys, self.applied_files) = counts;
-                Err(error)
+        let result = write(self).and_then(|value| {
+            if before != self.file_metadata() {
+                self.db.execute(
+                    "UPDATE file_metadata SET revision=?1,keys=?2,applied=?3,earlier=?4,delegated=?5,incomplete=?6",
+                    self.file_metadata(),
+                )?;
             }
+            self.db.execute_batch("RELEASE file_index")?;
+            Ok(value)
+        });
+        if result.is_err() {
+            let _ = self
+                .db
+                .execute_batch("ROLLBACK TO file_index; RELEASE file_index");
+            (
+                self.file_revision,
+                self.file_keys,
+                self.applied_files,
+                self.provider_earlier,
+                self.child_files_seen,
+                self.file_index_incomplete,
+            ) = before;
         }
+        result
     }
-    fn index_file_item_inner(
+    fn file_metadata(&self) -> (u64, usize, usize, bool, bool, bool) {
+        (
+            self.file_revision,
+            self.file_keys,
+            self.applied_files,
+            self.provider_earlier,
+            self.child_files_seen,
+            self.file_index_incomplete,
+        )
+    }
+    /// `body` and `spans` describe the extracted parent patch. Child patches
+    /// have their own chunks because their resident windows can evict.
+    pub(super) fn index_file_item(
         &mut self,
         item: &Item,
         source: &str,
@@ -409,6 +428,7 @@ impl Store {
         self.child_files_seen = false;
         self.file_index_incomplete = false;
         self.db.execute("DELETE FROM file_paths", [])?;
+        self.db.execute("UPDATE file_metadata SET valid=1", [])?;
         self.file_keys = 0;
         self.applied_files = 0;
         Ok(())
@@ -419,10 +439,34 @@ impl Store {
             || state.file_changes.coverage.has_incomplete_delegated_history != self.child_files_seen
             || state.file_changes.coverage.has_uncached_changes != self.file_index_incomplete
         {
-            state.file_changes = self.files_summary(0, None)?.into();
+            let index = FileIndex(&self.db);
+            index.require_valid()?;
+            state.file_changes = index.files_summary(0, None)?.into();
         }
         Ok(())
     }
+    #[cfg(test)]
+    fn file_query(
+        &self,
+        command: &Command,
+    ) -> Result<Option<crate::chat::FileChangeReply>, String> {
+        FileIndex(&self.db).query(command)
+    }
+}
+
+pub(super) struct FileIndex<'a>(pub(super) &'a Connection);
+impl FileIndex<'_> {
+    fn require_valid(&self) -> Result<(), String> {
+        let valid: bool = self
+            .0
+            .query_row("SELECT valid FROM file_metadata", [], |row| row.get(0))
+            .map_err(|error| error.to_string())?;
+        if !valid {
+            return Err("The cached file edit index could not be updated".into());
+        }
+        Ok(())
+    }
+
     fn files_summary(
         &self,
         request_id: u64,
@@ -431,7 +475,7 @@ impl Store {
         let (after_source, after_path) = after
             .map(|k| (source_key(&k.source), k.path.clone()))
             .unwrap_or_default();
-        let mut statement=self.db.prepare_cached("SELECT source,path,succeeded,pending,failed,imported,additions,deletions,unknown,
+        let mut statement=self.0.prepare_cached("SELECT source,path,succeeded,pending,failed,imported,additions,deletions,unknown,
             COALESCE((SELECT kind FROM file_edits e WHERE e.source=t.source AND e.path=t.path AND status=?5 ORDER BY ordinal DESC,file_index DESC LIMIT 1),
             (SELECT kind FROM file_edits e WHERE e.source=t.source AND e.path=t.path ORDER BY ordinal DESC,file_index DESC LIMIT 1)),revision,resolved
             FROM file_totals t WHERE (?1=0 OR (source,path)>(?2,?3)) ORDER BY source,path LIMIT ?4").map_err(|e|e.to_string())?;
@@ -504,19 +548,36 @@ impl Store {
             bytes += size;
             files.push(file);
         }
+        let (revision, total_files, applied_files, earlier, delegated, incomplete) = self
+            .0
+            .query_row(
+                "SELECT revision,keys,applied,earlier,delegated,incomplete FROM file_metadata",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .map_err(|error| error.to_string())?;
         Ok(FileChangesSummary {
             request_id,
-            revision: self.file_revision,
+            revision,
             files,
-            total_files: self.file_keys,
-            applied_files: self.applied_files,
+            total_files,
+            applied_files,
             has_more,
             coverage: FileChangesCoverage {
-                has_unloaded_history: self.provider_earlier,
-                has_incomplete_delegated_history: self.child_files_seen,
-                has_uncached_changes: self.file_index_incomplete,
+                has_unloaded_history: earlier,
+                has_incomplete_delegated_history: delegated,
+                has_uncached_changes: incomplete,
                 has_imported_history: self
-                    .db
+                    .0
                     .query_row(
                         "SELECT EXISTS(SELECT 1 FROM file_totals WHERE imported>0)",
                         [],
@@ -526,7 +587,7 @@ impl Store {
             },
         })
     }
-    pub(crate) fn file_query(
+    pub(super) fn query(
         &self,
         command: &Command,
     ) -> Result<Option<crate::chat::FileChangeReply>, String> {
@@ -535,6 +596,7 @@ impl Store {
             Command::LoadFileChangePatches { key, .. } => Some(key),
             _ => return Ok(None),
         };
+        self.require_valid()?;
         if requested_key.is_some_and(|key| {
             source_key(&key.source).len().saturating_add(key.path.len()) > super::METADATA_LIMIT
         }) {
@@ -554,7 +616,7 @@ impl Store {
                     request_id: *request_id,
                     key: key.clone(),
                     revision: self
-                        .db
+                        .0
                         .query_row(
                             "SELECT revision FROM file_totals WHERE source=?1 AND path=?2",
                             params![source_key(&key.source), key.path],
@@ -593,13 +655,13 @@ impl Store {
             if cursor.file_index > i64::MAX as usize {
                 return Err("Invalid patch continuation index".into());
             }
-            let exists:bool=self.db.query_row("SELECT EXISTS(SELECT 1 FROM file_edits WHERE source=?1 AND path=?2 AND ordinal=?3 AND file_index=?4 AND len>=?5)",params![key,page.key.path,cursor.ordinal,cursor.file_index as i64,i64::try_from(cursor.offset).map_err(|_|"Invalid patch continuation offset")?],|r|r.get(0)).map_err(|e|e.to_string())?;
+            let exists:bool=self.0.query_row("SELECT EXISTS(SELECT 1 FROM file_edits WHERE source=?1 AND path=?2 AND ordinal=?3 AND file_index=?4 AND len>=?5)",params![key,page.key.path,cursor.ordinal,cursor.file_index as i64,i64::try_from(cursor.offset).map_err(|_|"Invalid patch continuation offset")?],|r|r.get(0)).map_err(|e|e.to_string())?;
             if !exists {
                 return Err("Patch continuation does not name a cached edit".into());
             }
         }
 
-        let mut statement=self.db.prepare_cached("SELECT item_id,file_index,ordinal,kind,status,imported,start,len,placed FROM file_edits WHERE source=?1 AND path=?2 AND (ordinal,file_index)>=(?3,?4) ORDER BY ordinal,file_index LIMIT ?5").map_err(|e|e.to_string())?;
+        let mut statement=self.0.prepare_cached("SELECT item_id,file_index,ordinal,kind,status,imported,start,len,placed FROM file_edits WHERE source=?1 AND path=?2 AND (ordinal,file_index)>=(?3,?4) ORDER BY ordinal,file_index LIMIT ?5").map_err(|e|e.to_string())?;
         let records = statement
             .query_map(
                 params![
@@ -646,9 +708,9 @@ impl Store {
             remaining -= metadata_bytes;
             let end = offset.saturating_add(remaining).min(length);
             let mut bytes = if key.is_empty() {
-                self.field(&id, 0, start + offset, start + end)?
+                super::read_field(self.0, &id, 0, start + offset, start + end)?
             } else {
-                let mut statement=self.db.prepare_cached("SELECT substr(data,MAX(?4-position,0)+1,MIN(position+length(data),?5)-MAX(position,?4)) FROM file_patch_chunks WHERE source=?1 AND item_id=?2 AND file_index=?3 AND position>=COALESCE((SELECT MAX(position) FROM file_patch_chunks WHERE source=?1 AND item_id=?2 AND file_index=?3 AND position<=?4),?4) AND position<?5 AND position+length(data)>?4 ORDER BY position").map_err(|e|e.to_string())?;
+                let mut statement=self.0.prepare_cached("SELECT substr(data,MAX(?4-position,0)+1,MIN(position+length(data),?5)-MAX(position,?4)) FROM file_patch_chunks WHERE source=?1 AND item_id=?2 AND file_index=?3 AND position>=COALESCE((SELECT MAX(position) FROM file_patch_chunks WHERE source=?1 AND item_id=?2 AND file_index=?3 AND position<=?4),?4) AND position<?5 AND position+length(data)>?4 ORDER BY position").map_err(|e|e.to_string())?;
                 let rows = statement
                     .query_map(
                         params![key, id, index as i64, offset as i64, end as i64],
@@ -761,6 +823,79 @@ mod tests {
         }
     }
     const DIFF: &str = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1,2 @@\n-old\n+new\n+another\n";
+    #[test]
+    fn reader_keeps_file_revision_and_patch_bytes_in_one_committed_view() {
+        let mut store = Store::new().unwrap();
+        let reader = store.reader();
+        let edit = |diff: &str| {
+            item(
+                "edit",
+                "a.rs",
+                diff,
+                ToolStatus::Succeeded,
+                ChangeKind::Updated,
+            )
+        };
+        let summary_query = Command::LoadFileChanges {
+            request_id: 1,
+            after: None,
+        };
+        let read_summary = || {
+            let crate::chat::FileChangeReply::Files(summary) =
+                reader.file_query(&summary_query).unwrap().unwrap()
+            else {
+                panic!("expected files");
+            };
+            summary
+        };
+        let read_patch = |revision| {
+            let crate::chat::FileChangeReply::Patches(page) = reader
+                .file_query(&Command::LoadFileChangePatches {
+                    request_id: 2,
+                    key: key("a.rs"),
+                    cursor: None,
+                    revision,
+                })
+                .unwrap()
+                .unwrap()
+            else {
+                panic!("expected patches");
+            };
+            page
+        };
+        store.apply(Event::Item(edit(DIFF))).unwrap();
+        let old = read_summary();
+        let replacement = "--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-old\n+replacement λ\n";
+
+        store.db.execute_batch("SAVEPOINT staged_write").unwrap();
+        store.apply(Event::Item(edit(replacement))).unwrap();
+        assert_eq!(read_summary(), old);
+        let old_patch = read_patch(old.files[0].revision);
+        assert_eq!(old_patch.revision, old.files[0].revision);
+        assert_eq!(old_patch.patches[0].diff, DIFF);
+
+        store.db.execute_batch("RELEASE staged_write").unwrap();
+        let new = read_summary();
+        assert!(new.revision > old.revision);
+        assert_eq!(new.total_files, 1);
+        let new_patch = read_patch(new.files[0].revision);
+        assert_eq!(new_patch.revision, new.files[0].revision);
+        assert_eq!(new_patch.patches[0].diff, replacement);
+        store
+            .db
+            .execute_batch(
+                "CREATE TRIGGER reject_file_index BEFORE INSERT ON file_edits
+             BEGIN SELECT RAISE(ABORT,'injected edit failure'); END;",
+            )
+            .unwrap();
+        let error = store.apply(Event::Item(edit(DIFF))).unwrap_err();
+        assert!(error.contains("injected edit failure"), "{error}");
+        assert_eq!(
+            reader.file_query(&summary_query).unwrap_err(),
+            "The cached file edit index could not be updated"
+        );
+    }
+
     #[test]
     fn stopping_delegated_edits_preserves_settled_contributions_and_is_idempotent() {
         let mut store = Store::new().unwrap();

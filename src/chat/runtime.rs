@@ -65,6 +65,26 @@ fn unacknowledged_command() -> Rejection {
     )
 }
 
+fn diagnostic_copy_item<'a>(
+    state: &'a Snapshot,
+    id: &str,
+    source: &super::TextCopySource,
+) -> Option<&'a Item> {
+    let index = state
+        .text_copy_sources
+        .children
+        .get(id)?
+        .iter()
+        .position(|current| current.as_ref() == Some(source))?;
+    let item = state
+        .subagents
+        .iter()
+        .find(|agent| agent.id == id)?
+        .items
+        .get(index)?;
+    child_diagnostics::marked(item).then_some(item.as_ref())
+}
+
 const FRAME_LIMIT: usize = 32 * 1024 * 1024;
 /// A settled provider has no partial frame to preserve. Keep enough space for
 /// ordinary protocol lines, but do not make every retained actor keep the
@@ -414,6 +434,7 @@ struct Inner {
     failure: Arc<Mutex<Option<String>>>,
     worker: Mutex<Option<JoinHandle<()>>>,
     store: Arc<Mutex<Store>>,
+    cache_reader: store::CacheReader,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment: BTreeMap<String, String>,
@@ -715,6 +736,7 @@ impl LocalHandle {
         let exited_recovery_queue = Arc::new(Mutex::new(None));
         let draining = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
+        let cache_reader = store.reader();
         let store = Arc::new(Mutex::new(store));
         let agent_addresses = AgentAddresses::default();
         let prompt_cache = PromptCache::default();
@@ -744,6 +766,7 @@ impl LocalHandle {
             failure: failure.clone(),
             worker: Mutex::new(None),
             store: store.clone(),
+            cache_reader,
             notify: notify.clone(),
             execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(
                 spec.environment.clone(),
@@ -1409,69 +1432,56 @@ impl LocalHandle {
         &self,
         command: &Command,
     ) -> Result<Option<super::FileChangeReply>, String> {
-        let asked = Instant::now();
-        let store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
-        // The store is shared with persistence; a query that waits long for
-        // it can miss its caller's deadline.
-        let waited = asked.elapsed();
-        if waited >= Duration::from_secs(1) {
-            tracing::warn!(
-                waited_ms = waited.as_millis() as u64,
-                "a changed files query waited for the conversation store"
-            );
-        }
-        store.file_query(command)
+        self.0.cache_reader.file_query(command)
     }
+    /// A diagnostic backing may need to clear itself on failure. Its
+    /// caller must let that read run with the owning store.
+    fn read_text_copy(
+        &self,
+        source: &super::TextCopySource,
+        offset: u64,
+    ) -> Option<Result<super::TextCopyPage, String>> {
+        match &source.scope {
+            super::TextCopyScope::Conversation => {
+                Some(self.0.cache_reader.text_copy(source, offset))
+            }
+            super::TextCopyScope::Subagent { id } => {
+                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+                if diagnostic_copy_item(&state, id, source).is_some() {
+                    return None;
+                }
+                Some(child_text_copy::read(&state, source, offset))
+            }
+        }
+    }
+
     pub(crate) fn text_copy(
         &self,
         source: &super::TextCopySource,
         offset: u64,
     ) -> Result<super::TextCopyPage, String> {
-        match &source.scope {
-            super::TextCopyScope::Conversation => self
-                .0
-                .store
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .text_copy(source, offset),
-            super::TextCopyScope::Subagent { id } => {
-                // Keep the existing store-before-state lock order. Resident
-                // authority is checked before disk IO; no database read holds
-                // the state lock, and guessed child/item IDs grant no access.
-                let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
-                let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-                let item = state
-                    .text_copy_sources
-                    .children
-                    .get(id)
-                    .and_then(|sources| {
-                        sources
-                            .iter()
-                            .position(|current| current.as_ref() == Some(source))
-                    })
-                    .and_then(|index| {
-                        state
-                            .subagents
-                            .iter()
-                            .find(|agent| agent.id == *id)
-                            .and_then(|agent| agent.items.get(index))
-                    })
-                    .filter(|item| child_diagnostics::marked(item))
-                    .map(|item| item.id.clone());
-                if let Some(item) = item {
-                    drop(state);
-                    let result = store.diagnostics.read(id, &item, source, offset);
-                    if result.is_err() && store.diagnostics.is_empty() {
-                        let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-                        store.diagnostics.publish(&mut state);
-                        state.generation = state.generation.saturating_add(1);
-                    }
-                    result
-                } else {
-                    child_text_copy::read(&state, source, offset)
-                }
-            }
+        if let Some(page) = self.read_text_copy(source, offset) {
+            return page;
         }
+        let super::TextCopyScope::Subagent { id } = &source.scope else {
+            return Err(super::TEXT_COPY_UNAVAILABLE.into());
+        };
+        // Recheck under the store-before-state lock order after taking the
+        // writer lock. A removed or rewritten child grants no disk access.
+        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(item) = diagnostic_copy_item(&state, id, source) else {
+            return child_text_copy::read(&state, source, offset);
+        };
+        let item = item.id.clone();
+        drop(state);
+        let result = store.diagnostics.read(id, &item, source, offset);
+        if result.is_err() && store.diagnostics.is_empty() {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            store.diagnostics.publish(&mut state);
+            state.generation = state.generation.saturating_add(1);
+        }
+        result
     }
     /// Resident provider usage only: never opens the transcript store.
     pub(crate) fn usage(&self) -> super::Usage {
@@ -1571,9 +1581,20 @@ impl LocalHandle {
         chat_id: crate::model::TerminalId,
         after: Option<u64>,
     ) -> Option<crate::terminal_ipc::ServerResponse> {
-        let mut store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        let store = self.0.store.lock().unwrap_or_else(|p| p.into_inner());
+        self.presentation_locked(chat_id, after, store, |_| {})
+    }
+
+    fn presentation_locked(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+        mut store: std::sync::MutexGuard<'_, Store>,
+        sample: impl FnOnce(&Snapshot),
+    ) -> Option<crate::terminal_ipc::ServerResponse> {
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if after == Some(state.generation) && !store.dirty {
+            sample(&state);
             return None;
         }
         let mut fill = false;
@@ -1680,6 +1701,7 @@ impl LocalHandle {
                 .map(|agent| (agent.id.clone(), agent.items.clone()))
                 .collect();
         }
+        sample(&state);
         let response = if let Some(presentation) = store
             .presentation
             .as_ref()
@@ -4383,6 +4405,7 @@ impl Actor {
                 _ => true,
             };
         }
+        let reset = matches!(event, Event::Reset { .. });
         let child_changed = matches!(
             &event,
             Event::Subagent { .. }
@@ -4403,7 +4426,7 @@ impl Actor {
                 return;
             }
         }
-        if matches!(&event, Event::Reset { .. }) {
+        if reset {
             self.attention.apply(&event);
             *self
                 .confirmed_session
@@ -4431,6 +4454,12 @@ impl Actor {
         };
         apply_projected_event(&mut state, &mut self.indices, event, preview_observed);
         if let Some(store) = &mut diagnostic_store {
+            if reset {
+                // The Store resets before resident state. Invalidate again
+                // after projecting this event so hydration between those
+                // steps cannot retain pre-reset child rows.
+                store.invalidate_presentations();
+            }
             let owners = store.diagnostics.owners(&state);
             drop(state);
             // Keep the store lock across projection and source publication so
