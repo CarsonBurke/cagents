@@ -106,9 +106,8 @@ pub(super) struct Config {
     legacy_models: Option<Select>,
     /// `modes` from session setup, for an agent with no mode option.
     legacy_modes: Option<Select>,
-    /// The reasoning levels each model offered while it was the current
-    /// one. A reasoning option lists only the current model's levels, and
-    /// models differ: Muse offers a level for some and none for others.
+    /// Levels learned for the models still listed, including models the
+    /// combined identifiers described when that list was available.
     levels_seen: HashMap<String, Vec<String>>,
 }
 
@@ -117,7 +116,7 @@ impl Config {
     /// carries: `configOptions`, `modes` and `models` are each optional.
     pub fn learn(&mut self, value: &Value) {
         if let Some(options) = value["configOptions"].as_array() {
-            self.learn_options(options);
+            self.set_options(options);
         }
         if let Some(modes) = value.get("modes").filter(|modes| modes.is_object()) {
             self.legacy_modes = legacy(
@@ -146,6 +145,11 @@ impl Config {
     /// `session/set_config_option` report them: an option no longer listed
     /// no longer exists.
     pub fn learn_options(&mut self, options: &[Value]) {
+        self.set_options(options);
+        self.remember_levels();
+    }
+
+    fn set_options(&mut self, options: &[Value]) {
         let (mut model, mut reasoning, mut mode) = (None, None, None);
         for option in options {
             let slot = match option["category"].as_str() {
@@ -159,22 +163,34 @@ impl Config {
             }
         }
         (self.model, self.reasoning, self.mode) = (model, reasoning, mode);
-        self.remember_levels();
     }
 
-    /// Keeps the levels the reasoning option now lists as the current
-    /// model's. Only a listed model is kept, so the record stays as small
-    /// as the agent's own list.
     fn remember_levels(&mut self) {
         let Some(models) = self.models() else {
+            self.levels_seen.clear();
             return;
         };
-        if models.name_of(&models.current).is_none() {
-            return;
-        }
-        let current = models.current.clone();
-        let levels = self.reasoning.as_ref().map(Select::values);
-        self.levels_seen.insert(current, levels.unwrap_or_default());
+        let combined = self.combined_models();
+        let listed = models
+            .choices
+            .iter()
+            .filter_map(|choice| {
+                let id = &choice.value;
+                let levels = match (&self.reasoning, combined) {
+                    (Some(reasoning), Some(combined)) => {
+                        acp_levels::joined(id, &reasoning.choices, &combined.choices)
+                    }
+                    (_, None) if *id == models.current => self
+                        .reasoning
+                        .as_ref()
+                        .map(Select::values)
+                        .unwrap_or_default(),
+                    _ => self.levels_seen.get(id)?.clone(),
+                };
+                Some((id.clone(), levels))
+            })
+            .collect();
+        self.levels_seen = listed;
     }
 
     /// The combined identifiers in the `models` state, such as agy's
@@ -207,6 +223,7 @@ impl Config {
         {
             select.choices.retain(|choice| offered(&choice.value));
         }
+        self.levels_seen.retain(|id, _| offered(id));
     }
 
     /// `model` read as an offered model and an offered reasoning level
@@ -319,7 +336,7 @@ impl Config {
 
     /// The events that publish the model choice, the active model and the
     /// mode as they now stand.
-    pub fn events(&self) -> Vec<Event> {
+    pub fn events(&self, observed_options: bool) -> Vec<Event> {
         let combined = self.combined_models();
         let mut events = Vec::with_capacity(3);
         if let Some(models) = self.models() {
@@ -342,6 +359,17 @@ impl Config {
                     .collect(),
                 selected: Some(models.current.clone()),
                 reasoning: current_reasoning.clone(),
+                acp_reasoning_observed: Some(
+                    models
+                        .choices
+                        .iter()
+                        .filter(|choice| {
+                            observed_options
+                                && (combined.is_some() || choice.value == models.current)
+                        })
+                        .map(|choice| choice.value.clone())
+                        .collect(),
+                ),
             });
             events.push(Event::ActiveModel(Some(ActiveModel {
                 label: models

@@ -3007,6 +3007,7 @@ fn confirmed_default_reasoning_clears_override_but_catalog_refresh_does_not() {
         &mut state,
         &mut indices,
         Event::Models {
+            acp_reasoning_observed: None,
             models: Vec::new(),
             selected: Some("model".into()),
             reasoning: Some("high".into()),
@@ -3016,6 +3017,7 @@ fn confirmed_default_reasoning_clears_override_but_catalog_refresh_does_not() {
         &mut state,
         &mut indices,
         Event::Models {
+            acp_reasoning_observed: None,
             models: Vec::new(),
             selected: None,
             reasoning: None,
@@ -3026,6 +3028,7 @@ fn confirmed_default_reasoning_clears_override_but_catalog_refresh_does_not() {
         &mut state,
         &mut indices,
         Event::Models {
+            acp_reasoning_observed: None,
             models: Vec::new(),
             selected: Some("model".into()),
             reasoning: None,

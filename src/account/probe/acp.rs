@@ -15,7 +15,7 @@ use std::{
 use serde_json::{Value, json};
 use tokio::process::Command;
 
-use super::{Catalog, Identity, Observed, Probed, Session, UsageSnapshot, UsageStatus};
+use super::{CatalogObservation, Identity, Observed, Probed, Session, UsageSnapshot, UsageStatus};
 use crate::{
     account::Account,
     chat::{Model, acp_levels},
@@ -34,7 +34,7 @@ const ANTIGRAVITY_PROBE_DATA: &str = "antigravity-cli/cagents-probe";
 pub(super) struct Opened {
     pub signed_in: bool,
     pub session: Option<String>,
-    pub catalog: Option<Catalog>,
+    pub catalog: Option<CatalogObservation>,
     /// Antigravity's name for the plan the sign-in is on.
     pub tier: Option<String>,
     /// The version the agent's `initialize` reply names it by.
@@ -297,7 +297,7 @@ async fn open(session: &mut Session, cwd: &Path) -> Result<Observed<Opened>, Str
         .await?;
     let created = response(session, 2).await?;
     let opened = match created.value {
-        Ok(result) => opened(&result),
+        Ok(result) => opened(&result, created.observed_at),
         Err(error) if error["code"].as_i64() == Some(AUTH_REQUIRED) => Opened::default(),
         Err(_) => return Err("The agent could not open a session".into()),
     };
@@ -352,7 +352,7 @@ async fn response(
 
 /// What a `session/new` reply offers: its config options' models, each with
 /// its own reasoning levels, and the defaults it opened with.
-fn opened(result: &Value) -> Opened {
+fn opened(result: &Value, observed_at: u64) -> Opened {
     let options = result["configOptions"].as_array();
     let select = |category: &str| {
         options
@@ -413,8 +413,17 @@ fn opened(result: &Value) -> Opened {
                 label,
             })
             .collect::<Vec<_>>();
-        let mut catalog = super::observed_catalog(models, super::now_ms())?;
-        catalog.default_model = option["currentValue"].as_str().map(str::to_owned);
+        let mut catalog = super::observed_catalog(models, observed_at)?;
+        catalog.catalog.default_model = option["currentValue"].as_str().map(str::to_owned);
+        catalog.reasoning_observed_at = Some(
+            catalog
+                .models
+                .iter()
+                .filter(|model| named || model.id == current)
+                .map(|model| (model.id.clone(), catalog.observed_at))
+                .collect::<std::collections::BTreeMap<_, _>>()
+                .into(),
+        );
         // A model runs at a level only if it offers one.
         if let (Some(model), Some(level)) = (
             catalog.default_model.clone(),
@@ -422,7 +431,10 @@ fn opened(result: &Value) -> Opened {
         ) && catalog.models.iter().any(|offered| {
             offered.id == model && offered.reasoning.iter().any(|known| known == level)
         }) {
-            catalog.reasoning_defaults.insert(model, level.to_owned());
+            catalog
+                .catalog
+                .reasoning_defaults
+                .insert(model, level.to_owned());
         }
         Some(catalog)
     });
@@ -445,21 +457,24 @@ mod tests {
 
     #[test]
     fn a_session_lists_its_models_levels_defaults_and_tier() {
-        let opened = opened(&json!({
-            "sessionId": "5eb802bd-a4cd-45e4-95df-8a58b97d9c8c",
-            "configOptions": [
-                {"id": "model", "category": "model", "type": "select", "currentValue": "gemini-4-neon",
-                 "options": [{"value": "gemini-4-neon", "name": "Gemini 4 Neon"},
-                             {"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"}]},
-                {"id": "thought_level", "category": "thought_level", "type": "select", "currentValue": "high",
-                 "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
-                {"id": "mode", "category": "mode", "type": "select", "currentValue": "default",
-                 "options": [{"value": "default", "name": "Default"}]}],
-            "models": {"currentModelId": "gemini-4-neon-high", "availableModels": [
-                {"modelId": "gemini-4-neon-low"}, {"modelId": "gemini-4-neon-high"},
-                {"modelId": "gemini-3.8-flash-low"}, {"modelId": "gpt-oss-120b-medium"}]},
-            "_meta": {"antigravity": {"tier": {"name": "Google AI Pro", "id": "g1-pro-tier"}}},
-        }));
+        let opened = opened(
+            &json!({
+                "sessionId": "5eb802bd-a4cd-45e4-95df-8a58b97d9c8c",
+                "configOptions": [
+                    {"id": "model", "category": "model", "type": "select", "currentValue": "gemini-4-neon",
+                     "options": [{"value": "gemini-4-neon", "name": "Gemini 4 Neon"},
+                                 {"value": "gemini-3.8-flash", "name": "Gemini 3.8 Flash"}]},
+                    {"id": "thought_level", "category": "thought_level", "type": "select", "currentValue": "high",
+                     "options": [{"value": "low", "name": "Low"}, {"value": "high", "name": "High"}]},
+                    {"id": "mode", "category": "mode", "type": "select", "currentValue": "default",
+                     "options": [{"value": "default", "name": "Default"}]}],
+                "models": {"currentModelId": "gemini-4-neon-high", "availableModels": [
+                    {"modelId": "gemini-4-neon-low"}, {"modelId": "gemini-4-neon-high"},
+                    {"modelId": "gemini-3.8-flash-low"}, {"modelId": "gpt-oss-120b-medium"}]},
+                "_meta": {"antigravity": {"tier": {"name": "Google AI Pro", "id": "g1-pro-tier"}}},
+            }),
+            42,
+        );
         assert!(opened.signed_in);
         assert_eq!(
             opened.session.as_deref(),
@@ -483,6 +498,13 @@ mod tests {
         assert_eq!(catalog.models[1].reasoning, ["low"]);
         assert_eq!(catalog.default_model.as_deref(), Some("gemini-4-neon"));
         assert_eq!(catalog.default_effort(None), Some("high"));
+        assert_eq!(
+            *catalog.reasoning_observed_at.unwrap(),
+            std::collections::BTreeMap::from([
+                ("gemini-3.8-flash".into(), 42),
+                ("gemini-4-neon".into(), 42),
+            ])
+        );
     }
 
     #[test]

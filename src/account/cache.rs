@@ -93,6 +93,126 @@ impl Catalog {
     }
 }
 
+/// A catalog together with the provider observations supporting its ACP
+/// reasoning lists. An absent model has yet to report its levels. A present
+/// model can report an empty list, which replaces its previously known levels.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CatalogObservation {
+    #[serde(flatten)]
+    pub catalog: Catalog,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_observed_at: Option<std::sync::Arc<BTreeMap<String, u64>>>,
+}
+
+impl From<Catalog> for CatalogObservation {
+    fn from(catalog: Catalog) -> Self {
+        Self {
+            catalog,
+            reasoning_observed_at: None,
+        }
+    }
+}
+
+impl std::ops::Deref for CatalogObservation {
+    type Target = Catalog;
+
+    fn deref(&self) -> &Catalog {
+        &self.catalog
+    }
+}
+
+impl CatalogObservation {
+    /// Update an in-memory or on-disk catalog by the same observation rules.
+    pub fn record(
+        catalogs: &mut BTreeMap<Provider, Self>,
+        provider: Provider,
+        incoming: Self,
+        now: u64,
+    ) -> bool {
+        match catalogs.entry(provider) {
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().replace(provider, incoming, now)
+            }
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(incoming);
+                true
+            }
+        }
+    }
+
+    fn replace(&mut self, provider: Provider, mut incoming: Self, now: u64) -> bool {
+        if supersedes(self.observed_at, incoming.observed_at, now) {
+            // The model list and its reasoning reports can arrive out of
+            // order. An older list may contain a later report for a model
+            // the newer list still offers.
+            return provider.speaks_acp() && self.merge_reasoning(&incoming, now);
+        }
+        if provider.speaks_acp() {
+            incoming.merge_reasoning(self, now);
+        }
+        incoming.catalog.inherit_defaults(self);
+        *self = incoming;
+        true
+    }
+
+    /// Merge newer reasoning reports into the chosen model list. A window
+    /// can publish data it inherited from its own older view of the cache.
+    fn merge_reasoning(&mut self, other: &Self, now: u64) -> bool {
+        let other_models: BTreeMap<_, _> = other
+            .models
+            .iter()
+            .map(|model| (&model.id, model))
+            .collect();
+        let catalog_at = self.observed_at;
+        let mut changed = false;
+        let mut observations = BTreeMap::new();
+        for model in &mut self.catalog.models {
+            let current = reasoning_stamp(&self.reasoning_observed_at, model, catalog_at);
+            let reported = other_models.get(&model.id).and_then(|other_model| {
+                let at =
+                    reasoning_stamp(&other.reasoning_observed_at, other_model, other.observed_at)?;
+                Some((*other_model, at))
+            });
+            let stamp = match reported {
+                Some((reported_model, at))
+                    if current.is_none_or(|current| supersedes(at, current, now)) =>
+                {
+                    model.reasoning.clone_from(&reported_model.reasoning);
+                    changed = true;
+                    Some(at)
+                }
+                _ => current,
+            };
+            if let Some(at) = stamp {
+                observations.insert(model.id.clone(), at);
+            }
+        }
+        if changed {
+            self.reasoning_observed_at = Some(observations.into());
+            self.catalog.reasoning_defaults.retain(|id, effort| {
+                self.catalog
+                    .models
+                    .iter()
+                    .any(|model| &model.id == id && model.reasoning.contains(effort))
+            });
+        }
+        changed
+    }
+}
+
+/// Legacy ACP catalogs recorded evidence only implicitly. A populated list
+/// is evidence; an empty one could have meant the model was unobserved.
+fn reasoning_stamp(
+    observations: &Option<std::sync::Arc<BTreeMap<String, u64>>>,
+    model: &Model,
+    catalog_at: u64,
+) -> Option<u64> {
+    match observations {
+        Some(observations) => observations.get(&model.id).copied(),
+        None => (!model.reasoning.is_empty()).then_some(catalog_at),
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct Document {
     version: u32,
@@ -100,7 +220,7 @@ struct Document {
     /// Added after the first version, which the version does not count: a
     /// build that predates it reads the rest, and drops it when it writes.
     #[serde(default, deserialize_with = "readable_catalogs")]
-    catalogs: BTreeMap<Provider, Catalog>,
+    catalogs: BTreeMap<Provider, CatalogObservation>,
     /// Added after the first version, like `catalogs`: each account's
     /// settled disagreement between two records of its login, by account
     /// key. A build that predates it drops it when it writes, which only
@@ -173,15 +293,13 @@ impl Document {
         true
     }
 
-    fn record_catalog(&mut self, provider: Provider, mut catalog: Catalog, now: u64) -> bool {
-        if let Some(previous) = self.catalogs.get(&provider) {
-            if supersedes(previous.observed_at, catalog.observed_at, now) {
-                return false;
-            }
-            catalog.inherit_defaults(previous);
-        }
-        self.catalogs.insert(provider, catalog);
-        true
+    fn record_catalog(
+        &mut self,
+        provider: Provider,
+        catalog: CatalogObservation,
+        now: u64,
+    ) -> bool {
+        CatalogObservation::record(&mut self.catalogs, provider, catalog, now)
     }
 }
 
@@ -315,7 +433,7 @@ fn readable_settlements<'de, D: serde::Deserializer<'de>>(
 /// a provider added since, say - costs only that list, not the whole file.
 fn readable_catalogs<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
-) -> Result<BTreeMap<Provider, Catalog>, D::Error> {
+) -> Result<BTreeMap<Provider, CatalogObservation>, D::Error> {
     let serde_json::Value::Object(catalogs) = serde_json::Value::deserialize(deserializer)? else {
         return Ok(BTreeMap::new());
     };
@@ -324,7 +442,7 @@ fn readable_catalogs<'de, D: serde::Deserializer<'de>>(
         .filter_map(|(provider, catalog)| {
             Some((
                 Provider::deserialize(serde_json::Value::String(provider)).ok()?,
-                Catalog::deserialize(catalog).ok()?,
+                CatalogObservation::deserialize(catalog).ok()?,
             ))
         })
         .collect())
@@ -401,7 +519,7 @@ impl Cache {
         entry: Entry,
         fingerprint: Option<String>,
         provider: Provider,
-        catalog: Option<Catalog>,
+        catalog: Option<CatalogObservation>,
     ) {
         let Some(catalog) = catalog else {
             let _ = self.store_observed(key, entry, fingerprint);
@@ -444,6 +562,15 @@ impl Cache {
     /// The models each provider last listed, as of `now`. Like
     /// [`Cache::load`], a list stamped in the future is left out.
     pub fn catalogs(&self, now: u64) -> BTreeMap<Provider, Catalog> {
+        self.catalog_observations(now)
+            .into_iter()
+            .map(|(provider, observation)| (provider, observation.catalog))
+            .collect()
+    }
+
+    /// The catalog and its reasoning observations, for readers that merge it
+    /// with live lists and publish the result back to the cache.
+    pub fn catalog_observations(&self, now: u64) -> BTreeMap<Provider, CatalogObservation> {
         read_document(&self.path())
             .map(|document| {
                 document
@@ -457,8 +584,12 @@ impl Cache {
 
     /// Remembers what `provider` listed, unless another window has written
     /// a newer list meanwhile - the same rule [`Cache::store`] keeps.
-    pub fn store_catalog(&self, provider: Provider, catalog: Catalog) -> io::Result<()> {
-        self.publish(|document, now| document.record_catalog(provider, catalog, now))
+    pub fn store_catalog(
+        &self,
+        provider: Provider,
+        catalog: impl Into<CatalogObservation>,
+    ) -> io::Result<()> {
+        self.publish(|document, now| document.record_catalog(provider, catalog.into(), now))
     }
 
     fn publish(&self, record: impl FnOnce(&mut Document, u64) -> bool) -> io::Result<()> {
@@ -1167,7 +1298,13 @@ mod tests {
         separate
             .store_catalog(Provider::Codex, models.clone())
             .unwrap();
-        combined.store_probe(key, usage, fingerprint, Provider::Codex, Some(models));
+        combined.store_probe(
+            key,
+            usage,
+            fingerprint,
+            Provider::Codex,
+            Some(models.into()),
+        );
 
         assert_eq!(
             fs::read(separate.path()).unwrap(),
@@ -1191,14 +1328,14 @@ mod tests {
             usage.clone(),
             Some("current".into()),
             Provider::Codex,
-            Some(known),
+            Some(known.into()),
         );
         cache.store_probe(
             key,
             entry(20, "older usage"),
             Some("older".into()),
             Provider::Codex,
-            Some(catalog(40, "model")),
+            Some(catalog(40, "model").into()),
         );
 
         assert_eq!(cache.unchanged(key, "current", 100, 100), Some(usage));
@@ -1212,7 +1349,7 @@ mod tests {
             usage.clone(),
             Some("newer".into()),
             Provider::Codex,
-            Some(catalog(20, "older model")),
+            Some(catalog(20, "older model").into()),
         );
         assert_eq!(cache.unchanged(key, "newer", 100, 100), Some(usage));
         assert_eq!(cache.catalogs(100)[&Provider::Codex], models);
@@ -1227,7 +1364,13 @@ mod tests {
         let oversized = "x".repeat(MAX_BYTES as usize);
         let mut models = catalog(20, "model");
         models.models[0].label.clone_from(&oversized);
-        cache.store_probe(key, usage.clone(), None, Provider::Codex, Some(models));
+        cache.store_probe(
+            key,
+            usage.clone(),
+            None,
+            Provider::Codex,
+            Some(models.into()),
+        );
         assert_eq!(cache.load(100)[key], usage);
         assert!(cache.catalogs(100).is_empty());
 
@@ -1237,7 +1380,7 @@ mod tests {
             entry(20, &oversized),
             None,
             Provider::Codex,
-            Some(models.clone()),
+            Some(models.clone().into()),
         );
         assert_eq!(cache.load(100)[key], usage);
         assert_eq!(cache.catalogs(100)[&Provider::Codex], models);
@@ -1293,6 +1436,128 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(legacy.default_effort(None), None);
+    }
+
+    #[test]
+    fn acp_catalog_replacement_keeps_known_levels_until_the_model_reports_again() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let provider = Provider::Muse;
+        // A cache written by a prior version has a list but no observation map.
+        let mut original = catalog(10, "spark");
+        original.default_model = Some("spark".into());
+        original
+            .reasoning_defaults
+            .insert("spark".into(), "high".into());
+        cache.store_catalog(provider, original).unwrap();
+
+        let observation = |at, levels: &[&str], reported| {
+            let mut catalog = catalog(at, "spark");
+            catalog.models[0].label = "Spark (latest label)".into();
+            catalog.models[0].reasoning = levels.iter().map(|level| (*level).into()).collect();
+            let observations = if reported {
+                BTreeMap::from([("spark".into(), at)])
+            } else {
+                BTreeMap::new()
+            };
+            CatalogObservation {
+                catalog,
+                reasoning_observed_at: Some(observations.into()),
+            }
+        };
+        let read = || cache.catalog_observations(100).remove(&provider).unwrap();
+
+        cache
+            .store_catalog(provider, observation(20, &[], false))
+            .unwrap();
+        let mut peer = read();
+        assert_eq!(peer.models[0].label, "Spark (latest label)");
+        assert_eq!(peer.models[0].reasoning, ["high"]);
+        assert_eq!(peer.default_effort(None), Some("high"));
+
+        cache
+            .store_catalog(provider, observation(30, &["low"], true))
+            .unwrap();
+        assert_eq!(read().models[0].reasoning, ["low"]);
+        assert_eq!(read().default_effort(None), None);
+
+        cache
+            .store_catalog(provider, observation(40, &[], true))
+            .unwrap();
+        // This window still has the original inheritance, with a newer
+        // overall list because it received another partial observation.
+        peer.catalog.observed_at = 50;
+        cache.store_catalog(provider, peer).unwrap();
+        assert!(read().models[0].reasoning.is_empty());
+        assert_eq!(read().reasoning_observed_at.unwrap()["spark"], 40);
+        assert_eq!(read().default_effort(None), None);
+
+        cache
+            .store_catalog(provider, observation(60, &[], false))
+            .unwrap();
+        assert_eq!(read().reasoning_observed_at.unwrap()["spark"], 40);
+        cache
+            .store_catalog(provider, catalog(70, "wonder"))
+            .unwrap();
+        cache
+            .store_catalog(provider, observation(80, &[], false))
+            .unwrap();
+        assert!(read().reasoning_observed_at.unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_delayed_acp_list_can_update_levels_without_replacing_a_newer_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let provider = Provider::Muse;
+        let mut first = catalog(10, "spark");
+        first
+            .reasoning_defaults
+            .insert("spark".into(), "high".into());
+        cache.store_catalog(provider, first).unwrap();
+
+        let mut latest = catalog(30, "spark");
+        latest.models[0].label = "Latest Spark".into();
+        latest.models[0].reasoning.clear();
+        latest.models.push(catalog(30, "wonder").models.remove(0));
+        latest.models[1].reasoning.clear();
+        cache
+            .store_catalog(
+                provider,
+                CatalogObservation {
+                    catalog: latest,
+                    reasoning_observed_at: Some(BTreeMap::from([("wonder".into(), 30)]).into()),
+                },
+            )
+            .unwrap();
+        assert_eq!(cache.catalogs(100)[&provider].models[0].reasoning, ["high"]);
+
+        let mut delayed = catalog(20, "spark");
+        delayed.models[0].reasoning.clear();
+        delayed.models.push(catalog(20, "removed").models.remove(0));
+        cache
+            .store_catalog(
+                provider,
+                CatalogObservation {
+                    catalog: delayed,
+                    reasoning_observed_at: Some(
+                        BTreeMap::from([("spark".into(), 20), ("removed".into(), 20)]).into(),
+                    ),
+                },
+            )
+            .unwrap();
+
+        let latest = cache.catalog_observations(100).remove(&provider).unwrap();
+        assert_eq!(latest.observed_at, 30);
+        assert_eq!(latest.models[0].label, "Latest Spark");
+        assert_eq!(latest.models[1].id, "wonder");
+        assert_eq!(latest.models.len(), 2);
+        assert!(latest.models.iter().all(|model| model.reasoning.is_empty()));
+        assert!(latest.reasoning_defaults.is_empty());
+        assert_eq!(
+            *latest.reasoning_observed_at.unwrap(),
+            BTreeMap::from([("spark".into(), 20), ("wonder".into(), 30),])
+        );
     }
 
     /// Each provider's list is kept beside the figures, and the newer of two

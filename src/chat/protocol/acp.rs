@@ -567,14 +567,19 @@ impl Acp {
             .any(|command| command.name == "compact")
     }
 
-    fn configuration_changed(&self, step: &mut Step) {
+    fn configuration_changed(&self, step: &mut Step, observed_options: bool) {
         step.events
-            .extend(self.config.events().into_iter().map(|event| match event {
-                Event::PermissionMode(Some(mode)) => {
-                    Event::PermissionMode(Some(self.profile.mode_meaning(&mode).to_owned()))
-                }
-                event => event,
-            }));
+            .extend(
+                self.config
+                    .events(observed_options)
+                    .into_iter()
+                    .map(|event| match event {
+                        Event::PermissionMode(Some(mode)) => {
+                            Event::PermissionMode(Some(self.profile.mode_meaning(&mode).to_owned()))
+                        }
+                        event => event,
+                    }),
+            );
         if self.stage == Stage::Ready {
             step.events.push(self.capabilities());
         }
@@ -1076,14 +1081,18 @@ impl Acp {
                 self.setting_in_flight = false;
                 match outcome {
                     Ok(result) => {
+                        // The reply's options describe the model after the
+                        // switch, even when the legacy setter names it.
+                        if let Setting::Model(model) = &setting {
+                            self.config.model_changed(model);
+                        }
                         let options = result["configOptions"].as_array();
                         if let Some(options) = options {
                             self.config.learn_options(options);
                             self.config.retain_models(self.profile.offers_model);
                         }
                         match &setting {
-                            Setting::Model(model) => {
-                                self.config.model_changed(model);
+                            Setting::Model(_) => {
                                 // Each model offers its own reasoning levels,
                                 // as Muse's do. A level queued with the model
                                 // that the new model's options leave out is
@@ -1132,7 +1141,7 @@ impl Acp {
                             }
                             Setting::Reasoning(_) => {}
                         }
-                        self.configuration_changed(step);
+                        self.configuration_changed(step, options.is_some());
                     }
                     Err(error) => {
                         let (what, value) = match &setting {
@@ -1249,7 +1258,7 @@ impl Acp {
         }
         self.config.learn(result);
         self.config.retain_models(self.profile.offers_model);
-        self.configuration_changed(step);
+        self.configuration_changed(step, result["configOptions"].is_array());
         self.stage = Stage::Configuring;
         self.advance_settings(step);
         // Session load replays messages, but an agent may only publish a
@@ -1555,7 +1564,7 @@ impl Acp {
                     self.config.learn_options(options);
                     self.config.retain_models(self.profile.offers_model);
                     let mut changed = Step::default();
-                    self.configuration_changed(&mut changed);
+                    self.configuration_changed(&mut changed, true);
                     events.extend(changed.events);
                 }
             }

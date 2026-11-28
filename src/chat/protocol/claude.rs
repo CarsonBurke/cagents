@@ -2237,6 +2237,7 @@ impl Claude {
         step.events.push(Event::ActiveModel(active));
         step.events.extend([
             Event::Models {
+                acp_reasoning_observed: None,
                 models: self.models.clone(),
                 selected: self.selected.clone(),
                 reasoning: self.reasoning.clone(),

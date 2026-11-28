@@ -1301,6 +1301,7 @@ impl Adapter for Omp {
                         step.events
                             .push(Event::ActiveModel(self.active_model.clone()));
                         step.events.push(Event::Models {
+                            acp_reasoning_observed: None,
                             models: Vec::new(),
                             selected: model_id(&data["model"]),
                             reasoning: self
@@ -1357,6 +1358,7 @@ impl Adapter for Omp {
                             })
                             .collect();
                         step.events.push(Event::Models {
+                            acp_reasoning_observed: None,
                             models,
                             selected: None,
                             reasoning: None,
@@ -1628,6 +1630,7 @@ impl Adapter for Omp {
                     .or_else(|| frame["thinkingLevel"].as_str())
                     .map(str::to_owned);
                 step.events.push(Event::Models {
+                    acp_reasoning_observed: None,
                     models: Vec::new(),
                     selected: None,
                     reasoning: self.configured_reasoning.clone(),

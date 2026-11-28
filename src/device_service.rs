@@ -284,11 +284,11 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::AccountsCache { reports } => {
             use crate::account::{
                 Account,
-                cache::{Cache, Catalog, Entry},
+                cache::{Cache, CatalogObservation, Entry},
             };
             let (entries, catalogs): (
                 Vec<(Account, Entry)>,
-                Vec<(crate::agent::Provider, Catalog)>,
+                Vec<(crate::agent::Provider, CatalogObservation)>,
             ) = serde_json::from_value(reports).map_err(|error| error.to_string())?;
             let cache = Cache::installation().ok_or("The device account cache is unavailable")?;
             for (account, entry) in entries {
@@ -2579,8 +2579,10 @@ pub struct AccountSnapshot {
     /// Canonical cache keys must be resolved by this daemon, never the UI's filesystem.
     #[serde(default)]
     pub cache_keys: std::collections::BTreeMap<crate::account::AccountId, String>,
-    pub catalogs:
-        std::collections::BTreeMap<crate::agent::Provider, crate::account::cache::Catalog>,
+    pub catalogs: std::collections::BTreeMap<
+        crate::agent::Provider,
+        crate::account::cache::CatalogObservation,
+    >,
     pub installed: std::collections::BTreeMap<crate::agent::Provider, bool>,
 }
 #[cfg(feature = "host")]
@@ -2620,7 +2622,7 @@ fn accounts() -> Result<Reply, String> {
             .unwrap_or_default(),
         catalogs: cache
             .as_ref()
-            .map(|cache| cache.catalogs(now))
+            .map(|cache| cache.catalog_observations(now))
             .unwrap_or_default(),
         installed,
     };

@@ -32,7 +32,7 @@ use tokio::{
 
 use super::{
     Account, Identity, UsageSnapshot, UsageSource, UsageStatus,
-    cache::{Cache, Catalog, Entry},
+    cache::{Cache, Catalog, CatalogObservation, Entry},
     schedule::STALE_AFTER,
 };
 use crate::{agent::Provider, chat::Model};
@@ -133,7 +133,7 @@ pub enum Outcome {
         snapshot: Box<UsageSnapshot>,
         /// The models the CLI listed while it was asked, which a cached
         /// answer does not repeat: the cache holds its own list.
-        catalog: Option<Catalog>,
+        catalog: Option<CatalogObservation>,
     },
     /// The CLI gave no usable answer. The message is cagents' own summary of
     /// the failure, never the CLI's output.
@@ -444,7 +444,7 @@ struct Probed {
     /// Raw plan observations used only to merge verified profile metadata.
     plan_metadata: super::claude::PlanMetadata,
     /// A model response has its own observation, independent of quota.
-    catalog: Option<Catalog>,
+    catalog: Option<CatalogObservation>,
 }
 
 impl Probed {
@@ -452,7 +452,7 @@ impl Probed {
         status: UsageStatus,
         detail: &str,
         observed_at: u64,
-        catalog: Option<Catalog>,
+        catalog: Option<CatalogObservation>,
     ) -> Self {
         Self {
             identity: None,
@@ -487,12 +487,15 @@ struct Observed<T> {
     observed_at: u64,
 }
 
-fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<Catalog> {
-    (!models.is_empty()).then_some(Catalog {
-        models,
-        observed_at,
-        default_model: None,
-        reasoning_defaults: Default::default(),
+fn observed_catalog(models: Vec<Model>, observed_at: u64) -> Option<CatalogObservation> {
+    (!models.is_empty()).then(|| {
+        Catalog {
+            models,
+            observed_at,
+            default_model: None,
+            reasoning_defaults: Default::default(),
+        }
+        .into()
     })
 }
 
@@ -1620,7 +1623,7 @@ fn finish_claude_probe(
 /// What the usage session answered.
 struct ClaudeSession {
     /// The models `initialize` listed.
-    catalog: Option<Catalog>,
+    catalog: Option<CatalogObservation>,
     /// The `get_usage` control response's inner `response`, or the error
     /// message Claude answered either request with.
     usage: Observed<Result<Value, String>>,
@@ -1657,7 +1660,7 @@ async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String>
     })
 }
 
-fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<Catalog> {
+fn claude_catalog(initialized: &Observed<Result<Value, String>>) -> Option<CatalogObservation> {
     initialized.value.as_ref().ok().and_then(|value| {
         let entries = value["models"].as_array();
         let mut listed = models(entries, Model::from_claude);
@@ -1751,7 +1754,7 @@ async fn probe_codex_with_path(
 fn codex_catalog(
     answer: &Observed<RpcResult>,
     config: Option<&Observed<RpcResult>>,
-) -> Option<Catalog> {
+) -> Option<CatalogObservation> {
     let result = answer.value.as_ref().ok()?;
     let entries = result["data"].as_array();
     let mut catalog =
@@ -1766,6 +1769,7 @@ fn codex_catalog(
         }
         if let Some(effort) = entry["defaultReasoningEffort"].as_str() {
             catalog
+                .catalog
                 .reasoning_defaults
                 .insert(id.to_owned(), effort.to_owned());
         }
@@ -1774,12 +1778,13 @@ fn codex_catalog(
         return Some(catalog);
     };
     let configured = |key: &str| config[key].as_str();
-    catalog.default_model = configured("model").or(flagged).map(str::to_owned);
+    catalog.catalog.default_model = configured("model").or(flagged).map(str::to_owned);
     // A configured effort applies to every model that offers it.
     if let Some(effort) = configured("model_reasoning_effort") {
-        for model in &catalog.models {
+        for model in &catalog.catalog.models {
             if model.reasoning.iter().any(|level| level == effort) {
                 catalog
+                    .catalog
                     .reasoning_defaults
                     .insert(model.id.clone(), effort.to_owned());
             }
@@ -3000,7 +3005,7 @@ sleep 30
             catalog,
             ..
         } = probe_claude(&account, &script).await.unwrap();
-        let models = catalog.unwrap().models;
+        let models = catalog.unwrap().catalog.models;
         assert_eq!(identity.unwrap().email.as_deref(), Some("user@example.com"));
         assert_eq!(models.len(), 1, "initialize listed one model");
         assert_eq!(snapshot.windows.len(), 1);
@@ -3065,7 +3070,7 @@ cat >/dev/null
         } = probe_codex(&Account::system(Provider::Codex), &script)
             .await
             .unwrap();
-        let models = catalog.unwrap().models;
+        let models = catalog.unwrap().catalog.models;
         assert_eq!(identity.unwrap().plan.as_deref(), Some("plus"));
         assert_eq!(models.len(), 1, "a signed-out Codex still lists its models");
         assert_eq!(snapshot.status, UsageStatus::NeedsLogin);

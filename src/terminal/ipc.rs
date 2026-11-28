@@ -369,7 +369,9 @@ use crate::{
 /// carry a device window's source control as JSON.
 ///
 /// Version 219 appends the Accounts discovery refresh device operation.
-pub const PROTOCOL_VERSION: u16 = 219;
+///
+/// Version 220 appends the per-model ACP reasoning observations to chat snapshots.
+pub const PROTOCOL_VERSION: u16 = 220;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -398,11 +400,12 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
 pub use older_clients::{
-    ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH, ENDED_TOOL_STATUS,
-    NOT_RESUMED_NOTICES, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS, PROJECT_ORDER, QUEUE_HOLDS,
-    SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT, WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing,
-    before_project_order, before_queue_holds, before_send_queued_now, decoding_before,
-    decoding_from, encoding_before, encoding_for,
+    ACP_REASONING_OBSERVATIONS, ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH,
+    ENDED_TOOL_STATUS, NOT_RESUMED_NOTICES, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
+    PROJECT_ORDER, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT, WAIT_KINDS,
+    WAITING_TOOL_STATUS, WithoutTrailing, before_acp_reasoning_observations, before_project_order,
+    before_queue_holds, before_send_queued_now, decoding_before, decoding_from, encoding_before,
+    encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 

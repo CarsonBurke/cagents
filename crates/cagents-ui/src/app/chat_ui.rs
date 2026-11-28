@@ -12405,6 +12405,7 @@ impl Cagents {
             use std::hash::{Hash, Hasher};
             let mut hasher = crate::fingerprint::hasher();
             snapshot.models.hash(&mut hasher);
+            snapshot.reasoning_observed_at.hash(&mut hasher);
             snapshot
                 .active_model
                 .as_ref()
@@ -12418,11 +12419,7 @@ impl Cagents {
             return Task::none();
         }
         let provider = runtime.session.launch.provider;
-        self.observe_listed_models(
-            provider,
-            snapshot.models.clone(),
-            snapshot.active_model.as_ref(),
-        )
+        self.observe_chat_catalog(provider, &snapshot)
     }
 
     pub(super) fn start_chat(
