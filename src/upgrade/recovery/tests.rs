@@ -866,7 +866,7 @@ fn a_reviewed_conversation_whose_provider_ended_need_not_be_checkpointed() {
 
 #[test]
 fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
-    use crate::update::in_flight::InFlight;
+    use crate::update::in_flight::{InFlight, QueuedText};
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let proof = &preparation.authority.source;
@@ -899,6 +899,11 @@ fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
     let working = InFlight {
         id: chat.id,
         turn: true,
+        queued: vec!["queued-1".into()],
+        queued_text: vec![QueuedText {
+            id: "queued-1".into(),
+            text: "original unsent input\nsecond line".into(),
+        }],
         ..InFlight::default()
     };
     census.in_flight = vec![working.clone()];

@@ -5475,6 +5475,17 @@ fn printable(text: &str) -> String {
     printable
 }
 
+fn update_report(mut job: crate::update::UpdateJob) -> Result<CommandOutput, AppError> {
+    for outcome in &mut job.in_flight {
+        outcome.work.queued_text.clear();
+    }
+    Ok(CommandOutput {
+        command: "daemon.upgrade",
+        human: job.message.clone(),
+        data: serde_json::to_value(job).map_err(|error| AppError::new("serialization", error))?,
+    })
+}
+
 fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
     if crate::device::is_remote()
         && matches!(
@@ -5515,12 +5526,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 None => crate::update::upgrade_installed(yes, interrupt),
             }
             .map_err(|error| AppError::new("update", error))?;
-            Ok(CommandOutput {
-                command: "daemon.upgrade",
-                human: job.message.clone(),
-                data: serde_json::to_value(job)
-                    .map_err(|error| AppError::new("serialization", error))?,
-            })
+            update_report(job)
         }
         DaemonCommand::Boot { command } => boot::execute(command),
         DaemonCommand::Start => {
@@ -7346,6 +7352,28 @@ fn emit_error(json_output: bool, error: &AppError) {
 #[cfg(test)]
 mod tests {
     use super::ControlError;
+
+    #[test]
+    fn update_report_keeps_queue_ids_without_private_text() {
+        let job: crate::update::UpdateJob = serde_json::from_value(serde_json::json!({
+            "id": "fixture",
+            "version": "1.2.3",
+            "phase": "Complete",
+            "message": "Update complete",
+            "log_path": "/private/update.log",
+            "in_flight": [{
+                "id": crate::model::TerminalId::new(),
+                "queued": ["pending-1"],
+                "queued_text": [{"id": "pending-1", "text": "private message"}],
+                "fate": "stopped"
+            }]
+        }))
+        .unwrap();
+        let result = super::update_report(job).unwrap();
+        assert_eq!(result.data["in_flight"][0]["queued"][0], "pending-1");
+        assert!(result.data["in_flight"][0].get("queued_text").is_none());
+        assert!(!result.human.contains("private message"));
+    }
 
     /// A client reads an update source's frames as that source wrote them,
     /// and leaves its decode scope however the read ends.

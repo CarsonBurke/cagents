@@ -15,7 +15,7 @@
 //! them, so every field defaults and every enum names what it doesn't know.
 use crate::{
     agent::Provider,
-    chat::{ItemContent, Snapshot, ToolStatus},
+    chat::{ItemContent, QueuedMessage, Snapshot, ToolStatus},
     model::TerminalId,
 };
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ use serde::{Deserialize, Serialize};
 pub(crate) const MAX_TASKS: usize = 32;
 /// Queued messages kept for one conversation; the rest are only counted.
 pub(crate) const MAX_QUEUED: usize = 32;
+/// Encoded queue text kept across all conversations in one update.
+pub(crate) const QUEUED_TEXT_CENSUS_BYTES: usize = 512 * 1024;
 /// Bytes of a provider-issued identity kept; a longer one is not an identity.
 const MAX_ID_BYTES: usize = 256;
 
@@ -43,9 +45,28 @@ pub struct InFlight {
     /// provider's identity, at most [`MAX_QUEUED`] of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued: Vec<String>,
+    /// Complete text-only messages among `queued`, in the original order.
+    /// Kept in private update state and omitted from the CLI's update report.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_text: Vec<QueuedText>,
     /// Tasks and queued messages beyond those listed.
     #[serde(default, skip_serializing_if = "is_zero")]
     pub unlisted: u32,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedText {
+    pub id: String,
+    pub text: String,
+}
+
+impl std::fmt::Debug for QueuedText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueuedText")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
 }
 
 fn is_zero(count: &u32) -> bool {
@@ -141,15 +162,46 @@ impl InFlight {
             }
         }
         for message in &snapshot.queued_messages {
-            if message.id.len() > MAX_ID_BYTES {
+            if message.id.len() > MAX_ID_BYTES || work.queued.len() >= MAX_QUEUED {
                 work.unlisted = work.unlisted.saturating_add(1);
-            } else if work.queued.len() < MAX_QUEUED {
-                work.queued.push(message.id.clone());
-            } else {
-                work.unlisted = work.unlisted.saturating_add(1);
+                continue;
+            }
+            work.queued.push(message.id.clone());
+            if message.editable
+                && message.attachments.is_empty()
+                && !message.text.is_empty()
+                && message.text.len() <= QueuedMessage::PREVIEW_BYTES
+            {
+                work.queued_text.push(QueuedText {
+                    id: message.id.clone(),
+                    text: message.text.clone(),
+                });
             }
         }
         work
+    }
+
+    pub(crate) fn fit_queued_text(&mut self, remaining: &mut usize) {
+        if self.queued_text.is_empty() {
+            return;
+        }
+        let Some(mut available) = remaining.checked_sub("\"queued_text\":[],".len()) else {
+            self.queued_text.clear();
+            return;
+        };
+        self.queued_text.retain(|message| {
+            let Ok(encoded) = serde_json::to_vec(message) else {
+                return false;
+            };
+            let Some(left) = available.checked_sub(encoded.len() + 1) else {
+                return false;
+            };
+            available = left;
+            true
+        });
+        if !self.queued_text.is_empty() {
+            *remaining = available;
+        }
     }
 
     /// The update interrupted this conversation's turn, and with it these
@@ -242,7 +294,7 @@ impl Fate {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
-    use crate::chat::{CommandAction, Item, QueuedMessage, Role, Subagent};
+    use crate::chat::{CommandAction, Item, Role, Subagent};
     use std::sync::Arc;
 
     fn agent(id: &str, status: ToolStatus, background: bool) -> Subagent {
@@ -361,6 +413,7 @@ mod tests {
             ]
         );
         assert_eq!(work.queued, ["q1"]);
+        assert_eq!(work.queued_text[0].text, "and then push");
     }
 
     #[test]
@@ -451,6 +504,50 @@ mod tests {
     }
 
     #[test]
+    fn queued_text_keeps_only_whole_messages_within_both_budgets() {
+        let first = "\0".repeat(QueuedMessage::PREVIEW_BYTES);
+        let oversized = QueuedMessage {
+            text: "λ".repeat(QueuedMessage::PREVIEW_BYTES),
+            ..queued("too-large")
+        };
+        let with_file = QueuedMessage {
+            attachments: vec![crate::chat::Attachment::file("fixture.txt")],
+            ..queued("with-file")
+        };
+        let snapshot = Snapshot {
+            queued_messages: vec![
+                QueuedMessage::new("first".into(), first.clone()),
+                oversized,
+                QueuedMessage::new("last".into(), "🙂".into()),
+                QueuedMessage::new(
+                    "preview".into(),
+                    "a".repeat(QueuedMessage::PREVIEW_BYTES + 1),
+                ),
+                with_file,
+            ],
+            ..Snapshot::default()
+        };
+        let mut work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
+        assert_eq!(
+            work.queued,
+            ["first", "too-large", "last", "preview", "with-file"]
+        );
+        assert_eq!(work.queued_text.len(), 2);
+        assert_eq!(work.queued_text[0].text, first);
+        assert_eq!(work.queued_text[1].text, "🙂");
+
+        // JSON escaping can be larger than the original UTF-8. A later whole
+        // message can still fit without losing any delivery IDs.
+        let mut remaining = 1024;
+        work.fit_queued_text(&mut remaining);
+        assert_eq!(work.queued.len(), 5);
+        assert_eq!(work.queued_text.len(), 1);
+        assert_eq!(work.queued_text[0].id, "last");
+        assert!(remaining < 1024);
+        assert!(!format!("{work:?}").contains('🙂'));
+    }
+
+    #[test]
     fn records_read_across_versions() {
         // A record from before these fields, or naming kinds and fates this
         // build does not know, still reads.
@@ -460,6 +557,10 @@ mod tests {
         assert!(older.work.is_empty());
         assert_eq!(older.fate, Fate::Unknown);
         assert!(!older.lost());
+        let old_queue = serde_json::json!({ "id": id, "queued": ["q"] });
+        let queue: InFlight = serde_json::from_value(old_queue.clone()).unwrap();
+        assert!(queue.queued_text.is_empty());
+        assert_eq!(serde_json::to_value(queue).unwrap(), old_queue);
         let newer: Outcome = serde_json::from_value(serde_json::json!({
             "id": id,
             "turn": true,
@@ -493,6 +594,10 @@ mod tests {
                     waiting: false,
                 }],
                 queued: vec!["q".into()],
+                queued_text: vec![QueuedText {
+                    id: "q".into(),
+                    text: "continue after the agent is ready\nwith the second line".into(),
+                }],
                 unlisted: 2,
             },
             label: "Fix the build".into(),

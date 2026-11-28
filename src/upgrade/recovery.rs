@@ -236,7 +236,20 @@ impl Census {
         reviewed: &DaemonImpact,
         windows: &[String],
     ) -> Result<(), String> {
-        let bounds = self.identity_bounds(source, reviewed, windows)?;
+        let mut bounds = self.identity_bounds(source, reviewed, windows)?;
+        if bounds.iter().any(|bound| !bound.fits())
+            && self
+                .in_flight
+                .iter()
+                .any(|work| !work.queued_text.is_empty())
+        {
+            // The queued text is optional evidence. Keep the message IDs
+            // and allow a handoff that fits without the text.
+            for work in &mut self.in_flight {
+                work.queued_text.clear();
+            }
+            bounds = self.identity_bounds(source, reviewed, windows)?;
+        }
         if let Some(refusal) = self.refusal(&bounds, source, reviewed, windows)? {
             return Err(refusal);
         }
