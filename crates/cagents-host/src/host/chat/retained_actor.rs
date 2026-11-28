@@ -28,6 +28,10 @@ impl Startup {
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
         &self.source.launch.recipe.working_directory
     }
+
+    pub(in crate::host) fn local_source(&self) -> Option<&Session> {
+        self.local.then_some(&self.source)
+    }
 }
 
 pub(super) fn local_startup_conflicts(state: &HostState, source: &Session) -> bool {
@@ -1188,32 +1192,12 @@ pub(super) fn reconcile_startup_for_start(
     if prepare_failed_start_for_start(host, source)?.is_some() {
         return Ok(true);
     }
-    reconcile_unpublished_startup(host, source, false)
-}
-
-pub(in crate::host) fn reconcile_local_startup_for_close(
-    host: &SharedHost,
-    source: &Session,
-) -> Result<(), String> {
-    reconcile_unpublished_startup(host, source, true)
-        .map(|_| ())
-        .map_err(|error| error.to_string())
-}
-
-fn reconcile_unpublished_startup(
-    host: &SharedHost,
-    source: &Session,
-    local_only: bool,
-) -> Result<bool, chat::protocol::SetupError> {
     use chat::protocol::SetupError;
     let pending = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(pending) = state.native_actor_startups.get(&source.id) else {
             return Ok(false);
         };
-        if local_only && !pending.local {
-            return Ok(false);
-        }
         if &pending.source != source && &pending.requested != source {
             return Err(SetupError::Invalid(
                 "The retained startup belongs to another exact descriptor".into(),
@@ -1231,20 +1215,53 @@ fn reconcile_unpublished_startup(
         }
         (pending.source.clone(), pending.context.clone())
     };
-    match pending
-        .1
-        .reconcile_cleanup()
-        .map_err(SetupError::Unavailable)?
-    {
-        chat::protocol::LaunchOutcome::NoProvider
-        | chat::protocol::LaunchOutcome::TeardownProved => {
-            forget_startup(host, &pending.0, &pending.1);
-            Ok(true)
+    prove_startup_cleanup(&pending.1).map_err(SetupError::Unavailable)?;
+    forget_startup(host, &pending.0, &pending.1);
+    Ok(true)
+}
+
+pub(in crate::host) fn has_local_startup(host: &SharedHost, id: TerminalId) -> bool {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .native_actor_startups
+        .get(&id)
+        .is_some_and(|startup| startup.local)
+}
+
+/// The caller holds the exact close reservation. Retain the receipt until
+/// its durable retirement commits, including when that commit needs a retry.
+pub(super) fn prove_local_startup_closed(
+    host: &SharedHost,
+    source: &Session,
+    named: &Session,
+) -> Result<Option<Startup>, String> {
+    let pending = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .native_actor_startups
+        .get(&source.id)
+        .filter(|startup| startup.local)
+        .cloned();
+    if let Some(pending) = &pending {
+        if ![source, named]
+            .into_iter()
+            .any(|source| &pending.source == source || &pending.requested == source)
+        {
+            return Err("The retained startup belongs to another exact descriptor".into());
         }
-        chat::protocol::LaunchOutcome::Uncertain => Err(SetupError::Unavailable(
+        prove_startup_cleanup(&pending.context)?;
+    }
+    Ok(pending)
+}
+
+fn prove_startup_cleanup(context: &chat::protocol::ExecutionContext) -> Result<(), String> {
+    match context.reconcile_cleanup()? {
+        chat::protocol::LaunchOutcome::NoProvider
+        | chat::protocol::LaunchOutcome::TeardownProved => Ok(()),
+        chat::protocol::LaunchOutcome::Uncertain => Err(
             "The exact retained startup has not proved cleanup; no second provider was started"
                 .into(),
-        )),
+        ),
     }
 }
 

@@ -51,19 +51,17 @@ pub(super) fn fail_managed_start_after_spawn(
     Err("fixture startup failed after spawning".into())
 }
 
-#[test]
-fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
+fn failed_managed_pane() -> (
+    SharedHost,
+    Session,
+    crate::model::AgentId,
+    Arc<StartupFailure>,
+) {
     use super::super::agent_execution;
     use crate::agent_execution::{HostedSession, Origin};
 
-    if agent_execution::tests::isolated(
-        "host::chat::startup_tests::managed_pane_retries_the_original_cleanup_before_replacing_its_provider",
-    )
-    .is_some()
-    {
-        return;
-    }
-    let (host, request, path) = agent_execution::tests::fixture();
+    let (host, mut request, path) = agent_execution::tests::fixture();
+    request.idempotency_key = uuid::Uuid::new_v4().to_string();
     let registry = agent_execution::registry(&host).unwrap();
     let agent = registry
         .lock()
@@ -91,6 +89,35 @@ fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
         .unwrap()
         .bind_agent(agent.id, None, HostedSession::Chat(source.clone()))
         .unwrap();
+    let failure = Arc::new(StartupFailure::default());
+    FAIL_AFTER_SPAWN.set(Some(failure.clone()));
+    assert!(
+        start(
+            &host,
+            1,
+            source.clone(),
+            None,
+            false,
+            None,
+            Default::default()
+        )
+        .unwrap_err()
+        .message
+        .contains("fixture startup failed after spawning")
+    );
+    (host, source, agent.id, failure)
+}
+
+#[test]
+fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
+    if super::super::agent_execution::tests::isolated(
+        "host::chat::startup_tests::managed_pane_retries_the_original_cleanup_before_replacing_its_provider",
+    )
+    .is_some()
+    {
+        return;
+    }
+    let (host, source, _, failure) = failed_managed_pane();
     let start = || {
         start(
             &host,
@@ -102,14 +129,6 @@ fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
             Default::default(),
         )
     };
-    let failure = Arc::new(StartupFailure::default());
-    FAIL_AFTER_SPAWN.set(Some(failure.clone()));
-    assert!(
-        start()
-            .unwrap_err()
-            .message
-            .contains("fixture startup failed after spawning")
-    );
     assert!(
         start()
             .unwrap_err()
@@ -134,6 +153,111 @@ fn managed_pane_retries_the_original_cleanup_before_replacing_its_provider() {
     assert_ne!(original.provider_process(), replacement.provider_process());
     drop(state);
     replacement.close().unwrap();
+}
+
+#[test]
+fn both_close_paths_retire_a_failed_managed_pane_after_proving_cleanup() {
+    use super::super::agent_execution;
+    use crate::agent_execution::{Authority, Operation, Reply};
+
+    if agent_execution::tests::isolated(
+        "host::chat::startup_tests::both_close_paths_retire_a_failed_managed_pane_after_proving_cleanup",
+    )
+    .is_some()
+    {
+        return;
+    }
+    for from_pane in [true, false] {
+        let (host, source, id, failure) = failed_managed_pane();
+        let close = || {
+            if from_pane {
+                close_retained_from_pane(&host, &source)
+            } else {
+                match agent_execution::process(&host, Authority::default(), Operation::Close(id))? {
+                    Reply::Closed(agent) if agent.closed => Ok(()),
+                    reply => panic!("unexpected close response: {reply:?}"),
+                }
+            }
+        };
+        assert!(
+            close()
+                .unwrap_err()
+                .contains("fixture cleanup has not settled")
+        );
+        assert!(
+            host.lock()
+                .unwrap()
+                .native_actor_startups
+                .contains_key(&source.id)
+        );
+        failure.ready.store(true, Ordering::Relaxed);
+        close().unwrap();
+        let registry = agent_execution::registry(&host).unwrap();
+        assert!(registry.lock().unwrap().agent(id).unwrap().closed);
+        assert!(
+            !host
+                .lock()
+                .unwrap()
+                .native_actor_startups
+                .contains_key(&source.id)
+        );
+    }
+}
+
+#[test]
+fn a_failed_codex_start_fences_its_terminal_and_cli_alias() {
+    use crate::model::{TerminalContinuity, TerminalSession};
+
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("managed-start"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("incarnation"),
+    });
+    let mut source = chat::fresh_session(
+        Provider::Codex,
+        TerminalId::new(),
+        "/var/tmp".into(),
+        &crate::account::Account::system(Provider::Codex),
+    )
+    .unwrap();
+    source.proof = Some(state.proof().clone());
+    let thread = uuid::Uuid::new_v4().to_string();
+    source.launch.session_id = Some(thread.clone());
+    state.native_actor_startups.insert(
+        source.id,
+        retained_actor::Startup {
+            local: true,
+            source: source.clone(),
+            requested: source.clone(),
+            context: Arc::new(ExecutionContext::default()),
+            failed_close: None,
+        },
+    );
+    let mut terminal = TerminalSession {
+        id: source.id,
+        owned_codex_listener: None,
+        predecessor: None,
+        recovery_origin: None,
+        resume_hint: None,
+        transcript_path: None,
+        continuity: TerminalContinuity::Live {
+            host_session_id: state.proof().host_session_id.clone(),
+            boot_id: state.proof().boot_id.clone(),
+            host_incarnation: state.proof().host_incarnation.clone(),
+        },
+        launch: LaunchRecipe {
+            program: "codex".into(),
+            arguments: vec!["resume".into(), thread],
+            working_directory: "/var/tmp".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+    };
+    assert!(state.reserve_spawn_of(&terminal).is_err());
+    terminal.id = TerminalId::new();
+    assert!(state.reserve_spawn_of(&terminal).is_err());
+    state.native_actor_startups.clear();
+    state.reserve_spawn_of(&terminal).unwrap();
 }
 
 #[test]

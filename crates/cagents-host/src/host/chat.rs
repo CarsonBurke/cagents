@@ -1357,7 +1357,9 @@ fn reserve_unhosted_allocation(
 /// conversation an earlier boot left, with no owner, agent or launch, has
 /// nothing to close. Everything else needs its exact close receipt.
 pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
-    retained_actor::reconcile_local_startup_for_close(host, session)?;
+    if retained_actor::has_local_startup(host, session.id) {
+        return native_cleanup::close_from_pane(host, session);
+    }
     if super::agent_execution::close_lost_agent_from_pane(host, session)? {
         return Ok(());
     }
@@ -1441,11 +1443,20 @@ fn settle_lost_execution(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
+    settle_lost_execution_after_startup(host, session, proof, None)
+}
+
+fn settle_lost_execution_after_startup(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+    startup: Option<&retained_actor::Startup>,
+) -> Result<(), String> {
     if !claimed_for_close(&host.lock().unwrap_or_else(|p| p.into_inner()), session) {
         return Err("This conversation's Close lost its claim; it was not closed".into());
     }
     refuse_scheduled_agent(host, session)?;
-    if let Some(holds) = what_holds(host, session, proof)? {
+    if let Some(holds) = what_holds_after_startup(host, session, proof, startup)? {
         return Err(lost_execution_refusal(session, holds));
     }
     let _ = return_listener_allocation(session);
@@ -1799,6 +1810,15 @@ fn what_holds(
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<Option<Holds>, String> {
+    what_holds_after_startup(host, session, proof, None)
+}
+
+fn what_holds_after_startup(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+    settled_startup: Option<&retained_actor::Startup>,
+) -> Result<Option<Holds>, String> {
     // A receipt exact cleanup did not consume names another descriptor of
     // the terminal. It confirms that one's close, and says nothing either way
     // about this one, so it neither holds nor settles this Close: the evidence
@@ -1808,7 +1828,9 @@ fn what_holds(
         if codex_terminal_owner(&state, session).is_some()
             || state.chat_handoffs.contains_key(&session.id)
             || state.native_actor_startups.values().any(|startup| {
-                startup.source.id == session.id || startup.requested.id == session.id
+                (startup.source.id == session.id || startup.requested.id == session.id)
+                    && settled_startup
+                        .is_none_or(|settled| !Arc::ptr_eq(&startup.context, &settled.context))
             })
         {
             return Ok(Some(Holds::InProgress));
@@ -1830,13 +1852,25 @@ fn what_holds(
     };
     // A startup cleanup owner retained for the agent is a launch of this boot
     // whose teardown is unconfirmed.
-    if agent.is_some_and(|agent| {
+    if agent.as_ref().is_some_and(|agent| {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .execution_startups
             .contains_key(&agent.id)
     }) {
         return Ok(Some(Holds::LaunchUnconfirmed));
+    }
+    // A proved teardown for this daemon's exact unpublished local provider
+    // suffices when the descriptor cannot also name an independent owner.
+    if settled_startup.is_some_and(|startup| &startup.source == session)
+        && session.proof.as_ref() == Some(proof)
+        && session.terminal.is_none()
+        && !session.native_continuity.retains_provider()
+        && session.owned_codex_listener.is_none()
+        && agent.as_ref().is_none_or(|agent| agent.console.is_none())
+        && owners.is_empty()
+    {
+        return Ok(None);
     }
     use super::upgrade_inspect::ExecutionEnd;
     match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
@@ -5802,9 +5836,7 @@ pub(super) fn close_captured(
     let chat_id = target.source.id;
     let handle = target.handle.clone();
     let source = target.source.clone();
-    target.require_current(host)?;
-    retained_actor::reconcile_local_startup_for_close(host, &source).map_err(unavailable)?;
-    let closing = {
+    let (closing, current) = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state
             .chats
@@ -5816,10 +5848,13 @@ pub(super) fn close_captured(
             ));
         };
         let current = record.current_session();
-        capacity::Reservation::removing(host, &mut state, &source, current)?
+        let closing = capacity::Reservation::removing(host, &mut state, &source, current.clone())?;
+        (closing, current)
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
+    let local_startup =
+        retained_actor::prove_local_startup_closed(host, &source, &current).map_err(unavailable)?;
     let detached = super::agent_execution::detached_work_on_close(host, source.id);
     handle.decide_detached_work(detached);
     if let Err(error) = handle.close_for_resume() {
@@ -6001,6 +6036,9 @@ pub(super) fn close_captured(
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     drop(record);
+    if let Some(startup) = local_startup {
+        retained_actor::forget_startup(host, &startup.source, &startup.context);
+    }
     super::state::retire_recovered_upgrade_chat(host, chat_id);
     Ok(ServerResponse::ChatClosed { chat_id, snapshot })
 }
