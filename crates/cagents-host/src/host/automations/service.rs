@@ -17,6 +17,8 @@ pub(in crate::host) enum Error {
     Invalid(String),
     #[error("{0}")]
     PermissionDenied(String),
+    #[error("{}", agent_execution::NEW_WORK_HELD)]
+    UpdateInProgress,
 }
 
 impl From<String> for Error {
@@ -44,6 +46,13 @@ impl Error {
         let (code, message) = match self {
             Self::Invalid(message) => (ProtocolErrorCode::InvalidRequest, message),
             Self::PermissionDenied(message) => (ProtocolErrorCode::PermissionDenied, message),
+            error @ Self::UpdateInProgress => {
+                return ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    error.to_string(),
+                    true,
+                );
+            }
         };
         ProtocolError::new(code, message, false)
     }
@@ -63,13 +72,13 @@ pub(in crate::host) fn process_under_control(
     if authority.token().is_some() {
         return process_hosted(host, &authority, request);
     }
-    process_user(host, request).map_err(Error::Invalid)
+    process_user(host, request)
 }
 
 fn process_user(
     host: &SharedHost,
     request: crate::automations::Request,
-) -> Result<crate::automations::Response, String> {
+) -> Result<crate::automations::Response, Error> {
     use crate::automations::{Request, Response};
     let registry = agent_execution::registry(host)?;
     let handle = || {
@@ -107,7 +116,8 @@ fn process_user(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .pending_automation_proposals(&repository, after, limit)
-                .map(Response::Proposals);
+                .map(Response::Proposals)
+                .map_err(Into::into);
         }
         Request::ResolveProposal {
             id,
@@ -156,7 +166,8 @@ fn process_user(
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automations(after, limit)
-                .map(Response::Listed);
+                .map(Response::Listed)
+                .map_err(Into::into);
         }
         Request::Show { id } => {
             return registry
@@ -164,35 +175,40 @@ fn process_user(
                 .unwrap_or_else(|p| p.into_inner())
                 .automation(id)
                 .map(Box::new)
-                .map(Response::Automation);
+                .map(Response::Automation)
+                .map_err(Into::into);
         }
         Request::History { id, before, limit } => {
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_history(id, before, limit)
-                .map(Response::History);
+                .map(Response::History)
+                .map_err(Into::into);
         }
         Request::Audit { id, before, limit } => {
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_audit(id, before, limit)
-                .map(Response::Audit);
+                .map(Response::Audit)
+                .map_err(Into::into);
         }
         Request::ShowFiring { id } => {
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_run_detail(id)
-                .map(|detail| Response::Detail(Box::new(detail)));
+                .map(|detail| Response::Detail(Box::new(detail)))
+                .map_err(Into::into);
         }
         Request::ShowRun { run } => {
             return registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .automation_detail_for_run(run)
-                .map(|detail| Response::Detail(Box::new(detail)));
+                .map(|detail| Response::Detail(Box::new(detail)))
+                .map_err(Into::into);
         }
         Request::Create { definition } => Response::Automation(Box::new(create(host, definition)?)),
         Request::Edit {
