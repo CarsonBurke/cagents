@@ -5292,8 +5292,22 @@ fn image_url_file_name(url: &str) -> Option<String> {
         return None;
     }
     let url = url::Url::parse(url).ok()?;
-    let name = url.path_segments()?.next_back()?;
-    (!name.is_empty()).then(|| name.to_owned())
+    let segment = url.path_segments()?.next_back()?;
+    // Escapes for control bytes, separators and non-UTF-8 names keep
+    // their wire spelling so the label stays a single readable segment.
+    match percent_encoding::percent_decode_str(segment).decode_utf8() {
+        Ok(name) if name.trim().is_empty() => None,
+        Ok(name)
+            if !name.contains(|ch: char| {
+                ch.is_control()
+                    || crate::names::is_bidi_control(ch)
+                    || matches!(ch, '/' | '\\' | '\u{2028}' | '\u{2029}')
+            }) =>
+        {
+            Some(name.into_owned())
+        }
+        _ => Some(segment.to_owned()),
+    }
 }
 
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
