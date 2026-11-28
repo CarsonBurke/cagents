@@ -7517,6 +7517,7 @@ fn an_agent_handle_change_keeps_the_already_projected_pane() {
     drop(app.focus_workspace_card(pane.id));
     drop(app.project_workspace(true));
     assert_eq!(app.workspace.focused(), Some(pane.id));
+    let displayed_title = app.card_chrome[&pane.id].title.clone();
     let identity = app.workspace_model.identity;
     let sequence = app.workspace_model.sequence;
     let agent_edge = |sequence, agent| {
@@ -7542,7 +7543,7 @@ fn an_agent_handle_change_keeps_the_already_projected_pane() {
     assert_eq!(app.workspace_model.agents, [renamed.clone()]);
     assert_eq!(app.durable.active_channel, Some(channel));
     assert_eq!(app.workspace.focused(), Some(pane.id));
-    assert_eq!(app.card_chrome[&pane.id].title, pane.title);
+    assert_eq!(app.card_chrome[&pane.id].title, displayed_title);
     // The name-only edge still advances the shared row's clock.
     assert!(!reconciles(&mut app, agent_edge(sequence + 1, original)));
     assert_eq!(app.workspace_model.agents, [renamed]);
