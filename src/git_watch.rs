@@ -1460,23 +1460,18 @@ impl Monitor {
                             || restoring_metadata
                             || rearm.all
                             || rearmed_metadata.contains(&id);
-                        let worktrees = reads_after_registration(
+                        let mut change = reads_after_registration(
                             project,
                             before,
                             was_unwatched.get(&id),
                             &now_unwatched,
                             &acquired,
                         );
-                        let mut change = if recovering {
+                        if recovering {
                             // The listing and bookkeeping could have moved
                             // before these watches were installed.
-                            Change::recovering(worktrees)
-                        } else {
-                            Change {
-                                worktrees,
-                                ..Change::default()
-                            }
-                        };
+                            change = Change::recovering(change.worktrees);
+                        }
                         // Acknowledge coverage even when the paths did not change:
                         // this settles fallback after a successful retry.
                         change.coverage = Some(coverage);
@@ -1648,31 +1643,40 @@ fn reconcile(
 ///   an edit made while it was unwatched would otherwise never show.
 /// - One whose file watches were acquired in this pass: events may have
 ///   been lost while they were down.
+/// - An already watched checkout that starts reporting untracked paths.
+///   A panel read may have finished before registration began reporting them,
+///   so only the reader that includes untracked files needs to catch up.
 fn reads_after_registration(
     project: &Project,
     before: Option<&Project>,
     was_unwatched: Option<&BTreeSet<WorktreeId>>,
     now_unwatched: &BTreeSet<WorktreeId>,
     acquired: &BTreeSet<WorktreeId>,
-) -> BTreeSet<WorktreeId> {
+) -> Change {
     let before = before
         .into_iter()
         .flat_map(|project| &project.worktrees)
         .map(|worktree| (worktree.id, worktree))
         .collect::<HashMap<_, _>>();
-    project
-        .worktrees
-        .iter()
-        .filter(|worktree| {
-            let old = before.get(&worktree.id).copied();
-            acquired.contains(&worktree.id)
-                || worktree.needs_read_after(old)
-                || (worktree.interest.watches_files()
-                    && !now_unwatched.contains(&worktree.id)
-                    && was_unwatched.is_some_and(|was| was.contains(&worktree.id)))
-        })
-        .map(|worktree| worktree.id)
-        .collect()
+    let mut change = Change::default();
+    for worktree in &project.worktrees {
+        let id = worktree.id;
+        let old = before.get(&id).copied();
+        if acquired.contains(&id)
+            || worktree.needs_read_after(old)
+            || (worktree.interest.watches_files()
+                && !now_unwatched.contains(&id)
+                && was_unwatched.is_some_and(|was| was.contains(&id)))
+        {
+            change.worktrees.insert(id);
+        } else if worktree.interest == Interest::Inspected
+            && !now_unwatched.contains(&id)
+            && old.is_some_and(|old| old.interest != Interest::Inspected)
+        {
+            change.untracked.insert(id);
+        }
+    }
+    change
 }
 
 impl Drop for Monitor {
@@ -2332,7 +2336,7 @@ mod tests {
             &linked_unwatched,
             &BTreeSet::new(),
         );
-        assert_eq!(reads, BTreeSet::from([linked]));
+        assert_eq!(reads.worktrees, BTreeSet::from([linked]));
         // Registering the same plan again only reads the checkouts whose
         // content watches had to be set up again.
         let again = |acquired: &BTreeSet<WorktreeId>| {
@@ -2343,9 +2347,34 @@ mod tests {
                 &linked_unwatched,
                 acquired,
             )
+            .worktrees
         };
         assert!(again(&BTreeSet::new()).is_empty());
         assert_eq!(again(&BTreeSet::from([first])), BTreeSet::from([first]));
+    }
+
+    #[test]
+    fn starting_untracked_coverage_owes_only_the_panel_a_catch_up_read() {
+        let mut active = project(Path::new("/repo"));
+        active.worktrees[0].interest = Interest::Active;
+        let mut inspected = active.clone();
+        inspected.worktrees[0].interest = Interest::Inspected;
+        let id = inspected.worktrees[0].id;
+        let reads = |next: &Project, previous: &Project| {
+            reads_after_registration(
+                next,
+                Some(previous),
+                None,
+                &BTreeSet::new(),
+                &BTreeSet::new(),
+            )
+        };
+
+        let promoted = reads(&inspected, &active);
+        assert!(promoted.untracked_only());
+        assert_eq!(promoted.untracked, BTreeSet::from([id]));
+        assert!(reads(&inspected, &inspected).untracked.is_empty());
+        assert!(reads(&active, &inspected).untracked.is_empty());
     }
 
     #[test]
