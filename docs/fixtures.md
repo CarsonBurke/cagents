@@ -28,6 +28,7 @@ person.
 | The status bar's phone popover: paired phones, a connected phone, Tailscale up or down, no SSH server | [The phone host marker](#phone-connection-states), `home/.cagents-fixture-mobile-host`, and the fixture HOME's own `.ssh/authorized_keys` |
 | A daemon still restoring after an update, or holding its restore for recovery | [The startup recovery marker](#an-update-restore-in-progress-or-held), `home/.cagents-fixture-startup-recovery` |
 | A conversation whose restart the update stopped | [The stopped-restart marker](#a-conversation-the-update-stopped), `home/.cagents-fixture-update-stopped` |
+| An Oh My Pi chat whose subagents failed with oversized diagnostics, one retained in full and one only as a preview | [The offline OMP peer](#an-offline-oh-my-pi), installed by `native-evidence start SIDE --omp` |
 | An offline ACP agent shaped like Antigravity or Muse, with tools, approvals, stops, saved sessions and sign-in failures | [`tests/fixtures/fake-acp-agent.py`](#an-offline-acp-agent) |
 | The offer, after an update, to resume conversations whose work it stopped | [`tests/fixtures/update-resume-scene.sh`](#an-update-that-stopped-work-in-progress), which records an ended update over four offline agents and reopens the window |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
@@ -593,6 +594,26 @@ succeed again.
 ```sh
 scripts/native-evidence env touch '{fixture}/home/.config/fixture-text-copy-unavailable'
 scripts/native-evidence env rm '{fixture}/home/.config/fixture-text-copy-unavailable'
+```
+
+## An offline Oh My Pi
+
+`native-evidence start SIDE --omp` (or `pair ... --omp`) installs
+[`tests/fixtures/omp-child-errors.py`](../tests/fixtures/omp-child-errors.py)
+as the fixture's `omp`, through
+[`tests/fixtures/fixture-omp.sh`](../tests/fixtures/fixture-omp.sh). It answers
+the app's `omp --mode rpc-ui` requests offline, for one conversation named
+"OMP diagnostic fixture" whose two subagents failed. Retained worker's
+diagnostic is larger than a child transcript keeps but within what the daemon
+retains, so Details shows a shortened preview and Copy details copies the
+original. Refused worker's is larger than the daemon retains, so only the
+preview remains. Each diagnostic's last line states its byte count, which the
+preview leaves out. A prompt plays one short turn that changes neither
+subagent. Without `--omp`, the app sees Oh My Pi as not installed.
+
+```sh
+evidence cli --json agent spawn --provider omp --surface chat \
+    --repository '{fixture}/project' --prompt 'Run the offline check.'
 ```
 
 ## An offline Codex

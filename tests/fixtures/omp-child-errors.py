@@ -76,7 +76,7 @@ class Peer:
         self.session = session
         self.clock = 100
         self.history = [
-            message("user", 1, "Run the offline check."),
+            message("user", 1, "Start both offline workers."),
             message("assistant", 2, "Both workers failed. Their diagnostics are in their tabs."),
         ]
 
