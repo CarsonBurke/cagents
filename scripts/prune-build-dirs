@@ -731,6 +731,10 @@ def main() -> int:
                         note(f"keep {crate}: a rustc compiles it")
                         kept_bytes += bytes_
                         continue
+                except FileNotFoundError:
+                    # Removed meanwhile, as by `cargo clean`.
+                    continue
+                try:
                     if aside != crate:
                         os.rename(crate, aside)
                 except OSError as error:
