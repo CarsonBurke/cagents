@@ -25,7 +25,7 @@ while (($#)); do
             printf '%s\n' 'Usage: scripts/smoke-release-artifacts --dist DIR --version VERSION [--rootfs DIR] [--legacy-editor-layout] [--appimage]' \
                 'Install, exercise and remove every shipped artifact in offline disposable Ubuntu root filesystems.' \
                 '--legacy-editor-layout selects releases that shipped the editor-only archive before bundling Ceditor.' \
-                '--appimage requires the versioned AppImage in the bundle.' \
+                '--appimage requires the versioned AppImage and its identical stable alias.' \
                 'Prepare the default runtime image with scripts/prepare-release-smoke-rootfs. No network or host installation is used by smoke runs.'
             exit 0 ;;
         *) fail "unknown argument: $1" ;;
@@ -63,6 +63,7 @@ full_deb="cagents_${VERSION}_amd64.deb"
 full_archive="cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 editor_archive="ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 appimage="cagents-${VERSION}-x86_64.AppImage"
+appimage_alias=cagents-x86_64.AppImage
 artifacts=(
     "$full_deb"
     "cagents-browserless_${VERSION}_amd64.deb"
@@ -70,7 +71,14 @@ artifacts=(
     "cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
     "$editor_archive"
 )
-if ((REQUIRE_APPIMAGE)) || [[ -e $DIST_DIR/$appimage || -L $DIST_DIR/$appimage ]]; then
+if ((REQUIRE_APPIMAGE)) || [[ -e $DIST_DIR/$appimage || -L $DIST_DIR/$appimage ||
+                              -e $DIST_DIR/$appimage_alias || -L $DIST_DIR/$appimage_alias ]]; then
+    for image in "$appimage" "$appimage_alias"; do
+        [[ -f $DIST_DIR/$image && ! -L $DIST_DIR/$image ]] || fail "missing regular artifact: $image"
+    done
+    command -v cmp >/dev/null || fail 'required command not found: cmp'
+    cmp -s -- "$DIST_DIR/$appimage" "$DIST_DIR/$appimage_alias" ||
+        fail "AppImage alias differs from $appimage"
     artifacts+=("$appimage")
 fi
 for artifact in "${artifacts[@]}"; do

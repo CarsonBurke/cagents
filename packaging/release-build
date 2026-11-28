@@ -204,7 +204,8 @@ grep -Fqx "DEFAULT_REPOSITORY='CarsonBurke/cagents'" /dist/install.sh
 appimage=()
 if [[ -x ./scripts/package-appimage ]]; then
     ./scripts/package-appimage "$VERSION" /dist /dist/install.sh /opt/appimage/runtime-x86_64
-    appimage=("cagents-$VERSION-x86_64.AppImage")
+    appimage=("cagents-$VERSION-x86_64.AppImage" cagents-x86_64.AppImage)
+    ln -T -- "/dist/${appimage[0]}" "/dist/${appimage[1]}"
 fi
 
 staging=$(mktemp -d)

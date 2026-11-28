@@ -95,6 +95,7 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `cagents_${VERSION}_amd64.deb`
 - `cagents-${VERSION}-sizes.txt`
 - `cagents-${VERSION}-artifact-comparison.txt`
+- `cagents-${VERSION}-x86_64.AppImage` and its identical `cagents-x86_64.AppImage` alias
 - `SHA256SUMS`
 - `install.sh`
 - `cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
