@@ -9920,7 +9920,7 @@ fn files_task(
 /// The theme is a parameter rather than read from the global here, because a
 /// shell theme change has to re-render the open page with the theme it is
 /// changing to, which the application knows before the global is updated.
-fn pdf_tone(theme: &cosmic::Theme) -> crate::editor::PdfTone {
+pub(crate) fn pdf_tone(theme: &cosmic::Theme) -> crate::editor::PdfTone {
     if theme.theme_type.is_dark() {
         pdf_tone_inverted(theme)
     } else {
@@ -9932,7 +9932,7 @@ fn pdf_tone(theme: &cosmic::Theme) -> crate::editor::PdfTone {
 ///
 /// Separate because the toolbar's toggle asks for it directly: the reader who
 /// presses it has decided they want the page adapted whatever the shell is.
-fn pdf_tone_inverted(theme: &cosmic::Theme) -> crate::editor::PdfTone {
+pub(crate) fn pdf_tone_inverted(theme: &cosmic::Theme) -> crate::editor::PdfTone {
     let paper = theme.current_container().component.base;
     crate::editor::PdfTone::Inverted {
         paper: [
