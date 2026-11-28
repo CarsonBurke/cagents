@@ -2800,11 +2800,20 @@ fn an_image_is_sent_inline_only_to_an_agent_that_reads_them() {
 
 #[test]
 fn a_non_json_line_is_skipped_unless_it_hides_a_frame() {
-    assert!(!rpc::embedded_frame(b"agy: warming up"));
-    assert!(!rpc::embedded_frame(b"{\"jsonrpc\" mentioned in prose"));
-    assert!(rpc::embedded_frame(
-        br#"log: {"jsonrpc":"2.0","id":3,"result":{}} trailing"#
-    ));
+    use crate::chat::protocol::EmbeddedFrame;
+
+    assert_eq!(
+        rpc::embedded_frame(b"agy: warming up"),
+        EmbeddedFrame::Absent
+    );
+    assert_eq!(
+        rpc::embedded_frame(br#"{"jsonrpc" mentioned in prose"#),
+        EmbeddedFrame::Absent
+    );
+    assert_eq!(
+        rpc::embedded_frame(br#"log: {"jsonrpc":"2.0","id":3,"result":{}} trailing"#),
+        EmbeddedFrame::Present,
+    );
     let (spec, _) = create(&TEST_PROFILE, &launch(&["acp"], None)).unwrap();
     assert!(spec.stdout_noise.is_some());
     assert_eq!(spec.program, "/opt/fake-acp-agent");

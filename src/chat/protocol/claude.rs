@@ -2,7 +2,7 @@
 //! Wire reference: anthropics/claude-agent-sdk-python, _internal/query.py,
 //! _internal/transport/subprocess_cli.py and types.py; matched SDK 0.3.236.
 //! https://unpkg.com/@anthropic-ai/claude-agent-sdk@0.3.236/sdk.d.ts
-use super::{Adapter, ProcessSpec, QueuedInput, Step};
+use super::{Adapter, EmbeddedFrame, ProcessSpec, QueuedInput, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
 use crate::chat;
@@ -75,31 +75,11 @@ pub(super) fn create_history_for_start(
 /// lose the frame, and a lost `result` or `control_request` never settles. A
 /// candidate must be a whole JSON object with the shape of a real frame, so
 /// ordinary text that merely has braces or mentions a frame type is still noise.
-pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
-    // Inspect a bounded number of objects, however many braces a line has.
-    const CANDIDATES: usize = 64;
+pub(crate) fn embedded_protocol_frame(line: &[u8]) -> EmbeddedFrame {
     if !line.windows(6).any(|window| window == b"\"type\"") {
-        return false;
+        return EmbeddedFrame::Absent;
     }
-    let mut start = 0;
-    for _ in 0..CANDIDATES {
-        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
-            return false;
-        };
-        let at = start + offset;
-        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
-        match values.next() {
-            Some(Ok(value)) => {
-                if has_frame_shape(&value) {
-                    return true;
-                }
-                // Fields nested in a complete object are not top-level frames.
-                start = at + values.byte_offset();
-            }
-            _ => start = at + 1,
-        }
-    }
-    false
+    super::embedded_frame(line, has_frame_shape)
 }
 
 /// The whole record at the end of a line that opens with a damaged one, and

@@ -101,9 +101,9 @@ pub struct ProcessSpec {
     /// user's own words.
     pub messages: Option<std::sync::Arc<crate::agent_execution::mailbox::Recognizer>>,
     /// Opt-in tolerance for non-JSON lines on JSON-lines stdout. `None` keeps
-    /// such output immediately fatal. The function reports whether a skipped
-    /// line hides a protocol frame, which must never be dropped silently.
-    pub stdout_noise: Option<fn(&[u8]) -> bool>,
+    /// such output immediately fatal. Only lines clear of protocol frames
+    /// may be discarded.
+    pub stdout_noise: Option<fn(&[u8]) -> EmbeddedFrame>,
     /// The Work tracker reads this conversation from cagents' own record,
     /// so the record remembers every change from the start for it.
     pub followed: bool,
@@ -641,6 +641,48 @@ fn pinned(
         &mut spec.unset_environment,
     );
     (spec, adapter)
+}
+
+/// Whether a line that failed JSON decoding can be skipped safely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddedFrame {
+    Absent,
+    Present,
+    Unchecked,
+}
+
+fn embedded_frame(line: &[u8], has_frame_shape: impl Fn(&Value) -> bool) -> EmbeddedFrame {
+    // Bound parse attempts even when a damaged prefix contains many braces.
+    const CANDIDATES: usize = 64;
+    let mut start = 0;
+    for _ in 0..CANDIDATES {
+        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
+            return EmbeddedFrame::Absent;
+        };
+        let at = start + offset;
+        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) => {
+                if has_frame_shape(&value) {
+                    return EmbeddedFrame::Present;
+                }
+                // A nested object in a complete diagnostic is not a frame.
+                start = at + values.byte_offset();
+            }
+            _ => start = at + 1,
+        }
+    }
+    // A frame may follow the last candidate we could afford to inspect.
+    let suffix = &line[start..];
+    if suffix
+        .iter()
+        .position(|byte| *byte == b'{')
+        .is_some_and(|at| suffix[at..].contains(&b'}'))
+    {
+        EmbeddedFrame::Unchecked
+    } else {
+        EmbeddedFrame::Absent
+    }
 }
 
 /// A bounded diagnostic prefix, with terminal controls escaped. Inspect only

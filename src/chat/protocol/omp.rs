@@ -1,4 +1,4 @@
-use super::{Adapter, ProcessSpec, Step};
+use super::{Adapter, EmbeddedFrame, ProcessSpec, Step};
 use crate::agent_execution::CompactionOutcome;
 use crate::chat::{
     self, Answer, ChangeKind, Choice, Command, CommandAction, Event, Field, FileChange, Item,
@@ -21,6 +21,7 @@ const MAX_CALLS: usize = 128;
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     let mut spec = ProcessSpec::from(&launch.recipe);
+    spec.stdout_noise = Some(embedded_protocol_frame);
     spec.followed = true;
     let mut args = launch.recipe.arguments.iter();
     let mut kept = Vec::new();
@@ -101,6 +102,35 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
             ..Omp::default()
         }),
     ))
+}
+
+fn embedded_protocol_frame(line: &[u8]) -> EmbeddedFrame {
+    super::embedded_frame(line, |frame| match text(frame, "type") {
+        "response" => frame["command"].is_string(),
+        "rpc_chunk" => frame["chunkId"].is_string(),
+        "ready"
+        | "queue_update"
+        | "message_start"
+        | "message_update"
+        | "message_end"
+        | "tool_execution_start"
+        | "tool_execution_update"
+        | "tool_execution_end"
+        | "command_output"
+        | "tool_stream_update"
+        | "subagent_lifecycle"
+        | "subagent_progress"
+        | "subagent_event"
+        | "thinking_level_changed"
+        | "agent_start"
+        | "agent_end"
+        | "auto_compaction_start"
+        | "auto_compaction_end"
+        | "extension_ui_request"
+        | "available_commands_update"
+        | "prompt_result" => true,
+        _ => false,
+    })
 }
 
 #[derive(Default)]

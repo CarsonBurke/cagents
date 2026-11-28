@@ -3,6 +3,7 @@
 //! The agent is both a server and a client: cagents calls its methods, and it
 //! calls back for permission and, were cagents to advertise them, files and
 //! terminals. Every frame is therefore classified before it is interpreted.
+use super::super::EmbeddedFrame;
 use serde_json::{Value, json};
 
 /// JSON-RPC's reserved code for a method the receiver does not implement.
@@ -119,28 +120,9 @@ pub(super) fn error_reason(error: &Value) -> &str {
 /// Whether a non-JSON stdout line contains what looks like a JSON-RPC frame,
 /// which the transport must not drop silently: losing a reply would leave
 /// the conversation waiting for it forever.
-pub(super) fn embedded_frame(line: &[u8]) -> bool {
-    // Inspect a bounded number of objects, however many braces a line has.
-    const CANDIDATES: usize = 64;
+pub(super) fn embedded_frame(line: &[u8]) -> EmbeddedFrame {
     if !line.windows(9).any(|window| window == b"\"jsonrpc\"") {
-        return false;
+        return EmbeddedFrame::Absent;
     }
-    let mut start = 0;
-    for _ in 0..CANDIDATES {
-        let Some(offset) = line[start..].iter().position(|byte| *byte == b'{') else {
-            return false;
-        };
-        let at = start + offset;
-        let mut values = serde_json::Deserializer::from_slice(&line[at..]).into_iter::<Value>();
-        match values.next() {
-            Some(Ok(value)) => {
-                if value.get("jsonrpc").is_some() {
-                    return true;
-                }
-                start = at + values.byte_offset();
-            }
-            _ => start = at + 1,
-        }
-    }
-    false
+    super::super::embedded_frame(line, |value| value.get("jsonrpc").is_some())
 }
