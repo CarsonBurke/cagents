@@ -347,8 +347,23 @@ for line in sys.stdin:
     .await;
     assert_eq!(
         replay.status,
-        ConsumeStatus::NoCredit,
-        "the replay reports an already-used claim, not a new reset"
+        ConsumeStatus::Reset,
+        "the replay confirms the original reset was applied"
+    );
+    assert_eq!(
+        replay.message.as_deref(),
+        Some("The original reset was already applied. Usage refreshed.")
+    );
+    assert_eq!(
+        replay
+            .snapshot
+            .unwrap()
+            .windows
+            .iter()
+            .find(|window| window.key == "weekly_scoped:Fable")
+            .unwrap()
+            .used,
+        0.0
     );
     assert_eq!(
         state(&root, "claude")["consume_count"],
@@ -449,8 +464,8 @@ for line in sys.stdin:
         .await
         .unwrap();
     assert_eq!(
-        reset_consume::claude_status(&spent),
-        ConsumeStatus::NoCredit
+        reset_consume::claude_result(&spent, false),
+        (ConsumeStatus::NoCredit, None)
     );
     std::fs::write(
         root.join("home/.claude/fixture-auth-email"),
