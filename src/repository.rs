@@ -7,6 +7,9 @@
 
 mod ignored_worktree_files;
 mod managed_worktrees;
+#[cfg(all(test, target_os = "linux"))]
+#[path = "../tests/support/repository_scale.rs"]
+mod scale_support;
 pub use ignored_worktree_files::default_disposable_ignored_directories;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -9374,10 +9377,6 @@ mod tests {
             RepositoryService::new("git", Arc::new(IsolatedExecutor))
         }
 
-        #[cfg(target_os = "linux")] // Beneath a private subreaper, which only Linux has.
-        mod scale_support {
-            include!("../tests/support/repository_scale.rs");
-        }
         #[cfg(target_os = "linux")]
         use scale_support::isolated_large_pathspec_test;
 
