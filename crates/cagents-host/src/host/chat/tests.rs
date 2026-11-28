@@ -1935,7 +1935,8 @@ fn muse_return_refuses_an_unrepresentable_live_mode_before_closing() {
     assert!(
         failure
             .message
-            .contains("no equivalent for Deny unmatched actions")
+            .contains("no equivalent for Deny unmatched actions"),
+        "{failure:?}"
     );
     assert!(!handle.is_completed());
     {
@@ -1950,7 +1951,10 @@ fn muse_return_refuses_an_unrepresentable_live_mode_before_closing() {
 fn muse_return_leaves_a_reopenable_chat_if_its_mode_changes_during_close() {
     let (host, chat_id, handle) = muse_return_actor(true);
     let failure = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap_err();
-    assert!(failure.message.contains("Reopen it in chat to continue"));
+    assert!(
+        failure.message.contains("Reopen it in chat to continue"),
+        "{failure:?}"
+    );
     assert!(handle.is_completed());
     let state = host.lock().unwrap();
     assert!(!state.chats[&chat_id].returning_terminal);
@@ -1959,7 +1963,12 @@ fn muse_return_leaves_a_reopenable_chat_if_its_mode_changes_during_close() {
 }
 
 fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Handle) {
-    struct ModeOnInterrupt;
+    const SESSION_ID: &str = "12345678-1234-4234-8234-123456789abc";
+
+    struct ModeOnInterrupt {
+        mode: &'static str,
+        busy: bool,
+    }
     impl Adapter for ModeOnInterrupt {
         fn initialize(&mut self) -> Result<Step, String> {
             Ok(Step::default())
@@ -1978,13 +1987,26 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
             })
         }
         fn receive(&mut self, _: Value) -> Result<Step, String> {
-            Ok(Step::default())
+            Ok(Step {
+                events: vec![
+                    Event::Session {
+                        id: SESSION_ID.into(),
+                        title: None,
+                    },
+                    Event::Ready(true),
+                    Event::PermissionMode(Some(self.mode.into())),
+                    Event::Status {
+                        busy: self.busy,
+                        detail: "Muse".into(),
+                    },
+                ],
+                ..Step::default()
+            })
         }
     }
 
     let host = completion_wake_host();
     let chat_id = TerminalId::new();
-    let session_id = "12345678-1234-4234-8234-123456789abc";
     let recipe = LaunchRecipe {
         program: "/bin/cat".into(),
         arguments: Vec::new(),
@@ -1998,24 +2020,19 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
     } else {
         "dontAsk"
     };
+    // A provider frame confirms the ID. The initial projection alone carries
+    // no authority to start an exact terminal handoff.
     let mut initial = Step {
-        events: vec![
-            Event::Session {
-                id: session_id.into(),
-                title: None,
-            },
-            Event::PermissionMode(Some(mode.into())),
-            Event::Status {
-                busy: changes_during_close,
-                detail: "Muse".into(),
-            },
-        ],
+        writes: vec![json!({"ready": true})],
         ..Step::default()
     };
     let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
     let handle = Handle::start(
         spec,
-        Box::new(ModeOnInterrupt),
+        Box::new(ModeOnInterrupt {
+            mode,
+            busy: changes_during_close,
+        }),
         initial,
         store,
         None,
@@ -2023,10 +2040,10 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
     )
     .unwrap();
     completion_wait_until(|| {
-        handle.snapshot(None).is_some_and(|snapshot| {
-            snapshot.session_id.as_deref() == Some(session_id)
-                && snapshot.permission_mode.as_deref() == Some(mode)
-        })
+        handle.confirmed_session_id().as_deref() == Some(SESSION_ID)
+            && handle
+                .snapshot(None)
+                .is_some_and(|snapshot| snapshot.permission_mode.as_deref() == Some(mode))
     });
     completion_wake_record(
         &host,
@@ -2040,7 +2057,7 @@ fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Han
                 arguments: vec!["--approval-mode".into(), "never".into()],
                 ..recipe
             },
-            session_id: Some(session_id.into()),
+            session_id: Some(SESSION_ID.into()),
             draft_model: None,
         },
     );
