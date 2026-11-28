@@ -1835,6 +1835,7 @@ impl Codex {
     }
     fn model_events(&self, step: &mut Step) {
         step.events.push(Event::Models {
+            acp_reasoning_observed: None,
             models: self.models.clone(),
             selected: self.selected.clone(),
             reasoning: self.reasoning.clone(),

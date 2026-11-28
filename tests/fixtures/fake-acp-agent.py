@@ -292,6 +292,8 @@ class Session:
         self.cwd = cwd
         if SHAPE == "muse":
             self.mode, self.model, self.level = "onRequest", "muse-spark-1.2", None
+            if marked("initial-model"):
+                self.model = (Path(MARKS) / "initial-model").read_text().strip()
         else:
             self.mode, self.model, self.level = "default", "gemini-3.8-flash", "low"
         if marked("initial-mode"):

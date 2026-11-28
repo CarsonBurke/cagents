@@ -1129,6 +1129,7 @@ pub(crate) fn retain_reader_fields(snapshot: &mut crate::chat::Snapshot) {
     take(&mut snapshot.text_copy_sources);
     take(&mut snapshot.requests);
     take(&mut snapshot.models);
+    take(&mut snapshot.reasoning_observed_at);
     take(&mut snapshot.permission_denials);
     take(&mut snapshot.commands);
     take(&mut snapshot.skills);

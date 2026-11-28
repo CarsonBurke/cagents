@@ -268,6 +268,7 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
                 models,
                 selected,
                 reasoning,
+                ..
             } => Some((models.clone(), selected.clone(), reasoning.clone())),
             _ => None,
         })
@@ -529,6 +530,10 @@ fn a_muse_model_offers_only_the_levels_it_listed_while_current() {
         ]
     };
     assert_eq!(levels(&step), expect(&["xhigh"]));
+    let mut snapshot = crate::chat::Snapshot::default();
+    crate::chat::runtime::project_events_for_test(&mut snapshot, step.events);
+    let initial = snapshot.reasoning_observed_at.clone().unwrap();
+    assert_eq!(initial.keys().collect::<Vec<_>>(), ["muse-spark-1.2"]);
 
     // Wonder, once current, lists no option; spark keeps the level it had.
     options.as_array_mut().unwrap().pop();
@@ -541,6 +546,11 @@ fn a_muse_model_offers_only_the_levels_it_listed_while_current() {
         )
         .unwrap();
     assert_eq!(levels(&step), expect(&["xhigh"]));
+    crate::chat::runtime::project_events_for_test(&mut snapshot, step.events);
+    let observed = snapshot.reasoning_observed_at.unwrap();
+    assert_eq!(observed["muse-spark-1.2"], initial["muse-spark-1.2"]);
+    assert!(observed.contains_key("muse-wonder-full-1.0"));
+    assert!(snapshot.models[1].reasoning.is_empty());
 }
 
 #[test]
@@ -651,6 +661,54 @@ fn an_agent_with_only_the_older_states_is_driven_by_their_own_methods() {
         })
         .is_err()
     );
+}
+
+#[test]
+fn a_legacy_model_switch_attributes_reported_levels_to_the_new_model() {
+    let mut acp = adapter(&[], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let reasoning = |level| {
+        json!([{
+            "id": "thought_level", "category": "thought_level", "type": "select",
+            "currentValue": level, "options": [{"value": level}]
+        }])
+    };
+    acp.receive(reply(
+        only_write(&opened),
+        json!({
+            "sessionId": "fixture",
+            "models": {"currentModelId": "first", "availableModels": [
+                {"modelId": "first"}, {"modelId": "second"}
+            ]},
+            "configOptions": reasoning("high")
+        }),
+    ))
+    .unwrap();
+    let step = acp
+        .command(Command::SetModel {
+            model: "second".into(),
+            reasoning: None,
+        })
+        .unwrap();
+    let request = only_write(&step);
+    assert_eq!(request["method"], "session/set_model");
+    let step = acp
+        .receive(reply(request, json!({"configOptions": reasoning("low")})))
+        .unwrap();
+    assert_eq!(
+        levels(&step),
+        vec![
+            ("first".to_owned(), vec!["high".to_owned()]),
+            ("second".to_owned(), vec!["low".to_owned()])
+        ]
+    );
+    assert!(step.events.iter().any(|event| matches!(
+        event, Event::Models { acp_reasoning_observed: Some(observed), .. }
+            if observed == &["second"]
+    )));
 }
 
 #[test]

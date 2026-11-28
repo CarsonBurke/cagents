@@ -4894,8 +4894,18 @@ fn apply_projected_event(
             models,
             selected,
             reasoning,
+            acp_reasoning_observed,
         } => {
             if !models.is_empty() {
+                state.reasoning_observed_at = acp_reasoning_observed.map(|observed| {
+                    let mut stamps = state.reasoning_observed_at.take().unwrap_or_default();
+                    let stamps_mut = Arc::make_mut(&mut stamps);
+                    stamps_mut.retain(|id, _| models.iter().any(|model| &model.id == id));
+                    if let Some(now) = observed_at() {
+                        stamps_mut.extend(observed.into_iter().map(|id| (id, now)));
+                    }
+                    stamps
+                });
                 state.models = models;
             }
             if selected.is_some() {

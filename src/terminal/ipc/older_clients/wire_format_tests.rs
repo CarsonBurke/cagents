@@ -1180,7 +1180,7 @@ fn queued_input_fields_follow_the_peers_protocol() {
         ..Snapshot::default()
     };
     let message = (snapshot.clone(), 7u8);
-    let current = postcard::to_stdvec(&message).unwrap();
+    let current = encoding_for(QUEUE_HOLDS, || postcard::to_stdvec(&message)).unwrap();
     for (protocol, omitted) in [
         (SEND_QUEUED_NOW - 1, 4),
         (SEND_QUEUED_NOW, 1),
@@ -1202,4 +1202,29 @@ fn queued_input_fields_follow_the_peers_protocol() {
     // Saved JSON carries the current fields independently of the wire layout.
     let saved: Snapshot = serde_json::from_slice(&serde_json::to_vec(&snapshot).unwrap()).unwrap();
     assert_eq!(saved, snapshot);
+}
+
+#[test]
+fn acp_reasoning_observations_follow_the_peers_protocol() {
+    use crate::chat::Snapshot;
+
+    let snapshot = Snapshot {
+        reasoning_observed_at: Some(
+            std::collections::BTreeMap::from([("spark".into(), 42)]).into(),
+        ),
+        ..Default::default()
+    };
+    let message = (snapshot.clone(), 7u8);
+    for protocol in [ACP_REASONING_OBSERVATIONS - 1, ACP_REASONING_OBSERVATIONS] {
+        let sent = encoding_for(protocol, || postcard::to_stdvec(&message)).unwrap();
+        let (read, after): (Snapshot, u8) =
+            decoding_from(protocol, || postcard::from_bytes(&sent)).unwrap();
+        let expected = if protocol == ACP_REASONING_OBSERVATIONS {
+            snapshot.clone()
+        } else {
+            Snapshot::default()
+        };
+        assert_eq!(read, expected);
+        assert_eq!(after, 7);
+    }
 }

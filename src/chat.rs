@@ -2119,28 +2119,37 @@ pub struct Snapshot {
     #[serde(default)]
     pub file_changes: std::sync::Arc<FileChangesSummary>,
     /// How a request to hand the queued messages to the running turn stands.
-    /// Last, so that a client or source from before it reads the rest.
     #[serde(
         default,
         skip_serializing_if = "crate::terminal_ipc::before_send_queued_now"
     )]
     pub send_now: Option<SendNow>,
+    /// ACP reasoning reports, stamped when received by the actor. Models
+    /// without a stamp have yet to report their levels in this conversation.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::before_acp_reasoning_observations"
+    )]
+    pub reasoning_observed_at: Option<std::sync::Arc<std::collections::BTreeMap<String, u64>>>,
 }
 
-/// As derived, except that a client from before [`SendNow`] is sent the
-/// fields it decodes: see [`Snapshot::send_now`].
 impl Serialize for Snapshot {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         Self::serialize(self, serializer)
     }
 }
 
-/// As derived, except that one from a source before [`SendNow`] has no
-/// request to read and stands for none.
 impl<'de> Deserialize<'de> for Snapshot {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        if crate::terminal_ipc::decoding_before(crate::terminal_ipc::SEND_QUEUED_NOW) {
-            return Self::deserialize(crate::terminal_ipc::WithoutTrailing::new(deserializer, 1));
+        use crate::terminal_ipc::{
+            ACP_REASONING_OBSERVATIONS, SEND_QUEUED_NOW, WithoutTrailing, decoding_before,
+        };
+
+        if decoding_before(SEND_QUEUED_NOW) {
+            return Self::deserialize(WithoutTrailing::new(deserializer, 2));
+        }
+        if decoding_before(ACP_REASONING_OBSERVATIONS) {
+            return Self::deserialize(WithoutTrailing::new(deserializer, 1));
         }
         Self::deserialize(deserializer)
     }
@@ -4073,6 +4082,9 @@ pub enum Event {
         models: Vec<Model>,
         selected: Option<String>,
         reasoning: Option<String>,
+        /// For ACP, the models whose levels this update directly reports.
+        #[serde(default)]
+        acp_reasoning_observed: Option<Vec<String>>,
     },
     ActiveModel(Option<ActiveModel>),
     FastMode(FastMode),

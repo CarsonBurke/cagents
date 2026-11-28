@@ -41,7 +41,7 @@ pub(super) fn install_url(provider: Provider) -> Option<&'static str> {
 use crate::account::{
     self, Account, AccountId, Identity, LiveReport, UsageSnapshot, UsageSource, UsageStatus,
     UsageWindow,
-    cache::{Cache, Catalog, Entry},
+    cache::{Cache, Catalog, CatalogObservation, Entry},
     home::Homes,
     omp::{self, History},
     probe::{self, Outcome},
@@ -153,7 +153,7 @@ pub(super) struct State {
     live_unsaved: BTreeSet<AccountId>,
     /// The models each provider last listed, which a new conversation offers
     /// before any provider's CLI is started for it.
-    catalogs: BTreeMap<Provider, Catalog>,
+    catalogs: BTreeMap<Provider, CatalogObservation>,
     /// Providers whose running conversation listed models the cache has not
     /// been given yet.
     catalogs_unsaved: BTreeSet<Provider>,
@@ -857,7 +857,7 @@ impl State {
 
     /// The models `provider` last listed, in a conversation or to a probe.
     pub(super) fn catalog(&self, provider: Provider) -> Option<&Catalog> {
-        self.catalogs.get(&provider)
+        self.catalogs.get(&provider).map(|entry| &entry.catalog)
     }
 
     /// Whether the last discovery found no CLI for `provider` where this
@@ -886,23 +886,14 @@ impl State {
                 || self.of(provider).any(|account| account.present))
     }
 
-    /// Takes what `provider` listed, unless what is known is newer: another
-    /// window's list read from the cache can be older than this window's.
-    /// A known stamp beyond the current clock's slack follows a clock rollback
-    /// and must not prevent a current list, just as with quota and disk cache.
-    /// Whether it was taken.
-    fn take_catalog(&mut self, provider: Provider, mut catalog: Catalog, now: Millis) -> bool {
-        if self.catalogs.get(&provider).is_some_and(|known| {
-            known.observed_at > catalog.observed_at
-                && known.observed_at <= now.saturating_add(schedule::CLOCK_SLACK)
-        }) {
-            return false;
-        }
-        if let Some(previous) = self.catalogs.get(&provider) {
-            catalog.inherit_defaults(previous);
-        }
-        self.catalogs.insert(provider, catalog);
-        true
+    /// Takes what the provider listed using the same rules as the shared cache.
+    fn take_catalog(
+        &mut self,
+        provider: Provider,
+        catalog: impl Into<CatalogObservation>,
+        now: Millis,
+    ) -> bool {
+        CatalogObservation::record(&mut self.catalogs, provider, catalog.into(), now)
     }
 
     /// Why Omp's usage record could not be read, when it could not.
@@ -931,7 +922,7 @@ impl State {
 
     /// What running conversations listed since the last write leave for the
     /// cache.
-    fn take_live_catalogs(&mut self) -> Vec<(Provider, Catalog)> {
+    fn take_live_catalogs(&mut self) -> Vec<(Provider, CatalogObservation)> {
         std::mem::take(&mut self.catalogs_unsaved)
             .into_iter()
             .filter_map(|provider| Some((provider, self.catalogs.get(&provider)?.clone())))
@@ -1429,7 +1420,7 @@ pub struct Loaded {
     generation: u64,
     registry: Result<Registry, String>,
     restored: Vec<Restored>,
-    catalogs: BTreeMap<Provider, Catalog>,
+    catalogs: BTreeMap<Provider, CatalogObservation>,
     installed: BTreeMap<Provider, bool>,
     /// Whether presence was judged on the interface's own `PATH` because the
     /// shell had not yet said what a terminal would search.
@@ -1645,7 +1636,11 @@ fn now_ms() -> Millis {
 /// Writes figures and models running conversations reported to the cache
 /// other windows read. Blocking: finding an account's cache key resolves its
 /// home.
-fn store_live(cache: &Cache, entries: Vec<(Account, Entry)>, catalogs: Vec<(Provider, Catalog)>) {
+fn store_live(
+    cache: &Cache,
+    entries: Vec<(Account, Entry)>,
+    catalogs: Vec<(Provider, CatalogObservation)>,
+) {
     for (account, entry) in entries {
         let Some(key) = account.cache_key() else {
             continue;
@@ -3102,7 +3097,7 @@ impl Cagents {
                 let restored = restore(&accounts, cache.as_ref(), now, &installed);
                 let catalogs = cache
                     .as_ref()
-                    .map(|cache| cache.catalogs(now))
+                    .map(|cache| cache.catalog_observations(now))
                     .unwrap_or_default();
                 // Not while the registry cannot be read, or its accounts' homes
                 // cannot be found, which would take every added account for
@@ -3954,28 +3949,31 @@ impl Cagents {
         Task::batch([save, probe])
     }
 
-    /// Takes the models a running conversation of `provider` listed, and
-    /// queues them for the cache like its figures.
-    pub(super) fn observe_listed_models(
+    /// Takes the models a running conversation listed and queues them for
+    /// the cache like its figures.
+    pub(super) fn observe_chat_catalog(
         &mut self,
         provider: Provider,
-        models: Vec<crate::chat::Model>,
-        active: Option<&crate::chat::ActiveModel>,
+        snapshot: &crate::chat::Snapshot,
     ) -> Task<Message> {
         let now = now_ms();
         let mut catalog = Catalog {
-            models,
+            models: snapshot.models.clone(),
             observed_at: now,
             default_model: None,
             reasoning_defaults: Default::default(),
         };
-        if let Some(active) = active
-            && let Some(effort) = active.default_reasoning.as_ref()
+        if let Some(active) = &snapshot.active_model
+            && let Some(effort) = &active.default_reasoning
         {
             catalog
                 .reasoning_defaults
                 .insert(active.id.clone(), effort.clone());
         }
+        let catalog = CatalogObservation {
+            catalog,
+            reasoning_observed_at: snapshot.reasoning_observed_at.clone(),
+        };
         if catalog.models.is_empty() || !self.account_ui.take_catalog(provider, catalog, now) {
             return Task::none();
         }
@@ -3985,6 +3983,23 @@ impl Cagents {
         }
         self.account_ui.catalogs_unsaved.insert(provider);
         self.schedule_live_save()
+    }
+
+    #[cfg(test)]
+    pub(super) fn observe_listed_models(
+        &mut self,
+        provider: Provider,
+        models: Vec<crate::chat::Model>,
+        active: Option<&crate::chat::ActiveModel>,
+    ) -> Task<Message> {
+        self.observe_chat_catalog(
+            provider,
+            &crate::chat::Snapshot {
+                models,
+                active_model: active.cloned(),
+                ..Default::default()
+            },
+        )
     }
 
     /// Queues `id`'s figures for the cache, written a little later together
@@ -11982,7 +11997,9 @@ mod app_tests {
         {
             known_catalog
         } else {
-            produced_catalog.expect("this case must publish its independently observed list")
+            produced_catalog
+                .expect("this case must publish its independently observed list")
+                .catalog
         };
         assert_eq!(app.account_ui.catalog(provider), Some(&expected_catalog));
         assert_eq!(app.account_ui.catalog(other_provider), Some(&other_catalog));
@@ -12151,7 +12168,7 @@ mod app_tests {
     type ProbeReplyEffects = (
         Millis,
         Registry,
-        BTreeMap<Provider, Catalog>,
+        BTreeMap<Provider, CatalogObservation>,
         Option<AccountId>,
         Vec<ProbeRowEffects>,
         (
@@ -12297,7 +12314,7 @@ mod app_tests {
                 assert!(state.failure.is_none());
                 assert!(!state.schedule.in_flight(now));
                 assert!(app.account_ui.pending_probe_for_test(&id).is_none());
-                assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                assert_eq!(app.account_ui.catalog(provider), catalog.as_deref());
                 assert_eq!(app.automatic_account(&current).unwrap().id(), id);
                 let queued_ticket = app.account_ui.pending_probe_for_test(&queued).unwrap();
                 let settled = probe_reply_effects(&app);
@@ -12697,7 +12714,7 @@ mod app_tests {
                         assert_eq!(state.identity, identity);
                         assert!(state.present && state.failure.is_none());
                         assert_eq!(state.schedule.failures(), 0);
-                        assert_eq!(app.account_ui.catalog(provider), catalog.as_ref());
+                        assert_eq!(app.account_ui.catalog(provider), catalog.as_deref());
                         assert!(app.account_ui.shown_in_switcher(state));
                         assert!(app.provider_chip(provider, finished, false).is_some());
                         assert_eq!(app.automatic_account(&current).unwrap().id(), id);
@@ -12814,7 +12831,7 @@ mod app_tests {
                         generation: app.account_ui.discovery_generation,
                         registry: Ok(app.account_ui.registry.clone()),
                         restored: Vec::new(),
-                        catalogs: BTreeMap::from([(provider, catalog(now, "current"))]),
+                        catalogs: BTreeMap::from([(provider, catalog(now, "current").into())]),
                         installed: BTreeMap::new(),
                         provisional: false,
                     }))),
@@ -12833,7 +12850,7 @@ mod app_tests {
                                     "probe after clock rollback",
                                     now,
                                 )),
-                                catalog: Some(catalog(now, "current")),
+                                catalog: Some(catalog(now, "current").into()),
                             },
                         }))
                     }
@@ -12850,6 +12867,45 @@ mod app_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_new_acp_conversation_keeps_other_models_reasoning_in_the_draft_catalog() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.cache = Some(cache.clone());
+        let provider = Provider::Muse;
+        let spark = |levels: &[&str]| crate::chat::Model {
+            id: "spark".into(),
+            label: "Spark".into(),
+            reasoning: levels.iter().map(|level| (*level).into()).collect(),
+        };
+        let wonder = crate::chat::Model {
+            id: "wonder".into(),
+            label: "Wonder".into(),
+            reasoning: Vec::new(),
+        };
+        let snapshot = |spark, reported: &str, observed_at| crate::chat::Snapshot {
+            models: vec![spark, wonder.clone()],
+            reasoning_observed_at: Some(BTreeMap::from([(reported.into(), observed_at)]).into()),
+            ..Default::default()
+        };
+
+        let _ = app.observe_chat_catalog(provider, &snapshot(spark(&["xhigh"]), "spark", 10));
+        let _ = app.observe_chat_catalog(provider, &snapshot(spark(&[]), "wonder", 20));
+        let draft_catalog = app.account_ui.catalog(provider).unwrap().clone();
+        assert_eq!(draft_catalog.models, [spark(&["xhigh"]), wonder.clone()]);
+
+        let pending = app.account_ui.take_live_catalogs();
+        store_live(&cache, Vec::new(), pending);
+        assert_eq!(cache.catalogs(now_ms())[&provider], draft_catalog);
+
+        let _ = app.observe_chat_catalog(provider, &snapshot(spark(&[]), "spark", 30));
+        assert_eq!(
+            app.account_ui.catalog(provider).unwrap().models,
+            [spark(&[]), wonder.clone()]
+        );
     }
 
     /// The models each provider lists come from the cache at startup, from
@@ -12878,7 +12934,7 @@ mod app_tests {
             generation: app.account_ui.discovery_generation,
             registry: Ok(app.account_ui.registry.clone()),
             restored: Vec::new(),
-            catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached"))]),
+            catalogs: BTreeMap::from([(Provider::Codex, catalog(now - 10_000, "cached").into())]),
             installed: BTreeMap::new(),
             provisional: false,
         })));
@@ -12903,7 +12959,7 @@ mod app_tests {
             outcome: Outcome::Answered {
                 identity: None,
                 snapshot: Box::new(snapshot.clone()),
-                catalog: Some(catalog(now - 5_000, "probed")),
+                catalog: Some(catalog(now - 5_000, "probed").into()),
             },
         }));
         assert_eq!(listed(&app, Provider::Codex).as_deref(), Some("probed"));

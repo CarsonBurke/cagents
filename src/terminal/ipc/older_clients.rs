@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 219,
+    proven_at: 220,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -177,6 +177,14 @@ pub fn before_project_order<T>(_: &T) -> bool {
 /// computer started. A client before it is never sent one.
 pub const NOT_RESUMED_NOTICES: u16 = 213;
 
+/// The first protocol whose snapshots distinguish an unreported ACP model's
+/// levels from a confirmed empty list.
+pub const ACP_REASONING_OBSERVATIONS: u16 = 220;
+
+pub fn before_acp_reasoning_observations<T>(_: &T) -> bool {
+    encoding_before(ACP_REASONING_OBSERVATIONS)
+}
+
 /// Reads a struct whose last `omitted` fields a source from before the
 /// protocol that added them never encoded. Postcard reads a struct as a tuple
 /// of its fields, so the struct is read as a tuple of the fields that source
@@ -258,6 +266,11 @@ const OMITTED_FIELDS: &[(&str, &[&str], u16)] = &[
     ),
     ("cagents::chat::Snapshot", &["send_now"], SEND_QUEUED_NOW),
     (
+        "cagents::chat::Snapshot",
+        &["reasoning_observed_at"],
+        ACP_REASONING_OBSERVATIONS,
+    ),
+    (
         "cagents::chat::Capabilities",
         &["send_queued_now"],
         SEND_QUEUED_NOW,
@@ -313,6 +326,11 @@ const DECODED_WITHOUT: &[(&str, &[&str], u16)] = &[
         DRAFT_MODEL_IN_LAUNCH,
     ),
     ("cagents::chat::Snapshot", &["send_now"], SEND_QUEUED_NOW),
+    (
+        "cagents::chat::Snapshot",
+        &["reasoning_observed_at"],
+        ACP_REASONING_OBSERVATIONS,
+    ),
     (
         "cagents::chat::Capabilities",
         &["send_queued_now"],

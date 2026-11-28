@@ -15,7 +15,7 @@ use std::{
 use serde_json::Value;
 use tokio::io::AsyncReadExt;
 
-use super::{Catalog, Group, Probed, UsageStatus, after_close, now_ms};
+use super::{Catalog, CatalogObservation, Group, Probed, UsageStatus, after_close, now_ms};
 use crate::{account::Account, agent::Provider, chat::Model};
 
 /// The most of Muse's complaint the probe reads; it is one line.
@@ -74,7 +74,7 @@ fn usage(
     output: &[u8],
     complaint: &[u8],
     observed_at: u64,
-    catalog: Option<Catalog>,
+    catalog: Option<CatalogObservation>,
 ) -> Result<Probed, String> {
     if String::from_utf8_lossy(complaint).contains(NOT_LOGGED_IN) {
         return Ok(Probed::state(
@@ -121,7 +121,7 @@ pub(super) fn data_home(environment: &dyn Fn(&str) -> Option<String>) -> Option<
 /// its newest cache, of the layout this reads. Hidden and contributor models
 /// are left out, as a Muse chat leaves them out. Their reasoning levels are
 /// left for the conversation, which offers fewer than the catalog lists.
-fn catalog(data: &Option<PathBuf>, observed_at: u64) -> Option<Catalog> {
+fn catalog(data: &Option<PathBuf>, observed_at: u64) -> Option<CatalogObservation> {
     let directory = data.as_ref()?.join("model-catalog");
     let newest = std::fs::read_dir(directory)
         .ok()?
@@ -137,7 +137,7 @@ fn catalog(data: &Option<PathBuf>, observed_at: u64) -> Option<Catalog> {
     parse_catalog(&std::fs::read(newest).ok()?, observed_at)
 }
 
-fn parse_catalog(bytes: &[u8], observed_at: u64) -> Option<Catalog> {
+fn parse_catalog(bytes: &[u8], observed_at: u64) -> Option<CatalogObservation> {
     let cache: Value = serde_json::from_slice(bytes).ok()?;
     if cache["schema_version"].as_u64() != Some(CATALOG_SCHEMA) {
         return None;
@@ -167,11 +167,14 @@ fn parse_catalog(bytes: &[u8], observed_at: u64) -> Option<Catalog> {
         .find(|row| row["is_default"] == true)
         .and_then(|row| row["model_id"].as_str())
         .map(str::to_owned);
-    (!models.is_empty()).then(|| Catalog {
-        models,
-        observed_at,
-        default_model,
-        reasoning_defaults: Default::default(),
+    (!models.is_empty()).then(|| CatalogObservation {
+        catalog: Catalog {
+            models,
+            observed_at,
+            default_model,
+            reasoning_defaults: Default::default(),
+        },
+        reasoning_observed_at: Some(Default::default()),
     })
 }
 
