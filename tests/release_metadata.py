@@ -71,6 +71,31 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertEqual(products["cagents"]["deb"], f"cagents_{VERSION}_amd64.deb")
         self.assertNotIn("deb", products["cagents-browserless"])
 
+    def assert_archive_requires_checksums(self, product, checksums):
+        (self.release / f"{product}-{VERSION}-x86_64-unknown-linux-gnu.tar.gz").write_bytes(b"archive")
+        path = self.release / "release-metadata.json"
+        refused = self.write(check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(checksums, refused.stderr)
+        self.assertFalse(path.exists())
+
+        manifest = self.release / checksums
+        manifest.write_bytes(b"checksums")
+        self.write()
+        stale = json.loads(path.read_bytes())
+        del stale["assets"][checksums]
+        path.write_text(json.dumps(stale))
+        manifest.unlink()
+        refused = run("check", "--dir", str(self.release), check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(checksums, refused.stderr)
+
+    def test_a_browserless_archive_requires_its_checksum_file(self):
+        self.assert_archive_requires_checksums("cagents-browserless", "SHA256SUMS-browserless")
+
+    def test_a_ceditor_archive_requires_its_checksum_file(self):
+        self.assert_archive_requires_checksums("ceditor", "SHA256SUMS-ceditor")
+
     def test_a_linux_release_names_no_macos_target(self):
         self.write()
         targets = json.loads((self.release / "release-metadata.json").read_bytes())["targets"]

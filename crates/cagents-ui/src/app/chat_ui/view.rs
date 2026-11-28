@@ -1810,7 +1810,7 @@ impl Cagents {
 }
 
 /// Prefer concrete activity from the newest assistant item when available.
-fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
+pub(super) fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
     if snapshot.has_later {
         return "Working";
     }
@@ -2358,169 +2358,6 @@ impl Runtime {
             .find(|line| !line.is_empty())
     }
 
-    /// Completion requires provider evidence. An unstarted conversation is a
-    /// draft; an idle attached one is ready, while an attachment is connecting.
-    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
-        self.conversation_status_with_failures(transitioning, true)
-    }
-
-    fn conversation_status_with_failures(
-        &self,
-        transitioning: bool,
-        include_failures: bool,
-    ) -> (Option<Icon>, String) {
-        self.conversation_status_of(transitioning, include_failures, true)
-    }
-
-    /// The conversation's own status, leaving its subagents to whoever
-    /// shows them separately.
-    pub(super) fn own_conversation_status(&self) -> (Option<Icon>, String) {
-        self.conversation_status_of(false, false, false)
-    }
-
-    fn conversation_status_of(
-        &self,
-        transitioning: bool,
-        include_failures: bool,
-        include_subagents: bool,
-    ) -> (Option<Icon>, String) {
-        let (glyph, label) = self.conversation_status_base(transitioning);
-        let snapshot = &self.snapshot;
-        if self.closed_elsewhere
-            || self.queued.is_some()
-            || transitioning
-            || self.attachment_chooser_pending.is_some()
-            || self.says_sending()
-            || self.disconnected
-            || snapshot.exited
-        {
-            return (glyph, label.to_owned());
-        }
-        // Left out, the subagents are not walked at all: the inspector and
-        // its rail ask for the conversation's own status on every frame.
-        let activity = if include_subagents {
-            snapshot.subagent_activity()
-        } else {
-            chat::SubagentActivity::default()
-        };
-        let (working, waiting, on_background_work, failed) = (
-            activity.working,
-            activity.waiting,
-            activity.on_background_work,
-            activity.failed.len(),
-        );
-        let active = self.reported_errors().find_map(|message| {
-            chat::failure::Failure::parse(self.session.launch.provider, message)
-        });
-        // The reset is when the conversation can carry on, so a limit that
-        // still holds, as the daemon judges it, says it.
-        let limit_reset = self
-            .usage_limit
-            .as_ref()
-            .filter(|_| {
-                active
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-            })
-            .and_then(|limit| limit.reset.as_deref())
-            .map(|reset| format!("Account limit reached · resets {reset}"));
-        let failure_label = active.as_ref().and_then(|failure| match failure.kind {
-            chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
-            chat::failure::FailureKind::Authentication => Some("Sign-in required"),
-            chat::failure::FailureKind::NoAllowance => Some("No usage allowance"),
-            chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
-            chat::failure::FailureKind::Connection => Some("Connection interrupted"),
-            chat::failure::FailureKind::Interrupted => Some("Interrupted"),
-            chat::failure::FailureKind::OutOfMemory => Some("Stopped: out of memory"),
-            // The agent carried on; its notice is in the transcript.
-            chat::failure::FailureKind::CommandOutOfMemory => None,
-            chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
-            chat::failure::FailureKind::Unresponsive => Some("Not responding"),
-        });
-        let mut parts = Vec::new();
-        if let Some(label) = limit_reset.as_deref().or(failure_label) {
-            parts.push(label.to_owned());
-        } else if snapshot.busy
-            || snapshot.waiting
-            || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0 && on_background_work == 0 && failed == 0)
-        {
-            parts.push(label.to_owned());
-        }
-        let mut agent_parts = Vec::new();
-        if working > 0 {
-            agent_parts.push(format!(
-                "{working} {} working",
-                if working == 1 {
-                    "subagent"
-                } else {
-                    "subagents"
-                }
-            ));
-        }
-        if waiting > 0 {
-            agent_parts.push(if agent_parts.is_empty() {
-                format!(
-                    "{waiting} {} waiting",
-                    if waiting == 1 {
-                        "subagent"
-                    } else {
-                        "subagents"
-                    }
-                )
-            } else {
-                format!("{waiting} waiting")
-            });
-        }
-        if on_background_work > 0 {
-            agent_parts.push(if agent_parts.is_empty() {
-                format!(
-                    "{on_background_work} {} waiting on background work",
-                    if on_background_work == 1 {
-                        "subagent"
-                    } else {
-                        "subagents"
-                    }
-                )
-            } else {
-                format!("{on_background_work} waiting on background work")
-            });
-        }
-        parts.extend(agent_parts);
-        if include_failures && failed > 0 {
-            parts.push(Self::agent_failure_label(&activity.failed));
-        }
-        if working + waiting + on_background_work + failed > 0 || failure_label.is_some() {
-            return (
-                if working > 0 || snapshot.busy {
-                    Some(Icon::AgentWorking)
-                } else if active
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-                {
-                    // A usage limit waits on a reset or another account,
-                    // not on a fix: the limit's own mark, not a failure's.
-                    Some(Icon::UsageLimit)
-                } else if failure_label.is_some() || failed > 0 {
-                    Some(Icon::Error)
-                } else if waiting > 0 {
-                    // The conversation's own wait says what it waits for;
-                    // a subagent's alone is unnamed.
-                    glyph
-                        .filter(|glyph| {
-                            crate::sidebar::AttentionState::of_glyph(*glyph)
-                                .is_some_and(crate::sidebar::AttentionState::waits_on_user)
-                        })
-                        .or(Some(Icon::AgentWaiting))
-                } else {
-                    None
-                },
-                parts.join(" · "),
-            );
-        }
-        (glyph, parts.join(" · "))
-    }
-
     pub(super) fn agent_failure_task(agent: &chat::Subagent) -> &str {
         Self::native_child_task(agent).unwrap_or_else(|| Self::native_child_name(agent))
     }
@@ -2653,16 +2490,10 @@ impl Runtime {
             // The turn stays open on its background commands alone.
             Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label)),
             // A recent failed task stays actionable even after the lead finishes.
-            Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
-                Some((Icon::Error, label))
-            }
+            Some(Icon::Error) if self.status_children().failed > 0 => Some((Icon::Error, label)),
             // Nothing is asked of the reader, but the finished stamp alone
             // would read as everything being done.
-            _ if snapshot
-                .subagents
-                .iter()
-                .any(|agent| agent.status == chat::ToolStatus::Waiting) =>
-            {
+            _ if self.status_children().on_background_work > 0 => {
                 Some((Icon::AgentBackground, label))
             }
             _ => None,
@@ -2746,7 +2577,7 @@ impl Runtime {
         transitioning: bool,
         selected: Option<&chat::Subagent>,
     ) -> Option<(Icon, String)> {
-        if selected.is_none() && self.queue_sending() && !self.snapshot.is_working() {
+        if selected.is_none() && self.queue_sending() && !self.status_is_working() {
             return None;
         }
         self.timeline_activity(transitioning, selected)
@@ -2997,12 +2828,12 @@ impl Runtime {
     /// Whether the conversation's status reads "Sending": a message is on
     /// its way, and the queue is not already saying so above a working agent.
     fn says_sending(&self) -> bool {
-        self.on_its_way() && !(self.queue_sending() && self.snapshot.is_working())
+        self.on_its_way() && !(self.queue_sending() && self.status_is_working())
     }
 
     /// Whether a message has yet to be taken by the provider. One it took
     /// is sent, whatever the conversation has shown of it so far.
-    fn on_its_way(&self) -> bool {
+    pub(super) fn on_its_way(&self) -> bool {
         self.commands.unsent().next().is_some()
             || self
                 .commands
@@ -3052,104 +2883,6 @@ impl Runtime {
             .into_iter()
             .chain(self.snapshot.error.as_deref())
             .filter(|message| !chat::failure::is_notice(message))
-    }
-
-    pub(super) fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
-        let snapshot = &self.snapshot;
-        if self.closed_elsewhere {
-            (
-                Some(Icon::Close),
-                if !self.has_unsent_text() && self.attachments.is_empty() {
-                    "Closed"
-                } else {
-                    "Closed · draft retained"
-                },
-            )
-        } else if self.queued.is_some() {
-            (Some(Icon::AgentWorking), "Starting")
-        } else if self.disconnected && self.reattaching && self.attachment_chooser_pending.is_none()
-        {
-            // Waiting for its next attempt or making one: either way the
-            // window is on it, and nothing here is being switched. An open
-            // file chooser holds the attempt back, and says so below.
-            (Some(Icon::AgentWorking), "Reconnecting")
-        } else if transitioning {
-            (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending.is_some() {
-            (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.says_sending() {
-            (Some(Icon::AgentWorking), "Sending")
-        } else if self.disconnected {
-            (Some(Icon::Warning), "Disconnected")
-        } else if snapshot.exited && self.session.owns_codex_listener() {
-            (Some(Icon::Warning), "Unavailable")
-        } else if snapshot.exited {
-            (Some(Icon::Warning), "Exited")
-        } else if snapshot.waiting || !snapshot.requests.is_empty() {
-            // What it waits for, where a request says: the same glyph the
-            // sidebar and tabs give that wait.
-            match snapshot.activity() {
-                crate::agent::ActivityState::Approval => {
-                    (Some(Icon::Permission), "Waiting for your permission")
-                }
-                crate::agent::ActivityState::Question => {
-                    (Some(Icon::Question), "Waiting for your answer")
-                }
-                _ => (Some(Icon::AgentWaiting), "Waiting for you"),
-            }
-        } else if !snapshot.busy
-            && snapshot
-                .subagents
-                .iter()
-                .any(|agent| agent.waiting && agent.is_running())
-            && !snapshot
-                .subagents
-                .iter()
-                .any(|agent| !agent.waiting && agent.is_running())
-        {
-            (Some(Icon::AgentWaiting), "Subagents waiting")
-        } else if snapshot.stopping() {
-            // Asked to stop, the agent is still winding down: its last
-            // activity would read as work going on regardless.
-            (Some(Icon::AgentWorking), chat::TURN_STOPPING)
-        } else if snapshot.busy && snapshot.detail == chat::WAITING_ON_BACKGROUND_WORK {
-            // The turn is open but the agent is idle until its background
-            // commands finish, however long that takes; its last words
-            // would otherwise read as a reply still being written.
-            (
-                Some(Icon::AgentBackground),
-                chat::WAITING_ON_BACKGROUND_WORK,
-            )
-        } else if snapshot.is_working() {
-            (
-                Some(Icon::AgentWorking),
-                if !snapshot.busy {
-                    "Subagents working"
-                } else if activity_label(snapshot) != "Working" || snapshot.detail.is_empty() {
-                    activity_label(snapshot)
-                } else {
-                    snapshot.detail.as_str()
-                },
-            )
-        } else if snapshot.finished_at.is_some() {
-            let label = self.finished_label();
-            (
-                Some(match label {
-                    TURN_STOPPED => Icon::Ended,
-                    "Finished" => Icon::Check,
-                    _ => Icon::Error,
-                }),
-                label,
-            )
-        } else if self.reported_errors().next().is_some() {
-            (Some(Icon::Error), "Error")
-        } else if self.is_draft() {
-            (None, "Draft")
-        } else if snapshot.ready {
-            (None, "Ready")
-        } else {
-            (Some(Icon::AgentWorking), "Connecting")
-        }
     }
 
     /// What the logical copy/selection catalog is built from, as revisions
