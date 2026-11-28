@@ -62,6 +62,7 @@ note() {
 VERSION=
 PREFIX=
 START=1
+BOOTSTRAP=0
 UNINSTALL=0
 PURGE=0
 PUBLISH_TREE=
@@ -82,6 +83,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --no-start) START=0; shift ;;
+        --bootstrap) BOOTSTRAP=1; shift ;;
         --uninstall) UNINSTALL=1; shift ;;
         --purge) UNINSTALL=1; PURGE=1; shift ;;
         --publish-removal) PUBLISH_REMOVAL=1; shift ;;
@@ -473,6 +475,7 @@ if [ -z "$PUBLISH_TREE" ]; then
             || fail 'use the release installer published with this archive'
     fi
     set -- --prefix "$PREFIX" --version "$VERSION" --publish-tree "$NEW" --publisher "$publisher"
+    [ "$BOOTSTRAP" -eq 0 ] || set -- "$@" --bootstrap
     "$publisher" --no-start coordinate-install --prefix "$PREFIX" \
         --installer "$0" --publish-only -- "$@"
 
@@ -565,6 +568,9 @@ CURRENT_VERSION=
 if [ -L "$PREFIX/current" ]; then
     CURRENT_VERSION=$(readlink "$PREFIX/current")
     CURRENT_VERSION=${CURRENT_VERSION#versions/}
+fi
+if [ "$BOOTSTRAP" -eq 1 ] && [ -n "$CURRENT_VERSION" ] && [ "$CURRENT_VERSION" != "$VERSION" ]; then
+    fail "the disk image cannot replace the selected release $CURRENT_VERSION"
 fi
 daemon=$(installed_daemon "$PUBLISH_TREE/bin/cagents") \
     || fail 'cannot tell whether the cagents daemon is running; the installation was not changed'

@@ -24,6 +24,7 @@ RELEASE_TARGET=aarch64-apple-darwin
 MINIMUM_SYSTEM_VERSION=11.0
 PREBUILT=
 SMOKE=1
+DMG=0
 # Archive times are SOURCE_DATE_EPOCH in UTC, whatever this Mac's zone.
 TZ=UTC
 export TZ
@@ -37,7 +38,7 @@ fail() {
 
 usage() {
     cat <<'EOF'
-Usage: scripts/package-macos [--output DIR] [--prebuilt DIR] [--no-smoke]
+Usage: scripts/package-macos [--output DIR] [--prebuilt DIR] [--no-smoke] [--dmg]
 
 Builds cagents, cagentsd, cagents-ui and cagents-dictate for
 aarch64-apple-darwin with the release profile (CAGENTS_CARGO_PROFILE
@@ -55,6 +56,8 @@ checks the installed commands, LaunchAgent and bundle, and uninstalls it.
                   Each must report VERSION, and cagents-ui and
                   cagents-dictate must carry an embedded __info_plist.
   --no-smoke      Skip the private install check.
+  --dmg           Also build the installable Apple Silicon disk image and
+                  include both its versioned and stable names in the checksums.
 EOF
 }
 
@@ -69,6 +72,7 @@ while [ "$#" -gt 0 ]; do
             shift 2
             ;;
         --no-smoke) SMOKE=0; shift ;;
+        --dmg) DMG=1; shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1 (see --help)" ;;
     esac
@@ -83,6 +87,9 @@ esac
 for command in cc codesign gzip install mktemp otool plutil shasum sort strip tar touch; do
     command -v "$command" >/dev/null 2>&1 || fail "required command not found: $command"
 done
+if [ "$DMG" -eq 1 ]; then
+    command -v hdiutil >/dev/null 2>&1 || fail 'required command not found: hdiutil'
+fi
 
 if [ -z "${VERSION:-}" ]; then
     VERSION=$(sed -n '/^\[package\]/,/^\[/{s/^version = "\([^"]*\)"/\1/p;}' "$ROOT_DIR/Cargo.toml" | sed -n '1p')
@@ -279,5 +286,36 @@ if [ "$SMOKE" = 1 ]; then
         || fail 'the private install check failed'
 fi
 
+if [ "$DMG" -eq 1 ]; then
+    DMG_NAME=Cagents-$VERSION-arm64.dmg
+    DMG_ALIAS=Cagents-arm64.dmg
+    DMG_ROOT=$WORK_DIR/disk-image
+    DMG_APP=$DMG_ROOT/Cagents.app
+    DMG_RESOURCES=$DMG_APP/Contents/Resources
+    mkdir "$DMG_ROOT"
+    cp -R "$APP_DIR" "$DMG_APP"
+    cc -O2 -Wall -Wextra -Werror -mmacosx-version-min="$MINIMUM_SYSTEM_VERSION" -DCAGENTS_DISK_IMAGE \
+        -o "$DMG_APP/Contents/MacOS/Cagents" "$ROOT_DIR/packaging/macos/launcher.c" \
+        || fail 'could not build the disk image launcher'
+    install -m 0644 "$ROOT_DIR/packaging/macos/first-launch" "$DMG_RESOURCES/first-launch"
+    printf '%s\n' "$VERSION" > "$DMG_RESOURCES/release-version"
+    install -m 0644 "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$INSTALLER_NAME" \
+        "$DIST_DIR/$CHECKSUM_NAME" "$DMG_RESOURCES"
+    sign "$DMG_APP"
+    codesign --verify --strict "$DMG_APP" || fail 'signature check failed for the disk image app'
+    ln -s /Applications "$DMG_ROOT/Applications"
+    hdiutil create -srcfolder "$DMG_ROOT" -volname Cagents -format UDZO "$WORK_DIR/$DMG_NAME" \
+        || fail 'could not create the disk image'
+    mv -f "$WORK_DIR/$DMG_NAME" "$DIST_DIR/$DMG_NAME"
+    cp "$DIST_DIR/$DMG_NAME" "$DIST_DIR/$DMG_ALIAS"
+    (
+        cd "$DIST_DIR"
+        shasum -a 256 "$DMG_NAME" "$DMG_ALIAS" >> "$CHECKSUM_NAME"
+    )
+fi
+
 printf 'Created the macOS package (daemon protocol %s):\n  %s\n  %s\n  %s\n' "$PROTOCOL_VERSION" \
     "$DIST_DIR/$ARCHIVE_NAME" "$DIST_DIR/$INSTALLER_NAME" "$DIST_DIR/$CHECKSUM_NAME"
+if [ "$DMG" -eq 1 ]; then
+    printf '  %s\n  %s\n' "$DIST_DIR/$DMG_NAME" "$DIST_DIR/$DMG_ALIAS"
+fi

@@ -365,14 +365,17 @@ class PublisherSignatures(unittest.TestCase):
                                "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
-    def drafted(self, macos: bool = False, android: bool = False, appimage: bool = False) -> Path:
+    def drafted(self, macos: bool = False, android: bool = False, appimage: bool = False,
+                disk_image: bool = False) -> Path:
         """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
         release workflow leaves it; its bundle."""
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         self.bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
                                               "release-metadata.json.sig": "release-metadata.json.sig"})
-        release = self.bundle("0.2.5", ["new"], macos=macos, android=android, appimage=appimage)
+        release = self.bundle("0.2.5", ["new"], macos=macos or disk_image, android=android, appimage=appimage)
+        if disk_image:
+            self.add_disk_images(release, "0.2.5", ["new"])
         result = self.publish("0.2.5", release, "--draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified v0.2.5 as a draft", result.stdout)
@@ -629,6 +632,20 @@ class PublisherSignatures(unittest.TestCase):
         self.restamp(dist, ["old"])
         self.assertRefused(self.verify("0.2.4", dist), "macOS installer is not stamped")
 
+    def test_macos_disk_image_names_are_published_together(self):
+        dist = self.bundle("0.2.4", ["old"], macos=True)
+        image, alias = self.add_disk_images(dist, "0.2.4", ["old"])
+        accepted = self.verify("0.2.4", dist)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("Validated v0.2.4: 21 assets", accepted.stdout)
+
+        alias.unlink()
+        self.assertRefused(self.verify("0.2.4", dist), "expected assets")
+        alias.write_bytes(b"another disk image")
+        self.assertRefused(self.verify("0.2.4", dist), "checksum verification failed: SHA256SUMS-macos")
+        self.restamp(dist, ["old"], images=(image.name, alias.name))
+        self.assertRefused(self.verify("0.2.4", dist), "stable macOS disk image differs")
+
     def test_a_draft_with_the_macos_build_is_promoted_whole(self):
         release = self.drafted(macos=True)
         served = self.directory / "github/releases/v0.2.5/assets"
@@ -672,10 +689,51 @@ class PublisherSignatures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((served / "cagents-android.apk").read_bytes(), b"fixture APK")
 
-    def restamp(self, dist: Path, signers: list[str]):
+    def test_a_draft_with_macos_disk_images_retains_both_names_on_promotion(self):
+        self.android_tools()
+        release = self.drafted(disk_image=True, android=True, appimage=True)
+        draft = self.directory / "github/releases/v0.2.5"
+        image = "Cagents-0.2.5-arm64.dmg"
+        alias = "Cagents-arm64.dmg"
+        self.assertIn(f"/releases/download/v0.2.5/{image}", (draft / "release.json").read_text())
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in (image, alias, "SHA256SUMS-macos", "cagents-android.apk", "cagents-x86_64.AppImage"):
+            self.assertEqual((draft / "assets" / name).read_bytes(), (release / name).read_bytes())
+
+    def test_macos_terminal_notes_stop_when_the_download_directory_exists(self):
+        self.drafted(disk_image=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"].split("## macOS\n", 1)[1]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "macos-terminal-commands"
+        tools.mkdir()
+        curl = tools / "curl"
+        curl.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\nexit 1\n")
+        curl.chmod(0o755)
+        environment = {"PATH": f"{tools}:{os.defpath}"}
+
+        for expected in ("--disable", ""):
+            with self.subTest(first_download=bool(expected)):
+                result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                        env=environment, text=True, capture_output=True, timeout=HANG_GUARD)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
+    def add_disk_images(self, dist: Path, version: str, signers: list[str]) -> tuple[Path, Path]:
+        image = dist / f"Cagents-{version}-arm64.dmg"
+        alias = dist / "Cagents-arm64.dmg"
+        image.write_bytes(b"offline disk image fixture")
+        alias.write_bytes(image.read_bytes())
+        self.restamp(dist, signers, images=(image.name, alias.name))
+        return image, alias
+
+    def restamp(self, dist: Path, signers: list[str], images: tuple[str, ...] = ()):
         """Rewrites DIST's macOS checksums and metadata after a change, and signs it again."""
         version = dist.name.split("-")[1]
-        lines = subprocess.run(["sha256sum", "--", f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh"],
+        payloads = [f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh", *images]
+        lines = subprocess.run(["sha256sum", "--", *payloads],
                                cwd=dist, check=True, text=True, capture_output=True, timeout=HANG_GUARD).stdout
         (dist / "SHA256SUMS-macos").write_text(lines)
         commit = self.git("rev-parse", f"v{version}^{{commit}}").strip()
