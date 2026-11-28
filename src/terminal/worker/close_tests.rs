@@ -581,6 +581,69 @@ fn natural_eof_retains_the_cleanup_obligation_for_a_job_without_pty_descriptors(
     assert_cleanup_obligation_retained(true);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn natural_eof_waits_for_the_live_threads_of_a_redirected_job() {
+    let shell = CloseSafetyShell::shell(Path::new("/bin/bash"));
+    fs::write(
+        shell.home.path().join("job.py"),
+        r#"import ctypes, os, signal, threading, time
+signal.signal(signal.SIGHUP, signal.SIG_IGN)
+threading.Thread(target=time.sleep, args=(60,)).start()
+with open("child.pid", "w") as pid:
+    print(os.getpid(), file=pid)
+ctypes.CDLL(None).pthread_exit(None)
+"#,
+    )
+    .unwrap();
+    shell
+        .terminal
+        .input(b"/usr/bin/python3 job.py </dev/null >/dev/null 2>&1 &\n")
+        .unwrap();
+    let mut child = None;
+    shell.wait_for("the job's thread-group leader to exit", || {
+        let Some(pid) = fs::read_to_string(shell.home.path().join("child.pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<libc::pid_t>().ok())
+        else {
+            return false;
+        };
+        let Ok(stat) = fs::read(format!("/proc/{pid}/stat")) else {
+            return false;
+        };
+        if crate::model::agent_recovery::process_stat_fields(&stat)
+            .and_then(|mut fields| fields.next())
+            != Some("Z")
+        {
+            return false;
+        }
+        child = Some(pin_shutdown_process(pid));
+        true
+    });
+    let child = child.unwrap();
+    assert!(!child.0.exited().unwrap());
+    shell.terminal.input(b"exit 3\n").unwrap();
+    let events = shell.terminal.events();
+    shell.wait_for("shell exit", || {
+        events
+            .try_iter()
+            .any(|event| matches!(event, TerminalEvent::Exited { exit_code: 3, .. }))
+    });
+    let still_live = Instant::now() + Duration::from_millis(250);
+    while let Ok(event) = events.recv_deadline(still_live) {
+        assert!(
+            !unconfirmed_child_cleanup(&event) && !matches!(event, TerminalEvent::Completed { .. }),
+            "cleanup settled while the redirected job was live: {event:?}"
+        );
+    }
+    // The remaining thread ends inside the cleanup budget, with no PTY event
+    // to wake the worker. A session recheck must publish completion.
+    assert!(child.0.signal(libc::SIGTERM).unwrap());
+    shell.wait_for("cleanup to confirm the last thread exited", || {
+        shell.terminal.is_completed()
+    });
+}
+
 fn assert_cleanup_obligation_retained(redirect_job_io: bool) {
     let proof = crate::model::HostSessionProof {
         host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),

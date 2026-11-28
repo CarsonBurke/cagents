@@ -81,8 +81,6 @@ const CHILD_HANGUP_GRACE: Duration = Duration::from_millis(500);
 const CHILD_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(3);
 /// Keep a bounded tail for exact-child exit and PTY/session confirmation.
 const CHILD_SHUTDOWN_CONFIRMATION_RESERVE: Duration = CHILD_HANGUP_GRACE;
-/// Within that tail, the final session census keeps this much for itself.
-const CHILD_SHUTDOWN_CENSUS_RESERVE: Duration = Duration::from_millis(250);
 /// Actual OS joins happen off-caller; ordinary shutdown shares this deadline.
 const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -99,8 +97,6 @@ pub(super) struct ShutdownBudget {
     /// The tail of `deadline` kept to confirm the exact child's exit and the
     /// PTY session's end.
     confirmation_reserve: Duration,
-    /// Within that tail, what the final session census keeps for itself.
-    census_reserve: Duration,
     /// How long a caller of [`TerminalHandle::shutdown`] waits for the worker.
     join: Duration,
 }
@@ -110,7 +106,6 @@ impl ShutdownBudget {
         deadline: CHILD_SHUTDOWN_DEADLINE,
         hangup_grace: CHILD_HANGUP_GRACE,
         confirmation_reserve: CHILD_SHUTDOWN_CONFIRMATION_RESERVE,
-        census_reserve: CHILD_SHUTDOWN_CENSUS_RESERVE,
         join: WORKER_JOIN_TIMEOUT,
     };
 
@@ -126,7 +121,6 @@ impl ShutdownBudget {
         deadline: Duration::from_secs(45),
         hangup_grace: Duration::from_secs(15),
         confirmation_reserve: Duration::from_secs(15),
-        census_reserve: Duration::from_secs(5),
         join: Duration::from_secs(60),
     };
 
@@ -4233,12 +4227,7 @@ impl Worker {
                 let cleanup = if self.checked_shutdown {
                     Ok(())
                 } else {
-                    confirm_exited_family(
-                        &self.child,
-                        &self.master,
-                        Instant::now() + budget.deadline,
-                        budget.census_reserve,
-                    )
+                    confirm_exited_family(&self.child, Instant::now() + budget.deadline)
                 };
                 match cleanup {
                     Ok(()) => true,
@@ -4263,7 +4252,6 @@ impl Worker {
                 }
                 let result = shutdown_child_exit(
                     &self.child,
-                    &self.master,
                     self.child_identity.as_ref(),
                     &self.child_exit_rx,
                     self.checked_shutdown,
@@ -6749,7 +6737,6 @@ fn wait_for_worker_event(
 /// before accepting the holder's report.
 fn shutdown_child_exit(
     child: &holder::HeldChild,
-    master: &holder::PtyMaster,
     identity: Option<&RootIdentity>,
     exits: &Receiver<ChildExit>,
     checked: bool,
@@ -6829,7 +6816,7 @@ fn shutdown_child_exit(
                 }
             }
         }
-        confirm_exited_family(child, master, deadline, budget.census_reserve)?;
+        confirm_exited_family(child, deadline)?;
     }
     if let Some(report) = report {
         return report;
@@ -6845,85 +6832,36 @@ fn shutdown_child_exit(
         })?
 }
 
-fn confirm_exited_family(
-    child: &holder::HeldChild,
-    master: &holder::PtyMaster,
-    deadline: Instant,
-    census_reserve: Duration,
-) -> Result<(), String> {
-    let ended = |deadline| -> Result<bool, String> {
+fn confirm_exited_family(child: &holder::HeldChild, deadline: Instant) -> Result<(), String> {
+    // PTY hangup is independent of session exit. A redirected job can outlive
+    // EOF, while a process outside the session can keep the descriptor open.
+    // Keep checking the session until it is empty or the deadline expires.
+    let deadline = if cfg!(target_os = "macos") {
+        deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE)
+    } else {
+        deadline
+    };
+    let ended = || -> Result<bool, String> {
         Ok(child
             .exited_within(Duration::ZERO)
             .map_err(|error| format!("observe child exit: {error}"))?
             && close_processes::session_is_empty(child.pid(), deadline)?)
     };
-    if cfg!(target_os = "macos") {
-        // Darwin's PTY EOF can precede the last job's exit, and the master
-        // does not wake a poll with no requested events. Wait for bounded
-        // session observations instead.
-        let deadline = deadline.min(Instant::now() + CHILD_SHUTDOWN_DEADLINE);
-        let mut delay = Duration::from_millis(20);
-        loop {
-            let result = ended(deadline);
-            if matches!(result, Ok(true)) {
-                return Ok(());
-            }
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                if let Err(error) = result {
-                    tracing::warn!(%error, "could not confirm the terminal family's cleanup");
-                }
-                return Err("Terminal process cleanup remains unconfirmed".into());
-            }
-            std::thread::sleep(delay.min(remaining));
-            delay = (delay * 2).min(Duration::from_millis(250));
-        }
-    }
-    // Usually the family is already gone. A process outside it (one that left
-    // the session, such as `setsid -f`) may keep the PTY open indefinitely;
-    // cleanup never claims or depends on it, so its PTY is no reason to wait.
-    // A first census that fails or runs late defers to the final one below.
-    let drained = deadline.checked_sub(census_reserve).unwrap_or(deadline);
-    if ended(drained).unwrap_or(false) {
-        return Ok(());
-    }
-    // A job can fork between thaw and HUP, outside the tracked set. Give the
-    // session's last members the bounded budget to finish, ending early once
-    // nothing holds the PTY, and keep the final census its own time.
-    let master = master.duplicate().map_err(|error| error.to_string())?;
-    let mut target = libc::pollfd {
-        fd: master.as_raw_fd(),
-        events: 0,
-        revents: 0,
-    };
+    let mut delay = Duration::from_millis(20);
     loop {
-        let remaining = drained.saturating_duration_since(Instant::now());
-        // SAFETY: one live, owned descriptor; this only observes readiness.
-        match unsafe {
-            libc::poll(
-                &mut target,
-                1,
-                remaining
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(i32::MAX as u128) as libc::c_int,
-            )
-        } {
-            -1 if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted => {}
-            -1 => return Err(std::io::Error::last_os_error().to_string()),
-            _ => break,
+        let result = ended();
+        if matches!(result, Ok(true)) {
+            return Ok(());
         }
-    }
-    // A final census that cannot finish, for instance one a loaded host's
-    // scan of /proc runs past the deadline, confirms nothing: the root has
-    // exited and nothing was stopped, so report the open obligation itself.
-    match ended(deadline) {
-        Ok(true) => Ok(()),
-        Ok(false) => Err("Terminal process cleanup remains unconfirmed".into()),
-        Err(error) => {
-            tracing::warn!(%error, "could not confirm the terminal family's cleanup");
-            Err("Terminal process cleanup remains unconfirmed".into())
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            if let Err(error) = result {
+                tracing::warn!(%error, "could not confirm the terminal family's cleanup");
+            }
+            return Err("Terminal process cleanup remains unconfirmed".into());
         }
+        std::thread::sleep(delay.min(remaining));
+        delay = (delay * 2).min(Duration::from_millis(250));
     }
 }
 

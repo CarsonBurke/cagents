@@ -590,11 +590,29 @@ pub(super) fn session_is_empty(session: libc::pid_t, deadline: Instant) -> Resul
     #[cfg(target_os = "macos")]
     let processes = session_members(session, deadline)?;
     let daemon = daemon_subtree(this_daemon(), &processes);
-    Ok(processes.iter().all(|process| {
-        process.session != session
-            || matches!(process.state, b'Z' | b'X')
-            || daemon.contains(&process.pid)
-    }))
+    for process in &processes {
+        if process.session != session || daemon.contains(&process.pid) {
+            continue;
+        }
+        if !matches!(process.state, b'Z' | b'X') {
+            return Ok(false);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // A zombie leader can have running threads. A process pidfd is
+            // readable only once the whole group exits.
+            // If the identity disappears while being pinned, retry the census
+            // instead of inferring that the thread group left no members.
+            let exited = open_target(process)
+                .and_then(|pin| pin.exited())
+                .map_err(|error| error.to_string())?;
+            if !exited {
+                return Ok(false);
+            }
+            check_deadline(deadline)?;
+        }
+    }
+    Ok(true)
 }
 
 #[cfg(target_os = "macos")]
