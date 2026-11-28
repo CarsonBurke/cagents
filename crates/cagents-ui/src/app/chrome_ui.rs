@@ -2388,7 +2388,7 @@ fn notice_copy_id(id: u64) -> String {
 
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<crate::interaction::TipBody<'a>>,
     id: widget::Id,
     action: Option<Message>,
 ) -> Element<'a, Message> {
@@ -2966,16 +2966,16 @@ impl Cagents {
         let enabled = !self.modal_is_open();
         let control = command(
             Icon::Plus,
-            format!(
-                "New tab · Thread {} · Terminal {}",
-                workspace_widget::shortcut_chords(
-                    workspace_widget::GlobalShortcut::NewThread,
-                    &self.settings.keyboard_shortcuts
-                ),
-                workspace_widget::shortcut_chords(
-                    workspace_widget::GlobalShortcut::NewTerminal,
-                    &self.settings.keyboard_shortcuts
-                )
+            crate::interaction::RichTip::new("New tab").rows(
+                [
+                    ("Thread", workspace_widget::GlobalShortcut::NewThread),
+                    ("Terminal", workspace_widget::GlobalShortcut::NewTerminal),
+                ]
+                .into_iter()
+                .filter_map(|(label, action)| {
+                    workspace_widget::primary_shortcut(action, &self.settings.keyboard_shortcuts)
+                        .map(|chord| crate::interaction::TipRow::shortcut(label, chord))
+                }),
             ),
             widget::Id::new(TOOLBAR_FOCUS_ID),
             enabled.then_some(Message::ChromeUi(Action::ToggleNewTab)),
@@ -2987,16 +2987,18 @@ impl Cagents {
                     NewTab::Thread | NewTab::Resume => Icon::Chat.handle(),
                     NewTab::Browser => Icon::Browser.handle(),
                 };
-                let tooltip = match kind {
+                let tooltip: crate::interaction::TipBody<'_> = match kind {
                     NewTab::Thread => workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewThread,
                         &self.settings.keyboard_shortcuts,
-                    ),
+                    )
+                    .into(),
                     NewTab::Terminal => workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewTerminal,
                         &self.settings.keyboard_shortcuts,
-                    ),
-                    NewTab::Browser | NewTab::Resume => description.to_owned(),
+                    )
+                    .into(),
+                    NewTab::Browser | NewTab::Resume => description.into(),
                 };
                 crate::interaction::tooltip(
                     crate::ui_controls::popover_item(
@@ -3222,15 +3224,11 @@ impl Cagents {
                 .focused()
                 .and_then(|id| self.card_state(id))
                 .is_some_and(|card| card.kind == CardKind::Work);
-        let shortcut = workspace_widget::shortcut_chords(
+        let label = workspace_widget::shortcut_tooltip_named(
             workspace_widget::GlobalShortcut::OpenWorktrees,
             &self.settings.keyboard_shortcuts,
+            "Worktrees",
         );
-        let label = if shortcut.is_empty() {
-            Cow::Borrowed("Worktrees")
-        } else {
-            Cow::Owned(format!("Worktrees ({shortcut})"))
-        };
         crate::ui_controls::icon_button(Icon::Worktree, label)
             .id(widget::Id::new("worktrees.control"))
             .selected(shown)
@@ -4087,13 +4085,14 @@ impl Cagents {
                         |chrome| Cow::Borrowed(chrome.close_name.as_str()),
                     );
                     if focused {
-                        Cow::Owned(workspace_widget::shortcut_tooltip_named(
+                        workspace_widget::shortcut_tooltip_named(
                             workspace_widget::GlobalShortcut::CloseFocusedCard,
                             &self.settings.keyboard_shortcuts,
-                            &label,
-                        ))
+                            label.into_owned(),
+                        )
+                        .into()
                     } else {
-                        label
+                        crate::interaction::TipBody::from(label)
                     }
                 },
                 chrome.map_or_else(

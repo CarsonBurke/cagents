@@ -6673,12 +6673,13 @@ fn header<'a>(
             ),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.has_search_query() {
-                "Close and clear search".to_owned()
+                crate::interaction::TipBody::from("Close and clear search")
             } else {
                 crate::workspace_widget::shortcut_tooltip(
                     crate::workspace_widget::GlobalShortcut::FocusProjectSearch,
                     shortcuts,
                 )
+                .into()
             },
         );
         if compact {
@@ -6909,12 +6910,13 @@ fn utility_controls<'a>(
     shortcuts: Option<&crate::settings::KeyboardShortcuts>,
 ) -> [Element<'a, SidebarAction>; 3] {
     let label = shortcuts.map_or_else(
-        || "Settings".to_owned(),
+        || crate::interaction::TipBody::from("Settings"),
         |shortcuts| {
             crate::workspace_widget::shortcut_tooltip(
                 crate::workspace_widget::GlobalShortcut::OpenSettings,
                 shortcuts,
             )
+            .into()
         },
     );
     let settings: Element<'a, SidebarAction> =
@@ -13823,7 +13825,7 @@ fn centered_icon_handle_button<'a>(
 /// One icon command in shared workspace chrome.
 fn icon_action<'a>(
     icon_name: Icon,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<crate::interaction::TipBody<'a>>,
     action: Option<SidebarAction>,
     id: Id,
 ) -> Element<'a, SidebarAction> {
@@ -13975,7 +13977,10 @@ pub fn status_icon<'a, Message: Clone + 'a>(
     label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, Message> {
-    crate::interaction::tooltip(toned_icon(icon_name, tone), label)
+    crate::interaction::tooltip(
+        toned_icon(icon_name, tone),
+        crate::interaction::TipBody::Text(label.into()),
+    )
 }
 
 pub fn check_indicator<Message: Clone + 'static>(status: CheckStatus) -> Element<'static, Message> {

@@ -1,7 +1,5 @@
 //! Compact, keyboard-accessible icon targets and the flat surface they share.
 
-use std::borrow::Cow;
-
 use cosmic::{
     Element,
     iced::{self, Length},
@@ -10,7 +8,7 @@ use cosmic::{
 
 use crate::{
     design::{self, Tone, space},
-    interaction::tooltip,
+    interaction::{TipBody, tooltip},
 };
 
 /// How large an icon target is.
@@ -42,11 +40,11 @@ impl Scale {
 
 /// A centered, fixed-size icon target with a quiet selected surface.
 ///
-/// The label is both its accessible name and its tooltip. The native button
+/// The label is its tooltip, and its title is its accessible name. The native button
 /// underneath keeps keyboard focus, accessibility and the enabled cursor.
 pub struct IconButton<'a, Message> {
     icon: widget::icon::Handle,
-    label: Cow<'a, str>,
+    label: TipBody<'a>,
     scale: Scale,
     selected: bool,
     tone: Option<Tone>,
@@ -56,7 +54,7 @@ pub struct IconButton<'a, Message> {
 
 pub fn icon_button<'a, Message>(
     icon: impl Into<widget::icon::Handle>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<TipBody<'a>>,
 ) -> IconButton<'a, Message> {
     IconButton {
         icon: icon.into(),
@@ -126,7 +124,7 @@ impl<'a, Message: Clone + 'a> From<IconButton<'a, Message>> for Element<'a, Mess
             .class(design::transparent())
             .center(Length::Fill);
         let mut button = widget::button::custom(content)
-            .name(label.clone())
+            .name(label.title().to_owned())
             .selected(selected)
             .class(control_style(selected, tone))
             .width(scale.target())

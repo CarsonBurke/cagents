@@ -25,6 +25,8 @@ mod list_navigation;
 pub use list_navigation::{reveal_list_selection, selection_offset};
 mod reveal_focus;
 pub use reveal_focus::{focus_group, reveal_focus};
+mod rich_tip;
+pub use rich_tip::{RichTip, TipBody, TipRow, TipTone, chord_keys};
 
 use crate::design::space;
 
@@ -678,7 +680,7 @@ pub fn fade<'a, Message: 'a>(
 /// follows the control, not its label, so live status text cannot postpone it.
 pub fn tooltip<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<TipBody<'a>>,
 ) -> Element<'a, Message> {
     tooltip_positioned(content, label, TipPlacement::Below)
 }
@@ -686,7 +688,7 @@ pub fn tooltip<'a, Message: 'a>(
 /// Keep a tooltip above chrome whose native child surface covers the area below.
 pub fn tooltip_above<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<TipBody<'a>>,
 ) -> Element<'a, Message> {
     tooltip_positioned(content, label, TipPlacement::Above)
 }
@@ -697,7 +699,7 @@ pub fn tooltip_above<'a, Message: 'a>(
 /// beside its middle when no pointer opened it.
 pub fn tooltip_beside<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<TipBody<'a>>,
 ) -> Element<'a, Message> {
     tooltip_positioned(content, label, TipPlacement::Beside)
 }
@@ -717,7 +719,7 @@ pub fn disabled_tooltip<'a, Message: 'a>(
         content: content.into(),
         kind: Kind::Tooltip,
         tip: Some(Tip {
-            label: reason.into(),
+            label: TipBody::Text(reason.into()),
             placement: TipPlacement::Below,
             explains_disabled: true,
             content: None,
@@ -739,7 +741,7 @@ enum TipPlacement {
 
 fn tooltip_positioned<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<TipBody<'a>>,
     placement: TipPlacement,
 ) -> Element<'a, Message> {
     Effect {
@@ -2379,7 +2381,7 @@ struct Effect<'a, Message> {
 }
 
 struct Tip<'a, Message> {
-    label: Cow<'a, str>,
+    label: TipBody<'a>,
     placement: TipPlacement,
     /// Whether the label says why the control is disabled, so it shows while
     /// the control is; see [`disabled_tooltip`].
@@ -2392,8 +2394,10 @@ struct Tip<'a, Message> {
 
 impl<'a, Message: 'a> Tip<'a, Message> {
     fn content(&mut self) -> &mut Element<'a, Message> {
-        self.content
-            .get_or_insert_with(|| tip_surface(self.label.clone()))
+        self.content.get_or_insert_with(|| match &self.label {
+            TipBody::Text(label) => tip_surface(label.clone()),
+            TipBody::Rich(tip) => rich_tip::surface(tip.clone()),
+        })
     }
 }
 

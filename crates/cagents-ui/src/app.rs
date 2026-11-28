@@ -18141,7 +18141,7 @@ impl Application for Cagents {
                         .map(|name| name.to_string_lossy().into_owned())
                 })
                 .unwrap_or_else(|| "Workspace".into());
-            let quick = |glyph, label, id, message| {
+            let quick = |glyph, label: crate::interaction::TipBody<'static>, id, message| {
                 Element::from(
                     crate::ui_controls::icon_button(glyph, label)
                         .on_press(message)
@@ -18165,7 +18165,8 @@ impl Application for Cagents {
                     workspace_widget::shortcut_tooltip(
                         workspace_widget::GlobalShortcut::NewTerminal,
                         &self.settings.keyboard_shortcuts,
-                    ),
+                    )
+                    .into(),
                     "empty.new-terminal",
                     Message::NewTerminal,
                 ),
@@ -18176,13 +18177,13 @@ impl Application for Cagents {
                     } else {
                         "Open in system browser"
                     }
-                    .to_owned(),
+                    .into(),
                     "empty.new-browser",
                     Message::NewBrowser,
                 ),
                 quick(
                     Icon::Avatar,
-                    "Agent accounts".to_owned(),
+                    "Agent accounts".into(),
                     "empty.accounts",
                     Message::AccountUi(account_ui::Action::OpenPane),
                 ),
@@ -18194,7 +18195,7 @@ impl Application for Cagents {
                     1,
                     quick(
                         Icon::History,
-                        "Resume conversation".to_owned(),
+                        "Resume conversation".into(),
                         "empty.resume-conversation",
                         Message::ResumeConversation(resume_ui::Action::Open),
                     ),

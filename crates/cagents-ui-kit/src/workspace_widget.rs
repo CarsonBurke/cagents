@@ -521,19 +521,28 @@ pub fn shortcut_chords(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) ->
     format_chords(shortcut_keys(action, shortcuts))
 }
 
-pub fn shortcut_tooltip(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> String {
+/// The tooltip of a control that runs `action`: the action's name, with the
+/// first chord bound to it as key caps. An unbound action shows no keys.
+pub fn shortcut_tooltip(
+    action: GlobalShortcut,
+    shortcuts: &KeyboardShortcuts,
+) -> crate::interaction::RichTip<'static> {
     shortcut_tooltip_named(action, shortcuts, shortcut_descriptor(action).label)
 }
 
+/// [`shortcut_tooltip`] under a name of the control's own, such as "Stop
+/// dictating" for the chord that starts and stops dictation.
 pub fn shortcut_tooltip_named(
     action: GlobalShortcut,
     shortcuts: &KeyboardShortcuts,
-    label: &str,
-) -> String {
-    if shortcut_keys(action, shortcuts).is_empty() {
-        return format!("{label} — unbound");
-    }
-    format!("{label} — {}", shortcut_chords(action, shortcuts))
+    label: impl Into<std::borrow::Cow<'static, str>>,
+) -> crate::interaction::RichTip<'static> {
+    crate::interaction::RichTip::new(label).shortcut_maybe(primary_shortcut(action, shortcuts))
+}
+
+/// The chord a tooltip shows for `action`: the first one bound to it.
+pub fn primary_shortcut(action: GlobalShortcut, shortcuts: &KeyboardShortcuts) -> Option<String> {
+    shortcut_keys(action, shortcuts).first().cloned()
 }
 
 #[derive(Debug, Default)]
