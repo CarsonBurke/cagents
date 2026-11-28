@@ -3206,7 +3206,7 @@ impl Cagents {
         else {
             return false;
         };
-        if !crate::chat::is_first_codex_identity_update(current, learned) {
+        if !crate::chat::is_first_stable_identity_update(current, learned) {
             return false;
         }
         let Some(state) = self.card_state_mut(card) else {
@@ -3228,7 +3228,7 @@ impl Cagents {
             (
                 crate::agent_execution::HostedSession::Chat(shown),
                 Some(crate::agent_execution::HostedSession::Chat(saved)),
-            ) if crate::chat::is_first_codex_identity_update(shown, saved) => {
+            ) if crate::chat::is_first_stable_identity_update(shown, saved) => {
                 crate::agent_execution::HostedSession::Chat(saved.clone())
             }
             _ => session,

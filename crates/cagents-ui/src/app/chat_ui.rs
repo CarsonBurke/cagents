@@ -11953,9 +11953,7 @@ impl Cagents {
     }
     /// The conversation `source`, card `card`'s descriptor, is when its open
     /// agent holds the ID the card lacks and nothing else of the two differs:
-    /// the same chat, proof, launch and owned listener
-    /// ([`chat::is_first_codex_identity_update`]). Nothing is inferred from
-    /// the provider's saved conversations.
+    /// the same actor, proof and launch. The ID comes from the agent record.
     fn open_agent_conversation(
         &self,
         card: CardId,
@@ -11972,7 +11970,7 @@ impl Cagents {
                 Some(crate::agent_execution::HostedSession::Chat(saved))
                     if !agent.closed
                         && (agent.id == managed || saved.id == source.id)
-                        && chat::is_first_codex_identity_update(source, saved) =>
+                        && chat::is_first_stable_identity_update(source, saved) =>
                 {
                     Some(saved.clone())
                 }

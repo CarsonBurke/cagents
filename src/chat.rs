@@ -1453,27 +1453,42 @@ pub fn is_unstarted_resume_successor(session: &Session) -> bool {
         && session.launch.session_id.is_some()
 }
 
+/// The opaque conversation ID accepted by ACP's session/load.
+pub(crate) fn valid_acp_session_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 256 && !id.contains(char::is_control)
+}
+
 /// An identity-only projection: `replacement` is `source` with nothing changed
-/// but the conversation ID and native continuity its provider confirmed. It
-/// covers retained Claude helpers and daemon-hosted Codex threads on their own
-/// listener, the two actors whose first identity arrives after the descriptor
-/// was saved. This shape grants no authority: callers must authenticate the
-/// exact source lineage (the hosted actor, the helper's census, or the
-/// daemon's own saved agent record) before updating a saved agent or pane.
+/// but the conversation ID and native continuity its provider confirmed.
+/// Callers must authenticate the exact source lineage before updating an
+/// agent or pane.
 pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> bool {
+    let Some(id) = replacement.launch.session_id.as_deref() else {
+        return false;
+    };
     let learns = match source.launch.provider {
-        Provider::Claude => matches!(
-            source.native_continuity,
-            NativeContinuity::RetainedClaudeActor { protocol: 2 }
-        ),
-        // A begun Codex thread never changes identity, and only a thread on
-        // its own listener belongs to this one hosted conversation.
+        Provider::Claude => {
+            uuid::Uuid::parse_str(id).is_ok()
+                && matches!(
+                    source.native_continuity,
+                    NativeContinuity::RetainedClaudeActor { protocol: 2 }
+                )
+        }
+        // Only a thread on its own listener belongs to this hosted chat.
         Provider::Codex => {
-            source.launch.session_id.is_none()
+            uuid::Uuid::parse_str(id).is_ok()
+                && source.launch.session_id.is_none()
                 && source.owns_codex_listener()
                 && source.native_continuity == NativeContinuity::ReconnectOnly
         }
-        _ => false,
+        // An ACP connection serves one conversation for its entire lifetime.
+        Provider::Antigravity | Provider::Muse => {
+            valid_acp_session_id(id)
+                && source.launch.session_id.is_none()
+                && source.owned_codex_listener.is_none()
+                && source.native_continuity == NativeContinuity::ReconnectOnly
+        }
+        Provider::Omp => false,
     };
     if !learns
         || !source.has_valid_native_continuity()
@@ -1482,11 +1497,6 @@ pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> 
             .proof
             .as_ref()
             .is_some_and(|proof| proof.is_complete())
-        || replacement
-            .launch
-            .session_id
-            .as_ref()
-            .is_none_or(|id| uuid::Uuid::parse_str(id).is_err())
     {
         return false;
     }
@@ -1503,15 +1513,14 @@ pub fn is_confirmed_identity_update(source: &Session, replacement: &Session) -> 
     projected == *replacement
 }
 
-/// [`is_confirmed_identity_update`] for a daemon-hosted Codex thread only: the
-/// first ID its provider confirmed for a thread that had none. A Codex thread
-/// never changes identity once begun, so a saved copy holding this ID is never
-/// outdated by the copy without it, and either may be restored from the other.
-/// A Claude conversation can be cleared or replaced under the same process, so
-/// copying a saved Claude ID onto a descriptor that lacks one could revive a
-/// conversation the person left; callers that restore an ID use this instead.
-pub fn is_first_codex_identity_update(source: &Session, replacement: &Session) -> bool {
-    source.launch.provider == Provider::Codex && is_confirmed_identity_update(source, replacement)
+/// First identity for a daemon-owned Codex thread or an ACP conversation.
+/// Their adapters keep the same conversation throughout each actor's lifetime,
+/// so a stale copy without an ID can safely learn it from the saved copy.
+pub fn is_first_stable_identity_update(source: &Session, replacement: &Session) -> bool {
+    matches!(
+        source.launch.provider,
+        Provider::Codex | Provider::Antigravity | Provider::Muse
+    ) && is_confirmed_identity_update(source, replacement)
 }
 
 /// A formerly hosted pane may never have observed its first provider identity.

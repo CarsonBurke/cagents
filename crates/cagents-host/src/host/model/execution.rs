@@ -2,6 +2,7 @@
 
 use super::{Registry, repository_key, take_ordinal};
 use crate::{
+    agent::Provider,
     agent_execution::{
         AcceptanceError, Accepted, Agent, Authority, Destination, HostedSession, Lineage,
         MAX_CHILDREN, MAX_PARENT_DEPTH, Origin, Placement, ResultSummary, Run, State, Submit,
@@ -696,9 +697,10 @@ impl Registry {
         &mut self,
         saved: &crate::chat::Session,
     ) -> Result<bool, String> {
-        // Only a Codex thread's ID is restored to its pane.
-        if saved.launch.provider != crate::agent::Provider::Codex
-            || saved.launch.session_id.is_none()
+        if !matches!(
+            saved.launch.provider,
+            Provider::Codex | Provider::Antigravity | Provider::Muse
+        ) || saved.launch.session_id.is_none()
             || !super::views::store::chat_pane_lacks_identity(&self.db, saved.id)?
         {
             return Ok(false);
@@ -6384,7 +6386,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_identity_update_learns_only_an_owned_codex_threads_first_id() {
+    fn codex_identity_update_requires_the_owned_threads_first_id() {
         let codex = owned_codex();
         let thread = uuid::Uuid::new_v4().to_string();
         let learned = |source: &crate::chat::Session| {
@@ -6427,12 +6429,45 @@ mod tests {
         let mut invalid = codex.clone();
         invalid.launch.session_id = Some("not-a-thread".into());
         assert!(!confirmed_identity_update(&codex, &invalid));
-        // Other providers and plain Claude sessions do not learn this way.
+        // Plain Claude sessions do not learn this way.
         let HostedSession::Chat(mut claude) = source() else {
             unreachable!()
         };
         claude.launch.session_id = None;
         assert!(!confirmed_identity_update(&claude, &learned(&claude)));
+    }
+
+    #[test]
+    fn acp_identity_update_learns_first_id_from_the_same_actor() {
+        for provider in [Provider::Antigravity, Provider::Muse] {
+            let HostedSession::Chat(mut source) = source() else {
+                unreachable!()
+            };
+            source.launch.provider = provider;
+            source.launch.recipe.program = provider.executable().into();
+            source.launch.session_id = None;
+            let named = |id: &str| crate::chat::Session {
+                launch: crate::chat::Launch {
+                    session_id: Some(id.into()),
+                    ..source.launch.clone()
+                },
+                ..source.clone()
+            };
+            let current = named("opaque-session-id");
+            assert!(crate::chat::is_first_stable_identity_update(
+                &source, &current
+            ));
+            assert!(!confirmed_identity_update(&current, &named("another-id")));
+            for id in ["", "control\n", &"x".repeat(257)] {
+                assert!(!confirmed_identity_update(&source, &named(id)));
+            }
+            let mut changed = current;
+            changed.launch.recipe.working_directory = "/elsewhere".into();
+            assert!(!confirmed_identity_update(&source, &changed));
+            changed.launch.recipe = source.launch.recipe.clone();
+            changed.proof = None;
+            assert!(!confirmed_identity_update(&source, &changed));
+        }
     }
 
     /// A daemon-hosted Codex thread on its own listener, before its provider

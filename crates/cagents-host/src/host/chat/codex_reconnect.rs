@@ -88,7 +88,7 @@ pub(in crate::host) fn restore(host: &SharedHost, source: &Session) -> Result<bo
             .as_ref()
             .is_some_and(HostSessionProof::is_complete)
         || previous.proof.as_ref() == Some(&proof)
-        || !(source == &previous || chat::is_first_codex_identity_update(source, &previous))
+        || !(source == &previous || chat::is_confirmed_identity_update(source, &previous))
     {
         return Err(retryable_unavailable(
             "The agent's exact saved Codex conversation is unavailable for reconnect",
