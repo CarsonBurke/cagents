@@ -3316,7 +3316,7 @@ fn start_publishing(
                 &handle,
                 reconnect.thread(),
                 true,
-                Instant::now() + Duration::from_secs(15),
+                Instant::now() + crate::upgrade::handoff::CODEX_RECONNECT_CONFIRMATION,
                 || {
                     crate::daemon::termination_requested()
                         || host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down

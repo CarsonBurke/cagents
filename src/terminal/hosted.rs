@@ -1604,8 +1604,6 @@ fn ensure_daemon_ready_at(
 
     refuse_update_launch(socket)?;
 
-    let timeout = crate::upgrade::handoff::startup_timeout()
-        .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe = crate::process::current_executable()
         .map_err(HostedTerminalStartError::CurrentExecutable)?;
     if application == crate::notifications::Application::Ceditor {
@@ -1617,6 +1615,12 @@ fn ensure_daemon_ready_at(
     if !daemon_binary.is_file() {
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
+    #[cfg(target_os = "macos")]
+    let timeout = crate::upgrade::handoff::startup_timeout_for(&daemon_binary)
+        .map_err(HostedTerminalStartError::HostStartup)?;
+    #[cfg(not(target_os = "macos"))]
+    let timeout = crate::upgrade::handoff::startup_timeout()
+        .map_err(HostedTerminalStartError::HostStartup)?;
 
     // User scopes execute the command locally and preserve explicitly
     // forwarded descriptors, including both update admission and inventory.
@@ -1665,6 +1669,23 @@ fn verify_existing_startup_stream(
     stream: UnixStream,
     started: Instant,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
+    #[cfg(target_os = "macos")]
+    let peer = crate::daemon::peer_credentials(&stream).ok();
+    verify_existing_startup_stream_with_allowance(socket, stream, started, || {
+        #[cfg(target_os = "macos")]
+        if let Some(peer) = peer {
+            return crate::update::selected_listener_startup_allowance(socket, peer);
+        }
+        Duration::ZERO
+    })
+}
+
+fn verify_existing_startup_stream_with_allowance(
+    socket: &Path,
+    stream: UnixStream,
+    started: Instant,
+    selected_allowance: impl FnOnce() -> Duration,
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     use crate::upgrade::handoff::{STARTUP_BASE, StartupInventory};
 
     let inventory = StartupInventory::capture();
@@ -1674,6 +1695,7 @@ fn verify_existing_startup_stream(
                 + inventory
                     .and_then(StartupInventory::timeout)
                     .unwrap_or(STARTUP_BASE)
+                + selected_allowance()
         })
     })
 }
@@ -3968,7 +3990,7 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
         const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
         let Ok(checkpoint) = std::env::var(CHILD) else {
-            for checkpoint in ["absent", "damaged", "consumed"] {
+            for checkpoint in ["absent", "damaged", "consumed", "selected-reconnects"] {
                 let root = tempfile::tempdir().unwrap();
                 std::fs::create_dir(root.path().join("tmp")).unwrap();
                 let mut command = Command::new(std::env::current_exe().unwrap());
@@ -3998,7 +4020,7 @@ mod tests {
             .join("daemon-upgrade");
         let checkpoint_path = upgrade.join("daemon-upgrade.json");
         let contents: &[u8] = match checkpoint.as_str() {
-            "absent" => b"",
+            "absent" | "selected-reconnects" => b"",
             "damaged" => b"damaged checkpoint",
             "consumed" => br#"{"version":1,"terminals":[],"chats":[{}]}"#,
             _ => unreachable!("unknown checkpoint fixture"),
@@ -4050,19 +4072,27 @@ mod tests {
             thread::sleep(restore);
             let _ = stream.write_all(&reply[6..]);
         });
-        let result = if checkpoint == "consumed" {
-            // Spend the base budget before the fixture starts. After the
-            // ordinary hello times out, only the captured restore allowance
-            // can still extend the deadline.
-            let started = Instant::now() - crate::upgrade::handoff::STARTUP_BASE;
-            verify_existing_startup_stream(&socket, UnixStream::connect(&socket).unwrap(), started)
-        } else {
-            ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
+        // Spend the base budget before the fixture starts. After the ordinary
+        // hello times out, only the checkpoint or selected allowance can extend it.
+        let started = Instant::now() - crate::upgrade::handoff::STARTUP_BASE;
+        let result = match checkpoint.as_str() {
+            "consumed" => verify_existing_startup_stream(
+                &socket,
+                UnixStream::connect(&socket).unwrap(),
+                started,
+            ),
+            "selected-reconnects" => verify_existing_startup_stream_with_allowance(
+                &socket,
+                UnixStream::connect(&socket).unwrap(),
+                started,
+                || crate::upgrade::handoff::selected_reconnect_allowance(3),
+            ),
+            _ => ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents),
         };
         server.join().unwrap();
         result.unwrap();
         match checkpoint.as_str() {
-            "absent" => assert!(
+            "absent" | "selected-reconnects" => assert!(
                 !upgrade.exists(),
                 "budget estimation must not create upgrade storage"
             ),

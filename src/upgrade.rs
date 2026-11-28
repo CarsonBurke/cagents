@@ -1811,7 +1811,7 @@ pub mod handoff {
         /// Use the issued descriptor of the exact first selected claimant.
         /// The caller supplies the separately authenticated cutover census.
         /// A completed lineage entry by itself grants no restart authority.
-        #[cfg(all(target_os = "macos", feature = "host"))]
+        #[cfg(target_os = "macos")]
         pub(crate) fn reconnectable_codex(
             &self,
             originals: &[chat::Session],
@@ -1889,9 +1889,36 @@ pub mod handoff {
     /// there is no upgrade inventory (for example, after a daemon crash).
     pub(crate) const STARTUP_BASE: std::time::Duration = std::time::Duration::from_secs(30);
 
-    /// Budget sequential provider confirmation without parsing session payloads.
-    /// Estimating readiness must not create durable upgrade storage.
+    /// Time to confirm the exact saved thread after opening its provider.
+    #[doc(hidden)]
+    pub const CODEX_RECONNECT_CONFIRMATION: std::time::Duration =
+        std::time::Duration::from_secs(15);
+
+    #[cfg(any(target_os = "macos", test))]
+    pub(crate) fn selected_reconnect_allowance(chats: usize) -> std::time::Duration {
+        // Opening a provider's claimed listener can take a further 15 seconds.
+        (std::time::Duration::from_secs(15) + CODEX_RECONNECT_CONFIRMATION)
+            * chats.min(MAX_CHATS) as u32
+    }
+
+    /// Budget sequential checkpoint restoration and any selected restart's
+    /// Codex reconnects. Estimating readiness must not create upgrade storage.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
+        let timeout = checkpoint_startup_timeout()?;
+        #[cfg(target_os = "macos")]
+        let timeout = timeout
+            + crate::process::current_executable()
+                .map(|executable| crate::update::selected_startup_allowance(&executable))
+                .unwrap_or_default();
+        Ok(timeout)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(crate) fn startup_timeout_for(executable: &Path) -> Result<std::time::Duration, String> {
+        Ok(checkpoint_startup_timeout()? + crate::update::selected_startup_allowance(executable))
+    }
+
+    fn checkpoint_startup_timeout() -> Result<std::time::Duration, String> {
         Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 

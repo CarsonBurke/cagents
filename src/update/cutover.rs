@@ -1022,31 +1022,110 @@ impl SelectedRestart {
 /// holder discovery and interrupted run settlement.
 #[cfg(feature = "host")]
 pub fn selected_reconnectable_codex() -> Result<Vec<crate::upgrade::handoff::Chat>, UpdateError> {
-    let executable = crate::process::current_executable()?;
-    let layout = match locate(&executable) {
-        Ok(layout) => layout,
-        Err(UpdateError::UnsupportedInstallation) => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
-    let state = layout.prefix.join(".update");
-    let Some(job) = read_job(&state)? else {
-        return Ok(Vec::new());
-    };
-    let Some((intent, original)) = restart_intent(&layout, &state, &job)? else {
+    let Some(restart) = pending_restart(&crate::process::current_executable()?)? else {
         return Ok(Vec::new());
     };
     if crate::process::mapped_region_identity(
         std::process::id(),
         crate::process::own_code_address(),
-    )? != intent.target_image
+    )? != restart.intent.target_image
     {
         return Ok(Vec::new());
     }
-    let store = crate::upgrade::handoff::Store::observe_existing()
+    let store = Store::observe_existing()
         .map_err(invalid)?
         .ok_or_else(|| invalid("Selected Ready recovery is missing its saved work directory"))?;
-    let recovered = store.recovered_chats().map_err(invalid)?;
-    Ok(recovered.reconnectable_codex(&original.chats, &intent.successor))
+    restart.reconnectable_codex(&store)
+}
+
+struct PendingRestart {
+    state: PathBuf,
+    intent: Intent,
+    original: OriginalInventory,
+}
+
+impl PendingRestart {
+    fn reconnectable_codex(
+        &self,
+        store: &Store,
+    ) -> Result<Vec<crate::upgrade::handoff::Chat>, UpdateError> {
+        let recovered = store.recovered_chats().map_err(invalid)?;
+        Ok(recovered.reconnectable_codex(&self.original.chats, &self.intent.successor))
+    }
+
+    fn startup_allowance(&self) -> Result<Duration, UpdateError> {
+        let Some(store) = Store::observe_existing().map_err(invalid)? else {
+            return Ok(Duration::ZERO);
+        };
+        // Only the ordinary recovery path can do this work. A checkpoint
+        // scheduled for retirement may still be present when a launcher reads it.
+        if let Some(checkpoint) = store.checkpoint_status().map_err(invalid)?
+            && !checkpoint_retirement_matches(&self.state, &self.intent, &checkpoint)?
+        {
+            return Ok(Duration::ZERO);
+        }
+        Ok(crate::upgrade::handoff::selected_reconnect_allowance(
+            self.reconnectable_codex(&store)?.len(),
+        ))
+    }
+}
+
+fn pending_restart(executable: &Path) -> Result<Option<PendingRestart>, UpdateError> {
+    let layout = match locate(executable) {
+        Ok(layout) => layout,
+        Err(UpdateError::UnsupportedInstallation) => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let state = layout.prefix.join(".update");
+    let Some(job) = read_job(&state)? else {
+        return Ok(None);
+    };
+    let Some((intent, original)) = restart_intent(&layout, &state, &job)? else {
+        return Ok(None);
+    };
+    Ok(Some(PendingRestart {
+        state,
+        intent,
+        original,
+    }))
+}
+
+/// A deadline estimate grants no recovery authority. Invalid or already
+/// settled selected evidence leaves the ordinary checkpoint budget in effect.
+pub(crate) fn selected_startup_allowance(executable: &Path) -> Duration {
+    pending_restart(executable)
+        .ok()
+        .flatten()
+        .and_then(|restart| restart.startup_allowance().ok())
+        .unwrap_or_default()
+}
+
+/// Joining a listener must budget for the daemon at the other end, including
+/// when the caller is an editor companion from a different installation.
+pub(crate) fn selected_listener_startup_allowance(
+    socket: &Path,
+    peer: crate::daemon::PeerCredentials,
+) -> Duration {
+    let allowance = || {
+        let paths = crate::daemon::RuntimePaths::discover().ok()?;
+        if paths.socket != socket || peer.uid != crate::daemon::current_uid() {
+            return None;
+        }
+        let process = crate::daemon::lease_handoff::observe_owner(&paths).ok()?;
+        if process.pid() != peer.pid {
+            return None;
+        }
+        let executable = process.executable().ok()?;
+        let restart = pending_restart(&executable).ok()??;
+        if crate::process::mapped_executable_identity(peer.pid, &executable).ok()?
+            != restart.intent.target_image
+            || process.exited().ok()?
+        {
+            return None;
+        }
+        restart.startup_allowance().ok()
+    };
+    allowance().unwrap_or_default()
 }
 
 /// An unrelated job must not replace the unfinished status between the
