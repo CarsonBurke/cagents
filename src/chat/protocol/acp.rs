@@ -26,7 +26,7 @@
 //!
 //! Antigravity's subagents are listed apart from the parent, with the steps
 //! of theirs that reach its session; see [`subagents`].
-use super::{Adapter, ProcessSpec, QueuedInput, Step};
+use super::{Adapter, MetadataWake, ProcessSpec, QueuedInput, Step};
 use crate::chat::{
     self, Capabilities, Choice, Command, Event, Item, ItemContent, Launch, PlanState, PlanStep,
     PromptMode, Request, RequestKind, Role, SkillReach, SlashCommand, ToolStatus,
@@ -34,6 +34,7 @@ use crate::chat::{
 use crate::notifications::Kind;
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::time::{Duration, Instant};
 
 pub mod antigravity;
 mod config;
@@ -69,6 +70,8 @@ const MAX_PERMISSIONS: usize = 64;
 /// prompts may hold between them, inline images included.
 const MAX_QUEUED: usize = 32;
 const MAX_QUEUED_BYTES: usize = 64 * 1024 * 1024;
+/// Let the actor retire an unconfirmed start before its command wait expires.
+const FIRST_MODEL_SETTINGS_TIMEOUT: Duration = Duration::from_secs(8);
 
 fn title_text(value: &Value) -> Option<&str> {
     let title = value.as_str()?;
@@ -224,21 +227,25 @@ fn prepare(profile: &'static Profile, launch: &Launch) -> Result<(ProcessSpec, A
     // is skipped unless it hides a protocol frame.
     spec.stdout_noise = Some(rpc::embedded_frame);
     spec.followed = true;
-    let settings = startup.settings;
+    let Settings {
+        model,
+        reasoning,
+        mode,
+    } = startup.settings;
+    let selection = match model {
+        Some(model) => Some(Setting::Model { model, reasoning }),
+        None => reasoning.map(Setting::Reasoning),
+    };
     Ok((
         spec,
         Acp {
             profile,
             cwd,
             resume: launch.session_id.clone(),
-            settings: [
-                settings.model.map(Setting::Model),
-                settings.reasoning.map(Setting::Reasoning),
-                settings.mode.map(Setting::Mode),
-            ]
-            .into_iter()
-            .flatten()
-            .collect(),
+            settings: [selection, mode.map(Setting::Mode)]
+                .into_iter()
+                .flatten()
+                .collect(),
             ..Acp::new(profile)
         },
     ))
@@ -257,7 +264,10 @@ enum Stage {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Setting {
-    Model(String),
+    Model {
+        model: String,
+        reasoning: Option<String>,
+    },
     Reasoning(String),
     Mode(String),
 }
@@ -353,6 +363,8 @@ struct Acp {
     /// choosing a model can change the reasoning levels it offers.
     settings: VecDeque<Setting>,
     setting_in_flight: bool,
+    first_model_deadline: Option<Instant>,
+    first_prompt_started: bool,
     /// A mode update can arrive after readiness and before dispatch reaches
     /// this actor. Check the launch's mode again at the first correlated turn.
     first_run_mode: Option<ConfirmedMode>,
@@ -394,6 +406,8 @@ impl Acp {
             config: config::Config::default(),
             settings: VecDeque::new(),
             setting_in_flight: false,
+            first_model_deadline: None,
+            first_prompt_started: false,
             first_run_mode: None,
             commands: Vec::new(),
             replay: None,
@@ -589,6 +603,7 @@ impl Acp {
     fn advance_settings(&mut self, step: &mut Step) {
         while !self.setting_in_flight && self.stage != Stage::Failed {
             let Some(mut setting) = self.settings.pop_front() else {
+                self.first_model_deadline = None;
                 if self.stage == Stage::Configuring {
                     self.become_ready(step);
                 }
@@ -597,21 +612,15 @@ impl Acp {
             // A terminal's model can name a reasoning level too, as agy's
             // `gemini-3.8-flash-low` does, where the session offers the model
             // and its level as two options.
-            if let Setting::Model(model) = &setting
+            if let Setting::Model { model, reasoning } = &mut setting
                 && !self.config.offers_model(model)
                 && let Some((base, level)) = self.config.split_model(model)
             {
-                if !self
-                    .settings
-                    .iter()
-                    .any(|queued| matches!(queued, Setting::Reasoning(_)))
-                {
-                    self.settings.push_front(Setting::Reasoning(level));
-                }
-                setting = Setting::Model(base);
+                *model = base;
+                reasoning.get_or_insert(level);
             }
             let (setter, value, offered, what) = match &setting {
-                Setting::Model(model) => (
+                Setting::Model { model, .. } => (
                     self.config.model_setter(),
                     model,
                     self.config.offers_model(model),
@@ -700,6 +709,12 @@ impl Acp {
                 self.profile.label
             ));
         }
+        if self.first_model_pending() {
+            return Err(format!(
+                "{} is still applying the first message's model settings.",
+                self.profile.label
+            ));
+        }
         Ok(())
     }
 
@@ -714,6 +729,7 @@ impl Acp {
         let params = json!({"sessionId": self.session_id(), "prompt": blocks});
         let (id, frame) = self.request("session/prompt", params, Pending::Prompt);
         step.writes.push(frame);
+        self.first_prompt_started = true;
         self.first_run_mode = None;
         self.segment = None;
         self.turn = Some(Turn {
@@ -1083,7 +1099,9 @@ impl Acp {
                     Ok(result) => {
                         // The reply's options describe the model after the
                         // switch, even when the legacy setter names it.
-                        if let Setting::Model(model) = &setting {
+                        if setter == config::Setter::Model
+                            && let Setting::Model { model, .. } = &setting
+                        {
                             self.config.model_changed(model);
                         }
                         let options = result["configOptions"].as_array();
@@ -1092,16 +1110,14 @@ impl Acp {
                             self.config.retain_models(self.profile.offers_model);
                         }
                         match &setting {
-                            Setting::Model(_) => {
-                                // Each model offers its own reasoning levels,
-                                // as Muse's do. A level queued with the model
-                                // that the new model's options leave out is
-                                // dropped rather than sent and refused.
-                                if options.is_some()
-                                    && let Some(Setting::Reasoning(level)) = self.settings.front()
-                                    && !self.config.offers_reasoning(level)
+                            Setting::Model { model, reasoning } => {
+                                // A model switch can replace the effort option
+                                // and its values, as it does in Muse.
+                                if let Some(level) = reasoning
+                                    && self.config.confirms_model(&setter, model)
+                                    && (options.is_none() || self.config.offers_reasoning(level))
                                 {
-                                    self.settings.pop_front();
+                                    self.settings.push_front(Setting::Reasoning(level.clone()));
                                 }
                             }
                             Setting::Mode(mode) => {
@@ -1145,7 +1161,7 @@ impl Acp {
                     }
                     Err(error) => {
                         let (what, value) = match &setting {
-                            Setting::Model(model) => ("model", model),
+                            Setting::Model { model, .. } => ("model", model),
                             Setting::Reasoning(level) => ("reasoning level", level),
                             Setting::Mode(mode) => ("mode", mode),
                         };
@@ -1815,6 +1831,32 @@ impl Adapter for Acp {
         !matches!(self.stage, Stage::Ready | Stage::Failed)
     }
 
+    fn first_model_pending(&self) -> bool {
+        self.first_model_deadline.is_some()
+    }
+
+    fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
+        self.first_model_deadline.map(MetadataWake::RetryAt)
+    }
+
+    fn refresh_metadata(&mut self) -> Option<Step> {
+        self.first_model_deadline
+            .filter(|at| *at <= Instant::now())?;
+        self.first_model_deadline = None;
+        let mut step = Step::default();
+        step.events.push(Event::Ready(false));
+        // A late reply could apply the settings after a prompt. Retire the
+        // session so the draft can retry with a fresh one.
+        self.fail(
+            format!(
+                "{} did not confirm the first message's model settings in time.",
+                self.profile.label
+            ),
+            &mut step,
+        );
+        Some(step)
+    }
+
     fn outcome_pending(&self) -> bool {
         self.turn.as_ref().is_some_and(|turn| turn.cancelling)
     }
@@ -2060,10 +2102,13 @@ impl Adapter for Acp {
                 if !self.config.offers_model(&model) {
                     return Err(format!("{label} does not offer the model {model:?}."));
                 }
-                self.settings.push_back(Setting::Model(model));
-                if let Some(level) = reasoning {
-                    self.settings.push_back(Setting::Reasoning(level));
+                if self.first_model_pending() {
+                    return Err(format!("{label} is still applying the first model choice."));
                 }
+                if self.resume.is_none() && !self.first_prompt_started && reasoning.is_some() {
+                    self.first_model_deadline = Some(Instant::now() + FIRST_MODEL_SETTINGS_TIMEOUT);
+                }
+                self.settings.push_back(Setting::Model { model, reasoning });
                 let mut step = Step::default();
                 self.advance_settings(&mut step);
                 Ok(step)

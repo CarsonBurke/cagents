@@ -122,6 +122,13 @@ impl std::ops::Deref for CatalogObservation {
 }
 
 impl CatalogObservation {
+    /// The levels this catalog has evidence for, including an empty report.
+    pub fn reported_reasoning(&self, id: &str) -> Option<&[String]> {
+        let model = self.models.iter().find(|model| model.id == id)?;
+        reasoning_stamp(&self.reasoning_observed_at, model, self.observed_at)?;
+        Some(&model.reasoning)
+    }
+
     /// Update an in-memory or on-disk catalog by the same observation rules.
     pub fn record(
         catalogs: &mut BTreeMap<Provider, Self>,

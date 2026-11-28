@@ -17778,6 +17778,69 @@ fn a_first_message_drops_an_effort_its_conversation_lacks_from_the_draft() {
     );
 }
 
+#[test]
+fn a_first_message_keeps_acp_reasoning_until_the_model_switch() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = reasoning_action_draft(&mut app, Provider::Muse);
+    write(&mut app, card, "hello");
+    submit(&mut app, card);
+
+    let attempt = chat_runtime_attempt(&app, card);
+    let handle = fixture_handle(&app, card, None);
+    handle.replace_snapshot_for_test(Snapshot {
+        models: vec![
+            fixture_model("other-model", &[]),
+            fixture_model("fixture-model", &[]),
+        ],
+        selected_model: Some("other-model".into()),
+        ready: true,
+        ..Snapshot::default()
+    });
+    answer_start(&mut app, attempt, Ok(handle));
+    assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+    assert_eq!(
+        chat_runtime(&app, card)
+            .commands
+            .in_flight()
+            .unwrap()
+            .choice,
+        Some(commands::Choice::Model {
+            model: "fixture-model".into(),
+            reasoning: Some("high".into()),
+        })
+    );
+    settle(&mut app, card, Err("model settings timed out".into()));
+    assert_eq!(pending_step(&app, card), None);
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.is_draft());
+    assert_eq!(runtime.composer.text(), "hello");
+    assert_eq!(
+        runtime.snapshot.selected_model.as_deref(),
+        Some("fixture-model")
+    );
+    assert_eq!(runtime.snapshot.reasoning.as_deref(), Some("high"));
+}
+
+#[test]
+fn a_new_acp_draft_filters_remembered_effort_only_after_a_reasoning_report() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    app.remember_chat_model(Provider::Muse, Some("spark".into()), Some("xhigh".into()));
+    let mut snapshot = Snapshot {
+        models: vec![fixture_model("spark", &[])],
+        reasoning_observed_at: Some(Arc::default()),
+        ..Snapshot::default()
+    };
+    drop(app.observe_chat_catalog(Provider::Muse, &snapshot));
+    assert_eq!(
+        app.chat_draft_snapshot(Provider::Muse).reasoning.as_deref(),
+        Some("xhigh")
+    );
+
+    snapshot.reasoning_observed_at = Some(Arc::new([("spark".into(), 1)].into()));
+    drop(app.observe_chat_catalog(Provider::Muse, &snapshot));
+    assert_eq!(app.chat_draft_snapshot(Provider::Muse).reasoning, None);
+}
+
 /// A model the conversation turns out not to offer is not waited for:
 /// the message goes to its default, and the transcript says so.
 #[test]

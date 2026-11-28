@@ -354,6 +354,8 @@ class Session:
             levels = MUSE_LEVELS.get(self.model)
             if not levels:
                 return [mode, model]
+            if self.model == "muse-spark-1.2" and marked("spark-low-reasoning"):
+                levels = [("low", "Use this for quick replies."), *levels]
             if self.level not in [v for v, _ in levels]:
                 self.level = levels[0][0]
             return [mode, model,

@@ -866,6 +866,7 @@ impl LocalHandle {
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
+                    first_model_reply: None,
                     offset: 0,
                     queued: 0,
                     stderr: VecDeque::new(),
@@ -2818,6 +2819,8 @@ struct Actor {
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
     pending: VecDeque<QueuedWrite>,
+    /// The provider's first model and effort replies may arrive separately.
+    first_model_reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
@@ -3979,6 +3982,7 @@ impl Actor {
                 continue;
             }
             let loads_earlier = command == Command::LoadEarlier;
+            let was_selecting_first_model = self.adapter.first_model_pending();
             let prepared = match run {
                 Some(run) => self.adapter.command_for_run(run, command),
                 None => self.adapter.command(command),
@@ -4005,7 +4009,14 @@ impl Actor {
                             detail: "Waiting for provider turn".into(),
                         });
                     }
-                    let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
+                    if result.is_ok()
+                        && !was_selecting_first_model
+                        && self.adapter.first_model_pending()
+                    {
+                        self.first_model_reply = Some(reply);
+                    } else {
+                        let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
+                    }
                     result?;
                     if started {
                         self.publish_activity();
@@ -4091,6 +4102,7 @@ impl Actor {
             || !self.pending.is_empty()
             || !self.output.is_empty()
             || self.adapter.compaction_pending()
+            || self.adapter.first_model_pending()
         {
             UpdateReadiness::Unready
         } else if state.holds_work() {
@@ -4456,6 +4468,16 @@ impl Actor {
             }
         }
         self.publish_activity();
+        if self.first_model_reply.is_some()
+            && !self.adapter.first_model_pending()
+            && let Some(reply) = self.first_model_reply.take()
+        {
+            let _ = reply.send(
+                frame_error
+                    .clone()
+                    .map_or(Ok(()), |error| Err(Rejection::Unacknowledged(error))),
+            );
+        }
         match frame_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -4629,8 +4651,10 @@ impl Actor {
         self.ready = state.ready;
         let compacting = self.adapter.compaction_pending();
         self.compaction_pending.store(compacting, Ordering::Release);
-        let prompt_available =
-            !compacting && accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
+        let prompt_available = !compacting
+            && !self.adapter.first_model_pending()
+            && accepts_prompt(&state)
+            && !self.stop.load(Ordering::Acquire);
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
         // The person's queue can empty while the conversation stays idle,

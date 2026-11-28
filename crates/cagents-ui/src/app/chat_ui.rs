@@ -9145,9 +9145,8 @@ impl Cagents {
     /// What a new draft of `provider` shows: the models it listed last, and
     /// the one last chosen among them.
     fn chat_draft_snapshot(&self, provider: Provider) -> Snapshot {
-        let models = self
-            .account_ui
-            .catalog(provider)
+        let catalog = self.account_ui.catalog_observation(provider);
+        let models = catalog
             .map(|catalog| catalog.models.clone())
             .unwrap_or_default();
         let (model, reasoning) = self
@@ -9156,6 +9155,13 @@ impl Cagents {
             .get(&provider)
             .cloned()
             .map_or((None, None), |(model, reasoning)| (Some(model), reasoning));
+        let reasoning = reasoning.filter(|effort| {
+            !provider.speaks_acp()
+                || model
+                    .as_deref()
+                    .and_then(|model| catalog?.reported_reasoning(model))
+                    .is_none_or(|levels| levels.contains(effort))
+        });
         draft_snapshot(provider, models, model, reasoning)
     }
 
@@ -13531,11 +13537,23 @@ impl Cagents {
             if snapshot.selected_model.as_ref() == Some(&model) && snapshot.reasoning == reasoning {
                 queued.model = None;
             } else if let Some(listed) = snapshot.models.iter().find(|listed| listed.id == model) {
-                let reasoning = reasoning.filter(|reasoning| listed.reasoning.contains(reasoning));
-                // A draft this message goes back to offers the effort it used.
-                if queued.chosen.0.as_ref() == Some(&model) {
-                    queued.chosen.1.clone_from(&reasoning);
-                }
+                // ACP can report a model's levels only after selecting it.
+                // Send the whole choice so the adapter can validate it then.
+                let reasoning_reported = snapshot
+                    .reasoning_observed_at
+                    .as_ref()
+                    .is_some_and(|observed| observed.contains_key(&model));
+                let reasoning = if provider.speaks_acp() && !reasoning_reported {
+                    reasoning
+                } else {
+                    let reasoning =
+                        reasoning.filter(|reasoning| listed.reasoning.contains(reasoning));
+                    // A draft this message goes back to offers the effort it used.
+                    if queued.chosen.0.as_ref() == Some(&model) {
+                        queued.chosen.1.clone_from(&reasoning);
+                    }
+                    reasoning
+                };
                 return self.chat_send_step(
                     target,
                     Command::SetModel { model, reasoning },
@@ -13606,6 +13624,15 @@ impl Cagents {
             (QueuedStep::Model, Ok(())) => {
                 queued.model = None;
                 None
+            }
+            (QueuedStep::Model, Err(error))
+                if provider.speaks_acp()
+                    && queued
+                        .model
+                        .as_ref()
+                        .is_some_and(|(_, effort)| effort.is_some()) =>
+            {
+                return self.revert_chat_draft(target, Some(error));
             }
             (QueuedStep::Model, Err(error)) => {
                 let model = queued.model.take().map(|(model, _)| model);
@@ -13697,9 +13724,26 @@ impl Cagents {
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
             return Task::none();
         };
-        let Some(chosen) = runtime.queued.as_ref().map(|queued| queued.chosen.clone()) else {
+        let Some(mut chosen) = runtime.queued.as_ref().map(|queued| queued.chosen.clone()) else {
             return Task::none();
         };
+        if provider.speaks_acp()
+            && let (Some(model), Some(effort), Some(handle)) =
+                (&chosen.0, &chosen.1, runtime.handle())
+        {
+            let latest = handle.snapshot();
+            if latest
+                .reasoning_observed_at
+                .as_ref()
+                .is_some_and(|observed| observed.contains_key(model))
+                && latest
+                    .models
+                    .iter()
+                    .any(|listed| listed.id == *model && !listed.reasoning.contains(effort))
+            {
+                chosen.1 = None;
+            }
+        }
         let Some(mut draft) = runtime.unqueue() else {
             return Task::none();
         };
