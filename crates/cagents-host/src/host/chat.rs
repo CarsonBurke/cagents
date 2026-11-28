@@ -62,7 +62,7 @@ use crate::{
     agent::Provider,
     chat::{
         self, Session,
-        runtime::{Handle, Update},
+        runtime::{Handle, Update, UpgradeRestoreQueueBudget},
     },
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
@@ -2318,6 +2318,12 @@ fn publication_refusal(
     }
 }
 
+#[derive(Clone, Copy)]
+struct UpgradeRestart<'a> {
+    launch: &'a chat::Launch,
+    queue_budget: &'a UpgradeRestoreQueueBudget,
+}
+
 fn start_with_execution(
     host: &SharedHost,
     client: ClientId,
@@ -2327,7 +2333,7 @@ fn start_with_execution(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
-    restart_launch: Option<&chat::Launch>,
+    upgrade_restart: Option<UpgradeRestart<'_>>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
 ) -> Result<ServerResponse, ProtocolError> {
     let id = session.id;
@@ -2340,7 +2346,7 @@ fn start_with_execution(
         selection,
         execution_environment,
         execution,
-        restart_launch,
+        upgrade_restart,
         pane,
         None,
     )?;
@@ -2361,10 +2367,11 @@ fn start_publishing(
     selection: Option<PendingBinding>,
     execution_environment: crate::terminal_ipc::ChatExecutionEnvironment,
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
-    restart_launch: Option<&chat::Launch>,
+    upgrade_restart: Option<UpgradeRestart<'_>>,
     pane: Option<crate::terminal_ipc::PaneChatStart>,
     reconnect: Option<&codex_reconnect::Managed>,
 ) -> Result<ServerResponse, ProtocolError> {
+    let restart_launch = upgrade_restart.map(|restart| restart.launch);
     // Reading the floor can fail transiently. The client routes an ordinary
     // start of a fenced conversation through its update resume, so a start
     // that still reaches the fence cannot pass it by repeating itself. Name no
@@ -3288,6 +3295,7 @@ fn start_publishing(
                 store,
                 session.clone(),
                 recovery_environment,
+                upgrade_restart.map(|restart| restart.queue_budget.clone()),
                 notify,
             )
         }
@@ -6372,57 +6380,14 @@ pub(super) fn restored_terminal_source(
     Ok(replacement)
 }
 
-/// Lock queue time is shared by the entire checkpoint, rather than granted
-/// anew to every conversation while the daemon's accept loop is unavailable.
-pub(super) struct UpgradeRestoreQueueBudget {
-    remaining: Duration,
-}
-
-impl Default for UpgradeRestoreQueueBudget {
-    fn default() -> Self {
-        Self {
-            remaining: Duration::from_secs(60),
-        }
-    }
-}
-
-impl UpgradeRestoreQueueBudget {
-    fn permits(&self, queued: Duration) -> bool {
-        queued.is_zero() || queued < self.remaining
-    }
-
-    fn charge(&mut self, queued: Duration) {
-        self.remaining = self.remaining.saturating_sub(queued);
-    }
-}
-
 pub(super) fn restore_upgrade(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
 ) -> Result<(), String> {
-    restore_upgrade_with_queue_budget(host, saved, &mut UpgradeRestoreQueueBudget::default())
+    restore_upgrade_with_queue_budget(host, saved, &UpgradeRestoreQueueBudget::default())
 }
 
 pub(super) fn restore_upgrade_with_queue_budget(
-    host: &SharedHost,
-    saved: &crate::upgrade::handoff::Chat,
-    queue_budget: &mut UpgradeRestoreQueueBudget,
-) -> Result<(), String> {
-    let result = restore_upgrade_with_queue_limit(host, saved, queue_budget);
-    let handle = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&saved.source.id)
-        .map(|record| record.handle.clone());
-    // Charge unsuccessful restarts too, before their stop removes the actor.
-    if let Some(handle) = handle {
-        queue_budget.charge(handle.startup_lock_wait());
-    }
-    result
-}
-
-fn restore_upgrade_with_queue_limit(
     host: &SharedHost,
     saved: &crate::upgrade::handoff::Chat,
     queue_budget: &UpgradeRestoreQueueBudget,
@@ -6438,7 +6403,10 @@ fn restore_upgrade_with_queue_limit(
     let mut session = crate::upgrade::handoff::restored_chat(&saved.source, &saved.launch)?;
     // Every provider keeps the descriptor already issued to windows. The
     // checkpoint's normalized resume arguments are execution context only.
-    let restart_launch = Some(&saved.launch);
+    let upgrade_restart = Some(UpgradeRestart {
+        launch: &saved.launch,
+        queue_budget,
+    });
     let source = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         session.proof = Some(state.proof().clone());
@@ -6489,7 +6457,7 @@ fn restore_upgrade_with_queue_limit(
         selection,
         Default::default(),
         None,
-        restart_launch,
+        upgrade_restart,
         None,
     )
     .map_err(|error| error.message)?;
@@ -6521,11 +6489,6 @@ fn restore_upgrade_with_queue_limit(
             );
         }
         let queued = handle.startup_lock_wait();
-        if !queue_budget.permits(queued) {
-            return Err(
-                "Codex startup lock queue budget for this upgrade restore was exhausted".into(),
-            );
-        }
         if let Some(actual) = handle.confirmed_session_id() {
             if Some(&actual) != saved.launch.session_id.as_ref() {
                 return Err("The restarted provider confirmed a different conversation".into());

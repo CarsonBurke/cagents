@@ -167,7 +167,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 semver = { version = "1.0", features = ["serde"] }
 serde_bytes = "0.11"
 serde_ignored = "0.1"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 serde_path_to_error = "0.1"
 sha2 = "0.10"
 # `cagents device update` sends this computer's installed tree as a release

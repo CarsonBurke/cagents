@@ -13,12 +13,17 @@ use crate::{
     test_timing::EVENTUALLY,
 };
 use std::{
+    collections::BTreeSet,
     fs::File,
     io::Read,
-    os::fd::{AsRawFd, FromRawFd},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        linux::net::SocketAddrExt,
+        unix::net::SocketAddr,
+    },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::{OnceLock, mpsc},
+    sync::{Mutex, OnceLock, mpsc},
     time::{Duration, Instant},
 };
 
@@ -27,6 +32,15 @@ const TEST: &str = "CAGENTS_EXIT_DRAIN_TEST_NAME";
 const SCOPE: &str = "CAGENTS_EXIT_DRAIN_INHERITED_SCOPE";
 static READY: OnceLock<mpsc::Sender<Result<SharedHost, String>>> = OnceLock::new();
 static STARTUP: OnceLock<std::sync::Mutex<StartupObservation>> = OnceLock::new();
+static PENDING_CLIENTS: Mutex<BTreeSet<[u8; 16]>> = Mutex::new(BTreeSet::new());
+
+/// Match an opted-in client once, using the source address of its real socket.
+/// The fixture handler separately verifies the kernel peer PID and UID.
+pub(super) fn take_fixture_client(address: &SocketAddr) -> bool {
+    address
+        .as_abstract_name()
+        .is_some_and(|name| PENDING_CLIENTS.lock().unwrap().remove(name))
+}
 
 struct StartupObservation {
     began: Instant,
@@ -217,9 +231,44 @@ struct Rpc {
 }
 impl Rpc {
     fn connect(socket: &Path) -> Self {
-        let stream = UnixStream::connect(socket).unwrap();
-        Self::from_stream(stream)
+        use rustix::net::{AddressFamily, SocketAddrUnix, SocketFlags, SocketType};
+
+        let target = SocketAddrUnix::new(socket).unwrap();
+        let source = uuid::Uuid::new_v4().into_bytes();
+        let stream = rustix::net::socket_with(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .unwrap();
+        rustix::net::bind(
+            &stream,
+            &SocketAddrUnix::new_abstract_name(&source).unwrap(),
+        )
+        .unwrap();
+        // Bind before registering. Until this stream closes, no other socket
+        // can claim its address. The listener consumes the opt-in at accept.
+        assert!(PENDING_CLIENTS.lock().unwrap().insert(source));
+        let connected = rustix::net::connect(&stream, &target);
+        if connected.is_err() {
+            PENDING_CLIENTS.lock().unwrap().remove(&source);
+        }
+        connected.unwrap();
+        let rpc = Self::fixture_user(stream.into());
+        assert!(!PENDING_CLIENTS.lock().unwrap().contains(&source));
+        rpc
     }
+
+    fn fixture_user(stream: UnixStream) -> Self {
+        let mut rpc = Self::from_stream(stream);
+        assert!(matches!(
+            rpc.authenticate_user().unwrap(),
+            ServerResponse::Accepted
+        ));
+        rpc
+    }
+
     fn from_stream(mut stream: UnixStream) -> Self {
         stream.set_read_timeout(Some(EVENTUALLY)).unwrap();
         stream.set_write_timeout(Some(EVENTUALLY)).unwrap();
@@ -244,19 +293,17 @@ impl Rpc {
             panic!("actual private HOST must complete a fresh Connect");
         };
         assert_eq!(envelope.proof, proof);
-        let mut rpc = Self {
+        Self {
             stream,
             proof,
             next: 2,
-        };
-        assert!(matches!(
-            rpc.request(ClientRequest::Authenticate {
-                authority: crate::agent_execution::Authority::default(),
-            })
-            .unwrap(),
-            ServerResponse::Accepted
-        ));
-        rpc
+        }
+    }
+
+    fn authenticate_user(&mut self) -> Result<ServerResponse, ProtocolError> {
+        self.request(ClientRequest::Authenticate {
+            authority: crate::agent_execution::Authority::default(),
+        })
     }
     fn request(&mut self, request: ClientRequest) -> Result<ServerResponse, ProtocolError> {
         let id = self.next;
@@ -575,6 +622,22 @@ fn healthy_host_exit_joins_its_actual_terminal_without_reopening_reservations() 
     let paths = RuntimePaths::discover().unwrap();
     let (host, completed, running) = run_host();
     let mut rpc = Rpc::connect(&paths.socket);
+    let ordinary = UnixStream::connect(&paths.socket).unwrap();
+    // Here both ends belong to the same test process. The ordinary socket
+    // must still receive the decision the kernel peer classifier makes.
+    let peer = daemon::peer_credentials(&ordinary).unwrap();
+    let requires_authority = daemon::peer_requires_session_authority(&ordinary, peer);
+    let mut ordinary = Rpc::from_stream(ordinary);
+    let result = ordinary.authenticate_user();
+    if requires_authority {
+        assert_eq!(
+            result.unwrap_err().code,
+            ProtocolErrorCode::PermissionDenied
+        );
+    } else {
+        assert!(matches!(result.unwrap(), ServerResponse::Accepted));
+    }
+    drop(ordinary);
     let source = session(&root);
     assert!(
         matches!(rpc.request(ClientRequest::Spawn { session: source.clone(), options: TerminalSpawnOptions::default() }).unwrap(), ServerResponse::Spawned { terminal } if terminal.session.id == source.id)
@@ -621,8 +684,8 @@ fn pending_exit_keeps_actual_checked_close_and_fences_late_registration() {
     let host = Arc::new(state::HostLock::new(state));
     let (peer, server) = UnixStream::pair().unwrap();
     let serve_host = host.clone();
-    let serving = thread::spawn(move || client::serve(server, 1, serve_host));
-    let mut rpc = Rpc::from_stream(peer);
+    let serving = thread::spawn(move || client::serve_fixture_user(server, 1, serve_host));
+    let mut rpc = Rpc::fixture_user(peer);
     let source = session(&root);
     assert!(source.continuity.live_proof().is_none());
     let ServerResponse::Spawned { terminal } = rpc

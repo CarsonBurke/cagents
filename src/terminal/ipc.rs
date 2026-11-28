@@ -380,7 +380,12 @@ use crate::{
 ///
 /// Version 224 appends `ConversationWorktree::last_activity_unix_ms` to
 /// order conversation Work rows by local file and commit activity.
-pub const PROTOCOL_VERSION: u16 = 224;
+///
+/// Version 225 adds a chat snapshot's count of history before and after its
+/// loaded window, cached or still with the provider, and appends the `Seek`
+/// chat command that moves the window to any cached item. An older CLI is sent
+/// snapshots without the count, and an older update source is read without it.
+pub const PROTOCOL_VERSION: u16 = 225;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -410,11 +415,11 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 mod older_clients;
 pub use older_clients::{
     ACP_REASONING_OBSERVATIONS, ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH,
-    ENDED_TOOL_STATUS, NOT_RESUMED_NOTICES, PATCH_LINE_ORIGIN, PLAN_AND_RESET_READINGS,
-    PROJECT_ORDER, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT, WAIT_KINDS,
-    WAITING_TOOL_STATUS, WithoutTrailing, before_acp_reasoning_observations, before_project_order,
-    before_queue_holds, before_send_queued_now, decoding_before, decoding_from, encoding_before,
-    encoding_for,
+    ENDED_TOOL_STATUS, HISTORY_EXTENTS, NOT_RESUMED_NOTICES, PATCH_LINE_ORIGIN,
+    PLAN_AND_RESET_READINGS, PROJECT_ORDER, QUEUE_HOLDS, SEND_QUEUED_NOW, USAGE_COMPACT_LIMIT,
+    WAIT_KINDS, WAITING_TOOL_STATUS, WithoutTrailing, before_acp_reasoning_observations,
+    before_history_extents, before_project_order, before_queue_holds, before_send_queued_now,
+    decoding_before, decoding_from, encoding_before, encoding_for,
 };
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
@@ -1086,12 +1091,26 @@ pub enum TerminalScroll {
     Row(u64),
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Deserialize)]
 pub struct ServerEnvelope {
     pub version: u16,
     pub request_id: Option<u64>,
     pub proof: HostSessionProof,
     pub message: ServerMessage,
+}
+
+/// Encoded as its [`ServerEnvelopeRef`] is, so an envelope in an older
+/// client's version encodes its message as that client decodes it.
+impl Serialize for ServerEnvelope {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ServerEnvelopeRef {
+            version: self.version,
+            request_id: self.request_id,
+            proof: &self.proof,
+            message: &self.message,
+        }
+        .serialize(serializer)
+    }
 }
 
 /// A host reply whose transcript may already be encoded by a retained helper.
@@ -3419,7 +3438,8 @@ mod tests {
 
     /// The daemon's writer serializes `ServerEnvelopeRef`, but every peer
     /// decodes `ServerEnvelope`. A field reorder or type change on either side
-    /// would silently mis-decode, so pin the encoding rather than the shape.
+    /// would silently mis-decode, so pin that what one encodes the other
+    /// decodes, rather than the shape.
     #[test]
     fn borrowed_envelope_encodes_identically() {
         let envelope = ServerEnvelope {
@@ -3445,6 +3465,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owned, borrowed);
+        let decoded: ServerEnvelope = read_frame(&mut borrowed.as_slice()).unwrap().unwrap();
+        assert_eq!(decoded, envelope);
     }
 
     #[test]

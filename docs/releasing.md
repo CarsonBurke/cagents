@@ -459,6 +459,8 @@ releases published on GitHub, read from their tags in the checkout;
 - A release that begins a generation must verify with the keys of every
   release of the generation before. When that generation is 1, it must hold
   exactly one signature.
+- If the preceding generation shipped Apple Silicon builds, the bridge must
+  carry an Apple Silicon build. Publication checks the published release assets.
 - A generation follows the one before it, never skipping one or going back.
 - The metadata it carries for older generations must be the one their
   generation's successor published, signed as those builds read it. For

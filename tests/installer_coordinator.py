@@ -326,8 +326,10 @@ class InstallerCoordinator(unittest.TestCase):
         self.executable(path, f"#!{sys.executable}\n" + body)
 
     def install(self, *options, version=VERSION):
-        command = ["/bin/sh", str(ROOT / "install.sh"), "--version", version, "--prefix", str(self.prefix),
-                   *options]
+        command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(self.prefix)]
+        if version is not None:
+            command.extend(("--version", version))
+        command.extend(options)
         with subprocess.Popen(command, env=self.environment, cwd=self.directory,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True) as process:
@@ -566,6 +568,38 @@ exec /usr/bin/awk "$@"
         self.assertEqual(Path(coordinator['helper']).name, 'cagentsd')
         self.assertEqual(coordinator['mode'], 0o700)
 
+    def test_public_downloads_disable_curl_configuration(self):
+        self.environment.update(
+            CAGENTS_REPOSITORY="CarsonBurke/cagents",
+            FIXTURE_ARCHIVE=self.environment.pop("CAGENTS_ARCHIVE"),
+            FIXTURE_CHECKSUMS=self.environment.pop("CAGENTS_CHECKSUMS"),
+        )
+        self.python(self.tools / "curl", fr'''
+import json
+import os
+import shutil
+import sys
+
+args = sys.argv[1:]
+url = args[-1]
+with open(os.environ["FIXTURE_CALLS"], "a") as calls:
+    calls.write(json.dumps(dict(event="curl", option=args[0], url=url)) + "\n")
+if url.endswith("/latest"):
+    print(url.removesuffix("/latest") + "/tag/v{VERSION}", end="")
+else:
+    key = "FIXTURE_CHECKSUMS" if url.endswith("/SHA256SUMS") else "FIXTURE_ARCHIVE"
+    shutil.copyfile(os.environ[key], args[args.index("-o") + 1])
+''')
+        self.assert_installed(self.install(version=None), 'candidate')
+        requests = [(event['option'], event['url']) for event in self.events()
+                    if event['event'] == 'curl']
+        base = "https://github.com/CarsonBurke/cagents/releases"
+        self.assertEqual(requests, [
+            ("--disable", f"{base}/latest"),
+            ("--disable", f"{base}/download/v{VERSION}/{self.archive.name}"),
+            ("--disable", f"{base}/download/v{VERSION}/SHA256SUMS"),
+        ])
+
     def test_old_cli_without_install_guard_uses_the_verified_candidate_pair(self):
         previous = self.installed_cli(guarded=False)
         coordinator = self.assert_installed(self.install(), 'candidate')
@@ -616,6 +650,10 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
 
     def test_archive_requires_the_ui_lease_marker_independently_of_autostart(self):
         self.assert_missing_member_rejected('bin/.cagents-ui-lease-v1')
+
+    def test_archive_validation_ignores_user_tar_options(self):
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        self.assert_installed(self.install(), 'candidate')
 
     def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
         self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')

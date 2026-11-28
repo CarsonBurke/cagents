@@ -96,7 +96,8 @@ pub(super) fn preparation(root: &Path) -> Preparation {
                 chats: Vec::new(),
                 snapshots: Vec::new(),
                 ..Default::default()
-            },
+            }
+            .into(),
             checkpoint_path: root.join("daemon-upgrade.json"),
             checkpoint_hash: String::new(),
             worker_path,
@@ -638,6 +639,55 @@ fn explicit_recovery_request_binds_original_census_windows_and_typed_origin() {
 }
 
 #[test]
+fn explicit_recovery_uses_exact_census_bytes_with_unknown_fields() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let checkpoint = checkpoint(&preparation, "Prepared");
+    save(path, &checkpoint);
+    let original = serde_json::to_string(&preparation.authority.census).unwrap();
+    let extended = format!(r#"{{"future_field": {{"counter": 1}}, {}"#, &original[1..]);
+    let capture = CapturedCensus {
+        producer: Some(CaptureProducer::Acknowledged {
+            job: preparation.authority.job.clone(),
+            request_hash: preparation.authority.job_request_hash.clone(),
+        }),
+        source: preparation.authority.source.clone(),
+        checkpoint_hash: Some(digest(&checkpoint)),
+        census: serde_json::from_str(&extended).unwrap(),
+        windows: vec!["primary".into()],
+    };
+    persist_bound_capture(path, &capture).unwrap();
+    let pending = PendingRecovery::inspect_at(path).unwrap().unwrap();
+    assert_eq!(pending.census, preparation.authority.census);
+    assert_eq!(serde_json::to_string(&pending.census).unwrap(), extended);
+    let mut authority = pending.authority();
+    authority.job = uuid::Uuid::new_v4().to_string();
+    authority.target = PathBuf::from("/candidate/bin/cagentsd");
+    authority.target_hash = "b".repeat(64);
+    let request = serde_json::to_vec(&ManualRequest {
+        version: 1,
+        job: authority.job.clone(),
+        checkpoint: authority.checkpoint_hash.clone(),
+        source: authority.source.clone(),
+        target: authority.target.clone(),
+        target_hash: authority.target_hash.clone(),
+        census_hash: digest(extended.as_bytes()),
+        windows: authority.windows.clone(),
+    })
+    .unwrap();
+    authority.request_identity = digest(&request);
+    authority.job_request_hash = digest(&request);
+    let receipt = serde_json::to_vec(&authority).unwrap();
+    let mut received: Authority = serde_json::from_slice(&receipt).unwrap();
+    validate_request_origin(&received, &request).unwrap();
+    let changed = extended.replace("counter\": 1", "counter\": 2");
+    received.census = serde_json::from_str(&changed).unwrap();
+    assert_eq!(received.census, authority.census);
+    assert!(validate_request_origin(&received, &request).is_err());
+}
+
+#[test]
 #[cfg_attr(
     not(target_os = "linux"),
     ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
@@ -870,7 +920,7 @@ fn census_work_in_flight_is_optional_and_names_only_its_own_conversations() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
     let proof = &preparation.authority.source;
-    let mut census = preparation.authority.census.clone();
+    let mut census = preparation.authority.census.value.clone();
     let chat = Session {
         id: TerminalId::new(),
         launch: crate::chat::Launch {
@@ -1433,7 +1483,7 @@ fn scale_census(
     chats: usize,
     page: impl Fn(usize) -> (usize, usize),
 ) -> Census {
-    let mut census = preparation.authority.census.clone();
+    let mut census = preparation.authority.census.value.clone();
     let mut captured = SnapshotCapture::default();
     let mut sessions = Vec::new();
     for index in 0..chats {
@@ -1487,7 +1537,7 @@ fn fit_long_transcripts(chats: usize, page: fn(usize) -> (usize, usize)) -> usiz
     let reviewed = preparation.authority.reviewed.clone().unwrap();
     census.fit_pages(&source, &reviewed, &[]).unwrap();
     census.validate_capture(&source).unwrap();
-    preparation.authority.census = census.clone();
+    preparation.authority.census = census.clone().into();
     preflight_preparation_size(&preparation.authority).unwrap();
     // Recovery saves these pages without shortening them any further.
     let mut record = census.record(&source);
@@ -2405,7 +2455,8 @@ fn issued_chat_aliases_bind_the_original_allocation_and_each_serving_proof() {
         census: Census {
             chats: vec![known],
             ..Default::default()
-        },
+        }
+        .into(),
         adopted_terminals: Vec::new(),
         adopted_chats: vec![issued.id],
         adopted_chat_descriptors: vec![issued.clone()],
@@ -2728,7 +2779,7 @@ fn settled_prepared_is_read_only_history_without_active_update_authority() {
             .unwrap()
             .unwrap();
         assert_eq!(classified.source, record.source);
-        assert_eq!(classified.census, record.census);
+        assert_eq!(classified.census, *record.census);
         assert_eq!(classified.paused_terminals, record.paused_terminals);
         assert!(classified.paused_chats.is_empty());
         assert_eq!(
@@ -2748,7 +2799,7 @@ fn settled_prepared_is_read_only_history_without_active_update_authority() {
         source: record.source.clone(),
         target: target.clone(),
         target_hash: record.target_hash.clone(),
-        census_hash: digest(&serde_json::to_vec(&record.census).unwrap()),
+        census_hash: digest(&serde_json::to_vec(&baseline["census"]).unwrap()),
         windows: record.windows.clone(),
     };
     let manual_request = serde_json::to_vec(&manual).unwrap();
@@ -3266,7 +3317,7 @@ fn daemon_upgrade_retention_expires_only_unreferenced_captures() {
         producer: None,
         source: source.clone(),
         checkpoint_hash: None,
-        census: Census::default(),
+        census: Census::default().into(),
         windows: Vec::new(),
     };
     let proposed = capture_path(&files.checkpoint, source).unwrap();

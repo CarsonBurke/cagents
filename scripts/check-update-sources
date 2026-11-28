@@ -5,11 +5,11 @@ Live updates start only from the installed builds pinned in RELEASED_SOURCES
 (src/update/source.rs) and the current matched release. When PROTOCOL_VERSION
 was relative, bumping it silently dropped the build users were running: 174
 dropped 173, and a 173 install could no longer be updated live. So each
-protocol main served since the oldest pinned source, which is each wire-format
-recording below PROTOCOL_VERSION, must be pinned, or retired in RETIRED_SOURCES
-with a reason. A protocol bump then cannot merge without deciding about the
-protocol it replaces. CI does not run the Rust tests that prove a pinned
-source, so this checks the decision, not the proof.
+protocol main served since live-update qualification began must be pinned or
+retired in RETIRED_SOURCES with a reason. The immutable IPC snapshots preserve
+that history if a wire-format fixture is deleted. A bump cannot merge without
+deciding about the protocol it replaces. CI checks the decisions, and Rust
+tests prove each pinned source.
 """
 
 import argparse
@@ -20,6 +20,9 @@ from pathlib import Path
 IPC = Path("src/terminal/ipc.rs")
 SOURCES = Path("src/update/source.rs")
 RECORDINGS = Path("tests/fixtures/wire-formats")
+CONTRACTS = Path("tests/fixtures/protocol-contract")
+# Older snapshots predate the first explicitly qualified update source.
+FIRST_DECISION_PROTOCOL = 156
 
 
 def block(text: str, name: str) -> str | None:
@@ -54,6 +57,9 @@ def problems(root: Path) -> list[str]:
     recordings = {
         int(path.stem) for path in (root / RECORDINGS).glob("*.json") if path.stem.isdigit()
     }
+    served = recordings | {
+        int(path.stem) for path in (root / CONTRACTS).glob("*.json") if path.stem.isdigit()
+    }
     found = []
     for value in released:
         if value >= protocol:
@@ -65,8 +71,9 @@ def problems(root: Path) -> list[str]:
             found.append(f"{SOURCES}: pinned source protocol {value} has no {RECORDINGS}/{value}.json")
         if value in retired:
             found.append(f"{SOURCES}: protocol {value} is both pinned and retired")
-    for value in sorted(recordings):
-        if min(released) <= value < protocol and value not in released and value not in retired:
+    undecided = served - set(released) - set(retired)
+    for value in sorted(undecided):
+        if FIRST_DECISION_PROTOCOL <= value < protocol:
             found.append(
                 f"{SOURCES}: main served protocol {value}, which is neither a live-update "
                 f"source nor retired. Pin it in RELEASED_SOURCES once an update from its "

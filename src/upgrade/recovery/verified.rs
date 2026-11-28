@@ -511,7 +511,7 @@ pub(super) mod tests {
                 }),
                 source: proof("source"),
                 checkpoint_hash: Some(digest(&bytes)),
-                census: census.clone(),
+                census: census.clone().into(),
                 windows: vec![],
             };
             write_private(
@@ -528,7 +528,7 @@ pub(super) mod tests {
                 windows: vec![],
                 source: proof("source"),
                 checkpoint_hash: digest(&bytes),
-                census,
+                census: census.into(),
                 adopted_terminals: vec![original_terminal.session.id],
                 adopted_chats: if adopted { vec![source.id] } else { vec![] },
                 adopted_chat_descriptors: if adopted {

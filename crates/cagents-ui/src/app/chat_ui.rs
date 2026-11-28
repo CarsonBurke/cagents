@@ -149,6 +149,7 @@ mod thumbnails;
 mod tool_text;
 mod tool_title;
 mod turn;
+mod unloaded;
 mod update_recovery;
 mod view;
 mod virtualized;
@@ -362,6 +363,7 @@ pub enum Action {
     AccountRestored(CardId, Result<account::remote::RestoredHome, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
+    DraftPermissionResolved(Target, u64, Option<String>),
     /// Opens or closes the account choice.
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
@@ -916,6 +918,7 @@ impl Action {
             | Self::LogicalProseRead(target, ..)
             | Self::MarkdownPrepared(target, ..)
             | Self::LocalPromptPrepared(target, ..)
+            | Self::DraftPermissionResolved(target, ..)
             | Self::ThumbnailLoaded(target, ..)
             | Self::FindGroups(target, ..)
             | Self::FindHighlight(target, ..)
@@ -977,6 +980,7 @@ impl Action {
             Self::RestoreAccount(..) => "RestoreAccount",
             Self::AccountRestored(..) => "AccountRestored",
             Self::DraftSkills(..) => "DraftSkills",
+            Self::DraftPermissionResolved(..) => "DraftPermissionResolved",
             Self::AccountPicker(..) => "AccountPicker",
             Self::DispatchQueued(..) => "DispatchQueued",
             Self::CancelQueued(..) => "CancelQueued",
@@ -1174,6 +1178,7 @@ impl Action {
             Self::Ready(..)
                 | Self::ReadyAfterExitedQueue(..)
                 | Self::DraftStartCheckpointed(..)
+                | Self::DraftPermissionResolved(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -3309,6 +3314,10 @@ enum HistoryNavigation {
     EarlierExplicit,
     NewerEdge,
     Latest,
+    /// The reader moved into history outside the loaded window.
+    Seek,
+    /// The current request must finish before its next provider page.
+    ContinueSeek,
 }
 
 #[derive(Clone, Copy)]
@@ -3980,6 +3989,11 @@ pub(super) struct Runtime {
     /// id, so a view parses each input once rather than on every frame.
     denial_inputs: std::cell::RefCell<HashMap<String, Arc<str>>>,
     scroll: view::Scroll,
+    /// The height each unloaded item of the main transcript is given.
+    history_estimate: std::cell::Cell<view::HistoryEstimate>,
+    /// The conversation index the window was last moved to, while the
+    /// reader is still in the unloaded history around it.
+    sought: Option<u64>,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
     deferred_page: Option<HistoryNavigation>,
@@ -5497,6 +5511,11 @@ impl Runtime {
         if self.target != target {
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
+            if self.draft_permission.pending.is_some() {
+                // A failed first send can restore this recipe under the new
+                // target. The old target's worker cannot answer it.
+                self.draft_permission = DraftPermissionPreview::default();
+            }
             self.target = target;
         }
     }
@@ -5523,11 +5542,14 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let mut draft_permission = DraftPermissionPreview::default();
-        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
+        let permission_mode =
+            match recipe_permission_mode(&session.launch.recipe, session.launch.provider) {
+                PermissionPreview::Known(mode) => mode,
+                PermissionPreview::ReadConfig => None,
+            };
         let mut runtime = Self {
             preparation: preparation::State::default(),
-            draft_permission,
+            draft_permission: DraftPermissionPreview::default(),
             draft_model_chosen: false,
             target,
             session,
@@ -5658,6 +5680,8 @@ impl Runtime {
             selection_document: Default::default(),
             denial_inputs: Default::default(),
             scroll: view::Scroll::default(),
+            history_estimate: Default::default(),
+            sought: None,
             subagent_scroll: HashMap::new(),
             page_request: None,
             deferred_page: None,
@@ -5688,6 +5712,8 @@ impl Runtime {
         self.page_request = None;
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
+        self.history_estimate.take();
+        self.sought = None;
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
         self.selection_document.get_mut().clear();
@@ -5818,13 +5844,6 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
-    /// The permission mode this draft's launch recipe previews, read from
-    /// provider config only when the recipe changed since the last read.
-    fn draft_permission_mode(&mut self) -> Option<String> {
-        self.draft_permission
-            .get(&self.session.launch.recipe, self.session.launch.provider)
-    }
-
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -7109,11 +7128,7 @@ impl Runtime {
                 .any(|message| &message.id == id)
         });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    self.draft_permission
-                        .get(&self.session.launch.recipe, self.session.launch.provider)
-                });
+            Arc::make_mut(&mut snapshot).permission_mode = self.snapshot.permission_mode.clone();
         }
         if !self.parent_scroll().at_bottom()
             && !snapshot.has_later
@@ -8414,24 +8429,28 @@ fn draft_snapshot(
     }
 }
 
-/// The permission mode a draft's launch recipe previews. Reading it touches
-/// provider config files, so it is computed once per (provider, recipe).
+/// The recipe last considered for a preview, including a resolved absence.
 #[derive(Default)]
 struct DraftPermissionPreview {
-    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+    recipe: Option<(Provider, LaunchRecipe)>,
+    pending: Option<u64>,
+    mode: Option<String>,
 }
 
 impl DraftPermissionPreview {
-    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
-        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
-            && *cached_provider == provider
-            && cached_recipe == recipe
-        {
-            return mode.clone();
-        }
-        let mode = draft_permission_mode(recipe, provider);
-        self.resolved = Some((provider, recipe.clone(), mode.clone()));
-        mode
+    /// Supersede an older read before changing the mode displayed by the draft.
+    fn select(&mut self, provider: Provider, recipe: &LaunchRecipe, mode: Option<String>) {
+        self.recipe = Some((provider, recipe.clone()));
+        self.pending = None;
+        self.mode = mode;
+    }
+
+    fn matches(&self, provider: Provider, recipe: &LaunchRecipe) -> bool {
+        self.recipe
+            .as_ref()
+            .is_some_and(|(old_provider, old_recipe)| {
+                *old_provider == provider && old_recipe == recipe
+            })
     }
 }
 
@@ -8442,7 +8461,12 @@ fn conversation_place() -> String {
         .map_or_else(|| "this computer".to_owned(), |device| device.name.clone())
 }
 
-fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+enum PermissionPreview {
+    Known(Option<String>),
+    ReadConfig,
+}
+
+fn recipe_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> PermissionPreview {
     let arguments = &recipe.arguments;
     match provider {
         Provider::Claude => {
@@ -8450,9 +8474,9 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .iter()
                 .any(|argument| argument == "--dangerously-skip-permissions")
             {
-                return Some("bypassPermissions".into());
+                return PermissionPreview::Known(Some("bypassPermissions".into()));
             }
-            arguments
+            let explicit = arguments
                 .iter()
                 .enumerate()
                 .find_map(|(index, argument)| {
@@ -8476,21 +8500,43 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                             .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
                     })
                     .flatten()
-                })
-                .or_else(|| chat::claude_configured_default_mode(recipe))
-                .or_else(|| Some("manual".into()))
+                });
+            explicit.map_or(PermissionPreview::ReadConfig, |mode| {
+                PermissionPreview::Known(Some(mode))
+            })
         }
-        Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
-        Provider::Omp => None,
+        Provider::Codex => match codex_recipe_policy(recipe) {
+            CodexRecipePolicy::Known(mode) => PermissionPreview::Known(mode.map(str::to_owned)),
+            CodexRecipePolicy::Config { .. } => PermissionPreview::ReadConfig,
+        },
+        Provider::Antigravity | Provider::Muse => {
+            PermissionPreview::Known(chat::acp_permission_mode(recipe, provider))
+        }
+        Provider::Omp => PermissionPreview::Known(None),
     }
 }
 
-/// Preview the launch policy without changing the CLI's configuration. Once
-/// connected, the thread's own reported policy replaces this preview.
-fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    match recipe_permission_mode(recipe, provider) {
+        PermissionPreview::Known(mode) => mode,
+        PermissionPreview::ReadConfig if provider == Provider::Claude => {
+            chat::claude_configured_default_mode(recipe).or_else(|| Some("manual".into()))
+        }
+        PermissionPreview::ReadConfig => codex_draft_permission_mode(recipe),
+    }
+}
+
+enum CodexRecipePolicy<'a> {
+    Known(Option<&'static str>),
+    Config {
+        approval: Option<&'a str>,
+        sandbox: Option<&'a str>,
+    },
+}
+
+fn codex_recipe_policy(recipe: &LaunchRecipe) -> CodexRecipePolicy<'_> {
     if crate::device::is_remote() {
-        return None;
+        return CodexRecipePolicy::Known(None);
     }
     let arguments = &recipe.arguments;
     if arguments.iter().any(|argument| {
@@ -8499,8 +8545,71 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
             "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
         )
     }) {
-        return Some("yolo".into());
+        return CodexRecipePolicy::Known(Some("yolo"));
     }
+    // These recipes are not supported for new native threads. Do not guess
+    // which profile or config override a resumed provider thread uses.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    if arguments.iter().enumerate().any(|(index, argument)| {
+        let override_value = argument.strip_prefix("--config=").or_else(|| {
+            matches!(argument.as_str(), "-c" | "--config")
+                .then(|| arguments.get(index + 1).map(String::as_str))
+                .flatten()
+        });
+        override_value.is_some_and(|value| {
+            value.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
+                )
+            })
+        })
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    let flag = |short: &str, long: &str| {
+        arguments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, argument)| {
+                argument.strip_prefix(&format!("{long}=")).or_else(|| {
+                    (argument == short || argument == long)
+                        .then(|| arguments.get(index + 1).map(String::as_str))
+                        .flatten()
+                })
+            })
+    };
+    let explicit_approval = flag("-a", "--ask-for-approval");
+    let explicit_sandbox = flag("-s", "--sandbox");
+    match (explicit_approval, explicit_sandbox) {
+        (Some(approval), Some(sandbox)) => {
+            CodexRecipePolicy::Known(codex_mode(Some(approval), Some(sandbox)))
+        }
+        (approval, sandbox) => CodexRecipePolicy::Config { approval, sandbox },
+    }
+}
+
+fn codex_mode(approval: Option<&str>, sandbox: Option<&str>) -> Option<&'static str> {
+    match (approval, sandbox) {
+        (Some("never"), Some("danger-full-access")) => Some("yolo"),
+        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite"),
+        (Some("on-request"), Some("read-only")) => Some("readOnly"),
+        _ => None,
+    }
+}
+
+/// Preview the launch policy without changing the CLI's configuration. Once
+/// connected, the thread's own reported policy replaces this preview.
+fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    let (explicit_approval, explicit_sandbox) = match codex_recipe_policy(recipe) {
+        CodexRecipePolicy::Known(mode) => return mode.map(str::to_owned),
+        CodexRecipePolicy::Config { approval, sandbox } => (approval, sandbox),
+    };
     let environment = |name: &str| {
         (!recipe.unset_environment.iter().any(|unset| unset == name))
             .then(|| {
@@ -8529,80 +8638,38 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         .and_then(|contents| contents.parse::<toml::Table>().ok())
         .unwrap_or_default();
 
-    // These recipes are not supported for new native threads. Do not guess
-    // which profile or config override a resumed provider thread uses.
-    if arguments.iter().any(|argument| {
-        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
-    }) {
+    if config.contains_key("profile")
+        || config.contains_key("default_permissions")
+        || config.contains_key("permissions")
+    {
         return None;
     }
-    if arguments.iter().enumerate().any(|(index, argument)| {
-        let override_value = argument.strip_prefix("--config=").or_else(|| {
-            matches!(argument.as_str(), "-c" | "--config")
-                .then(|| arguments.get(index + 1).map(String::as_str))
-                .flatten()
-        });
-        override_value.is_some_and(|value| {
-            value.split_once('=').is_some_and(|(key, _)| {
-                matches!(
-                    key.trim(),
-                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
-                )
-            })
-        })
-    }) {
-        return None;
-    }
-    let flag = |short: &str, long: &str| {
-        arguments
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, argument)| {
-                argument.strip_prefix(&format!("{long}=")).or_else(|| {
-                    (argument == short || argument == long)
-                        .then(|| arguments.get(index + 1).map(String::as_str))
-                        .flatten()
-                })
-            })
-    };
-    let explicit_approval = flag("-a", "--ask-for-approval");
-    let explicit_sandbox = flag("-s", "--sandbox");
-    if explicit_approval.is_none() || explicit_sandbox.is_none() {
-        if config.contains_key("profile")
-            || config.contains_key("default_permissions")
-            || config.contains_key("permissions")
-        {
-            return None;
+    let user_home = environment("HOME").map(PathBuf::from);
+    let user_config = root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
+    for directory in recipe.working_directory.ancestors() {
+        if user_home.as_deref() == Some(directory) {
+            break;
         }
-        let user_home = environment("HOME").map(PathBuf::from);
-        let user_config =
-            root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
-        for directory in recipe.working_directory.ancestors() {
-            if user_home.as_deref() == Some(directory) {
-                break;
-            }
-            let path = directory.join(".codex/config.toml");
-            // The account's own config can also be an ancestor of cwd. It
-            // remains a user layer rather than a second project layer.
-            if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
-                continue;
-            }
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                let project = contents.parse::<toml::Table>().ok()?;
-                if [
-                    "approval_policy",
-                    "sandbox_mode",
-                    "default_permissions",
-                    "permissions",
-                ]
-                .iter()
-                .any(|key| project.contains_key(*key))
-                {
-                    // Trust decides whether Codex loads this layer. Wait
-                    // for its authoritative thread policy rather than guess.
-                    return None;
-                }
+        let path = directory.join(".codex/config.toml");
+        // The account's own config can also be an ancestor of cwd. It
+        // remains a user layer rather than a second project layer.
+        if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let project = contents.parse::<toml::Table>().ok()?;
+            if [
+                "approval_policy",
+                "sandbox_mode",
+                "default_permissions",
+                "permissions",
+            ]
+            .iter()
+            .any(|key| project.contains_key(*key))
+            {
+                // Trust decides whether Codex loads this layer. Wait
+                // for its authoritative thread policy rather than guess.
+                return None;
             }
         }
     }
@@ -8610,12 +8677,7 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         explicit_approval.or_else(|| config.get("approval_policy").and_then(toml::Value::as_str));
     let sandbox =
         explicit_sandbox.or_else(|| config.get("sandbox_mode").and_then(toml::Value::as_str));
-    match (approval, sandbox) {
-        (Some("never"), Some("danger-full-access")) => Some("yolo".into()),
-        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite".into()),
-        (Some("on-request"), Some("read-only")) => Some("readOnly".into()),
-        _ => None,
-    }
+    codex_mode(approval, sandbox).map(str::to_owned)
 }
 
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
@@ -9167,14 +9229,11 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
-        let recipe = moved
-            .as_ref()
-            .map_or(&runtime.session.launch.recipe, |session| {
-                &session.launch.recipe
-            });
-        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
+            snapshot
+                .permission_mode
+                .clone_from(&runtime.snapshot.permission_mode);
         }
         runtime.draft_model_chosen = true;
         runtime.snapshot = Arc::new(snapshot);
@@ -9196,7 +9255,7 @@ impl Cagents {
         self.remember_chat_model(provider, model, reasoning);
         self.replace_chat_conversation(target.card, session);
         let skills = if moved.is_some() {
-            self.load_draft_skills(target)
+            self.load_draft_details(target)
         } else {
             Task::none()
         };
@@ -9307,12 +9366,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
-        self.load_draft_skills(target)
+        self.load_draft_details(target)
     }
 
     /// The managed account `session` was recorded on, when the account list
@@ -9777,6 +9833,55 @@ impl Cagents {
         )
     }
 
+    fn load_draft_details(&mut self, target: Target) -> Task<Message> {
+        Task::batch([
+            self.load_draft_permission(target),
+            self.load_draft_skills(target),
+        ])
+    }
+
+    fn load_draft_permission(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self
+            .chat_card_runtime_mut(target)
+            .filter(|runtime| runtime.is_draft())
+        else {
+            return Task::none();
+        };
+        let provider = runtime.session.launch.provider;
+        let recipe = &runtime.session.launch.recipe;
+        let preview = &mut runtime.draft_permission;
+        if preview.matches(provider, recipe) {
+            // A model choice can replace the draft snapshot without changing its recipe.
+            Arc::make_mut(&mut runtime.snapshot)
+                .permission_mode
+                .clone_from(&preview.mode);
+            return Task::none();
+        }
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        match recipe_permission_mode(recipe, provider) {
+            PermissionPreview::Known(mode) => {
+                snapshot.permission_mode.clone_from(&mode);
+                preview.select(provider, recipe, mode);
+                return Task::none();
+            }
+            PermissionPreview::ReadConfig => {
+                snapshot.permission_mode = None;
+                preview.select(provider, recipe, None);
+            }
+        }
+        static NEXT_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+        preview.pending = Some(read);
+        let recipe = recipe.clone();
+        cosmic::task::future(async move {
+            let mode =
+                tokio::task::spawn_blocking(move || draft_permission_mode(&recipe, provider))
+                    .await
+                    .unwrap_or_default();
+            action(Action::DraftPermissionResolved(target, read, mode))
+        })
+    }
+
     /// Read authored skills on the blocking pool. No daemon or provider is
     /// involved, and a late result cannot replace a different account's list
     /// or the authoritative catalog of a conversation that has started.
@@ -9890,9 +9995,6 @@ impl Cagents {
             }
             runtime.draft_model_chosen = true;
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on,
             // and the composer's note to the launch that refused it.
@@ -9900,14 +10002,13 @@ impl Cagents {
             runtime.composer_note = None;
             runtime.completion.restart(true);
         }
-        if !rehomed {
-            // The skills this window found still answer the draft's home
-            // and directory; another window's model or permission choice
-            // changes neither.
-            return Task::none();
-        }
         let target = runtime.target;
-        self.load_draft_skills(target)
+        if rehomed {
+            self.load_draft_details(target)
+        } else {
+            // The skills still match this provider's home and directory.
+            self.load_draft_permission(target)
+        }
     }
 
     /// Takes the draft out of `card` when another window has started the
@@ -10055,6 +10156,12 @@ impl Cagents {
                     },
                 )
             }
+            // End of a window that is not the conversation's newest is not
+            // the end: it is the newest history the reader wants.
+            Named::End if runtime.selected_subagent.is_none() && runtime.snapshot.has_later => {
+                let target = runtime.target;
+                return Some(self.handle_chat_action(Action::Latest(target)));
+            }
             Named::Home | Named::End => {
                 let edge = if *key == Named::Home {
                     scroll::Edge::Start
@@ -10065,15 +10172,24 @@ impl Cagents {
                 runtime
                     .scroll_memory
                     .request_edge(runtime.selected_subagent.as_deref(), edge);
-                return Some(
-                    scroll::snap_to_edge(
-                        runtime.target,
-                        edge,
-                        runtime.find_navigation.guard(),
-                        runtime.find_navigation.document_epoch(),
-                    )
-                    .map(cosmic::Action::App),
-                );
+                let snap = scroll::snap_to_edge(
+                    runtime.target,
+                    edge,
+                    runtime.find_navigation.guard(),
+                    runtime.find_navigation.document_epoch(),
+                )
+                .map(cosmic::Action::App);
+                // The conversation's start is outside the window: move the
+                // window there, and the reader to its first item.
+                if edge == scroll::Edge::Start
+                    && runtime.selected_subagent.is_none()
+                    && runtime.snapshot.history.earlier() > 0
+                {
+                    let target = runtime.target;
+                    let start = runtime.history_start();
+                    return Some(Task::batch([snap, self.follow_into_history(target, start)]));
+                }
+                return Some(snap);
             }
             _ => return None,
         };
@@ -10214,7 +10330,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let mut snapshot = self.chat_draft_snapshot(provider);
+        let snapshot = self.chat_draft_snapshot(provider);
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return Task::none();
         };
@@ -10224,9 +10340,6 @@ impl Cagents {
             to = provider.label(),
             "moved an untouched draft off a provider that isn't installed"
         );
-        snapshot.permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         runtime.snapshot = Arc::new(snapshot);
         runtime.session = session.clone();
         runtime.model_picker = None;
@@ -10238,7 +10351,7 @@ impl Cagents {
         runtime.completion.restart(true);
         let target = runtime.target;
         self.replace_chat_conversation(card, session);
-        Task::batch([self.load_draft_skills(target), self.save_snapshot_soon()])
+        Task::batch([self.load_draft_details(target), self.save_snapshot_soon()])
     }
 
     /// What the start page says when no provider can start a conversation:
@@ -11063,8 +11176,6 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.draft_model_chosen = model_chosen;
-        // The runtime already read its recipe's preview; this is that answer.
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -11083,7 +11194,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([self.load_draft_skills(target), moved])
+        Task::batch([self.load_draft_details(target), moved])
     }
 
     /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
@@ -13838,7 +13949,6 @@ impl Cagents {
             draft_choice::set(&mut draft, &chosen);
         }
         (snapshot.selected_model, snapshot.reasoning) = chosen;
-        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -13856,7 +13966,7 @@ impl Cagents {
         self.observe_agent_activity_for_card(target.card, None);
         Task::batch([
             self.retire_chat(target.card, handle, Some(draft)),
-            self.load_draft_skills(target),
+            self.load_draft_details(target),
         ])
     }
 
@@ -13895,6 +14005,17 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        // A window that holds the item sought has answered the seek, so a
+        // later one to the same item, after paging moved the window off it,
+        // is sent again.
+        let history = runtime.snapshot.history;
+        if runtime.sought.is_some_and(|index| {
+            index
+                .checked_sub(history.before)
+                .is_some_and(|offset| offset < runtime.window_items().count() as u64)
+        }) {
+            runtime.sought = None;
+        }
         if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
@@ -13902,8 +14023,16 @@ impl Cagents {
         {
             return Task::none();
         }
-        let Some(page) = runtime.deferred_page.take() else {
-            return Task::none();
+        let page = match runtime.deferred_page.take() {
+            Some(page) => page,
+            // A reader held at the start while its history is fetched is
+            // what asks for the next page. A refresh, a reconnect or a
+            // subagent read meanwhile can drop what was deferred; the reader
+            // still waiting there resumes it.
+            None if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Start) => {
+                HistoryNavigation::Seek
+            }
+            None => return Task::none(),
         };
         match page {
             HistoryNavigation::Latest
@@ -13927,7 +14056,12 @@ impl Cagents {
                     LatestReader::Preserve,
                 )
             }
-            HistoryNavigation::Latest => Task::none(),
+            // Home since: the reader waits at the start instead.
+            HistoryNavigation::Latest
+                if runtime.scroll_memory.edge(None) != Some(scroll::Edge::Start) =>
+            {
+                Task::none()
+            }
             HistoryNavigation::NewerEdge
                 if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
@@ -13941,8 +14075,107 @@ impl Cagents {
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
+            HistoryNavigation::Seek | HistoryNavigation::ContinueSeek
+                if runtime.snapshot.history_loading =>
+            {
+                runtime.deferred_page = Some(page);
+                Task::none()
+            }
+            HistoryNavigation::Seek
+            | HistoryNavigation::ContinueSeek
+            | HistoryNavigation::Latest => {
+                let sought = if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Start) {
+                    (runtime.snapshot.history.earlier() > 0).then(|| runtime.history_start())
+                } else {
+                    runtime.history_index(runtime.parent_scroll())
+                };
+                match sought {
+                    Some(sought) => self.follow_into_history(target, sought),
+                    None => Task::none(),
+                }
+            }
             _ => Task::none(),
         }
+    }
+
+    /// Brings the history the reader moved to, outside the loaded window,
+    /// into it.
+    fn follow_into_history(&mut self, target: Target, sought: view::Sought) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        match sought {
+            view::Sought::Cached { index, at } => self.seek_history(target, index, Some(at)),
+            // The provider hands history over a page at a time, back from
+            // the oldest it has handed over. The window goes there, and each
+            // page that arrives is followed by the next until it reaches the
+            // reader, who waits in the space standing for it.
+            view::Sought::Unfetched => {
+                if !runtime.snapshot.has_earlier {
+                    return Task::none();
+                }
+                runtime.scroll_memory.release(scroll::Edge::Latest);
+                runtime.scroll_memory.cancel_landing();
+                if !runtime.commands.is_idle()
+                    || runtime.queued.is_some()
+                    || runtime.disconnected
+                    || runtime.snapshot.history_loading
+                {
+                    runtime.deferred_page = Some(HistoryNavigation::Seek);
+                    return Task::none();
+                }
+                runtime.deferred_page = Some(HistoryNavigation::ContinueSeek);
+                if runtime.snapshot.history.before > 0 {
+                    return self.seek_history(target, 0, None);
+                }
+                self.chat_send(target, Command::LoadEarlier, false)
+            }
+            // The reader at the conversation's start stays there, as Home
+            // keeps them, while the window moves to its first item: the
+            // space standing for unloaded history above them is gone once
+            // it is all loaded, and nothing else would place them.
+            view::Sought::Start => {
+                runtime
+                    .scroll_memory
+                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::Start);
+                let start = runtime.history_start();
+                self.follow_into_history(target, start)
+            }
+            // The reader at the conversation's end is at its newest history,
+            // as End takes them there.
+            view::Sought::Latest => self.handle_chat_action(Action::Latest(target)),
+        }
+    }
+
+    /// Moves the transcript window to the conversation's item at `index`,
+    /// unless that is where it is already being moved.
+    fn seek_history(&mut self, target: Target, index: u64, landing: Option<f32>) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.scroll_memory.release(scroll::Edge::Latest);
+        if !runtime.commands.is_idle()
+            || runtime.queued.is_some()
+            || runtime.disconnected
+            || runtime.snapshot.history_loading
+        {
+            // A provider page can insert items ahead of an index. Recompute
+            // it from the reader's position after the page arrives.
+            runtime.scroll_memory.cancel_landing();
+            runtime.deferred_page = Some(HistoryNavigation::Seek);
+            return Task::none();
+        }
+        if let Some(at) = landing {
+            runtime.scroll_memory.land(index, at);
+            if runtime.deferred_page == Some(HistoryNavigation::ContinueSeek) {
+                runtime.deferred_page = None;
+            }
+        }
+        if runtime.sought == Some(index) {
+            return Task::none();
+        }
+        runtime.sought = Some(index);
+        self.chat_send(target, Command::Seek { index }, false)
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
@@ -14683,6 +14916,20 @@ impl Cagents {
             Action::OpeningName(card, conversation, title) => {
                 self.opening_name_read(card, conversation, title);
             }
+            Action::DraftPermissionResolved(target, read, mode) => {
+                if let Some(runtime) = self.chat_card_runtime_mut(target)
+                    && runtime.is_draft()
+                    && runtime.draft_permission.pending == Some(read)
+                    && runtime.draft_permission.matches(
+                        runtime.session.launch.provider,
+                        &runtime.session.launch.recipe,
+                    )
+                {
+                    runtime.draft_permission.pending = None;
+                    runtime.draft_permission.mode.clone_from(&mode);
+                    Arc::make_mut(&mut runtime.snapshot).permission_mode = mode;
+                }
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -15389,6 +15636,10 @@ impl Cagents {
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
                             runtime.deferred_page = None;
+                            // A seek the old handle took may never have
+                            // reached the daemon, so the same one is sent
+                            // again rather than awaited.
+                            runtime.sought = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             runtime.error = None;
@@ -17667,13 +17918,23 @@ impl Cagents {
                     }
                     (Err(error), None) => {
                         if pending.page == Some(view::Page::Latest) {
-                            runtime.scroll_memory.clear_latest();
+                            runtime.scroll_memory.release(scroll::Edge::Latest);
                             runtime.scroll_memory.cancel_preserve(pending.id);
                         }
-                        if pending.page.is_some() {
+                        if pending.page.is_some() || pending.seeks() {
                             runtime.page_request = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
+                            runtime.sought = None;
+                            // Stop the failed request's own continuation.
+                            // A newer gesture still gets to choose the next window.
+                            if runtime.deferred_page != Some(HistoryNavigation::Seek) {
+                                runtime.scroll_memory.release(scroll::Edge::Start);
+                                runtime.scroll_memory.cancel_landing();
+                                if runtime.deferred_page == Some(HistoryNavigation::ContinueSeek) {
+                                    runtime.deferred_page = None;
+                                }
+                            }
                         }
                         // A message the provider did not take goes back to
                         // the composer, and so does any written after it:
@@ -18010,12 +18271,24 @@ impl Cagents {
                         }
                         runtime.refresh_find();
                     }
-                    runtime.deferred_page = None;
+                    // Paging toward a reader waiting in the main transcript's
+                    // history waits while they read a subagent, and resumes
+                    // once they are back there; paging at an edge they
+                    // scrolled to does not.
+                    if !matches!(
+                        runtime.deferred_page,
+                        Some(HistoryNavigation::Seek | HistoryNavigation::ContinueSeek)
+                    ) {
+                        runtime.deferred_page = None;
+                    }
                     runtime.selection_document.get_mut().clear();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
                     runtime.refresh_find();
                     images::sync(runtime);
+                    if runtime.selected_subagent.is_none() {
+                        return self.resume_history_navigation(target);
+                    }
                 }
             }
             Action::CopyMessage(target, id, source) => {
@@ -18319,6 +18592,9 @@ impl Cagents {
                 };
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
+                    runtime.scroll_memory.cancel_landing();
+                    runtime.sought = None;
+                    runtime.deferred_page = None;
                     if !runtime.commands.is_idle() {
                         runtime
                             .scroll_memory
@@ -18785,12 +19061,17 @@ impl Cagents {
                         // A different launch recipe was never refused.
                         runtime.release_start_block();
                     }
+                    runtime.draft_permission.select(
+                        provider,
+                        &runtime.session.launch.recipe,
+                        Some(mode.clone()),
+                    );
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
                     // Skills found for the earlier launch are not accepted for
                     // this one, so a discovery under way would be dropped.
-                    return self.load_draft_skills(target);
+                    return self.load_draft_details(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
@@ -19133,6 +19414,29 @@ impl Cagents {
                 runtime.scroll = scroll;
                 if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
+                }
+                let sought = runtime.history_index(scroll);
+                if sought.is_none() {
+                    // Reports queue behind the moves that make them, so one
+                    // from a moment ago in unloaded history can have asked
+                    // to land after the reader came back. The rows they see
+                    // now place them when the window arrives.
+                    runtime.scroll_memory.cancel_landing();
+                    runtime.sought = None;
+                    if matches!(
+                        runtime.deferred_page,
+                        Some(HistoryNavigation::Seek | HistoryNavigation::ContinueSeek)
+                    ) {
+                        runtime.deferred_page = None;
+                    }
+                }
+                // A track click, a drag of the thumb or a fast fling can take
+                // the reader past what is loaded. A page from the window's
+                // edge would not reach them, so the window moves to them.
+                if let Some(sought) = sought {
+                    runtime.earlier_asked = None;
+                    runtime.later_asked = None;
+                    return self.follow_into_history(target, sought);
                 }
                 // Pages are fetched ahead of the reader, within a couple of
                 // screens of a loaded edge rather than at it.

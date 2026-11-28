@@ -2534,6 +2534,76 @@ fn edge_views_install_by_revision_and_fence_older_snapshots() {
 }
 
 #[test]
+fn bulk_view_removals_preserve_newer_incarnations_and_fence_missing_scopes() {
+    use crate::workspace_model::views::{Scope, View};
+
+    let (mut app, _, repository) = app_with_project();
+    let view = |name: &str, revision| View {
+        revision,
+        ..View::empty(Scope::Worktree {
+            repository: repository.clone(),
+            path: repository.join(name),
+        })
+    };
+    let first = view("first", 2);
+    let retired = view("retired", 4);
+    let recreated = view("recreated", 9);
+    let last = view("last", 6);
+    let missing = view("missing", 1);
+    app.workspace_model.views = vec![
+        first.clone(),
+        retired.clone(),
+        recreated.clone(),
+        last.clone(),
+    ];
+    app.shared_views
+        .view_sequences
+        .insert(recreated.scope.clone(), 30);
+
+    let removal = ViewChanges {
+        sequence: 20,
+        removed: vec![
+            (retired.scope.clone(), 4),
+            (recreated.scope.clone(), 8),
+            (missing.scope.clone(), 1),
+            (retired.scope.clone(), 3),
+        ],
+        ..Default::default()
+    };
+    assert!(app.install_edge_views(removal.clone(), true));
+    assert!(!app.install_edge_views(removal, true));
+    assert_eq!(app.workspace_model.views, [first, recreated.clone(), last]);
+    assert_eq!(app.shared_views.view_sequences[&recreated.scope], 30);
+    assert!(
+        !app.shared_views
+            .scope_absences
+            .contains_key(&recreated.scope)
+    );
+    for scope in [&retired.scope, &missing.scope] {
+        assert_eq!(app.shared_views.view_sequences[scope], 20);
+        assert_eq!(app.shared_views.scope_absences[scope], 20);
+    }
+
+    assert!(!app.install_edge_views(
+        ViewChanges {
+            sequence: 20,
+            views: vec![retired, missing],
+            ..Default::default()
+        },
+        true,
+    ));
+    assert!(app.install_edge_views(
+        ViewChanges {
+            sequence: 21,
+            views: vec![view("retired", 10)],
+            ..Default::default()
+        },
+        true,
+    ));
+    assert_eq!(app.workspace_model.views.last(), Some(&view("retired", 10)));
+}
+
+#[test]
 fn scoped_absence_removes_newer_window_data_and_preserves_later_recreation() {
     use crate::workspace_model::views::{Scope, View};
     let (mut app, _, repository) = app_with_project();
@@ -7484,6 +7554,29 @@ fn reconciles(app: &mut Cagents, update: ModelUpdate) -> bool {
     let before = complete_reconciliations();
     drop(app.apply_workspace_model_update(update));
     complete_reconciliations() != before
+}
+
+#[test]
+fn unchanged_edges_reconcile_only_when_the_worktree_topology_changes() {
+    let (mut app, baseline, repository) = window_with_registry();
+    let edge = |offset| {
+        changed_edge(
+            baseline.identity,
+            baseline.sequence + offset,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![],
+        )
+    };
+    let revision = app.shared_views.reconciled_topology;
+    app.sidebar_model.projects[0].name = "Renamed project".into();
+    assert!(!reconciles(&mut app, edge(1)));
+    assert_eq!(app.shared_views.reconciled_topology, revision);
+
+    // The roots themselves did not change, but their scope authority did.
+    app.sidebar_model.projects[0].repository = repository.with_extension("other");
+    assert!(reconciles(&mut app, edge(2)));
+    assert_ne!(app.shared_views.reconciled_topology, revision);
 }
 
 /// A copy of an edge this window already installed, such as the observer's

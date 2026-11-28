@@ -252,7 +252,7 @@ mod tests {
             None,
         );
         let history = scan.next_work();
-        scan.failed_history(&history);
+        scan.failed_history(&history, 0);
         assert_eq!(scan.requested[&1].current.id, "active");
         let work = scan.next_work();
         page(&mut scan, &work, Vec::new(), None);
@@ -298,7 +298,7 @@ mod tests {
             )
             .is_err()
         );
-        scan.failed_history(&repeated);
+        scan.failed_history(&repeated, 0);
         assert_eq!(scan.requested[&1].history, History::Unknown);
         let discovery = scan.next_work();
         page(
@@ -307,7 +307,7 @@ mod tests {
             vec![entry(1, Some(current.clone()))],
             None,
         );
-        let retry = scan.next_work();
+        let retry = scan.next_due_work(super::super::shared::backoff(1), true);
         assert_eq!(
             retry,
             Work::History {
@@ -343,7 +343,7 @@ mod tests {
             Some("repeated"),
         );
         let history = scan.next_work();
-        scan.failed_history(&history);
+        scan.failed_history(&history, 0);
         let next = scan.next_work();
         assert!(
             scan.page(
@@ -357,8 +357,6 @@ mod tests {
             .is_err()
         );
         assert!(scan.requested.contains_key(&1));
-        let history = scan.next_work();
-        scan.failed_history(&history);
         assert_eq!(scan.next_work(), Work::Page { cursor: None });
     }
 }
@@ -389,6 +387,10 @@ struct PendingHistory {
     before: Option<String>,
     matching: BTreeSet<String>,
     cursors: BTreeSet<String>,
+    #[serde(default)]
+    failures: u32,
+    #[serde(default)]
+    due: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -405,16 +407,24 @@ pub struct Scan {
 }
 
 impl Scan {
-    pub fn next_work(&mut self) -> Work {
-        if self.history_next {
+    #[cfg(test)]
+    fn next_work(&mut self) -> Work {
+        self.next_due_work(0, true)
+    }
+
+    pub(super) fn next_due_work(&mut self, now: u64, discover: bool) -> Work {
+        if (self.history_next || !discover)
+            && let Some(index) = self.histories.iter().position(|history| history.due <= now)
+        {
             self.history_next = false;
-            if let Some(history) = self.histories.front() {
-                return Work::History {
-                    number: history.number,
-                    request: history.request.clone(),
-                    before: history.before.clone(),
-                };
-            }
+            let history = self.histories.remove(index).expect("selected history");
+            let work = Work::History {
+                number: history.number,
+                request: history.request.clone(),
+                before: history.before.clone(),
+            };
+            self.histories.push_front(history);
+            return work;
         }
         self.history_next = true;
         Work::Page {
@@ -459,6 +469,8 @@ impl Scan {
                 before: None,
                 matching: BTreeSet::new(),
                 cursors: BTreeSet::new(),
+                failures: 0,
+                due: 0,
             });
         }
         self.requested.insert(
@@ -574,6 +586,8 @@ impl Scan {
                 return Err("GitHub repeated a review history cursor".into());
             }
             pending.before = Some(cursor);
+            pending.failures = 0;
+            pending.due = 0;
             // Round-robin historical requests as well as repository pages.
             self.histories.push_back(pending);
         }
@@ -584,21 +598,31 @@ impl Scan {
     /// found. Until then it has work worth doing as soon as the budget allows.
     /// A scan reset for a new viewer has read nothing, so it is not settled.
     pub fn settled(&self) -> bool {
-        self.censused && self.cursor.is_none() && self.histories.is_empty()
+        self.discovery_complete() && self.histories.is_empty()
+    }
+
+    pub(super) fn discovery_complete(&self) -> bool {
+        self.censused && self.cursor.is_none()
+    }
+
+    pub(super) fn history_due(&self) -> Option<u64> {
+        self.histories.iter().map(|history| history.due).min()
     }
 
     /// An unavailable timeline never revokes the authoritative current request.
     /// Retry it after other pending requests and discovery get a turn.
-    pub fn failed_history(&mut self, work: &Work) {
+    pub(super) fn failed_history(&mut self, work: &Work, completed: u64) {
         if let Work::History {
             number, request, ..
         } = work
-            && self
+            && let Some(index) = self
                 .histories
-                .front()
-                .is_some_and(|pending| pending.number == *number && pending.request == *request)
+                .iter()
+                .position(|pending| pending.number == *number && pending.request == *request)
         {
-            let history = self.histories.pop_front().unwrap();
+            let mut history = self.histories.remove(index).expect("failed history");
+            history.failures = history.failures.saturating_add(1);
+            history.due = completed.saturating_add(super::shared::backoff(history.failures));
             self.histories.push_back(history);
         }
     }

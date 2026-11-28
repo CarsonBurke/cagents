@@ -124,16 +124,26 @@ pub(crate) fn probe(network: bool) -> Status {
         Some(fixture) => fixture.network(),
         None => read_network(),
     });
-    let connections = fixture
-        .as_ref()
-        .and_then(|fixture| fixture.connections(network.as_ref()))
-        .unwrap_or_else(|| connections(mobile_bridge_environments(), network.as_ref()));
+    let connections = read_connections(fixture.as_ref(), network.as_ref());
     Status {
         phones,
         unwritable,
         connections,
         network,
     }
+}
+
+pub(super) fn connected_count() -> usize {
+    read_connections(fixture::read().as_ref(), None).len()
+}
+
+fn read_connections(
+    fixture: Option<&fixture::Fixture>,
+    network: Option<&Network>,
+) -> Vec<Connection> {
+    fixture
+        .and_then(|fixture| fixture.connections(network))
+        .unwrap_or_else(|| connections(mobile_bridge_environments(), network))
 }
 
 fn read_network() -> Network {

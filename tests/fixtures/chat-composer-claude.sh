@@ -695,7 +695,14 @@ handle_control() {
             for tool in $background_agents; do stop_agent "$tool"; done
             if [ "$busy" = true ]; then
                 busy=false
-                record_stop
+                if [ -e "$config/fixture-stop-without-record" ]; then
+                    open_tools=
+                    jq -cn --arg session "$session" --arg turn "$turn" \
+                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+                    session_idle
+                else
+                    record_stop
+                fi
             fi
             ;;
         send_now)

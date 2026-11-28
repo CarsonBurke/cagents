@@ -859,6 +859,7 @@ pub(super) fn restore_saved_history(
         store,
         session.clone(),
         environment,
+        None,
         move |update| changed(&weak, id, update),
     )
     .map_err(retryable_unavailable)?;
@@ -2036,10 +2037,6 @@ read -r initialization
 id=${initialization#*\"request_id\":\"}
 id=${id%%\"*}
 printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$id"
-# Connected, the adapter asks where Claude Code compacts; take the request
-# rather than leave it a closed pipe.
-IFS= read -r frame || :
-exit 0
 "#,
         )
         .unwrap();

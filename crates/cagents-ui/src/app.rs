@@ -3446,6 +3446,7 @@ fn background_poll(message: &Message) -> bool {
             // The phone's status is read only by its own control and popover.
             | Message::Phone(
                 phone_ui::Action::Tick
+                    | phone_ui::Action::ConnectionsObserved { .. }
                     | phone_ui::Action::Probed(_)
                     | phone_ui::Action::Progressed(_)
             )
@@ -16113,6 +16114,12 @@ impl Cagents {
         }
     }
 
+    fn report_status_notice(&mut self) {
+        if let Some(notice) = self.status.take() {
+            self.report_notice(notice);
+        }
+    }
+
     fn close_pane_group(&mut self) -> Task<Message> {
         let cards = std::mem::take(&mut self.chrome_ui.closing_group);
         let tasks: Vec<_> = cards
@@ -18519,6 +18526,8 @@ impl Application for Cagents {
         });
         #[cfg(any(test, feature = "development"))]
         let (_running, settled_projection) = self.settle_projection(&message);
+        // The oracle checks the combined result once, after every dispatched
+        // handler has contributed to the projection this update owes.
         #[cfg(any(test, feature = "development"))]
         let oracle_message =
             projection_oracle::enabled().then(|| crate::performance::ui_trace::label(&message));
@@ -18534,7 +18543,7 @@ impl Application for Cagents {
         // handler: its postlude answers only for its own messages.
         let enclosing_scope_changed = std::mem::take(&mut self.attention_scope_changed);
         self.dispatching += 1;
-        let task = self.dispatch(message);
+        let task = self.dispatch_message(message);
         self.dispatching -= 1;
         let task = self.resume_deferred_update_review(task);
         let task = self.finish_update(
@@ -18738,13 +18747,9 @@ impl Cagents {
         ControlFlow::Continue(message)
     }
 
-    /// Runs `message`'s handler once [`Self::admit`] lets it through, and
-    /// adds the projection the handler declares to `owed_projection` rather
-    /// than projecting. `update` dispatches its own message this way and then
-    /// projects what is owed, once. A handler that acts by way of another
-    /// message dispatches that message the same way, not through an `update`
-    /// of its own, so one input projects once however many messages it comes
-    /// to: a shortcut and the focus move it stands for share one projection.
+    /// Runs another handler within the current update. The update projects
+    /// what both handlers owe once. Each handler can raise a notice before
+    /// or after another handler writes to the same status slot.
     ///
     /// Outside a handler, where no update would project what it owes, as
     /// when a test drives a helper directly, it runs a whole update instead.
@@ -18752,6 +18757,15 @@ impl Cagents {
         if self.dispatching == 0 {
             return self.update(message);
         }
+        let _trace = crate::performance::ui_trace::dispatch(&message);
+        self.report_status_notice();
+        let task = self.dispatch_message(message);
+        self.report_status_notice();
+        task
+    }
+
+    /// Admits the message and adds the handler's projection to the update's.
+    fn dispatch_message(&mut self, message: Message) -> Task<Message> {
         // Noted before admission, as a message held back still arrived.
         self.attention_scope_changed |= changes_attention_scope(&message);
         let (message, settled) = match self.admit(message) {
@@ -21075,6 +21089,11 @@ impl Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DeviceLoad(load) => {
+                // Only the status bar reads load. A new sample does not
+                // invalidate any derived workspace state.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
                 self.device_ui.load = load;
                 Task::none()
             }
@@ -21278,11 +21297,7 @@ impl Cagents {
             projection_stage!("replica_snapshot", self.materialize_replica_snapshot());
         }
         self.sync_popup_keyboard_nav();
-        // The transport wording the health banner replaces may sit in either
-        // part of a notice: a reworded one keeps the raw reason as detail.
-        if let Some(notice) = self.status.take() {
-            self.report_notice(notice);
-        }
+        self.report_status_notice();
         self.resolve_card_notices();
         self.retire_pane_follow_notice();
         // A canonical save can arrive before the retry reply. Restore input
