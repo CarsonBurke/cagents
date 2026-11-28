@@ -4518,6 +4518,7 @@ impl Actor {
                 | Event::SubagentTextDelta { .. }
                 | Event::SubagentOutputDelta { .. }
                 | Event::SubagentItemsRemoved { .. }
+                | Event::SubagentMerged { .. }
                 | Event::Reset { .. }
         );
         if matches!(
@@ -4871,6 +4872,7 @@ fn apply_projected_event(
             | Event::SubagentTextDelta { .. }
             | Event::SubagentOutputDelta { .. }
             | Event::SubagentItemsRemoved { .. }
+            | Event::SubagentMerged { .. }
     );
     match event {
         Event::OutputDelta { id, offset, delta } => {
@@ -5126,6 +5128,14 @@ fn apply_projected_event(
                         agent.detail.clear();
                     }
                 }
+            }
+        }
+        Event::SubagentMerged { from, into } => {
+            if let Some(index) = state.subagents.iter().position(|agent| agent.id == from) {
+                let provisional = state.subagents.remove(index);
+                let agent = subagent(state, &into);
+                // An unresolved invocation has no child transcript yet.
+                agent.items = provisional.items;
             }
         }
         Event::SubagentItem { id, mut item } => {

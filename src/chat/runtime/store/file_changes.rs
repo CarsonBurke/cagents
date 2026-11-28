@@ -43,6 +43,10 @@ fn source(value: String) -> FileChangeSource {
         None => FileChangeSource::Conversation,
     }
 }
+fn unresolved_file_identity(source: &str, path: &str) -> String {
+    format!("u:{}", serde_json::to_string(&(source, path)).unwrap())
+}
+
 /// Only unified hunk lines represent additions/deletions. An empty/opaque patch
 /// has unknown counts; a recognizable zero-edit hunk has known zero counts.
 fn counts(patch: &str) -> Option<(u64, u64)> {
@@ -183,9 +187,7 @@ impl Store {
             let identity = resolved
                 .as_ref()
                 .map(|p| format!("p:{p}"))
-                .unwrap_or_else(|| {
-                    format!("u:{}", serde_json::to_string(&(source, path)).unwrap())
-                });
+                .unwrap_or_else(|| unresolved_file_identity(source, path));
             let old: i64 = self
                 .db
                 .query_row(
@@ -401,6 +403,46 @@ impl Store {
                     }
                 };
                 self.index_file_item(item, &key, ordinal, false, "", &[])?;
+            }
+            Event::SubagentMerged { from, into } => {
+                let old = format!("c:{from}");
+                let new = format!("c:{into}");
+                // The file index savepoint commits the owner, patch chunks,
+                // and published revision together.
+                let db = &self.db;
+                db.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+                // Unresolved paths are counted under their owner. Resolved
+                // paths share a pathname key across owners and keep that key.
+                {
+                    let mut paths = db.prepare(
+                        "SELECT path FROM file_totals WHERE source=?1 AND resolved IS NULL AND succeeded>0",
+                    )?;
+                    for path in paths.query_map([&old], |row| row.get::<_, String>(0))? {
+                        let path = path?;
+                        db.execute(
+                            "UPDATE file_paths SET identity=?1 WHERE identity=?2",
+                            params![
+                                unresolved_file_identity(&new, &path),
+                                unresolved_file_identity(&old, &path),
+                            ],
+                        )?;
+                    }
+                }
+                let moved = db.execute(
+                    "UPDATE file_edits SET source=?1 WHERE source=?2",
+                    params![new, old],
+                )?;
+                db.execute(
+                    "UPDATE file_patch_chunks SET source=?1 WHERE source=?2",
+                    params![new, old],
+                )?;
+                db.execute(
+                    "UPDATE file_totals SET source=?1, revision=?3 WHERE source=?2",
+                    params![new, old, self.file_revision.saturating_add(1)],
+                )?;
+                if moved > 0 {
+                    self.file_revision = self.file_revision.saturating_add(1);
+                }
             }
             Event::SubagentItemsRemoved { id, ids } => {
                 for item in ids {
@@ -1108,6 +1150,63 @@ mod tests {
             .unwrap();
         assert_eq!(summary(&mut store).total_files, 0);
     }
+    #[test]
+    fn identifying_a_subagent_moves_its_file_patches_to_its_role() {
+        let mut store = Store::new().unwrap();
+        store
+            .apply(Event::SubagentItem {
+                id: "child".into(),
+                item: item(
+                    "edit",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Updated,
+                ),
+            })
+            .unwrap();
+        let previous_revision = summary(&mut store).revision;
+        store
+            .apply(Event::SubagentMerged {
+                from: "child".into(),
+                into: "tool:invocation".into(),
+            })
+            .unwrap();
+        let result = summary(&mut store);
+        assert!(result.revision > previous_revision);
+        assert_eq!(result.total_files, 1);
+        assert_eq!(result.applied_files, 1);
+        let file = &result.files[0];
+        assert_eq!(
+            file.key.source,
+            FileChangeSource::Subagent {
+                id: "tool:invocation".into()
+            }
+        );
+        assert_eq!(
+            page(&mut store, file.key.clone(), None, 0).patches[0].diff,
+            DIFF
+        );
+        // A late revision replaces the same contribution under its new
+        // owner and must find the successful file's count there.
+        store
+            .apply(Event::SubagentItem {
+                id: "tool:invocation".into(),
+                item: item(
+                    "edit",
+                    "a.rs",
+                    DIFF,
+                    ToolStatus::Succeeded,
+                    ChangeKind::Updated,
+                ),
+            })
+            .unwrap();
+        let result = summary(&mut store);
+        assert_eq!(result.applied_files, 1);
+        assert_eq!(result.total_files, 1);
+        assert_eq!(result.files[0].succeeded, 1);
+    }
+
     /// Where a patch's line numbers count from is kept with it, for the
     /// conversation and for a subagent whose patch is stored apart.
     #[test]

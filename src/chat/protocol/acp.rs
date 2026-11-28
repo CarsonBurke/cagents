@@ -981,7 +981,6 @@ impl Acp {
         for (id, content) in self.calls.stop_running() {
             step.events.push(Event::Item(tool_item(id, content)));
         }
-        step.events.extend(self.subagents.settle(kind));
         // An agent that ended its turn can no longer act on an answer.
         if !self.permissions.is_empty() {
             let unanswered = std::mem::take(&mut self.permissions);
@@ -995,6 +994,7 @@ impl Acp {
             self.released(unanswered.into_values(), &mut step.events);
             step.events.push(Event::Waiting(false));
         }
+        step.events.extend(self.subagents.settle(kind));
         if let Some(message) = notice {
             step.events.push(Event::Error {
                 message,

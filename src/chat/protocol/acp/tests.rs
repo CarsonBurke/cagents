@@ -3305,6 +3305,87 @@ fn subagents_started_together_are_told_apart_only_on_evidence() {
 }
 
 #[test]
+fn subagents_reconcile_the_last_pair_after_an_ambiguous_child_asks_first() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start two subagents together.");
+    let mut snapshot = crate::chat::Snapshot::default();
+    let mut receive = |acp: &mut Acp, frame| {
+        let step = acp.receive(frame).unwrap();
+        crate::chat::runtime::project_events_for_test(&mut snapshot, step.events);
+    };
+    for (id, role, task) in [
+        ("review", "Reviewer", "Review the implementation."),
+        ("test", "Tester", "Run `make test` and report."),
+    ] {
+        receive(
+            &mut acp,
+            update(&session, invoke(id, role, task, "completed")),
+        );
+    }
+    let command = child_command(CHILD, "review-step", "git diff --stat", "pending");
+    receive(&mut acp, asks(&session, "1", command.clone()));
+    receive(
+        &mut acp,
+        update(
+            &session,
+            child_command(OTHER_CHILD, "test-step", "make test", "completed"),
+        ),
+    );
+    receive(&mut acp, reply(&turn, json!({"stopReason": "end_turn"})));
+
+    let [review, test] = snapshot.subagents.as_slice() else {
+        panic!("expected two subagents, got {:?}", snapshot.subagents);
+    };
+    assert_eq!((&*review.id, &*review.kind), ("tool:review", "Reviewer"));
+    assert_eq!(review.status, ToolStatus::Succeeded);
+    assert!(!review.waiting);
+    assert_eq!(review.items[0].id, format!("tool:{CHILD}:review-step"));
+    assert_eq!((&*test.id, &*test.kind), ("tool:test", "Tester"));
+    assert_eq!(test.items[0].id, format!("tool:{OTHER_CHILD}:test-step"));
+
+    let mut later = command;
+    later["status"] = json!("completed");
+    let step = acp.receive(update(&session, later)).unwrap();
+    assert_eq!(child_steps(&step)[0].0, "tool:review");
+    assert!(listed(&step).is_empty());
+}
+
+#[test]
+fn subagents_do_not_merge_a_child_with_a_call_started_after_its_first_step() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start subagents in stages.");
+    acp.receive(update(
+        &session,
+        child_command(CHILD, "early-step", "git diff --stat", "completed"),
+    ))
+    .unwrap();
+    acp.receive(update(
+        &session,
+        invoke("late", "Tester", "Run the tests.", "completed"),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(OTHER_CHILD, "late-step", "make all", "completed"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, "tool:late");
+
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::SubagentMerged { .. }))
+    );
+}
+
+#[test]
 fn a_step_of_a_subagent_no_call_started_never_joins_the_parents() {
     let mut acp = adapter(&[], None);
     let session = ready(&mut acp);

@@ -42,7 +42,10 @@ pub(super) fn prepare(state: &mut Snapshot, event: &Event) -> Update {
         _ => {
             return Update {
                 child: None,
-                reconcile: matches!(event, Event::Subagent { .. } | Event::Reset { .. }),
+                reconcile: matches!(
+                    event,
+                    Event::Subagent { .. } | Event::SubagentMerged { .. } | Event::Reset { .. }
+                ),
             };
         }
     };
