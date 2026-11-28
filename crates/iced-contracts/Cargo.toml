@@ -18,3 +18,10 @@ iced_graphics = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74
 # The runtime queues events for subscriptions through these.
 iced_futures = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
 futures = { version = "0.3", default-features = false, features = ["std", "executor"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+calloop = "0.14.3"
+calloop-wayland-source = "0.4.1"
+rustix = { version = "1", features = ["event", "net"] }
+wayland-client = "0.31.10"
+winit-wayland = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14", default-features = false, features = ["dlopen"] }

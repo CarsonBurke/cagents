@@ -1383,11 +1383,16 @@ dependencies = [
 name = "cagents-iced-contracts"
 version = "0.1.0"
 dependencies = [
+ "calloop",
+ "calloop-wayland-source",
  "futures",
  "iced_accessibility",
  "iced_core",
  "iced_futures",
  "iced_graphics",
+ "rustix 1.1.4",
+ "wayland-client",
+ "winit-wayland",
 ]
 
 [[package]]
@@ -4933,6 +4938,7 @@ dependencies = [
  "window_clipboard",
  "winit",
  "winit-core",
+ "winit-wayland",
  "x11rb",
  "xkbcommon 0.7.0",
  "xkbcommon-dl",

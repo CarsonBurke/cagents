@@ -29,6 +29,7 @@ use winit_core::event_loop::{
 use winit_core::monitor::MonitorHandle as CoreMonitorHandle;
 use winit_core::window::Theme;
 
+use crate::flush::{WaylandFlush, flush_pending};
 use crate::types::cursor::WaylandCustomCursor;
 
 mod proxy;
@@ -74,6 +75,7 @@ pub struct EventLoop {
     // XXX drop after everything else, just to be safe.
     /// Calloop's event loop.
     event_loop: calloop::EventLoop<'static, WinitState>,
+    wayland_flush: WaylandFlush,
 
     pump_event_notifier: Option<PumpEventNotifier>,
 }
@@ -162,6 +164,7 @@ impl EventLoop {
             handle,
             wayland_dispatcher,
             event_loop,
+            wayland_flush: WaylandFlush::default(),
             active_event_loop,
             pump_event_notifier: None,
         };
@@ -261,17 +264,6 @@ impl EventLoop {
                 };
                 min_timeout(control_flow_timeout, timeout)
             };
-
-            // NOTE Ideally we should flush as the last thing we do before polling
-            // to wait for events, and this should be done by the calloop
-            // WaylandSource but we currently need to flush writes manually.
-            //
-            // Checking for flush error is essential to perform an exit with error, since
-            // once we have a protocol error, we could get stuck retrying...
-            if self.handle.connection.flush().is_err() {
-                self.set_exit_code(1);
-                return;
-            }
 
             if let Err(error) = self.loop_dispatch(timeout) {
                 // NOTE We exit on errors from dispatches, since if we've got protocol error
@@ -555,13 +547,17 @@ impl EventLoop {
         callback(state)
     }
 
-    fn loop_dispatch<D: Into<Option<std::time::Duration>>>(&mut self, timeout: D) -> IOResult<()> {
-        let state = &mut self.active_event_loop.state.get_mut();
-
-        self.event_loop.dispatch(timeout, state).map_err(|error| {
-            tracing::error!("Error dispatching event loop: {}", error);
-            error.into()
-        })
+    fn loop_dispatch(&mut self, timeout: Option<Duration>) -> IOResult<()> {
+        let state = self.active_event_loop.state.get_mut();
+        let event_loop = &mut self.event_loop;
+        self.wayland_flush
+            .dispatch(&self.handle.connection, &event_loop.handle(), || {
+                event_loop.dispatch(timeout, state)
+            })
+            .map_err(|error| {
+                tracing::error!("Error dispatching event loop: {}", error);
+                error.into()
+            })
     }
 
     fn roundtrip(&mut self) -> Result<usize, OsError> {
@@ -806,16 +802,25 @@ impl PumpEventNotifier {
                     drop(wait);
 
                     while let Some(read_guard) = connection.prepare_read() {
-                        let _ = connection.flush();
-                        let poll_fd = PollFd::from_borrowed_fd(connection.as_fd(), PollFlags::IN);
+                        let interest = match flush_pending(&connection) {
+                            Ok(true) => PollFlags::IN | PollFlags::OUT,
+                            Ok(false) => PollFlags::IN,
+                            Err(_) => break,
+                        };
+                        let poll_fd = PollFd::from_borrowed_fd(connection.as_fd(), interest);
                         let pipe_poll_fd = PollFd::from_borrowed_fd(read.as_fd(), PollFlags::IN);
-                        // Read from the `fd` before going back to poll.
-                        if Ok(1) == rustix::io::read(read.as_fd(), &mut [0u8; 1]) {
+                        let mut fds = [poll_fd, pipe_poll_fd];
+                        match rustix::event::poll(&mut fds, None) {
+                            Ok(_) => (),
+                            Err(rustix::io::Errno::INTR) => continue,
+                            Err(_) => break,
+                        }
+                        if fds[1].revents().contains(PollFlags::IN) {
                             break 'outer;
                         }
-                        let _ = rustix::event::poll(&mut [poll_fd, pipe_poll_fd], None);
-                        // Non-blocking read the connection.
-                        let _ = read_guard.read_without_dispatch();
+                        if fds[0].revents().intersects(PollFlags::IN | PollFlags::ERR | PollFlags::HUP) {
+                            let _ = read_guard.read_without_dispatch();
+                        }
                     }
 
                     awakener.ping();

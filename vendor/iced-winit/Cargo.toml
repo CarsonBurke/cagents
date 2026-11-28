@@ -14,6 +14,7 @@ keywords = ["gui", "ui", "graphics", "interface", "widgets"]
 [features]
 wayland = [
     "winit/wayland",
+    "dep:winit-wayland",
     "wayland-csd-adwaita",
     "wayland-protocols",
     "raw-window-handle",
@@ -62,6 +63,7 @@ iced_program = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c
 [target.'cfg(all(unix, not(any(target_os = "redox", target_family = "wasm", target_os = "android", target_vendor = "apple"))))'.dependencies]
 
 clipboard_x11 = { git = "https://github.com/pop-os/window_clipboard.git", tag = "sctk-0.20", optional = true }
+winit-wayland = { git = "https://github.com/pop-os/winit.git", tag = "cosmic-0.14", default-features = false, optional = true }
 x11rb = { version = "0.13", optional = true }
 
 mundy = { version = "0.2", default-features = false, optional = true }
@@ -89,3 +91,6 @@ wasm-bindgen-futures = { version = "0.4" }
 build_helpers = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d" }
 
 [workspace]
+
+[patch."https://github.com/pop-os/winit.git"]
+winit-wayland = { path = "../winit-wayland" }
