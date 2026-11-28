@@ -375,6 +375,15 @@ impl Builder {
         self.before.is_none()
     }
 
+    /// Whether this batch of provider IDs might satisfy the pending cursor.
+    /// The caller still accounts for these IDs when skipping a batch.
+    #[cfg(feature = "host")]
+    pub fn cursor_in<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> bool {
+        self.before
+            .as_deref()
+            .is_some_and(|before| ids.into_iter().any(|id| names(before, id)))
+    }
+
     pub fn is_full(&self) -> bool {
         self.full_page
     }

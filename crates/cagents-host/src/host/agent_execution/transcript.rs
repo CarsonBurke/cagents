@@ -12,13 +12,16 @@ use crate::{
     agent_execution::{
         Authority,
         directory::{Member, Relation, Scope},
-        transcript::{Builder, MAX_LIMIT, Page, Query},
+        transcript::{Builder, Entry, MAX_LIMIT, Page, Query},
     },
-    chat::{self, Item, ItemContent, Launch, protocol::codex::rollout::Rollout},
+    chat::{
+        self, Item, ItemContent, Launch,
+        protocol::codex::rollout::{Batch, Rollout},
+    },
     model::TerminalId,
 };
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::{HashMap, HashSet, VecDeque},
     fs::Metadata,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -72,29 +75,53 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
         .unwrap_or_else(|p| p.into_inner())
         .rollouts
         .clone();
-    let (modified, mut history) = source.open(&rollouts)?;
+    let (modified, (entries, earlier)) = source.page(&rollouts, &query, |item| {
+        recognizer.as_ref().and_then(|seal| seal.recognized(item))
+    })?;
     session.active_at = modified;
-    let mut builder = Builder::new(&query);
-    let mut seen = std::collections::HashSet::new();
+    Ok(Page {
+        session,
+        entries,
+        earlier,
+    })
+}
+
+type Entries = (Vec<Entry>, Option<String>);
+
+fn page(
+    history: &mut dyn History,
+    query: &Query,
+    recognize: impl Fn(&Item) -> Option<Item>,
+) -> Result<Entries, String> {
+    let mut builder = Builder::new(query);
+    let mut seen = HashSet::new();
     let mut pages = 0;
     let mut exhausted = false;
     'pages: loop {
-        let (items, earlier) = if pages == 0 {
-            history.newest()?
+        let skipped = (!builder.found_cursor())
+            .then(|| history.skip_before(&builder, &mut seen))
+            .flatten();
+        let earlier = if let Some(earlier) = skipped {
+            earlier
         } else {
-            history.earlier()?
+            let (items, earlier) = if pages == 0 {
+                history.newest()?
+            } else {
+                history.earlier()?
+            };
+            for item in items.iter().rev() {
+                // The newest occurrence of each provider ID wins.
+                if !seen.insert(item.id.clone()) {
+                    continue;
+                }
+                let recognized = recognize(item);
+                if !builder.push(recognized.as_ref().unwrap_or(item)) {
+                    break 'pages;
+                }
+            }
+            earlier
         };
         pages += 1;
-        for item in items.iter().rev() {
-            // Neighboring provider pages can repeat an item at their seam.
-            if !seen.insert(item.id.clone()) {
-                continue;
-            }
-            let recognized = recognizer.as_ref().and_then(|seal| seal.recognized(item));
-            if !builder.push(recognized.as_ref().unwrap_or(item)) {
-                break 'pages;
-            }
-        }
         if !earlier {
             exhausted = true;
             break;
@@ -106,12 +133,7 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
     if !exhausted && !builder.found_cursor() {
         return Err("The cursor is too far back to reach in one read".into());
     }
-    let (entries, earlier) = builder.finish(exhausted)?;
-    Ok(Page {
-        session,
-        entries,
-        earlier,
-    })
+    builder.finish(exhausted)
 }
 
 /// The one session `handle` names, as `cagents send` resolves a recipient:
@@ -316,20 +338,39 @@ impl Source {
         modified(&std::fs::metadata(self.path().ok()?).ok()?)
     }
 
-    fn open(&self, rollouts: &Rollouts) -> Result<(Option<u64>, Box<dyn History>), String> {
-        match self.launch.provider {
-            Provider::Claude => Ok((self.modified(), Box::new(Claude::open(&self.launch)?))),
-            Provider::Codex => {
-                let rollout = Rollout::open(&self.path()?)?;
-                let at = modified(rollout.metadata());
-                Ok((at, Box::new(Whole(rollouts.read(rollout)))))
-            }
-            Provider::Omp => Err("Reading an Omp conversation is not supported yet".into()),
-            Provider::Antigravity | Provider::Muse => Err(format!(
-                "Reading {} conversations is not supported yet",
-                self.launch.provider.label()
-            )),
+    fn page(
+        &self,
+        rollouts: &Rollouts,
+        query: &Query,
+        recognize: impl Fn(&Item) -> Option<Item>,
+    ) -> Result<(Option<u64>, Entries), String> {
+        if self.launch.provider == Provider::Claude {
+            let at = self.modified();
+            return Ok((
+                at,
+                page(&mut Claude::open(&self.launch)?, query, recognize)?,
+            ));
         }
+        let rollout = Rollout::open(&self.path()?)?;
+        let at = modified(rollout.metadata());
+        match rollouts.open(rollout) {
+            Ok(mut history) => {
+                let result = page(&mut *history, query, &recognize);
+                if history.still_current() {
+                    return Ok((at, result?));
+                }
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::UnexpectedEof => {
+                return Err(error.to_string());
+            }
+            Err(_) => {}
+        }
+        // A writer changed the descriptor between indexing and replay. Use a
+        // single forward read of a freshly opened revision.
+        let rollout = Rollout::open(&self.path()?)?;
+        let at = modified(rollout.metadata());
+        let entries = page(&mut Whole(Arc::new(rollout.read().0)), query, recognize)?;
+        Ok((at, entries))
     }
 }
 
@@ -349,23 +390,76 @@ pub(in crate::host) struct Rollouts(Mutex<VecDeque<Arc<CachedRollout>>>);
 
 struct CachedRollout {
     revision: FileRevision,
-    /// Coalesce simultaneous requests for the same version without blocking
-    /// reads of other conversations on this file.
-    items: Mutex<Option<Arc<Vec<Item>>>>,
+    /// Same-revision readers share the index and recent small batches.
+    snapshot: Mutex<Option<Snapshot>>,
+}
+
+const BATCH_BYTES: u64 = 256 * 1024;
+
+type Items = Arc<Vec<Item>>;
+type BatchCache = Mutex<Option<Items>>;
+
+enum Snapshot {
+    Whole(Items),
+    Indexed(Arc<Index>),
+}
+
+impl Snapshot {
+    fn history(&self, rollout: Rollout, revision: FileRevision) -> Box<dyn History> {
+        match self {
+            Self::Whole(items) => Box::new(Whole(items.clone())),
+            Self::Indexed(index) => Box::new(Codex {
+                remaining: index.batches.len(),
+                index: index.clone(),
+                rollout,
+                revision,
+            }),
+        }
+    }
+}
+
+struct Index {
+    batches: Vec<Batch>,
+    /// Recent payloads have a separate bound from the size of the file.
+    recent: [BatchCache; 2],
+    /// Earlier batches already visited for a cursor need only their IDs
+    /// when a later request searches through them again.
+    visited: Mutex<Visited>,
+}
+
+#[derive(Default)]
+struct Visited {
+    bytes: usize,
+    ids: HashMap<usize, Box<[String]>>,
+}
+
+impl Visited {
+    fn remember(&mut self, batch: usize, items: &[Item]) {
+        const MAX_BYTES: usize = 1024 * 1024;
+        if self.ids.contains_key(&batch) {
+            return;
+        }
+        let bytes = items
+            .iter()
+            .fold(std::mem::size_of::<usize>(), |bytes, item| {
+                bytes + std::mem::size_of::<String>() + item.id.len()
+            });
+        if bytes <= MAX_BYTES - self.bytes {
+            self.ids
+                .insert(batch, items.iter().map(|item| item.id.clone()).collect());
+            self.bytes += bytes;
+        }
+    }
 }
 
 impl Rollouts {
-    fn read(&self, rollout: Rollout) -> Arc<Vec<Item>> {
+    fn open(&self, rollout: Rollout) -> std::io::Result<Box<dyn History>> {
         const MAX_ENTRIES: usize = 4;
-        const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
-        // Short records, such as compactions, still allocate a complete Item
-        // and its strings. Bound that expansion separately from source bytes.
-        const MAX_ROWS_PER_ENTRY: usize = 16_384;
 
-        let Some(revision) = FileRevision::of(rollout.metadata()).filter(|revision| {
-            revision.len <= MAX_SOURCE_BYTES && rollout.supports_revision_cache()
-        }) else {
-            return Arc::new(rollout.read().0);
+        let Some(revision) =
+            FileRevision::of(rollout.metadata()).filter(|_| rollout.supports_revision_cache())
+        else {
+            return Ok(Box::new(Whole(Arc::new(rollout.read().0))));
         };
         let entry = {
             let mut entries = self.0.lock().unwrap_or_else(|p| p.into_inner());
@@ -376,47 +470,176 @@ impl Rollouts {
                     entries.retain(|entry| !entry.revision.same_file(revision));
                     Arc::new(CachedRollout {
                         revision,
-                        items: Mutex::new(None),
+                        snapshot: Mutex::new(None),
                     })
                 });
             entries.push_front(entry.clone());
-            while entries.len() > MAX_ENTRIES
-                || entries.iter().map(|entry| entry.revision.len).sum::<u64>() > MAX_SOURCE_BYTES
-            {
-                entries.pop_back();
-            }
+            entries.truncate(MAX_ENTRIES);
             entry
         };
-        let mut cached = entry.items.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(items) = cached.as_ref() {
-            return items.clone();
+        let mut cached = entry.snapshot.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(snapshot) = cached.as_ref() {
+            return Ok(snapshot.history(rollout, revision));
         }
-        let (items, closing) = rollout.read();
-        let rows = items.iter().fold(items.capacity(), |total, item| {
-            total
-                + match &item.content {
-                    ItemContent::Changes { changes, .. } => changes.capacity(),
-                    ItemContent::WebSearch { results, .. } => results.capacity(),
-                    _ => 0,
-                }
-        });
-        let items = Arc::new(items);
-        if rows <= MAX_ROWS_PER_ENTRY
-            && closing.as_ref().and_then(FileRevision::of) == Some(revision)
-        {
-            *cached = Some(items.clone());
+        if revision.len <= BATCH_BYTES {
+            let (items, closing) = rollout.read();
+            let items = Arc::new(items);
+            if closing.as_ref().and_then(FileRevision::of) == Some(revision) && cacheable(&items) {
+                *cached = Some(Snapshot::Whole(items.clone()));
+            }
+            return Ok(Box::new(Whole(items)));
         }
-        items
+        let snapshot = Snapshot::Indexed(Arc::new(Index {
+            batches: rollout.batches(BATCH_BYTES)?,
+            recent: Default::default(),
+            visited: Default::default(),
+        }));
+        let history = snapshot.history(rollout, revision);
+        if !history.still_current() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "The Codex rollout changed during a read",
+            ));
+        }
+        *cached = Some(snapshot);
+        Ok(history)
     }
 }
 
-type HistoryPage = (Arc<Vec<Item>>, bool);
+struct Codex {
+    rollout: Rollout,
+    revision: FileRevision,
+    index: Arc<Index>,
+    remaining: usize,
+}
+
+impl Codex {
+    fn remember(&self, index: usize, items: &[Item]) {
+        self.index
+            .visited
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remember(index, items);
+    }
+}
+
+impl History for Codex {
+    fn newest(&mut self) -> Result<HistoryPage, String> {
+        self.earlier()
+    }
+
+    fn earlier(&mut self) -> Result<HistoryPage, String> {
+        let Some(index) = self.remaining.checked_sub(1) else {
+            return Ok(HistoryPage::default());
+        };
+        let batch = self.index.batches[index];
+        let replay = || {
+            self.rollout
+                .replay(batch)
+                .map(Arc::new)
+                .map_err(|err| err.to_string())
+        };
+        let distance = self.index.batches.len() - self.remaining;
+        let items = if let Some(slot) = self.index.recent.get(distance) {
+            let mut slot = slot.lock().unwrap_or_else(|p| p.into_inner());
+            if let Some(items) = slot.as_ref() {
+                items.clone()
+            } else {
+                let items = replay()?;
+                if self.still_current() {
+                    if cacheable(&items) {
+                        *slot = Some(items.clone());
+                    } else {
+                        self.remember(index, &items);
+                    }
+                }
+                items
+            }
+        } else {
+            let items = replay()?;
+            if self.still_current() {
+                self.remember(index, &items);
+            }
+            items
+        };
+        self.remaining = index;
+        Ok((items, index != 0))
+    }
+
+    fn skip_before(&mut self, builder: &Builder, seen: &mut HashSet<String>) -> Option<bool> {
+        let index = self.remaining.checked_sub(1)?;
+        let visited = self.index.visited.lock().unwrap_or_else(|p| p.into_inner());
+        let ids = visited.ids.get(&index)?;
+        if builder.cursor_in(ids.iter().map(String::as_str)) {
+            return None;
+        }
+        // Preserve deduplication against items in the skipped newer batch.
+        seen.extend(ids.iter().cloned());
+        self.remaining = index;
+        Some(index != 0)
+    }
+
+    fn still_current(&self) -> bool {
+        self.rollout
+            .current_metadata()
+            .ok()
+            .as_ref()
+            .and_then(FileRevision::of)
+            == Some(self.revision)
+    }
+}
+
+/// A large source turn can project to a small batch after clipping tool
+/// output. Charge retained payloads, including vector storage for short rows.
+fn cacheable(items: &Vec<Item>) -> bool {
+    const MAX_BYTES: usize = 1024 * 1024;
+    let bytes = items.iter().fold(
+        items.capacity() * std::mem::size_of::<Item>(),
+        |total, item| {
+            total
+                + item.id.capacity()
+                + item.content.byte_len()
+                + match &item.content {
+                    ItemContent::Changes { changes, .. } => {
+                        changes.capacity() * std::mem::size_of::<chat::FileChange>()
+                    }
+                    ItemContent::WebSearch { results, .. } => {
+                        results.capacity() * std::mem::size_of::<chat::SearchResult>()
+                    }
+                    _ => 0,
+                }
+        },
+    );
+    bytes <= MAX_BYTES
+}
+
+type HistoryPage = (Items, bool);
 
 /// Saved history read newest page first. Each page is oldest first and says
 /// whether earlier pages remain.
 trait History {
     fn newest(&mut self) -> Result<HistoryPage, String>;
     fn earlier(&mut self) -> Result<HistoryPage, String>;
+
+    fn skip_before(&mut self, _builder: &Builder, _seen: &mut HashSet<String>) -> Option<bool> {
+        None
+    }
+
+    fn still_current(&self) -> bool {
+        true
+    }
+}
+
+struct Whole(Items);
+
+impl History for Whole {
+    fn newest(&mut self) -> Result<HistoryPage, String> {
+        Ok((self.0.clone(), false))
+    }
+
+    fn earlier(&mut self) -> Result<HistoryPage, String> {
+        Ok(HistoryPage::default())
+    }
 }
 
 /// Claude's read-only history reader: the same one a window uses to show a
@@ -461,19 +684,6 @@ impl History for Claude {
     }
 }
 
-/// A history read whole, as Codex rollouts are.
-struct Whole(Arc<Vec<Item>>);
-
-impl History for Whole {
-    fn newest(&mut self) -> Result<HistoryPage, String> {
-        Ok((self.0.clone(), false))
-    }
-
-    fn earlier(&mut self) -> Result<HistoryPage, String> {
-        Ok(HistoryPage::default())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -482,6 +692,210 @@ mod tests {
         directory::{Entry, Surface},
         transcript::Content,
     };
+
+    fn codex_source(root: &std::path::Path) -> (Source, PathBuf) {
+        let id = "01a1b0ba-e200-7000-8000-000000000002";
+        let day = root.join("sessions/2026/11/06");
+        std::fs::create_dir_all(&day).unwrap();
+        let path = day.join(format!("rollout-2026-11-06T12-00-00-{id}.jsonl"));
+        let launch = Launch {
+            provider: Provider::Codex,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: root.into(),
+                environment: [
+                    ("HOME".into(), root.display().to_string()),
+                    ("CODEX_HOME".into(), root.display().to_string()),
+                ]
+                .into(),
+                unset_environment: Default::default(),
+            },
+            draft_model: None,
+        };
+        (Source { launch }, path)
+    }
+
+    fn saved_message(id: &str, text: &str) -> String {
+        format!(
+            "{}\n",
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"message","id":id,"role":"assistant",
+                "content":[{"type":"output_text","text":text}]
+            }})
+        )
+    }
+
+    const TURN: &str = "{\"type\":\"event_msg\",\"payload\":{\"type\":\"task_started\"}}\n";
+
+    fn query(before: Option<String>) -> Query {
+        Query {
+            session: "fixture".into(),
+            before,
+            limit: 3,
+            tools: true,
+            full: false,
+        }
+    }
+
+    #[test]
+    fn codex_batched_pages_match_whole_history_and_warm_cursor_lookup() {
+        use crate::agent_execution::transcript::cursor;
+        use std::io::Write as _;
+
+        let root = tempfile::tempdir().unwrap();
+        let (source, path) = codex_source(root.path());
+        let mut file = std::fs::File::create(&path).unwrap();
+        let payload = "x".repeat(BATCH_BYTES as usize / 3);
+        for turn in 0..24 {
+            file.write_all(TURN.as_bytes()).unwrap();
+            // The newer copy of this ID excludes the old one even when its
+            // batch is skipped during a warm lookup.
+            let id = if turn == 3 || turn == 12 {
+                "duplicate".into()
+            } else {
+                format!("turn-{turn}")
+            };
+            file.write_all(saved_message(&id, &format!("{turn} {payload}")).as_bytes())
+                .unwrap();
+        }
+        drop(file);
+        let rollouts = Rollouts::default();
+        let whole = Arc::new(Rollout::open(&path).unwrap().read().0);
+        for before in [
+            None,
+            Some(cursor("turn-4")),
+            Some("turn-4".into()),
+            Some("missing".into()),
+        ] {
+            let query = query(before);
+            let expected = page(&mut Whole(whole.clone()), &query, |_| None);
+            let actual = || {
+                source
+                    .page(&rollouts, &query, |_| None)
+                    .map(|(_, entries)| entries)
+            };
+            assert_eq!(actual(), expected);
+            assert_eq!(actual(), expected);
+        }
+    }
+
+    #[test]
+    fn codex_batch_index_follows_appends_and_in_place_rewrites() {
+        use std::{fs, io::Write as _};
+
+        let root = tempfile::tempdir().unwrap();
+        let (source, path) = codex_source(root.path());
+        let old = saved_message("old", &"x".repeat(BATCH_BYTES as usize));
+        let complete = saved_message("new", "finished");
+        let split = complete.len() / 2;
+        fs::write(&path, format!("{TURN}{old}{TURN}{}", &complete[..split])).unwrap();
+        let rollouts = Rollouts::default();
+        let query = query(None);
+        let latest = || source.page(&rollouts, &query, |_| None).unwrap().1.0;
+        assert_eq!(latest()[0].id, "old");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(complete[split..].as_bytes())
+            .unwrap();
+        assert_eq!(latest()[1].id, "new");
+
+        // Growing in place can also rewrite previous records and introduce
+        // new turn boundaries. No prefix inferred from length may survive.
+        let corrected = saved_message("corrected", &"y".repeat(BATCH_BYTES as usize + 500));
+        fs::write(&path, format!("{TURN}{corrected}{TURN}{complete}")).unwrap();
+        let entries = latest();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].id, "corrected");
+        assert_eq!(entries[1].id, "new");
+
+        let modified = fs::metadata(&path).unwrap().modified().unwrap();
+        let edited = corrected.replace("corrected", "different");
+        assert_eq!(corrected.len(), edited.len());
+        fs::write(&path, format!("{TURN}{edited}{TURN}{complete}")).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(latest()[0].id, "different");
+    }
+
+    #[test]
+    fn codex_archived_rewrite_during_page_resolves_the_session_again() {
+        use std::{cell::Cell, fs};
+
+        let root = tempfile::tempdir().unwrap();
+        let (source, path) = codex_source(root.path());
+        let older = saved_message("older", &"x".repeat(BATCH_BYTES as usize));
+        let newer = saved_message("newer", "present at open");
+        fs::write(&path, format!("{TURN}{older}{TURN}{newer}")).unwrap();
+
+        let archive = root.path().join("archived_sessions");
+        fs::create_dir(&archive).unwrap();
+        let archived = archive.join(path.file_name().unwrap());
+        let changed = Cell::new(false);
+        let rollouts = Rollouts::default();
+        let (_, (entries, _)) = source
+            .page(&rollouts, &query(None), |_| {
+                if !changed.replace(true) {
+                    let replacement = saved_message("replacement", "present after rewrite");
+                    fs::rename(&path, &archived).unwrap();
+                    fs::write(&archived, replacement).unwrap();
+                }
+                None
+            })
+            .unwrap();
+        assert_eq!(
+            entries
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["replacement"]
+        );
+    }
+
+    #[test]
+    fn codex_caches_a_large_turn_when_its_projected_payload_is_small() {
+        let root = tempfile::tempdir().unwrap();
+        let (_source, path) = codex_source(root.path());
+        let records = [
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call","call_id":"large","name":"exec_command","arguments":"run"
+            }}),
+            serde_json::json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"large","output":"x".repeat(BATCH_BYTES as usize * 2)
+            }}),
+        ];
+        let transcript = records
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, transcript).unwrap();
+        let rollouts = Rollouts::default();
+        let read = || {
+            rollouts
+                .open(Rollout::open(&path).unwrap())
+                .unwrap()
+                .newest()
+                .unwrap()
+                .0
+        };
+        let first = read();
+        assert_eq!(first.len(), 1);
+        assert!(Arc::ptr_eq(&first, &read()));
+    }
+
+    fn open_codex(source: &Source, rollouts: &Rollouts) -> (Option<u64>, Box<dyn History>) {
+        let rollout = Rollout::open(&source.path().unwrap()).unwrap();
+        (
+            modified(rollout.metadata()),
+            rollouts.open(rollout).unwrap(),
+        )
+    }
 
     fn member(id: &str, lineage: &str, relation: Relation, exited: bool) -> Member {
         let session = Entry {
@@ -608,7 +1022,7 @@ mod tests {
         };
         let rollouts = Rollouts::default();
         for tools in [true, false] {
-            let (_, mut history) = source.open(&rollouts).unwrap();
+            let (_, mut history) = open_codex(&source, &rollouts);
             let (items, earlier) = history.newest().unwrap();
             assert!(!earlier);
             let query = Query {
@@ -683,7 +1097,7 @@ mod tests {
             },
         };
         let rollouts = Rollouts::default();
-        let (modified, mut history) = source.open(&rollouts).unwrap();
+        let (modified, mut history) = open_codex(&source, &rollouts);
         assert!(modified.is_some());
         assert_eq!(modified, source.modified());
         let (items, earlier) = history.newest().unwrap();
@@ -709,7 +1123,7 @@ mod tests {
 
         let mut moved = source;
         moved.launch.session_id = Some("01a1b0ba-e200-7000-8000-000000000009".into());
-        assert!(moved.open(&rollouts).err().unwrap().contains("missing"));
+        assert!(moved.path().unwrap_err().contains("missing"));
     }
 
     #[test]
@@ -728,7 +1142,14 @@ mod tests {
             )
         };
         let rollouts = Rollouts::default();
-        let read = || rollouts.read(Rollout::open(&path).unwrap());
+        let read = || {
+            rollouts
+                .open(Rollout::open(&path).unwrap())
+                .unwrap()
+                .newest()
+                .unwrap()
+                .0
+        };
         fs::write(&path, record("first")).unwrap();
         let first = read();
         assert!(Arc::ptr_eq(&first, &read()));
@@ -762,5 +1183,70 @@ mod tests {
         let replaced = read();
         assert_ne!(replaced[0], truncated[0]);
         assert!(Arc::ptr_eq(&replaced, &read()));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "opt-in transcript measurement"]
+    fn measure_rollout_page() {
+        use std::{fs, io::Write as _, path::Path, time::Instant};
+
+        fn metric(path: &str, key: &str) -> u64 {
+            fs::read_to_string(path)
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix(key))
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap()
+        }
+
+        let root = std::env::var("CAGENTS_TRANSCRIPT_FIXTURE").unwrap();
+        let root = Path::new(&root);
+        let dir = tempfile::tempdir().unwrap();
+        let (source, path) = codex_source(dir.path());
+        fs::copy(root.join("rollout.jsonl"), &path).unwrap();
+        crate::instance::install_tracing("transcript benchmark", "off");
+        let scenario = std::env::var("CAGENTS_TRANSCRIPT_SCENARIO").unwrap();
+        let mut query = query(None);
+        query.limit = 20;
+        let rollouts = Rollouts::default();
+        let read = |query: &Query| source.page(&rollouts, query, |_| None).unwrap().1;
+        match scenario.as_str() {
+            "append" => {
+                read(&query);
+                fs::OpenOptions::new()
+                    .append(true)
+                    .open(&path)
+                    .unwrap()
+                    .write_all(&fs::read(root.join("append.jsonl")).unwrap())
+                    .unwrap();
+            }
+            "deep" | "warm-deep" => {
+                query.before = Some(crate::agent_execution::transcript::cursor("reply-60"));
+                if scenario == "warm-deep" {
+                    read(&query);
+                }
+            }
+            "latest" => {}
+            _ => panic!("unknown transcript benchmark scenario"),
+        }
+        if crate::diagnostics::local_debug() {
+            eprintln!("measuring {scenario}");
+        }
+        let io_before = metric("/proc/self/io", "rchar:");
+        let start = Instant::now();
+        let result = read(&query);
+        let took = start.elapsed();
+        let read_bytes = metric("/proc/self/io", "rchar:") - io_before;
+        let rss_kib = metric("/proc/self/status", "VmHWM:");
+        use sha2::{Digest as _, Sha256};
+        let page_hash = Sha256::digest(serde_json::to_vec(&result).unwrap());
+        println!(
+            "{scenario}: {took:?}, rchar delta {read_bytes}, peak RSS {rss_kib} KiB, page SHA-256 {page_hash:x}"
+        );
     }
 }
