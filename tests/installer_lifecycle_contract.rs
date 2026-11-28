@@ -882,6 +882,9 @@ esac
         r#"#!/bin/sh
 set -eu
 [ "$FIXTURE_DOWNLOAD" = public ] || [ "$FIXTURE_DOWNLOAD" = auth-failure ] || exit 98
+# curl ignores its default configuration only when this is argument one.
+[ "${1-}" = --disable ] || exit 98
+shift
 destination=
 url=
 while [ "$#" -gt 0 ]; do
