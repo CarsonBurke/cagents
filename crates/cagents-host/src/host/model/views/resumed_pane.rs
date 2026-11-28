@@ -36,6 +36,18 @@ impl Registry {
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if super::super::pane_chat_starts::allocation_in(&tx, stopped.id)?
+            .is_some_and(|allocation| allocation != started.id)
+        {
+            return Ok(false);
+        }
+        // A daemon proof identifies the host, not an allocation on it.
+        if started.id != stopped.id
+            && started.proof == stopped.proof
+            && !Self::predecessors_in(&tx, started.id)?.contains(&stopped.id)
+        {
+            return Ok(false);
+        }
         let Some(id) = store::chat_pane(&tx, stopped.id)? else {
             return Ok(false);
         };
@@ -113,7 +125,6 @@ pub(super) fn shows_resumed(stopped: &Session, started: &Session) -> bool {
         .proof
         .as_ref()
         .is_some_and(crate::model::HostSessionProof::is_complete)
-        && (started.proof != stopped.proof || started.id == stopped.id)
         && started != stopped
         && started.terminal.as_ref().is_none_or(|terminal| {
             terminal.id == started.id && terminal.continuity.live_proof() == started.proof
@@ -164,6 +175,82 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: Default::default(),
         }
+    }
+
+    #[test]
+    fn adoption_on_the_same_daemon_requires_the_current_successor() {
+        use crate::{agent_execution::Placement, workspace_model::ModelEdit};
+
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().to_path_buf();
+        let mut registry = Registry::at(&root.join("model.sqlite3")).unwrap();
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: root.clone(),
+                name: "Resume fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        let mut stopped = session(TerminalId::new(), proof("same", "daemon"));
+        stopped.launch.recipe.working_directory = root.clone();
+        let card = crate::model::CardId::new();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: Placement::Worktree {
+                    repository: root.clone(),
+                    path: root.clone(),
+                },
+                closed: vec![],
+                panes: vec![crate::workspace_model::views::Pane {
+                    id: card,
+                    title: "Codex".into(),
+                    user_title: None,
+                    pending_terminal_start: false,
+                    width_fraction: 1.0,
+                    kind: CardKind::Chat(stopped.clone()),
+                    scope: Some(root),
+                }],
+            })
+            .unwrap();
+        assert_eq!(
+            registry.chat_pane_descriptor(stopped.id).unwrap(),
+            Some(stopped.clone())
+        );
+        let started = Session {
+            id: TerminalId::new(),
+            ..stopped.clone()
+        };
+        assert!(
+            !registry
+                .adopt_resumed_chat_pane(&stopped, &started)
+                .unwrap()
+        );
+
+        assert!(registry.bind_pane_chat_start(card, None, &stopped).unwrap());
+        registry
+            .succeed(started.id, stopped.id, None, |_| false)
+            .unwrap();
+        let newer = Session {
+            id: TerminalId::new(),
+            ..started.clone()
+        };
+        registry
+            .succeed(newer.id, started.id, None, |_| false)
+            .unwrap();
+        assert!(
+            !registry
+                .adopt_resumed_chat_pane(&stopped, &started)
+                .unwrap()
+        );
+        assert_eq!(
+            registry.chat_pane_descriptor(stopped.id).unwrap(),
+            Some(stopped.clone())
+        );
+        assert!(registry.adopt_resumed_chat_pane(&stopped, &newer).unwrap());
+        assert_eq!(
+            registry.chat_pane_descriptor(newer.id).unwrap(),
+            Some(newer)
+        );
     }
 
     #[test]

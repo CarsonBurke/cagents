@@ -387,7 +387,9 @@ exec /bin/sleep 60
     host.lock().unwrap().codex_listeners = CodexListenerRoots::in_runtime_directory(runtime.path());
     let mut saved = reopened(root);
     let mut old_proof = host.lock().unwrap().proof().clone();
-    old_proof.boot_id = BootId::new("earlier-boot");
+    if boot {
+        old_proof.boot_id = BootId::new("earlier-boot");
+    }
     saved.proof = Some(old_proof);
     saved.terminal = Some(Box::new(
         crate::terminal_ipc::TerminalDescriptor::relaunchable(
