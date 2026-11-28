@@ -85,6 +85,23 @@ pub(crate) fn require_lock_history(file: &fs::File) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 pub const INDEX_READS: usize = 3;
 
+/// Inspect the flock on this exact Linux description, including a flock
+/// originally acquired by another process before the descriptor was passed.
+#[cfg(target_os = "linux")]
+pub(crate) fn description_holds_exclusive_lock(file: &fs::File) -> io::Result<bool> {
+    use std::os::fd::AsRawFd;
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    Ok(info
+        .lines()
+        .filter_map(|line| line.strip_prefix("lock:"))
+        .any(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            fields.len() == 8
+                && fields[1..4] == ["FLOCK", "ADVISORY", "WRITE"]
+                && fields[6..8] == ["0", "EOF"]
+        }))
+}
+
 #[cfg(target_os = "linux")]
 pub(crate) fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {
     let fields: Vec<_> = line.split_whitespace().collect();

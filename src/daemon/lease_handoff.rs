@@ -247,17 +247,7 @@ pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<()
     validate_inode(lock, paths)?;
     // fdinfo describes this exact open-file description, including locks
     // inherited from another PID. Contention alone could be someone else's lock.
-    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", lock.as_raw_fd()))?;
-    if !info
-        .lines()
-        .filter_map(|line| line.strip_prefix("lock:"))
-        .any(|line| {
-            let fields: Vec<_> = line.split_whitespace().collect();
-            fields.len() == 8
-                && fields[1..4] == ["FLOCK", "ADVISORY", "WRITE"]
-                && fields[6..8] == ["0", "EOF"]
-        })
-    {
+    if !crate::flock::description_holds_exclusive_lock(lock)? {
         return Err(io::Error::other("daemon inherited an unheld lease descriptor").into());
     }
     // SAFETY: the validated descriptor must itself own the exclusive flock.

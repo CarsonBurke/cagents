@@ -431,7 +431,7 @@ pub(super) fn perform(
             let receipt = survivors.recovery_receipt();
             #[cfg(target_os = "linux")]
             if handoff.is_some() {
-                linux_handoff::record(state, job, &daemon, &recovery, &guard)?;
+                linux_handoff::arm(state, job, &daemon, &recovery, &guard)?;
             }
             #[cfg(target_os = "macos")]
             let ready_plan = receipt

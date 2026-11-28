@@ -3,7 +3,7 @@ use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
 #[cfg(target_os = "linux")]
 use crate::flock::process_owns_lock as process_owns_slot;
 use crate::pinned_process::PinnedProcess;
-#[cfg(any(feature = "host", all(target_os = "linux", feature = "ui")))]
+#[cfg(any(feature = "host", target_os = "linux"))]
 use std::time::Instant;
 use std::{
     env,
@@ -775,7 +775,7 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
-#[cfg(any(feature = "host", all(target_os = "macos", feature = "ui")))]
+#[cfg(any(feature = "host", feature = "ui", target_os = "linux"))]
 const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "macos", feature = "ui"))]
 static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -1955,7 +1955,7 @@ impl UiUpdateGuard {
         self.restore_policy
     }
 
-    #[cfg(all(target_os = "linux", feature = "host"))]
+    #[cfg(target_os = "linux")]
     pub(crate) fn set_restore_policy(&mut self, policy: WindowRestorePolicy) {
         self.restore_policy = policy;
     }
@@ -2023,16 +2023,16 @@ impl UiUpdateGuard {
         Self::acquire_with_operation(libc::LOCK_EX | libc::LOCK_NB)
     }
 
-    /// Wait on the settlement thread for the updater's installer or successor
-    /// to release its inherited fence, including during slow restoration.
-    #[cfg(all(feature = "host", target_os = "linux"))]
+    /// Wait for the updater's installer or successor to release its
+    /// inherited fence, including during slow restoration.
+    #[cfg(target_os = "linux")]
     pub(crate) fn acquire_after_updater() -> io::Result<Self> {
         Self::acquire_with_operation(libc::LOCK_EX)
     }
 
     /// Let a window that is already taking its slot reach the fence naturally.
     /// The detached flock waiter owns no update lease if this budget expires.
-    #[cfg(feature = "host")]
+    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn acquire_for_cutover() -> io::Result<Self> {
         match Self::acquire() {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
@@ -2509,7 +2509,7 @@ impl UiUpdateGuard {
         )
     }
 
-    #[cfg(feature = "host")]
+    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
@@ -2621,7 +2621,7 @@ impl UiUpdateGuard {
 }
 
 /// A naturally opened window can take its lease before binding activation.
-#[cfg(feature = "host")]
+#[cfg(any(feature = "host", target_os = "linux"))]
 fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
     use std::os::fd::AsFd;
 

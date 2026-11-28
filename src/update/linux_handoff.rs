@@ -1,11 +1,16 @@
-//! Finish an approved Linux handoff from the daemon that accepted it.
+//! Finish the update accepted by the replacement daemon in the user's launch context.
 use super::*;
 use crate::{
     daemon::holder_registry::Process,
+    descriptor_frame::{FrameByteOrder, receive_json_with_fds_until, send_json_with_fds_until},
     instance::{UiUpdateGuard, WindowRestorePolicy},
     model::HostSessionProof,
     pinned_process::PinnedProcess,
     upgrade::handoff::Phase,
+};
+use std::os::{
+    fd::{AsFd, BorrowedFd},
+    unix::net::UnixStream,
 };
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
@@ -13,6 +18,7 @@ use crate::{
 struct Handoff {
     job: String,
     worker: Process,
+    finisher: Option<Process>,
     request_digest: String,
     census_digest: String,
     source: HostSessionProof,
@@ -30,17 +36,6 @@ struct Handoff {
 struct Acceptance {
     proof: HostSessionProof,
     process: Process,
-}
-
-/// The exact approved record this process saw before restoring work.
-#[cfg(feature = "host")]
-pub struct AcceptedHandoff(Handoff);
-
-#[cfg(feature = "host")]
-impl AcceptedHandoff {
-    pub fn ready_checkpoint(&self) -> Option<&str> {
-        (self.0.checkpoint_phase == Phase::Ready).then_some(&self.0.checkpoint_digest)
-    }
 }
 
 fn artifact(job: &str) -> String {
@@ -84,19 +79,15 @@ impl Handoff {
         Ok(Some(handoff))
     }
 
-    #[cfg(feature = "host")]
     fn verify_target(&self, layout: &InstallLayout) -> Result<(), UpdateError> {
         if self.target != layout.version_root.join("bin/cagentsd")
             || installed::stamp(&layout.version_root)? != self.build
-            || fs::metadata("/proc/self/exe").map(|m| (m.dev(), m.ino()))?
-                != self.build.daemon_inode()
         {
             return Err(invalid("The approved replacement executable changed"));
         }
         Ok(())
     }
 
-    #[cfg(feature = "host")]
     fn census(&self, state: &Path) -> Result<recovery::Census, UpdateError> {
         let census = recovery::Census::load(&recovery::census_path(state, &self.job))?;
         if census.transaction != self.job
@@ -111,20 +102,17 @@ impl Handoff {
         Ok(census)
     }
 
-    #[cfg(feature = "host")]
-    fn can_finish(&self, serving: &HostSessionProof) -> Result<bool, UpdateError> {
-        let exact_successor = serving.boot_id == self.source.boot_id
-            && self.accepted.as_ref().is_some_and(|accepted| {
-                &accepted.proof == serving
-                    && accepted.process.pid == std::process::id() as i32
-                    && accepted.process.is_current()
-            });
-        Ok(exact_successor && process_exited(&self.worker, Duration::from_secs(1))?)
+    fn accepted_from(&self, mut retained: Handoff) -> Result<Option<Acceptance>, UpdateError> {
+        let accepted = retained.accepted.take();
+        if retained != *self {
+            return Err(invalid("The accepted update handoff record changed"));
+        }
+        Ok(accepted)
     }
 }
 
 /// Persist the continuation before giving the target any startup authority.
-pub(super) fn record(
+pub(super) fn arm(
     state: &Path,
     job: &UpdateJob,
     target: &Path,
@@ -148,6 +136,7 @@ pub(super) fn record(
     let handoff = Handoff {
         job: job.id.clone(),
         worker: Process::read(std::process::id() as i32)?,
+        finisher: None,
         request_digest: request_digest(state, &job.id)?,
         census_digest: census.digest()?,
         source: checkpoint.proof,
@@ -159,13 +148,69 @@ pub(super) fn record(
         restore_policy: guard.restore_policy(),
         accepted: None,
     };
-    write_state_file(state, &artifact(&job.id), &handoff)
+    match start_finisher(&layout.version_root.join("bin/cagents"), handoff) {
+        Ok(armed) => write_state_file(state, &artifact(&job.id), &armed),
+        Err(error) => {
+            // An earlier target can still complete through the original worker.
+            eprintln!("Could not arm the update finisher: {error}");
+            Ok(())
+        }
+    }
+}
+
+const PLAN_TRANSFER_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn start_finisher(cli: &Path, mut approved: Handoff) -> Result<Handoff, UpdateError> {
+    // Use the worker's login and display context for the same inventory and
+    // window startup calls it makes normally. Daemon children are hosted peers.
+    let (mut coordinator, receiver) = UnixStream::pair()?;
+    coordinator.set_read_timeout(Some(PLAN_TRANSFER_TIMEOUT))?;
+    if unsafe { libc::fcntl(WORKER_LOCK_FD, libc::F_GETFD) } == -1 {
+        return Err(io::Error::last_os_error().into());
+    }
+    // SAFETY: run_worker owns this reserved description for the entire handoff.
+    let worker = unsafe { BorrowedFd::borrow_raw(WORKER_LOCK_FD) };
+    let mut command = Command::new(cli);
+    command
+        .arg("finish-update-handoff")
+        .stdin(Stdio::from(OwnedFd::from(receiver)))
+        .stdout(Stdio::null())
+        .process_group(0);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    // SAFETY: the new process can keep the launcher's output and private
+    // channel. The worker and launch fences must settle independently of it.
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    let mut child = command.spawn()?;
+    drop(command);
+    let finisher = Process::read(child.id() as i32);
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    approved.finisher = Some(finisher?);
+    send_json_with_fds_until(
+        &coordinator,
+        &approved,
+        &[worker],
+        Instant::now() + PLAN_TRANSFER_TIMEOUT,
+        JOB_STATE_LIMIT as usize,
+        1,
+        FrameByteOrder::LittleEndian,
+    )
+    .map_err(invalid)?;
+    let mut ready = [0];
+    coordinator.read_exact(&mut ready)?;
+    if ready != [1] {
+        return Err(invalid(
+            "The installed update finisher did not accept the approved handoff",
+        ));
+    }
+    Ok(approved)
 }
 
 /// Called before restoration, with the authenticated inherited runtime and
 /// launch leases held. An ordinary restart has no authority to accept this job.
 #[cfg(feature = "host")]
-pub fn accept(serving: &HostSessionProof) -> Result<Option<AcceptedHandoff>, UpdateError> {
+pub fn accept(serving: &HostSessionProof) -> Result<Option<String>, UpdateError> {
     let layout = match locate(&crate::process::current_executable()?) {
         Ok(layout) => layout,
         Err(UpdateError::UnsupportedInstallation) => return Ok(None),
@@ -185,6 +230,9 @@ pub fn accept(serving: &HostSessionProof) -> Result<Option<AcceptedHandoff>, Upd
         return Ok(None);
     }
     handoff.verify_target(&layout)?;
+    if fs::metadata("/proc/self/exe").map(|m| (m.dev(), m.ino()))? != handoff.build.daemon_inode() {
+        return Err(invalid("The successor is not the approved daemon image"));
+    }
     handoff.census(&state)?;
     recovery::checkpoint_status()?
         .filter(|status| {
@@ -198,7 +246,7 @@ pub fn accept(serving: &HostSessionProof) -> Result<Option<AcceptedHandoff>, Upd
         process: Process::read(std::process::id() as i32)?,
     });
     write_state_file(&state, &artifact(&job.id), &handoff)?;
-    Ok(Some(AcceptedHandoff(handoff)))
+    Ok((handoff.checkpoint_phase == Phase::Ready).then_some(handoff.checkpoint_digest))
 }
 
 fn process_exited(expected: &Process, timeout: Duration) -> io::Result<bool> {
@@ -221,7 +269,12 @@ pub(super) fn pending(state: &Path, job: &UpdateJob) -> Result<bool, UpdateError
     let Some(handoff) = Handoff::read(state, job)? else {
         return Ok(false);
     };
-    if handoff.source.boot_id != crate::daemon::read_boot_id()? {
+    let Some(finisher) = &handoff.finisher else {
+        return Ok(false);
+    };
+    if handoff.source.boot_id != crate::daemon::read_boot_id()?
+        || process_exited(finisher, Duration::ZERO)?
+    {
         return Ok(false);
     }
     if handoff.accepted.is_none()
@@ -240,67 +293,134 @@ pub(super) fn pending(state: &Path, job: &UpdateJob) -> Result<bool, UpdateError
     })
 }
 
-#[cfg(feature = "host")]
-impl AcceptedHandoff {
-    /// Runs under the worker lease. Only this exact daemon may reopen slots.
-    pub(super) fn finish(
-        &self,
-        layout: &InstallLayout,
-        state: &Path,
-        serving: &HostSessionProof,
-        job: &UpdateJob,
-    ) -> Result<Option<String>, UpdateError> {
-        if job.phase != UpdatePhase::Installing
-            || job.id != self.0.job
-            || layout.version != job.version
-            || !self.0.can_finish(serving)?
-        {
-            return Ok(None);
-        }
-        let result = (|| {
-            if Handoff::read(state, job)?.as_ref() != Some(&self.0) {
-                return Err(invalid("The accepted update handoff record changed"));
-            }
-            finish_windows(layout, state, serving, &self.0)
-        })();
-        let mut job = job.clone();
-        job.confirmation = None;
-        job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
-        job.message = completion_message(&result, &job, false);
-        job.phase = if result.is_ok() {
-            UpdatePhase::Complete
-        } else {
-            UpdatePhase::Failed
-        };
-        write_job(state, &job)?;
-        retention::remember_success(state, &job.id, &job.phase);
-        result.map(|_| Some(job.id))
+/// Hidden entry point. The worker must send its exact pre-transfer approval
+/// over a private channel it created, while it still owns the worker lease.
+pub(crate) fn run_finisher() -> Result<(), UpdateError> {
+    let mut channel = UnixStream::from(io::stdin().as_fd().try_clone_to_owned()?);
+    let (approved, descriptors): (Handoff, _) = receive_json_with_fds_until(
+        &channel,
+        Instant::now() + PLAN_TRANSFER_TIMEOUT,
+        JOB_STATE_LIMIT as usize,
+        1,
+        FrameByteOrder::LittleEndian,
+    )
+    .map_err(invalid)?;
+    let peer = crate::pinned_process::peer_credentials(&channel)?;
+    let layout = locate(&crate::process::current_executable()?)?;
+    let caller = PinnedProcess::open(peer.pid)?;
+    let worker_executable = caller.executable()?;
+    if peer.uid != crate::daemon::current_uid()
+        || Process::read(peer.pid as i32)? != approved.worker
+        || approved.finisher.as_ref() != Some(&Process::read(std::process::id() as i32)?)
+        || approved.accepted.is_some()
+        || worker_executable.file_name().and_then(|name| name.to_str()) != Some("cagents")
+        || locate(&worker_executable)?.prefix != layout.prefix
+    {
+        return Err(invalid("The update finisher requires its original worker"));
     }
+    let state = state_dir(&layout.prefix)?;
+    let [worker]: [OwnedFd; 1] = descriptors
+        .try_into()
+        .map_err(|_| invalid("The update finisher requires the original worker lease"))?;
+    let worker = File::from(worker);
+    let actual = worker.metadata()?;
+    let expected = fs::symlink_metadata(state.join("lock"))?;
+    validate_lock(&worker)?;
+    if (actual.dev(), actual.ino()) != (expected.dev(), expected.ino())
+        || !crate::flock::description_holds_exclusive_lock(&worker)?
+    {
+        return Err(invalid(
+            "The update finisher received a different or unheld worker lease",
+        ));
+    }
+    approved.verify_target(&layout)?;
+    approved.census(&state)?;
+    // Close the proof copy before acknowledging. The finisher waits on a
+    // fresh description and must never keep the worker's flock alive itself.
+    drop(worker);
+    channel.write_all(&[1])?;
+    drop(channel);
+    let _worker = crate::instance::owned_file_lock(open_worker_lock(&state)?, libc::LOCK_EX)?;
+    finish_under_lease(&layout, &state, &approved)
 }
 
-#[cfg(feature = "host")]
+fn finish_under_lease(
+    layout: &InstallLayout,
+    state: &Path,
+    approved: &Handoff,
+) -> Result<(), UpdateError> {
+    let Some(mut job) = read_job(state)? else {
+        return Ok(());
+    };
+    if job.phase != UpdatePhase::Installing
+        || job.id != approved.job
+        || layout.version != job.version
+        || approved.source.boot_id != crate::daemon::read_boot_id()?
+        || !process_exited(&approved.worker, Duration::from_secs(1))?
+    {
+        return Ok(());
+    }
+    // The signed installer and parked daemon can outlive the worker while
+    // holding the same launch description. Neither may race a reopen.
+    let guard = UiUpdateGuard::acquire_after_updater()?;
+    let Some(retained) = Handoff::read(state, &job)? else {
+        return Ok(());
+    };
+    let result = match approved.accepted_from(retained) {
+        Ok(Some(accepted)) => finish_windows(layout, state, approved, &accepted, guard),
+        Ok(None) => return Ok(()),
+        Err(error) => Err(error),
+    };
+    job.confirmation = None;
+    job.refusal = result.as_ref().err().and_then(UpdateError::refusal);
+    job.message = completion_message(&result, &job, false);
+    job.phase = if result.is_ok() {
+        UpdatePhase::Complete
+    } else {
+        UpdatePhase::Failed
+    };
+    write_job(state, &job)?;
+    retention::remember_success(state, &job.id, &job.phase);
+    result.map(drop)
+}
+
 fn finish_windows(
     layout: &InstallLayout,
     state: &Path,
-    serving: &HostSessionProof,
     handoff: &Handoff,
+    accepted: &Acceptance,
+    mut guard: UiUpdateGuard,
 ) -> Result<Completion, UpdateError> {
-    // A release installer may still be running after its parent was killed.
-    // Wait until it drops the inherited launch fence before reading current
-    // or reopening a window, even for a job that saved zero windows.
-    let mut guard = UiUpdateGuard::acquire_after_updater()?;
+    let serving = &accepted.proof;
     let verify_target = || {
         handoff.verify_target(layout)?;
-        if served_version_root(layout)? != layout.version_root {
+        if served_version_root(layout)? != layout.version_root
+            || serving.boot_id != handoff.source.boot_id
+        {
             return Err(invalid("The approved replacement is no longer selected"));
         }
-        source::Peer::confirm_serving(
-            &crate::terminal_ipc::daemon_socket_path()?,
-            &handoff.target,
-            serving,
-        )
+        let client = source::Client::connect_matched(&crate::terminal_ipc::daemon_socket_path()?)
+            .map_err(|error| invalid(error.to_string()))?;
+        if client.proof() != serving
+            || client.peer_pid() as i32 != accepted.process.pid
+            || client.serving_executable()? != handoff.target
+            || fs::metadata(format!("/proc/{}/exe", accepted.process.pid))
+                .map(|m| (m.dev(), m.ino()))?
+                != handoff.build.daemon_inode()
+            || !accepted.process.is_current()
+        {
+            return Err(invalid(
+                "The serving process is not the successor that accepted the handoff",
+            ));
+        }
+        Ok(())
     };
     let census = handoff.census(state)?;
+    installed::confirm_daemon_ready(
+        &handoff.target,
+        Some(accepted.process.pid as u32),
+        crate::install_guard::daemon_start_timeout()?,
+    )?;
     verify_target()?;
     if handoff.checkpoint_phase == Phase::Prepared {
         let store = crate::upgrade::handoff::Store::existing()
@@ -383,6 +503,7 @@ mod tests {
         let handoff = Handoff {
             job: id.clone(),
             worker,
+            finisher: Some(Process::read(std::process::id() as i32).unwrap()),
             request_digest: request_digest(state, &id).unwrap(),
             census_digest: recovery::Census::load(&recovery::census_path(state, &id))
                 .unwrap()
@@ -415,8 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_successor_can_continue_after_worker_exit() {
-        let state = tempfile::tempdir().unwrap();
+    fn the_original_worker_is_proven_exited_before_it_is_reaped() {
         let mut worker = Command::new("/bin/sleep").arg("60").spawn().unwrap();
         let epoch = Process::read(worker.id() as i32).unwrap();
         let alive = !process_exited(&epoch, Duration::ZERO).unwrap();
@@ -426,14 +546,7 @@ mod tests {
         worker.wait().unwrap();
         assert!(alive && exited);
 
-        let (_, mut handoff) = saved_handoff(state.path(), epoch);
-        let successor = proof("successor");
-        assert!(handoff.can_finish(&successor).unwrap());
-        assert!(!handoff.can_finish(&proof("another-successor")).unwrap());
-        handoff.accepted.as_mut().unwrap().process.start += 1;
-        assert!(!handoff.can_finish(&successor).unwrap());
-        handoff.accepted = None;
-        assert!(!handoff.can_finish(&successor).unwrap());
+        assert!(process_exited(&epoch, Duration::ZERO).unwrap());
     }
 
     #[test]
@@ -464,29 +577,24 @@ mod tests {
     #[test]
     fn the_accepted_window_roster_cannot_be_replaced() {
         let state = tempfile::tempdir().unwrap();
-        let mut worker = Command::new("/bin/true").spawn().unwrap();
-        let epoch = Process::read(worker.id() as i32).unwrap();
-        worker.wait().unwrap();
-        let (job, handoff) = saved_handoff(state.path(), epoch);
-        let target = handoff.target.parent().unwrap().parent().unwrap();
-        let layout = InstallLayout {
-            prefix: state.path().to_owned(),
-            version_root: target.to_owned(),
-            version: job.version.clone(),
-        };
-        let successor = proof("successor");
-        let mut changed: Handoff =
-            serde_json::from_value(serde_json::to_value(&handoff).unwrap()).unwrap();
+        let worker = Process::read(std::process::id() as i32).unwrap();
+        let (job, mut approved) = saved_handoff(state.path(), worker);
+        write_state_file(state.path(), &artifact(&job.id), &approved).unwrap();
+        approved.accepted = None;
+        let accepted = Handoff::read(state.path(), &job).unwrap().unwrap();
+        assert!(approved.accepted_from(accepted).unwrap().is_some());
+        let mut changed = Handoff::read(state.path(), &job).unwrap().unwrap();
         changed.windows.push("unapproved".into());
-        write_state_file(state.path(), &artifact(&job.id), &changed).unwrap();
-        let _lease = acquire_lock(state.path()).unwrap();
-        let error = AcceptedHandoff(handoff)
-            .finish(&layout, state.path(), &successor, &job)
-            .unwrap_err();
-        assert!(error.to_string().contains("handoff record changed"));
-        assert_eq!(
-            read_job(state.path()).unwrap().unwrap().phase,
-            UpdatePhase::Failed
-        );
+        assert!(approved.accepted_from(changed).is_err());
+    }
+
+    #[test]
+    fn a_dead_finisher_does_not_keep_an_accepted_job_pending() {
+        let state = tempfile::tempdir().unwrap();
+        let worker = Process::read(std::process::id() as i32).unwrap();
+        let (job, mut handoff) = saved_handoff(state.path(), worker);
+        handoff.finisher.as_mut().unwrap().start += 1;
+        write_state_file(state.path(), &artifact(&job.id), &handoff).unwrap();
+        assert!(!pending(state.path(), &job).unwrap());
     }
 }

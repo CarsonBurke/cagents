@@ -30,9 +30,10 @@ mod installed;
 mod linux_handoff;
 #[cfg(all(target_os = "linux", feature = "host"))]
 #[doc(hidden)]
-pub use linux_handoff::{
-    AcceptedHandoff as AcceptedLinuxHandoff, accept as accept_linux_update_handoff,
-};
+pub use linux_handoff::accept as accept_linux_update_handoff;
+
+#[cfg(target_os = "linux")]
+pub(crate) use linux_handoff::run_finisher as finish_linux_update_handoff;
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 mod publication;
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
@@ -2247,7 +2248,6 @@ fn settle_under_worker_lease(
 #[cfg(feature = "host")]
 pub fn settle_as_successor(
     serving: crate::model::HostSessionProof,
-    #[cfg(target_os = "linux")] accepted: Option<AcceptedLinuxHandoff>,
     #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory + Send + 'static,
 ) {
@@ -2268,8 +2268,6 @@ pub fn settle_as_successor(
                 &layout,
                 &state,
                 &serving,
-                #[cfg(target_os = "linux")]
-                accepted.as_ref(),
                 #[cfg(target_os = "macos")]
                 entry_checkpoint,
                 #[cfg(target_os = "macos")]
@@ -2295,7 +2293,6 @@ fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
-    #[cfg(target_os = "linux")] accepted: Option<&AcceptedLinuxHandoff>,
     #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory,
 ) -> Result<Option<String>, UpdateError> {
@@ -2307,12 +2304,6 @@ fn settle_after_worker(
     let Some(job) = read_job(state)? else {
         return Ok(None);
     };
-    #[cfg(target_os = "linux")]
-    if let Some(accepted) = accepted
-        && let Some(completed) = accepted.finish(layout, state, serving, &job)?
-    {
-        return Ok(Some(completed));
-    }
     #[cfg(target_os = "macos")]
     if let Some(completed) = cutover::finish(
         layout,
@@ -2918,7 +2909,7 @@ fn perform_update(
         )?;
         #[cfg(target_os = "linux")]
         if handoff.is_some() {
-            linux_handoff::record(state, job, &target_daemon, &recovery, &guard)?;
+            linux_handoff::arm(state, job, &target_daemon, &recovery, &guard)?;
         }
         run_installer(
             installation,
@@ -7969,8 +7960,6 @@ mod reconciliation_tests {
                 &layout,
                 &state,
                 proof,
-                #[cfg(target_os = "linux")]
-                None,
                 #[cfg(target_os = "macos")]
                 CutoverStartupCheckpoint::Absent,
                 #[cfg(target_os = "macos")]

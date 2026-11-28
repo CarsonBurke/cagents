@@ -432,6 +432,9 @@ pub enum TopCommand {
         #[arg(help = "Detached update job ID.")]
         job_id: String,
     },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    FinishUpdateHandoff,
     /// Cooperatively fence application windows around an external installer.
     #[command(hide = true)]
     CoordinateInstall {
@@ -4546,6 +4549,10 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
+    #[cfg(target_os = "linux")]
+    if matches!(command, TopCommand::FinishUpdateHandoff) {
+        return false;
+    }
     // `daemon upgrade` enters the served candidate's updater. An older owner's
     // preflight cannot qualify the panes this candidate knows how to carry.
     !matches!(
@@ -4779,6 +4786,16 @@ fn execute_with_model_context(
                 command: "update.worker",
                 data: json!({ "job_id": job_id, "complete": true }),
                 human: "Application update complete".into(),
+            })
+        }
+        #[cfg(target_os = "linux")]
+        TopCommand::FinishUpdateHandoff => {
+            crate::update::finish_linux_update_handoff()
+                .map_err(|error| AppError::new("update", error))?;
+            Ok(CommandOutput {
+                command: "update.finish_handoff",
+                data: json!({}),
+                human: String::new(),
             })
         }
         TopCommand::RestartWindows { instance } => {

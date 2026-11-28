@@ -1135,7 +1135,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("daemon lease acquired", None);
     #[cfg(target_os = "linux")]
-    let accepted_update = if inherited_update {
+    let accepted_ready = if inherited_update {
         match crate::update::accept_linux_update_handoff(&proof) {
             Ok(ready) => ready,
             Err(error) => {
@@ -1274,13 +1274,10 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
                     |digest| update_recovery::restore_observed_adoption(&host, digest),
                 );
             #[cfg(target_os = "linux")]
-            let ordinary = accepted_update
-                .as_ref()
-                .and_then(crate::update::AcceptedLinuxHandoff::ready_checkpoint)
-                .map_or_else(
-                    || update_recovery::restore_ordinary(&host),
-                    |digest| update_recovery::restore_observed_adoption(&host, digest),
-                );
+            let ordinary = accepted_ready.as_deref().map_or_else(
+                || update_recovery::restore_ordinary(&host),
+                |digest| update_recovery::restore_observed_adoption(&host, digest),
+            );
             #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             let ordinary = update_recovery::restore_ordinary(&host);
             ordinary.map_err(io::Error::other)?;
@@ -1560,8 +1557,6 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             .unwrap_or_else(|p| p.into_inner())
             .proof()
             .clone(),
-        #[cfg(target_os = "linux")]
-        accepted_update,
     );
     loop {
         #[cfg(any(target_os = "linux", target_os = "macos"))]
