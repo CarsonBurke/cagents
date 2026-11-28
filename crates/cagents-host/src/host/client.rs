@@ -240,7 +240,7 @@ fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
         &UnixStream,
     ) -> Result<RequestOutcome<R>, WireFailure>,
 ) {
-    serve_connection(
+    serve_connection_inner(
         stream,
         client_id,
         host,
@@ -254,14 +254,25 @@ fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
 /// kernel peer must be the test process itself to act as the synthetic user.
 #[cfg(test)]
 pub(super) fn serve_fixture_user(stream: UnixStream, client_id: ClientId, host: SharedHost) {
-    serve_connection(stream, client_id, host, process_wire_request, true);
+    serve_connection_inner(
+        stream,
+        client_id,
+        host,
+        |host, client, request, reader| process_wire_request(host, client, request, Some(reader)),
+        true,
+    );
 }
 
-fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
+fn serve_connection_inner<R: Into<crate::terminal_ipc::PreparedResponse>>(
     stream: UnixStream,
     client_id: ClientId,
     host: SharedHost,
-    handle: RequestHandler<R>,
+    handle: impl Fn(
+        &SharedHost,
+        ClientId,
+        ClientRequest,
+        &UnixStream,
+    ) -> Result<RequestOutcome<R>, WireFailure>,
     #[cfg(test)] fixture_user: bool,
 ) {
     let registration = Registration::new(Arc::clone(&host), client_id);
