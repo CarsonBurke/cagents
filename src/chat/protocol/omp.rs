@@ -547,33 +547,28 @@ impl Omp {
                         );
                         (format!("tool:{id}"), content)
                     }
-                    "image" => (
-                        format!("{key}:{index}"),
-                        ItemContent::Image {
-                            reference: mapping.as_ref().and_then(|(_, refs)| {
-                                index
-                                    .checked_sub(1)
-                                    .and_then(|index| refs.get(index))
-                                    .cloned()
-                                    .flatten()
-                            }),
-                            path: format!(
-                                "data:{};base64,{}",
-                                text(block, "mimeType"),
-                                text(block, "data")
-                            ),
-                            description: mapping
-                                .as_ref()
-                                .and_then(|(_, refs)| {
-                                    index
-                                        .checked_sub(1)
-                                        .and_then(|index| refs.get(index))
-                                        .and_then(Option::as_ref)
-                                })
-                                .map(|reference| reference.label())
-                                .unwrap_or_else(|| "Image attachment".into()),
-                        },
-                    ),
+                    "image" => {
+                        let reference = mapping.as_ref().and_then(|(_, refs)| {
+                            index
+                                .checked_sub(1)
+                                .and_then(|index| refs.get(index))
+                                .and_then(Option::as_ref)
+                        });
+                        (
+                            format!("{key}:{index}"),
+                            ItemContent::Image {
+                                reference: reference.cloned(),
+                                path: format!(
+                                    "data:{};base64,{}",
+                                    text(block, "mimeType"),
+                                    text(block, "data")
+                                ),
+                                description: reference
+                                    .map(|reference| reference.label())
+                                    .unwrap_or_default(),
+                            },
+                        )
+                    }
                     _ => return None,
                 };
                 Some(Item {
@@ -2101,20 +2096,34 @@ mod tests {
             );
             let mut content = vec![json!({"type":"text","text":message})];
             content.extend(request["images"].as_array().unwrap().iter().cloned());
-            let items = adapter
-                .message_items(&json!({"role":"user","id":"omp-unlabeled","content":content}));
+            let received = adapter
+                .receive(json!({"type":"message_end","message":{
+                    "role":"user","timestamp":123,"content":content
+                }}))
+                .unwrap();
+            let items = received
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::Item(item) => Some(&item.content),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(items.len(), 3);
             assert!(
-                matches!(&items[0].content, ItemContent::Text { text: restored, .. } if restored == &text)
+                matches!(items[0], ItemContent::Text { text: restored, .. } if restored == &text)
             );
             assert!(
-                matches!(&items[1].content, ItemContent::Image { reference: Some(r), .. } if r == &reference)
+                matches!(items[1], ItemContent::Image { reference: Some(r), description, .. }
+                    if r == &reference && description == &reference.label())
             );
             assert!(matches!(
-                &items[2].content,
+                items[2],
                 ItemContent::Image {
                     reference: None,
-                    ..
-                }
+                    description,
+                    path,
+                } if description.is_empty() && path.starts_with("data:image/")
             ));
         });
     }
