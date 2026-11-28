@@ -50,11 +50,10 @@ as working native buttons.
 
 Codex owner recovery requires positive evidence: reconnect to the retained
 owner, or resume after confirmed close or a kernel boot change. Uncertain
-same-boot ownership refuses to start another writer. The daemon-death durability
-allowlist is 0.157.1, 0.160.1 and 0.161.0, each qualified through a killed daemon as
-[the daemon guide](daemon.md#native-provider-continuity) describes; 0.159.3 was
-tested only for connection loss against a local mock API, which does not
-establish that guarantee, so it is not listed.
+same-boot ownership refuses to start another writer. The daemon guide lists the
+versions qualified through a killed daemon. The 0.159.3 connection-loss
+experiment left daemon-death behavior unverified.
+[Native provider continuity](daemon.md#native-provider-continuity)
 
 Validation uses recorded protocol fixtures, fake provider executables in an
 isolated native UI session, and a real Codex executable against a local mock
