@@ -2543,6 +2543,21 @@ impl GlobalScope {
         }
     }
 
+    /// The "site for cookies" of this global's environment, which decides
+    /// whether its requests carry `SameSite=Lax` and `SameSite=Strict` cookies.
+    /// A dedicated worker uses its owner's. Other workers and worklets use an
+    /// opaque origin, so their requests are treated as cross-site.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re>
+    pub(crate) fn site_for_cookies(&self) -> ImmutableOrigin {
+        if let Some(window) = self.downcast::<Window>() {
+            return window.Document().site_for_cookies();
+        }
+        if let Some(worker) = self.downcast::<DedicatedWorkerGlobalScope>() {
+            return worker.site_for_cookies().clone();
+        }
+        ImmutableOrigin::new_opaque()
+    }
+
     /// <https://html.spec.whatwg.org/multipage/#nested-browsing-context>
     pub(crate) fn is_nested_browsing_context(&self) -> bool {
         self.downcast::<Window>()
@@ -3329,6 +3344,7 @@ impl GlobalScope {
         request_builder: RequestBuilder,
         network_listener: NetworkListener<Listener>,
     ) {
+        let request_builder = request_builder.site_for_cookies(self.site_for_cookies());
         fetch_async(
             &self.core_resource_thread(),
             request_builder,

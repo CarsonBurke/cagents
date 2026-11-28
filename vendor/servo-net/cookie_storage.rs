@@ -19,7 +19,7 @@ use net_traits::{CookieSource, SiteDescriptor};
 use serde::{Deserialize, Serialize};
 use servo_url::ServoUrl;
 
-use crate::cookie::ServoCookie;
+use crate::cookie::{SameSiteContext, ServoCookie};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CookieStorage {
@@ -213,8 +213,23 @@ impl CookieStorage {
     // http://tools.ietf.org/html/rfc6265#section-5.4
     pub fn cookies_for_url(&mut self, url: &ServoUrl, source: CookieSource) -> Option<String> {
         // Let cookie-list be the set of cookies from the cookie store
-        let cookie_list = self.cookies_data_for_url(url, source);
+        let cookie_list = self.matching_cookies(url, source, None);
+        Self::cookie_string(cookie_list)
+    }
 
+    /// The `Cookie` header for an HTTP request to `url`, leaving out the
+    /// `SameSite` cookies that `context` excludes.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-retrieval-algorithm>
+    pub fn cookies_for_request(
+        &mut self,
+        url: &ServoUrl,
+        context: SameSiteContext,
+    ) -> Option<String> {
+        let cookie_list = self.matching_cookies(url, CookieSource::HTTP, Some(context));
+        Self::cookie_string(cookie_list)
+    }
+
+    fn cookie_string(cookie_list: impl Iterator<Item = Cookie<'static>>) -> Option<String> {
         let reducer = |acc: String, cookie: Cookie<'static>| -> String {
             // Serialize the cookie-list into a cookie-string by processing each cookie in the cookie-list in order:
             // If the cookies' name is not empty, output the cookie's name followed by the %x3D ("=") character.
@@ -266,12 +281,27 @@ impl CookieStorage {
         url: &'a ServoUrl,
         source: CookieSource,
     ) -> impl Iterator<Item = cookie::Cookie<'static>> + 'a {
+        self.matching_cookies(url, source, None)
+    }
+
+    /// The cookies for `url`, also applying `SameSite` when there is a request
+    /// `context`. Without one, as for `document.cookie` and the embedder's
+    /// cookie APIs, `SameSite` is not applied.
+    fn matching_cookies<'a>(
+        &'a mut self,
+        url: &'a ServoUrl,
+        source: CookieSource,
+        context: Option<SameSiteContext>,
+    ) -> impl Iterator<Item = cookie::Cookie<'static>> + 'a {
         let domain = reg_host(url.host_str().unwrap_or(""));
         let cookies = self.cookies_map.entry(domain).or_default();
 
         cookies
             .iter_mut()
-            .filter(move |c| c.appropriate_for_url(url, source))
+            .filter(move |c| match context {
+                Some(context) => c.appropriate_for_request(url, context),
+                None => c.appropriate_for_url(url, source),
+            })
             .sorted_by(|a: &&mut ServoCookie, b: &&mut ServoCookie| {
                 // The user agent SHOULD sort the cookie-list
                 CookieStorage::cookie_comparator(a, b)

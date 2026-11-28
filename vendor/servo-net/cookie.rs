@@ -9,10 +9,12 @@ use std::borrow::ToOwned;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::time::SystemTime;
 
-use cookie::Cookie;
+use cookie::{Cookie, SameSite};
+use http::Method;
 use log::{Level, debug, log_enabled};
 use net_traits::CookieSource;
 use net_traits::pub_domains::is_pub_domain;
+use net_traits::request::Request;
 use nom::branch::alt;
 use nom::bytes::complete::{tag, tag_no_case, take, take_while_m_n};
 use nom::combinator::{opt, recognize};
@@ -219,7 +221,17 @@ impl ServoCookie {
 
         // TODO: Step 16, Ignore cookies from insecure request uris based on existing cookies
 
-        // TODO: Steps 17-19, same-site-flag
+        // Steps 17-18. The same-site-flag is the cookie's `SameSite` attribute,
+        // or "Default" when it has none. Servo does not treat "Default" as
+        // "Lax". A restricted cookie received from a cross-site request is
+        // rejected by `SameSiteContext::permits_storage`, because only the
+        // caller knows the request.
+
+        // Step 19. If the cookie's same-site-flag is "None", abort these steps
+        // and ignore the cookie entirely unless the cookie's secure-only-flag is true.
+        if cookie.same_site() == Some(SameSite::None) && !secure_only {
+            return None;
+        }
 
         // Step 20. If the cookie-name begins with a case-insensitive match for the string "__Secure-",
         // abort these steps and ignore the cookie entirely unless the cookie's secure-only-flag is true.
@@ -336,6 +348,14 @@ impl ServoCookie {
                 string.parse::<Ipv6Addr>().is_err())
     }
 
+    /// The retrieval algorithm's `SameSite` exclusion for a cookie whose other
+    /// attributes already match the request.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-retrieval-algorithm>
+    pub fn appropriate_for_request(&self, url: &ServoUrl, context: SameSiteContext) -> bool {
+        self.appropriate_for_url(url, CookieSource::HTTP) &&
+            context.permits_retrieval(self.cookie.same_site())
+    }
+
     /// <http://tools.ietf.org/html/rfc6265#section-5.4> step 1
     pub fn appropriate_for_url(&self, url: &ServoUrl, source: CookieSource) -> bool {
         if log_enabled!(Level::Debug) {
@@ -379,8 +399,8 @@ impl ServoCookie {
         if self.cookie.http_only().unwrap_or(false) && source == CookieSource::NonHTTP {
             return false;
         }
-        // TODO: Apply same site checks
-        // TOOD: Apply Partitioning checks
+        // `SameSite` is applied by `appropriate_for_request`, for callers that
+        // have a request. TODO: Apply Partitioning checks
 
         true
     }
@@ -651,4 +671,61 @@ impl ServoCookie {
             .iter()
             .any(|c| *c == 0x7f || (*c <= 0x1f && *c != 0x09))
     }
+}
+
+/// How a request relates to its client's site, which decides whether a
+/// `SameSite=Lax` or `SameSite=Strict` cookie may accompany it or be set by its
+/// response. Cookies with `SameSite=None`, or with no `SameSite` attribute,
+/// are not restricted.
+/// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re>
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct SameSiteContext {
+    /// Every URL the request has visited is same-site with its client's site for cookies.
+    pub same_site: bool,
+    /// The request navigates a top-level traversable.
+    pub top_level_navigation: bool,
+    /// The request's method is safe: `GET`, `HEAD`, `OPTIONS` or `TRACE`.
+    pub safe_method: bool,
+}
+
+impl SameSiteContext {
+    pub fn for_request(request: &Request) -> SameSiteContext {
+        SameSiteContext {
+            same_site: request.is_same_site_for_cookies(),
+            top_level_navigation: request.is_top_level_navigation(),
+            safe_method: is_safe_method(&request.method),
+        }
+    }
+
+    /// The `SameSite` step of the retrieval algorithm: a restricted cookie is
+    /// excluded from a cross-site request, except that a `Lax` cookie still
+    /// accompanies a top-level navigation with a safe method.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-retrieval-algorithm>
+    pub fn permits_retrieval(&self, same_site: Option<SameSite>) -> bool {
+        match same_site {
+            Some(SameSite::Strict) => self.same_site,
+            Some(SameSite::Lax) => {
+                self.same_site || (self.top_level_navigation && self.safe_method)
+            },
+            Some(SameSite::None) | None => true,
+        }
+    }
+
+    /// Step 18 of the storage model: a restricted cookie is stored only from a
+    /// same-site request or a top-level navigation, whatever its method.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-storage-model>
+    pub fn permits_storage(&self, same_site: Option<SameSite>) -> bool {
+        match same_site {
+            Some(SameSite::Strict | SameSite::Lax) => self.same_site || self.top_level_navigation,
+            Some(SameSite::None) | None => true,
+        }
+    }
+}
+
+/// <https://httpwg.org/specs/rfc9110.html#safe.methods>
+fn is_safe_method(method: &Method) -> bool {
+    matches!(
+        *method,
+        Method::GET | Method::HEAD | Method::OPTIONS | Method::TRACE
+    )
 }

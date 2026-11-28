@@ -22,7 +22,7 @@ use http::HeaderMap;
 use http::header::{self, HeaderName, HeaderValue};
 use ipc_channel::ipc::IpcSender;
 use log::{debug, trace, warn};
-use net_traits::request::{RequestBuilder, RequestMode};
+use net_traits::request::{RequestBuilder, RequestMode, is_same_site_for_cookies};
 use net_traits::{CookieSource, MessageData, WebSocketDomAction, WebSocketNetworkEvent};
 use servo_base::generic_channel::CallbackSetter;
 use servo_url::ServoUrl;
@@ -37,7 +37,7 @@ use tungstenite::{ClientRequestBuilder, Message};
 
 use crate::async_runtime::spawn_task;
 use crate::connector::TlsConfig;
-use crate::cookie::ServoCookie;
+use crate::cookie::{SameSiteContext, ServoCookie};
 use crate::hosts::replace_host;
 use crate::http_loader::HttpState;
 
@@ -96,9 +96,15 @@ pub fn create_handshake_request(
         headers.insert("Sec-WebSocket-Protocol", HeaderValue::from_str(&protocols)?);
     }
 
+    // A WebSocket handshake is a subresource request with a safe method.
+    let same_site = SameSiteContext {
+        same_site: is_same_site_for_cookies(&request.site_for_cookies, &request.url),
+        top_level_navigation: false,
+        safe_method: true,
+    };
     let mut cookie_jar = http_state.cookie_jar.write();
     cookie_jar.remove_expired_cookies_for_url(&request.url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(&request.url, CookieSource::HTTP) {
+    if let Some(cookie_list) = cookie_jar.cookies_for_request(&request.url, same_site) {
         headers.insert("Cookie", HeaderValue::from_str(&cookie_list)?);
     }
 
@@ -125,6 +131,7 @@ fn process_ws_response(
     response: &Response,
     resource_url: &ServoUrl,
     protocols: &[String],
+    same_site: SameSiteContext,
 ) -> Result<Option<String>, Error> {
     trace!("processing websocket http response for {}", resource_url);
     let mut protocol_in_use = None;
@@ -149,7 +156,9 @@ fn process_ws_response(
             if let Some(cookie) =
                 ServoCookie::from_cookie_string(s, resource_url, CookieSource::HTTP)
             {
-                jar.push(cookie, resource_url, CookieSource::HTTP);
+                if same_site.permits_storage(cookie.cookie.same_site()) {
+                    jar.push(cookie, resource_url, CookieSource::HTTP);
+                }
             }
         }
     }
@@ -353,7 +362,13 @@ pub(crate) async fn start_websocket(
     let (stream, response) =
         client_async_tls_with_connector_and_config(builder, socket, Some(connector), None).await?;
 
-    let protocol_in_use = process_ws_response(&http_state, &response, &url, protocols)?;
+    let protocol_in_use = process_ws_response(
+        &http_state,
+        &response,
+        &url,
+        protocols,
+        SameSiteContext::for_request(client),
+    )?;
 
     if !initiated_close.load(Ordering::SeqCst) {
         if resource_event_sender

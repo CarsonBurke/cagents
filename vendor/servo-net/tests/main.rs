@@ -20,6 +20,7 @@ mod http_cache;
 mod http_loader;
 mod image_cache;
 mod resource_thread;
+mod same_site;
 mod subresource_integrity;
 use std::sync::Arc;
 

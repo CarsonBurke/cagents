@@ -1639,6 +1639,7 @@ pub(crate) fn fetch_a_single_module_script(
         );
         match document {
             Some(document) => {
+                let request = request.site_for_cookies(document.site_for_cookies());
                 document.loader_mut().fetch_async_with_callback(
                     LoadType::Script(url),
                     request,

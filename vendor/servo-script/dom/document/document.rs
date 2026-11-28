@@ -39,7 +39,7 @@ use net_traits::CookieSource::NonHTTP;
 use net_traits::CoreResourceMsg::{GetCookieStringForUrl, SetCookiesForUrl};
 use net_traits::ReferrerPolicy;
 use net_traits::policy_container::PolicyContainer;
-use net_traits::pub_domains::is_pub_domain;
+use net_traits::pub_domains::{is_pub_domain, is_same_site};
 use net_traits::request::{
     InsecureRequestsPolicy, PreloadId, PreloadKey, PreloadedResources, RequestBuilder,
 };
@@ -2132,7 +2132,8 @@ impl Document {
     ) {
         request = request
             .insecure_requests_policy(self.insecure_requests_policy())
-            .has_trustworthy_ancestor_origin(self.has_trustworthy_ancestor_or_current_origin());
+            .has_trustworthy_ancestor_origin(self.has_trustworthy_ancestor_or_current_origin())
+            .site_for_cookies(self.site_for_cookies());
         let callback = NetworkListener {
             context: std::sync::Arc::new(Mutex::new(Some(listener))),
             task_source: self
@@ -2153,7 +2154,8 @@ impl Document {
     ) {
         request = request
             .insecure_requests_policy(self.insecure_requests_policy())
-            .has_trustworthy_ancestor_origin(self.has_trustworthy_ancestor_or_current_origin());
+            .has_trustworthy_ancestor_origin(self.has_trustworthy_ancestor_or_current_origin())
+            .site_for_cookies(self.site_for_cookies());
         let callback = NetworkListener {
             context: std::sync::Arc::new(Mutex::new(Some(listener))),
             task_source: self
@@ -4965,6 +4967,30 @@ impl Document {
     pub(crate) fn has_trustworthy_ancestor_or_current_origin(&self) -> bool {
         self.has_trustworthy_ancestor_origin.get() ||
             self.origin().immutable().is_potentially_trustworthy()
+    }
+
+    /// The "site for cookies" of this document: the top-level document's
+    /// origin if this document and every ancestor are same-site with it, and
+    /// an opaque origin otherwise.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
+    pub(crate) fn site_for_cookies(&self) -> ImmutableOrigin {
+        let origin = self.origin().immutable().clone();
+        let mut top_origin = origin.clone();
+        let mut parent = self.window().parent_info();
+        while let Some(pipeline_id) = parent {
+            // Servo gives each site its own event loop, so an ancestor that is
+            // not in this one is cross-site, and so is one that is gone.
+            let Some(ancestor) = ScriptThread::find_document(pipeline_id) else {
+                return ImmutableOrigin::new_opaque();
+            };
+            let ancestor_origin = ancestor.origin().immutable().clone();
+            if !is_same_site(&ancestor_origin, &origin) {
+                return ImmutableOrigin::new_opaque();
+            }
+            top_origin = ancestor_origin;
+            parent = ancestor.window().parent_info();
+        }
+        top_origin
     }
 
     pub(crate) fn highlight_dom_node(&self, node: Option<&Node>) {

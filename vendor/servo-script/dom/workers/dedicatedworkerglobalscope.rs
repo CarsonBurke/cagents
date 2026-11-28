@@ -214,6 +214,10 @@ pub(crate) struct DedicatedWorkerGlobalScope {
     #[no_trace]
     queued_worker_tasks: DomRefCell<Vec<MessageData>>,
     debugger_global: Dom<DebuggerGlobalScope>,
+    /// The owner's site for cookies, fixed when the worker is created.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-dedicated-and-shared-worke>
+    #[no_trace]
+    site_for_cookies: ImmutableOrigin,
 }
 
 impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
@@ -259,6 +263,10 @@ impl WorkerEventLoopMethods for DedicatedWorkerGlobalScope {
 }
 
 impl DedicatedWorkerGlobalScope {
+    pub(crate) fn site_for_cookies(&self) -> &ImmutableOrigin {
+        &self.site_for_cookies
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn new_inherited(
         init: WorkerGlobalScopeInit,
@@ -279,6 +287,7 @@ impl DedicatedWorkerGlobalScope {
         insecure_requests_policy: InsecureRequestsPolicy,
         font_context: Option<Arc<FontContext>>,
         debugger_global: &DebuggerGlobalScope,
+        site_for_cookies: ImmutableOrigin,
     ) -> DedicatedWorkerGlobalScope {
         DedicatedWorkerGlobalScope {
             workerglobalscope: WorkerGlobalScope::new_inherited(
@@ -304,6 +313,7 @@ impl DedicatedWorkerGlobalScope {
             control_receiver,
             queued_worker_tasks: Default::default(),
             debugger_global: Dom::from_ref(debugger_global),
+            site_for_cookies,
         }
     }
 
@@ -327,6 +337,7 @@ impl DedicatedWorkerGlobalScope {
         insecure_requests_policy: InsecureRequestsPolicy,
         font_context: Option<Arc<FontContext>>,
         debugger_global: &DebuggerGlobalScope,
+        site_for_cookies: ImmutableOrigin,
         cx: &mut js::context::JSContext,
     ) -> DomRoot<DedicatedWorkerGlobalScope> {
         let scope = Box::new(DedicatedWorkerGlobalScope::new_inherited(
@@ -349,6 +360,7 @@ impl DedicatedWorkerGlobalScope {
             insecure_requests_policy,
             font_context,
             debugger_global,
+            site_for_cookies,
         ));
         DedicatedWorkerGlobalScopeBinding::Wrap::<crate::DomTypeHolder>(cx, scope)
     }
@@ -387,6 +399,7 @@ impl DedicatedWorkerGlobalScope {
         let current_global_ancestor_trustworthy = current_global.has_trustworthy_ancestor_origin();
         let is_secure_context = current_global.is_secure_context();
         let is_nested_browsing_context = current_global.is_nested_browsing_context();
+        let site_for_cookies = current_global.site_for_cookies();
 
         let worker_type = worker_options.type_;
         let worker_name = worker_options.name.to_string();
@@ -489,6 +502,7 @@ impl DedicatedWorkerGlobalScope {
                     insecure_requests_policy,
                     font_context,
                     &debugger_global,
+                    site_for_cookies,
                     cx,
                 );
                 debugger_global.fire_add_debuggee(

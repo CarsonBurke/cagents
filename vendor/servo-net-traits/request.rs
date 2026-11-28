@@ -475,6 +475,14 @@ pub struct RequestBuilder {
     pub policy_container: RequestPolicyContainer,
     pub insecure_requests_policy: InsecureRequestsPolicy,
     pub has_trustworthy_ancestor_origin: bool,
+    /// The "site for cookies" of the request's client, which decides whether
+    /// `SameSite=Lax` and `SameSite=Strict` cookies accompany the request.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
+    ///
+    /// cagents: this defaults to a new opaque origin, which is same-site with
+    /// nothing, so a request whose client does not establish its site for
+    /// cookies is treated as cross-site and is not sent restricted cookies.
+    pub site_for_cookies: ImmutableOrigin,
 
     /// <https://fetch.spec.whatwg.org/#concept-request-referrer>
     pub referrer: Referrer,
@@ -531,6 +539,7 @@ impl RequestBuilder {
             policy_container: RequestPolicyContainer::default(),
             insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
             has_trustworthy_ancestor_origin: false,
+            site_for_cookies: ImmutableOrigin::new_opaque(),
             referrer,
             referrer_policy: ReferrerPolicy::EmptyString,
             pipeline_id: None,
@@ -705,6 +714,12 @@ impl RequestBuilder {
         self
     }
 
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
+    pub fn site_for_cookies(mut self, site_for_cookies: ImmutableOrigin) -> RequestBuilder {
+        self.site_for_cookies = site_for_cookies;
+        self
+    }
+
     /// <https://fetch.spec.whatwg.org/#request-service-workers-mode>
     pub fn service_workers_mode(
         mut self,
@@ -762,6 +777,7 @@ impl RequestBuilder {
         request.policy_container = self.policy_container;
         request.insecure_requests_policy = self.insecure_requests_policy;
         request.has_trustworthy_ancestor_origin = self.has_trustworthy_ancestor_origin;
+        request.site_for_cookies = self.site_for_cookies;
         request
     }
 
@@ -847,6 +863,14 @@ pub struct Request {
     /// <https://w3c.github.io/webappsec-upgrade-insecure-requests/#insecure-requests-policy>
     pub insecure_requests_policy: InsecureRequestsPolicy,
     pub has_trustworthy_ancestor_origin: bool,
+    /// The "site for cookies" of the request's client, which decides whether
+    /// `SameSite=Lax` and `SameSite=Strict` cookies accompany the request.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
+    ///
+    /// cagents: this defaults to a new opaque origin, which is same-site with
+    /// nothing, so a request whose client does not establish its site for
+    /// cookies is treated as cross-site and is not sent restricted cookies.
+    pub site_for_cookies: ImmutableOrigin,
     pub https_state: HttpsState,
     /// Servo internal: if crash details are present, trigger a crash error page with these details.
     pub crash: Option<String>,
@@ -897,6 +921,7 @@ impl Request {
             policy_container: RequestPolicyContainer::Client,
             insecure_requests_policy: InsecureRequestsPolicy::DoNotUpgrade,
             has_trustworthy_ancestor_origin: false,
+            site_for_cookies: ImmutableOrigin::new_opaque(),
             https_state,
             crash: None,
         }
@@ -925,6 +950,27 @@ impl Request {
     /// <https://fetch.spec.whatwg.org/#concept-request-current-url>
     pub fn current_url_mut(&mut self) -> &mut ServoUrl {
         self.url_list.last_mut().unwrap()
+    }
+
+    /// Whether this request navigates a top-level traversable, in which case
+    /// `SameSite=Lax` cookies accompany it even from another site when its
+    /// method is safe. A request without a client is treated as nested.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-top-level-navigations>
+    pub fn is_top_level_navigation(&self) -> bool {
+        self.mode == RequestMode::Navigate &&
+            self.client
+                .as_ref()
+                .is_some_and(|client| !client.is_nested_browsing_context)
+    }
+
+    /// Whether every URL in this request's URL list is same-site with its
+    /// site for cookies, so that a redirect through another site makes the
+    /// request cross-site.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re>
+    pub fn is_same_site_for_cookies(&self) -> bool {
+        self.url_list
+            .iter()
+            .all(|url| is_same_site_for_cookies(&self.site_for_cookies, url))
     }
 
     /// <https://fetch.spec.whatwg.org/#navigation-request>
@@ -1276,4 +1322,27 @@ pub fn create_request_body_with_content(content: &str) -> RequestBody {
     );
 
     RequestBody::new(chunk_request_sender, BodySource::Object, Some(content_len))
+}
+
+/// Whether `url` is same-site with `site_for_cookies` for SameSite cookie
+/// decisions. WebSocket URLs are compared under their HTTP equivalents, so
+/// `wss://example.com` is same-site with `https://example.com`.
+/// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-same-site-and-cross-site-re>
+pub fn is_same_site_for_cookies(site_for_cookies: &ImmutableOrigin, url: &ServoUrl) -> bool {
+    let http_scheme = match url.scheme() {
+        "ws" => Some("http"),
+        "wss" => Some("https"),
+        _ => None,
+    };
+    let origin = match http_scheme {
+        Some(scheme) => {
+            let mut url = url.as_url().clone();
+            if url.set_scheme(scheme).is_err() {
+                return false;
+            }
+            ServoUrl::from_url(url).origin()
+        },
+        None => url.origin(),
+    };
+    is_same_site(site_for_cookies, &origin)
 }

@@ -739,7 +739,9 @@ pub(crate) fn load_whole_resource(
     csp_violations_processor: &dyn CspViolationsProcessor,
     cx: &mut js::context::JSContext,
 ) -> Result<(Metadata, Vec<u8>, bool), NetworkError> {
-    let request = request.https_state(global.get_https_state());
+    let request = request
+        .https_state(global.get_https_state())
+        .site_for_cookies(global.site_for_cookies());
     let (action_sender, action_receiver) = ipc::channel().unwrap();
     let url = request.url.clone();
     core_resource_thread
@@ -787,6 +789,7 @@ impl RequestWithGlobalScope for RequestBuilder {
     fn with_global_scope(self, global: &GlobalScope) -> Self {
         self.insecure_requests_policy(global.insecure_requests_policy())
             .has_trustworthy_ancestor_origin(global.has_trustworthy_ancestor_or_current_origin())
+            .site_for_cookies(global.site_for_cookies())
             .policy_container(global.policy_container())
             .client(global.request_client())
             .pipeline_id(Some(global.pipeline_id()))

@@ -79,7 +79,7 @@ use crate::async_runtime::spawn_task;
 use crate::connector::{
     CertificateErrorOverrideManager, ServoClient, TlsHandshakeInfo, create_tls_config,
 };
-use crate::cookie::ServoCookie;
+use crate::cookie::{SameSiteContext, ServoCookie};
 use crate::cookie_storage::CookieStorage;
 use crate::decoder::Decoder;
 use crate::embedder::NetToEmbedderMsg;
@@ -333,10 +333,11 @@ fn set_request_cookies(
     url: &ServoUrl,
     headers: &mut HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
+    same_site: SameSiteContext,
 ) {
     let mut cookie_jar = cookie_jar.write();
     cookie_jar.remove_expired_cookies_for_url(url);
-    if let Some(cookie_list) = cookie_jar.cookies_for_url(url, CookieSource::HTTP) {
+    if let Some(cookie_list) = cookie_jar.cookies_for_request(url, same_site) {
         headers.insert(
             header::COOKIE,
             HeaderValue::from_bytes(cookie_list.as_bytes()).unwrap(),
@@ -344,12 +345,19 @@ fn set_request_cookies(
     }
 }
 
-fn set_cookie_for_url(cookie_jar: &RwLock<CookieStorage>, request: &ServoUrl, cookie_val: &str) {
+fn set_cookie_for_url(
+    cookie_jar: &RwLock<CookieStorage>,
+    request: &ServoUrl,
+    cookie_val: &str,
+    same_site: SameSiteContext,
+) {
     let mut cookie_jar = cookie_jar.write();
     let source = CookieSource::HTTP;
 
     if let Some(cookie) = ServoCookie::from_cookie_string(cookie_val, request, source) {
-        cookie_jar.push(cookie, request, source);
+        if same_site.permits_storage(cookie.cookie.same_site()) {
+            cookie_jar.push(cookie, request, source);
+        }
     }
 }
 
@@ -357,6 +365,7 @@ fn set_cookies_from_headers(
     url: &ServoUrl,
     headers: &HeaderMap,
     cookie_jar: &RwLock<CookieStorage>,
+    same_site: SameSiteContext,
 ) {
     for cookie in headers.get_all(header::SET_COOKIE) {
         let cookie_bytes = cookie.as_bytes();
@@ -364,7 +373,7 @@ fn set_cookies_from_headers(
             continue;
         }
         if let Ok(cookie_str) = std::str::from_utf8(cookie_bytes) {
-            set_cookie_for_url(cookie_jar, url, cookie_str);
+            set_cookie_for_url(cookie_jar, url, cookie_str, same_site);
         }
     }
 }
@@ -1623,10 +1632,12 @@ async fn http_network_or_cache_fetch(
         // Substep 1
         // TODO http://mxr.mozilla.org/servo/source/components/net/http_loader.rs#504
         // XXXManishearth http_loader has block_cookies: support content blocking here too
+        let same_site = SameSiteContext::for_request(http_request);
         set_request_cookies(
             &current_url,
             &mut http_request.headers,
             &context.state.cookie_jar,
+            same_site,
         );
         // Substep 2
         if !http_request.headers.contains_key(header::AUTHORIZATION) {
@@ -2095,6 +2106,7 @@ async fn http_network_fetch(
 
     // Step 1: Let request be fetchParams’s request.
     let request = &mut fetch_params.request;
+    let same_site = SameSiteContext::for_request(request);
 
     // Step 2
     // TODO be able to create connection using current url's origin and credentials
@@ -2405,7 +2417,12 @@ async fn http_network_fetch(
     // TODO this step isn't possible yet
     // Step 15
     if credentials_flag {
-        set_cookies_from_headers(&url, &response.headers, &context.state.cookie_jar);
+        set_cookies_from_headers(
+            &url,
+            &response.headers,
+            &context.state.cookie_jar,
+            same_site,
+        );
     }
     context
         .state

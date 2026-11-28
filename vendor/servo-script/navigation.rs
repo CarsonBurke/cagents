@@ -15,6 +15,7 @@ use embedder_traits::{Theme, ViewportDetails, WebDriverLoadStatus};
 use http::header;
 use js::context::JSContext;
 use net_traits::policy_container::RequestPolicyContainer;
+use net_traits::pub_domains::is_same_site;
 use net_traits::request::{
     CredentialsMode, InsecureRequestsPolicy, Origin, PreloadedResources, RedirectMode,
     RequestBuilder, RequestClient, RequestMode,
@@ -210,6 +211,34 @@ impl InProgressLoad {
         }
     }
 
+    /// The site for cookies of this load's navigation request.
+    ///
+    /// A top-level navigation starts from its initiator's site, and from its own
+    /// URL's site when the user or the embedder started it, so that only a
+    /// navigation from another site is cross-site. A nested navigation uses its
+    /// parent's site for cookies, and is cross-site when a document on another
+    /// site started it.
+    /// <https://httpwg.org/http-extensions/draft-ietf-httpbis-rfc6265bis.html#name-document-based-requests>
+    fn site_for_cookies(&self) -> ImmutableOrigin {
+        let initiator = match self.load_data.load_origin {
+            LoadOrigin::Script(ref initiator) => Some(initiator.immutable().clone()),
+            LoadOrigin::Constellation | LoadOrigin::WebDriver => None,
+        };
+        let Some(parent) = self.parent_info else {
+            return initiator.unwrap_or_else(|| self.load_data.url.origin());
+        };
+        // A parent that is not in this event loop is on another site.
+        let Some(parent) = ScriptThread::find_document(parent) else {
+            return ImmutableOrigin::new_opaque();
+        };
+        match initiator {
+            Some(initiator) if !is_same_site(&initiator, &self.load_data.url.origin()) => {
+                ImmutableOrigin::new_opaque()
+            },
+            _ => parent.site_for_cookies(),
+        }
+    }
+
     pub(crate) fn request_builder(&mut self) -> RequestBuilder {
         let client_origin = match self.load_data.load_origin {
             LoadOrigin::Script(ref initiator_origin) => initiator_origin.immutable().clone(),
@@ -234,6 +263,8 @@ impl InProgressLoad {
             insecure_requests_policy,
         };
 
+        let site_for_cookies = self.site_for_cookies();
+
         let mut request_builder = RequestBuilder::new(
             Some(webview_id),
             self.load_data.url.clone(),
@@ -249,6 +280,7 @@ impl InProgressLoad {
         .policy_container(self.load_data.policy_container.clone().unwrap_or_default())
         .insecure_requests_policy(insecure_requests_policy)
         .has_trustworthy_ancestor_origin(self.load_data.has_trustworthy_ancestor_origin)
+        .site_for_cookies(site_for_cookies)
         .headers(self.load_data.headers.clone())
         .body(self.load_data.data.clone())
         .redirect_mode(RedirectMode::Manual)
