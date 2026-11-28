@@ -97,6 +97,8 @@ pub enum Operation {
     /// appended after it alike. Appended wire tag.
     Repository(String),
     CloseSessions(SessionCloseScope),
+    /// Refresh the owning daemon's provider discovery before reading Accounts.
+    AccountsRefresh,
 }
 /// Removing a project preserves independently owned sessions. Deleting a
 /// checkout closes all sessions inside the directory that is going away.
@@ -269,7 +271,7 @@ pub fn execute(operation: Operation) -> Result<Reply, String> {
         Operation::ProjectNavigation { repository, kind } => {
             navigation(repository, kind).map(Reply::ProjectNavigation)
         }
-        Operation::AccountsRead => accounts(),
+        Operation::AccountsRead | Operation::AccountsRefresh => accounts(),
         // Under the daemon, account preference changes run typed, through
         // [`account_default`] and [`update_accounts`], so a held account list
         // reaches the window as a retryable refusal.
@@ -2593,24 +2595,8 @@ fn accounts() -> Result<Reply, String> {
     .map_err(|error| error.to_string())?;
     let now = crate::chat::now_ms().unwrap_or_default();
     let cache = Cache::installation();
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .map_err(|error| error.to_string())?;
-    let search_path = runtime.block_on(probe::search_path());
-    let installed = [
-        crate::agent::Provider::Claude,
-        crate::agent::Provider::Codex,
-        crate::agent::Provider::Omp,
-    ]
-    .into_iter()
-    .map(|provider| {
-        (
-            provider,
-            probe::find_executable(provider.executable(), search_path.as_deref()).is_some(),
-        )
-    })
-    .collect();
+    let search_path = probe::current_search_path();
+    let installed = probe::provider_installations(search_path.as_deref());
     let cache_keys = registry
         .accounts(homes.as_ref())
         .into_iter()
@@ -2903,6 +2889,7 @@ mod wire_tests {
         }
         for request in [
             Operation::AccountsRead,
+            Operation::AccountsRefresh,
             Operation::AccountDefault {
                 expected_revision: 3,
                 provider: crate::agent::Provider::Claude,

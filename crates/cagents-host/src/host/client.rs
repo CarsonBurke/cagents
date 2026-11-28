@@ -1324,6 +1324,36 @@ fn process_wire_request(
             false,
         ));
     }
+    use crate::device_service::Operation::{AccountsRead, AccountsRefresh};
+    if let ClientRequest::DeviceOperation {
+        operation: operation @ (AccountsRead | AccountsRefresh),
+    } = &request
+    {
+        let refresh = matches!(operation, AccountsRefresh);
+        if refresh || !crate::account::probe::shell_asked() {
+            {
+                let _shared = gate.shared();
+                ensure_request_open(host, &request)?;
+                ensure_startup_recovery_request(host, &request)?;
+                super::agent_execution::terminals::admit(host, client_id, &request)?;
+            }
+            // Shell startup can take seconds. The normal admission below
+            // checks again before reading and sweeping the on-disk registry.
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    ProtocolError::new(ProtocolErrorCode::Internal, error.to_string(), false)
+                })?;
+            runtime.block_on(async {
+                if refresh {
+                    crate::account::probe::refresh_search_path().await;
+                } else {
+                    crate::account::probe::search_path().await;
+                }
+            });
+        }
+    }
     // Compiled only into debug builds, and inert outside a native-evidence
     // fixture that asks for it.
     #[cfg(debug_assertions)]
