@@ -41,8 +41,17 @@ pub(super) fn release(root: &Path) -> Result<Option<Release>, UpdateError> {
         .transpose()
 }
 
-pub(super) fn offers_release(root: &Path) -> bool {
-    root.join(RELEASE).exists()
+pub(super) fn current_version(root: &Path) -> Result<Option<String>, UpdateError> {
+    let Some(bytes) = read_fixture(&root.join(CURRENT))? else {
+        return Ok(None);
+    };
+    let version: String = serde_json::from_slice(&bytes)?;
+    installed_version(&version)?;
+    Ok(Some(version))
+}
+
+pub(super) fn has_check_result(root: &Path) -> bool {
+    root.join(RELEASE).exists() || root.join(CURRENT).exists()
 }
 
 /// Whether the fixture's release is offered as macOS offers one: through
@@ -52,6 +61,7 @@ pub(super) fn offers_installer(root: &Path) -> bool {
 }
 
 const RELEASE: &str = "home/.config/fixture-update-release.json";
+const CURRENT: &str = "home/.config/fixture-update-current.json";
 
 fn read_fixture(path: &Path) -> Result<Option<Vec<u8>>, UpdateError> {
     match read_private(path, JOB_STATE_LIMIT) {
@@ -162,11 +172,28 @@ mod tests {
     }
 
     #[test]
+    fn the_current_fixture_can_report_the_restored_version() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join(CURRENT);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        assert!(!has_check_result(root.path()));
+        assert!(current_version(root.path()).unwrap().is_none());
+
+        serde_json::to_writer(private_create(&path).unwrap(), "1.2.3").unwrap();
+
+        assert!(has_check_result(root.path()));
+        assert_eq!(
+            current_version(root.path()).unwrap().as_deref(),
+            Some("1.2.3")
+        );
+    }
+
+    #[test]
     fn the_release_fixture_is_offered_as_a_release() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("home/.config");
         fs::create_dir_all(&directory).unwrap();
-        assert!(!offers_release(root.path()));
+        assert!(!has_check_result(root.path()));
         assert!(release(root.path()).unwrap().is_none());
         let mut file = OpenOptions::new()
             .write(true)
@@ -176,7 +203,7 @@ mod tests {
             .unwrap();
         file.write_all(include_bytes!("../../tests/fixtures/update-release.json"))
             .unwrap();
-        assert!(offers_release(root.path()));
+        assert!(has_check_result(root.path()));
         let offered = release(root.path()).unwrap().unwrap();
         assert_eq!(offered.version, "9.8.7");
     }
