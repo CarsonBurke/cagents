@@ -15652,13 +15652,14 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     adapter.running = Some("claude-opus-5-5".into());
     let result_in = || {
         json!({"type":"result","subtype":"success","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001",
-            "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000},"claude-sonnet":{"contextWindow":200000}}})
+            "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000},
+                "provider.sonnet":{"canonicalModel":"claude-sonnet","contextWindow":200000}}})
     };
     adapter.receive(result_in()).unwrap();
     assert!(adapter.refresh_visible_context(&|| true).is_none());
+    // An older SDK can report an unresolved alias before B's first call.
     let model_switch = adapter
-        .receive(json!({"type":"assistant","uuid":"model-switch","message":{
-        "role":"assistant","model":"claude-sonnet","content":[]}}))
+        .receive(json!({"type":"system","subtype":"init","model":"sonnet"}))
         .unwrap();
     assert!(
         model_switch
@@ -15671,6 +15672,10 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}))
         .unwrap();
     assert_eq!(usage_of(&local_turn).unwrap().context_budget(), 0);
+    adapter
+        .receive(json!({"type":"assistant","uuid":"model-switch","message":{
+        "role":"assistant","model":"claude-sonnet","content":[]}}))
+        .unwrap();
     let switched = adapter.receive(result_in()).unwrap();
     assert!(switched.writes.is_empty());
     let usage = usage_of(&switched).unwrap();

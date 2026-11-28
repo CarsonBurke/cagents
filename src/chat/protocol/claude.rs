@@ -5425,22 +5425,22 @@ impl Claude {
                 }
                 if let Some(models) = frame["modelUsage"].as_object() {
                     let model = self.context_model.as_deref().or(self.running.as_deref());
-                    let data = model.and_then(|model| models.get(model)).or_else(|| {
+                    let data = match model {
+                        Some(model) => models.get(model).or_else(|| {
+                            // Model usage can be keyed by a provider-specific
+                            // request ID. A unique canonical match still
+                            // identifies the model the assistant reported.
+                            let mut matches = models
+                                .values()
+                                .filter(|entry| entry["canonicalModel"].as_str() == Some(model));
+                            let entry = matches.next()?;
+                            matches.next().is_none().then_some(entry)
+                        }),
                         // Local turns can repeat cumulative usage for a prior
-                        // model. Only fall back for unidentified or alias models.
-                        if models.len() == 1
-                            && model.is_none_or(|model| {
-                                matches!(
-                                    model,
-                                    "default" | "opus" | "sonnet" | "haiku" | "opusplan"
-                                )
-                            })
-                        {
-                            models.values().next()
-                        } else {
-                            None
-                        }
-                    });
+                        // model, so a sole row only helps without a model ID.
+                        None if models.len() == 1 => models.values().next(),
+                        None => None,
+                    };
                     if let Some(window) = data
                         .and_then(|data| data["contextWindow"].as_u64())
                         .filter(|window| *window > 0)
