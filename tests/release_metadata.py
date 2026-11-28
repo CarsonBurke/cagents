@@ -124,6 +124,34 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertIn("install-macos.sh", refused.stderr)
         self.assertFalse((self.release / "release-metadata.json").exists())
 
+    def test_android_assets_include_both_names_and_the_checksums(self):
+        apk, alias = f"cagents-android-{VERSION}.apk", "cagents-android.apk"
+        for name in (apk, alias):
+            (self.release / name).write_bytes(b"fixture APK")
+        sha = hashlib.sha256(b"fixture APK").hexdigest()
+        checksums = self.release / "SHA256SUMS-android"
+        checksums.write_text(f"{sha}  {apk}\n{sha}  {alias}\n")
+        self.write()
+        assets = json.loads((self.release / "release-metadata.json").read_bytes())["assets"]
+        self.assertEqual(assets[apk], assets[alias])
+        self.assertEqual(assets[apk]["sha256"], sha)
+        self.assertIn(checksums.name, assets)
+        run("check", "--dir", str(self.release))
+
+    def test_android_assets_refuse_a_partial_wrong_version_or_mismatched_set(self):
+        apk, alias = f"cagents-android-{VERSION}.apk", "cagents-android.apk"
+        (self.release / alias).write_bytes(b"wrong alias")
+        self.assertIn(apk, self.write(check=False).stderr)
+        (self.release / f"cagents-android-1.2.2.apk").write_bytes(b"wrong version")
+        self.assertIn(apk, self.write(check=False).stderr)
+        (self.release / "cagents-android-1.2.2.apk").unlink()
+        (self.release / apk).write_bytes(b"fixture APK")
+        (self.release / "SHA256SUMS-android").write_text("invalid\n")
+        self.assertIn("differs from", self.write(check=False).stderr)
+        (self.release / alias).write_bytes(b"fixture APK")
+        self.assertIn("does not match the two APKs", self.write(check=False).stderr)
+        self.assertFalse((self.release / "release-metadata.json").exists())
+
     def test_check_refuses_a_changed_added_or_removed_file(self):
         self.write()
         for change, message in (
