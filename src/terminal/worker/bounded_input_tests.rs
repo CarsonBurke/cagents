@@ -1443,8 +1443,7 @@ while True: time.sleep(1)
             .unwrap(),
         Ok(())
     );
-    assert!(worker.reader.is_some());
-    assert!(worker.reader_wake.is_some());
+    assert!(!worker.reader.as_ref().unwrap().stopping());
     assert_eq!(worker.pending_input.front(), accepted);
     assert_eq!(replies(&worker), vec![b"\x1b[1;1R".to_vec(); QUERIES]);
     assert!(!input_root_exited(&root.pidfd).unwrap());
@@ -1494,7 +1493,7 @@ while True: time.sleep(1)
     worker.test_write_budget = Some(0);
     let bytes = b"accepted before timed-out stable cut".to_vec();
     handle.input(bytes.clone()).unwrap();
-    let reader = worker.reader.as_ref().unwrap().thread().id();
+    let reader = worker.reader.as_ref().unwrap().id;
     let token = Arc::new(std::sync::atomic::AtomicBool::new(true));
     let (resumed, restarted) = crossbeam_channel::bounded(1);
     let started = Instant::now();
@@ -1510,7 +1509,7 @@ while True: time.sleep(1)
         restarted.try_recv(),
         Err(crossbeam_channel::TryRecvError::Empty)
     ));
-    assert_eq!(worker.reader.as_ref().unwrap().thread().id(), reader);
+    assert_eq!(worker.reader.as_ref().unwrap().id, reader);
     // Owner has not processed either accepted command yet. The exact timeout
     // token must cancel without discarding the earlier bytes or touching reader.
     worker.handle_command(worker.commands.try_recv().unwrap());
@@ -1522,8 +1521,8 @@ while True: time.sleep(1)
             .unwrap(),
         Ok(())
     );
-    assert_eq!(worker.reader.as_ref().unwrap().thread().id(), reader);
-    assert!(worker.reader_wake.is_some());
+    assert_eq!(worker.reader.as_ref().unwrap().id, reader);
+    assert!(!worker.reader.as_ref().unwrap().stopping());
     assert_eq!(worker.pending_input.front(), bytes);
     assert!(worker.input_handoff.is_none());
     assert!(!worker.published.input_order.lock().unwrap().handoff);
@@ -1598,7 +1597,7 @@ while True: time.sleep(1)
     assert!(worker.pending_input.is_empty());
     assert!(!worker.reply_pending());
     worker.test_write_budget = Some(0);
-    let old_reader = worker.reader.as_ref().unwrap().thread().id();
+    let old_reader = worker.reader.as_ref().unwrap().id;
     fs::write("precut-query-gate", b"query").unwrap();
     let deadline = Instant::now() + crate::test_timing::EVENTUALLY;
     while worker.pty_rx.is_empty() {
@@ -1634,11 +1633,11 @@ while True: time.sleep(1)
         Ok(())
     );
     assert_ne!(
-        worker.reader.as_ref().unwrap().thread().id(),
+        worker.reader.as_ref().unwrap().id,
         old_reader,
-        "refused cut must actually restart joined original reader"
+        "refused cut must actually replace the stopped reader"
     );
-    assert!(worker.reader_wake.is_some());
+    assert!(!worker.reader.as_ref().unwrap().stopping());
     assert_eq!(worker.pending_input.front(), b"\x1b[1;1R");
     assert_eq!(worker.pending_input.len(), 6);
     assert!(!worker.reply_pending());

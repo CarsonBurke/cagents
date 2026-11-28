@@ -4,6 +4,7 @@ use std::{
     collections::BTreeMap,
     ffi::OsStr,
     fs,
+    io::Read,
     os::unix::fs::{PermissionsExt, symlink},
     sync::atomic::{AtomicUsize, Ordering},
     time::{Duration, Instant},
@@ -728,36 +729,24 @@ fn a_terminal_whose_root_exits_ends_its_output_without_an_error() {
         exits,
     )
     .unwrap();
-    let mut reader = File::from(held.master.duplicate().unwrap());
-    let readiness = held.master.duplicate().unwrap();
-    let (wake_rx, _wake_tx) = wake_pipe().unwrap();
-    let (sender, messages) = crossbeam_channel::unbounded();
-    read_pty(
-        &mut reader,
-        &sender,
-        readiness,
-        wake_rx,
-        &AtomicBool::new(false),
-    );
-
-    let messages: Vec<_> = messages.try_iter().collect();
-    let output: Vec<u8> = messages
-        .iter()
-        .filter_map(|message| match message {
-            PtyMessage::Bytes(bytes) => Some(bytes.as_slice()),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect();
+    nonblocking_writer(&File::from(held.master.duplicate().unwrap())).unwrap();
+    let reader = Reader::start(&held.master, 8, Vec::new()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut output = Vec::new();
+    loop {
+        match reader.output.recv_deadline(deadline).unwrap() {
+            PtyMessage::Bytes(bytes) => {
+                reader.task.consumed();
+                output.extend(bytes);
+            }
+            PtyMessage::Eof => break,
+            PtyMessage::Error(error) => panic!("terminal ended with a read error: {error}"),
+        }
+    }
     assert!(String::from_utf8_lossy(&output).contains("finished"));
-    assert!(
-        matches!(messages.last(), Some(PtyMessage::Eof)),
-        "{:?}",
-        messages.last().map(|message| match message {
-            PtyMessage::Error(error) => error.as_str(),
-            _ => "not the end",
-        })
+    assert_eq!(
+        reader.task.done.recv_deadline(deadline),
+        Err(RecvTimeoutError::Disconnected)
     );
     let status = exited
         .recv_timeout(Duration::from_secs(5))
@@ -3485,25 +3474,17 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
             // XNU waits for the master to drain before reporting the shell's
             // exit. Use the same cancellable reader as the normal worker.
             drop(reader);
-            let Reader {
-                output: _output,
-                wake,
-                done,
-                thread,
-                discard_pending,
-                ..
-            } = Reader::start(TerminalId::new(), &held.master, 8, Vec::new()).unwrap();
-            discard_pending.store(true, Ordering::Release);
+            let mut reader = Reader::start(&held.master, 8, Vec::new()).unwrap();
+            reader.task.discard_pending();
             let result = shutdown();
-            drop(wake);
+            reader.task.stop();
             assert!(
                 matches!(
-                    done.recv_timeout(READER_SHUTDOWN_GRACE),
+                    reader.task.done.recv_timeout(READER_SHUTDOWN_GRACE),
                     Err(RecvTimeoutError::Disconnected)
                 ),
                 "the held PTY reader did not stop after shutdown"
             );
-            thread.join().unwrap();
             result
         };
         #[cfg(target_os = "linux")]
