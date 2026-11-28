@@ -195,7 +195,7 @@ fn panes_without_progress_are_reported_before_the_budget_once_the_daemon_is_read
     drop(deliver(&mut app, Ok(StartupState::Ready)));
     elapse(&mut app, NO_PROGRESS - Duration::from_secs(1));
     drop(app.verify_startup_gate());
-    assert_eq!(app.startup_gate.reported_notice(), None);
+    assert_eq!(reported(&app), None);
 
     elapse(&mut app, Duration::from_secs(2));
     drop(app.verify_startup_gate());
@@ -780,7 +780,7 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     drop(app.update(poll(Some(job.id.clone()), job)));
     assert!(!app.notices.has(NoticeKey::StartupRecovery));
     assert!(!app.notices.has(verification));
-    assert_eq!(reported(&app), None);
+    assert_eq!(app.startup_gate.reported_notice(), None);
     assert!(app.startup_terminal_gave_up(card));
     assert_eq!(
         app.startup_gave_up_caption(card),
