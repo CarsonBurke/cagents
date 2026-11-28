@@ -1,5 +1,5 @@
 #!/usr/bin/python3
-"""Contracts of tests/fixtures/offline-review-cache.py, run in a stand-in fixture.
+"""Contracts for the cached and live pull request review fixtures.
 
 The stand-in store has the review cache tables exactly as src/persistence.rs
 creates them. Whether the app reads the record back is shown natively: the
@@ -59,20 +59,32 @@ class OfflineReviewCache(unittest.TestCase):
 
     def git(self, directory, *arguments):
         return subprocess.run(["git", "-C", str(directory), *arguments], check=True, text=True,
-                              stdout=subprocess.PIPE, env={**os.environ, **QUIET_GIT}).stdout.strip()
+                              stdout=subprocess.PIPE, env={**os.environ, **QUIET_GIT, "GIT_ALLOW_PROTOCOL": "file"}).stdout.strip()
 
     def environment(self, **extra):
         return {"PATH": f"{self.fixture / 'bin'}:/usr/bin:/bin", "HOME": str(self.fixture / "home"),
                 "XDG_DATA_HOME": str(self.fixture / "data"), "CAGENTS_EVIDENCE_FIXTURE": str(self.fixture),
                 "CAGENTS_DEVELOPMENT_INSTANCE": "", **extra}
 
-    def helper(self, environment=None, check=True):
-        return subprocess.run(["/usr/bin/python3", "-I", str(HELPER)], text=True, capture_output=True,
+    def helper(self, *arguments, environment=None, check=True):
+        return subprocess.run(["/usr/bin/python3", "-I", str(HELPER), *arguments], text=True, capture_output=True,
                               check=check, env=self.environment() if environment is None else environment)
 
+    def gh_run(self, *arguments, check=True):
+        return subprocess.run(["gh", *arguments], cwd=self.fixture / "project", check=check,
+                              text=True, capture_output=True, env=self.environment())
+
     def gh(self, *arguments):
-        return json.loads(subprocess.run(["gh", *arguments], cwd=self.fixture / "project", check=True,
-                                         text=True, capture_output=True, env=self.environment()).stdout)
+        return json.loads(self.gh_run(*arguments).stdout)
+
+    def graphql(self, query, *, check=True):
+        return self.gh_run("api", "--include", "graphql", "-f", f"query={query}",
+                           "-f", "owner=OCTO-ORG", "-f", "name=Fixture-App", "-F", "number=57",
+                           check=check)
+
+    def refresh_query(self):
+        source = (ROOT / "src" / "github" / "review_refresh.rs").read_text()
+        return re.search(r'let query = "([^"]+)";', source)[1]
 
     def rows(self):
         connection = sqlite3.connect(self.store)
@@ -87,10 +99,10 @@ class OfflineReviewCache(unittest.TestCase):
         return reviews, files
 
     def test_it_refuses_outside_a_fixture_or_before_the_app_made_its_store(self):
-        missing = self.helper({"PATH": "/usr/bin:/bin", "HOME": str(self.fixture / "home")}, check=False)
+        missing = self.helper(environment={"PATH": "/usr/bin:/bin", "HOME": str(self.fixture / "home")}, check=False)
         self.assertEqual(missing.returncode, 2)
         self.assertIn("run it in a native-evidence fixture", missing.stderr)
-        elsewhere = self.helper(self.environment(HOME=self.directory.name), check=False)
+        elsewhere = self.helper(environment=self.environment(HOME=self.directory.name), check=False)
         self.assertEqual(elsewhere.returncode, 2)
         self.assertIn("not a native-evidence fixture", elsewhere.stderr)
         early = self.helper(check=False)
@@ -138,6 +150,53 @@ class OfflineReviewCache(unittest.TestCase):
         entries = [json.loads(row[2]) for row in files]
         self.assertEqual([(bytes(entry["path"]).decode(), entry["kind"]) for entry in entries],
                          [("docs/caching.md", "added"), ("src/cache.rs", "modified")])
+
+    def test_live_review_loads_the_canonical_repository_and_local_refs_without_a_cache(self):
+        printed = json.loads(self.helper("--live").stdout)
+        self.assertFalse(self.store.exists())
+        project = self.fixture / "project"
+        self.assertEqual(self.git(project, "config", "--get", "remote.origin.url"),
+                         "https://github.com/Octo-Org/Fixture-App")
+        self.assertEqual(self.gh("repo", "view", "--json", "nameWithOwner,url"),
+                         {"nameWithOwner": "octo-org/fixture-app", "url": "https://github.com/octo-org/fixture-app"})
+        self.assertEqual(self.gh("repo", "view", "OCTO-ORG/another", "--json", "nameWithOwner,url")["nameWithOwner"],
+                         "OCTO-ORG/another")
+        self.assertEqual(self.gh("pr", "view", "57", "-R", SELECTOR, "--json", "headRefOid,baseRefOid"),
+                         {"headRefOid": printed["head"], "baseRefOid": printed["base"]})
+        output = self.graphql(self.refresh_query())
+        headers, body = output.stdout.split("\n\n", 1)
+        self.assertIn("HTTP/2.0 200 OK", headers)
+        data = json.loads(body)["data"]
+        self.assertEqual(data["viewer"]["login"], "fixture")
+        review = data["repository"]["pullRequest"]
+        self.assertEqual(review["id"], "PR_fixture57")
+        self.assertEqual((review["headRefOid"], review["baseRefOid"]), (printed["head"], printed["base"]))
+        self.assertFalse(review["viewerDidAuthor"])
+        self.assertEqual([(node["path"], node["viewerViewedState"]) for node in review["files"]["nodes"]],
+                         [("docs/caching.md", "UNVIEWED"), ("src/cache.rs", "UNVIEWED")])
+        self.assertEqual(review["reviews"]["nodes"], [])
+        for section in ("reviewThreads", "reviews", "comments"):
+            query = f"query($number:Int!){{pullRequest(number:$number){{{section}(first:50,after:$cursor){{nodes{{id}}}}}}}}"
+            discussion = json.loads(self.graphql(query).stdout.split("\n\n", 1)[1])
+            self.assertEqual(discussion["data"]["repository"]["pullRequest"][section],
+                             {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}})
+
+        for name, remote_ref, oid in (("head", "refs/pull/57/head", printed["head"]),
+                                      ("base", "refs/heads/main", printed["base"])):
+            local_ref = f"refs/cagents/pull/57/{name}"
+            self.git(project, "update-ref", "-d", local_ref)
+            self.git(project, "fetch", "--quiet", "--no-tags", "--no-write-fetch-head", "--refmap=",
+                     "--end-of-options", "origin", f"+{remote_ref}:{local_ref}")
+            self.assertEqual(self.git(project, "rev-parse", local_ref), oid)
+        self.assertEqual(json.loads(self.helper("--live").stdout), printed)
+
+    def test_cached_review_still_gets_a_not_found_response(self):
+        self.make_store()
+        self.helper()
+        output = self.graphql(self.refresh_query(), check=False)
+        self.assertEqual(output.returncode, 1)
+        self.assertIn("Could not resolve to a PullRequest", output.stderr)
+        self.assertEqual(json.loads(output.stdout.split("\n\n", 1)[1])["errors"][0]["type"], "NOT_FOUND")
 
     def test_running_it_again_replaces_the_cache_and_keeps_other_seeds(self):
         self.make_store()

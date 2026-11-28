@@ -19,6 +19,8 @@ person.
 | A chat whose inspector lists the pull requests and worktrees it worked on | [`tests/fixtures/conversation-work.py`](#conversation-work), run through `scripts/native-evidence env python3 ...` before starting a Claude chat, or an Antigravity or Muse chat prompted with `work` |
 | A Work board of fourteen GitHub projects, optionally with the account's GraphQL quota spent | [`tests/fixtures/work-board-projects.py`](#many-projects-on-the-work-board), run through `scripts/native-evidence env python3 ...` |
 | A pull request review read from cache while GitHub is unavailable, with a restored draft line comment | [`tests/fixtures/offline-review-cache.py`](#an-offline-cached-review), run through `scripts/native-evidence env python3 ...` once the app has started |
+| A fresh pull request review, with different casing in the Git remote and the forge | [The live review fixture](#a-fresh-review-from-the-offline-forge) |
+| A manual automation run whose acknowledgement never reaches the UI | [The one-shot daemon reply marker](#an-accepted-automation-run-whose-reply-was-lost) |
 | The inert draft copy older windows kept beside a pane whose conversation came back with a new proof (#4115) | [`tests/fixtures/stale-chat-copy.py`](../tests/fixtures/stale-chat-copy.py)` TITLE [DRAFT]`, run through `scripts/native-evidence env python3 ...` with the app window closed; it copies the first chat of the channel titled TITLE |
 | A long saved chat for paging backward and forward | [`tests/fixtures/claude-long-history.py`](../tests/fixtures/claude-long-history.py)` PROJECT`, run through `scripts/native-evidence env python3 ...`; 260 numbered exchanges exceed the retained history window |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
@@ -431,6 +433,45 @@ evidence cli project open '{fixture}/project'
 sleep 12
 evidence shot sidebar-avatar
 ```
+
+## A fresh review from the offline forge
+
+Run the review fixture with `--live` in a fresh native-evidence task. It gives
+the project the remote `https://github.com/Octo-Org/Fixture-App` while the
+forge reports `octo-org/fixture-app` as the canonical name. The forge answers
+review context, files and discussion reads for #57, and Git fetches the
+base and head from the fixture's local repository.
+
+```sh
+scripts/native-evidence env python3 -I "$PWD/tests/fixtures/offline-review-cache.py" --live
+scripts/native-evidence cli project open '{fixture}/project'
+```
+
+Open **Pull requests in project** from the Worktrees pane and select
+**Key the response cache by locale**. The review should load its two changed
+files from a fresh fetch and show the review controls. Use the regular
+cached fixture below for a read-only review with a draft. The forge enables
+fresh review reads per pull request through its `fixtureReviewFiles` array.
+To supply canonical casing for another repository, put its `OWNER/NAME` in
+`home/.config/fixture-forge-canonical-repository` inside the fixture.
+
+## An accepted automation run whose reply was lost
+
+Start a native-evidence session with a saved automation that can run against
+an offline provider. Before clicking **Run now** and confirming, arm one
+reply drop:
+
+```sh
+scripts/native-evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/drop-automation-run-now-reply"'
+```
+
+The development daemon records the run as usual, consumes the marker and
+closes the UI's request connection before sending the acknowledgement.
+Wait for the accepted run to finish in **Run history**. Return to the
+automation and choose **Retry run…** to check that history still has one
+row for that run. The marker
+applies to the next successful **Run now** from the native UI. Failed
+requests, CLI commands and subsequent retries keep their normal replies.
 
 ## An offline cached review
 
