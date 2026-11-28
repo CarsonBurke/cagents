@@ -356,6 +356,15 @@ impl UpdateError {
 }
 
 impl UpdateJob {
+    /// Whether this recorded failure still concerns a release newer than the
+    /// installed build.
+    #[cfg(feature = "ui")]
+    pub fn is_failed_newer_release(&self, installed: &str) -> bool {
+        self.phase == UpdatePhase::Failed
+            && self.refusal.is_none()
+            && is_newer(&self.version, installed).unwrap_or(false)
+    }
+
     pub fn active_confirmation(&self) -> Option<&UpdateConfirmation> {
         matches!(
             self.phase,

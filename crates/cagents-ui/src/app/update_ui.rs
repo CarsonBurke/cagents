@@ -1431,11 +1431,7 @@ impl Cagents {
                 Some(UpdateState::Current { version }) => state
                     .job
                     .as_ref()
-                    .filter(|job| {
-                        job.phase == UpdatePhase::Failed
-                            && job.refusal.is_none()
-                            && job.version != *version
-                    })
+                    .filter(|job| job.is_failed_newer_release(version))
                     .map_or_else(
                         || ("cagents is up to date".to_owned(), false),
                         |job| (startup_gate::update_failure(&job.message).summary, true),
@@ -2112,6 +2108,19 @@ pub(in crate::app) mod tests {
         assert_eq!(summary.status, "cagents 9.1.2 is available");
         assert!(!summary.failed);
         assert_eq!(summary.available.unwrap().0, "9.1.2");
+
+        // An external installation can leave the failed job on disk.
+        for installed in ["9.1.1+local.abc", "9.1.10"] {
+            drop(
+                app.update_update_ui(Action::Checked(Ok(UpdateState::Current {
+                    version: installed.into(),
+                }))),
+            );
+            let summary = app.summarize_updates(false);
+            assert_eq!(summary.status, "cagents is up to date", "{installed}");
+            assert!(!summary.failed, "{installed}");
+            assert!(summary.available.is_none(), "{installed}");
+        }
     }
 
     /// A window reopened by an older worker can first read that worker's
