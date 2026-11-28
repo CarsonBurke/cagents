@@ -22,6 +22,11 @@ const CHECKS_SHOWN: usize = 6;
 /// While GitHub cannot be reached, a row checked longer ago than this says
 /// when it was.
 const STALE_AFTER_MS: u64 = 5 * 60 * 1000;
+/// How long the Work rows keep their order once sorted by when each last
+/// changed. An agent editing two worktrees by turns would otherwise swap
+/// them on every edit; at most once a minute, a row the user is about to
+/// press stays where it is.
+const RESORT_AFTER_MS: u64 = 60 * 1000;
 
 /// A piece of work the inspector can show the changes and files of.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,12 +161,19 @@ pub struct State {
     /// The daemon could not be asked for a list, and none has arrived. The
     /// watch keeps trying.
     lost: bool,
-    /// The Work rows in the order they were first shown, so a list that
-    /// fills in while GitHub answers never moves a row the user may be
-    /// about to click: work found later goes after what is shown, and a
-    /// worktree found to head a pull request becomes that pull request's row
-    /// where it is.
+    /// The Work rows in the order they are shown: the work that changed
+    /// most recently first, as of [`Self::sorted_at_unix_ms`]. Between
+    /// sorts no row moves, so a list that fills in while GitHub answers
+    /// never moves a row the user may be about to click: work found later
+    /// goes after what is shown, and a worktree found to head a pull
+    /// request becomes that pull request's row where it is.
     slots: Vec<Slot>,
+    /// The fallback scope when the conversation's worktree is unavailable.
+    /// The file and change panels follow this work's identity across sorts.
+    default_work: Option<Slot>,
+    /// When the rows were last sorted, by the daemon's clock, which each
+    /// list is dated by; `None` before any were shown.
+    sorted_at_unix_ms: Option<u64>,
     /// How many rows the Work section lists, counted once per list rather
     /// than on every frame that shows it.
     work_count: usize,
@@ -319,9 +331,9 @@ impl State {
             .collect()
     }
 
-    /// Every piece of work the conversation did, in the order its rows were
-    /// first shown, as [`Self::place`] last placed them; work it hasn't
-    /// placed goes last. `here` is the worktree the conversation runs in,
+    /// Every piece of work the conversation did, in the order
+    /// [`Self::place`] last placed its rows; work it hasn't placed goes
+    /// last. `here` is the worktree the conversation runs in,
     /// listed when none of the work is in a worktree Projects lists, which
     /// `openable` says, so its changes stay a click away.
     pub(crate) fn work<'a>(
@@ -343,9 +355,7 @@ impl State {
 
     /// The work the inspector shows: the one chosen while it is listed in
     /// `work` or `mentioned`, else the one of `work` where the conversation
-    /// runs, else the first checked out in a worktree Projects lists, which
-    /// `openable` says, so the panel has something to show. A mention is
-    /// shown only once chosen.
+    /// runs, else the fallback work. A mention is shown only once chosen.
     pub(crate) fn shown<'w>(
         &self,
         choices: &Choices,
@@ -363,12 +373,27 @@ impl State {
             .or_else(|| {
                 here.and_then(|here| work.iter().find(|work| work.worktree() == Some(here)))
             })
-            .or_else(|| {
-                work.iter()
-                    .find(|work| work.worktree().is_some_and(openable))
-            })
-            .or_else(|| work.first())
+            .or_else(|| self.default_shown(work, openable))
             .copied()
+    }
+
+    /// Prefer a checkout that can be opened and retain the current fallback
+    /// within that set while it is still listed.
+    fn default_shown<'w>(
+        &self,
+        work: &'w [Work<'w>],
+        openable: &dyn Fn(&Path) -> bool,
+    ) -> Option<&'w Work<'w>> {
+        let current = self
+            .default_work
+            .as_ref()
+            .and_then(|slot| work.iter().find(|work| slot.names(work)));
+        let checked_out = |work: &Work<'_>| work.worktree().is_some_and(openable);
+        current
+            .filter(|work| checked_out(work))
+            .or_else(|| work.iter().find(|work| checked_out(work)))
+            .or(current)
+            .or_else(|| work.first())
     }
 
     /// The work the latest list names, as the daemon orders it: pull
@@ -401,18 +426,40 @@ impl State {
     }
 
     /// Fits the latest list, with `here` and `openable` as [`Self::work`]
-    /// takes them, into the rows already shown: a row keeps its place while
-    /// anything it is known by is still listed, taking on what the list now
-    /// knows it by; two rows the list finds are one piece of work become
-    /// one, in the earlier's place; and work the list names for the first
-    /// time goes last. A row whose work is no longer listed leaves. Placing
-    /// the same list again changes nothing.
+    /// takes them, into the rows shown.
+    ///
+    /// The first rows shown, and every row once [`RESORT_AFTER_MS`] has
+    /// passed since the last sort, are sorted by when their work last
+    /// changed, most recent first (see [`changed_at`]). Otherwise a row
+    /// keeps its place while anything it is known by is still listed,
+    /// taking on what the list now knows it by; two rows the list finds are
+    /// one piece of work become one, in the earlier's place; and work the
+    /// list names for the first time goes last. A row whose work is no
+    /// longer listed leaves. Placing the same list again changes nothing
+    /// until the next sort is due.
     pub(super) fn place(&mut self, here: Option<&Path>, openable: &dyn Fn(&Path) -> bool) {
-        let listed: Vec<Slot> = self
-            .listed_work(here, openable)
-            .iter()
-            .map(Slot::of)
-            .collect();
+        let now = self
+            .list
+            .as_deref()
+            .map_or(0, |list| list.generated_at_unix_ms);
+        let mut listed = self.listed_work(here, openable);
+        let due = self
+            .sorted_at_unix_ms
+            .is_none_or(|at| now.saturating_sub(at) >= RESORT_AFTER_MS);
+        let default_work = self.default_shown(&listed, openable).map(Slot::of);
+        let sort = self.slots.is_empty() || due;
+        if sort {
+            // Stable, so work with the same time, or none, keeps the
+            // daemon's order.
+            listed.sort_by_cached_key(|work| std::cmp::Reverse(changed_at(work)));
+        }
+        let listed: Vec<Slot> = listed.iter().map(Slot::of).collect();
+        self.default_work = default_work;
+        if sort {
+            self.slots = listed;
+            self.sorted_at_unix_ms = (!self.slots.is_empty()).then_some(now);
+            return;
+        }
         // Each row goes to the work with its pull request, else to the work
         // in its worktree, so a worktree moved to another pull request's
         // branch takes no row from a pull request still listed.
@@ -553,6 +600,27 @@ impl State {
     }
 }
 
+/// When `work` last changed, for ordering the Work rows: its worktree's files
+/// or commits, else, for a pull request with no worktree here, when GitHub
+/// last updated it, as the Work board dates its cards. Work with neither,
+/// such as the worktree the conversation runs in, sorts last.
+fn changed_at(work: &Work<'_>) -> Option<u64> {
+    match work {
+        Work::PullRequest { row, worktree } => worktree
+            .and_then(|worktree| worktree.last_activity_unix_ms)
+            .or_else(|| {
+                let updated = row
+                    .pull_request
+                    .as_ref()?
+                    .updated_at
+                    .parse::<jiff::Timestamp>();
+                u64::try_from(updated.ok()?.as_millisecond()).ok()
+            }),
+        Work::Worktree(worktree) => worktree.last_activity_unix_ms,
+        Work::Here(_) => None,
+    }
+}
+
 /// The daemon's lists for one conversation, from a thread that holds the
 /// subscription. Dropping the stream hangs the connection up, so the daemon
 /// stops reading the conversation for this window.
@@ -668,6 +736,21 @@ const ROW_SPACING: f32 = space::XXS;
 /// Above and below the list's notes.
 const NOTE_PADDING: f32 = space::XS;
 
+/// Native focus and press state follow the identified action if rows move.
+fn row_key(work: Work<'_>, part: &[u8]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(part);
+    if let Some(row) = work.pull_request() {
+        hash.update(b"pr\0")
+            .update(&row.number.to_le_bytes())
+            .update(row.repository.gh_selector().to_ascii_lowercase().as_bytes());
+    } else if let Some(path) = work.worktree() {
+        hash.update(b"checkout\0")
+            .update(path.as_os_str().as_encoded_bytes());
+    }
+    *hash.finalize().as_bytes()
+}
+
 /// `card`'s list of `work`, the Work section's or the Mentioned section's, with
 /// the `shown` row expanded, and marked while `shown_open` says its changes
 /// or files are open beneath, then the list's notes when `with_note` asks
@@ -687,7 +770,7 @@ pub(super) fn view<'a>(
     openable: &dyn Fn(&Path) -> bool,
     reviewable: &dyn Fn(&GitHubRepoKey, u64) -> bool,
 ) -> Element<'a, Action> {
-    let mut children: Vec<Element<'a, Action>> = Vec::with_capacity(work.len() + 2);
+    let mut children = Vec::with_capacity(work.len() + 2);
     let list = state.list.as_deref();
     for item in work {
         let chosen = shown.is_some_and(|key| item.is(key));
@@ -695,26 +778,26 @@ pub(super) fn view<'a>(
         let review = item
             .pull_request()
             .is_some_and(|row| reviewable(&row.repository, row.number));
-        children.push(work_row(
-            card,
-            list,
-            *item,
-            chosen && shown_open,
-            details,
-            openable,
-            review,
+        children.push((
+            row_key(*item, b"row\0"),
+            work_row(
+                card,
+                list,
+                *item,
+                chosen && shown_open,
+                details,
+                openable,
+                review,
+            ),
         ));
         if details && let Some(details) = item.pull_request().and_then(chosen_details) {
-            children.push(details);
+            children.push((row_key(*item, b"details\0"), details));
         }
     }
     if with_note && let Some(note) = list.and_then(note) {
-        children.push(note);
+        children.push((*blake3::hash(b"note").as_bytes(), note));
     }
-    widget::column::with_children(children)
-        .spacing(ROW_SPACING)
-        .width(Length::Fill)
-        .into()
+    crate::interaction::keyed_list_rows_with_spacing(children, ROW_SPACING)
 }
 
 /// How tall [`view`] draws the list, and how much of that the shown work's
@@ -1643,6 +1726,7 @@ mod tests {
             changed_paths: Some(1),
             diff: None,
             pull_request,
+            last_activity_unix_ms: None,
         }
     }
 
@@ -1686,6 +1770,90 @@ mod tests {
                 None => work.scope_label(),
             })
             .collect()
+    }
+
+    /// The rows go most recently changed first: a worktree by its files and
+    /// commits, a pull request by its worktree's, or by GitHub's update when
+    /// it has none here. While an agent edits two worktrees by turns, the
+    /// rows hold still; a minute after they were sorted, the next list sorts
+    /// them again.
+    #[test]
+    fn rows_go_most_recently_changed_first_and_hold_still_between_sorts() {
+        const MINUTE: u64 = 60 * 1000;
+        let at = |mut watch: Watch, now: u64| {
+            let Watch::Listed { list, .. } = &mut watch else {
+                unreachable!()
+            };
+            Arc::make_mut(list).generated_at_unix_ms = now;
+            watch
+        };
+        let edited = |path: &str, pull_request, changed: u64| ConversationWorktree {
+            last_activity_unix_ms: Some(changed),
+            ..worktree(path, pull_request)
+        };
+        let mut merged = row(35, Relation::Updated);
+        // 1970-01-01T00:00:05Z: GitHub's update, for a row with no worktree.
+        merged.pull_request.as_mut().unwrap().updated_at = "1970-01-01T00:00:05Z".into();
+        let rows = vec![row(41, Relation::Created), merged];
+        let mut state = State::default();
+        let conversation = TerminalId::new();
+        state.retarget(Some(conversation));
+        let list = |revision, cache: u64, docs: u64| {
+            with_worktrees(
+                conversation,
+                revision,
+                rows.clone(),
+                vec![
+                    edited("/cache", Some(41), cache),
+                    edited("/docs", None, docs),
+                ],
+            )
+        };
+        // The daemon lists pull requests first; the rows go by time.
+        show(&mut state, at(list(1, 1_000, 9_000), 10 * MINUTE));
+        assert_eq!(rows_of(&state), ["docs", "#35", "#41"]);
+
+        let mut choices = Choices::default();
+        let shown_path = |state: &State, choices: &Choices| {
+            let work = state.work(None, &|_| true);
+            state
+                .shown(choices, &work, &[], None, &|_| true)
+                .and_then(Work::worktree)
+                .map(Path::to_path_buf)
+        };
+        assert_eq!(shown_path(&state, &choices), Some(PathBuf::from("/cache")));
+        state.choose(&mut choices, WorkKey::Worktree("/docs".into()), false);
+        // #41's worktree is edited now, and docs' again: nothing moves
+        // within the minute.
+        show(
+            &mut state,
+            at(list(2, 10 * MINUTE + 1_000, 9_000), 10 * MINUTE + 1_000),
+        );
+        assert_eq!(rows_of(&state), ["docs", "#35", "#41"]);
+        show(
+            &mut state,
+            at(
+                list(3, 10 * MINUTE + 1_000, 10 * MINUTE + 2_000),
+                10 * MINUTE + 2_000,
+            ),
+        );
+        assert_eq!(rows_of(&state), ["docs", "#35", "#41"]);
+        // A minute after the sort, the next list sorts them again.
+        show(
+            &mut state,
+            at(list(4, 11 * MINUTE, 10 * MINUTE + 2_000), 11 * MINUTE),
+        );
+        assert_eq!(rows_of(&state), ["#41", "docs", "#35"]);
+        assert_eq!(shown_path(&state, &choices), Some(PathBuf::from("/docs")));
+        // And they hold again from there.
+        show(
+            &mut state,
+            at(
+                list(5, 11 * MINUTE, 11 * MINUTE + 1_000),
+                11 * MINUTE + 1_000,
+            ),
+        );
+        assert_eq!(rows_of(&state), ["#41", "docs", "#35"]);
     }
 
     /// While GitHub answers, a list fills in: its worktrees are found to head
@@ -1901,6 +2069,74 @@ mod tests {
             fill(&mut state, list(3, both(), Vec::new()), true),
             ["#1", "#2", "main"]
         );
+    }
+
+    #[test]
+    fn releasing_after_a_work_row_moves_does_not_choose_the_row_that_replaced_it() {
+        use cosmic::iced::{
+            Point, Rectangle, Size,
+            advanced::{Layout, Shell, clipboard, layout, widget::Tree},
+            mouse,
+        };
+
+        let state = State::default();
+        let choices = Choices::default();
+        let card = CardId::new();
+        let docs = worktree("/docs", None);
+        let cache = worktree("/cache", None);
+        let render = |work: &[Work<'_>]| {
+            view(
+                card,
+                &state,
+                &choices,
+                work,
+                None,
+                false,
+                false,
+                &|_| true,
+                &|_, _| false,
+            )
+        };
+        let renderer = crate::ui_controls::accessibility_probe::headless_renderer();
+        let viewport = Rectangle::with_size(Size::new(260.0, 400.0));
+        let cursor =
+            mouse::Cursor::Available(Point::new(20.0, row_height(&Work::Worktree(&docs)) / 2.0));
+        let update = |element: &mut Element<'_, Action>, tree: &mut Tree, event| {
+            let layout = element.as_widget_mut().layout(
+                tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, viewport.size()),
+            );
+            let mut messages = Vec::new();
+            element.as_widget_mut().update(
+                tree,
+                &iced::Event::Mouse(event),
+                Layout::new(&layout),
+                cursor,
+                &renderer,
+                &mut clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &viewport,
+            );
+            messages
+        };
+
+        let mut before = render(&[Work::Worktree(&docs), Work::Worktree(&cache)]);
+        let mut tree = Tree::new(before.as_widget());
+        let press = mouse::Event::ButtonPressed(mouse::Button::Left);
+        let release = mouse::Event::ButtonReleased(mouse::Button::Left);
+        assert!(update(&mut before, &mut tree, press).is_empty());
+
+        let mut after = render(&[Work::Worktree(&cache), Work::Worktree(&docs)]);
+        tree.diff(after.as_widget_mut());
+        assert!(update(&mut after, &mut tree, release).is_empty());
+
+        assert!(update(&mut after, &mut tree, press).is_empty());
+        let messages = update(&mut after, &mut tree, release);
+        assert!(matches!(
+            messages.as_slice(),
+            [Action::Choose { key: WorkKey::Worktree(path), .. }] if path == Path::new("/cache")
+        ));
     }
 
     /// The height the list reports is the height it lays out at, so its

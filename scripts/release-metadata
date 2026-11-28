@@ -104,12 +104,18 @@ def products(version: str, names: set[str]) -> dict:
         found["cagents"]["deb"] = f"cagents_{version}_amd64.deb"
     browserless = f"cagents-browserless-{version}-{TARGET}.tar.gz"
     if browserless in names:
-        found["cagents-browserless"] = {"archive": browserless, "checksums": "SHA256SUMS-browserless"}
+        checksums = "SHA256SUMS-browserless"
+        if checksums not in names:
+            raise Refused(f"{browserless} needs {checksums}")
+        found["cagents-browserless"] = {"archive": browserless, "checksums": checksums}
         if f"cagents-browserless_{version}_amd64.deb" in names:
             found["cagents-browserless"]["deb"] = f"cagents-browserless_{version}_amd64.deb"
     editor = f"ceditor-{version}-{TARGET}.tar.gz"
     if editor in names:
-        found["ceditor"] = {"archive": editor, "checksums": "SHA256SUMS-ceditor"}
+        checksums = "SHA256SUMS-ceditor"
+        if checksums not in names:
+            raise Refused(f"{editor} needs {checksums}")
+        found["ceditor"] = {"archive": editor, "checksums": checksums}
     return found
 
 

@@ -400,6 +400,94 @@ fn a_streamed_chunk_catalogs_the_transcript_only_when_read() {
     );
 }
 
+#[test]
+fn conversation_status_is_reused_across_frames_and_text_only_publications() {
+    let mut pane = Pane::new(transcript(16));
+    pane.metadata.busy = true;
+    pane.metadata.subagents = (0..32)
+        .map(|index| {
+            let mut child = super::tests::native_child_fixture();
+            child.id = format!("delegated-{index}");
+            child
+        })
+        .collect();
+    pane.publish();
+    pane.prepare_publication();
+    pane.frame();
+    let runtime = &pane.runtime;
+    assert_eq!(
+        runtime.conversation_status(false).1,
+        "Responding · 32 subagents working"
+    );
+    assert_eq!(runtime.inspector_status().1, "Responding");
+    assert_eq!(
+        runtime.parent_tab_state(),
+        Some((Icon::AgentWorking, "Responding".to_owned()))
+    );
+    let builds = runtime.status.borrow().builds;
+    assert!(builds > 0);
+    for chunk in 0..3 {
+        pane.frame();
+        pane.tail().push_str(&format!(" streamed chunk {chunk}"));
+        pane.publish();
+        pane.prepare_publication();
+        pane.frame();
+        assert_eq!(pane.runtime.inspector_status().1, "Responding");
+        assert_eq!(pane.runtime.status.borrow().builds, builds);
+    }
+
+    // Release the producer's ownership to exercise a unique Arc::make_mut.
+    pane.runtime.snapshot = Arc::new((*pane.runtime.snapshot).clone());
+    assert_eq!(pane.runtime.status.borrow().builds, builds);
+    assert_eq!(
+        pane.runtime.conversation_status(false).1,
+        "Responding · 32 subagents working"
+    );
+    assert_eq!(Arc::strong_count(&pane.runtime.snapshot), 1);
+    Arc::make_mut(&mut pane.runtime.snapshot).subagents[0].waiting = true;
+    assert_eq!(
+        pane.runtime.conversation_status(false).1,
+        "Responding · 31 subagents working · 1 waiting"
+    );
+    assert_eq!(pane.runtime.status.borrow().builds, builds + 1);
+    assert_eq!(
+        pane.runtime.conversation_status(true).1,
+        "Switching session"
+    );
+    assert_eq!(pane.runtime.inspector_status().1, "Responding");
+
+    pane.runtime.error = Some(format!(
+        "{} systemd-oomd ended it.",
+        chat::failure::PROVIDER_OUT_OF_MEMORY
+    ));
+    assert_eq!(pane.runtime.inspector_status().1, "Stopped: out of memory");
+    let prefix = chat::failure::PROVIDER_OUT_OF_MEMORY;
+    pane.runtime.error = Some(format!("{prefix} {}", "ë".repeat(40_000)));
+    assert_eq!(pane.runtime.inspector_status().1, "Stopped: out of memory");
+    let builds = pane.runtime.status.borrow().builds;
+    // Changing the body beyond the part that classifies the failure cannot
+    // invalidate a status or require keeping the whole diagnostic.
+    pane.runtime.error.as_mut().unwrap().push('x');
+    assert_eq!(pane.runtime.inspector_status().1, "Stopped: out of memory");
+    assert_eq!(pane.runtime.status.borrow().builds, builds);
+    pane.runtime.disconnected = true;
+    assert_eq!(pane.runtime.inspector_status().1, "Disconnected");
+}
+
+#[test]
+fn publication_prunes_question_anchors_after_their_items_leave_the_window() {
+    let mut pane = Pane::new(transcript(2));
+    let evicted = pane.items[0].id.clone();
+    let retained = pane.items[8].id.clone();
+    pane.runtime.asked_after.extend([evicted, retained.clone()]);
+
+    pane.items.drain(..8);
+    pane.publish();
+    pane.prepare_publication();
+
+    assert_eq!(pane.runtime.asked_after, HashSet::from([retained]));
+}
+
 /// The reply the native frame pass streams: the repository's own
 /// documentation, with its headings, tables, lists and code fences, 24 bytes
 /// a publication. Preparing a publication lays out the new text once, so it

@@ -3,12 +3,14 @@ use super::*;
 
 pub(super) fn view<'a, Message: 'a>(
     rows: Vec<([u8; 32], Element<'a, Message>)>,
+    spacing: f32,
 ) -> Element<'a, Message> {
     let (keys, children): (Vec<_>, Vec<_>) = rows.into_iter().unzip();
     Element::new(KeyedList {
         keys,
         on_focus: None,
         content: widget::column::with_children(children)
+            .spacing(spacing)
             .width(Length::Fill)
             .into(),
     })
@@ -287,7 +289,7 @@ mod tests {
         if row {
             horizontal(controls, space::XS)
         } else {
-            view(controls)
+            view(controls, space::XS)
         }
     }
 
