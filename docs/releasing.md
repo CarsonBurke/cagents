@@ -219,9 +219,9 @@ Every executable and the bundle are signed ad hoc (`codesign --sign -`), which
 Apple Silicon requires to run anything. Files that `curl`, `tar` or
 `install-macos.sh` download carry no quarantine attribute, so Gatekeeper does
 not assess them. A browser download is quarantined, and the installer clears
-the attribute on the tree it installs. Gatekeeper blocks an ad hoc signed app
-opened from a quarantined download, as from a disk image, which is why the
-release installs from a terminal.
+the attribute on the tree it installs. Gatekeeper can block the first launch
+of the ad hoc signed app copied from the disk image. Use Open Anyway to
+approve that launch.
 
 Notarization, which would let people open a downloaded app without a warning,
 needs an Apple Developer ID Application certificate and an App Store Connect

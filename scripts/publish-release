@@ -834,8 +834,9 @@ To install from a terminal:
 
 \`\`\`sh
 base=https://github.com/$REPOSITORY/releases/download/$TAG
-mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
-curl --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh" &&
+mkdir "cagents-$VERSION" &&
+cd "cagents-$VERSION" &&
+curl --disable --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh" &&
 expected=\$(shasum -a 256 "$MACOS_ARCHIVE" install-macos.sh) &&
 recorded=\$(awk -v archive="$MACOS_ARCHIVE" '
     \$2 == archive { a = \$0; archives++ }

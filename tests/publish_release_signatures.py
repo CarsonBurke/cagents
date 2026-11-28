@@ -702,6 +702,25 @@ class PublisherSignatures(unittest.TestCase):
         for name in (image, alias, "SHA256SUMS-macos", "cagents-android.apk", "cagents-x86_64.AppImage"):
             self.assertEqual((draft / "assets" / name).read_bytes(), (release / name).read_bytes())
 
+    def test_macos_terminal_notes_stop_when_the_download_directory_exists(self):
+        self.drafted(disk_image=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"].split("## macOS\n", 1)[1]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "macos-terminal-commands"
+        tools.mkdir()
+        curl = tools / "curl"
+        curl.write_text("#!/bin/sh\nprintf '%s\\n' \"$1\"\nexit 1\n")
+        curl.chmod(0o755)
+        environment = {"PATH": f"{tools}:{os.defpath}"}
+
+        for expected in ("--disable", ""):
+            with self.subTest(first_download=bool(expected)):
+                result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                        env=environment, text=True, capture_output=True, timeout=HANG_GUARD)
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout.strip(), expected)
+
     def add_disk_images(self, dist: Path, version: str, signers: list[str]) -> tuple[Path, Path]:
         image = dist / f"Cagents-{version}-arm64.dmg"
         alias = dist / "Cagents-arm64.dmg"
