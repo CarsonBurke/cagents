@@ -884,8 +884,8 @@ fn installed_terminal_candidate(
     Ok(served.to_owned())
 }
 
-pub(crate) fn macos_device_release_digest(version: &str) -> Result<String, UpdateError> {
-    let version = stable_version(version)?.to_string();
+pub(crate) fn macos_device_release(version: &str) -> Result<(String, String), UpdateError> {
+    let version = installed_version(version)?.to_string();
     let release = feed::Feed::configured()
         .map_err(invalid)?
         .macos_for_protocol(
@@ -893,11 +893,12 @@ pub(crate) fn macos_device_release_digest(version: &str) -> Result<String, Updat
             crate::terminal_ipc::PROTOCOL_VERSION,
             &CancellationToken::for_terminal(),
         )?;
-    Ok(release
+    let digest = release
         .metadata
         .iter()
         .map(|byte| format!("{byte:02x}"))
-        .collect())
+        .collect();
+    Ok((version, digest))
 }
 
 pub fn upgrade_release(

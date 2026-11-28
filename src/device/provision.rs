@@ -184,19 +184,19 @@ pub fn update(
     };
     progress(Step::Upgrading);
     let release = mac_release
-        .as_deref()
-        .map(|digest| (local.version.as_str(), digest));
+        .as_ref()
+        .map(|(version, digest)| (version.as_str(), digest.as_str()));
     session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
-    match daemon_state() {
-        Daemon::Stopped if release.is_some() => {
-            let selected = Remote::probe(&session, device, &local.version)?;
+    match (daemon_state(), release) {
+        (Daemon::Stopped, Some((version, _))) => {
+            let selected = Remote::probe(&session, device, version)?;
             if selected.protocol == Some(PROTOCOL_VERSION)
                 && selected
                     .installation
                     .and_then(|found| found.current)
                     .as_deref()
-                    == Some(&local.version)
+                    == Some(version)
             {
                 Ok(Outcome::Updated { sent })
             } else {
@@ -206,12 +206,12 @@ pub fn update(
                 )))
             }
         }
-        Daemon::Compatible | Daemon::Stopped => Ok(Outcome::Updated { sent }),
-        Daemon::Speaks(actual) => Err(io::Error::other(format!(
+        (Daemon::Compatible | Daemon::Stopped, _) => Ok(Outcome::Updated { sent }),
+        (Daemon::Speaks(actual), _) => Err(io::Error::other(format!(
             "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs.",
             name = device.name
         ))),
-        Daemon::Unknown(error) => Err(io::Error::other(format!(
+        (Daemon::Unknown(error), _) => Err(io::Error::other(format!(
             "{name}'s update finished, but this computer could not reach its daemon: {error}",
             name = device.name
         ))),
@@ -222,11 +222,11 @@ fn verify_mac_release(
     device: &Device,
     version: &str,
     action: &Action,
-) -> io::Result<Option<String>> {
+) -> io::Result<Option<(String, String)>> {
     if !matches!(action, Action::MacRelease { .. } | Action::MacInstaller) {
         return Ok(None);
     }
-    let digest = crate::update::macos_device_release_digest(version).map_err(|error| {
+    let (version, digest) = crate::update::macos_device_release(version).map_err(|error| {
         io::Error::other(format!(
             "Could not verify the Apple Silicon release for {}: {error}",
             device.name
@@ -240,11 +240,11 @@ fn verify_mac_release(
 
 {}",
                 device.name,
-                crate::update::installer_command(Some(version)),
+                crate::update::installer_command(Some(&version)),
             ),
         ));
     }
-    Ok(Some(digest))
+    Ok(Some((version, digest)))
 }
 
 /// The installed build this executable belongs to.
