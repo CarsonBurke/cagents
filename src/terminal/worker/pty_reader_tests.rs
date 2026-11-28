@@ -1,91 +1,8 @@
 //! Actual PTY readiness and bounded parser backpressure, without a child.
 use super::*;
-use std::os::fd::FromRawFd;
+use std::{io::Read, os::fd::FromRawFd};
 
-struct Reading {
-    reader: File,
-    observed: Sender<usize>,
-}
-
-impl Read for Reading {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        let result = self.reader.read(buffer);
-        if let Ok(length) = &result {
-            let _ = self.observed.try_send(*length);
-        }
-        result
-    }
-}
-
-struct ReaderOwner {
-    wake: Option<OwnedFd>,
-    discard_pending: Arc<AtomicBool>,
-    done: Receiver<()>,
-    thread: Option<JoinHandle<()>>,
-}
-
-impl ReaderOwner {
-    fn start(
-        mut reader: impl Read + Send + 'static,
-        readiness: OwnedFd,
-        sender: Sender<PtyMessage>,
-    ) -> Self {
-        let (wake_rx, wake) = wake_pipe().unwrap();
-        let (done_tx, done) = crossbeam_channel::bounded(0);
-        let discard_pending = Arc::new(AtomicBool::new(false));
-        let reader_discard_pending = Arc::clone(&discard_pending);
-        let thread = thread::spawn(move || {
-            let _done = done_tx;
-            read_pty(
-                &mut reader,
-                &sender,
-                readiness,
-                wake_rx,
-                &reader_discard_pending,
-            );
-        });
-        Self {
-            wake: Some(wake),
-            discard_pending,
-            done,
-            thread: Some(thread),
-        }
-    }
-
-    fn cancel(&mut self) {
-        self.discard_pending.store(true, Ordering::Release);
-        self.stop_for_carry();
-    }
-
-    fn stop_for_carry(&mut self) {
-        drop(self.wake.take());
-    }
-
-    fn finish(&mut self) {
-        assert!(
-            matches!(
-                self.done.recv_timeout(Duration::from_secs(2)),
-                Err(RecvTimeoutError::Disconnected)
-            ),
-            "original PTY reader did not finish"
-        );
-        self.thread.take().unwrap().join().unwrap();
-    }
-}
-
-impl Drop for ReaderOwner {
-    fn drop(&mut self) {
-        self.cancel();
-        if self.thread.is_some()
-            && matches!(
-                self.done.recv_timeout(Duration::from_secs(2)),
-                Err(RecvTimeoutError::Disconnected)
-            )
-        {
-            let _ = self.thread.take().unwrap().join();
-        }
-    }
-}
+const PROMPT: Duration = Duration::from_secs(5);
 
 fn private_pty() -> (File, File) {
     let mut master = -1;
@@ -123,182 +40,155 @@ fn private_pty() -> (File, File) {
         unsafe { libc::tcsetattr(slave.as_raw_fd(), libc::TCSANOW, &attributes) },
         0
     );
+    nonblocking_writer(&master).unwrap();
     (master, slave)
 }
 
+fn activate(reader: &mut Reader) {
+    reader.task.start.take().unwrap().send(()).unwrap();
+}
+
+fn stop(reader: &mut Reader) {
+    reader.task.stop();
+    assert_eq!(
+        reader.task.done.recv_timeout(PROMPT),
+        Err(RecvTimeoutError::Disconnected),
+        "reader did not release its PTY"
+    );
+}
+
 #[test]
-fn original_reader_cancellation_escapes_a_full_output_queue() {
-    let (reader, mut slave) = private_pty();
-    let readiness = reader.try_clone().unwrap().into();
-    let (observed, read) = crossbeam_channel::bounded(1);
-    let (sender, output) = crossbeam_channel::bounded(1);
-    sender
-        .send(PtyMessage::Bytes(b"already queued".to_vec()))
-        .unwrap();
-    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
-    slave.write_all(b"blocked output").unwrap();
-    assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
-    // The actual PTY read has finished. Its output cannot enter the full
-    // inbox, and closing the original wake pipe must still release it.
-    owner.cancel();
-    owner.finish();
+fn a_full_parser_inbox_does_not_block_another_pty_or_lose_carry_bytes() {
+    let (master, mut slave) = private_pty();
+    let mut successor = master.try_clone().unwrap();
+    let mut reader = Reader::prepare_file(master, 1, b"earlier output".to_vec()).unwrap();
+    activate(&mut reader);
+    slave.write_all(b"unread output").unwrap();
+
+    // The other stream completes on the same reactor while this one has no
+    // room for another message.
+    let (other_master, mut other_slave) = private_pty();
+    let mut other = Reader::prepare_file(other_master, 1, Vec::new()).unwrap();
+    activate(&mut other);
+    other_slave.write_all(b"another terminal").unwrap();
+    expect_bytes(&other, b"another terminal");
+
+    stop(&mut reader);
+    expect_bytes(&reader, b"earlier output");
+    assert!(reader.output.try_recv().is_err());
+    // The former reader did not pull an extra chunk out of the kernel. The
+    // exact successor receives it without losing or repeating bytes.
+    slave.write_all(b" successor").unwrap();
+    let expected = b"unread output successor";
+    assert_eq!(read_private_pty(&mut successor, expected.len()), expected);
+    stop(&mut other);
+}
+
+#[test]
+fn parser_capacity_resumes_the_reader_and_preserves_output_order_through_eof() {
+    let (master, mut slave) = private_pty();
+    let mut reader = Reader::prepare_file(master, 1, b"earlier output".to_vec()).unwrap();
+    activate(&mut reader);
+    slave.write_all(b"later output").unwrap();
+
+    expect_bytes(&reader, b"earlier output");
+    expect_bytes(&reader, b"later output");
+    drop(slave);
     assert!(matches!(
-        output.try_recv().unwrap(),
-        PtyMessage::Bytes(bytes) if bytes == b"already queued"
+        reader.output.recv_timeout(PROMPT).unwrap(),
+        PtyMessage::Eof
     ));
-    assert!(output.try_recv().is_err());
+    stop(&mut reader);
+}
+
+#[test]
+fn a_parked_reader_releases_the_pty_without_consuming_output() {
+    let (master, mut slave) = private_pty();
+    let mut successor = master.try_clone().unwrap();
+    let mut reader = Reader::prepare_file(master, 1, b"retained prefix".to_vec()).unwrap();
+    slave.write_all(b"still in the PTY").unwrap();
+    stop(&mut reader);
+    expect_bytes(&reader, b"retained prefix");
+    assert!(reader.output.try_recv().is_err());
+    assert_eq!(read_private_pty(&mut successor, 16), b"still in the PTY");
 }
 
 #[cfg(target_os = "macos")]
 #[test]
-fn destructive_shutdown_keeps_draining_a_full_pty_output_queue() {
-    let (reader, mut slave) = private_pty();
-    let readiness = reader.try_clone().unwrap().into();
-    let (observed, read) = crossbeam_channel::bounded(1);
-    let (sender, output) = crossbeam_channel::bounded(1);
-    sender
-        .send(PtyMessage::Bytes(b"already queued".to_vec()))
+fn destructive_shutdown_drains_a_full_pty_output_inbox() {
+    let (master, mut slave) = private_pty();
+    let watch = master.try_clone().unwrap();
+    let mut reader = Reader::prepare_file(master, 1, b"already queued".to_vec()).unwrap();
+    activate(&mut reader);
+    slave
+        .write_all(b"drain while the renderer is closing")
         .unwrap();
-    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
-    slave.write_all(b"a").unwrap();
-    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-    owner.discard_pending.store(true, Ordering::Release);
-    slave.write_all(b"b").unwrap();
-    assert_eq!(read.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
-    assert!(matches!(
-        output.try_recv().unwrap(),
-        PtyMessage::Bytes(bytes) if bytes == b"already queued"
-    ));
-    owner.cancel();
-    owner.finish();
-    assert!(output.try_recv().is_err());
-}
-
-#[test]
-fn actual_pty_output_survives_parser_backpressure_in_order_until_eof() {
-    let (reader, mut slave) = private_pty();
-    let readiness = reader.try_clone().unwrap().into();
-    let (observed, read) = crossbeam_channel::bounded(1);
-    let (sender, output) = crossbeam_channel::bounded(1);
-    sender
-        .send(PtyMessage::Bytes(b"earlier output".to_vec()))
-        .unwrap();
-    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
-    slave.write_all(b"later output").unwrap();
-    assert!(read.recv_timeout(Duration::from_secs(2)).unwrap() > 0);
-    assert!(matches!(
-        output.recv_timeout(Duration::from_secs(2)).unwrap(),
-        PtyMessage::Bytes(bytes) if bytes == b"earlier output"
-    ));
-    expect_bytes(&output, b"later output");
-    drop(slave);
-    assert!(matches!(
-        output.recv_timeout(Duration::from_secs(2)).unwrap(),
-        PtyMessage::Eof
-    ));
-    owner.finish();
-}
-
-#[test]
-fn stopping_for_carry_keeps_already_read_bytes_behind_a_full_output_queue() {
-    let (reader, mut slave) = private_pty();
-    let mut successor = reader.try_clone().unwrap();
-    let readiness = reader.try_clone().unwrap().into();
-    let (observed, read) = crossbeam_channel::bounded(1);
-    let (sender, output) = crossbeam_channel::bounded(1);
-    sender
-        .send(PtyMessage::Bytes(b"previous screen".to_vec()))
-        .unwrap();
-    let mut owner = ReaderOwner::start(Reading { reader, observed }, readiness, sender);
-    slave.write_all(b"already read").unwrap();
-    let consumed = read.recv_timeout(Duration::from_secs(2)).unwrap();
-    assert!(consumed > 0 && consumed <= b"already read".len());
-    // Carry closes the same original wake pipe but must collect this in-flight
-    // read before the holder snapshots the screen and transfers the PTY.
-    owner.stop_for_carry();
-    assert!(matches!(owner.done.try_recv(), Err(TryRecvError::Empty)));
-    expect_bytes(&output, b"previous screen");
-    expect_bytes(&output, &b"already read"[..consumed]);
-    owner.finish();
-    assert!(output.try_recv().is_err());
-    // The exact master duplicate keeps unread kernel output, then accepts
-    // fresh output after the old reader ends. Neither path replays bytes.
-    slave.write_all(b"successor").unwrap();
-    let expected = [&b"already read"[consumed..], b"successor".as_slice()].concat();
-    assert_eq!(read_private_pty(&mut successor, expected.len()), expected);
-}
-
-struct ConsumedReadiness {
-    reader: File,
-    raced: Option<Sender<()>>,
-}
-
-impl Read for ConsumedReadiness {
-    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-        if let Some(raced) = self.raced.take() {
-            // Consume the bytes that made poll readable, just as another
-            // duplicate reader can. Obtain EAGAIN from the genuine PTY fd.
-            let mut consumed = Vec::new();
-            loop {
-                match self.reader.read(buffer) {
-                    Ok(0) => panic!("private PTY closed before the readiness race"),
-                    Ok(length) => consumed.extend_from_slice(&buffer[..length]),
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => {
-                        assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
-                        assert_eq!(consumed, b"stale");
-                        raced.send(()).unwrap();
-                        return Err(error);
-                    }
-                }
-            }
+    reader.task.discard_pending();
+    let deadline = Instant::now() + PROMPT;
+    loop {
+        let mut readable = libc::pollfd {
+            fd: watch.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let ready = unsafe { libc::poll(&mut readable, 1, 0) };
+        assert!(ready >= 0);
+        if ready == 0 {
+            break;
         }
-        self.reader.read(buffer)
+        assert!(
+            Instant::now() < deadline,
+            "destructive drain stalled at a full inbox"
+        );
+        thread::sleep(Duration::from_millis(2));
     }
+    stop(&mut reader);
+    expect_bytes(&reader, b"already queued");
+    assert!(reader.output.try_recv().is_err());
 }
 
 #[test]
-fn shared_nonblocking_pty_readiness_race_rearms_without_losing_output() {
-    let (reader, mut slave) = private_pty();
-    let readiness: OwnedFd = reader.try_clone().unwrap().into();
-    let flags = unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_GETFL) };
-    assert!(flags >= 0);
-    assert_eq!(
-        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
-        0
-    );
-    // This is the same OFD, not an independently configured descriptor.
-    assert_ne!(
-        unsafe { libc::fcntl(readiness.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK,
-        0
-    );
-    let (raced, race) = crossbeam_channel::bounded(1);
-    let (sender, output) = crossbeam_channel::bounded(1);
-    let mut owner = ReaderOwner::start(
-        ConsumedReadiness {
-            reader,
-            raced: Some(raced),
-        },
-        readiness,
-        sender,
-    );
+fn a_consumed_readiness_edge_rearms_the_original_pty() {
+    use tokio::io::{Interest, unix::AsyncFd};
+
+    let (master, mut slave) = private_pty();
+    let mut duplicate = master.try_clone().unwrap();
+    let runtime = super::super::reactor::runtime().unwrap();
+    let (started, ready) = crossbeam_channel::bounded(1);
+    let (raced, rearmed) = crossbeam_channel::bounded(1);
+    let handle = runtime.spawn(async move {
+        let master = AsyncFd::with_interest(master, Interest::READABLE).unwrap();
+        let mut edge = master.readable().await.unwrap();
+        let mut consumed = [0; 5];
+        duplicate.read_exact(&mut consumed).unwrap();
+        assert_eq!(&consumed, b"stale");
+        assert!(
+            edge.try_io(|fd| pty_reader::read_message(fd.get_ref()))
+                .is_err()
+        );
+        started.send(()).unwrap();
+        let mut edge = master.readable().await.unwrap();
+        let output = edge
+            .try_io(|fd| pty_reader::read_message(fd.get_ref()))
+            .unwrap()
+            .unwrap();
+        assert!(matches!(output, PtyMessage::Bytes(bytes) if bytes == b"fresh"));
+        raced.send(()).unwrap();
+    });
     slave.write_all(b"stale").unwrap();
-    race.recv_timeout(Duration::from_secs(2)).unwrap();
-    slave.write_all(b"current").unwrap();
-    expect_bytes(&output, b"current");
-    drop(slave);
-    assert!(matches!(
-        output.recv_timeout(Duration::from_secs(2)).unwrap(),
-        PtyMessage::Eof
-    ));
-    owner.finish();
+    ready.recv_timeout(PROMPT).unwrap();
+    slave.write_all(b"fresh").unwrap();
+    rearmed.recv_timeout(PROMPT).unwrap();
+    runtime.block_on(handle).unwrap();
 }
 
-fn expect_bytes(output: &Receiver<PtyMessage>, expected: &[u8]) {
+fn expect_bytes(reader: &Reader, expected: &[u8]) {
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     let mut bytes = Vec::new();
     while bytes.len() < expected.len() {
-        match output.recv_deadline(deadline).unwrap() {
+        let message = reader.output.recv_deadline(deadline).unwrap();
+        reader.task.consumed();
+        match message {
             PtyMessage::Bytes(next) => bytes.extend_from_slice(&next),
             other => panic!("expected remaining PTY bytes, received {other:?}"),
         }

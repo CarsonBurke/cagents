@@ -10,16 +10,18 @@ pub(crate) mod holder;
 mod input_queue;
 mod joins;
 mod manager_environment;
+mod pty_reader;
 #[cfg(test)]
 mod pty_reader_tests;
 
 use close_processes::{FrozenFamily, RootIdentity};
+use pty_reader::Reader;
 
 use std::{
     cell::{Cell, RefCell},
     collections::{HashMap, VecDeque},
     fs::File,
-    io::{BufWriter, Read, Write},
+    io::{BufWriter, Write},
     os::{
         fd::{AsRawFd, OwnedFd},
         unix::fs::FileExt,
@@ -147,15 +149,8 @@ impl ShutdownBudget {
     }
 }
 
-/// How long shutdown waits for the PTY reader to leave its blocking read
-/// before abandoning the thread. Closing its wake pipe releases the read
-/// immediately in every case we can construct; this only bounds the ones we
-/// cannot, because a hung join here wedges the daemon's dispatch thread.
+/// A carry or shutdown waits this long for the reactor to release its reader.
 const READER_SHUTDOWN_GRACE: Duration = Duration::from_millis(500);
-/// A full parser inbox must not hide closure of the reader's original wake
-/// pipe. Keep backpressure lossless while the owner is running, and check its
-/// cancellation between bounded channel waits.
-const READER_SEND_POLL: Duration = Duration::from_millis(10);
 /// How long a synchronized update (DEC mode 2026) may withhold output from the
 /// published grid. A program brackets a frame it has to emit in several writes -
 /// clearing the screen, then repainting it - so that no half-drawn frame is
@@ -3278,21 +3273,9 @@ struct Worker {
     input_handoff: Option<InputHandoff>,
     reader_restart_pending: bool,
     reply_backpressured: bool,
-    reader: Option<JoinHandle<()>>,
-    /// Retained startup never lets this reader consume the PTY. The queued
-    /// original replay prefix stays in pty_rx until explicit recovery.
-    reader_start: Option<Sender<()>>,
+    reader: Option<pty_reader::Task>,
     #[cfg(any(test, feature = "test-support"))]
     test_startup_queue: Option<Sender<PtyMessage>>,
-    /// Write end of the reader's wake pipe. Closing it releases a read that a
-    /// disowned grandchild would otherwise hold open indefinitely.
-    reader_wake: Option<OwnedFd>,
-    /// Disconnects when the reader thread returns, so shutdown can wait for
-    /// it with a deadline instead of joining unconditionally.
-    reader_done: Receiver<()>,
-    /// Destructive teardown can abandon an undelivered read. Carry leaves
-    /// this false and drains every byte already consumed from the PTY.
-    reader_discard_pending: Arc<AtomicBool>,
     pty_capacity: usize,
 }
 
@@ -3335,97 +3318,6 @@ fn nonblocking_writer(writer: &File) -> Result<(), String> {
         ));
     }
     Ok(())
-}
-
-/// The thread that reads a terminal's PTY into its worker.
-struct Reader {
-    thread: JoinHandle<()>,
-    start: Option<Sender<()>>,
-    /// Closing this releases the reader, however long a read would block.
-    wake: OwnedFd,
-    done: Receiver<()>,
-    output: Receiver<PtyMessage>,
-    #[cfg(any(test, feature = "test-support"))]
-    test_queue: Sender<PtyMessage>,
-    discard_pending: Arc<AtomicBool>,
-}
-
-impl Reader {
-    /// Starts reading `master`, delivering `pending` before anything it reads.
-    fn start(
-        terminal_id: crate::model::TerminalId,
-        master: &holder::PtyMaster,
-        capacity: usize,
-        pending: Vec<u8>,
-    ) -> Result<Self, String> {
-        let mut reader = Self::prepare(terminal_id, master, capacity, pending)?;
-        reader.activate();
-        Ok(reader)
-    }
-
-    /// Allocate the reader without consuming PTY output until ownership commits.
-    fn prepare(
-        terminal_id: crate::model::TerminalId,
-        master: &holder::PtyMaster,
-        capacity: usize,
-        pending: Vec<u8>,
-    ) -> Result<Self, String> {
-        let duplicate = |purpose: &str| {
-            master
-                .duplicate()
-                .map_err(|error| format!("duplicate PTY descriptor for {purpose}: {error}"))
-        };
-        let mut reader = File::from(duplicate("reading")?);
-        // Closing the master does not release a read already blocked on a
-        // duplicate: a PTY master read only fails with EIO once the last slave
-        // descriptor closes, which a disowned grandchild can defer forever.
-        // Wait for readiness on a descriptor this worker hands over instead,
-        // alongside a pipe whose closure is the shutdown signal, so the reader
-        // always has a way out.
-        let readiness = duplicate("readiness")?;
-        let (wake_rx, wake) = wake_pipe()?;
-        let (pty_tx, output) = crossbeam_channel::bounded(capacity.max(1));
-        if !pending.is_empty() {
-            let _ = pty_tx.send(PtyMessage::Bytes(pending));
-        }
-        #[cfg(any(test, feature = "test-support"))]
-        let test_queue = pty_tx.clone();
-        let (done_tx, done) = crossbeam_channel::bounded::<()>(0);
-        let (start, started) = crossbeam_channel::bounded(1);
-        let discard_pending = Arc::new(AtomicBool::new(false));
-        let reader_discard_pending = Arc::clone(&discard_pending);
-        let thread = thread::Builder::new()
-            .name(format!("terminal-pty-reader-{terminal_id:?}"))
-            .spawn(move || {
-                let _done = done_tx;
-                if started.recv().is_ok() {
-                    read_pty(
-                        &mut reader,
-                        &pty_tx,
-                        readiness,
-                        wake_rx,
-                        &reader_discard_pending,
-                    );
-                }
-            })
-            .map_err(|error| format!("start PTY reader: {error}"))?;
-        Ok(Self {
-            thread,
-            start: Some(start),
-            wake,
-            done,
-            output,
-            #[cfg(any(test, feature = "test-support"))]
-            test_queue,
-            discard_pending,
-        })
-    }
-
-    fn activate(&mut self) {
-        if let Some(start) = self.start.take() {
-            let _ = start.send(());
-        }
-    }
 }
 
 impl Worker {
@@ -3704,7 +3596,7 @@ impl Worker {
         }
         // Output an adopted terminal produced between daemons comes first, as
         // any other output would.
-        let mut reader = Reader::prepare(session.id, &held.master, config.pty_capacity, output)?;
+        let reader = Reader::prepare(&held.master, config.pty_capacity, output)?;
 
         let transcript_options = session.transcript_path.map(|path| TranscriptOptions {
             path,
@@ -3833,13 +3725,9 @@ impl Worker {
             input_handoff: None,
             reader_restart_pending: false,
             reply_backpressured: false,
-            reader: Some(reader.thread),
-            reader_start: reader.start.take(),
+            reader: Some(reader.task),
             #[cfg(any(test, feature = "test-support"))]
             test_startup_queue: Some(reader.test_queue),
-            reader_wake: Some(reader.wake),
-            reader_done: reader.done,
-            reader_discard_pending: reader.discard_pending,
         };
         Ok(worker)
     }
@@ -3877,7 +3765,7 @@ impl Worker {
         let retained = self.holder.commit_adoption().err();
         let mut retained = retained;
         if retained.is_none()
-            && let Some(start) = self.reader_start.take()
+            && let Some(start) = self.reader.as_mut().and_then(|reader| reader.start.take())
             && start.send(()).is_err()
         {
             retained = Some(
@@ -3969,7 +3857,7 @@ impl Worker {
                     // Only an explicit checked destructive close releases
                     // unresolved replay. Ordinary shutdown/Drop does not.
                     self.holder.prove_startup_cleanup();
-                    drop(self.reader_start.take());
+                    drop(self.reader.as_mut().and_then(|reader| reader.start.take()));
                     self.published
                         .startup_unresolved
                         .store(false, Ordering::Release);
@@ -4169,6 +4057,9 @@ impl Worker {
                 // the loop. An expired synchronized update is released here.
                 WorkerEvent::Timer => self.capture_if_ready(),
                 WorkerEvent::Pty(message) => {
+                    if let Some(reader) = &self.reader {
+                        reader.consumed();
+                    }
                     pty_open = self.handle_pty_message(message);
                 }
                 WorkerEvent::ChildExit(message) => {
@@ -4215,12 +4106,12 @@ impl Worker {
             && matches!(self.root_exit, Some(TerminalEvent::Exited { .. }));
         let shutdown_cleanup_confirmed = if (shutting_down || natural_census) && !self.carried {
             #[cfg(target_os = "macos")]
-            if shutting_down {
+            if shutting_down && let Some(reader) = &self.reader {
                 // XNU drains the controlling tty before notifying the root's
                 // exit. This worker has published its final grid and no longer
                 // consumes the reader queue. Drain through that backpressure
-                // until process cleanup has finished and the wake pipe closes.
-                self.reader_discard_pending.store(true, Ordering::Release);
+                // until process cleanup has finished and the reader is cancelled.
+                reader.discard_pending();
             }
             let budget = self.published.shutdown_budget();
             if exited {
@@ -4268,21 +4159,14 @@ impl Worker {
             transcript.finish();
         }
 
-        // Release the reader's blocking wait before waiting on it, then bound
-        // that wait: a reader still stuck on a descriptor a disowned
-        // grandchild holds open is abandoned rather than joined forever,
-        // because a hung join here wedges the daemon's dispatch thread.
-        self.reader_discard_pending.store(true, Ordering::Release);
-        drop(self.reader_wake.take());
-        if let Some(reader) = self.reader.take() {
-            match self.reader_done.recv_timeout(READER_SHUTDOWN_GRACE) {
-                Err(RecvTimeoutError::Timeout) => tracing::warn!(
-                    terminal_id = %self.terminal_id,
-                    "abandoning PTY reader thread still blocked on its descriptor"
-                ),
-                _ => {
-                    let _ = reader.join();
-                }
+        if let Some(mut reader) = self.reader.take() {
+            reader.discard_pending();
+            reader.stop();
+            if matches!(
+                reader.done.recv_timeout(READER_SHUTDOWN_GRACE),
+                Err(RecvTimeoutError::Timeout)
+            ) {
+                tracing::warn!(terminal_id = %self.terminal_id, "PTY reader cancellation timed out");
             }
         }
         // A failed destructive close retains its original family obligation.
@@ -4423,7 +4307,12 @@ impl Worker {
             Some(PtyMessage::Bytes(mut bytes)) => {
                 while bytes.len() < PTY_BATCH_LIMIT {
                     match self.pty_rx.try_recv() {
-                        Ok(PtyMessage::Bytes(next)) => bytes.extend_from_slice(&next),
+                        Ok(PtyMessage::Bytes(next)) => {
+                            if let Some(reader) = &self.reader {
+                                reader.consumed();
+                            }
+                            bytes.extend_from_slice(&next);
+                        }
                         Ok(PtyMessage::Eof) => {
                             self.pty_eof = true;
                             self.process_output(bytes);
@@ -5533,22 +5422,20 @@ impl Worker {
     /// channel remains the sole owner of all unread batches; never replace
     /// that receiver before the stopped reader is joined and it is drained.
     fn restart_reader(&mut self) -> Result<bool, String> {
-        if self.reader.is_some() && self.reader_wake.is_some() {
-            return Ok(true);
-        }
-        if self.reader.is_some() {
-            if matches!(self.reader_done.try_recv(), Err(TryRecvError::Empty)) {
+        if let Some(reader) = &self.reader {
+            if !reader.stopping() {
+                return Ok(true);
+            }
+            if matches!(reader.done.try_recv(), Err(TryRecvError::Empty)) {
                 return Ok(false);
             }
-            if let Some(reader) = self.reader.take() {
-                let _ = reader.join();
-            }
+            self.reader.take();
         }
         self.drain_effects();
         if self.reply_pending() {
             return Ok(false);
         }
-        // Actual join above means no producer can extend this fixed batch.
+        // The stopped reader can no longer extend this fixed batch.
         for _ in 0..self.pty_rx.len() {
             match self.pty_rx.try_recv() {
                 Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
@@ -5559,16 +5446,8 @@ impl Worker {
                 return Ok(false);
             }
         }
-        let reader = Reader::start(
-            self.terminal_id,
-            &self.master,
-            self.pty_capacity,
-            Vec::new(),
-        )?;
-        self.reader = Some(reader.thread);
-        self.reader_wake = Some(reader.wake);
-        self.reader_done = reader.done;
-        self.reader_discard_pending = reader.discard_pending;
+        let reader = Reader::start(&self.master, self.pty_capacity, Vec::new())?;
+        self.reader = Some(reader.task);
         self.pty_rx = reader.output;
         self.pty_eof = false;
         Ok(true)
@@ -5676,14 +5555,15 @@ impl Worker {
         if self.reply_pending() {
             return Err("Terminal reply is still pending; reader cut remains unconfirmed".into());
         }
-        if self.reader.is_none() {
+        let Some(reader) = &mut self.reader else {
             return if self.pty_rx.is_empty() {
                 Ok(())
             } else {
                 Err("Terminal output is still pending; reader cut remains unconfirmed".into())
             };
-        }
-        drop(self.reader_wake.take());
+        };
+        reader.stop();
+        let done = reader.done.clone();
         let deadline = std::time::Instant::now() + READER_SHUTDOWN_GRACE;
         let mut reading = true;
         while reading {
@@ -5698,7 +5578,7 @@ impl Worker {
                     // Nothing more to read; the holder has the rest.
                     Ok(PtyMessage::Eof | PtyMessage::Error(_)) | Err(_) => reading = false,
                 },
-                recv(self.reader_done) -> _ => reading = false,
+                recv(done) -> _ => reading = false,
                 default(deadline.saturating_duration_since(std::time::Instant::now())) => {
                     // The reader may yet read: handing the terminal over now
                     // could lose or reorder its output.
@@ -5706,9 +5586,12 @@ impl Worker {
                 }
             }
         }
-        if let Some(reader) = self.reader.take() {
-            let _ = reader.join();
+        // EOF and output channel disconnection do not by themselves prove
+        // the descriptor has been released by the reactor.
+        if matches!(done.recv_deadline(deadline), Err(RecvTimeoutError::Timeout)) {
+            return Err("the terminal's reader did not stop".into());
         }
+        self.reader.take();
         while !self.reply_pending() {
             match self.pty_rx.try_recv() {
                 Ok(PtyMessage::Bytes(bytes)) => self.process_output(bytes),
@@ -7119,154 +7002,6 @@ fn pty_size(size: TerminalSize) -> PtySize {
             .unwrap_or(u16::MAX),
         pixel_height: u16::try_from(u32::from(size.rows).saturating_mul(size.cell_height_px))
             .unwrap_or(u16::MAX),
-    }
-}
-
-/// Read and write ends of the reader's shutdown pipe. Nothing is ever written
-/// to it: dropping the write end hangs the read end up, which is the one event
-/// a blocking reader can always observe.
-fn wake_pipe() -> Result<(OwnedFd, OwnedFd), String> {
-    crate::descriptor::pipe(false).map_err(|error| format!("create PTY reader wake pipe: {error}"))
-}
-
-enum Readiness {
-    Readable,
-    Shutdown,
-    Failed(String),
-}
-
-/// Wait until the terminal has output, or until shutdown hangs up the wake
-/// pipe. A PTY master read only fails with EIO once the last slave descriptor
-/// closes, so a disowned grandchild can keep a blocking read - and therefore
-/// shutdown - waiting indefinitely; the pipe is the way out.
-fn wait_readable(readiness: &OwnedFd, wake: &OwnedFd) -> Readiness {
-    let mut fds = [
-        libc::pollfd {
-            fd: readiness.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: wake.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-    ];
-    loop {
-        // SAFETY: this thread owns both descriptors for the whole call.
-        let ready = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Readiness::Failed(error.to_string());
-        }
-        if fds[1].revents != 0 {
-            return Readiness::Shutdown;
-        }
-        if fds[0].revents != 0 {
-            // Hangup still needs one more read: the parser must see everything
-            // the child wrote before its slave closed, and an unreadable
-            // descriptor surfaces as EOF or an error from the read itself.
-            return Readiness::Readable;
-        }
-    }
-}
-
-fn read_pty(
-    reader: &mut dyn Read,
-    sender: &Sender<PtyMessage>,
-    readiness: OwnedFd,
-    wake: OwnedFd,
-    discard_pending: &AtomicBool,
-) {
-    let mut buffer = vec![0u8; PTY_READ_SIZE];
-    loop {
-        match wait_readable(&readiness, &wake) {
-            Readiness::Readable => {}
-            Readiness::Shutdown => return,
-            Readiness::Failed(error) => {
-                send_pty_message(sender, PtyMessage::Error(error), &wake, discard_pending);
-                return;
-            }
-        }
-        match reader.read(&mut buffer) {
-            Ok(0) => {
-                send_pty_message(sender, PtyMessage::Eof, &wake, discard_pending);
-                return;
-            }
-            // A PTY master reads EIO, not end of file, once its terminal's
-            // last slave closes: the ordinary end of a terminal.
-            Err(error) if error.raw_os_error() == Some(libc::EIO) => {
-                send_pty_message(sender, PtyMessage::Eof, &wake, discard_pending);
-                return;
-            }
-            Ok(read) => {
-                if !send_pty_message(
-                    sender,
-                    PtyMessage::Bytes(buffer[..read].to_vec()),
-                    &wake,
-                    discard_pending,
-                ) {
-                    return;
-                }
-            }
-            // A duplicate shares file-status flags with the writer. If that
-            // owner uses nonblocking I/O, another read/line-discipline change
-            // can consume readiness before this read. Re-arm the original
-            // descriptor instead of treating EAGAIN as terminal failure.
-            Err(error)
-                if matches!(
-                    error.kind(),
-                    std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
-                ) => {}
-            Err(error) => {
-                send_pty_message(
-                    sender,
-                    PtyMessage::Error(error.to_string()),
-                    &wake,
-                    discard_pending,
-                );
-                return;
-            }
-        }
-    }
-}
-
-fn send_pty_message(
-    sender: &Sender<PtyMessage>,
-    mut message: PtyMessage,
-    wake: &OwnedFd,
-    discard_pending: &AtomicBool,
-) -> bool {
-    loop {
-        // Carry must deliver the already-read message even if checking a
-        // cancellation descriptor fails. Only destructive teardown permits
-        // discarding it; ordinary delivery needs no extra poll syscall.
-        if discard_pending.load(Ordering::Acquire) {
-            let mut cancellation = libc::pollfd {
-                fd: wake.as_raw_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            if unsafe { libc::poll(&mut cancellation, 1, 0) } < 0 {
-                if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return false;
-            }
-            if cancellation.revents != 0 {
-                return false;
-            }
-            #[cfg(target_os = "macos")]
-            return true;
-        }
-        match sender.send_timeout(message, READER_SEND_POLL) {
-            Ok(()) => return true,
-            Err(crossbeam_channel::SendTimeoutError::Timeout(pending)) => message = pending,
-            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => return false,
-        }
     }
 }
 
