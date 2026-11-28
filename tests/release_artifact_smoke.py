@@ -94,6 +94,8 @@ class SmokeBoundary(unittest.TestCase):
             (self.dist / artifact).write_text("boundary fixture only\n")
         self.work = self.directory / "work"
         self.work.mkdir()
+        self.notes = self.directory / "notes.md"
+        self.notes.write_text("Fixture release notes\n")
         self.environment = os.environ.copy()
         self.environment.update(
             PATH=f"{self.bin}:{os.environ['PATH']}",
@@ -311,7 +313,7 @@ class SmokeBoundary(unittest.TestCase):
         output = self.directory / "release-output"
 
         result = self.invoke(
-            BUILD, ["--ref", "HEAD", "--output", str(output)],
+            BUILD, ["--ref", "HEAD", "--notes", str(self.notes), "--output", str(output)],
             CARGO_BUILD_JOBS="1",
             CAGENTS_RELEASE_CACHE=str(build_cache),
             CAGENTS_RELEASE_SMOKE_CACHE=str(smoke_cache),
@@ -344,10 +346,11 @@ class SmokeBoundary(unittest.TestCase):
                 text=True, timeout=HANG_GUARD,
             ).strip()
 
-        def materialize(commit):
+        def materialize(repository, destination, commit):
             subprocess.run(
                 ["bash", "-ec", 'source "$1"; CACHE=$2 checkout_release_source "$3" "$4"',
-                 "checkout", str(ROOT / "scripts/release-build-cache"), str(cache), str(source), commit],
+                 "checkout", str(ROOT / "scripts/release-build-cache"),
+                 str(destination), str(repository), commit],
                 check=True, timeout=HANG_GUARD,
             )
 
@@ -361,7 +364,7 @@ class SmokeBoundary(unittest.TestCase):
         git("commit", "-qam", "second tree")
         after = git("rev-parse", "HEAD")
 
-        materialize(after)
+        materialize(source, cache, after)
         self.assertEqual((checkout / "changed").read_text(), "after\n")
         self.assertFalse((checkout / ".git").exists())
         exported_history = subprocess.check_output(
@@ -373,10 +376,41 @@ class SmokeBoundary(unittest.TestCase):
         unchanged_mtime = unchanged.stat().st_mtime_ns
         (checkout / "untracked").write_text("left by the build\n")
 
-        materialize(before)
+        materialize(source, cache, before)
         self.assertEqual((checkout / "changed").read_text(), "before\n")
         self.assertEqual(unchanged.stat().st_mtime_ns, unchanged_mtime)
         self.assertFalse((checkout / "untracked").exists())
+
+        shallow = self.directory / "shallow"
+        subprocess.run(
+            ["git", "clone", "-q", "--depth=1", source.as_uri(), str(shallow)],
+            check=True, timeout=HANG_GUARD,
+        )
+        shallow_cache = self.directory / "shallow-cache"
+        (shallow_cache / "source").mkdir(parents=True)
+        materialize(shallow, shallow_cache, after)
+        self.assertEqual((shallow_cache / "source/changed").read_text(), "after\n")
+
+    def test_release_rejects_shallow_history_for_automatic_notes(self):
+        self.build_cache()
+        git = self.bin / "git"
+        system_git = shlex.quote(shutil.which("git"))
+        git.write_text(
+            '#!/bin/sh\n'
+            'if [ "$3" = rev-parse ] && [ "$4" = --is-shallow-repository ]; then\n'
+            '    printf "true\\n"\n'
+            '    exit 0\n'
+            'fi\n'
+            f'exec {system_git} "$@"\n'
+        )
+        git.chmod(0o755)
+        output = self.directory / "out"
+        result = self.invoke(BUILD, ["--ref", "HEAD", "--output", str(output)])
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("automatic release notes need full history", result.stderr)
+        self.assertFalse(output.exists())
+        self.assertFalse(self.network_calls.exists())
+        self.assertEqual(self.recorded(), [])
 
     def test_release_builder_reclaims_only_recognized_scratch_in_its_marked_cache(self):
         cache = self.build_cache()
@@ -403,7 +437,7 @@ class SmokeBoundary(unittest.TestCase):
         published = self.directory / "published"
         published.mkdir()
         (published / "archive").write_text("verified asset")
-        command = ["--ref", "HEAD", "--output", str(self.directory / "out")]
+        command = ["--ref", "HEAD", "--notes", str(self.notes), "--output", str(self.directory / "out")]
 
         with (cache / ".lock").open("w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -481,7 +515,7 @@ print("sandbox ready", flush=True)
 signal.pause()
 """)
         self.environment["CAGENTS_RELEASE_SMOKE_CACHE"] = str(smoke_cache)
-        command = [str(BUILD), "--ref", "HEAD", "--output", str(self.directory / "out")]
+        command = [str(BUILD), "--ref", "HEAD", "--notes", str(self.notes), "--output", str(self.directory / "out")]
         with subprocess.Popen(command, env=self.environment, stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True, start_new_session=True) as builder:
             try:

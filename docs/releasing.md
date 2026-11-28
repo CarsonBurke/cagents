@@ -71,7 +71,8 @@ disk cache. The next build reclaims recognized scratch left by interrupted
 runs after taking the cache lock. A supervisor keeps that lock through
 sandbox teardown. The cache keeps a source-only checkout of the selected
 commit. Each build rewrites only changed files so Cargo can reuse unaffected
-crates.
+crates. Use a full checkout for automatic release notes, or pass
+`--notes FILE` to build from a shallow checkout.
 
 Add `--timings` to `release:build` to retain Cargo's unit reports for each
 product and variant. The builder prints their directory inside its private

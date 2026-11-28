@@ -60,7 +60,7 @@ reclaim_release_runs() (
 
 # Keep one source-only checkout in the locked cache. Git rewrites only the
 # files that differ from the previous build, keeping unchanged path crates
-# fresh for Cargo. Commit history and tags are only needed in the caller.
+# fresh for Cargo. Only automatic notes need the caller's history and tags.
 checkout_release_source() (
     local repository=$1 commit=$2 object_format
     source_git() {

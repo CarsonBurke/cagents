@@ -105,6 +105,8 @@ PROTOCOL=$(sed -n 's/^pub const PROTOCOL_VERSION: u16 = \([0-9]*\);$/\1/p' <<< "
 if [[ -n $NOTES ]]; then
     [[ -f $NOTES ]] || fail "release notes not found: $NOTES"
     NOTES=$(realpath -- "$NOTES")
+elif [[ $(git -C "$ROOT_DIR" rev-parse --is-shallow-repository) != false ]]; then
+    fail 'automatic release notes need full history; fetch it or pass --notes FILE'
 fi
 for file in scripts/package-linux.sh scripts/package-ceditor-linux.sh install.sh; do
     git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:$file" || fail "missing source file: $file"
@@ -113,10 +115,6 @@ if [[ $TIMINGS == true ]] && ! git -C "$ROOT_DIR" grep -Fq CAGENTS_RELEASE_CARGO
     "$SOURCE_COMMIT" -- scripts/package-linux.sh; then
     fail 'the selected source does not support Cargo unit timings'
 fi
-# The source checkout in the cache is shallow. The caller still needs the
-# complete history to generate notes from the previous release.
-[[ $(git -C "$ROOT_DIR" rev-parse --is-shallow-repository) == false ]] ||
-    fail 'the source repository is shallow; fetch its full history first'
 # A source-only export must not silently omit submodule contents.
 while read -r mode type object path; do
     [[ $mode != 160000 ]] || fail 'source ref contains submodules; source-only export is unsupported'
