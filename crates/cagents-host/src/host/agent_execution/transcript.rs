@@ -12,7 +12,7 @@ use crate::{
     agent_execution::{
         Authority,
         directory::{Member, Relation, Scope},
-        transcript::{Builder, Entry, MAX_LIMIT, Page, Query},
+        transcript::{Builder, Entry, MAX_LIMIT, Page, Query, matches_cursor},
     },
     chat::{
         self, Item, ItemContent, Launch,
@@ -98,9 +98,11 @@ fn page(
     let mut pages = 0;
     let mut exhausted = false;
     'pages: loop {
-        let skipped = (!builder.found_cursor())
-            .then(|| history.skip_before(&builder, &mut seen))
-            .flatten();
+        let skipped = query
+            .before
+            .as_deref()
+            .filter(|_| !builder.found_cursor())
+            .and_then(|before| history.skip_before(before, &mut seen));
         let earlier = if let Some(earlier) = skipped {
             earlier
         } else {
@@ -566,11 +568,11 @@ impl History for Codex {
         Ok((items, index != 0))
     }
 
-    fn skip_before(&mut self, builder: &Builder, seen: &mut HashSet<String>) -> Option<bool> {
+    fn skip_before(&mut self, before: &str, seen: &mut HashSet<String>) -> Option<bool> {
         let index = self.remaining.checked_sub(1)?;
         let visited = self.index.visited.lock().unwrap_or_else(|p| p.into_inner());
         let ids = visited.ids.get(&index)?;
-        if builder.cursor_in(ids.iter().map(String::as_str)) {
+        if ids.iter().any(|id| matches_cursor(before, id)) {
             return None;
         }
         // Preserve deduplication against items in the skipped newer batch.
@@ -621,7 +623,7 @@ trait History {
     fn newest(&mut self) -> Result<HistoryPage, String>;
     fn earlier(&mut self) -> Result<HistoryPage, String>;
 
-    fn skip_before(&mut self, _builder: &Builder, _seen: &mut HashSet<String>) -> Option<bool> {
+    fn skip_before(&mut self, _before: &str, _seen: &mut HashSet<String>) -> Option<bool> {
         None
     }
 

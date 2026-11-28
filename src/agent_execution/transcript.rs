@@ -104,7 +104,7 @@ pub fn cursor(id: &str) -> String {
 }
 
 /// Whether `before`, an entry ID or its [`cursor`], names the entry `id`.
-fn names(before: &str, id: &str) -> bool {
+pub fn matches_cursor(before: &str, id: &str) -> bool {
     id == before || (before.len() == CURSOR_DIGITS && cursor(id) == before)
 }
 
@@ -375,15 +375,6 @@ impl Builder {
         self.before.is_none()
     }
 
-    /// Whether this batch of provider IDs might satisfy the pending cursor.
-    /// The caller still accounts for these IDs when skipping a batch.
-    #[cfg(feature = "host")]
-    pub fn cursor_in<'a>(&self, ids: impl IntoIterator<Item = &'a str>) -> bool {
-        self.before
-            .as_deref()
-            .is_some_and(|before| ids.into_iter().any(|id| names(before, id)))
-    }
-
     pub fn is_full(&self) -> bool {
         self.full_page
     }
@@ -395,7 +386,7 @@ impl Builder {
             return false;
         }
         if let Some(cursor) = &self.before {
-            if names(cursor, &item.id) {
+            if matches_cursor(cursor, &item.id) {
                 // Until an older item joins the page, the cursor's entry
                 // still marks where the next page begins: by its ID, as
                 // `earlier` always is, whichever name the caller gave.
