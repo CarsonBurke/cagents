@@ -1537,6 +1537,46 @@ fn conversation_footer_requires_completion_evidence_and_tracks_delegated_waiting
 }
 
 #[test]
+fn composer_tab_and_inspector_reuse_the_same_status_derivation() {
+    let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(16));
+    let snapshot = Arc::make_mut(&mut runtime.snapshot);
+    snapshot.subagents = (0..128)
+        .map(|index| {
+            let mut child = native_child_fixture();
+            child.id = format!("child-{index}");
+            child.status = if index == 0 {
+                chat::ToolStatus::Running
+            } else {
+                chat::ToolStatus::Succeeded
+            };
+            child
+        })
+        .collect();
+    let reads = |runtime: &Runtime| {
+        let _ = runtime.conversation_status(false);
+        let _ = runtime.own_conversation_status();
+        let _ = runtime.parent_tab_state();
+        let _ = runtime.closing_activity(false, None);
+        let _ = runtime.agent_failure_control();
+        let _ = runtime.conversation_statuses(false).timeline.clone();
+    };
+    STATUS_BUILDS.with(|count| count.set(0));
+    reads(&runtime);
+    reads(&runtime);
+    assert_eq!(STATUS_BUILDS.with(std::cell::Cell::get), 1);
+
+    Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+    assert_eq!(runtime.conversation_status(false).1, "1 subagent waiting");
+    reads(&runtime);
+    assert_eq!(STATUS_BUILDS.with(std::cell::Cell::get), 2);
+
+    runtime.disconnected = true;
+    assert_eq!(runtime.own_conversation_status().1, "Disconnected");
+    reads(&runtime);
+    assert_eq!(STATUS_BUILDS.with(std::cell::Cell::get), 3);
+}
+
+#[test]
 fn a_stopped_command_is_a_notice_rather_than_the_conversation_state() {
     let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
     let notice = format!(

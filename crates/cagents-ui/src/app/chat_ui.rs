@@ -3783,6 +3783,7 @@ pub(super) struct Runtime {
     fork_requested: bool,
     fork_seen: Option<String>,
     snapshot: Arc<Snapshot>,
+    conversation_status: std::cell::RefCell<[Option<view::ConversationStatusMemo>; 2]>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
     finished_stamp: Option<FinishedStamp>,
@@ -5533,6 +5534,7 @@ impl Runtime {
                 permission_mode,
                 ..Snapshot::default()
             }),
+            conversation_status: Default::default(),
             provider_queue: std::cell::RefCell::default(),
             source_clock: None,
             finished_stamp: None,

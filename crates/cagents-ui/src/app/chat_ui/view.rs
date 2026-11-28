@@ -2124,6 +2124,60 @@ impl AgentWork {
     }
 }
 
+type ConversationStatus = (Option<Icon>, String);
+
+/// The mutable inputs outside the snapshot which can change the status.
+#[derive(PartialEq, Eq)]
+struct StatusInputs {
+    closed_elsewhere: bool,
+    retained_draft: bool,
+    queued: bool,
+    disconnected: bool,
+    reattaching: bool,
+    choosing_attachments: bool,
+    outgoing: bool,
+    queue_sending: bool,
+    draft: bool,
+    provider: Provider,
+    owns_codex_listener: bool,
+    finished_stamp: Option<(u64, &'static str)>,
+}
+
+struct ConversationStatuses {
+    #[cfg(test)]
+    base: ConversationStatus,
+    composer: ConversationStatus,
+    timeline: ConversationStatus,
+    own: ConversationStatus,
+    failure_control: Option<ChildFailureControl>,
+    background_children: bool,
+    working: bool,
+    sending: bool,
+}
+
+struct ChildFailureControl {
+    label: String,
+    name: String,
+    tooltip: String,
+    child: Option<String>,
+    key: u64,
+}
+
+pub(super) struct ConversationStatusMemo {
+    // Holding a weak reference fences even Arc::make_mut in-place edits.
+    // COW dissociates the weak reference before mutating this publication.
+    snapshot: std::sync::Weak<Snapshot>,
+    inputs: StatusInputs,
+    error: Option<String>,
+    reset: Option<String>,
+    statuses: ConversationStatuses,
+}
+
+#[cfg(test)]
+thread_local! {
+    static STATUS_BUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// How a delivery's one line reads; see [`Runtime::delivery_outcome`].
 #[derive(Debug, PartialEq)]
 struct DeliveryOutcome<'a> {
@@ -2358,71 +2412,119 @@ impl Runtime {
             .find(|line| !line.is_empty())
     }
 
-    /// Completion requires provider evidence. An unstarted conversation is a
-    /// draft; an idle attached one is ready, while an attachment is connecting.
-    pub(super) fn conversation_status(&self, transitioning: bool) -> (Option<Icon>, String) {
-        self.conversation_status_with_failures(transitioning, true)
-    }
-
-    fn conversation_status_with_failures(
+    /// The composer, closing line, tabs and inspector share one derivation.
+    fn conversation_statuses(
         &self,
         transitioning: bool,
-        include_failures: bool,
-    ) -> (Option<Icon>, String) {
-        self.conversation_status_of(transitioning, include_failures, true)
+    ) -> std::cell::Ref<'_, ConversationStatuses> {
+        let slot = usize::from(transitioning);
+        let outgoing = self.on_its_way();
+        let inputs = StatusInputs {
+            closed_elsewhere: self.closed_elsewhere,
+            retained_draft: self.closed_elsewhere
+                && (self.has_unsent_text() || !self.attachments.is_empty()),
+            queued: self.queued.is_some(),
+            disconnected: self.disconnected,
+            reattaching: self.reattaching,
+            choosing_attachments: self.attachment_chooser_pending.is_some(),
+            outgoing,
+            queue_sending: outgoing && self.queue_sending(),
+            draft: self.is_draft(),
+            provider: self.session.launch.provider,
+            owns_codex_listener: self.snapshot.exited && self.session.owns_codex_listener(),
+            finished_stamp: self
+                .finished_stamp
+                .as_ref()
+                .map(|stamp| (stamp.at, stamp.outcome)),
+        };
+        let error = self.error.as_deref();
+        let reset = self
+            .usage_limit
+            .as_ref()
+            .and_then(|limit| limit.reset.as_deref());
+        if self.conversation_status.borrow()[slot]
+            .as_ref()
+            .is_none_or(|memo| {
+                memo.snapshot.as_ptr() != Arc::as_ptr(&self.snapshot)
+                    || memo.inputs != inputs
+                    || memo.error.as_deref() != error
+                    || memo.reset.as_deref() != reset
+            })
+        {
+            let statuses = self.derive_conversation_statuses(transitioning, &inputs, reset);
+            self.conversation_status.borrow_mut()[slot] = Some(ConversationStatusMemo {
+                snapshot: Arc::downgrade(&self.snapshot),
+                inputs,
+                error: error.map(str::to_owned),
+                reset: reset.map(str::to_owned),
+                statuses,
+            });
+        }
+        std::cell::Ref::map(self.conversation_status.borrow(), |memo| {
+            &memo[slot].as_ref().unwrap().statuses
+        })
     }
 
-    /// The conversation's own status, leaving its subagents to whoever
-    /// shows them separately.
-    pub(super) fn own_conversation_status(&self) -> (Option<Icon>, String) {
-        self.conversation_status_of(false, false, false)
+    #[cfg(test)]
+    pub(super) fn conversation_status(&self, transitioning: bool) -> ConversationStatus {
+        self.conversation_statuses(transitioning).composer.clone()
     }
 
-    fn conversation_status_of(
+    /// The conversation's own status for surfaces which show children separately.
+    pub(super) fn own_conversation_status(&self) -> ConversationStatus {
+        self.conversation_statuses(false).own.clone()
+    }
+
+    #[cfg(test)]
+    pub(super) fn conversation_status_base(&self, transitioning: bool) -> ConversationStatus {
+        self.conversation_statuses(transitioning).base.clone()
+    }
+
+    fn derive_conversation_statuses(
         &self,
         transitioning: bool,
-        include_failures: bool,
-        include_subagents: bool,
-    ) -> (Option<Icon>, String) {
-        let (glyph, label) = self.conversation_status_base(transitioning);
+        inputs: &StatusInputs,
+        reset: Option<&str>,
+    ) -> ConversationStatuses {
+        #[cfg(test)]
+        STATUS_BUILDS.with(|count| count.set(count.get() + 1));
         let snapshot = &self.snapshot;
-        if self.closed_elsewhere
-            || self.queued.is_some()
+        let activity = snapshot.subagent_activity();
+        let failure_control = Self::child_failure_control(&activity.failed);
+        let is_working = snapshot.busy || activity.working > 0 || activity.waiting > 0;
+        let sending = inputs.outgoing && !(inputs.queue_sending && is_working);
+        let (glyph, label) = self.base_status(transitioning, inputs, sending, &activity);
+        if inputs.closed_elsewhere
+            || inputs.queued
             || transitioning
-            || self.attachment_chooser_pending.is_some()
-            || self.says_sending()
-            || self.disconnected
+            || inputs.choosing_attachments
+            || sending
+            || inputs.disconnected
             || snapshot.exited
         {
-            return (glyph, label.to_owned());
+            let base = (glyph, label.to_owned());
+            return ConversationStatuses {
+                composer: base.clone(),
+                timeline: base.clone(),
+                own: base.clone(),
+                failure_control,
+                background_children: activity.on_background_work > 0,
+                working: is_working,
+                sending,
+                #[cfg(test)]
+                base,
+            };
         }
-        // Left out, the subagents are not walked at all: the inspector and
-        // its rail ask for the conversation's own status on every frame.
-        let activity = if include_subagents {
-            snapshot.subagent_activity()
-        } else {
-            chat::SubagentActivity::default()
-        };
-        let (working, waiting, on_background_work, failed) = (
-            activity.working,
-            activity.waiting,
-            activity.on_background_work,
-            activity.failed.len(),
-        );
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
         // The reset is when the conversation can carry on, so a limit that
         // still holds, as the daemon judges it, says it.
-        let limit_reset = self
-            .usage_limit
+        let limit = active
             .as_ref()
-            .filter(|_| {
-                active
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-            })
-            .and_then(|limit| limit.reset.as_deref())
+            .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit);
+        let limit_reset = reset
+            .filter(|_| limit)
             .map(|reset| format!("Account limit reached · resets {reset}"));
         let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
@@ -2437,8 +2539,27 @@ impl Runtime {
             chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
             chat::failure::FailureKind::Unresponsive => Some("Not responding"),
         });
+        let failure = limit_reset.as_deref().or(failure_label);
+        let own = (
+            if failure.is_some() && snapshot.busy {
+                Some(Icon::AgentWorking)
+            } else if limit {
+                Some(Icon::UsageLimit)
+            } else if failure.is_some() {
+                Some(Icon::Error)
+            } else {
+                glyph
+            },
+            failure.unwrap_or(label).to_owned(),
+        );
+        let (working, waiting, on_background_work, failed) = (
+            activity.working,
+            activity.waiting,
+            activity.on_background_work,
+            activity.failed.len(),
+        );
         let mut parts = Vec::new();
-        if let Some(label) = limit_reset.as_deref().or(failure_label) {
+        if let Some(label) = failure {
             parts.push(label.to_owned());
         } else if snapshot.busy
             || snapshot.waiting
@@ -2487,25 +2608,17 @@ impl Runtime {
             });
         }
         parts.extend(agent_parts);
-        if include_failures && failed > 0 {
-            parts.push(Self::agent_failure_label(&activity.failed));
-        }
-        if working + waiting + on_background_work + failed > 0 || failure_label.is_some() {
-            return (
+        #[cfg(test)]
+        let base_glyph = glyph;
+        let glyph =
+            if working + waiting + on_background_work + failed > 0 || failure_label.is_some() {
                 if working > 0 || snapshot.busy {
                     Some(Icon::AgentWorking)
-                } else if active
-                    .as_ref()
-                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-                {
-                    // A usage limit waits on a reset or another account,
-                    // not on a fix: the limit's own mark, not a failure's.
+                } else if limit {
                     Some(Icon::UsageLimit)
                 } else if failure_label.is_some() || failed > 0 {
                     Some(Icon::Error)
                 } else if waiting > 0 {
-                    // The conversation's own wait says what it waits for;
-                    // a subagent's alone is unnamed.
                     glyph
                         .filter(|glyph| {
                             crate::sidebar::AttentionState::of_glyph(*glyph)
@@ -2514,11 +2627,28 @@ impl Runtime {
                         .or(Some(Icon::AgentWaiting))
                 } else {
                     None
-                },
-                parts.join(" · "),
-            );
+                }
+            } else {
+                glyph
+            };
+        let timeline = (glyph, parts.join(" · "));
+        let composer = if let Some(control) = &failure_control {
+            parts.push(control.label.clone());
+            (glyph, parts.join(" · "))
+        } else {
+            timeline.clone()
+        };
+        ConversationStatuses {
+            #[cfg(test)]
+            base: (base_glyph, label.to_owned()),
+            composer,
+            timeline,
+            own,
+            failure_control,
+            background_children: on_background_work > 0,
+            working: is_working,
+            sending,
         }
-        (glyph, parts.join(" · "))
     }
 
     pub(super) fn agent_failure_task(agent: &chat::Subagent) -> &str {
@@ -2532,33 +2662,35 @@ impl Runtime {
         }
     }
 
-    /// The failed-subagents control's ID, which names the failures it
-    /// counts so that a new set of them is a new control.
-    pub(super) fn agent_failures_id(target: Target, failed: &[&chat::Subagent]) -> widget::Id {
+    fn agent_failures_key(failed: &[&chat::Subagent]) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut identity = crate::fingerprint::hasher();
         for agent in failed {
             agent.id.hash(&mut identity);
         }
-        card_control_id(
-            target.card,
-            &format!("chat-agent-failures-{:x}", identity.finish()),
-        )
+        identity.finish()
     }
 
-    fn agent_failure_control(&self) -> Option<Element<'_, Message>> {
-        let failed = self.snapshot.subagent_activity().failed;
-        if failed.is_empty() {
-            return None;
-        }
-        let (name, on_press) = match failed.as_slice() {
+    fn failure_control_id(target: Target, key: u64) -> widget::Id {
+        card_control_id(target.card, &format!("chat-agent-failures-{key:x}"))
+    }
+
+    /// The failed-subagents control's ID, which names the failures it
+    /// counts so that a new set of them is a new control.
+    pub(super) fn agent_failures_id(target: Target, failed: &[&chat::Subagent]) -> widget::Id {
+        Self::failure_control_id(target, Self::agent_failures_key(failed))
+    }
+
+    fn child_failure_control(failed: &[&chat::Subagent]) -> Option<ChildFailureControl> {
+        let (name, child) = match failed {
+            [] => return None,
             [agent] => (
                 format!("Open failed subagent: {}", Self::agent_failure_task(agent)),
-                Action::SelectSubagent(self.target, Some(agent.id.clone())),
+                Some(agent.id.clone()),
             ),
             _ => (
                 format!("Choose from {} failed subagents", failed.len()),
-                Action::SubagentChooser(self.target, child_navigation::Section::Attention),
+                None,
             ),
         };
         let tooltip = failed
@@ -2573,16 +2705,35 @@ impl Runtime {
             })
             .collect::<Vec<_>>()
             .join("\n");
+        Some(ChildFailureControl {
+            label: Self::agent_failure_label(failed),
+            name,
+            tooltip,
+            child,
+            key: Self::agent_failures_key(failed),
+        })
+    }
+
+    fn agent_failure_control(&self) -> Option<Element<'_, Message>> {
+        let statuses = self.conversation_statuses(false);
+        let failure = statuses.failure_control.as_ref()?;
+        let on_press = if let Some(child) = &failure.child {
+            Action::SelectSubagent(self.target, Some(child.clone()))
+        } else {
+            Action::SubagentChooser(self.target, child_navigation::Section::Attention)
+        };
         let button = widget::button::custom(
-            design::caption(Self::agent_failure_label(&failed))
-                .wrapping(iced::widget::text::Wrapping::None),
+            design::caption(failure.label.clone()).wrapping(iced::widget::text::Wrapping::None),
         )
-        .name(name)
-        .id(Self::agent_failures_id(self.target, &failed))
+        .name(failure.name.clone())
+        .id(Self::failure_control_id(self.target, failure.key))
         .padding(0)
         .class(crate::ui_controls::control_style(false, None))
         .on_press(action(on_press));
-        Some(crate::interaction::tooltip_above(button, tooltip))
+        Some(crate::interaction::tooltip_above(
+            button,
+            failure.tooltip.clone(),
+        ))
     }
 
     /// What the agent is doing now, for the row that closes the transcript:
@@ -2641,30 +2792,24 @@ impl Runtime {
         if snapshot.has_later {
             return None;
         }
-        let (glyph, label) = self.conversation_status(transitioning);
-        match glyph {
+        let statuses = self.conversation_statuses(transitioning);
+        let (glyph, label) = &statuses.composer;
+        let label = || label.clone();
+        match *glyph {
             Some(glyph)
                 if glyph == Icon::AgentWorking
                     || crate::sidebar::AttentionState::of_glyph(glyph)
                         .is_some_and(crate::sidebar::AttentionState::waits_on_user) =>
             {
-                Some((glyph, label))
+                Some((glyph, label()))
             }
             // The turn stays open on its background commands alone.
-            Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label)),
+            Some(Icon::AgentBackground) if snapshot.busy => Some((Icon::AgentBackground, label())),
             // A recent failed task stays actionable even after the lead finishes.
-            Some(Icon::Error) if !snapshot.subagent_activity().failed.is_empty() => {
-                Some((Icon::Error, label))
-            }
+            Some(Icon::Error) if statuses.failure_control.is_some() => Some((Icon::Error, label())),
             // Nothing is asked of the reader, but the finished stamp alone
             // would read as everything being done.
-            _ if snapshot
-                .subagents
-                .iter()
-                .any(|agent| agent.status == chat::ToolStatus::Waiting) =>
-            {
-                Some((Icon::AgentBackground, label))
-            }
+            _ if statuses.background_children => Some((Icon::AgentBackground, label())),
             _ => None,
         }
     }
@@ -2746,7 +2891,10 @@ impl Runtime {
         transitioning: bool,
         selected: Option<&chat::Subagent>,
     ) -> Option<(Icon, String)> {
-        if selected.is_none() && self.queue_sending() && !self.snapshot.is_working() {
+        if selected.is_none()
+            && self.queue_sending()
+            && !self.conversation_statuses(transitioning).working
+        {
             return None;
         }
         self.timeline_activity(transitioning, selected)
@@ -2997,7 +3145,7 @@ impl Runtime {
     /// Whether the conversation's status reads "Sending": a message is on
     /// its way, and the queue is not already saying so above a working agent.
     fn says_sending(&self) -> bool {
-        self.on_its_way() && !(self.queue_sending() && self.snapshot.is_working())
+        self.conversation_statuses(false).sending
     }
 
     /// Whether a message has yet to be taken by the provider. One it took
@@ -3054,34 +3202,39 @@ impl Runtime {
             .filter(|message| !chat::failure::is_notice(message))
     }
 
-    pub(super) fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    fn base_status(
+        &self,
+        transitioning: bool,
+        inputs: &StatusInputs,
+        sending: bool,
+        children: &chat::SubagentActivity<'_>,
+    ) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
-        if self.closed_elsewhere {
+        if inputs.closed_elsewhere {
             (
                 Some(Icon::Close),
-                if !self.has_unsent_text() && self.attachments.is_empty() {
+                if !inputs.retained_draft {
                     "Closed"
                 } else {
                     "Closed · draft retained"
                 },
             )
-        } else if self.queued.is_some() {
+        } else if inputs.queued {
             (Some(Icon::AgentWorking), "Starting")
-        } else if self.disconnected && self.reattaching && self.attachment_chooser_pending.is_none()
-        {
+        } else if inputs.disconnected && inputs.reattaching && !inputs.choosing_attachments {
             // Waiting for its next attempt or making one: either way the
             // window is on it, and nothing here is being switched. An open
             // file chooser holds the attempt back, and says so below.
             (Some(Icon::AgentWorking), "Reconnecting")
         } else if transitioning {
             (Some(Icon::AgentWorking), "Switching session")
-        } else if self.attachment_chooser_pending.is_some() {
+        } else if inputs.choosing_attachments {
             (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.says_sending() {
+        } else if sending {
             (Some(Icon::AgentWorking), "Sending")
-        } else if self.disconnected {
+        } else if inputs.disconnected {
             (Some(Icon::Warning), "Disconnected")
-        } else if snapshot.exited && self.session.owns_codex_listener() {
+        } else if snapshot.exited && inputs.owns_codex_listener {
             (Some(Icon::Warning), "Unavailable")
         } else if snapshot.exited {
             (Some(Icon::Warning), "Exited")
@@ -3097,16 +3250,7 @@ impl Runtime {
                 }
                 _ => (Some(Icon::AgentWaiting), "Waiting for you"),
             }
-        } else if !snapshot.busy
-            && snapshot
-                .subagents
-                .iter()
-                .any(|agent| agent.waiting && agent.is_running())
-            && !snapshot
-                .subagents
-                .iter()
-                .any(|agent| !agent.waiting && agent.is_running())
-        {
+        } else if !snapshot.busy && children.waiting > 0 && children.working == 0 {
             (Some(Icon::AgentWaiting), "Subagents waiting")
         } else if snapshot.stopping() {
             // Asked to stop, the agent is still winding down: its last
@@ -3120,7 +3264,7 @@ impl Runtime {
                 Some(Icon::AgentBackground),
                 chat::WAITING_ON_BACKGROUND_WORK,
             )
-        } else if snapshot.is_working() {
+        } else if snapshot.busy || children.working > 0 {
             (
                 Some(Icon::AgentWorking),
                 if !snapshot.busy {
@@ -3143,7 +3287,7 @@ impl Runtime {
             )
         } else if self.reported_errors().next().is_some() {
             (Some(Icon::Error), "Error")
-        } else if self.is_draft() {
+        } else if inputs.draft {
             (None, "Draft")
         } else if snapshot.ready {
             (None, "Ready")
@@ -4024,8 +4168,7 @@ impl Runtime {
                 .then(|| self.agent_failure_control())
                 .flatten();
             let label = if failure.is_some() {
-                self.conversation_status_with_failures(transitioning, false)
-                    .1
+                self.conversation_statuses(transitioning).timeline.1.clone()
             } else {
                 label
             };
