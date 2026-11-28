@@ -172,13 +172,22 @@ def encode(metadata: dict) -> bytes:
     return (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
 
 
+def unique_json_object(fields: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for name, value in fields:
+        if name in result:
+            raise Refused(f"{METADATA} contains a duplicate JSON field {name!r}")
+        result[name] = value
+    return result
+
+
 def check(directory: Path, version: str | None, source_commit: str | None) -> str:
     path = directory / METADATA
     raw = path.read_bytes()
     try:
-        metadata = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise Refused(f"{METADATA} is not JSON: {error}") from None
+        metadata = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Refused(f"{METADATA} is not UTF-8 JSON: {error}") from None
     if not isinstance(metadata, dict) or metadata.get("schema_version") != SCHEMA:
         raise Refused(f"{METADATA} is not schema {SCHEMA}")
     if version is not None and metadata.get("version") != version:
@@ -191,7 +200,8 @@ def check(directory: Path, version: str | None, source_commit: str | None) -> st
             or not isinstance(metadata.get("assets"), dict)):
         raise Refused(f"{METADATA} lacks its notes, protocol or assets")
     expected = build(directory, metadata.get("version", ""), metadata.get("source_commit", ""), protocol, notes)
-    if metadata != expected:
+    # JSON preserves the type distinctions that Python equality collapses.
+    if encode(metadata) != encode(expected):
         listed, present = set(metadata.get("assets", {})), set(expected["assets"])
         if listed != present:
             raise Refused(f"{METADATA} lists {sorted(listed ^ present)} differently from the release files")

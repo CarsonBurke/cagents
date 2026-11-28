@@ -62,6 +62,11 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertEqual(run("check", "--dir", str(self.release), "--version", VERSION,
                              "--source-commit", COMMIT).stdout.strip(), printed)
 
+        compact = json.dumps(written, separators=(",", ":")).encode()
+        (self.release / "release-metadata.json").write_bytes(compact)
+        self.assertEqual(run("check", "--dir", str(self.release)).stdout.strip(),
+                         hashlib.sha256(compact).hexdigest())
+
     def test_a_published_release_lists_every_product(self):
         for name in (f"cagents_{VERSION}_amd64.deb", f"cagents-browserless-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
                      "SHA256SUMS-browserless", f"ceditor-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
@@ -155,6 +160,42 @@ class ReleaseMetadata(unittest.TestCase):
         old["schema_version"] = 1
         path.write_text(json.dumps(old))
         self.assertIn("not schema 2", run("check", "--dir", str(self.release), check=False).stderr)
+
+    def test_check_rejects_float_and_boolean_encodings_for_integer_fields(self):
+        (self.release / ARCHIVE).write_bytes(b"x")
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_bytes()
+        for field, value in (("schema_version", 2.0), ("size", 1.0), ("size", True)):
+            with self.subTest(field=field, value=value):
+                metadata = json.loads(raw)
+                target = metadata if field == "schema_version" else metadata["assets"][ARCHIVE]
+                target[field] = value
+                path.write_text(json.dumps(metadata))
+                result = run("check", "--dir", str(self.release), check=False)
+                self.assertEqual(result.returncode, 1)
+
+    def test_check_rejects_duplicate_json_fields(self):
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_text()
+        duplicate = raw.replace('"schema_version": 2,', '"schema_version": 2,\n  "schema_version": 2,', 1)
+        self.assertNotEqual(duplicate, raw)
+        path.write_text(duplicate)
+        result = run("check", "--dir", str(self.release), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("duplicate JSON field", result.stderr)
+
+    def test_check_requires_utf8_json_without_a_byte_order_mark(self):
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_text(encoding="utf-8")
+        for encoding in ("utf-8-sig", "utf-16", "utf-32"):
+            with self.subTest(encoding=encoding):
+                path.write_bytes(raw.encode(encoding))
+                result = run("check", "--dir", str(self.release), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not UTF-8 JSON", result.stderr)
 
     def test_write_refuses_bad_input(self):
         cases = (
