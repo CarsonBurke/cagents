@@ -3399,7 +3399,6 @@ mod tests {
         let root_identity = super::super::RootIdentity::capture(root.pid, None).unwrap();
         super::super::shutdown_child_exit(
             &held.child,
-            &held.master,
             Some(&root_identity),
             &exited,
             false,

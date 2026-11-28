@@ -3479,16 +3479,7 @@ fn shutdown_bounds_a_root_that_ignores_hangup_and_preserves_graceful_exit() {
         assert_eq!(&ready, b"ready");
         let root = RootIdentity::capture(held.child.pid(), None).unwrap();
         let started = std::time::Instant::now();
-        let shutdown = || {
-            shutdown_child_exit(
-                &held.child,
-                &held.master,
-                Some(&root),
-                &exits,
-                false,
-                budget,
-            )
-        };
+        let shutdown = || shutdown_child_exit(&held.child, Some(&root), &exits, false, budget);
         #[cfg(target_os = "macos")]
         let status = {
             // XNU waits for the master to drain before reporting the shell's
@@ -3561,7 +3552,7 @@ fn shutdown_does_not_fabricate_completion_when_holder_reporting_fails() {
     let (sender, disconnected) = crossbeam_channel::bounded(1);
     drop(sender);
     assert!(
-        matches!(shutdown_child_exit(&held.child, &held.master, None, &disconnected, true, ShutdownBudget::PRODUCT), Err(message) if message == "child reaper closed")
+        matches!(shutdown_child_exit(&held.child, None, &disconnected, true, ShutdownBudget::PRODUCT), Err(message) if message == "child reaper closed")
     );
     assert!(matches!(
         child_exit_event(&mut false, Err("child reaper closed".into()), false),
