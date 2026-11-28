@@ -108,6 +108,8 @@ const MASTER_EXIT_TIMEOUT: Duration = Duration::from_secs(2);
 
 pub(crate) const BRIDGE_ABSENT_EXIT: u8 = 69;
 const BRIDGE_ABSENT_MARKER: &str = "cagents daemon bridge: daemon_not_running";
+pub(crate) const BRIDGE_TRANSITION_EXIT: u8 = 75;
+const BRIDGE_TRANSITION_MARKER: &str = "cagents daemon bridge: daemon_transitioning";
 /// What a device bridge writes to stderr as it starts, before it looks for
 /// its daemon: SSH logged in and ran cagents there, so a device that then
 /// says nothing is slow rather than unreachable. An older bridge never says
@@ -125,6 +127,22 @@ pub(crate) fn daemon_absent(error: &io::Error) -> bool {
     error
         .get_ref()
         .is_some_and(|error| error.is::<DaemonNotRunning>())
+}
+#[derive(Debug)]
+struct DaemonTransitioning;
+
+impl std::fmt::Display for DaemonTransitioning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("The daemon still owns its inventory lease but is not accepting connections")
+    }
+}
+
+impl std::error::Error for DaemonTransitioning {}
+
+pub(crate) fn daemon_transitioning(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|error| error.is::<DaemonTransitioning>())
 }
 /// The selected device's daemon speaks another protocol than this computer's
 /// executables, so no window or command here can use it. Which side is older
@@ -294,12 +312,35 @@ pub(crate) fn existing_daemon_missing() -> bool {
         .and_then(|transport| transport.newest_stream())
         .is_some_and(|stream| stream.failure().daemon_missing)
 }
+/// A failed read-only bridge can distinguish a held daemon lease from a CLI
+/// that refused the read-only flag before it could look for a daemon.
+pub(crate) enum RemoteStatusRefusal {
+    Transitioning,
+    OldCli,
+}
+
+pub(crate) fn remote_status_refusal() -> Option<RemoteStatusRefusal> {
+    let failure = selected_transport(true)?.newest_stream()?.failure();
+    if failure.daemon_transitioning {
+        Some(RemoteStatusRefusal::Transitioning)
+    } else if failure.old_cli {
+        Some(RemoteStatusRefusal::OldCli)
+    } else {
+        None
+    }
+}
+
 // Best effort: `eprintln!` would panic, ending the bridge before it serves
 // anything, if SSH has already closed stderr.
 pub(crate) fn report_absent_bridge() {
     use io::Write as _;
     let _ = writeln!(io::stderr().lock(), "{BRIDGE_ABSENT_MARKER}");
 }
+pub(crate) fn report_transitioning_bridge() {
+    use io::Write as _;
+    let _ = writeln!(io::stderr().lock(), "{BRIDGE_TRANSITION_MARKER}");
+}
+
 pub(crate) fn report_bridge_started() {
     use io::Write as _;
     let _ = writeln!(io::stderr().lock(), "{BRIDGE_STARTED_MARKER}");
@@ -339,6 +380,8 @@ struct StreamFailure {
     unreachable: Option<String>,
     /// The remote bridge explicitly reported that its daemon was absent.
     daemon_missing: bool,
+    daemon_transitioning: bool,
+    old_cli: bool,
     /// SSH's diagnostic for any other failure of this stream.
     diagnostic: Option<String>,
 }
@@ -1279,6 +1322,15 @@ impl Forwarding {
                 unreachable,
                 daemon_missing: status.code() == Some(i32::from(BRIDGE_ABSENT_EXIT))
                     && detail.daemon_absent,
+                daemon_transitioning: status.code() == Some(i32::from(BRIDGE_TRANSITION_EXIT))
+                    && detail.daemon_transitioning,
+                old_cli: transport.no_start
+                    && status.code() == Some(2)
+                    && self.status.reached() != Some(Reached::BridgeStarted)
+                    && detail.text.lines().chain(detail.tail.lines()).any(|line| {
+                        line.trim_start()
+                            .starts_with("error: unexpected argument '--no-start'")
+                    }),
                 diagnostic: Some(diagnostic),
             };
         }
@@ -1433,7 +1485,41 @@ struct ForwardingDiagnostics {
     /// login banner printed before it.
     tail: String,
     daemon_absent: bool,
+    daemon_transitioning: bool,
 }
+
+/// Matches a complete receipt line independently of captured stderr length.
+struct Receipt {
+    marker: &'static [u8],
+    progress: Option<usize>,
+    seen: bool,
+}
+
+impl Receipt {
+    fn new(marker: &'static str) -> Self {
+        Self {
+            marker: marker.as_bytes(),
+            progress: Some(0),
+            seen: false,
+        }
+    }
+
+    fn push(&mut self, byte: u8) {
+        if byte == b'\n' {
+            self.seen = self.complete();
+            self.progress = Some(0);
+        } else {
+            self.progress = self.progress.and_then(|position| {
+                (self.marker.get(position) == Some(&byte)).then_some(position + 1)
+            });
+        }
+    }
+
+    fn complete(&self) -> bool {
+        self.seen || self.progress == Some(self.marker.len())
+    }
+}
+
 /// How much of the end of SSH's stderr is kept for its own error.
 const DIAGNOSTIC_TAIL: usize = 512;
 fn capture_diagnostics(
@@ -1445,11 +1531,10 @@ fn capture_diagnostics(
     let mut captured = Vec::new();
     let mut tail = std::collections::VecDeque::with_capacity(DIAGNOSTIC_TAIL);
     let mut chunk = [0u8; 1024];
-    let marker = BRIDGE_ABSENT_MARKER.as_bytes();
-    let mut marker_progress = Some(0usize);
-    let started = BRIDGE_STARTED_MARKER.as_bytes();
-    let mut started_progress = Some(0usize);
-    let mut daemon_absent = false;
+    let mut absent = Receipt::new(BRIDGE_ABSENT_MARKER);
+    let mut transitioning = Receipt::new(BRIDGE_TRANSITION_MARKER);
+    let mut started = Receipt::new(BRIDGE_STARTED_MARKER);
+    let mut observed_start = false;
     let mut cancelled_bytes = 0usize;
     loop {
         match stderr.read(&mut chunk) {
@@ -1463,21 +1548,13 @@ fn capture_diagnostics(
                 tail.extend(&chunk[start..count]);
                 // Parse the receipt independently of the bounded diagnostic
                 // prefix, including markers split across pipe reads.
-                for byte in &chunk[..count] {
-                    if *byte == b'\n' {
-                        daemon_absent |= marker_progress == Some(marker.len());
-                        marker_progress = Some(0);
-                        if started_progress == Some(started.len()) {
-                            status.reach(Reached::BridgeStarted);
-                        }
-                        started_progress = Some(0);
-                    } else {
-                        marker_progress = marker_progress.and_then(|index| {
-                            (index < marker.len() && marker[index] == *byte).then_some(index + 1)
-                        });
-                        started_progress = started_progress.and_then(|index| {
-                            (index < started.len() && started[index] == *byte).then_some(index + 1)
-                        });
+                for &byte in &chunk[..count] {
+                    absent.push(byte);
+                    transitioning.push(byte);
+                    started.push(byte);
+                    if !observed_start && started.seen {
+                        status.reach(Reached::BridgeStarted);
+                        observed_start = true;
                     }
                 }
                 // Drain available bytes after settlement, but a persistent SSH
@@ -1505,14 +1582,18 @@ fn capture_diagnostics(
             Err(_) => break,
         }
     }
-    daemon_absent |= marker_progress == Some(marker.len());
-    if started_progress == Some(started.len()) {
+    if started.complete() {
         status.reach(Reached::BridgeStarted);
     }
     // The start receipt is for this computer, not part of what went wrong.
     let without_receipt = |text: std::borrow::Cow<'_, str>| {
         text.lines()
-            .filter(|line| line.trim() != BRIDGE_STARTED_MARKER)
+            .filter(|line| {
+                !matches!(
+                    line.trim(),
+                    BRIDGE_STARTED_MARKER | BRIDGE_TRANSITION_MARKER
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
             .trim()
@@ -1521,7 +1602,8 @@ fn capture_diagnostics(
     ForwardingDiagnostics {
         text: without_receipt(String::from_utf8_lossy(&captured)),
         tail: without_receipt(String::from_utf8_lossy(tail.make_contiguous())),
-        daemon_absent,
+        daemon_absent: absent.complete(),
+        daemon_transitioning: transitioning.complete(),
     }
 }
 
@@ -1606,7 +1688,7 @@ pub fn serve_stdio() -> io::Result<()> {
             if crate::daemon::HostLease::is_held_at(&path).map_err(io::Error::other)? {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "The daemon still owns its inventory lease but is not accepting connections",
+                    DaemonTransitioning,
                 ));
             }
             return Err(io::Error::new(
