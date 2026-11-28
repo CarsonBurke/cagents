@@ -11,6 +11,10 @@ on:
     paths:
       - ".github/workflows/pages.yml"
       - "website/**"
+  # The site links each download only once a release has it, so a published
+  # release rebuilds the site from main.
+  release:
+    types: [published]
   workflow_dispatch:
 
 permissions:
@@ -23,8 +27,24 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
+  # A release event runs on its tag, which the Pages environment doesn't
+  # deploy from; it asks for a run on main instead.
+  rebuild-for-release:
+    name: Rebuild website from main
+    if: github.event_name == 'release'
+    permissions:
+      actions: write
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Start a run on main
+        run: gh workflow run pages.yml --repo "$GITHUB_REPOSITORY" --ref main
+        env:
+          GH_TOKEN: ${{ github.token }}
+
   build:
     name: Build website
+    if: github.event_name != 'release'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
