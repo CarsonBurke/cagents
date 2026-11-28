@@ -1868,7 +1868,7 @@ fn what_holds_after_startup(
         && !session.native_continuity.retains_provider()
         && session.owned_codex_listener.is_none()
         && agent.as_ref().is_none_or(|agent| agent.console.is_none())
-        && owners.is_empty()
+        && owners.as_ref().is_ok_and(Vec::is_empty)
     {
         return Ok(None);
     }
