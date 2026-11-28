@@ -62,16 +62,27 @@ export function pictureHtml(screen, { eager = false } = {}) {
   return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture>${sources.join("")}${img}</picture>${icon}</a>${caption}`;
 }
 
+// The themes every screenshot on the page was captured in. A reader sees the
+// app in one theme throughout: until each capture has a light variant, light
+// mode shows the dark captures too, rather than mixing dark and light app
+// windows on one page.
+export function sharedThemes(names, screens) {
+  const [first, ...rest] = names.map((name) => screens[name].themes);
+  const themes = first.filter((theme) => rest.every((other) => other.includes(theme)));
+  if (!themes.length) throw new Error(`the page's screenshots share no theme: ${names.join(", ")}`);
+  return themes;
+}
+
 export function renderPage(html, { screens }) {
-  const used = new Set();
-  const out = html
-    .replace(/<!--screenshot:([a-z0-9-]+)(:eager)?-->/g, (_, name, eager) => {
-      const screen = screens[name];
-      if (!screen) throw new Error(`index.html names screenshot ${name}, which screens.json does not list`);
-      used.add(name);
-      return pictureHtml(screen, { eager: Boolean(eager) });
-    });
-  const unused = Object.keys(screens).filter((name) => !used.has(name));
+  const marker = /<!--screenshot:([a-z0-9-]+)(:eager)?-->/g;
+  const names = [...html.matchAll(marker)].map(([, name]) => name);
+  for (const name of names) {
+    if (!screens[name]) throw new Error(`index.html names screenshot ${name}, which screens.json does not list`);
+  }
+  const unused = Object.keys(screens).filter((name) => !names.includes(name));
   if (unused.length) throw new Error(`screens.json lists screenshots the page doesn't show: ${unused.join(", ")}`);
-  return out;
+  const themes = sharedThemes(names, screens);
+  return html.replace(marker, (_, name, eager) =>
+    pictureHtml({ ...screens[name], themes }, { eager: Boolean(eager) }),
+  );
 }
