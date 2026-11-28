@@ -20,8 +20,7 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
-mod resume_point;
-pub use resume_point::ResumePoint;
+pub use super::resume_point::ResumePoint;
 
 /// Tasks kept for one conversation; the rest are only counted.
 pub(crate) const MAX_TASKS: usize = 32;

@@ -194,7 +194,7 @@ impl ResumePoint {
     }
 }
 
-#[cfg(all(test, any(feature = "ui", not(feature = "host"))))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
