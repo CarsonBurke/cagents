@@ -503,6 +503,11 @@ pub trait Adapter: Send {
         ));
         Ok(step)
     }
+    /// The first model choice is awaiting provider replies. Its command
+    /// acknowledgement waits so a caller can send the first prompt after it.
+    fn first_model_pending(&self) -> bool {
+        false
+    }
     /// A compaction request can be in flight before the provider reports
     /// itself busy. The actor must not admit courier work in that gap.
     fn compaction_pending(&self) -> bool {

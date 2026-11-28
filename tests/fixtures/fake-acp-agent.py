@@ -354,6 +354,8 @@ class Session:
             levels = MUSE_LEVELS.get(self.model)
             if not levels:
                 return [mode, model]
+            if self.model == "muse-spark-1.2" and marked("spark-low-reasoning"):
+                levels = [("low", "Use this for quick replies."), *levels]
             if self.level not in [v for v, _ in levels]:
                 self.level = levels[0][0]
             return [mode, model,
@@ -692,7 +694,7 @@ class Agent:
         elif "background" in words:
             stop = self.background(session)
         elif "subagent" in words:
-            stop = self.subagent(session)
+            stop = self.subagent(session, parallel="parallel" in words)
         elif "garbage" in words:
             self.say(session, "Before the stray line. ")
             noise("fake-acp-agent: a diagnostic line that is not JSON")
@@ -927,25 +929,44 @@ class Agent:
         self.say(session, "The build finished.")
         return "end_turn"
 
-    def subagent(self, session):
-        """Antigravity 1.5.17's `invoke_subagent`: the call ends as soon as
-        the subagent starts, and of the subagent's steps only those that need
-        approval reach the parent session, under `<child session>:<call>`,
-        and are not replayed. The turn ends once the subagent has reported;
-        stopping it fails the subagent's command."""
+    def subagent(self, session, parallel):
+        """Antigravity 1.5.17 completes the invocation when the child starts.
+        Only steps needing approval reach the parent, with a child session
+        prefix on the tool call ID. Loading replays only the invocations."""
+        if parallel:
+            self.invoke_subagent(session, "Diff Reviewer", "Review the changes and report.")
+        self.invoke_subagent(session, "Release Checker",
+                             "Run `make check` in the project and report whether it passes.")
+        self.say(session, "I asked two subagents to work." if parallel else
+                 "I asked a subagent to run the checks. Waiting for its report.")
+        self.usage(session)
+        if parallel:
+            review = self.subagent_command(session, "git diff --stat", "Three files changed.\n")
+            if review == "cancelled":
+                return review
+        checks = self.subagent_command(session, "make check", "All 214 checks passed.\n")
+        if checks == "cancelled":
+            return checks
+        if checks == "allowed":
+            self.usage(session)
+            self.say(session, "\n\nThe subagent reports that `make check` passes: all 214 checks.")
+        else:
+            self.say(session, "\n\nThe subagent was not allowed to run the checks.")
+        return "end_turn"
+
+    def invoke_subagent(self, session, role, prompt):
         invoke = {"toolCallId": "call_" + str(uuid.uuid4().int)[:19], "name": "invoke_subagent",
                   "kind": "other", "title": "Run invoke_subagent",
-                  "rawInput": {"Role": "Release Checker", "TypeName": "self", "Model": "inherit",
-                               "Prompt": "Run `make check` in the project and report whether "
-                                         "it passes."}}
+                  "rawInput": {"Role": role, "TypeName": "self", "Model": "inherit",
+                               "Prompt": prompt}}
         session.update({"sessionUpdate": "tool_call", **invoke, "status": "in_progress"},
                        record=False)
         session.update({"sessionUpdate": "tool_call", **invoke, "status": "completed"})
-        self.say(session, "I asked a subagent to run the checks. Waiting for its report.")
-        self.usage(session)
+
+    def subagent_command(self, session, line, output):
         command = {"toolCallId": f"{uuid.uuid4()}:call_{str(uuid.uuid4().int)[:19]}",
-                   "name": "run_command", "kind": "execute", "title": "make check",
-                   "rawInput": {"CommandLine": "make check", "Cwd": session.cwd,
+                   "name": "run_command", "kind": "execute", "title": line,
+                   "rawInput": {"CommandLine": line, "Cwd": session.cwd,
                                 "WaitMsBeforeAsync": 5000}}
         session.update({"sessionUpdate": "tool_call", **command, "status": "pending"},
                        record=False)
@@ -963,8 +984,7 @@ class Agent:
         if outcome.get("optionId") != "allow":
             session.update({"sessionUpdate": "tool_call_update", **command, "status": "failed",
                             "rawOutput": {"output": "Refused by the user"}}, record=False)
-            self.say(session, "\n\nThe subagent was not allowed to run the checks.")
-            return "end_turn"
+            return "denied"
         session.update({"sessionUpdate": "tool_call_update", **command, "status": "in_progress"},
                        record=False)
         if self.pause(2, session):
@@ -972,11 +992,8 @@ class Agent:
                            record=False)
             return "cancelled"
         session.update({"sessionUpdate": "tool_call_update", **command, "status": "completed",
-                        "rawOutput": {"output": "All 214 checks passed.\n", "exit_code": 0}},
-                       record=False)
-        self.usage(session)
-        self.say(session, "\n\nThe subagent reports that `make check` passes: all 214 checks.")
-        return "end_turn"
+                        "rawOutput": {"output": output, "exit_code": 0}}, record=False)
+        return "allowed"
 
     def index(self):
         try:

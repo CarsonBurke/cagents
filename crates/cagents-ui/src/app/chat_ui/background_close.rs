@@ -538,6 +538,24 @@ impl Cagents {
                 ))
     }
 
+    /// Whether this window still owes a stopped pane's removal, even if the
+    /// scope cannot project the returned pane yet. Match the registry's
+    /// conversation, since it may have put a successor in the same card.
+    pub(in crate::app) fn chat_close_can_retry_removal(
+        &self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> bool {
+        let matches =
+            |closed: &chat::Session| !closed.is_unstarted() && shares_conversation(closed, session);
+        self.chat_ui.stopped_closes.get(&card).is_some_and(matches)
+            || self
+                .chat_ui
+                .background_closes
+                .values()
+                .any(|closing| closing.card == card && matches(&closing.session))
+    }
+
     /// Gives up the reopen held in `card`, which is closing.
     pub(super) fn release_held_reopen(&mut self, card: CardId) {
         for closing in self.chat_ui.background_closes.values_mut() {
@@ -785,6 +803,9 @@ impl Cagents {
             None
         };
         if !open(self) {
+            // The returned pane's removal has committed. If its view still
+            // holds it, keep the local tombstone after this one retry.
+            self.chat_ui.stopped_closes.remove(&card);
             self.chat_ui.stopped_returns.remove(&card);
             self.chat_ui.hidden_returns.remove(&card);
             // Nothing is left for its view to admit.
@@ -969,18 +990,9 @@ impl Cagents {
     }
 
     /// Whether `card` is a closed pane kept out of sight while its
-    /// conversation stops.
+    /// conversation stops or its removal waits.
     pub(in crate::app) fn returned_close_is_hidden(&self, card: CardId) -> bool {
         self.chat_ui.hidden_returns.contains(&card)
-    }
-
-    /// Whether `card` closed and its conversation is still stopping, so a
-    /// view that keeps it keeps nothing the person is to act on.
-    pub(in crate::app) fn closes_in_background(&self, card: CardId) -> bool {
-        self.chat_ui
-            .background_closes
-            .values()
-            .any(|closing| closing.card == card)
     }
 
     /// Brings a closed pane kept out of sight back into it.

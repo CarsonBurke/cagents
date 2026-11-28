@@ -284,6 +284,13 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
         .flatten()
         .map(|sent| {
             use crate::chat::coordination::{Arrival, Receipt};
+            let recipient = &data["recipient"];
+            let live = recipient
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|id| id.parse().ok())
+                .filter(|_| recipient["exited"].as_bool() != Some(true))
+                .map(|id| (id, recipient["title"].as_str()));
             // How an agent recipient took it; absent from older output.
             let agent = data
                 .get("agent")
@@ -297,7 +304,7 @@ fn json_outcome(kind: &Kind, output: &str) -> Option<Outcome> {
                 .flatten();
             Receipt {
                 message: crate::agent_execution::mailbox::short(sent.message.id),
-                recipient: sent.message.to.label(),
+                recipient: messages::receipt_recipient_label(&sent, live),
                 arrival: Arrival::of(&sent, agent.as_ref()),
             }
         });
@@ -707,6 +714,65 @@ mod tests {
         reply["command"] = "agent.spawn".into();
         reply["data"]["run"]["agent"] = serde_json::json!(crate::model::AgentId::new());
         assert!(super::outcome(&spawn, &reply.to_string()).run.is_none());
+    }
+
+    #[test]
+    fn json_receipts_name_the_live_successor_and_fall_back_to_the_message_address() {
+        use crate::chat::coordination::Arrival;
+        use serde_json::{Value, json};
+
+        let send = parse("cagents --json send d7f07b0d hi", None).unwrap();
+        let mut output = json!({
+            "ok": true,
+            "command": "send",
+            "data": {
+                "message": {
+                    "id": "45d4828a-0000-4000-8000-000000000000",
+                    "from": {"lineage": null, "session": null, "title": null},
+                    "to": {
+                        "lineage": "7ced022f-0000-4000-8000-000000000000",
+                        "session": null,
+                        "title": "Previous title"
+                    },
+                    "reply_to": null,
+                    "body": "hi",
+                    "wait_until_ms": null,
+                    "state": "Pending",
+                    "created_ms": 0
+                },
+                "reach": "Conversation",
+                "recipient": {
+                    "id": "d7f07b0d-0000-4000-8000-000000000000",
+                    "title": "Fix login",
+                    "state": "Limited"
+                }
+            }
+        });
+        let read = |output: &Value| super::outcome(&send, &output.to_string()).receipt.unwrap();
+        let receipt = read(&output);
+        assert_eq!(receipt.recipient, r#"session d7f07b0d "Fix login""#);
+        assert_eq!(receipt.message, "45d4828a");
+        assert_eq!(receipt.arrival, Arrival::WhenIdle);
+
+        let address = r#"session 7ced022f "Previous title""#;
+        output["data"]["recipient"]["title"] = Value::Null;
+        assert_eq!(
+            read(&output).recipient,
+            r#"session d7f07b0d "Previous title""#
+        );
+        output["data"]["recipient"]["exited"] = json!(true);
+        assert_eq!(read(&output).recipient, address);
+        output["data"]["recipient"]["exited"] = json!(false);
+        output["data"]["reach"] = json!("Offline");
+        let receipt = read(&output);
+        assert_eq!(receipt.recipient, address);
+        assert_eq!(receipt.arrival, Arrival::NextSession);
+
+        output["data"]["reach"] = json!("Conversation");
+        output["data"]["recipient"]["id"] = json!("invalid");
+        assert_eq!(read(&output).recipient, address);
+        output["data"].as_object_mut().unwrap().remove("recipient");
+        assert_eq!(read(&output).recipient, address);
     }
 
     #[test]

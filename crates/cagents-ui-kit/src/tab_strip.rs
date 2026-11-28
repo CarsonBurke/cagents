@@ -57,6 +57,27 @@ pub fn horizontal_with_scroll<'a, Message: 'a>(
 
 type OnScroll<'a, Message> = Box<dyn Fn(scrollable::Viewport) -> Message + 'a>;
 
+/// The width the tabs `shown`, which share one width, are drawn at in a
+/// strip `available` wide: `live`, what they would take now, unless the
+/// pointer holds the strip at a width it had (see
+/// [`crate::interaction::hover_hold::HeldWidth`]).
+pub fn tab_width(
+    hold: Option<&crate::interaction::hover_hold::HeldWidth<crate::model::CardId>>,
+    live: f32,
+    shown: &[crate::model::CardId],
+    available: f32,
+) -> f32 {
+    hold.map_or(live, |hold| hold.width(live, available, shown))
+}
+
+/// How a strip whose owner holds its tabs' width hears the pointer come and
+/// go; see [`crate::interaction::hover_region`].
+pub struct Hover<'a, Message> {
+    /// Whether the owner holds the strip now.
+    pub held: bool,
+    pub on_hover: Box<dyn Fn(bool) -> Message + 'a>,
+}
+
 pub struct Reordering<'a, Message> {
     pub order: Vec<crate::model::CardId>,
     pub tab_width: f32,
@@ -72,15 +93,20 @@ pub fn reorderable<'a, Message: 'a>(
     header_height: f32,
     on_scroll: Option<OnScroll<'a, Message>>,
     reordering: Reordering<'a, Message>,
+    hover: Option<Hover<'a, Message>>,
 ) -> Element<'a, Message> {
-    strip(
+    let strip = strip(
         id,
         tab_row,
         row_height,
         header_height,
         on_scroll,
         Some(reordering),
-    )
+    );
+    match hover {
+        Some(Hover { held, on_hover }) => crate::interaction::hover_region(strip, held, on_hover),
+        None => strip,
+    }
 }
 
 fn strip<'a, Message: 'a>(
@@ -117,6 +143,10 @@ fn strip<'a, Message: 'a>(
         ),
         None => row.into(),
     };
+    // Every strip keeps its room while the pointer is on it, so a tab
+    // closed near the end of a scrolled strip does not slide the rest under
+    // the pointer as the strip clamps its offset.
+    let row = crate::interaction::hover_hold::hold_extent(row);
     let mut tabs = widget::scrollable::horizontal(row)
         .id(id)
         // No scrollbar rail: the thumb is suppressed outright, so there is nothing

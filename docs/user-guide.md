@@ -1079,6 +1079,40 @@ daemon was held back for recovery, or an update or shutdown interrupted its
 resume, the next daemon of that boot runs it, and it never reopens a
 conversation that boot already ran.
 
+### Keep and back up conversation history
+
+Cagents keeps saved conversation descriptors and leaves Claude and Codex
+history in the provider home where it was written, with no age or count limit
+on either. The same policy applies to system, linked and managed
+homes, including conversations started outside Cagents. A provider's own
+settings and actions still govern its files. A saved descriptor can identify a
+conversation after its provider history has gone, but cannot recreate it.
+
+Use **Resume conversation** to inspect the saved conversations Cagents can
+identify. For a session available to `cagents transcript`, `--json --full
+--tools` exports a page of messages and tool output. Follow `--before` with the
+returned `earlier` cursor to export older pages. For a backup of the original
+history, copy the provider files from the account that ran the conversation
+after its writers have stopped. Keep their paths relative to that home.
+
+- Claude keeps `projects/<project-key>/<session-id>.jsonl` and may keep
+  subagent history under `projects/<project-key>/<session-id>/subagents/`.
+  Use `CLAUDE_CONFIG_DIR` for the account, or `~/.claude` for the default home.
+- Codex keeps rollouts in `sessions/<year>/<month>/<day>/` and moves archived
+  ones to `archived_sessions/`. Keep `session_index.jsonl`, when present, for
+  conversation names. Use `CODEX_HOME` for the account, or `~/.codex` for the
+  default home.
+
+To back up saved session descriptors, use SQLite's `.backup` command on the
+primary `sessions.sqlite3`, the `workspace-model.sqlite3` beside it, and each
+named-window `sessions.sqlite3` you use. `.backup` includes committed data from
+SQLite's write-ahead log. Keep `daemon-upgrade/` with the backup when an update
+is unresolved or a stopped conversation relies on a captured transcript. Copy
+that directory while no upgrade is writing to it. Copy only the history files
+you intend to keep from provider homes, which also hold credentials. Store the
+backup privately.
+[Cagents store paths](configuration.md#files-and-directories)
+
 ### Image references and local image storage
 
 Pasted and selected images receive stable **Image N** labels. Their inline

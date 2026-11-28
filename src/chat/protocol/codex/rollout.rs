@@ -15,6 +15,7 @@ use std::{
     collections::HashMap,
     fs::{File, Metadata},
     io::{BufRead, BufReader, Read},
+    os::unix::fs::FileExt as _,
     path::Path,
 };
 
@@ -74,16 +75,139 @@ impl Rollout {
         crate::git_watch::supports_open_file_revisions(&self.file)
     }
 
+    pub fn current_metadata(&self) -> std::io::Result<Metadata> {
+        self.file.metadata()
+    }
+
     /// Reads up to the opening length. Return closing metadata only when the
     /// whole span was read, so a partial read cannot seed a reusable snapshot.
     pub fn read(self) -> (Vec<Item>, Option<Metadata>) {
-        let mut reader = (&self.file).take(self.metadata.len());
+        let mut reader = self.span(0, self.metadata.len());
         let items = parse(&mut reader);
         let finished = (reader.limit() == 0)
             .then(|| self.file.metadata().ok())
             .flatten();
         (items, finished)
     }
+
+    /// Index batches of whole turns without decoding their contents. The
+    /// opening stretch can be replayed history without any turn markers.
+    pub fn batches(&self, target_bytes: u64) -> std::io::Result<Vec<Batch>> {
+        let mut reader = BufReader::with_capacity(64 * 1024, self.span(0, self.metadata.len()));
+        let mut batches = Vec::new();
+        let mut start = Position::default();
+        let mut turn = start;
+        let mut next = start;
+        let mut head = Vec::new();
+        while next.byte < self.metadata.len() {
+            head.clear();
+            // Long records can be skipped in the reader without making a
+            // copy of their payload. Missing an unusually large turn marker
+            // only makes the enclosing batch larger.
+            let prefix = (&mut reader).take(4096).read_until(b'\n', &mut head)? as u64;
+            if prefix == 0 {
+                return Err(short_read());
+            }
+            let rest = if head.ends_with(b"\n") || prefix < 4096 {
+                0
+            } else {
+                reader.skip_until(b'\n')? as u64
+            };
+            if rest == 0 && starts_turn(&head) {
+                if next.byte - start.byte > target_bytes && start != turn {
+                    batches.push(Batch { start, end: turn });
+                    start = turn;
+                }
+                if next.byte - start.byte >= target_bytes {
+                    batches.push(Batch { start, end: next });
+                    start = next;
+                }
+                turn = next;
+            }
+            next.byte += prefix + rest;
+            next.line += 1;
+        }
+        if next != start {
+            // The last turn can itself push the last group over budget.
+            if next.byte - start.byte > target_bytes && start != turn {
+                batches.push(Batch { start, end: turn });
+                start = turn;
+            }
+            batches.push(Batch { start, end: next });
+        }
+        Ok(batches)
+    }
+
+    /// The descriptor and the batch table must have the same revision.
+    pub fn replay(&self, batch: Batch) -> std::io::Result<Vec<Item>> {
+        let mut reader = self.span(batch.start.byte, batch.bytes());
+        let items = parse_from(&mut reader, batch.start.line);
+        if reader.limit() != 0 {
+            return Err(short_read());
+        }
+        tracing::trace!(
+            bytes = batch.bytes(),
+            records = batch.end.line - batch.start.line,
+            "replayed Codex transcript batch"
+        );
+        Ok(items)
+    }
+
+    fn span(&self, offset: u64, bytes: u64) -> std::io::Take<Positioned<'_>> {
+        Positioned {
+            file: &self.file,
+            offset,
+        }
+        .take(bytes)
+    }
+}
+
+struct Positioned<'a> {
+    file: &'a File,
+    offset: u64,
+}
+
+impl Read for Positioned<'_> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let bytes = self.file.read_at(buffer, self.offset)?;
+        self.offset += bytes as u64;
+        Ok(bytes)
+    }
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct Position {
+    byte: u64,
+    line: usize,
+}
+
+/// A range beginning at the file's start or a confirmed turn boundary.
+#[derive(Clone, Copy)]
+pub struct Batch {
+    start: Position,
+    end: Position,
+}
+
+impl Batch {
+    pub fn bytes(self) -> u64 {
+        self.end.byte - self.start.byte
+    }
+}
+
+fn starts_turn(line: &[u8]) -> bool {
+    // The prefilter can miss an escaped spelling. Only a match confirmed by
+    // the replay parser can start a new batch.
+    std::str::from_utf8(line).is_ok_and(|line| line.contains("\"task_started\""))
+        && serde_json::from_slice::<Value>(line).is_ok_and(|record| {
+            record["type"] == "event_msg" && record["payload"]["type"] == "task_started"
+        })
+}
+
+fn short_read() -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "The Codex rollout changed during a read",
+    )
 }
 
 fn open(path: &Path) -> Result<(File, Metadata), String> {
@@ -178,19 +302,33 @@ pub(super) fn opening_title(home: &Path, id: &str) -> Option<crate::chat::Openin
 /// this version does not understand, is skipped rather than failing the
 /// conversation.
 pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
+    parse_from(reader, 0)
+}
+
+fn parse_from(reader: impl Read, first_line: usize) -> Vec<Item> {
     let mut items = Vec::new();
     // Raw calls no item in their turn describes, each with its place in `items`.
     let mut raw_tools = Vec::new();
     let mut turn = RawTurn::default();
-    for (line, text) in BufReader::new(reader).split(b'\n').enumerate() {
-        let Ok(text) = text else { break };
+    let mut reader = BufReader::new(reader);
+    let mut text = Vec::new();
+    for line in first_line.. {
+        text.clear();
+        if !reader
+            .read_until(b'\n', &mut text)
+            .is_ok_and(|bytes| bytes != 0)
+        {
+            break;
+        }
         let Ok(record) = serde_json::from_slice::<Value>(&text) else {
             continue;
         };
-        let at = record["timestamp"]
-            .as_str()
-            .and_then(|time| time.parse::<jiff::Timestamp>().ok())
-            .and_then(|time| u64::try_from(time.as_millisecond()).ok());
+        let at = || {
+            record["timestamp"]
+                .as_str()
+                .and_then(|time| time.parse::<jiff::Timestamp>().ok())
+                .and_then(|time| u64::try_from(time.as_millisecond()).ok())
+        };
         let payload = &record["payload"];
         let line_id = || format!("line-{line}");
         let item = |id: String, (role, content): (Role, ItemContent)| Item {
@@ -198,7 +336,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
             role,
             content,
             started_at: None,
-            at,
+            at: at(),
         };
         match (record["type"].as_str(), payload["type"].as_str()) {
             (Some("response_item"), Some("message")) => {
@@ -264,7 +402,7 @@ pub(crate) fn parse(reader: impl Read) -> Vec<Item> {
                 if payload["reason"].as_str() == Some("interrupted") =>
             {
                 items.push(Item {
-                    at,
+                    at: at(),
                     ..crate::chat::stopped_notice(line_id())
                 })
             }
@@ -714,6 +852,59 @@ fn value_text(value: &Value) -> String {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn replay_batches_keep_absolute_ids_and_tool_matches() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("rollout.jsonl");
+        let turn = json!({"type":"event_msg","payload":{"type":"task_started"}});
+        let raw = |name| {
+            json!({"type":"response_item","payload":{
+                "type":"function_call","name":"exec_command","call_id":"same","arguments":name
+            }})
+        };
+        let output = |text| {
+            json!({"type":"response_item","payload":{
+                "type":"function_call_output","call_id":"same","output":text
+            }})
+        };
+        let records = lines(&[
+            // A fork's unmarked replay can include raw tools and broken rows.
+            raw("parent"),
+            output("parent result"),
+            turn.clone(),
+            raw("child"),
+            json!({"type":"ignored","payload":{"type":"task_started","text":"x".repeat(9000)}}),
+            output("child result"),
+            json!({"type":"event_msg","payload":{"type":"item_completed","item":{
+                "type":"CommandExecution","id":"same","command":"child","status":"completed"
+            }}}),
+            turn,
+            raw("last"),
+            output("last result"),
+        ]);
+        // Keep physical line numbers even for malformed and unterminated rows.
+        let records = format!("\n{{broken\n{records}\n{{\"type\":");
+        std::fs::write(&path, &records).unwrap();
+        let rollout = Rollout::open(&path).unwrap();
+        let batches = rollout.batches(128).unwrap();
+        assert_eq!(batches.len(), 3);
+        let indexed = batches
+            .into_iter()
+            .flat_map(|batch| rollout.replay(batch).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(indexed, rollout.read().0);
+        assert_eq!(
+            indexed
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            ["line-2", "same", "line-10"]
+        );
+        assert!(
+            matches!(&indexed[2].content, ItemContent::Tool {output, ..} if output == "last result")
+        );
+    }
 
     fn lines(records: &[Value]) -> String {
         records

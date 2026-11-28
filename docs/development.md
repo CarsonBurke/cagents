@@ -1464,7 +1464,7 @@ It never touches:
 - other users' files;
 - anything reached through a symlink.
 
-What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
+Up to 1 MiB of recent removal records go to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The pruner's explicit `--log FILE` option appends without rotating. The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
 Each executable states its version with `cagents::stamp_version!()`, invoked
 once as an item at its root; the library answers `cagents::version()` from
@@ -1730,6 +1730,88 @@ submitting requests to the OS manager.
 
 See the [kernel pidfd fdinfo format](https://github.com/torvalds/linux/blob/master/fs/pidfs.c)
 and [systemd's numeric scope PID handling](https://github.com/systemd/systemd/blob/main/src/core/dbus-scope.c).
+
+#### Hosted peer identity qualification
+
+An older daemon can recognize its hosted peers by ancestry while the holder
+lives. A replacement daemon can still recognize a retained Cagents holder.
+After the holder exits and the payload reparents, a fresh local socket needs
+independent process evidence. The production peer check in
+`src/daemon/peer_scope.rs` also recognizes Linux session cgroups.
+
+Run the native probe for [#4624](https://github.com/CarsonBurke/cagents/issues/4624)
+from an external user session with access to the OS user manager:
+
+```sh
+/usr/bin/python3 -I -B scripts/qualify-hosted-identity.py
+# macOS background user domain
+/usr/bin/python3 -I -B scripts/qualify-hosted-identity.py --domain user
+```
+
+The probe uses a private socket. A payload execs in a new process session and
+connects to an observer. A replacement observer binds the same socket path and
+takes fresh connections while the owner is live and after the payload reparents. Both observers also query
+a peer from an independent shell under the same UID. The Linux probe reads the
+cgroup of the kernel-pinned socket peer. The macOS probe holds a kqueue exit
+watch on the numeric socket peer during the coalition query and rechecks the
+socket PID. The result qualifies the OS mechanisms with stand-ins for the
+daemon and payload.
+
+| Environment | Launch | Retained owner and detached payload | External control |
+| --- | --- | --- | --- |
+| Linux 7.3.6, cgroup v2, systemd 262.2 | User scope before exec | Exact session scope observed on every fresh connection, including after reparenting | Ordinary user unit |
+| Same Linux host | Move owner after payload starts | Owner enters the session scope. Existing payload stays in its original unit despite owner migration and reparenting | Same unit as payload |
+| Same Linux host | Launch without enrollment | Payload stays in the original unit | Same unit as payload |
+| Apple Silicon macOS 26.6.2 (25G83) | Unique launchd job in `gui/UID` with `Aqua`, or `user/UID` with `Background` | Distinct resource coalition observed for both jobs, including on fresh connections after reparenting to PID 1 | Different resource coalition |
+| Same Mac | Direct launch without a job | Payload inherits the caller's resource coalition | Same coalition as payload |
+
+**Linux launch paths.** The PTY keeper, retained Claude actor and native
+holder already finish a best-effort enrollment attempt before they start
+their payloads. The same boundary can require confirmed scope membership on
+systems with a verified user manager and cgroup v2. The direct provider path
+in `src/chat/runtime.rs` starts the provider before moving it. A provider can
+fork during startup, before any prompt. Requiring the current move to succeed
+would still leave that child in the original cgroup. A trusted launch stage
+can enter the scope before exec, as the probe's in-place
+`systemd-run --user --scope` launch demonstrates. Production integration
+needs to preserve child custody, the process group, provider pipes, the pinned
+working directory and the account lease. A child that already inherited a
+holder's session scope still has that identity even if a later move fails.
+[Linux cgroup v2](https://docs.kernel.org/admin-guide/cgroup-v2.html) ·
+[systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)
+
+**macOS launch paths.** The GUI and background launchd jobs worked on one
+logged-in Mac. The background job needed `LimitLoadToSessionType=Background`
+when bootstrapped into `user/UID`. Production holders are currently daemon
+children. A launchd-backed holder would need authenticated startup without
+inherited daemon descriptors and a boot-scoped record of the assigned
+coalition published before releasing the payload. A replacement can compare
+fresh peer observations to that record after the owner exits. Validate that
+handoff and the private `PROC_PIDCOALITIONINFO` ABI on the supported releases
+and login states before adopting it. `LOCAL_PEERPID` names the peer socket's
+last user. The exit watch covers the lifetime of the process it opens, so the
+probe does not qualify exact connect-time attribution under PID reuse or
+socket transfer. [XNU coalitions](https://github.com/apple-oss-distributions/xnu/blob/main/doc/observability/coalitions.md) ·
+[XNU process query](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/sys/proc_info_private.h) ·
+[XNU socket peer options](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/uipc_usrreq.c)
+
+**Unavailable containment.** Current launches continue on missing or refused
+enrollment. The fallback observations show why that mode cannot prove a
+detached process is hosted. On a path that requires containment, a failure
+must prevent payload exec. The Linux probe verifies this by requesting a scope
+whose unit name is already in use and checking that the payload never runs.
+Where containment cannot be required, qualify
+explicit authorization for user-scoped mutations before changing the default.
+That proof must come from a trusted user interaction and bind the approved
+operation. An environment variable or a missing session credential supplies no
+such proof.
+
+This identity distinguishes processes that stay in their launch boundary. A
+same-UID process with access to the OS manager can request a separate launch.
+On Linux, a process with the required cgroup migration permissions can also
+move existing work. Same-UID control of another process or its files can cross
+either boundary. Treat these identities as provenance for daemon admission
+within the existing local trust model.
 
 ## Testing
 

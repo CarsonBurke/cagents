@@ -877,6 +877,7 @@ impl LocalHandle {
                     output: Vec::new(),
                     scanned: 0,
                     pending: VecDeque::new(),
+                    first_model_reply: None,
                     offset: 0,
                     queued: 0,
                     stderr: VecDeque::new(),
@@ -2854,6 +2855,8 @@ struct Actor {
     /// Prefix already checked for a delimiter in the incomplete stdio frame.
     scanned: usize,
     pending: VecDeque<QueuedWrite>,
+    /// The provider's first model and effort replies may arrive separately.
+    first_model_reply: Option<crossbeam_channel::Sender<Result<(), Rejection>>>,
     offset: usize,
     queued: usize,
     stderr: VecDeque<u8>,
@@ -3724,7 +3727,10 @@ impl Actor {
             }
             if match &command {
                 ActorCommand::IdlePrompt { .. } => self.adapter.compaction_pending(),
-                ActorCommand::IdleCompact(_) => self.adapter.compaction_admission_pending(),
+                ActorCommand::IdleCompact(_) => {
+                    self.adapter.first_model_pending()
+                        || self.adapter.compaction_admission_pending()
+                }
                 _ => false,
             } {
                 let _ = refuse(COMPACTION_PENDING.into());
@@ -4019,6 +4025,7 @@ impl Actor {
                 continue;
             }
             let loads_earlier = command == Command::LoadEarlier;
+            let was_selecting_first_model = self.adapter.first_model_pending();
             let prepared = if tracked_compaction.is_some() {
                 self.adapter.tracked_compaction()
             } else {
@@ -4052,7 +4059,14 @@ impl Actor {
                             detail: "Waiting for provider turn".into(),
                         });
                     }
-                    let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
+                    if result.is_ok()
+                        && !was_selecting_first_model
+                        && self.adapter.first_model_pending()
+                    {
+                        self.first_model_reply = Some(reply);
+                    } else {
+                        let _ = reply.send(result.clone().map_err(Rejection::Unacknowledged));
+                    }
                     result?;
                     if started {
                         self.publish_activity();
@@ -4138,6 +4152,7 @@ impl Actor {
             || !self.pending.is_empty()
             || !self.output.is_empty()
             || self.adapter.compaction_pending()
+            || self.adapter.first_model_pending()
         {
             UpdateReadiness::Unready
         } else if state.holds_work() {
@@ -4527,6 +4542,16 @@ impl Actor {
             }
         }
         self.publish_activity();
+        if self.first_model_reply.is_some()
+            && !self.adapter.first_model_pending()
+            && let Some(reply) = self.first_model_reply.take()
+        {
+            let _ = reply.send(
+                frame_error
+                    .clone()
+                    .map_or(Ok(()), |error| Err(Rejection::Unacknowledged(error))),
+            );
+        }
         match frame_error {
             Some(error) => Err(error),
             None => Ok(()),
@@ -4589,6 +4614,7 @@ impl Actor {
                 | Event::SubagentTextDelta { .. }
                 | Event::SubagentOutputDelta { .. }
                 | Event::SubagentItemsRemoved { .. }
+                | Event::SubagentMerged { .. }
                 | Event::Reset { .. }
         );
         if matches!(
@@ -4699,8 +4725,10 @@ impl Actor {
         self.ready = state.ready;
         let compacting = self.adapter.compaction_pending();
         self.compaction_pending.store(compacting, Ordering::Release);
-        let prompt_available =
-            !compacting && accepts_prompt(&state) && !self.stop.load(Ordering::Acquire);
+        let prompt_available = !compacting
+            && !self.adapter.first_model_pending()
+            && accepts_prompt(&state)
+            && !self.stop.load(Ordering::Acquire);
         let became_available = prompt_available && !self.prompt_available;
         self.prompt_available = prompt_available;
         // The person's queue can empty while the conversation stays idle,
@@ -4942,6 +4970,7 @@ fn apply_projected_event(
             | Event::SubagentTextDelta { .. }
             | Event::SubagentOutputDelta { .. }
             | Event::SubagentItemsRemoved { .. }
+            | Event::SubagentMerged { .. }
     );
     match event {
         Event::OutputDelta { id, offset, delta } => {
@@ -5197,6 +5226,14 @@ fn apply_projected_event(
                         agent.detail.clear();
                     }
                 }
+            }
+        }
+        Event::SubagentMerged { from, into } => {
+            if let Some(index) = state.subagents.iter().position(|agent| agent.id == from) {
+                let provisional = state.subagents.remove(index);
+                let agent = subagent(state, &into);
+                // An unresolved invocation has no child transcript yet.
+                agent.items = provisional.items;
             }
         }
         Event::SubagentItem { id, mut item } => {

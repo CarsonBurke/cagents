@@ -21,7 +21,12 @@ impl Cagents {
         // `SidebarAction`s that arrive right here, so refusing
         // everything while it is up would strand it with no way out - a
         // worse fault than the one this guard exists for.
-        if self.modal_is_open() && !answers_discard_confirmation(&action) {
+        // The pointer's coming and going is reported whatever is open, so a
+        // hold does not outlast the dialog.
+        if self.modal_is_open()
+            && !answers_discard_confirmation(&action)
+            && !matches!(action, SidebarAction::ListHover(_))
+        {
             return ControlFlow::Break(Task::none());
         }
         if matches!(
@@ -43,6 +48,12 @@ impl Cagents {
                 if self.source_control_is_bound(key)
         ) {
             self.device_source_activity(false);
+        }
+        if let SidebarAction::ListHover(over) = action {
+            let compact = self.projects_sidebar_mode() == SidebarMode::Compact;
+            self.sidebar_state
+                .hover_list(&self.sidebar_model, compact, over);
+            return ControlFlow::Break(Task::none());
         }
         // Folding takes the rows, and any keyboard focus on one, out
         // of the tree; ask the tree drawn now before it does.
@@ -717,6 +728,7 @@ impl Cagents {
             | SidebarAction::ToggleProject(_)
             | SidebarAction::ToggleWorktrees(_)
             | SidebarAction::ToggleInProgress
+            | SidebarAction::ListHover(_)
             => Task::none(),
             // The settings page edits the same default, so this goes
             // through its path: the page's draft, the save and the

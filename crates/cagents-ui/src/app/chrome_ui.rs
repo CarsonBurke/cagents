@@ -25,6 +25,9 @@ pub(super) fn measure_tab_title(title: &str) -> f32 {
 #[derive(Debug, Default)]
 pub(super) struct State {
     pub(super) hovered_tab: Option<CardId>,
+    /// Where `hovered_tab` sits in the strip, so the tab that takes its
+    /// place under the pointer when it closes can be hovered in its stead.
+    hovered_slot: Option<usize>,
     pub(super) closing_group: Vec<CardId>,
     pub(super) user_titles: HashMap<CardId, String>,
     /// Accepted spawn labels, read without loading a provider conversation.
@@ -70,6 +73,13 @@ pub(super) struct State {
     /// the tab to the viewport edge - including a reveal triggered by merely
     /// hovering an already-visible tab under focus-follows-mouse.
     tabs_offset: f32,
+    /// The width the tabs shared when the pointer came over the strip, and
+    /// which tabs shared it. A close or a retitle under the pointer keeps it,
+    /// so the next tab's close control comes to rest where the pointer is,
+    /// until the pointer leaves the strip.
+    tabs_hold: crate::interaction::hover_hold::Hold<
+        crate::interaction::hover_hold::HeldWidth<crate::model::CardId>,
+    >,
     /// The notices control kept on screen, at this severity, for the frame
     /// after the last notice went: long enough to learn whether it held the
     /// keyboard, which would otherwise go nowhere with it.
@@ -245,6 +255,142 @@ mod tests {
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());
         app
+    }
+
+    /// Removes the last shown tab, as closing it does.
+    fn close_last_tab(app: &mut Cagents) {
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.remove(durable.cards.len() - 1);
+        let width = app.workspace.viewport_width();
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(width);
+        drop(app.sync_chrome());
+    }
+
+    #[test]
+    fn tabs_keep_their_width_under_the_pointer_until_it_leaves() {
+        // Long titles overflow five tabs at this width, so they are
+        // compact; one close later the row fits and they would widen.
+        let mut app = tab_fixture(5, 1100.0);
+        for card in app.durable.cards.iter() {
+            app.chrome_ui
+                .user_titles
+                .insert(card.id, "A long conversation title".into());
+        }
+        drop(app.sync_chrome());
+        let (_, compact) = app.tab_strip_geometry();
+        assert!(compact < design::TAB_MIN_WIDTH);
+        drop(app.update_chrome(Action::TabsHover(true)));
+        let mut live = compact;
+        while live == compact && app.workspace.shown().count() > 1 {
+            close_last_tab(&mut app);
+            live = app.live_tab_strip_geometry().1;
+            assert_eq!(
+                app.tab_strip_geometry().1,
+                compact,
+                "a close keeps the width"
+            );
+        }
+        assert!(live > compact, "the row would have widened");
+        // A retitle under the pointer is held too.
+        let first = app.durable.cards[0].id;
+        app.chrome_ui.user_titles.insert(first, "W".into());
+        drop(app.sync_chrome());
+        assert_eq!(app.tab_strip_geometry().1, compact);
+        drop(app.update_chrome(Action::TabsHover(false)));
+        assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
+    }
+
+    #[test]
+    fn a_new_tab_under_the_pointer_takes_a_fresh_hold() {
+        let mut app = tab_fixture(2, 1600.0);
+        drop(app.update_chrome(Action::TabsHover(true)));
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .push(super::super::tests::terminal_card_state());
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1600.0);
+        drop(app.sync_chrome());
+        // The strip makes room for the new tab, and the pointer, still on
+        // it, holds it afresh at that width.
+        assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
+        assert!(app.tabs_held());
+        let (available, width) = app.tab_strip_geometry();
+        assert_eq!(
+            app.chrome_ui.tabs_hold.get(),
+            Some(&crate::interaction::hover_hold::HeldWidth::new(
+                width,
+                available,
+                app.workspace.shown()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_tab_that_slides_under_the_pointer_is_hovered_in_the_closed_ones_place() {
+        for held in [true, false] {
+            let mut app = tab_fixture(5, 1100.0);
+            let order: Vec<_> = app.workspace.shown().collect();
+            if held {
+                drop(app.update_chrome(Action::TabsHover(true)));
+            }
+            drop(app.update_chrome(Action::HoverTab(Some(order[1]))));
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.retain(|card| card.id != order[1]);
+            app.workspace = Cagents::rebuild_workspace(&app.durable);
+            app.workspace.resize_viewport(1100.0);
+            drop(app.sync_chrome());
+            // Held, the next tab's close button comes to rest under the
+            // pointer and shows; otherwise the tabs resized and nothing in
+            // particular is under it.
+            assert_eq!(app.chrome_ui.hovered_tab, held.then_some(order[2]));
+            // The pointer leaving the strip hovers nothing, whichever tab
+            // its last report named.
+            drop(app.update_chrome(Action::TabsHover(false)));
+            assert_eq!(app.chrome_ui.hovered_tab, None);
+        }
+    }
+
+    #[test]
+    fn a_narrowed_strip_renews_its_hold_at_the_narrower_width() {
+        let mut app = tab_fixture(5, 1600.0);
+        drop(app.update_chrome(Action::TabsHover(true)));
+        app.workspace.resize_viewport(900.0);
+        drop(app.sync_chrome());
+        let narrowed = app.live_tab_strip_geometry();
+        assert_eq!(app.tab_strip_geometry(), narrowed);
+        // The hold is renewed at the narrowed width: closing tabs keeps it,
+        // and never brings back the width the wider strip had.
+        while app.workspace.shown().count() > 1 {
+            close_last_tab(&mut app);
+            assert_eq!(app.tab_strip_geometry(), narrowed);
+        }
+        drop(app.update_chrome(Action::TabsHover(false)));
+        assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
+    }
+
+    #[test]
+    fn other_tabs_under_the_pointer_are_not_held_at_the_last_ones_width() {
+        // Five compact tabs give way, under a pointer that stays, to two
+        // others, as when another set of tabs is shown in their place.
+        let mut app = tab_fixture(5, 1100.0);
+        for card in app.durable.cards.iter() {
+            app.chrome_ui
+                .user_titles
+                .insert(card.id, "A long conversation title".into());
+        }
+        drop(app.sync_chrome());
+        drop(app.update_chrome(Action::TabsHover(true)));
+        let durable = Arc::make_mut(&mut app.durable);
+        let others: Vec<_> = (0..2)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        durable.focused = others.first().map(|card| card.id);
+        durable.cards = others.into();
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1100.0);
+        drop(app.sync_chrome());
+        assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
     }
 
     #[test]
@@ -2142,6 +2288,8 @@ pub enum Action {
     ShowNoticesFor(CardId),
     Close,
     TabsScrolled(f32),
+    /// The pointer came over the tab strip, or left it.
+    TabsHover(bool),
     Launch(NewTab),
 }
 
@@ -2693,7 +2841,12 @@ impl Cagents {
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
         // Ending a hover is never refused: a dialog that opens while a tab is
         // hovered would otherwise leave it drawn hovered once it closes.
-        if self.modal_is_open() && !matches!(action, Action::Close | Action::UnhoverTab(_)) {
+        if self.modal_is_open()
+            && !matches!(
+                action,
+                Action::Close | Action::UnhoverTab(_) | Action::TabsHover(_)
+            )
+        {
             return Task::none();
         }
         if let Action::ShowNoticesFor(card) = &action
@@ -2713,6 +2866,8 @@ impl Cagents {
         match action {
             Action::HoverTab(card) => {
                 self.chrome_ui.hovered_tab = card;
+                self.chrome_ui.hovered_slot =
+                    card.and_then(|card| self.workspace.shown().position(|id| id == card));
                 Task::none()
             }
             Action::UnhoverTab(card) => {
@@ -2872,6 +3027,9 @@ impl Cagents {
             // view, saved with its settings, not to the workspace.
             Action::ToggleProjects => {
                 self.chrome_ui.projects_collapsed = !self.chrome_ui.projects_collapsed;
+                // The list is drawn afresh in its other form, which holds
+                // rows of its own once the pointer is over it.
+                self.sidebar_state.release_list_hold();
                 self.save_settings_task(false)
             }
             Action::AttentionPage(page) => {
@@ -2957,6 +3115,27 @@ impl Cagents {
             }
             Action::TabsScrolled(offset) => {
                 self.chrome_ui.tabs_offset = offset;
+                Task::none()
+            }
+            Action::TabsHover(over) => {
+                if !over {
+                    self.chrome_ui.tabs_hold.release();
+                    // Off the strip, no tab is under the pointer, whichever
+                    // tab its last report named.
+                    self.chrome_ui.hovered_tab = None;
+                    self.chrome_ui.hovered_slot = None;
+                } else if !self.tabs_held() {
+                    // Taken on arrival, and afresh once the strip shows a
+                    // tab the hold did not, at the width it made room at.
+                    let (available, width) = self.live_tab_strip_geometry();
+                    self.chrome_ui
+                        .tabs_hold
+                        .take(crate::interaction::hover_hold::HeldWidth::new(
+                            width,
+                            available,
+                            self.workspace.shown(),
+                        ));
+                }
                 Task::none()
             }
         }
@@ -3647,7 +3826,75 @@ impl Cagents {
         }
     }
 
+    /// Keeps the hovered tab the one under the pointer as tabs close.
+    ///
+    /// A tab hears the pointer come over it only when the pointer moves, so
+    /// the tab that slides into a closed one's place, where the held width
+    /// puts it under the resting pointer, would otherwise show no close
+    /// button until the pointer moved: closing tabs one after another
+    /// stalled after the first.
+    pub(super) fn follow_hovered_tab(&mut self) {
+        let Some(hovered) = self.chrome_ui.hovered_tab else {
+            self.chrome_ui.hovered_slot = None;
+            return;
+        };
+        let shown: Vec<_> = self.workspace.shown().collect();
+        if let Some(slot) = shown.iter().position(|id| *id == hovered) {
+            self.chrome_ui.hovered_slot = Some(slot);
+            return;
+        }
+        // Without a hold the tabs have resized, so nothing in particular
+        // came to rest under the pointer.
+        self.chrome_ui.hovered_tab = self
+            .tabs_held()
+            .then(|| self.chrome_ui.hovered_slot.and_then(|slot| shown.get(slot)))
+            .flatten()
+            .copied();
+        if self.chrome_ui.hovered_tab.is_none() {
+            self.chrome_ui.hovered_slot = None;
+        }
+    }
+
+    /// Renews a hold the strip has outgrown while the pointer stays on it,
+    /// as after a tab was added, another set of tabs shown or the window
+    /// narrowed, at the width the strip makes room at now. A hold that
+    /// gave way is never revived.
+    pub(super) fn refresh_tabs_hold(&mut self) {
+        if self.chrome_ui.tabs_hold.is_held() && !self.tabs_held() {
+            let (available, width) = self.live_tab_strip_geometry();
+            self.chrome_ui
+                .tabs_hold
+                .take(crate::interaction::hover_hold::HeldWidth::new(
+                    width,
+                    available,
+                    self.workspace.shown(),
+                ));
+        }
+    }
+
+    /// Whether the pointer holds the tab strip as it is now: every tab it
+    /// shows was there when the hold was taken.
+    fn tabs_held(&self) -> bool {
+        let Some(hold) = self.chrome_ui.tabs_hold.get() else {
+            return false;
+        };
+        let (available, _) = self.live_tab_strip_geometry();
+        let shown: Vec<_> = self.workspace.shown().collect();
+        hold.holds(available, &shown)
+    }
+
+    /// The strip's room and the width its tabs share: what they would take
+    /// now, unless the pointer holds the width they had (see `tabs_hold`).
     fn tab_strip_geometry(&self) -> (f32, f32) {
+        let (available, live) = self.live_tab_strip_geometry();
+        let shown: Vec<_> = self.workspace.shown().collect();
+        let width =
+            crate::tab_strip::tab_width(self.chrome_ui.tabs_hold.get(), live, &shown, available);
+        (available, width)
+    }
+
+    /// The strip's room and the width its tabs would share now.
+    fn live_tab_strip_geometry(&self) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
             - self.workspace_header_width()
             - self.window_controls_reach(crate::sidebar::WindowControlsEdge::Leading)
@@ -3708,8 +3955,10 @@ impl Cagents {
             + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
-            // Everything fits; any offset at all would be wrong.
-            return if self.chrome_ui.tabs_offset > 0.0 {
+            // Everything fits; any offset at all would be wrong, except that
+            // a strip under the pointer keeps its room until the pointer
+            // leaves, and then settles by itself.
+            return if self.chrome_ui.tabs_offset > 0.0 && !self.tabs_held() {
                 workspace_widget::scroll_to(widget::Id::new("workspace.tabs"), 0.0)
                     .map(cosmic::Action::App)
             } else {
@@ -3764,6 +4013,12 @@ impl Cagents {
                     event: WorkspaceViewportEvent::Reordered { card, before },
                 }),
             },
+            Some(crate::tab_strip::Hover {
+                // Answered while the pointer stays, whether or not the hold
+                // still fits the strip: `refresh_tabs_hold` renews it.
+                held: self.chrome_ui.tabs_hold.is_held(),
+                on_hover: Box::new(|over| Message::ChromeUi(Action::TabsHover(over))),
+            }),
         );
         let actions = widget::row::with_children(self.workflow_header())
             .spacing(space::XXS)

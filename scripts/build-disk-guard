@@ -55,8 +55,8 @@ Environment:
                                 default: ~/.cache and ~/.local/state of the
                                 account's home and of HOME, and /var/tmp.
   CAGENTS_BUILD_PRUNE_STATE     Prefix of the pruner's schedule, lock, last
-                                output (.log), removals (.tsv) and slot trim
-                                (.slots.log); default:
+                                output (.log), recent removals (.tsv, up to 1 MiB)
+                                and slot trim (.slots.log); default:
                                 /var/tmp/cagents-prune-build-dirs-UID.
   CAGENTS_BUILD_OFFLOAD_SLOTS   Directory of offload slots to trim; default:
                                 ~/.cache/cagents-offload of the account's
@@ -110,7 +110,7 @@ read_space() {
 
 # When the last reclaim for low space ran, beside the build lock, and the
 # pruner's own state for this user on this host: when it last ran on its
-# schedule, its last runs' output and every removal.
+# schedule, its last runs' output and recent removals.
 state=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}.prune
 pruner_state=${CAGENTS_BUILD_PRUNE_STATE:-/var/tmp/cagents-prune-build-dirs-$(id -u)}
 here=$(dirname -- "$(readlink -f -- "$0")")
@@ -144,7 +144,7 @@ run_pruner() {
         */.git) set -- --root "${common%/.git}" --keep-checkout "${common%/.git}" "$@" ;;
     esac
     set -- "$pruner" --apply --max-idle "$idle" --lock "$pruner_state.lock" \
-        --log "$pruner_state.tsv" --stamp "$pruner_state.scheduled" --keep "$build_dir" "$@"
+        --managed-log "$pruner_state.tsv" --stamp "$pruner_state.scheduled" --keep "$build_dir" "$@"
     if [ "$mode" = detached ]; then
         set -- $setsid nice -n "$niceness" $ionice "$@"
     fi

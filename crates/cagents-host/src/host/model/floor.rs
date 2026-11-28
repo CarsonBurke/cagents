@@ -188,8 +188,11 @@ pub(in crate::host) fn restore_presentations(
 /// store cannot be inspected, keep the evidence until its next successful read.
 fn prune_history(recovering: Option<&HostSessionProof>) {
     let result = (|| -> Result<(), String> {
+        if crate::upgrade::floor::load()?.records.is_empty() {
+            return Ok(());
+        }
         let registry = Registry::open()?;
-        let referenced = registry.saved_session_inventory()?;
+        let referenced = registry.session_inventory(true)?;
         crate::upgrade::floor::prune_unreferenced(&referenced, recovering)
     })();
     if let Err(error) = result {
@@ -199,22 +202,30 @@ fn prune_history(recovering: Option<&HostSessionProof>) {
 
 impl Registry {
     pub(in crate::host) fn saved_session_inventory(&self) -> Result<BTreeSet<TerminalId>, String> {
+        self.session_inventory(false)
+    }
+
+    fn session_inventory(
+        &self,
+        include_saved_conversations: bool,
+    ) -> Result<BTreeSet<TerminalId>, String> {
         let mut referenced = open_agent_sessions(&self.db)?;
-        let mut remember = |kind: &crate::model::CardKind| match kind {
-            crate::model::CardKind::Chat(session) => {
-                referenced.insert(session.id);
-                if let Some(terminal) = &session.terminal {
-                    referenced.insert(terminal.id);
+        let remember =
+            |referenced: &mut BTreeSet<TerminalId>, kind: &crate::model::CardKind| match kind {
+                crate::model::CardKind::Chat(session) => {
+                    referenced.insert(session.id);
+                    if let Some(terminal) = &session.terminal {
+                        referenced.insert(terminal.id);
+                    }
                 }
-            }
-            crate::model::CardKind::Terminal(session) => {
-                referenced.insert(session.id);
-            }
-            _ => (),
-        };
+                crate::model::CardKind::Terminal(session) => {
+                    referenced.insert(session.id);
+                }
+                _ => (),
+            };
         for view in super::views::occupied(&self.db)? {
             for pane in &view.panes {
-                remember(&pane.kind);
+                remember(&mut referenced, &pane.kind);
             }
         }
         let mut budget = crate::persistence::MigrationInspectionBudget::new(
@@ -230,7 +241,15 @@ impl Registry {
                 crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
                     .map_err(|error| error.to_string())?
             {
-                remember(&pane.kind);
+                remember(&mut referenced, &pane.kind);
+            }
+            if include_saved_conversations {
+                // Closed conversations still claim durable history. The
+                // resident reader and attention collectors use open claims.
+                referenced.extend(
+                    crate::persistence::read_saved_chat_ids_with_budget(&path, &mut budget)
+                        .map_err(|error| error.to_string())?,
+                );
             }
         }
         Ok(referenced)
@@ -460,6 +479,223 @@ mod tests {
         view.retired.push(id);
         view.revision = super::super::views::store::next_revision(&registry.db).unwrap();
         store_view(&registry.db, &view);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn startup_collection_preserves_saved_conversations_and_recovery() {
+        use crate::{
+            model::{CardState, Existence, Tombstone, WorkspaceState},
+            persistence::{SnapshotBase, StateStore},
+            upgrade::floor::{self, StoppedSnapshot},
+        };
+        use std::{io::Write, os::unix::fs::MetadataExt, time::UNIX_EPOCH};
+
+        const ROOT: &str = "CAGENTS_TEST_HISTORY_RETENTION_ROOT";
+        let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
+            let root = crate::fixture_tempdir().unwrap();
+            for directory in ["home", "run", "config", "project"] {
+                crate::secure_file::prepare_private_directory(&root.path().join(directory))
+                    .unwrap();
+            }
+            let test = std::thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env(ROOT, root.path())
+                .env("HOME", root.path().join("home"))
+                .env("XDG_RUNTIME_DIR", root.path().join("run"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
+                .env("XDG_CONFIG_HOME", root.path().join("config"))
+                .env("CLAUDE_CONFIG_DIR", root.path().join("claude"))
+                .env("CODEX_HOME", root.path().join("codex"))
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        };
+
+        let (_, fixture, _) = fixture();
+        let source = fixture.source.clone();
+        let mut recovering = source.clone();
+        recovering.host_incarnation = HostIncarnation::new("unresolved");
+        let mut record = Record::new(source.clone(), vec![], vec![]);
+        let mut unresolved = Record::new(recovering.clone(), vec![], vec![]);
+        let mut workspace = WorkspaceState::default();
+        let mut provider_files = Vec::new();
+        let mut unclaimed = Vec::new();
+        let cwd = root.join("project");
+        for provider in [Provider::Claude, Provider::Codex] {
+            for state in [
+                "open",
+                "closed",
+                "closed-alias",
+                "recovering",
+                "unclaimed",
+                "standalone",
+            ] {
+                let mut chat = fixture.chats[0].clone();
+                chat.id = TerminalId::new();
+                chat.launch.provider = provider;
+                chat.launch.recipe.program = provider.executable().into();
+                chat.launch.recipe.working_directory = cwd.clone();
+                let provider_id = uuid::Uuid::new_v4().to_string();
+                chat.launch.session_id = Some(provider_id.clone());
+                let provider_file = match provider {
+                    Provider::Claude => {
+                        let project = cwd
+                            .to_str()
+                            .unwrap()
+                            .replace(|c: char| !c.is_ascii_alphanumeric(), "-");
+                        root.join("claude/projects")
+                            .join(project)
+                            .join(format!("{provider_id}.jsonl"))
+                    }
+                    Provider::Codex => root
+                        .join(if state == "standalone" {
+                            "codex/archived_sessions"
+                        } else {
+                            "codex/sessions/2020/01/01"
+                        })
+                        .join(format!("rollout-2020-01-01T00-00-00-{provider_id}.jsonl")),
+                    _ => unreachable!(),
+                };
+                fs::create_dir_all(provider_file.parent().unwrap()).unwrap();
+                let contents = format!("{{\"fixture\":\"{state}\"}}\n");
+                let mut file = fs::File::create(&provider_file).unwrap();
+                file.write_all(contents.as_bytes()).unwrap();
+                file.set_modified(UNIX_EPOCH).unwrap();
+                provider_files.push((provider_file, contents));
+                if state == "standalone" {
+                    continue;
+                }
+                let record = if state == "recovering" {
+                    &mut unresolved
+                } else {
+                    &mut record
+                };
+                chat.proof = Some(record.source.clone());
+                record.chats.push(chat.clone());
+                record.snapshots.push(StoppedSnapshot {
+                    source: chat.clone(),
+                    snapshot: Default::default(),
+                    limitation: Some(state.into()),
+                });
+                if state == "closed-alias" {
+                    chat.launch.session_id = None;
+                }
+                match state {
+                    "open" | "closed" | "closed-alias" => workspace.cards.push(CardState {
+                        id: CardId::new(),
+                        generation: 0,
+                        title: state.into(),
+                        width_fraction: 1.0,
+                        existence: if state == "open" {
+                            Existence::Open
+                        } else {
+                            Existence::Closed {
+                                tombstone: Tombstone {
+                                    operation_id: None,
+                                    closed_at_unix_ms: 1,
+                                    reason: None,
+                                },
+                            }
+                        },
+                        kind: CardKind::Chat(chat),
+                    }),
+                    "unclaimed" => unclaimed.push(chat),
+                    _ => (),
+                }
+            }
+        }
+        let path = crate::instance::window_database_path("history-retention-test").unwrap();
+        let store = StateStore::open(&path, source.boot_id.clone()).unwrap();
+        store
+            .save_workspace(
+                &workspace,
+                SnapshotBase {
+                    workspace: 0,
+                    cards: &Default::default(),
+                },
+            )
+            .unwrap();
+        drop(store);
+        record.save().unwrap();
+        unresolved.save().unwrap();
+
+        let closed = &workspace.cards[1];
+        let CardKind::Chat(saved) = &closed.kind else {
+            unreachable!()
+        };
+        assert!(
+            !Registry::open()
+                .unwrap()
+                .saved_session_inventory()
+                .unwrap()
+                .contains(&saved.id)
+        );
+        let db = Connection::open(&path).unwrap();
+        let set_descriptor = |content: Option<&str>| {
+            db.execute(
+                "UPDATE cards SET content_json = ?1 WHERE card_id = ?2",
+                params![content, closed.id.to_string()],
+            )
+            .unwrap();
+        };
+        for unreadable in [None, Some("{invalid")] {
+            set_descriptor(unreadable);
+            prune_history(Some(&recovering));
+            assert!(unclaimed.iter().all(|chat| floor::snapshot(chat).is_ok()));
+        }
+        set_descriptor(Some(&serde_json::to_string(saved).unwrap()));
+        drop(db);
+
+        prune_history(Some(&recovering));
+        let ledger = floor::load().unwrap();
+        for card in &workspace.cards {
+            let CardKind::Chat(chat) = &card.kind else {
+                unreachable!()
+            };
+            let source = ledger.resume_source(chat).unwrap();
+            assert!(source.launch.session_id.is_some());
+            assert_eq!(
+                floor::snapshot(source).unwrap().limitation.as_deref(),
+                Some(card.title.as_str())
+            );
+        }
+        assert!(
+            unresolved
+                .chats
+                .iter()
+                .all(|chat| floor::snapshot(chat).is_ok())
+        );
+        assert!(unclaimed.iter().all(|chat| floor::snapshot(chat).is_err()));
+        let floor_directory = crate::instance::project_dirs()
+            .unwrap()
+            .data_local_dir()
+            .join("daemon-upgrade/update-floor");
+        let file_identities = || {
+            fs::read_dir(&floor_directory)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), entry.metadata().unwrap().ino())
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let before = file_identities();
+        prune_history(Some(&recovering));
+        assert_eq!(file_identities(), before);
+        for (path, contents) in provider_files {
+            assert_eq!(fs::read_to_string(path).unwrap(), contents);
+        }
+        let store = StateStore::open(&path, source.boot_id).unwrap();
+        assert_eq!(store.saved_conversations().unwrap().len(), 4);
     }
 
     #[test]

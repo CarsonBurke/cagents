@@ -24,6 +24,7 @@
 # how long a stopped turn takes to end.
 #
 # `acp/muse/initial-model` sets the model Muse reports when opening a session.
+# `acp/muse/spark-low-reasoning` adds Low as Spark's default, alongside XHigh.
 #
 # Every frame the agent receives goes to acp/AGENT/frames.log, so a check can
 # read which settings and prompts cagents sent.

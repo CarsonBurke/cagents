@@ -2551,11 +2551,6 @@ impl ArchivedWorktreePr {
                 == Some(self.pull_request.head_ref_name.as_str())
             && self.pull_request.belongs_to_head(head_repository)
     }
-
-    fn is_valid_for(&self, record: &WorktreeRecord, head_repository: &GitHubRepoKey) -> bool {
-        self.matches(record, head_repository)
-            && record.head_oid.as_deref() == Some(self.validated_head.as_str())
-    }
 }
 
 /// Resolve branches missing from the recent PR page within their source
@@ -2744,73 +2739,80 @@ fn pr_head_is_ancestor(worktree: &Path, pr_head: &str, local_head: &str) -> bool
 fn apply_attached_worktree_prs(
     project: &mut SidebarProject,
     worktrees: &[(WorktreeRecord, Option<StatusSnapshot>)],
-    recent: &[crate::github::PullRequest],
     archived: &[ArchivedWorktreePr],
 ) {
     let records = worktrees
         .iter()
         .map(|(record, _)| (record.id, record))
         .collect::<HashMap<_, _>>();
+    let recent = if project.github_ready {
+        project.pull_requests.as_slice()
+    } else {
+        &[]
+    };
     for row in &mut project.worktrees {
         let Some(record) = records.get(&row.id).copied() else {
+            continue;
+        };
+        let Some(head_repository) = row.head_repository.as_ref() else {
+            row.clear_pull_request();
             continue;
         };
         if record.detached || record.bare {
             row.clear_pull_request();
             continue;
         }
-        let Some(head_repository) = row.head_repository.as_ref() else {
-            row.clear_pull_request();
-            continue;
-        };
-        let valid_archived = || {
+
+        let candidates = || {
             archived
                 .iter()
-                .filter(|association| association.is_valid_for(record, head_repository))
-                .map(|association| &association.pull_request)
+                .filter(|association| association.matches(record, head_repository))
         };
-        let mut exact = recent.iter().chain(valid_archived()).filter(|pr| {
-            record
-                .branch
-                .as_deref()
-                .and_then(|branch| branch.strip_prefix("refs/heads/"))
-                == Some(pr.head_ref_name.as_str())
-                && record.head_oid.as_deref() == Some(pr.head_ref_oid.as_str())
-                && pr.belongs_to_head(head_repository)
+        let valid_archived = || {
+            candidates().filter(|association| {
+                record.head_oid.as_deref() == Some(association.validated_head.as_str())
+            })
+        };
+        let mut exact_archived = valid_archived().filter(|association| {
+            record.head_oid.as_deref() == Some(association.pull_request.head_ref_oid.as_str())
         });
-        let first = exact.next();
-        let ambiguous = first.is_some_and(|first| exact.any(|pr| pr.number != first.number));
+        let mut exact_recent = recent.iter().filter(|pr| {
+            pr.head_oid.is_some() && pr.head_oid == record.head_oid && pr.matches_worktree(row)
+        });
+        let first_recent = exact_recent.next();
+        let first_archived = exact_archived.next();
+        let mut exact_numbers = first_recent
+            .into_iter()
+            .chain(exact_recent)
+            .map(|pr| pr.number)
+            .chain(
+                first_archived
+                    .into_iter()
+                    .chain(exact_archived)
+                    .map(|association| association.pull_request.number),
+            );
+        let ambiguous = exact_numbers
+            .next()
+            .is_some_and(|first| exact_numbers.any(|number| number != first));
+
         if ambiguous {
             row.clear_pull_request();
-        } else if let Some(pr) = first {
-            row.set_pull_request(SidebarPullRequest::from_github(
-                project.id,
-                pr,
-                &pr.check_summaries(),
-            ));
-        } else if let Some(branch) = record
-            .branch
-            .as_deref()
-            .and_then(|branch| branch.strip_prefix("refs/heads/"))
-            && let Some(pr) = valid_archived().find(|pr| pr.head_ref_name == branch)
+        } else if let Some(pr) = first_recent {
+            row.set_pull_request(pr.clone());
+        } else if let Some(association) = first_archived.or_else(|| valid_archived().next()) {
+            let pr = &association.pull_request;
+            row.set_archived_pull_request(SidebarPullRequest::from_github(project.id, pr, &[]));
+        } else if row.archived_pull_request().is_some_and(|shown| {
+            candidates().any(|association| association.pull_request.url == shown.url)
+        }) {
+            // A remote result proved this PR against an older HEAD. Keep its
+            // badge until the queued local ancestry check settles the proof.
+        } else if let Some(pr) =
+            sidebar::matching_pull_request(row, recent).filter(|pr| !pr.is_terminal())
         {
-            // The proof still names this checkout's current HEAD, even when
-            // later local commits put it ahead of the historical PR head.
-            row.set_pull_request(SidebarPullRequest::from_github(
-                project.id,
-                pr,
-                &pr.check_summaries(),
-            ));
-        } else if matches!(
-            row.pull_request_state,
-            Some(
-                sidebar::WorktreePullRequestState::Closed
-                    | sidebar::WorktreePullRequestState::Merged
-            )
-        ) {
-            // A branch-only historical match from the recent page may belong
-            // to another incarnation of this branch. Open associations keep
-            // working while a local branch is ahead of its remote head.
+            // A recent open PR can still match a branch with unpushed commits.
+            row.set_pull_request(pr.clone());
+        } else if project.github_ready || row.archived_pull_request().is_some() {
             row.clear_pull_request();
         }
     }
@@ -3368,7 +3370,14 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
-        Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
+        // The pointer's coming and going is reported whatever is open, so a
+        // hover or a hold it ended does not outlast the dialog.
+        Message::ChromeUi(action) => !matches!(
+            action,
+            chrome_ui::Action::Close
+                | chrome_ui::Action::UnhoverTab(_)
+                | chrome_ui::Action::TabsHover(_)
+        ),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
@@ -3381,7 +3390,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
-        Message::Sidebar(action) => !answers_discard_confirmation(action),
+        Message::Sidebar(action) => {
+            !answers_discard_confirmation(action) && !matches!(action, SidebarAction::ListHover(_))
+        }
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
@@ -9918,6 +9929,7 @@ impl Cagents {
     fn sync_chrome(&mut self) -> Task<Message> {
         #[cfg(test)]
         terminal_output_tests::record_chrome();
+        self.follow_hovered_tab();
         self.terminal_working_directories
             .retain(|card, _| self.cards.contains_key(card));
         self.terminal_find
@@ -10016,6 +10028,8 @@ impl Cagents {
                 .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
+        // After the titles above, which set the width a renewed hold takes.
+        self.refresh_tabs_hold();
         self.sync_window_title()
     }
 
@@ -13851,6 +13865,10 @@ impl Cagents {
             .pin_panel_worktree(self.inspector_panel_pin());
         // The Attention list draws the focused pane's row as current.
         self.sidebar_state.follow_card(self.workspace.focused());
+        // Work that started under a resting pointer keeps the slot it
+        // joined In progress at.
+        let compact = self.projects_sidebar_mode() == SidebarMode::Compact;
+        self.sidebar_state.follow_list(&self.sidebar_model, compact);
         let focus = self.sidebar_focus();
         let changed = self
             .sidebar_state
@@ -18998,6 +19016,9 @@ impl Cagents {
                         .projects
                         .iter_mut()
                         .find(|project| project.id == project_id)
+                    && self.refresh_ui.git.remember_initial_archived(
+                        project_id, generation, &archived,
+                    )
                 {
                     let worktrees = worktrees
                         .into_iter()
@@ -19020,10 +19041,7 @@ impl Cagents {
                                 })
                         })
                         .collect::<Vec<_>>();
-                    apply_attached_worktree_prs(project, &worktrees, &recent, &archived);
-                    self.refresh_ui
-                        .git
-                        .remember_archived(project_id, generation, &archived);
+                    apply_attached_worktree_prs(project, &worktrees, &archived);
                     // Separate local HEADs can prove the same PR. Cleanup
                     // continues to receive each historical PR only once.
                     let mut archived_prs = archived

@@ -63,8 +63,10 @@ mise run release:build -- --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
 location and other details. `CARGO_BUILD_JOBS` defaults to one job per CPU,
 limited to one per 2 GiB of available memory; set it lower on a shared host.
 Download and build temporary files stay in its private
-disk cache rather than a RAM-backed `/tmp`. The cache also keeps one checkout of
-the source, and each build rewrites only the files that changed, so Cargo
+disk cache. The next build reclaims recognized scratch left by interrupted
+runs after taking the cache lock. A supervisor keeps that lock through
+sandbox teardown. The cache also keeps one checkout of the source. Each build
+rewrites only the files that changed, so Cargo
 recompiles only the crates they belong to.
 
 ## Native integrated browser capability smoke

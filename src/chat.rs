@@ -4259,6 +4259,13 @@ pub enum Event {
     #[cfg(feature = "host")]
     #[serde(skip)]
     ContextBudgetInvalidated,
+    /// Transfer an Antigravity child's provisional tool steps to its invocation.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    SubagentMerged {
+        from: String,
+        into: String,
+    },
 }
 
 #[cfg(feature = "host")]

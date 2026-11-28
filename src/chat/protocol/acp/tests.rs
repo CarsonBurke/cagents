@@ -587,23 +587,42 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
         .as_array_mut()
         .unwrap()
         .push(json!({"category": "thought_level",
-        "currentValue": "xhigh", "id": "thought_level", "name": "Reasoning effort",
-        "options": [{"name": "Extra high", "value": "xhigh"}], "type": "select"}));
+        "currentValue": "low", "id": "thought_level", "name": "Reasoning effort",
+        "options": [{"name": "Low", "value": "low"}, {"name": "Extra high", "value": "xhigh"}],
+        "type": "select"}));
     let step = acp
         .receive(reply(&setting, json!({"configOptions": options})))
         .unwrap();
     // spark-1.2 offers the level, so it is still asked for.
     assert_eq!(only_write(&step)["params"]["configId"], "thought_level");
+    assert_eq!(only_write(&step)["params"]["value"], "xhigh");
+    assert!(acp.first_model_pending());
+    assert!(acp.accepts_turn().is_err());
+    options[2]["currentValue"] = json!("xhigh");
     let step = acp
         .receive(reply(only_write(&step), json!({"configOptions": options})))
         .unwrap();
     assert!(step.writes.is_empty());
+    assert!(!acp.first_model_pending());
+    assert!(acp.accepts_turn().is_ok());
+
+    // A failed model switch cannot apply its effort to the previous model.
+    let switch_to_wonder = || Command::SetModel {
+        model: "muse-wonder-full-1.0".into(),
+        reasoning: Some("xhigh".into()),
+    };
+    let step = acp.command(switch_to_wonder()).unwrap();
+    let setting = only_write(&step);
     let step = acp
-        .command(Command::SetModel {
-            model: "muse-wonder-full-1.0".into(),
-            reasoning: Some("xhigh".into()),
-        })
+        .receive(json!({
+            "jsonrpc": "2.0", "id": setting["id"],
+            "error": {"code": -32602, "message": "Model switch refused"}
+        }))
         .unwrap();
+    assert!(step.writes.is_empty());
+    assert!(acp.accepts_turn().is_ok());
+
+    let step = acp.command(switch_to_wonder()).unwrap();
     let setting = only_write(&step).clone();
     let step = acp
         .receive(reply(
@@ -612,6 +631,7 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
         ))
         .unwrap();
     assert!(step.writes.is_empty());
+    assert!(acp.accepts_turn().is_ok());
     assert!(
         !step
             .events
@@ -620,6 +640,49 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
     );
     assert!(step.events.iter().any(|event| matches!(event,
         Event::ActiveModel(Some(model)) if model.id == "muse-wonder-full-1.0" && model.reasoning.is_none())));
+}
+
+#[test]
+fn a_modern_model_switch_without_its_model_option_cannot_set_effort() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let step = acp
+        .command(Command::SetModel {
+            model: "gemini-3.8-flash".into(),
+            reasoning: Some("low".into()),
+        })
+        .unwrap();
+    let mut options = agy_new()["configOptions"].as_array().unwrap().clone();
+    options.remove(0);
+    let step = acp
+        .receive(reply(only_write(&step), json!({"configOptions": options})))
+        .unwrap();
+    assert!(step.writes.is_empty(), "no confirmation of the destination");
+    assert!(!acp.first_model_pending());
+}
+
+#[test]
+fn an_unconfirmed_first_model_choice_retires_the_session_on_deadline() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    acp.command(Command::SetModel {
+        model: "gemini-3.8-flash".into(),
+        reasoning: Some("low".into()),
+    })
+    .unwrap();
+    assert!(matches!(
+        acp.metadata_wake(),
+        Some(MetadataWake::RetryAt(_))
+    ));
+    acp.first_model_deadline = Some(Instant::now());
+    let step = acp.refresh_metadata().unwrap();
+    assert!(step.writes.is_empty());
+    assert!(matches!(
+        step.events.as_slice(),
+        [Event::Ready(false), Event::Error { fatal: true, .. },]
+    ));
+    assert!(!acp.first_model_pending());
+    assert!(acp.accepts_turn().is_err());
 }
 
 #[test]
@@ -2944,7 +3007,8 @@ fn a_model_naming_its_reasoning_level_is_applied_as_both() {
     let model = only_write(&step);
     assert_eq!(model["params"]["configId"], "model");
     assert_eq!(model["params"]["value"], "gemini-3.8-flash");
-    let options = agy_new()["configOptions"].clone();
+    let mut options = agy_new()["configOptions"].clone();
+    options[0]["currentValue"] = json!("gemini-3.8-flash");
     let step = acp
         .receive(reply(model, json!({"configOptions": options})))
         .unwrap();
@@ -3301,6 +3365,87 @@ fn subagents_started_together_are_told_apart_only_on_evidence() {
             ("tool:call_1", ToolStatus::Succeeded),
             ("tool:call_2", ToolStatus::Succeeded),
         ]
+    );
+}
+
+#[test]
+fn subagents_reconcile_the_last_pair_after_an_ambiguous_child_asks_first() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start two subagents together.");
+    let mut snapshot = crate::chat::Snapshot::default();
+    let mut receive = |acp: &mut Acp, frame| {
+        let step = acp.receive(frame).unwrap();
+        crate::chat::runtime::project_events_for_test(&mut snapshot, step.events);
+    };
+    for (id, role, task) in [
+        ("review", "Reviewer", "Review the implementation."),
+        ("test", "Tester", "Run `make test` and report."),
+    ] {
+        receive(
+            &mut acp,
+            update(&session, invoke(id, role, task, "completed")),
+        );
+    }
+    let command = child_command(CHILD, "review-step", "git diff --stat", "pending");
+    receive(&mut acp, asks(&session, "1", command.clone()));
+    receive(
+        &mut acp,
+        update(
+            &session,
+            child_command(OTHER_CHILD, "test-step", "make test", "completed"),
+        ),
+    );
+    receive(&mut acp, reply(&turn, json!({"stopReason": "end_turn"})));
+
+    let [review, test] = snapshot.subagents.as_slice() else {
+        panic!("expected two subagents, got {:?}", snapshot.subagents);
+    };
+    assert_eq!((&*review.id, &*review.kind), ("tool:review", "Reviewer"));
+    assert_eq!(review.status, ToolStatus::Succeeded);
+    assert!(!review.waiting);
+    assert_eq!(review.items[0].id, format!("tool:{CHILD}:review-step"));
+    assert_eq!((&*test.id, &*test.kind), ("tool:test", "Tester"));
+    assert_eq!(test.items[0].id, format!("tool:{OTHER_CHILD}:test-step"));
+
+    let mut later = command;
+    later["status"] = json!("completed");
+    let step = acp.receive(update(&session, later)).unwrap();
+    assert_eq!(child_steps(&step)[0].0, "tool:review");
+    assert!(listed(&step).is_empty());
+}
+
+#[test]
+fn subagents_do_not_merge_a_child_with_a_call_started_after_its_first_step() {
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    let turn = prompt(&mut acp, "Start subagents in stages.");
+    acp.receive(update(
+        &session,
+        child_command(CHILD, "early-step", "git diff --stat", "completed"),
+    ))
+    .unwrap();
+    acp.receive(update(
+        &session,
+        invoke("late", "Tester", "Run the tests.", "completed"),
+    ))
+    .unwrap();
+    let step = acp
+        .receive(update(
+            &session,
+            child_command(OTHER_CHILD, "late-step", "make all", "completed"),
+        ))
+        .unwrap();
+    assert_eq!(child_steps(&step)[0].0, "tool:late");
+
+    let step = acp
+        .receive(reply(&turn, json!({"stopReason": "end_turn"})))
+        .unwrap();
+    assert!(
+        !step
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::SubagentMerged { .. }))
     );
 }
 

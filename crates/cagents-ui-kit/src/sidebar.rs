@@ -949,33 +949,18 @@ impl SidebarProject {
             if flags != (row.needs_review, row.review_requested_again) {
                 let mut row = row.clone();
                 (row.needs_review, row.review_requested_again) = flags;
-                worktree.set_pull_request(row);
+                worktree.set_worktree_pull_request(row, worktree.archived_pull_request);
             }
         }
     }
 
+    /// Replace the listing. Worktree associations are reconciled with local Git separately.
     pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
         if self.display_pull_requests() != pull_requests.as_slice() {
             self.pull_requests_revision = Revision::next();
         }
         self.pull_requests = pull_requests;
         self.cached_display = None;
-        self.refresh_worktree_pull_requests();
-    }
-
-    pub fn refresh_worktree_pull_requests(&mut self) {
-        for row in &mut self.worktrees {
-            if let Some(pr) = matching_pull_request(row, &self.pull_requests) {
-                row.set_pull_request(pr.clone());
-            } else if row.pull_request().is_some_and(|pr| {
-                !matches!(
-                    pr.state,
-                    Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
-                )
-            }) {
-                row.clear_pull_request();
-            }
-        }
     }
 
     /// Changes when [`Self::replace_pull_requests`] changes which pull
@@ -1108,6 +1093,7 @@ pub struct SidebarWorktree {
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
     pub pull_request_state: Option<WorktreePullRequestState>,
+    archived_pull_request: bool,
     /// Held by the application rather than read from the checkout, and
     /// reapplied whenever a read replaces the row.
     pub deletion: Option<RowDeletion>,
@@ -1169,6 +1155,7 @@ impl SidebarWorktree {
             created_at_unix_ms: None,
             head_repository: None,
             pull_request_state: None,
+            archived_pull_request: false,
             deletion: None,
             chrome,
         }
@@ -1302,6 +1289,19 @@ impl SidebarWorktree {
     }
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
+        self.set_worktree_pull_request(pull_request, false);
+    }
+
+    pub fn set_archived_pull_request(&mut self, pull_request: SidebarPullRequest) {
+        self.set_worktree_pull_request(pull_request, true);
+    }
+
+    pub fn archived_pull_request(&self) -> Option<&SidebarPullRequest> {
+        self.pull_request().filter(|_| self.archived_pull_request)
+    }
+
+    fn set_worktree_pull_request(&mut self, pull_request: SidebarPullRequest, archived: bool) {
+        self.archived_pull_request = archived;
         self.chrome.folded_pr_title = Some(fold(&pull_request.title));
         self.pull_request_state = pull_request.state;
         self.chrome.pull_request = Some(pull_request);
@@ -1316,6 +1316,7 @@ impl SidebarWorktree {
         let changed =
             self.pull_request_state.take().is_some() || self.chrome.pull_request.is_some();
         self.chrome.pull_request = None;
+        self.archived_pull_request = false;
         self.chrome.folded_pr_title = None;
         if changed {
             self.refresh_status_chrome();
@@ -1399,23 +1400,14 @@ pub fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) 
 /// Branch names are case-sensitive and only attached worktrees can own a PR.
 /// A project's PR list includes other forks. Match source repository as well
 /// as branch, and refuse ambiguous associations instead of using list order.
-fn matching_pull_request<'a>(
+pub fn matching_pull_request<'a>(
     worktree: &SidebarWorktree,
     pull_requests: &'a [SidebarPullRequest],
 ) -> Option<&'a SidebarPullRequest> {
-    if worktree.detached {
-        return None;
-    }
-    let branch = worktree.branch.as_deref()?;
-    let repository = worktree.head_repository.as_ref()?;
     let matching = || {
-        pull_requests.iter().filter(|pr| {
-            pr.head_ref == branch
-                && pr
-                    .head_repository
-                    .as_ref()
-                    .is_some_and(|head| head.same_repository(repository))
-        })
+        pull_requests
+            .iter()
+            .filter(|pr| pr.matches_worktree(worktree))
     };
     let is_open = |pr: &SidebarPullRequest| {
         matches!(
@@ -1579,7 +1571,18 @@ impl SidebarPullRequest {
         row
     }
 
-    fn is_terminal(&self) -> bool {
+    pub fn matches_worktree(&self, worktree: &SidebarWorktree) -> bool {
+        !worktree.detached
+            && worktree.branch.as_deref() == Some(self.head_ref.as_str())
+            && self.head_repository.as_ref().is_some_and(|head| {
+                worktree
+                    .head_repository
+                    .as_ref()
+                    .is_some_and(|repository| head.same_repository(repository))
+            })
+    }
+
+    pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
             Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
@@ -3588,6 +3591,9 @@ pub struct SidebarState {
     /// with a row does not pull it, and often its whole project, out from
     /// under the pointer. Never holds [`Listing::Live`].
     retained_attention: BTreeMap<SelectionRow, Listing>,
+    /// What the list showed when the pointer came over it, kept while the
+    /// pointer stays; see [`ListHold`].
+    list_hold: crate::interaction::hover_hold::Hold<ListHold>,
     agent_activity: BTreeMap<CardId, PaneActivity>,
     /// Worktrees holding at least one open pane. Derived by the application
     /// after its updates, never while drawing, so each row's read is one
@@ -3683,7 +3689,9 @@ impl SidebarState {
     fn draws_pane(&self, project: &SidebarProject, card: &SidebarCard) -> bool {
         self.lists_panes(project)
             || (self.filter == SidebarFilter::Attention
-                && (self.lists_card(card) || card.attention.only_working()))
+                && (self.lists_card(card)
+                    || card.attention.only_working()
+                    || self.held_in_progress(SelectionRow::Card(card.id))))
     }
 
     /// Whether the list gives `project`'s open panes rows of their own in
@@ -3812,7 +3820,64 @@ impl SidebarState {
     /// were dealt with under Attention go.
     fn set_filter(&mut self, filter: SidebarFilter) {
         self.retained_attention.clear();
+        self.list_hold.release();
         self.filter = filter;
+    }
+
+    /// Answers the list's [`crate::interaction::hover_region`]: the pointer
+    /// coming over the list holds which rows it shows, and where, and its
+    /// leaving lets the list settle.
+    pub fn hover_list(&mut self, model: &SidebarModel, compact: bool, over: bool) {
+        if !over {
+            self.list_hold.release();
+        } else if !self.list_hold.is_held() && !model.projects.is_empty() {
+            // A list still loading holds nothing worth keeping; the pointer's
+            // next move over the loaded list takes the hold.
+            let hold = ListHold::capture(model, self, compact);
+            self.list_hold.take(hold);
+        }
+    }
+
+    /// Grows the hold with the In progress rows that arrived since it was
+    /// taken, in the order they arrived, so each keeps its slot as later
+    /// ones come and go. The application runs this at the tail of every
+    /// update.
+    pub fn follow_list(&mut self, model: &SidebarModel, compact: bool) {
+        if !self.list_hold.is_held() {
+            return;
+        }
+        let rows: Vec<_> = in_progress_rows(model, self, compact)
+            .into_iter()
+            .map(InProgressRow::row)
+            .collect();
+        // What the rail drew since stays drawn as well.
+        let rail: Vec<_> = if compact {
+            ListHold::rail_rows(model, self).collect()
+        } else {
+            Vec::new()
+        };
+        if let Some(hold) = self.list_hold.get_mut() {
+            hold.in_progress.extend(rows);
+            hold.rail.extend(rail);
+        }
+    }
+
+    /// Whether the pointer holds the list still.
+    pub fn list_held(&self) -> bool {
+        self.list_hold.is_held()
+    }
+
+    /// Lets the list settle without the pointer leaving it, as when it is
+    /// hidden or replaced: a list no longer drawn hears no pointer leave.
+    pub fn release_list_hold(&mut self) {
+        self.list_hold.release();
+    }
+
+    /// Whether the held list kept `row` in its In progress section.
+    fn held_in_progress(&self, row: SelectionRow) -> bool {
+        self.list_hold
+            .get()
+            .is_some_and(|hold| hold.in_progress.contains(&row))
     }
 
     pub fn saved_view(&self) -> SidebarView {
@@ -4086,12 +4151,36 @@ impl SidebarState {
     /// Whether the Attention list's main section lists `card`: it needs the
     /// user, or was dealt with there and is kept until hidden.
     fn lists_card(&self, card: &SidebarCard) -> bool {
-        card.attention.needs_attention() || self.retained_in_attention(SelectionRow::Card(card.id))
+        let row = SelectionRow::Card(card.id);
+        self.held_in_list(
+            row,
+            card.attention.needs_attention() || self.retained_in_attention(row),
+        )
     }
 
     /// Whether the Attention list's main section lists `channel`.
     fn lists_channel(&self, channel: &SidebarChannel) -> bool {
-        channel.needs_attention() || self.retained_in_attention(SelectionRow::Channel(channel.id))
+        let row = SelectionRow::Channel(channel.id);
+        self.held_in_list(
+            row,
+            channel.needs_attention() || self.retained_in_attention(row),
+        )
+    }
+
+    /// Whether the Attention list's main section lists `row`, which `live`
+    /// says it would now. While the pointer holds the list, a row it listed
+    /// stays, and one held in In progress keeps its slot there, whatever its
+    /// agent has done since. Anything else that needs the user joins at
+    /// once: a new approval or question must not wait for the pointer.
+    fn held_in_list(&self, row: SelectionRow, live: bool) -> bool {
+        match self.list_hold.get() {
+            // A folded In progress section shows no slot to keep.
+            Some(hold) => {
+                hold.listed.contains(&row)
+                    || (live && (self.in_progress_collapsed || !hold.in_progress.contains(&row)))
+            }
+            None => live,
+        }
     }
 
     pub fn unread_updates(&self) -> &BTreeMap<CardId, Option<(ProjectId, WorktreeId)>> {
@@ -5153,14 +5242,30 @@ impl SidebarState {
     /// opening a worktree, staging, or pushing remain for the application.
     pub fn apply(&mut self, action: &SidebarAction) {
         match action {
-            SidebarAction::SearchChanged(query) => self.query.clone_from(query),
+            SidebarAction::SearchChanged(query) => {
+                // A search lists its matches as they are, not as they were.
+                self.list_hold.release();
+                self.query.clone_from(query);
+            }
             SidebarAction::SetFilter(filter) => self.set_filter(*filter),
-            SidebarAction::HideReadAttention => self.retained_attention.clear(),
+            SidebarAction::HideReadAttention => {
+                // Asked for by the pointer resting on the list: the rows
+                // it hides go now.
+                self.list_hold.release();
+                self.retained_attention.clear();
+            }
+            // Taking a hold needs the model; see `hover_list`.
+            SidebarAction::ListHover(over) => {
+                if !over {
+                    self.list_hold.release();
+                }
+            }
             SidebarAction::ToggleInProgress => {
                 self.in_progress_collapsed = !self.in_progress_collapsed;
                 self.in_progress_fold_pending = false;
             }
             SidebarAction::ToggleControls => {
+                self.list_hold.release();
                 self.controls_expanded = !self.controls_expanded;
                 // Hiding the search controls ends the search: a query nobody
                 // can see would keep hiding rows.
@@ -5544,6 +5649,9 @@ pub enum SidebarAction {
     /// Drops the rows the Attention list keeps only because they were dealt
     /// with there.
     HideReadAttention,
+    /// The pointer came over the project list, or left it. See
+    /// [`SidebarState::hover_list`].
+    ListHover(bool),
     /// Folds or unfolds the Attention list's "In progress" section.
     ToggleInProgress,
     ToggleControls,
@@ -5951,6 +6059,7 @@ struct NavigationSnapshot {
     hide_worktree_changes_icons: bool,
     agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     retained_attention: BTreeMap<SelectionRow, Listing>,
+    list_hold: crate::interaction::hover_hold::Hold<ListHold>,
     failed_updates: BTreeSet<CardId>,
     project_attention: BTreeMap<ProjectId, AttentionSummary>,
     worktree_attention: BTreeMap<(ProjectId, WorktreeId), AttentionSummary>,
@@ -5983,6 +6092,7 @@ impl NavigationSnapshot {
             && self.hide_worktree_changes_icons == state.hide_worktree_changes_icons
             && self.agent_updates == state.agent_updates
             && self.retained_attention == state.retained_attention
+            && self.list_hold == state.list_hold
             && self.failed_updates == state.failed_updates
             && self.project_attention == *state.project_attention_map()
             && self.worktree_attention == *state.worktree_attention_map()
@@ -6013,6 +6123,7 @@ impl NavigationSnapshot {
             hide_worktree_changes_icons: state.hide_worktree_changes_icons,
             agent_updates: state.agent_updates.clone(),
             retained_attention: state.retained_attention.clone(),
+            list_hold: state.list_hold.clone(),
             failed_updates: state.failed_updates.clone(),
             project_attention: state.project_attention_map().clone(),
             worktree_attention: state.worktree_attention_map().clone(),
@@ -6591,7 +6702,8 @@ fn view_inner<'a>(
         );
     }
 
-    content = content.push(
+    // Rows hold still while the pointer rests on the list; see `ListHold`.
+    content = content.push(crate::interaction::hover_region(
         widget::container(
             if let Some(cache) = cache
                 && !model.projects.is_empty()
@@ -6607,7 +6719,9 @@ fn view_inner<'a>(
         )
         .width(Length::Fill)
         .height(Length::Fill),
-    );
+        state.list_held(),
+        SidebarAction::ListHover,
+    ));
     content = content.width(Length::Fill).height(Length::Fill);
 
     widget::container(crate::interaction::layer(
@@ -7077,7 +7191,13 @@ fn project_list<'a>(
         !modal_open && !compact,
         sticky_viewport.clone(),
     );
-    if lists_kept_attention_rows(&projects) {
+    // Under the pointer, the control neither comes nor goes: it would move
+    // the In progress rows below it.
+    if state
+        .list_hold
+        .get()
+        .map_or(lists_kept_attention_rows(&projects), |hold| hold.hide_read)
+    {
         column =
             widget::column::with_children(vec![column, hide_read_attention(compact, modal_open)])
                 .spacing(space::XS)
@@ -14144,6 +14264,17 @@ fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) ->
         || channel.activity.is_some()
         || channel.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Channel(channel.id))
+        || held_on_rail(state, SelectionRow::Channel(channel.id))
+}
+
+/// Whether the rail keeps `row` because the pointer holds it: a row it drew
+/// stays drawn until the pointer leaves, though what put it there is over.
+fn held_on_rail(state: &SidebarState, row: SelectionRow) -> bool {
+    !compact_rail_searching(state)
+        && state
+            .list_hold
+            .get()
+            .is_some_and(|hold| hold.rail.contains(&row))
 }
 
 /// [`compact_rail_shows_channel`], for a worktree. A worktree with open panes
@@ -14163,6 +14294,7 @@ fn compact_rail_shows_worktree(
         || state.worktree_has_panes(project, worktree.id)
         || state.agent_activity(project, worktree.id).is_some()
         || worktree.deletion.is_some()
+        || held_on_rail(state, SelectionRow::Worktree(project, worktree.id))
 }
 
 /// The rail searches only while its popover holds the query.
@@ -14471,6 +14603,90 @@ fn cards_in_display_order<'a>(
     cards
 }
 
+/// Which rows the list showed, and where, when the pointer came over it.
+///
+/// Agents start, finish and come to need the user all the time, and each
+/// change moved rows between the Attention list's sections, or in and out of
+/// the compact rail, under a resting pointer. While the pointer stays, each
+/// row stays where it was and shows its new state: a row kept in the main
+/// list stays there, an In progress row keeps its slot even once its agent
+/// finishes or asks something, and a rail row stays drawn. Work that starts
+/// meanwhile joins In progress after the held rows. Anything else waits for
+/// the pointer to leave; the header's attention control still counts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ListHold {
+    /// The rows the Attention list's main section listed.
+    listed: BTreeSet<SelectionRow>,
+    /// The In progress section's rows, in order.
+    in_progress: crate::interaction::hover_hold::Held<SelectionRow>,
+    /// The channel and worktree rows the compact rail drew.
+    rail: BTreeSet<SelectionRow>,
+    /// Whether the list closed with its "Hide read" control.
+    hide_read: bool,
+}
+
+impl ListHold {
+    /// What `state`, holding nothing, shows of `model` now.
+    fn capture(model: &SidebarModel, state: &SidebarState, compact: bool) -> Self {
+        let mut hold = Self {
+            in_progress: crate::interaction::hover_hold::Held::new(
+                in_progress_rows(model, state, compact)
+                    .into_iter()
+                    .map(InProgressRow::row),
+            ),
+            hide_read: model.projects.iter().any(|project| {
+                project
+                    .channels
+                    .iter()
+                    .any(|channel| state.channel_listing(channel) != Listing::Live)
+                    || project
+                        .panes
+                        .iter()
+                        .any(|card| state.card_listing(card) != Listing::Live)
+            }),
+            ..Self::default()
+        };
+        hold.rail = Self::rail_rows(model, state).collect();
+        for project in &model.projects {
+            hold.listed.extend(
+                project
+                    .channels
+                    .iter()
+                    .filter(|channel| state.lists_channel(channel))
+                    .map(|channel| SelectionRow::Channel(channel.id)),
+            );
+            hold.listed.extend(
+                project
+                    .panes
+                    .iter()
+                    .filter(|card| state.lists_card(card))
+                    .map(|card| SelectionRow::Card(card.id)),
+            );
+        }
+        hold
+    }
+
+    /// The channel and worktree rows the compact rail draws now.
+    fn rail_rows<'a>(
+        model: &'a SidebarModel,
+        state: &'a SidebarState,
+    ) -> impl Iterator<Item = SelectionRow> + 'a {
+        model.projects.iter().flat_map(move |project| {
+            let channels = project
+                .channels
+                .iter()
+                .filter(move |channel| compact_rail_shows_channel(state, channel))
+                .map(|channel| SelectionRow::Channel(channel.id));
+            let worktrees = project
+                .worktrees
+                .iter()
+                .filter(move |worktree| compact_rail_shows_worktree(state, project.id, worktree))
+                .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id));
+            channels.chain(worktrees)
+        })
+    }
+}
+
 /// One row of the Attention list's "In progress" section: a channel or a
 /// pane whose agents are working and that needs nothing from the user.
 #[derive(Debug, Clone, Copy)]
@@ -14604,7 +14820,39 @@ fn in_progress_rows<'a>(
             }),
         );
     }
-    rows
+    let Some(hold) = state.list_hold.get() else {
+        return rows;
+    };
+    // Held rows keep their slots whatever their agents have done since;
+    // only a row that went, or is going, gives its slot up. One pass finds
+    // them all, however many rows are held.
+    let mut held = BTreeMap::new();
+    for project in &model.projects {
+        for channel in &project.channels {
+            let row = SelectionRow::Channel(channel.id);
+            if channel.deletion != Some(RowDeletion::Deleting) && hold.in_progress.contains(&row) {
+                let item = InProgressItem::Channel(channel);
+                held.insert(row, InProgressRow { project, item });
+            }
+        }
+        for card in &project.panes {
+            let row = SelectionRow::Card(card.id);
+            if hold.in_progress.contains(&row) {
+                let item = InProgressItem::Card(card);
+                held.insert(row, InProgressRow { project, item });
+            }
+        }
+    }
+    let live: Vec<_> = rows.into_iter().map(|row| (row.row(), row)).collect();
+    hold.in_progress
+        .arrange(
+            |row| held.remove(row).map(|found| (*row, found)),
+            live,
+            |(row, _)| row,
+        )
+        .into_iter()
+        .map(|(_, row)| row)
+        .collect()
 }
 
 /// Every top-level destination the sidebar lists -- each project's worktrees
