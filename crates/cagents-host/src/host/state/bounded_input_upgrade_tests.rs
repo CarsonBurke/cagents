@@ -778,7 +778,7 @@ fn restore_keeps_partial_originals_and_raw_prefix_reachable_after_commit_or_stor
             ] {
                 let error =
                     super::super::client::process_request(&successor, 0, request).unwrap_err();
-                assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+                assert_eq!(error.code, ProtocolErrorCode::StartupRecoveryHeld);
                 assert!(error.message.contains("Startup recovery"));
             }
             successor.lock().unwrap().request_shutdown();
@@ -1009,7 +1009,7 @@ fn orphan_registry_failure_keeps_the_committed_original_in_recovery_until_explic
             ] {
                 let error =
                     super::super::client::process_request(&successor, 0, request).unwrap_err();
-                assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+                assert_eq!(error.code, ProtocolErrorCode::StartupRecoveryHeld);
             }
             successor.lock().unwrap().request_shutdown();
             assert!(!successor.lock().unwrap().is_shutting_down());

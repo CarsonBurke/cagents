@@ -267,7 +267,7 @@ fn only_the_daemons_busy_refusal_reads_as_busy() {
     for (refusal, expected) in [
         (
             ServerMessage::Error(ProtocolError::new(
-                ProtocolErrorCode::Internal,
+                ProtocolErrorCode::DaemonBusy,
                 crate::terminal_ipc::DAEMON_BUSY,
                 true,
             )),

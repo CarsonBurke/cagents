@@ -445,12 +445,10 @@ pub(super) fn admit(host: &SharedHost, request: &ClientRequest) -> Result<(), Pr
     Err(refusal(&detail))
 }
 
-/// The hold's refusal. A client recognises it by
-/// [`crate::chat::STARTUP_RECOVERY_REFUSAL`]; the rest names the daemon's
-/// retained reason for the person reading it.
+/// Refuses a request while startup recovery retains the original owner.
 pub(super) fn refusal(detail: &str) -> ProtocolError {
     ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
+        ProtocolErrorCode::StartupRecoveryHeld,
         format!(
             "{}; inspect available sessions or explicitly Close the original actor: {detail}",
             crate::chat::STARTUP_RECOVERY_REFUSAL

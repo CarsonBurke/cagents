@@ -1653,8 +1653,10 @@ fn confirm_id() -> widget::Id {
 }
 
 fn is_source_close_refusal(error: &crate::control::ControlError) -> bool {
-    matches!(error, crate::control::ControlError::Remote { code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
-        message, retryable: false } if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT)
+    error.failure_class().is_some_and(|class| {
+        class.reason == crate::terminal_ipc::ProtocolErrorCode::TerminalCloseSourceConflict
+            && class.retry_advice() == crate::terminal_ipc::RetryAdvice::None
+    })
 }
 
 fn source_close_outcome(
@@ -1665,11 +1667,14 @@ fn source_close_outcome(
         Ok(TerminalCloseResult::Active) => CloseOutcome::Active,
         Ok(TerminalCloseResult::Unknown(reason)) => CloseOutcome::Unreachable(reason),
         Err(error) if is_source_close_refusal(&error) => CloseOutcome::SourceChanged,
-        Err(crate::control::ControlError::Remote {
-            code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
-            message,
-            retryable: false,
-        }) if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT => CloseOutcome::Stale,
+        Err(error)
+            if error.failure_class().is_some_and(|class| {
+                class.reason == crate::terminal_ipc::ProtocolErrorCode::TerminalCloseSourceAbsent
+                    && class.retry_advice() == crate::terminal_ipc::RetryAdvice::None
+            }) =>
+        {
+            CloseOutcome::Stale
+        }
         Err(error) => CloseOutcome::Unreachable(error.to_string()),
     }
 }
@@ -2114,8 +2119,8 @@ pub(in crate::app) mod tests {
     fn source_refusal_is_definitive_but_unknown_cleanup_remains_uncertain() {
         use crate::control::ControlError;
         let refusal = |retryable| ControlError::Remote {
-            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
-            message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT.into(),
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalCloseSourceConflict,
+            message: "The source changed before Close".into(),
             retryable,
         };
         assert!(matches!(
@@ -2132,8 +2137,8 @@ pub(in crate::app) mod tests {
         ));
         assert!(matches!(
             source_close_outcome(Err(ControlError::Remote {
-                code: crate::terminal_ipc::ProtocolErrorCode::TerminalNotFound,
-                message: crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
+                code: crate::terminal_ipc::ProtocolErrorCode::TerminalCloseSourceAbsent,
+                message: "The source disappeared".into(),
                 retryable: false,
             })),
             CloseOutcome::Stale

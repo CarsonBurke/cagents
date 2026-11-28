@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    control_gate::{self, ControlGate, Exclusive, Shared, WaitFailure},
+    control_gate::{ControlGate, Exclusive, Shared, WaitFailure},
     delivery::DeliveryQueue,
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
@@ -577,11 +577,7 @@ fn control_gate(host: &SharedHost) -> Arc<ControlGate> {
 
 pub(super) fn ensure_control_open(host: &SharedHost) -> Result<(), ProtocolError> {
     if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            "Daemon upgrade/shutdown is committed; no further control mutations are accepted",
-            false,
-        ));
+        return Err(ProtocolError::daemon_shutdown_committed());
     }
     Ok(())
 }
@@ -1034,7 +1030,7 @@ fn reserve_terminal_close(
 
 fn source_cleanup_conflict() -> ProtocolError {
     ProtocolError::new(
-        ProtocolErrorCode::InvalidRequest,
+        ProtocolErrorCode::TerminalCloseSourceConflict,
         crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
         false,
     )
@@ -1291,15 +1287,13 @@ fn terminal_io_request(request: &ClientRequest) -> bool {
     )
 }
 
-/// An account operation's failure as the daemon's reply. Both refusals left
-/// everything as it was and say so with `retryable`, so a client tells the
-/// person to wait and retry rather than reporting a failed operation. Only a
-/// busy control gate is the daemon's own busy sentence.
+/// The gate and account locks can refuse a lifecycle operation before it
+/// changes anything.
 pub(super) fn lifecycle_refusal(error: crate::account::remote::LifecycleError) -> ProtocolError {
     match error {
-        crate::account::remote::LifecycleError::Busy => control_gate::busy(),
+        crate::account::remote::LifecycleError::Busy => ProtocolError::daemon_busy(),
         crate::account::remote::LifecycleError::ListHeld(held) => {
-            ProtocolError::new(ProtocolErrorCode::InvalidRequest, held.to_string(), true)
+            ProtocolError::account_list_held(held)
         }
         crate::account::remote::LifecycleError::Failed(message) => {
             ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1424,7 +1418,7 @@ fn process_wire_request(
             Ok(prepared) => {
                 let _exclusive = gate
                     .exclusive_when_free_until(Instant::now() + MERGED_WORKTREE_REMOVAL_PATIENCE)
-                    .ok_or_else(control_gate::busy)?;
+                    .ok_or_else(ProtocolError::daemon_busy)?;
                 ensure_control_open(host)?;
                 super::account_lifecycle::ensure_idle(host)?;
                 prepared
@@ -1539,12 +1533,12 @@ fn process_wire_request(
                     request_abandoned(stream, automatic_switch)
                 })
                 .map_err(|failure| match failure {
-                    WaitFailure::Busy => control_gate::busy().into(),
+                    WaitFailure::Busy => ProtocolError::daemon_busy().into(),
                     WaitFailure::Abandoned => WireFailure::Abandoned,
                 })?
             } else {
                 gate.exclusive_until(deadline)
-                    .ok_or_else(control_gate::busy)?
+                    .ok_or_else(ProtocolError::daemon_busy)?
             };
             (Some(exclusive), None)
         }
@@ -1628,7 +1622,7 @@ fn validate_cleanup_source(
     if let Some((source, basis)) = expected {
         if !state.terminals.contains_key(&source.id) {
             return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalNotFound,
+                ProtocolErrorCode::TerminalCloseSourceAbsent,
                 crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT,
                 false,
             ));
@@ -1652,11 +1646,7 @@ fn validate_cleanup_source(
             _ => false,
         };
         if !valid {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::InvalidRequest,
-                crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT,
-                false,
-            ));
+            return Err(source_cleanup_conflict());
         }
     }
     Ok(())
@@ -2403,14 +2393,7 @@ fn process_admitted_request(
             let basis = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .terminal_removal_basis(source)
-                .map_err(|error| {
-                    if error.message == super::model::Registry::VIEW_REMOVAL_CONFLICT {
-                        source_cleanup_conflict()
-                    } else {
-                        error
-                    }
-                })?;
+                .terminal_removal_basis_for(source, source_cleanup_conflict)?;
             Ok((
                 ServerResponse::TerminalRemovalBasis(basis),
                 Vec::new(),

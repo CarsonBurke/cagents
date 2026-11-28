@@ -75,6 +75,7 @@ fn startup_failure(error: SetupError) -> ProtocolError {
         SetupError::Unavailable(message) => {
             ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, true)
         }
+        SetupError::Refused(error) => error,
     }
 }
 
@@ -450,7 +451,9 @@ impl Reservation {
         for home in &mut previous_homes {
             home.refresh_ancestors().map_err(refusal)?;
         }
-        let writer = gate.try_exclusive().ok_or_else(super::control_gate::busy)?;
+        let writer = gate
+            .try_exclusive()
+            .ok_or_else(ProtocolError::daemon_busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if !same_basis(&previous_basis, &entries) {

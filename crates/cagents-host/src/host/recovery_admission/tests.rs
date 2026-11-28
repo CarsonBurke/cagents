@@ -76,7 +76,7 @@ fn refused_by_hold(host: &SharedHost, client: u64, request: ClientRequest) {
         .expect_err(&format!("the hold admitted {description}"));
     assert_eq!(
         refusal.code,
-        ProtocolErrorCode::TerminalUnavailable,
+        ProtocolErrorCode::StartupRecoveryHeld,
         "{description}"
     );
     assert!(!refusal.retryable, "{description}");

@@ -8,6 +8,7 @@ use crate::{
     daemon::holder_registry::{OriginalRole, Record},
     host::model::{ArchivedHistory, NativeActorOwnership, NativeActorRetirement},
     model::HostSessionProof,
+    terminal_ipc::{ProtocolError, ProtocolErrorCode},
 };
 
 struct Evidence<'a> {
@@ -264,10 +265,6 @@ pub(super) fn ensure_prior_boot_account_for_start(
 
 const SURVIVOR: &str = "A process from this conversation's earlier Claude session is still running, so nothing was started in its place. Retry once it has exited";
 
-/// Also the answer for a pane whose conversation had an open CLI view, since
-/// that view's terminal could still hold the conversation.
-const UNMATCHED: &str = crate::chat::UNPROVEN_OWNER_REFUSAL;
-
 /// An actor that ended without retirement grants disk resume only when no
 /// writer of it can survive: its exact helper and provider are gone in this
 /// boot with nothing left in their process group or session, it was never
@@ -294,7 +291,12 @@ fn abandoned_for_start(
         || issued.terminal.is_some()
         || source.terminal.is_some()
     {
-        return Err(UNMATCHED.into());
+        // A paired CLI view can still hold the conversation.
+        return Err(SetupError::Refused(ProtocolError::new(
+            ProtocolErrorCode::UnprovenChatOwner,
+            crate::chat::UNPROVEN_OWNER_REFUSAL,
+            false,
+        )));
     }
     if !Handle::inspect_abandoned_actor(ownership.owner(), proof)
         .map_err(SetupError::Unavailable)?

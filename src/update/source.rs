@@ -963,6 +963,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         225,
         "the intermediate protocol from #3271 has no release qualified for live update",
     ),
+    (
+        226,
+        "the intermediate protocol from #4879 has no release qualified for live update",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]
@@ -1168,11 +1172,7 @@ mod prepare_receipt_tests {
                         false,
                     ))
                 } else if outcome == "busy" {
-                    ServerMessage::Error(ProtocolError::new(
-                        ProtocolErrorCode::Internal,
-                        crate::terminal_ipc::DAEMON_BUSY,
-                        true,
-                    ))
+                    ServerMessage::Error(ProtocolError::daemon_busy())
                 } else {
                     ServerMessage::Response {
                         response: ServerResponse::UpgradePrepared {
@@ -1205,7 +1205,8 @@ mod prepare_receipt_tests {
     }
 
     #[test]
-    fn a_busy_source_is_asked_again_on_the_same_connection_and_then_prepares() {
+    fn a_legacy_busy_source_is_asked_again_on_the_same_connection_and_then_prepares() {
+        const RELEASED_PROTOCOL: u16 = 198;
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new("busy-source"),
             boot_id: BootId::new("boot"),
@@ -1232,7 +1233,7 @@ mod prepare_receipt_tests {
                 write_frame(
                     peer,
                     &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
+                        version: RELEASED_PROTOCOL,
                         request_id: Some(request_id),
                         proof: proof.clone(),
                         message,
@@ -1277,7 +1278,12 @@ mod prepare_receipt_tests {
             }
             prepares
         });
-        let mut client = ControlClient::from_stream(stream).unwrap();
+        let mut client = ControlClient::from_stream_at_source_protocol(
+            stream,
+            Instant::now() + Duration::from_secs(5),
+            RELEASED_PROTOCOL,
+        )
+        .unwrap();
         let reply = prepare_retrying_busy(
             || prepare_reply(client.prepare_confirmed_upgrade(daemon.clone(), false)),
             Duration::from_secs(30),
@@ -1464,11 +1470,7 @@ mod prepare_receipt_tests {
     }
 
     fn busy() -> ServerMessage {
-        ServerMessage::Error(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            crate::terminal_ipc::DAEMON_BUSY,
-            true,
-        ))
+        ServerMessage::Error(ProtocolError::daemon_busy())
     }
 
     fn capability(generation: u64) -> ShutdownCapability {
@@ -1602,20 +1604,26 @@ mod prepare_receipt_tests {
         assert_eq!(source.finish().len(), 1);
     }
 
-    /// Any refusal other than busy is final at once and keeps its own words.
     #[test]
-    fn another_refusal_is_not_asked_again() {
-        let mut source = leased_source(
-            vec![ServerMessage::Error(ProtocolError::new(
-                ProtocolErrorCode::InvalidRequest,
-                "Not now",
-                false,
-            ))],
-            None,
-        );
-        let error = source.client.shutdown_preflight().unwrap_err();
-        assert!(matches!(&error, UpdateError::Invalid(message) if message.contains("Not now")));
-        assert_eq!(source.finish().len(), 1);
+    fn current_generic_refusals_never_authorize_replaying_stop() {
+        for (code, text, retryable) in [
+            (ProtocolErrorCode::InvalidRequest, "Not now", false),
+            (
+                ProtocolErrorCode::Internal,
+                crate::terminal_ipc::DAEMON_BUSY,
+                true,
+            ),
+        ] {
+            let mut source = leased_source(
+                vec![ServerMessage::Error(ProtocolError::new(
+                    code, text, retryable,
+                ))],
+                None,
+            );
+            let error = source.client.shutdown_preflight().unwrap_err();
+            assert!(matches!(&error, UpdateError::Invalid(message) if message.contains(text)));
+            assert_eq!(source.finish().len(), 1);
+        }
     }
 }
 

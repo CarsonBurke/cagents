@@ -813,9 +813,10 @@ impl Connection {
                         }
                     },
                     ServerMessage::Error(error)
-                        if error.code == ProtocolErrorCode::TerminalNotFound
+                        if error.code.legacy_code() == ProtocolErrorCode::TerminalNotFound
                             || (followed.ending
-                                && error.code == ProtocolErrorCode::TerminalUnavailable) =>
+                                && error.code.legacy_code()
+                                    == ProtocolErrorCode::TerminalUnavailable) =>
                     {
                         let message = if followed.ending {
                             "The conversation was closed.".into()
@@ -1110,18 +1111,30 @@ pub fn refused(error: &ProtocolError) -> api::Error {
         ProtocolErrorCode::PermissionDenied
         | ProtocolErrorCode::NotAdmitted
         | ProtocolErrorCode::AccountRemoved => api::ErrorCode::NotAllowed,
-        ProtocolErrorCode::TerminalNotFound => api::ErrorCode::NotFound,
-        ProtocolErrorCode::InvalidRequest => api::ErrorCode::BadRequest,
+        ProtocolErrorCode::TerminalNotFound | ProtocolErrorCode::TerminalCloseSourceAbsent => {
+            api::ErrorCode::NotFound
+        }
+        ProtocolErrorCode::InvalidRequest
+        | ProtocolErrorCode::AccountRegistryBusy
+        | ProtocolErrorCode::AccountLifecycleBusy
+        | ProtocolErrorCode::UnprovenChatOwner
+        | ProtocolErrorCode::TerminalCloseSourceConflict => api::ErrorCode::BadRequest,
         ProtocolErrorCode::Internal
         | ProtocolErrorCode::UnsupportedVersion
         | ProtocolErrorCode::HandshakeRequired
         | ProtocolErrorCode::AlreadyConnected
+        | ProtocolErrorCode::DaemonBusy
         | ProtocolErrorCode::ProofMismatch => api::ErrorCode::Internal,
         ProtocolErrorCode::TerminalAlreadyExists
         | ProtocolErrorCode::TerminalUnavailable
         | ProtocolErrorCode::QueueFull
         | ProtocolErrorCode::ViewConflict
         | ProtocolErrorCode::ChatCapacity
+        | ProtocolErrorCode::DaemonShutdownCommitted
+        | ProtocolErrorCode::StartupRecoveryHeld
+        | ProtocolErrorCode::UpdateRestartStopped
+        | ProtocolErrorCode::TerminalInputWorkerClosed
+        | ProtocolErrorCode::TerminalOutputCompleted
         | ProtocolErrorCode::StoreBusy => api::ErrorCode::Unavailable,
     };
     api_error(code, &error.message)

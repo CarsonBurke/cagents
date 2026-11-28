@@ -1912,9 +1912,9 @@ fn local_relaunch_retires_old_unread_without_acknowledging_it_or_same_session_re
 
 #[test]
 fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() {
-    for (message, retryable) in [
-        ("the terminal worker has closed", true),
-        ("terminal output has completed", false),
+    for refusal in [
+        ProtocolError::terminal_input_worker_closed(),
+        ProtocolError::terminal_output_completed(),
     ] {
         let (mut app, card, mut peer) = fixture();
         let proof = peer.handle.proof().unwrap();
@@ -1922,11 +1922,7 @@ fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() 
         let uncertain = app.uncertain_terminal_proofs.clone();
         let recovery_attempts = app.terminal_recovery_attempts.clone();
         let mut observed = peer.observed.try_iter().collect::<Vec<_>>();
-        *peer.reject_next_key.lock().unwrap() = Some(ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            message,
-            retryable,
-        ));
+        *peer.reject_next_key.lock().unwrap() = Some(refusal);
         let key = crate::terminal::KeyInput {
             action: crate::terminal::KeyAction::Release,
             key: crate::terminal::TerminalKey::Enter,

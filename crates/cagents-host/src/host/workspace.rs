@@ -1,7 +1,7 @@
 //! Workspace SQL owns its own serialized connection. HostState is borrowed only
 //! for resident admission, subscription and publication, never for layout SQL.
 use super::{
-    model::{DeltaApplied, Registry},
+    model::{DeltaApplied, EditError, Registry},
     state::{ClientId, SharedHost},
 };
 use crate::{
@@ -56,6 +56,12 @@ struct TitleAdmission(ProtocolError);
 impl From<String> for TitleAdmission {
     fn from(error: String) -> Self {
         Self(unavailable(error))
+    }
+}
+
+impl From<EditError> for TitleAdmission {
+    fn from(error: EditError) -> Self {
+        Self::from(error.to_string())
     }
 }
 
@@ -156,7 +162,7 @@ fn edit_then_guarded<T>(
     host: &SharedHost,
     origin: ClientId,
     edit: ModelEdit,
-    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(), String>,
+    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<(), EditError>,
     then: impl FnOnce(&Registry) -> Result<T, ProtocolError>,
 ) -> Result<(crate::workspace_model::delta::EditReceipt, T), ProtocolError> {
     let edit = edit
@@ -208,10 +214,10 @@ fn edit_then_guarded<T>(
                     unreachable!()
                 };
                 let CardKind::Terminal(source) = &before.kind else {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    return Err(EditError::RemovalConflict);
                 };
                 if !state.current_metadata_worker(source.id, worker) {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    return Err(EditError::RemovalConflict);
                 }
             }
             Ok(Some(state))
@@ -305,7 +311,7 @@ fn apply_delta_guarded<G>(
     registry: &mut Registry,
     edit: &ModelEdit,
     serving: Option<&HostSessionProof>,
-    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
+    guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, EditError>,
 ) -> Result<DeltaApplied, ProtocolError> {
     if let ModelEdit::ChangeView {
         scope,
@@ -349,19 +355,27 @@ fn apply_delta_guarded<G>(
     registry
         .apply_delta_guarded(edit, serving, guard)
         .map_err(|error| {
-            if error == Registry::VIEW_REMOVAL_CONFLICT
-                || error == Registry::VIEW_FOREIGN_CHAT_PROOF
-                || error == Registry::CHAT_PANE_ALREADY_SAVED
-            {
-                return ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false);
-            }
-            // Stale-precondition refusals the client resolves by reading again,
-            // the confirmed project close's channel set among them.
-            if error == Registry::VIEW_SOURCE_CONFLICT
-                || error == Registry::VIEW_REVISION_CONFLICT
-                || error == Registry::PROJECT_CHANNELS_CONFLICT
-            {
-                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
+            match error {
+                EditError::RemovalConflict
+                | EditError::ForeignChatProof
+                | EditError::ChatPaneAlreadySaved
+                | EditError::ChangeRefused(_) => {
+                    return ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        error.to_string(),
+                        false,
+                    );
+                }
+                EditError::SourceConflict
+                | EditError::RevisionConflict
+                | EditError::ProjectChannelsConflict => {
+                    return ProtocolError::new(
+                        ProtocolErrorCode::ViewConflict,
+                        error.to_string(),
+                        true,
+                    );
+                }
+                EditError::Store(_) => {}
             }
             // Execution retirement may close the scope after the preflight read.
             if let ModelEdit::ChangeView { scope, change, .. } = edit {
@@ -377,7 +391,7 @@ fn apply_delta_guarded<G>(
                     Ok(None) => {}
                 }
             }
-            unavailable(error)
+            unavailable(error.to_string())
         })
 }
 

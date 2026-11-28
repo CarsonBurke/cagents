@@ -58,7 +58,8 @@ impl SourceAdmission<'_> {
         terminal_retention::read_generation(&self.0, terminal)
     }
     pub(in crate::host) fn validate(&self, capture: &CapturedTerminalSource) -> Result<(), String> {
-        views::bindings::captured(&self.0, capture, None).map(drop)
+        views::bindings::captured(&self.0, capture, None)?;
+        Ok(())
     }
 
     pub(in crate::host) fn validate_pending(
@@ -86,7 +87,7 @@ impl SourceAdmission<'_> {
             PublishedTerminal,
             Vec<(ModelEdit, crate::workspace_model::delta::EditReceipt)>,
         ),
-        String,
+        EditError,
     > {
         if pending.is_some() {
             Registry::pending_terminal_save_fixture_error()?;
@@ -102,10 +103,10 @@ impl SourceAdmission<'_> {
             .optional()
             .map_err(|e| e.to_string())?;
         let mut scopes = pane
-            .map(|id| -> Result<_, String> {
+            .map(|id| -> Result<_, EditError> {
                 let id = id.parse::<CardId>().map_err(|e| e.to_string())?;
-                let scope = views::owner(&tx, id)?.ok_or(Registry::VIEW_REMOVAL_CONFLICT)?;
-                views::read(&tx, &scope)
+                let scope = views::owner(&tx, id)?.ok_or(EditError::RemovalConflict)?;
+                views::read(&tx, &scope).map_err(EditError::from)
             })
             .transpose()?
             .into_iter()
@@ -123,7 +124,7 @@ impl SourceAdmission<'_> {
                 if pane != old.id
                     || views::bindings::read(&tx, pane)?.is_none_or(|b| b.birth_sequence != birth)
                 {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    return Err(EditError::RemovalConflict);
                 }
             } else {
                 let CardKind::Terminal(saved) = &old.kind else {
@@ -138,7 +139,7 @@ impl SourceAdmission<'_> {
                     comparable.resume_hint = None;
                 }
                 if comparable != *saved {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    return Err(EditError::RemovalConflict);
                 }
             }
 
@@ -147,7 +148,7 @@ impl SourceAdmission<'_> {
                     || !old.pending_terminal_start
                     || !matches!(&old.kind, CardKind::Terminal(s) if s.launch == session.launch))
             {
-                return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                return Err(EditError::RemovalConflict);
             }
             view.panes[index].kind = CardKind::Terminal(session.clone());
             view.panes[index].pending_terminal_start = false;
@@ -208,7 +209,7 @@ impl SourceAdmission<'_> {
             ));
         }
         if (pending.is_some() || original.is_some()) && edges.is_empty() {
-            return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+            return Err(EditError::RemovalConflict);
         }
         tx.commit().map_err(|e| e.to_string())?;
         Ok((PublishedTerminal(()), edges))

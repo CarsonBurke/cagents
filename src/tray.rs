@@ -526,13 +526,16 @@ mod service {
         #[test]
         fn a_busy_refusal_reads_as_nothing_stopped_and_others_as_failures() {
             use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
-            let remote = |message: &str, retryable| ControlError::Remote {
-                code: ProtocolErrorCode::Internal,
+            let remote = |code, message: &str, retryable| ControlError::Remote {
+                code,
                 message: message.into(),
                 retryable,
             };
-            assert_eq!(stop_refused(remote(DAEMON_BUSY, true)), STOP_REFUSED_BUSY);
-            let other = remote("registry is unavailable", true);
+            assert_eq!(
+                stop_refused(remote(ProtocolErrorCode::DaemonBusy, DAEMON_BUSY, true)),
+                STOP_REFUSED_BUSY
+            );
+            let other = remote(ProtocolErrorCode::Internal, "registry is unavailable", true);
             let shown = other.to_string();
             assert_eq!(
                 stop_refused(other),

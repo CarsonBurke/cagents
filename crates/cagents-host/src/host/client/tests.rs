@@ -425,7 +425,14 @@ fn recovery_chat_requests_preserve_ordinary_exit_and_committed_shutdown_fences()
             let startup = chat_startup_request(&request);
             let failure = process_request(&host, 0, request).unwrap_err();
             assert_eq!(failure.retryable, startup);
-            assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
+            assert_eq!(
+                failure.code,
+                if ordinary_exit {
+                    ProtocolErrorCode::TerminalUnavailable
+                } else {
+                    ProtocolErrorCode::DaemonShutdownCommitted
+                }
+            );
             assert_eq!(
                 failure.message,
                 if ordinary_exit {
@@ -486,7 +493,7 @@ fn admission_refusing_an_automatic_switch_marks_it_not_admitted() {
     host.lock().unwrap().request_shutdown();
     for (idle_generation, code) in [
         (Some(3), ProtocolErrorCode::NotAdmitted),
-        (None, ProtocolErrorCode::TerminalUnavailable),
+        (None, ProtocolErrorCode::DaemonShutdownCommitted),
     ] {
         let failure = process_request(
             &host,
@@ -1803,7 +1810,7 @@ fn source_checked_close_cannot_retarget_a_completed_replacement_after_basis_read
         },
     )
     .unwrap_err();
-    assert_eq!(absent.code, ProtocolErrorCode::TerminalNotFound);
+    assert_eq!(absent.code, ProtocolErrorCode::TerminalCloseSourceAbsent);
     assert_eq!(
         absent.message,
         crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT
@@ -1829,7 +1836,7 @@ fn source_checked_close_cannot_retarget_a_completed_replacement_after_basis_read
                 },
             )
             .unwrap_err();
-            assert_eq!(error.code, ProtocolErrorCode::InvalidRequest);
+            assert_eq!(error.code, ProtocolErrorCode::TerminalCloseSourceConflict);
             assert_eq!(
                 error.message,
                 crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_CONFLICT
@@ -2763,7 +2770,7 @@ pub(in crate::host) fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdo
         ServerResponse::ShutdownAccepted
     ));
     let error = process_request(&host, 2, ClientRequest::List).unwrap_err();
-    assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+    assert_eq!(error.code, ProtocolErrorCode::DaemonShutdownCommitted);
     assert!(!error.retryable);
     assert!(prepare_resume(&host, 2, Vec::new()).is_err());
 }

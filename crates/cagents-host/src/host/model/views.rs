@@ -596,7 +596,7 @@ pub(super) fn retire_agent(
 
 #[cfg(test)]
 fn apply(transaction: &rusqlite::Transaction<'_>, edit: &ModelEdit) -> Result<bool, String> {
-    apply_recorded(transaction, edit, &mut Recorder::default(), None)
+    apply_recorded(transaction, edit, &mut Recorder::default(), None).map_err(String::from)
 }
 
 pub(super) fn apply_recorded(
@@ -604,10 +604,10 @@ pub(super) fn apply_recorded(
     edit: &ModelEdit,
     recorder: &mut Recorder,
     serving: Option<&crate::model::HostSessionProof>,
-) -> Result<bool, String> {
+) -> Result<bool, EditError> {
     let scope = match edit {
         ModelEdit::SeedView { scope, .. } | ModelEdit::ChangeView { scope, .. } => scope,
-        _ => return Err("expected a workspace view edit".into()),
+        _ => return Err(EditError::Store("expected a workspace view edit".into())),
     };
     if !exists(transaction, scope)? {
         if matches!(
@@ -617,18 +617,19 @@ pub(super) fn apply_recorded(
                 ..
             }
         ) {
-            return Err(if matches!(
-                edit,
-                ModelEdit::ChangeView {
-                    change: Change::RemoveSource { .. },
-                    ..
-                }
-            ) {
-                Registry::VIEW_REMOVAL_CONFLICT
-            } else {
-                "The source view is no longer open"
-            }
-            .into());
+            return Err(
+                if matches!(
+                    edit,
+                    ModelEdit::ChangeView {
+                        change: Change::RemoveSource { .. },
+                        ..
+                    }
+                ) {
+                    EditError::RemovalConflict
+                } else {
+                    EditError::ChangeRefused("The source view is no longer open".into())
+                },
+            );
         }
         return Ok(false);
     }
@@ -686,21 +687,21 @@ pub(super) fn apply_recorded(
                     || identity != registry.to_string()
                     || project(transaction, scope)? != *repository
                 {
-                    return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                    return Err(EditError::RemovalConflict);
                 }
             }
             if operation_seen(transaction, *operation)? {
                 return Ok(false);
             }
             if view.revision != *expected_revision {
-                return Err(Registry::VIEW_REVISION_CONFLICT.into());
+                return Err(EditError::RevisionConflict);
             }
             if let Change::UpdateTerminalSource { before, worker, .. } = change
                 && bindings::read(transaction, before.id)?
                     .and_then(|b| b.basis)
                     .is_some_and(|original| &original != worker)
             {
-                return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                return Err(EditError::RemovalConflict);
             }
             changed = match change {
                 Change::Transfer {
@@ -709,7 +710,7 @@ pub(super) fn apply_recorded(
                     before,
                 } => {
                     if let Some(reason) = refusal(transaction, scope, change)? {
-                        return Err(reason);
+                        return Err(EditError::ChangeRefused(reason));
                     }
                     let pane = view
                         .panes
@@ -743,15 +744,16 @@ pub(super) fn apply_recorded(
                 }
                 Change::Insert { pane, .. } | Change::InsertIfEmpty { pane } => {
                     if let Some(reason) = refusal(transaction, scope, change)? {
-                        return Err(reason);
+                        return Err(EditError::ChangeRefused(reason));
                     }
                     if resource_owner(transaction, pane)?.is_some() {
                         false
                     } else {
                         if owner(transaction, pane.id)?.is_some_and(|owner| &owner != scope) {
-                            return Err("pane already belongs to another view; use an atomic \
-                                        transfer"
-                                .into());
+                            return Err(EditError::Store(
+                                "pane already belongs to another view; use an atomic transfer"
+                                    .into(),
+                            ));
                         }
                         view.apply(change)?
                     }
@@ -762,7 +764,7 @@ pub(super) fn apply_recorded(
                     // the client can refuse source intent and retry presentation
                     // separately against the authoritative pane.
                     if view.source_update_conflicts(before, pane) {
-                        return Err(Registry::VIEW_SOURCE_CONFLICT.into());
+                        return Err(EditError::SourceConflict);
                     }
                     if resource_owner(transaction, pane)?.is_some() {
                         false
@@ -801,18 +803,18 @@ pub(super) fn apply_recorded(
                     if matches!(before.kind, crate::model::CardKind::Terminal(_))
                         && capture.is_none()
                     {
-                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                        return Err(EditError::RemovalConflict);
                     }
                     if let Some(capture) = capture {
                         if capture.scope != *scope || *capture.before != *before {
-                            return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                            return Err(EditError::RemovalConflict);
                         }
                         bindings::captured(transaction, capture, None)?;
                     }
                     if owner(transaction, before.id)?.as_ref() != Some(scope) {
-                        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+                        return Err(EditError::RemovalConflict);
                     }
-                    let changed = view.apply(change)?;
+                    let changed = view.apply(change).map_err(|_| EditError::RemovalConflict)?;
                     if changed {
                         recorder.closed.push(before.id);
                     }
@@ -843,7 +845,7 @@ pub(super) fn apply_recorded(
                             if old.id == chat.id && old.proof.as_ref() == Some(proof))
                 })
             {
-                return Err(Registry::VIEW_FOREIGN_CHAT_PROOF.into());
+                return Err(EditError::ForeignChatProof);
             }
         }
     }
@@ -862,8 +864,7 @@ pub(super) fn apply_recorded(
             ..
         } = edit
         {
-            let binding =
-                bindings::read(transaction, pane.id)?.ok_or(Registry::VIEW_SOURCE_CONFLICT)?;
+            let binding = bindings::read(transaction, pane.id)?.ok_or(EditError::SourceConflict)?;
             bindings::write(
                 transaction,
                 pane,
@@ -968,11 +969,11 @@ impl Registry {
     pub(in crate::host) fn guard_paneless_chat_insert(
         db: &Connection,
         session: crate::model::TerminalId,
-    ) -> Result<(), String> {
+    ) -> Result<(), EditError> {
         if store::terminal_pane_exists(db, session)?
             || !store::predecessor_panes(db, session)?.is_empty()
         {
-            return Err(Self::CHAT_PANE_ALREADY_SAVED.into());
+            return Err(EditError::ChatPaneAlreadySaved);
         }
         Ok(())
     }

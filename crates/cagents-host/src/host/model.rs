@@ -149,6 +149,40 @@ pub(crate) struct Registry {
     concurrency: std::sync::Arc<crate::agent_execution::concurrency::Setting>,
 }
 
+/// An edit's precondition refusal survives the transaction boundary, while
+/// unrelated storage diagnostics carry no authority to rebase the edit.
+#[derive(Debug, thiserror::Error)]
+pub(super) enum EditError {
+    #[error("{}", Registry::VIEW_REMOVAL_CONFLICT)]
+    RemovalConflict,
+    #[error("{}", Registry::VIEW_FOREIGN_CHAT_PROOF)]
+    ForeignChatProof,
+    #[error("{}", Registry::CHAT_PANE_ALREADY_SAVED)]
+    ChatPaneAlreadySaved,
+    #[error("{}", Registry::VIEW_SOURCE_CONFLICT)]
+    SourceConflict,
+    #[error("{}", Registry::VIEW_REVISION_CONFLICT)]
+    RevisionConflict,
+    #[error("{}", Registry::PROJECT_CHANNELS_CONFLICT)]
+    ProjectChannelsConflict,
+    #[error("{0}")]
+    ChangeRefused(String),
+    #[error("{0}")]
+    Store(String),
+}
+
+impl From<String> for EditError {
+    fn from(message: String) -> Self {
+        Self::Store(message)
+    }
+}
+
+impl From<EditError> for String {
+    fn from(error: EditError) -> Self {
+        error.to_string()
+    }
+}
+
 impl Registry {
     #[cfg(test)]
     pub(super) fn fixture_connection(&self) -> &Connection {
@@ -481,16 +515,17 @@ impl Registry {
             Self::pending_terminal_save_fixture_error()?;
         }
         self.apply_delta_guarded(edit, None, |_, _| Ok(()))
+            .map_err(String::from)
     }
 
     /// Acquire SQL writer admission before retaining resident serialization.
     /// The guard outlives commit, but never waits for BEGIN IMMEDIATE.
-    pub(crate) fn apply_delta_guarded<G>(
+    pub(super) fn apply_delta_guarded<G>(
         &mut self,
         edit: &ModelEdit,
         serving: Option<&crate::model::HostSessionProof>,
-        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, String>,
-    ) -> Result<DeltaApplied, String> {
+        guard: impl FnOnce(bool, &rusqlite::Connection) -> Result<G, EditError>,
+    ) -> Result<DeltaApplied, EditError> {
         self.commit_delta(
             edit,
             serving,
@@ -502,13 +537,13 @@ impl Registry {
     /// Like [`Registry::apply_delta_guarded`], but preserves a caller's
     /// structured resident-admission refusal. The chat guard can authorize a
     /// fallback when the provider explicitly cleared its title.
-    pub(crate) fn apply_title_delta<G, E>(
+    pub(super) fn apply_title_delta<G, E>(
         &mut self,
         edit: &ModelEdit,
         guard: impl FnOnce(&rusqlite::Connection) -> Result<(G, bool), E>,
     ) -> Result<DeltaApplied, E>
     where
-        E: From<String>,
+        E: From<String> + From<EditError>,
     {
         self.commit_delta(edit, None, |_, sql| guard(sql), true)
     }
@@ -533,7 +568,7 @@ impl Registry {
         check_schema: bool,
     ) -> Result<DeltaApplied, E>
     where
-        E: From<String>,
+        E: From<String> + From<EditError>,
     {
         let transaction = self
             .db
@@ -835,7 +870,7 @@ fn close_project(
     confirmed: Option<&BTreeSet<ChannelId>>,
     recorder: &mut views::Recorder,
     removed_channels: &mut Vec<ChannelId>,
-) -> Result<bool, String> {
+) -> Result<bool, EditError> {
     let key = repository_key(repository)?;
     let channels = transaction
         .prepare("SELECT id FROM channels WHERE repository = ?1")
@@ -849,7 +884,7 @@ fn close_project(
         .map(|id| parse_channel_id(id))
         .collect::<Result<BTreeSet<_>, _>>()?;
     if confirmed.is_some_and(|confirmed| *confirmed != channels) {
-        return Err(Registry::PROJECT_CHANNELS_CONFLICT.into());
+        return Err(EditError::ProjectChannelsConflict);
     }
     views::record_project_removal(transaction, repository, recorder)?;
     removed_channels.extend(channels);

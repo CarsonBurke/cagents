@@ -134,40 +134,23 @@ fn switch_unadmitted(error: crate::terminal::HostedTerminalStartError) -> StartF
     }
 }
 
-/// [`super::UNPROVEN_OWNER_REFUSAL`] as an earlier daemon worded it. A
-/// daemon outlives the client upgrades it serves, so a client still meets
-/// this sentence until that daemon is replaced.
-const EARLIER_UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be resumed after this computer restarts";
-
 fn start_failure(error: ipc::ProtocolError) -> StartFailure {
-    let recovery = match error.code {
-        ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
-        ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
-        _ if error.is_daemon_busy() => super::Recovery::Busy,
-        ipc::ProtocolErrorCode::NotAdmitted => super::Recovery::NotAdmitted,
-        // The daemon words this refusal retryable, but repeating the same
-        // attachment only meets it again: only a start reopens it.
-        ipc::ProtocolErrorCode::TerminalUnavailable
-            if error.message.starts_with(super::UPDATE_RESTART_STOPPED) =>
-        {
-            super::Recovery::UpdateStopped
-        }
-        _ if error.retryable => super::Recovery::Retry,
-        ipc::ProtocolErrorCode::TerminalUnavailable
-            if error.message.starts_with(super::STARTUP_RECOVERY_REFUSAL) =>
-        {
-            super::Recovery::UpdateRecovery
-        }
-        // Only the daemon's own whole sentence, never text that quotes it.
-        _ if [
-            super::UNPROVEN_OWNER_REFUSAL,
-            EARLIER_UNPROVEN_OWNER_REFUSAL,
-        ]
-        .contains(&error.message.as_str()) =>
-        {
-            super::Recovery::AfterRestart
-        }
-        _ => super::Recovery::Blocked,
+    use super::Recovery;
+    use ipc::{ProtocolErrorCode, RetryAdvice};
+
+    let class = error.failure_class();
+    let recovery = match class.reason {
+        ProtocolErrorCode::AccountRemoved => Recovery::Account,
+        ProtocolErrorCode::ChatCapacity => Recovery::Capacity,
+        ProtocolErrorCode::DaemonBusy if class.is_daemon_busy() => Recovery::Busy,
+        ProtocolErrorCode::NotAdmitted => Recovery::NotAdmitted,
+        _ => match class.retry_advice() {
+            RetryAdvice::Retry => Recovery::Retry,
+            RetryAdvice::AfterStartupRecovery => Recovery::UpdateRecovery,
+            RetryAdvice::Reopen => Recovery::UpdateStopped,
+            RetryAdvice::AfterRestart => Recovery::AfterRestart,
+            RetryAdvice::None => Recovery::Blocked,
+        },
     };
     StartFailure {
         message: error.message,
@@ -3609,7 +3592,7 @@ impl ClientHandle {
                         if !quiet { loop {
                             let (base, revision) = publication.capture();
                             let mut snapshot = (*base.snapshot).clone();
-                            if error.code == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
+                            if error.code.legacy_code() == ipc::ProtocolErrorCode::TerminalUnavailable { snapshot.ready = false; }
                             snapshot.error = Some(error.message.clone());
                             let mut proposed = Some(if base.resident {
                                 Publication::resident(snapshot, base.clock, base.lineage.clone(), base.source_thread.clone())

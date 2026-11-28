@@ -246,12 +246,7 @@ fn only_the_daemons_busy_refusal_is_typed_busy() {
         ))
         .recovery
     };
-    // As `host::control_gate::busy` refuses; its own tests pin that.
-    let busy = start_failure(ipc::ProtocolError::new(
-        ProtocolErrorCode::Internal,
-        ipc::DAEMON_BUSY,
-        true,
-    ));
+    let busy = start_failure(ipc::ProtocolError::daemon_busy());
     assert_eq!(busy.recovery, Recovery::Busy);
     assert_eq!(busy.message, ipc::DAEMON_BUSY);
     assert!(!Recovery::Busy.is_blocked());
@@ -274,7 +269,7 @@ fn only_the_startup_recovery_refusal_waits_on_update_recovery() {
         "{STARTUP_RECOVERY_REFUSAL}; inspect available sessions or explicitly Close the original actor: Codex server did not open its local socket within 15 seconds"
     );
     let failure = start_failure(ipc::ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
+        ProtocolErrorCode::StartupRecoveryHeld,
         held.clone(),
         false,
     ));
@@ -310,7 +305,7 @@ fn only_the_stopped_restart_refusal_reads_as_stopped_by_the_update() {
 
     let stopped = update_restart_stopped("Codex server exited before opening its local socket");
     let failure = start_failure(ipc::ProtocolError::new(
-        ProtocolErrorCode::TerminalUnavailable,
+        ProtocolErrorCode::UpdateRestartStopped,
         stopped.clone(),
         true,
     ));
@@ -361,7 +356,7 @@ fn recovery_restore_reports_a_conversation_the_update_stopped() {
                 },
                 (1, ClientRequest::ResolveUpgradeChat { source }) if source == expected => {
                     ServerMessage::Error(ipc::ProtocolError::new(
-                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        ipc::ProtocolErrorCode::UpdateRestartStopped,
                         refusal.clone(),
                         true,
                     ))
@@ -435,20 +430,25 @@ fn a_switch_whose_handshake_timed_out_is_unanswered_not_busy() {
             .message
             .contains("did not answer within 30 s")
     );
-    let refused = |message: &str, retryable| {
+    let refused = |code, message: &str, retryable| {
         switch_unadmitted(HostedTerminalStartError::Connect(
             crate::control::ControlError::Remote {
-                code: ipc::ProtocolErrorCode::Internal,
+                code,
                 message: message.into(),
                 retryable,
             },
         ))
     };
-    let busy = refused(ipc::DAEMON_BUSY, true);
+    let busy = refused(ipc::ProtocolErrorCode::DaemonBusy, ipc::DAEMON_BUSY, true);
     assert_eq!(busy.recovery, Recovery::Busy);
     assert_eq!(busy.message, ipc::DAEMON_BUSY);
     assert_eq!(
-        refused("refused before any effect", false).recovery,
+        refused(
+            ipc::ProtocolErrorCode::Internal,
+            "refused before any effect",
+            false
+        )
+        .recovery,
         Recovery::NotAdmitted
     );
     for unreachable in [
@@ -514,7 +514,7 @@ fn a_refusal_before_any_effect_is_typed_not_admitted_with_its_reason() {
             true,
         ))
         .recovery,
-        Recovery::Busy
+        Recovery::NotAdmitted
     );
 }
 
@@ -548,12 +548,7 @@ fn a_switch_that_failed_before_its_request_asked_nothing() {
         assert_eq!(switch_unasked(unreached).recovery, Recovery::Unreached);
     }
     assert_eq!(
-        switch_unasked(HandshakeError::Protocol(ProtocolError::new(
-            ProtocolErrorCode::Internal,
-            ipc::DAEMON_BUSY,
-            true,
-        )))
-        .recovery,
+        switch_unasked(HandshakeError::Protocol(ProtocolError::daemon_busy())).recovery,
         Recovery::Busy
     );
     for code in [
@@ -705,35 +700,30 @@ fn a_connected_reply_with_matching_proofs_is_accepted() {
 }
 
 #[test]
-fn only_the_daemons_whole_unproven_owner_refusal_waits_for_a_restart() {
+fn unproven_owner_recovery_depends_on_the_code() {
     use super::super::{Recovery, UNPROVEN_OWNER_REFUSAL};
-    use ipc::ProtocolErrorCode;
+    use ipc::{ProtocolError, ProtocolErrorCode};
 
-    let recovery = |message: &str, retryable| {
-        start_failure(ipc::ProtocolError::new(
+    let failure = start_failure(ProtocolError::new(
+        ProtocolErrorCode::UnprovenChatOwner,
+        "A prior actor still has unverified ownership.",
+        false,
+    ));
+    assert_eq!(failure.recovery, Recovery::AfterRestart);
+    assert!(failure.recovery.is_blocked());
+    assert_eq!(
+        failure.message,
+        "A prior actor still has unverified ownership."
+    );
+    assert_eq!(
+        start_failure(ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
-            message,
-            retryable,
+            UNPROVEN_OWNER_REFUSAL,
+            false,
         ))
-        .recovery
-    };
-    assert_eq!(
-        recovery(UNPROVEN_OWNER_REFUSAL, false),
-        Recovery::AfterRestart
+        .recovery,
+        Recovery::Blocked,
     );
-    assert!(Recovery::AfterRestart.is_blocked());
-    // A daemon still running from before the sentence was reworded.
-    assert_eq!(
-        recovery(super::EARLIER_UNPROVEN_OWNER_REFUSAL, false),
-        Recovery::AfterRestart
-    );
-    // A provider or wrapper quoting the sentence names no restart.
-    assert_eq!(
-        recovery(&format!("Provider said: {UNPROVEN_OWNER_REFUSAL}"), false),
-        Recovery::Blocked
-    );
-    // Retryability still wins: a retry is a nearer way back.
-    assert_eq!(recovery(UNPROVEN_OWNER_REFUSAL, true), Recovery::Retry);
 }
 
 #[test]
@@ -2995,7 +2985,7 @@ fn recovery_restore_keeps_permanent_attach_refusals_as_they_are() {
             Recovery::Blocked,
         ),
         (
-            ipc::ProtocolErrorCode::InvalidRequest,
+            ipc::ProtocolErrorCode::UnprovenChatOwner,
             UNPROVEN_OWNER_REFUSAL,
             false,
             Recovery::AfterRestart,

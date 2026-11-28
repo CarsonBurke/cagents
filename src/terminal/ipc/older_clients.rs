@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 226,
+    proven_at: 228,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -368,6 +368,61 @@ const RESTATED_VARIANTS: &[(&str, &str, u16)] = &[
         "cagents::terminal::ipc::ProtocolErrorCode",
         "not_admitted",
         NOT_ADMITTED_ERROR,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "daemon_busy",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "account_registry_busy",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "account_lifecycle_busy",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "startup_recovery_held",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "update_restart_stopped",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "unproven_chat_owner",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "terminal_input_worker_closed",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "terminal_output_completed",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "terminal_close_source_conflict",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "terminal_close_source_absent",
+        super::failure::TYPED_REFUSALS,
+    ),
+    (
+        "cagents::terminal::ipc::ProtocolErrorCode",
+        "daemon_shutdown_committed",
+        super::failure::TYPED_REFUSALS,
     ),
 ];
 
@@ -803,7 +858,7 @@ mod tests {
             boot_id: "boot".into(),
             host_incarnation: "incarnation".into(),
         };
-        let cases = [
+        let mut cases = vec![
             (
                 ProtocolError::new(ProtocolErrorCode::StoreBusy, "database is locked", true),
                 "store_busy",
@@ -831,6 +886,81 @@ mod tests {
                 ],
             ),
         ];
+        use ProtocolErrorCode::*;
+        let typed = [
+            (DaemonBusy, "daemon_busy", Internal, true),
+            (
+                AccountRegistryBusy,
+                "account_registry_busy",
+                InvalidRequest,
+                true,
+            ),
+            (
+                AccountLifecycleBusy,
+                "account_lifecycle_busy",
+                InvalidRequest,
+                true,
+            ),
+            (
+                StartupRecoveryHeld,
+                "startup_recovery_held",
+                TerminalUnavailable,
+                false,
+            ),
+            (
+                UpdateRestartStopped,
+                "update_restart_stopped",
+                TerminalUnavailable,
+                true,
+            ),
+            (
+                UnprovenChatOwner,
+                "unproven_chat_owner",
+                InvalidRequest,
+                false,
+            ),
+            (
+                TerminalInputWorkerClosed,
+                "terminal_input_worker_closed",
+                TerminalUnavailable,
+                true,
+            ),
+            (
+                TerminalOutputCompleted,
+                "terminal_output_completed",
+                TerminalUnavailable,
+                false,
+            ),
+            (
+                TerminalCloseSourceConflict,
+                "terminal_close_source_conflict",
+                InvalidRequest,
+                false,
+            ),
+            (
+                TerminalCloseSourceAbsent,
+                "terminal_close_source_absent",
+                TerminalNotFound,
+                false,
+            ),
+            (
+                DaemonShutdownCommitted,
+                "daemon_shutdown_committed",
+                TerminalUnavailable,
+                false,
+            ),
+        ];
+        cases.extend(typed.into_iter().map(|(code, json, legacy, retryable)| {
+            (
+                ProtocolError::new(code, "Diagnostic wording", retryable),
+                json,
+                vec![
+                    (CANDIDATE_LINE_PROTOCOL, legacy),
+                    (226, legacy),
+                    (PROTOCOL_VERSION, code),
+                ],
+            )
+        }));
         for (error, json, versions) in cases {
             for (version, expected) in versions {
                 let message = ServerMessage::Error(error.clone());

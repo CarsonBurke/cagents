@@ -164,9 +164,9 @@ fn an_exclusive_request_refuses_retryably_at_its_deadline() {
         started.elapsed() < Duration::from_secs(5),
         "the refusal arrived after the control client stops reading"
     );
-    assert_eq!(refusal.code, ProtocolErrorCode::Internal);
+    assert_eq!(refusal.code, ProtocolErrorCode::DaemonBusy);
     assert!(refusal.retryable);
-    // Clients match this exact sentence; the update retries only on it.
+    // Keep the wording carried clients expect.
     assert_eq!(refusal.message, crate::terminal_ipc::DAEMON_BUSY);
     assert!(
         crate::control::ControlError::Remote {
@@ -455,7 +455,7 @@ mod pipelined {
 fn a_busy_account_operation_refuses_as_the_gate_does() {
     use crate::account::remote::LifecycleError;
     let busy = super::lifecycle_refusal(LifecycleError::Busy);
-    assert_eq!(busy, super::control_gate::busy());
+    assert_eq!(busy, crate::terminal_ipc::ProtocolError::daemon_busy());
     assert!(
         crate::control::ControlError::Remote {
             code: busy.code,
@@ -473,9 +473,12 @@ fn a_busy_account_operation_refuses_as_the_gate_does() {
 #[test]
 fn a_held_account_list_refuses_retryably_in_its_own_words() {
     use crate::account::remote::{LifecycleError, ListHeld};
-    for held in [ListHeld::Registry, ListHeld::Lifecycle] {
+    for (held, code) in [
+        (ListHeld::Registry, ProtocolErrorCode::AccountRegistryBusy),
+        (ListHeld::Lifecycle, ProtocolErrorCode::AccountLifecycleBusy),
+    ] {
         let refusal = super::lifecycle_refusal(LifecycleError::ListHeld(held));
-        assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+        assert_eq!(refusal.code, code);
         assert_eq!(refusal.message, held.to_string());
         assert!(refusal.retryable);
         assert!(

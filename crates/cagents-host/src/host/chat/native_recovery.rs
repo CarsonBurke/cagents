@@ -358,14 +358,19 @@ fn restore_reserved(
         &registry::socket(&directory, source.id),
         Kind::Native,
     ).map_err(SetupError::Unavailable)?
-    .ok_or_else(|| SetupError::Unavailable(
-        // The update's restore stopped this conversation's failed restart:
-        // say so rather than suggest a holder may yet appear.
-        super::super::state::stopped_upgrade_reason(host, source).map_or_else(
-            || "The durable native holder is unavailable; this conversation was not restarted or resent".into(),
-            |reason| chat::update_restart_stopped(&reason),
-        ),
-    ))?;
+    .ok_or_else(|| {
+        if let Some(reason) = super::super::state::stopped_upgrade_reason(host, source) {
+            SetupError::Refused(ProtocolError::new(
+                ProtocolErrorCode::UpdateRestartStopped,
+                chat::update_restart_stopped(&reason),
+                true,
+            ))
+        } else {
+            SetupError::Unavailable(
+                "The durable native holder is unavailable; this conversation was not restarted or resent".into(),
+            )
+        }
+    })?;
     if Handle::is_remote_record(&record) {
         return super::retained_actor::restore_for_start(host, client, source, proof, record);
     }
@@ -508,6 +513,7 @@ fn restore_authenticated(
         return Err(match error {
             SetupError::Invalid(_) => SetupError::Invalid(message),
             SetupError::Unavailable(_) => SetupError::Unavailable(message),
+            SetupError::Refused(error) => SetupError::Refused(ProtocolError { message, ..error }),
         });
     }
     let paired = (|| {

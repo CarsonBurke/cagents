@@ -1194,7 +1194,7 @@ impl HostState {
                 .map_err(model_unavailable)?
             {
                 self.validate_view_removal(&edit).map_err(|reason| {
-                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason, false)
+                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, reason.to_string(), false)
                 })?;
             }
         }
@@ -2302,11 +2302,7 @@ impl HostState {
     ) -> Result<TerminalHandle, ProtocolError> {
         let record = self.attached_terminal(client_id, terminal_id)?;
         if record.handle.is_completed() {
-            return Err(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                "terminal output has completed",
-                false,
-            ));
+            return Err(ProtocolError::terminal_output_completed());
         }
         Ok(record.handle.clone())
     }
@@ -6517,17 +6513,14 @@ fn publish_installed_terminal(
         instance: expected.execution_instance(),
     };
     let (permit, edges) = match sql {
-        Some(sql) => sql
-            .publish(&canonical, &basis, pane, original)
-            .map_err(|error| {
-                if error == super::model::Registry::VIEW_REMOVAL_CONFLICT
-                    || error == super::model::Registry::VIEW_SOURCE_CONFLICT
-                {
-                    pending_save_conflict()
-                } else {
-                    model_unavailable(error)
-                }
-            })?,
+        Some(sql) => {
+            sql.publish(&canonical, &basis, pane, original)
+                .map_err(|error| match error {
+                    super::model::EditError::RemovalConflict
+                    | super::model::EditError::SourceConflict => pending_save_conflict(),
+                    error => model_unavailable(error.into()),
+                })?
+        }
         #[cfg(test)]
         None => (
             super::model::terminal_sources::PublishedTerminal::fixture(),
@@ -6583,11 +6576,7 @@ pub(crate) fn send_error(error: TerminalSendError) -> ProtocolError {
             "the terminal command queue is full",
             true,
         ),
-        TerminalSendError::Closed => ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            "the terminal worker has closed",
-            true,
-        ),
+        TerminalSendError::Closed => ProtocolError::terminal_input_worker_closed(),
         TerminalSendError::PasteTooLarge(bytes) => ProtocolError::new(
             ProtocolErrorCode::InvalidRequest,
             format!(
