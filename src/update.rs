@@ -4044,7 +4044,13 @@ fn read_job(state: &Path) -> Result<Option<UpdateJob>, UpdateError> {
 }
 
 fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
-    write_state_file(state, "status.json", job)
+    write_state_file(state, "status.json", job)?;
+    if job.phase == UpdatePhase::Starting
+        && let Err(error) = resume_census::clear(state)
+    {
+        tracing::warn!(%error, "could not clear superseded update resume data");
+    }
+    Ok(())
 }
 
 fn write_state_file(state: &Path, name: &str, value: &impl Serialize) -> Result<(), UpdateError> {

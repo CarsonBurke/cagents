@@ -8,8 +8,9 @@ use super::{UpdateError, retention, write_state_file};
 use crate::chat::{QueuedMessage, Snapshot};
 use crate::model::TerminalId;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::{fs, io, path::Path};
 
+const FILE: &str = "resume-census.json";
 const LIMIT: usize = 512 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -89,24 +90,35 @@ impl Capture {
     }
 
     pub(super) fn save(self, state: &Path, job: &str) -> Result<(), UpdateError> {
-        if let Some(name) = artifact(job)
-            && !self.entries.is_empty()
-        {
-            write_state_file(
-                state,
-                &name,
-                &Saved {
-                    job: job.to_owned(),
-                    entries: self.entries,
-                },
-            )?;
+        if !retention::canonical_id(job) {
+            return Err(super::invalid("invalid update job identifier"));
         }
-        Ok(())
+        clear(state)?;
+        if self.entries.is_empty() {
+            return Ok(());
+        }
+        write_state_file(
+            state,
+            FILE,
+            &Saved {
+                job: job.to_owned(),
+                entries: self.entries,
+            },
+        )
     }
 }
 
-fn artifact(job: &str) -> Option<String> {
-    retention::canonical_id(job).then(|| format!("{job}.resume-census.json"))
+/// The worker lease serializes capture and publication of a newer job.
+/// Both clear any optional payload from an earlier capture.
+pub(super) fn clear(state: &Path) -> Result<(), UpdateError> {
+    match fs::remove_file(state.join(FILE)) {
+        Ok(()) => {
+            fs::File::open(state)?.sync_all()?;
+            Ok(())
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Only the UI's view of a terminal job needs access to the private data.
@@ -121,10 +133,7 @@ pub(super) fn enrich(state: &Path, job: &mut super::UpdateJob) {
     {
         return;
     }
-    let Some(name) = artifact(&job.id) else {
-        return;
-    };
-    let Ok(bytes) = super::read_private(&state.join(name), LIMIT as u64) else {
+    let Ok(bytes) = super::read_private(&state.join(FILE), LIMIT as u64) else {
         return;
     };
     let Ok(saved) = serde_json::from_slice::<Saved>(&bytes) else {
@@ -198,14 +207,14 @@ mod tests {
         let mut job = job(work);
         let before = serde_json::to_vec(&job).unwrap();
         capture.save(directory.path(), &job.id).unwrap();
-        let path = directory.path().join(artifact(&job.id).unwrap());
+        let path = directory.path().join(FILE);
         let bytes = std::fs::read(&path).unwrap();
         assert!(String::from_utf8(bytes).unwrap().contains("and then push"));
         assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o600);
 
         enrich(directory.path(), &mut job);
         assert_eq!(job.in_flight[0].resume.queued_text[0].text, private);
-        assert!(!format!("{job:?}").contains(private));
+        assert!(!format!("{job:?}").contains("and then push"));
         assert_eq!(serde_json::to_vec(&job).unwrap(), before);
         assert_eq!(serde_json::to_vec(&census).unwrap(), legacy);
         assert_eq!(
@@ -213,8 +222,6 @@ mod tests {
             serde_json::json!([{ "id": id, "queued": ["q"] }]),
         );
 
-        let other_path = directory.path().join(artifact(&other_job.id).unwrap());
-        std::fs::hard_link(&path, &other_path).unwrap();
         enrich(directory.path(), &mut other_job);
         assert!(other_job.in_flight[0].resume.queued_text.is_empty());
 
@@ -222,6 +229,41 @@ mod tests {
         job.in_flight[0].work.queued.push("later".into());
         enrich(directory.path(), &mut job);
         assert!(job.in_flight[0].resume.queued_text.is_empty());
+    }
+
+    #[test]
+    fn a_failed_current_job_keeps_its_text_until_an_empty_recapture_or_new_job() {
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let snapshot = Snapshot {
+            queued_messages: vec![QueuedMessage::new("q".into(), "keep my request".into())],
+            ..Snapshot::default()
+        };
+        let work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
+        let mut superseding = job(work.clone());
+        superseding.phase = UpdatePhase::Starting;
+        let mut failed = job(work.clone());
+        failed.phase = UpdatePhase::Failed;
+        let capture = || {
+            let mut capture = Capture::new();
+            capture.observe(&work, &snapshot);
+            capture.save(state, &failed.id).unwrap();
+        };
+
+        capture();
+        super::super::write_job(state, &failed).unwrap();
+        let mut current = super::super::read_job(state).unwrap().unwrap();
+        enrich(state, &mut current);
+        assert_eq!(
+            current.in_flight[0].resume.queued_text[0].text,
+            "keep my request"
+        );
+
+        Capture::new().save(state, &failed.id).unwrap();
+        assert!(!state.join(FILE).exists());
+        capture();
+        super::super::write_job(state, &superseding).unwrap();
+        assert!(!state.join(FILE).exists());
     }
 
     #[test]

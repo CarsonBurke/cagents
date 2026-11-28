@@ -82,7 +82,6 @@ fn job_artifact(name: &str) -> Option<&str> {
         "log"
             | "request"
             | "census.json"
-            | "resume-census.json"
             | "recovery.json"
             | "settled.json"
             | "linux-handoff.json"
@@ -204,7 +203,6 @@ mod tests {
             "log",
             "request",
             "census.json",
-            "resume-census.json",
             "recovery.json",
             "cutover-inventory.json",
             "ready-parked-support.json",
