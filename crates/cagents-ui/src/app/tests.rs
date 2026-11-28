@@ -16186,7 +16186,11 @@ fn pull_request_panes_stay_in_the_worktree_where_the_user_opened_them() {
     drop(app.update(Message::GitUi(git_ui::Action::Remote {
         project,
         generation: 1,
-        result: Ok((availability, Vec::new())),
+        result: Ok(git_ui::RemoteRead {
+            availability,
+            archived: Vec::new(),
+            binding: None,
+        }),
     })));
     assert!(app.workspace.card(review).is_none());
     assert_eq!(app.workspace.focused(), Some(other.id));
