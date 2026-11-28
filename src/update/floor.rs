@@ -404,7 +404,20 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         daemon: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
         let mut client = source_client_for(daemon)?;
+        // Released daemons may serve unfenced terminal pages. Keep chat and
+        // terminal ownership inside the same census generation even there.
+        let generation = client.inventory_generation()?;
         let chats = client.list_chats()?;
+        let terminals: Vec<_> = client
+            .list()?
+            .into_iter()
+            .map(|item| item.session)
+            .collect();
+        if client.inventory_generation()? != generation {
+            return Err(invalid(
+                "The source inventory changed while capturing the update floor",
+            ));
+        }
         let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
         let mut in_flight = Vec::new();
         for chat in &chats {
@@ -416,11 +429,6 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             }
             snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
         }
-        let terminals: Vec<_> = client
-            .list()?
-            .into_iter()
-            .map(|item| item.session)
-            .collect();
         let mut presentation = crate::upgrade::floor::Record::new(
             self.proof.clone(),
             chats.clone(),

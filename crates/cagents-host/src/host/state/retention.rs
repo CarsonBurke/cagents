@@ -153,7 +153,11 @@ impl HostState {
 
     pub(super) fn remove_terminal_record(&mut self, id: TerminalId) -> Option<TerminalRecord> {
         self.terminal_completions.observed.remove(&id);
-        self.terminals.remove(&id)
+        let removed = self.terminals.remove(&id);
+        if removed.is_some() {
+            self.inventory_changed();
+        }
+        removed
     }
 
     pub(in crate::host) fn observe_completed_terminals(&mut self, now: Instant) {

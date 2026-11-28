@@ -1466,8 +1466,9 @@ impl ControlClient {
     }
 
     /// The terminal inventory, read a page at a time so that no reply has to
-    /// hold all of it. A terminal present throughout appears exactly once. An
-    /// update source from before pages answers it in one reply.
+    /// hold all of it. A current daemon refuses pages that cross a terminal
+    /// ownership change; discard the partial result and retry. Older update
+    /// sources may only offer the original unguarded listing.
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
         if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
             return match self.request_strict(ClientRequest::List)? {
@@ -1475,10 +1476,26 @@ impl ControlClient {
                 response => Err(unexpected_response("a terminal list", &response)),
             };
         }
+        const MAX_RESTARTS: usize = 2;
+        let mut restarts = 0;
         let mut inventory: Vec<TerminalDescriptor> = Vec::new();
         loop {
             let after = inventory.last().map(|terminal| terminal.session.id);
-            match self.request_strict(ClientRequest::ListPage { after })? {
+            let reply = match self.request_strict(ClientRequest::ListPage { after }) {
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::NotAdmitted,
+                    ref message,
+                    retryable: true,
+                }) if message == crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED
+                    && restarts < MAX_RESTARTS =>
+                {
+                    restarts += 1;
+                    inventory.clear();
+                    continue;
+                }
+                result => result?,
+            };
+            match reply {
                 ServerResponse::ListedPage {
                     terminals,
                     complete,
@@ -10416,6 +10433,88 @@ mod tests {
                 (result, expected) => panic!("listed {result:?}, expected {expected:?}"),
             }
             assert_eq!(server.join().unwrap(), expected_after);
+        }
+    }
+
+    #[test]
+    fn listing_restarts_after_an_inventory_change_and_discards_partial_rows() {
+        let id = TerminalId::new();
+        let terminal =
+            TerminalDescriptor::relaunchable(id, LaunchRecipe::shell("/".into()).unwrap(), None);
+        for recovers in [true, false] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let terminal = terminal.clone();
+            thread::scope(|scope| {
+                scope.spawn(move || {
+                    let handshake: ClientEnvelope =
+                        read_frame(&mut server_stream).unwrap().unwrap();
+                    write_frame(
+                        &mut server_stream,
+                        &connected_envelope(handshake.request_id, pinned.clone(), pinned.clone()),
+                    )
+                    .unwrap();
+                    let answer = |stream: &mut UnixStream, after, message| {
+                        let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+                        assert_eq!(request.request, ClientRequest::ListPage { after });
+                        write_frame(
+                            stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: pinned.clone(),
+                                message,
+                            },
+                        )
+                        .unwrap();
+                    };
+                    for _ in 0..if recovers { 1 } else { 3 } {
+                        answer(
+                            &mut server_stream,
+                            None,
+                            ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals: vec![terminal.clone()],
+                                    complete: false,
+                                },
+                            },
+                        );
+                        answer(
+                            &mut server_stream,
+                            Some(id),
+                            ServerMessage::Error(ProtocolError::new(
+                                ProtocolErrorCode::NotAdmitted,
+                                crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED,
+                                true,
+                            )),
+                        );
+                    }
+                    if recovers {
+                        answer(
+                            &mut server_stream,
+                            None,
+                            ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals: Vec::new(),
+                                    complete: true,
+                                },
+                            },
+                        );
+                    }
+                });
+                let mut client = ControlClient::from_stream(client_stream).unwrap();
+                if recovers {
+                    assert!(client.list().unwrap().is_empty());
+                } else {
+                    assert!(matches!(
+                        client.list(),
+                        Err(ControlError::Remote {
+                            code: ProtocolErrorCode::NotAdmitted,
+                            ..
+                        }),
+                    ));
+                }
+            });
         }
     }
 

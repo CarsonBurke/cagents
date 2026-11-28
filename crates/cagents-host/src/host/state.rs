@@ -74,6 +74,12 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+struct TerminalListCursor {
+    after: TerminalId,
+    generation: u64,
+    completed: Vec<TerminalId>,
+}
+
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
     /// Finite presentation revisions outlive disconnected viewports. Hidden
@@ -103,6 +109,14 @@ pub(crate) struct TerminalRecord {
 }
 
 impl TerminalRecord {
+    fn set_resume_hint(&mut self, hint: Option<&str>) -> bool {
+        if self.session.resume_hint.as_deref() == hint {
+            return false;
+        }
+        self.session.resume_hint = hint.map(str::to_owned);
+        true
+    }
+
     pub(super) fn execution_launch(&self) -> &crate::model::LaunchRecipe {
         self.execution_recipe
             .as_ref()
@@ -451,6 +465,8 @@ pub(crate) struct HostState {
     /// Its terminal may be the final startup owner blocking ordinary exit.
     checked_close_replies: BTreeSet<ClientId>,
     pub(super) inventory_generation: u64,
+    terminal_list_cursors: BTreeMap<ClientId, TerminalListCursor>,
+
     pub(super) tally_updates: Arc<tokio::sync::Notify>,
     published_terminal_workers: removal::PublishedWorkers,
     shutdown_capabilities: VecDeque<(ShutdownCapability, Instant)>,
@@ -666,6 +682,7 @@ impl HostState {
             ordinary_exit_registration_closed: false,
             checked_close_replies: BTreeSet::new(),
             inventory_generation: 0,
+            terminal_list_cursors: BTreeMap::new(),
             tally_updates: Arc::new(tokio::sync::Notify::new()),
             published_terminal_workers: Default::default(),
             shutdown_capabilities: VecDeque::new(),
@@ -757,6 +774,7 @@ impl HostState {
     /// Drops a departing client's delivery identity without unregistering its
     /// subscriptions, which is all a committed shutdown may still do.
     pub(crate) fn forget_client_delivery(&mut self, client_id: ClientId) {
+        self.terminal_list_cursors.remove(&client_id);
         self.mobile_watchers.remove(&client_id);
         self.chat_resolutions.remove(&client_id);
         self.exited_queue_transfers.remove(client_id);
@@ -1387,6 +1405,7 @@ impl HostState {
     }
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
+        self.terminal_list_cursors.remove(&client_id);
         self.mobile_watchers.remove(&client_id);
         let mut recheck_history = self
             .chat_resolutions
@@ -1716,14 +1735,70 @@ impl HostState {
         )
     }
 
+    /// One ownership-consistent list per connection. Keep only the last ID
+    /// and the worker completion observations, independent of recipe sizes.
+    pub(super) fn next_terminal_page(
+        &mut self,
+        client: ClientId,
+        after: Option<TerminalId>,
+        budget: usize,
+    ) -> Result<(Vec<TerminalDescriptor>, bool), ProtocolError> {
+        let previous = self.terminal_list_cursors.remove(&client);
+        let completed = self.completed_terminal_ids();
+        let generation = self.inventory_generation;
+        let changed = || {
+            ProtocolError::new(
+                ProtocolErrorCode::NotAdmitted,
+                crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED,
+                true,
+            )
+        };
+        if let Some(after) = after
+            && !previous.is_some_and(|previous| {
+                previous.after == after
+                    && previous.generation == generation
+                    && previous.completed == completed
+            })
+        {
+            return Err(changed());
+        }
+
+        let (page, complete) = self.list_page(client, after, budget, &completed);
+        // Workers release process ownership without taking HostState. Check
+        // both around projection and against the preceding page.
+        if completed != self.completed_terminal_ids() {
+            return Err(changed());
+        }
+        if !complete {
+            self.terminal_list_cursors.insert(
+                client,
+                TerminalListCursor {
+                    after: page.last().expect("a partial page is nonempty").session.id,
+                    generation,
+                    completed,
+                },
+            );
+        }
+        Ok((page, complete))
+    }
+
+    fn completed_terminal_ids(&self) -> Vec<TerminalId> {
+        self.terminals
+            .iter()
+            .filter(|(_, terminal)| terminal.handle.is_completed())
+            .map(|(&id, _)| id)
+            .collect()
+    }
+
     /// The descriptors after `after`, in identity order, until their encoding
     /// would pass `budget` bytes, and whether the page ends the inventory. A
     /// page always holds at least one descriptor when any follows `after`.
-    pub(crate) fn list_page(
+    fn list_page(
         &self,
         client_id: ClientId,
         after: Option<TerminalId>,
         budget: usize,
+        completed: &[TerminalId],
     ) -> (Vec<TerminalDescriptor>, bool) {
         let following = match after {
             Some(after) => self
@@ -1733,10 +1808,12 @@ impl HostState {
         };
         let mut page = Vec::new();
         let mut used = 0;
-        for terminal_id in following.map(|(terminal_id, _)| *terminal_id) {
-            let Ok(descriptor) = self.descriptor(client_id, terminal_id) else {
-                continue;
-            };
+        for (&terminal_id, record) in following {
+            let descriptor = self.project_terminal(
+                record,
+                self.subscriptions.attached(client_id, terminal_id),
+                completed.binary_search(&terminal_id).is_ok(),
+            );
             // A descriptor that cannot be measured cannot be encoded either;
             // charging it the whole budget gives it a page of its own.
             let size = postcard::experimental::serialized_size(&descriptor).unwrap_or(budget);
@@ -1805,14 +1882,23 @@ impl HostState {
             .terminals
             .get(&terminal_id)
             .ok_or_else(|| not_found(terminal_id))?;
+        Ok(self.project_terminal(record, attached, record.handle.is_completed()))
+    }
+
+    fn project_terminal(
+        &self,
+        record: &TerminalRecord,
+        attached: bool,
+        completed: bool,
+    ) -> TerminalDescriptor {
         let mut session = record.session.clone();
-        session.continuity = if !record.handle.is_completed() && attached {
+        session.continuity = if !completed && attached {
             TerminalContinuity::Live {
                 host_session_id: self.proof.host_session_id.clone(),
                 boot_id: self.proof.boot_id.clone(),
                 host_incarnation: self.proof.host_incarnation.clone(),
             }
-        } else if !record.handle.is_completed() {
+        } else if !completed {
             TerminalContinuity::DetachedSameBoot {
                 host_session_id: self.proof.host_session_id.clone(),
                 boot_id: self.proof.boot_id.clone(),
@@ -1824,7 +1910,7 @@ impl HostState {
                 last_exit: record.last_exit.clone(),
             }
         };
-        Ok(TerminalDescriptor {
+        TerminalDescriptor {
             screen_lost_after_crash: record.screen_lost_after_crash,
             session,
             activity: record.handle.activity(),
@@ -1844,7 +1930,7 @@ impl HostState {
             upgrade_sources: record.upgrade_sources.clone(),
             upgrade_relaunches: record.upgrade_relaunches.clone(),
             title: record.display_title.clone(),
-        })
+        }
     }
 
     #[cfg(test)]
@@ -1874,7 +1960,6 @@ impl HostState {
         for client in clients {
             self.subscriptions.detach(client, terminal_id);
         }
-        self.inventory_changed();
         Some(record)
     }
 
@@ -2102,6 +2187,7 @@ impl HostState {
         record.upgrade_sources = previous_sources.to_vec();
         record.upgrade_sources.push(source.clone());
         record.upgrade_relaunches = relaunches.to_vec();
+        self.inventory_changed();
         self.detach(0, source.id)
     }
 
@@ -2123,7 +2209,7 @@ impl HostState {
         // The worker learns a conversation's identity only from output it
         // sees, which the previous daemon already saw.
         if let Some(hint) = resume_hint {
-            record.session.resume_hint = Some(hint.to_owned());
+            record.set_resume_hint(Some(hint));
         }
         self.adopt_upgrade_lineage(
             &recovery.source,
@@ -6364,8 +6450,8 @@ fn start_terminal_view_owned_reserved(
             .get_mut(&terminal_id)
             .expect("installed original parent");
         record.options = options.clone();
-        if execution_recipe.is_some() {
-            record.session.resume_hint = session.resume_hint.clone();
+        if execution_recipe.is_some() && record.set_resume_hint(session.resume_hint.as_deref()) {
+            state.inventory_generation += 1;
         }
         state.publication_pending.insert(
             terminal_id,
@@ -7149,9 +7235,12 @@ fn record_event_from(
         if worker.is_some_and(|worker| !record.handle.same_worker(worker)) {
             return;
         }
-        if let WireTerminalEvent::ResumeHintChanged { hint } = &wire_event {
-            record.session.resume_hint = hint.clone();
-        }
+        let mut ownership_changed = match &wire_event {
+            WireTerminalEvent::ResumeHintChanged { hint } => {
+                record.set_resume_hint(hint.as_deref())
+            }
+            _ => false,
+        };
         record.event_sequence = record.event_sequence.saturating_add(1);
         let sequence = record.event_sequence;
         if let WireTerminalEvent::TitleChanged { title } = &wire_event {
@@ -7179,6 +7268,7 @@ fn record_event_from(
             exit_code, signal, ..
         } = &wire_event
         {
+            ownership_changed = true;
             record.running = false;
             record.last_exit = Some(TerminalExit {
                 code: signal
@@ -7197,6 +7287,9 @@ fn record_event_from(
         }
         while record.events.len() > EVENT_REPLAY_CAPACITY {
             record.events.pop_front();
+        }
+        if ownership_changed {
+            state.inventory_generation += 1;
         }
         if matches!(
             wire_event,
