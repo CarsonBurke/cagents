@@ -141,6 +141,7 @@ pub(in crate::app) use update_recovery::UpdateWait;
 mod scroll;
 mod selectable_prose;
 mod selection;
+mod status;
 mod step;
 mod stopped;
 mod text_copy;
@@ -3785,6 +3786,7 @@ pub(super) struct Runtime {
     snapshot: Arc<Snapshot>,
     provider_queue: std::cell::RefCell<prompt::ProviderQueue>,
     source_clock: Option<chat::client::SourceClock>,
+    status: std::cell::RefCell<status::Memo>,
     finished_stamp: Option<FinishedStamp>,
     cache: HashMap<String, CachedItem>,
     /// Only the selected child has presentation. Parent grouping continues to
@@ -5535,6 +5537,7 @@ impl Runtime {
             }),
             provider_queue: std::cell::RefCell::default(),
             source_clock: None,
+            status: Default::default(),
             finished_stamp: None,
             connection,
             closed_elsewhere: false,
@@ -7256,17 +7259,6 @@ impl Runtime {
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             self.find_navigation.changed_document();
         }
-        let live_ids: HashSet<&str> = snapshot
-            .items
-            .iter()
-            .chain(
-                snapshot
-                    .subagents
-                    .iter()
-                    .flat_map(|agent| agent.items.iter()),
-            )
-            .map(|item| item.id.as_str())
-            .collect();
         if self
             .selected_subagent
             .as_ref()
@@ -7327,17 +7319,30 @@ impl Runtime {
         // Keep disclosure choices across page eviction, with a bounded budget.
         // Question anchors only describe the currently loaded window.
         let parent_items_pruned = self.expanded.len() > 4096;
-        if parent_items_pruned
-            && self
-                .expanded
+        if parent_items_pruned || !self.asked_after.is_empty() {
+            let live_ids: HashSet<&str> = snapshot
+                .items
                 .iter()
-                .any(|id| !live_ids.contains(id.as_str()))
-        {
-            self.expanded
-                .edit()
-                .retain(|id| live_ids.contains(id.as_str()));
+                .chain(
+                    snapshot
+                        .subagents
+                        .iter()
+                        .flat_map(|agent| agent.items.iter()),
+                )
+                .map(|item| item.id.as_str())
+                .collect();
+            if parent_items_pruned
+                && self
+                    .expanded
+                    .iter()
+                    .any(|id| !live_ids.contains(id.as_str()))
+            {
+                self.expanded
+                    .edit()
+                    .retain(|id| live_ids.contains(id.as_str()));
+            }
+            self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         }
-        self.asked_after.retain(|id| live_ids.contains(id.as_str()));
         let retired_metadata = self.prepare_transcript_cache(&snapshot);
         if self.selected_subagent.is_some() {
             // Parent payload preparation stays lazy while a child is selected,

@@ -134,6 +134,8 @@ JOBS = (
         Suite("doctor", "tests/doctor.py", sources=("scripts/doctor",)),
         Suite("Zig discovery", "tests/run-development-zig.py", sources=("scripts/run-development",), isolated=False),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
+        Suite("macOS installer publication", "tests/installer_macos.py", sources=("install-macos.sh",),
+              syntax=(("sh", "install-macos.sh"),)),
         Suite("pinned sherpa-onnx libraries", "tests/sherpa_onnx_libs.py", sources=("scripts/sherpa-onnx-libs",)),
         Suite("formatter", "tests/check_format.py",
               sources=("scripts/check-format", "scripts/check-format-cache.py"),
@@ -264,7 +266,7 @@ SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compil
                 ("sh", "scripts/package-linux.sh"), ("sh", "scripts/package-ceditor-linux.sh"),
                 ("sh", "scripts/check-macos"), ("sh", "scripts/darwin-cc"), ("sh", "scripts/darwin-ar"),
                 # The macOS packaging runs only on a Mac.
-                ("sh", "scripts/package-macos"), ("sh", "install-macos.sh"), ("sh", "packaging/macos/smoke"),
+                ("sh", "scripts/package-macos"), ("sh", "packaging/macos/smoke"),
                 ("bash", "packaging/macos/make-icns"))
 
 # Run as `python3 -I -B -c SHARD FIXTURE INDEX COUNT VERBOSITY`: execute the fixture as
