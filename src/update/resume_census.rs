@@ -253,6 +253,6 @@ mod tests {
             entries: capture.entries,
         })
         .unwrap();
-        assert!(bytes.len() + 1 <= LIMIT);
+        assert!(bytes.len() < LIMIT);
     }
 }

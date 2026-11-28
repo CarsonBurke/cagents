@@ -265,7 +265,7 @@ impl Fate {
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
-    use crate::chat::{CommandAction, Item, Role, Subagent};
+    use crate::chat::{CommandAction, Item, QueuedMessage, Role, Subagent};
     use std::sync::Arc;
 
     fn agent(id: &str, status: ToolStatus, background: bool) -> Subagent {
