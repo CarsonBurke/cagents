@@ -1127,6 +1127,39 @@ class ChatViews(unittest.TestCase):
             self.assertIn('update did not report the candidate first-frame failure',
                           scenario.expected_refusal(root,'window-startup','old'))
 
+            before['target'] = {'version':'new'}
+            ended = {'state':'ended-provider', 'name':'codex-ended', 'exit':0,
+                     'chat_id':next(iter(before['sessions'])), 'agent_id':next(iter(before['agents']))}
+            (root/'seeds.json').write_text(json.dumps({'items':[ended]}))
+            ended_status = {**status, 'refusal':{'sessions':[{
+                'title':'codex-ended · Ended provider · alpha',
+                'reason':'Its provider is still starting. Wait for it to finish, then try the update again.',
+            }], 'blockers':[]}}
+            write(cancelled, ended_status)
+            self.assertEqual(scenario.expected_refusal(root,'ended-provider','old'), [])
+            for name, mutate in {
+                'target':lambda job:job.update(version='different'),
+                'phase':lambda job:job.update(phase='Complete'),
+                'missing refusal':lambda job:job.pop('refusal'),
+                'expired':lambda job:job['refusal'].update(expired=True),
+                'extra blocker':lambda job:job['refusal']['blockers'].append('other blocked work'),
+                'extra session':lambda job:job['refusal']['sessions'].append({}),
+                'different session':lambda job:job['refusal']['sessions'][0].update(title='codex-alpha'),
+                'different reason':lambda job:job['refusal']['sessions'][0].update(reason='provider stopped'),
+            }.items():
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(ended_status)
+                    mutate(candidate)
+                    write(cancelled, candidate)
+                    self.assertTrue(scenario.expected_refusal(root,'ended-provider','old'))
+            write(after, ended_status)
+            self.assertIn('ended-provider refusal sent an interrupt request',
+                          scenario.expected_refusal(root,'ended-provider','old'))
+            write(cancelled, ended_status)
+            (root/'seeds.json').write_text(json.dumps({'items':[{**ended,'exit':1}]}))
+            self.assertIn('ended-provider refusal lacks the original ended Codex chat',
+                          scenario.expected_refusal(root,'ended-provider','old'))
+
             # The current installer's --stage-only selects the candidate before the
             # update; a refusal must keep that staged current and its deferred owner.
             (prefix/'versions/new').mkdir()

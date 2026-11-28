@@ -931,7 +931,7 @@ start_next_version() {
 # draft the release workflow left and serve it as it would be published.
 rehearse() {
     local bundle=$BUNDLES/$VERSION sha previous root started mode=in-app files=() incoming status
-    local source=bundle metadata=release-metadata.json generation state reason
+    local source=bundle metadata=release-metadata.json generation state reason refusal_harness=-
     if [[ $FROM_DRAFT == true ]]; then
         source=draft
         sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
@@ -966,6 +966,11 @@ rehearse() {
     [[ $previous =~ $VERSION_PATTERN && $previous != "$VERSION" \
         && $(printf '%s\n%s\n' "$previous" "$VERSION" | sort -V | tail -n1) == "$VERSION" ]] \
         || fail "the newest published release is $previous, not older than $VERSION; there is nothing to rehearse"
+    # Even a staged update asks the published daemon to review its live work.
+    # The cut may predate the separate refusal case, which uses this checkout's harness.
+    if [[ $previous == 0.2.3 ]]; then
+        refusal_harness=$(repository_git rev-parse --verify HEAD) || fail 'cannot locate the refusal harness commit'
+    fi
     # ssh would drop an empty argument, and the host's shell parses the rest.
     root=${REHEARSAL_ROOT:--}
     [[ $root =~ ^[A-Za-z0-9_./-]+$ && $REHEARSAL_PARENTS =~ ^[A-Za-z0-9_./:-]+$ ]] \
@@ -990,7 +995,7 @@ HOST
     fi
     status=0
     on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" \
-        "$source" "$metadata" <<'HOST' || status=$?
+        "$source" "$metadata" "$refusal_harness" <<'HOST' || status=$?
 # Parsed whole before it runs, so nothing it starts reads the rest of it.
 main() {
 set -euo pipefail
@@ -1003,9 +1008,9 @@ main_run "$@"
 }
 main_run() {
 local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
-local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0 update
-local feed=$cache/feed-$3 path=() parents parent kept= marker before
-local source=${10} metadata=${11} digest
+local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release
+local feed=$cache/feed-$3 path=() refusal_path=() parents parent
+local source=${10} metadata=${11} refusal_harness=${12} digest
 # The nearest .git above a path, or nothing.
 git_above() {
     local ancestor=$1
@@ -1057,13 +1062,16 @@ if [[ ! -f $old/SHA256SUMS ]]; then
 fi
 (cd "$old" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS) \
     || { rm -rf -- "$old"; echo "release: the download of $previous was damaged; run the rehearsal again" >&2; exit 1; }
-# The harness of the commit released, which knows what that build does; made
-# afresh, so that nothing else in the directory can redirect Git.
-git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
-git -C "$repository" worktree prune
-git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
-git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$sha"
-git -C "$repository" worktree add -q --detach "$harness" "$sha"
+# Make a fresh checkout so nothing already at the path can redirect Git.
+load_harness() {
+    local revision=$1
+    git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
+    git -C "$repository" worktree prune
+    git -C "$repository" cat-file -e "$revision^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
+    git -C "$repository" cat-file -e "$revision^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$revision"
+    git -C "$repository" worktree add -q --detach "$harness" "$revision"
+}
+load_harness "$sha"
 local rehearse=$harness/scripts/rehearse-update
 if [[ $mode == in-app ]]; then
     rm -rf -- "$feed"
@@ -1087,6 +1095,10 @@ fi
 if [[ -f $harness/crates/ceditor/build.rs ]]; then
     path+=(--bundled-ceditor)
 fi
+qualify() {
+local expected=$1
+shift
+local status=0 report=$root/report.txt update marker before kept
 if [[ -e $root ]]; then
     echo "Replacing the earlier rehearsal in $root."
     # Without its marker, init never finished, so nothing there runs.
@@ -1100,8 +1112,7 @@ before=$(git_above "$(dirname -- "$root")")
 trap : TERM
 "$rehearse" --root "$root" run --old-dir "$old" --old-version "$previous" --old-installer "$old/install.sh" \
     --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes \
-    --ended-provider "${path[@]}" >/dev/null 9>&- || status=$?
-local report=$root/report.txt
+    "$@" >/dev/null 9>&- || status=$?
 # A sandbox can leave a .git mountpoint above the root while the rehearsal
 # runs, which the product then refuses as a checkout: a failure that says
 # nothing about the cut.
@@ -1118,19 +1129,11 @@ try:
 except (OSError, ValueError):
     print("absent")' "$root/home/.local/share/cagents-install/.update/status.json")
 echo "Update status: $update"
-[[ $update == Complete ]] || echo "release: the update ended $update, not Complete; reopened windows would say the update failed" >&2
-# Either way a reopened window reports anything but Complete as a failed
-# or refused update, which is what the rehearsal must catch (#3877).
-if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Complete ]]; then
-    # Its report is the evidence that it passed, for the metadata it updated
-    # to: publishing a draft requires a pass for that draft's.
-    { [[ -z $digest ]] || printf 'Rehearsed metadata: sha256 %s\nRehearsed from: %s\n' "$digest" "$previous"; cat -- "$report"; } \
-        > "$cache/passed-$version.txt"
-    "$rehearse" --root "$root" cleanup >/dev/null \
-        || echo "release: the rehearsal passed, but $root could not be removed" >&2
-    git -C "$repository" worktree remove --force "$harness" || :
-    rm -rf -- "$feed" "$new"
-    echo "Its report is in $cache/passed-$version.txt on $HOSTNAME."
+if [[ $update != "$expected" ]]; then
+    echo "release: the update ended $update, not $expected" >&2
+fi
+if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == "$expected" ]]; then
+    return 0
 elif [[ -n $marker ]]; then
     echo "release: $marker appeared above $root during the rehearsal, so its result says nothing" \
         "about $version; rehearse again (its report is in $root on $HOSTNAME)" >&2
@@ -1148,6 +1151,42 @@ else
     echo "release: its report, records and screenshots are in $root on $HOSTNAME" >&2
     exit 1
 fi
+}
+if [[ $refusal_harness == - ]]; then
+    path=(--ended-provider "${path[@]}")
+fi
+qualify Complete "${path[@]}"
+
+local update_report=$root/report.txt
+mkdir -- "$cache/$9"
+if [[ $refusal_harness != - ]]; then
+    # Preserve the successful upgrade report before reusing the short private root.
+    update_report=$cache/$9/update.txt
+    cp -- "$root/report.txt" "$update_report"
+    "$rehearse" --root "$root" cleanup >/dev/null
+    load_harness "$refusal_harness"
+    echo "Checking the expected ended-provider refusal from $previous."
+    if [[ $mode == in-app ]]; then
+        refusal_path=(--feed "$feed")
+    fi
+    qualify 'Failed refused' --ended-provider --expect-refusal ended-provider "${refusal_path[@]}"
+fi
+
+# Publishing a draft requires a pass for its exact metadata and source release.
+{
+    [[ -z $digest ]] || printf 'Rehearsed metadata: sha256 %s\nRehearsed from: %s\n' "$digest" "$previous"
+    cat -- "$update_report"
+    if [[ $refusal_harness != - ]]; then
+        printf '\nExpected ended-provider refusal from %s:\n' "$previous"
+        cat -- "$root/report.txt"
+    fi
+} > "$cache/$9/passed.txt"
+mv -- "$cache/$9/passed.txt" "$cache/passed-$version.txt"
+"$rehearse" --root "$root" cleanup >/dev/null \
+    || echo "release: the rehearsal passed, but $root could not be removed" >&2
+git -C "$repository" worktree remove --force "$harness" || :
+rm -rf -- "$feed" "$new"
+echo "Its report is in $cache/passed-$version.txt on $HOSTNAME."
 }
 setsid -w bash -c "$(declare -f main main_run); main \"\$@\"" bash "$@" </dev/null
 HOST

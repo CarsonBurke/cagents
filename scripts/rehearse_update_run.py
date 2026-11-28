@@ -805,6 +805,20 @@ def expected_refusal(root, kind, old_version):
         errors.append('update did not report the interruption settlement bound')
     if kind=='window-startup' and 'could not present its first window frame' not in message:
         errors.append('update did not report the candidate first-frame failure')
+    if kind=='ended-provider':
+        seeds = json.loads((root/'seeds.json').read_text())['items']
+        ended = [row for row in seeds if row.get('state')=='ended-provider']
+        if (len(ended)!=1 or ended[0].get('exit')!=0 or ended[0].get('name')!='codex-ended'
+                or ended[0].get('chat_id') not in before['sessions']
+                or ended[0].get('agent_id') not in before['agents']):
+            errors.append('ended-provider refusal lacks the original ended Codex chat')
+        refusal = status.get('refusal') or {}
+        sessions = refusal.get('sessions',[])
+        if (not target.get('version') or target.get('version')!=before.get('target',{}).get('version')
+                or refusal.get('expired',False) is not False or refusal.get('blockers')!=[]
+                or len(sessions)!=1 or sessions[0].get('title','').split(' · ',1)[0]!='codex-ended'
+                or sessions[0].get('reason')!='Its provider is still starting. Wait for it to finish, then try the update again.'):
+            errors.append('expected only the codex-ended still-starting refusal')
     current = root/'home/.local/share/cagents-install/current'
     staged = root/'staged-candidate.json'
     if staged.exists():
@@ -839,7 +853,7 @@ def expected_refusal(root, kind, old_version):
     started, finished = target.get('started',0), target.get('finished',0)
     events = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=started]
     interrupts = [row for row in events if row.get('event')=='request' and row.get('method')=='turn/interrupt']
-    if kind in ('cancel','window-startup'):
+    if kind in ('cancel','window-startup','ended-provider'):
         if interrupts:
             errors.append(f'{kind} refusal sent an interrupt request')
     else:
@@ -2518,7 +2532,7 @@ def main():
     run.add_argument('--new-terminal-after-restore',action='store_true',help='after verified existing-only reopening deliberately stop the private daemon, then open and use a new terminal through the same native UI')
     run.add_argument('--expect-terminal-restart-failure',action='store_true',help='before example only: require the native new-terminal action to fail with no daemon after the deliberate stop')
     run.add_argument('--reopen-timeout',type=float,default=45)
-    run.add_argument('--expect-refusal',choices=('interrupt','cancel','window-startup'),help='require the exact refusal and unchanged old service, install, windows and inventory')
+    run.add_argument('--expect-refusal',choices=('interrupt','cancel','window-startup','ended-provider'),help='require the exact refusal and unchanged old service, install, windows and inventory')
     run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
     run.add_argument('--plain-restart',action='store_true',help='after verified recovery, crash only the private daemon and start it normally; verify the original census again')
     run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')
@@ -2544,6 +2558,8 @@ def main():
     staged.add_argument('installer')
     staged.add_argument('--record',metavar='STAGE_LOG')
     args=parser.parse_args()
+    if args.command=='run' and args.expect_refusal=='ended-provider' and not args.ended_provider:
+        parser.error('--expect-refusal ended-provider requires --ended-provider')
     if args.command=='run' and args.natural_idle and (requires_working(args) or args.no_codex
             or args.working or args.yes or args.upgrade_arg or args.fail_new_daemon or args.expect_refusal
             or any(getattr(args,flag) for flag in ('no_init','exit_mid_turn','ignore_term','uncarryable','unreachable'))
