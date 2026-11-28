@@ -7408,8 +7408,11 @@ impl Runtime {
                 .iter()
                 .any(|message| &message.id == id)
         });
-        if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode = self.snapshot.permission_mode.clone();
+        if snapshot.permission_mode.is_none()
+            && snapshot.session_id.is_none()
+            && let Some(mode) = &self.snapshot.permission_mode
+        {
+            Arc::make_mut(&mut snapshot).permission_mode = Some(mode.clone());
         }
         if !self.parent_scroll().at_bottom()
             && !snapshot.has_later

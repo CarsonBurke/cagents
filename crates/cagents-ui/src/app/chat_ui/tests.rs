@@ -15211,6 +15211,27 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
 }
 
 #[test]
+fn snapshot_installation_shares_unknown_permission_and_carries_a_known_preview() {
+    let (mut runtime, _handle) = view::prepared_runtime_for_test(&[]);
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
+    let published = Arc::new(Snapshot {
+        generation: runtime.snapshot.generation + 1,
+        ready: true,
+        ..Snapshot::default()
+    });
+    runtime.install_snapshot(published.clone(), None);
+    assert!(
+        Arc::ptr_eq(&runtime.snapshot, &published),
+        "an unknown preview has no value to copy into the publication"
+    );
+
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = Some("default".into());
+    runtime.install_snapshot(published.clone(), None);
+    assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("default"));
+    assert!(published.permission_mode.is_none());
+}
+
+#[test]
 fn draft_permission_preview_resolves_once_and_discards_superseded_reads() {
     use iced::futures::StreamExt;
 
