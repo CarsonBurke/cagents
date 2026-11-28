@@ -1232,6 +1232,11 @@ impl HostState {
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
         self.mobile_sessions_changed();
+        if let Some(work) = &self.work
+            && !(effects.projects.is_empty() && effects.removed_projects.is_empty())
+        {
+            work.projects_changed();
+        }
         let edit = edit.committed();
         for client_id in &self.model_watchers {
             if *client_id == origin {

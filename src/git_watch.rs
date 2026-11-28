@@ -1746,6 +1746,44 @@ pub fn reliable_filesystem_events(path: &Path) -> bool {
     !Filesystem::of(path).is_ok_and(Filesystem::omits_events)
 }
 
+/// Whether a regular file on this filesystem can be cached by its metadata.
+#[cfg(feature = "host")]
+pub fn supports_file_revisions(path: &Path) -> bool {
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: the path is NUL-terminated and the helper supplies writable storage.
+    supports_revisions(|stat| unsafe { libc::statfs(path.as_ptr(), stat) })
+}
+
+/// Checks the filesystem of the file actually opened.
+#[cfg(feature = "host")]
+pub fn supports_open_file_revisions(file: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY: the file stays open and the helper supplies writable storage.
+    supports_revisions(|stat| unsafe { libc::fstatfs(file.as_raw_fd(), stat) })
+}
+
+#[cfg(feature = "host")]
+fn supports_revisions(stat: impl FnOnce(*mut libc::statfs) -> libc::c_int) -> bool {
+    let mut metadata = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    if stat(metadata.as_mut_ptr()) != 0 {
+        return false;
+    }
+    // SAFETY: successful statfs initialized the complete structure.
+    let metadata = unsafe { metadata.assume_init() };
+    #[cfg(target_os = "linux")]
+    {
+        Filesystem(metadata.f_type as u64 & 0xffff_ffff).reports_rewrites()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: Darwin statfs NUL-terminates the filesystem name.
+        let name = unsafe { std::ffi::CStr::from_ptr(metadata.f_fstypename.as_ptr()) };
+        name.to_bytes() == b"apfs"
+    }
+}
+
 impl Filesystem {
     fn of(path: &Path) -> std::io::Result<Self> {
         let path = std::ffi::CString::new(path.as_os_str().as_bytes())
