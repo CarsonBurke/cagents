@@ -306,6 +306,15 @@ impl Config {
             .is_some_and(|select| select.name_of(mode).is_some())
     }
 
+    pub fn confirms_model(&self, setter: &Setter, model: &str) -> bool {
+        let select = match setter {
+            Setter::Option(id) => self.model.as_ref().filter(|select| select.id == *id),
+            Setter::Model => self.models(),
+            Setter::Mode => None,
+        };
+        select.is_some_and(|select| select.current == model && select.name_of(model).is_some())
+    }
+
     pub fn confirms_mode(&self, setter: &Setter, mode: &str) -> bool {
         let select = match setter {
             Setter::Option(id) => self.mode.as_ref().filter(|select| select.id == *id),

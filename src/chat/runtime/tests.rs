@@ -5384,6 +5384,100 @@ fn an_antigravity_resumed_from_an_old_recipe_signs_in_without_the_locked_keyring
 }
 
 #[test]
+fn an_acp_first_model_switch_applies_reasoning_before_the_prompt() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    prepare_python_provider_fixture(root);
+    let agent = root.join("muse-upstream");
+    std::fs::write(
+        &agent,
+        include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o700)).unwrap();
+    std::fs::write(root.join("initial-model"), "muse-wonder-1.0").unwrap();
+    std::fs::write(root.join("spark-low-reasoning"), "").unwrap();
+    let log = root.join("frames.log");
+    let launch = super::super::Launch {
+        provider: crate::agent::Provider::Muse,
+        recipe: crate::model::LaunchRecipe {
+            program: agent.to_string_lossy().into_owned(),
+            arguments: Vec::new(),
+            working_directory: root.into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), root.to_string_lossy().into_owned()),
+                ("FAKE_ACP_STATE".into(), root.to_string_lossy().into_owned()),
+                ("FAKE_ACP_LOG".into(), log.to_string_lossy().into_owned()),
+            ]),
+            unset_environment: Default::default(),
+        },
+        session_id: None,
+        draft_model: None,
+    };
+    let (spec, mut adapter) = super::super::protocol::create(&launch).unwrap();
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let snapshot = until(&handle, |snapshot| snapshot.ready);
+    assert_eq!(snapshot.selected_model.as_deref(), Some("muse-wonder-1.0"));
+    let spark = snapshot
+        .models
+        .iter()
+        .find(|m| m.id == "muse-spark-1.2")
+        .unwrap();
+    assert!(spark.reasoning.is_empty());
+
+    handle
+        .command(Command::SetModel {
+            model: "muse-spark-1.2".into(),
+            reasoning: Some("xhigh".into()),
+        })
+        .unwrap();
+    assert_eq!(
+        handle.0.state.lock().unwrap().reasoning.as_deref(),
+        Some("xhigh")
+    );
+    handle
+        .command(Command::Prompt {
+            text: "Check the first prompt".into(),
+            attachments: Vec::new(),
+            mode: super::super::PromptMode::Send,
+        })
+        .unwrap();
+    until(&handle, |snapshot| {
+        !snapshot.busy
+            && snapshot
+                .items
+                .iter()
+                .any(|item| item.role == Role::Assistant)
+    });
+    let frames = std::fs::read_to_string(log).unwrap();
+    let methods: Vec<_> = frames
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter_map(|frame| match frame["method"].as_str() {
+            Some("session/set_config_option") => Some((
+                frame["params"]["configId"].as_str().unwrap().to_owned(),
+                frame["params"]["value"].as_str().unwrap().to_owned(),
+            )),
+            Some("session/prompt") => Some(("prompt".to_owned(), String::new())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        methods,
+        [
+            ("model".into(), "muse-spark-1.2".into()),
+            ("thought_level".into(), "xhigh".into()),
+            ("prompt".into(), String::new()),
+        ]
+    );
+    handle.close().unwrap();
+}
+
+#[test]
 fn an_acp_agent_works_answers_stops_and_resumes_through_the_real_pipe() {
     use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();

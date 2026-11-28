@@ -587,23 +587,42 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
         .as_array_mut()
         .unwrap()
         .push(json!({"category": "thought_level",
-        "currentValue": "xhigh", "id": "thought_level", "name": "Reasoning effort",
-        "options": [{"name": "Extra high", "value": "xhigh"}], "type": "select"}));
+        "currentValue": "low", "id": "thought_level", "name": "Reasoning effort",
+        "options": [{"name": "Low", "value": "low"}, {"name": "Extra high", "value": "xhigh"}],
+        "type": "select"}));
     let step = acp
         .receive(reply(&setting, json!({"configOptions": options})))
         .unwrap();
     // spark-1.2 offers the level, so it is still asked for.
     assert_eq!(only_write(&step)["params"]["configId"], "thought_level");
+    assert_eq!(only_write(&step)["params"]["value"], "xhigh");
+    assert!(acp.first_model_pending());
+    assert!(acp.accepts_turn().is_err());
+    options[2]["currentValue"] = json!("xhigh");
     let step = acp
         .receive(reply(only_write(&step), json!({"configOptions": options})))
         .unwrap();
     assert!(step.writes.is_empty());
+    assert!(!acp.first_model_pending());
+    assert!(acp.accepts_turn().is_ok());
+
+    // A failed model switch cannot apply its effort to the previous model.
+    let switch_to_wonder = || Command::SetModel {
+        model: "muse-wonder-full-1.0".into(),
+        reasoning: Some("xhigh".into()),
+    };
+    let step = acp.command(switch_to_wonder()).unwrap();
+    let setting = only_write(&step);
     let step = acp
-        .command(Command::SetModel {
-            model: "muse-wonder-full-1.0".into(),
-            reasoning: Some("xhigh".into()),
-        })
+        .receive(json!({
+            "jsonrpc": "2.0", "id": setting["id"],
+            "error": {"code": -32602, "message": "Model switch refused"}
+        }))
         .unwrap();
+    assert!(step.writes.is_empty());
+    assert!(acp.accepts_turn().is_ok());
+
+    let step = acp.command(switch_to_wonder()).unwrap();
     let setting = only_write(&step).clone();
     let step = acp
         .receive(reply(
@@ -612,6 +631,7 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
         ))
         .unwrap();
     assert!(step.writes.is_empty());
+    assert!(acp.accepts_turn().is_ok());
     assert!(
         !step
             .events
@@ -620,6 +640,49 @@ fn a_reasoning_level_is_reported_unless_a_new_model_explains_its_absence() {
     );
     assert!(step.events.iter().any(|event| matches!(event,
         Event::ActiveModel(Some(model)) if model.id == "muse-wonder-full-1.0" && model.reasoning.is_none())));
+}
+
+#[test]
+fn a_modern_model_switch_without_its_model_option_cannot_set_effort() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    let step = acp
+        .command(Command::SetModel {
+            model: "gemini-3.8-flash".into(),
+            reasoning: Some("low".into()),
+        })
+        .unwrap();
+    let mut options = agy_new()["configOptions"].as_array().unwrap().clone();
+    options.remove(0);
+    let step = acp
+        .receive(reply(only_write(&step), json!({"configOptions": options})))
+        .unwrap();
+    assert!(step.writes.is_empty(), "no confirmation of the destination");
+    assert!(!acp.first_model_pending());
+}
+
+#[test]
+fn an_unconfirmed_first_model_choice_retires_the_session_on_deadline() {
+    let mut acp = adapter(&[], None);
+    ready(&mut acp);
+    acp.command(Command::SetModel {
+        model: "gemini-3.8-flash".into(),
+        reasoning: Some("low".into()),
+    })
+    .unwrap();
+    assert!(matches!(
+        acp.metadata_wake(),
+        Some(MetadataWake::RetryAt(_))
+    ));
+    acp.first_model_deadline = Some(Instant::now());
+    let step = acp.refresh_metadata().unwrap();
+    assert!(step.writes.is_empty());
+    assert!(matches!(
+        step.events.as_slice(),
+        [Event::Ready(false), Event::Error { fatal: true, .. },]
+    ));
+    assert!(!acp.first_model_pending());
+    assert!(acp.accepts_turn().is_err());
 }
 
 #[test]
@@ -2944,7 +3007,8 @@ fn a_model_naming_its_reasoning_level_is_applied_as_both() {
     let model = only_write(&step);
     assert_eq!(model["params"]["configId"], "model");
     assert_eq!(model["params"]["value"], "gemini-3.8-flash");
-    let options = agy_new()["configOptions"].clone();
+    let mut options = agy_new()["configOptions"].clone();
+    options[0]["currentValue"] = json!("gemini-3.8-flash");
     let step = acp
         .receive(reply(model, json!({"configOptions": options})))
         .unwrap();

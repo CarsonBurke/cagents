@@ -857,7 +857,12 @@ impl State {
 
     /// The models `provider` last listed, in a conversation or to a probe.
     pub(super) fn catalog(&self, provider: Provider) -> Option<&Catalog> {
-        self.catalogs.get(&provider).map(|entry| &entry.catalog)
+        self.catalog_observation(provider)
+            .map(|entry| &entry.catalog)
+    }
+
+    pub(super) fn catalog_observation(&self, provider: Provider) -> Option<&CatalogObservation> {
+        self.catalogs.get(&provider)
     }
 
     /// Whether the last discovery found no CLI for `provider` where this
