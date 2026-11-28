@@ -3187,7 +3187,12 @@ impl Cagents {
                     return Task::none();
                 }
                 match notices_for {
-                    Some(card) if popup == Some(Popup::Notices) => self.focus_pane_keyboard(card),
+                    Some(card)
+                        if popup == Some(Popup::Notices)
+                            && self.workspace.shown().any(|shown| shown == card) =>
+                    {
+                        self.focus_pane_keyboard(card)
+                    }
                     _ => crate::ui_controls::return_focus(opener).map(cosmic::Action::App),
                 }
             }

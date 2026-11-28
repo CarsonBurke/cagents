@@ -8914,11 +8914,12 @@ impl Cagents {
             _ => None,
         };
         self.device_ui.menu_open = false;
+        let keyboard = self.card_keyboard_focus(card);
         let task = self.handle_chat_ui(action);
         if let Some(runtime) = self.chat_runtime_mut(target) {
             // A shortcut opens the picker from wherever the keyboard is in
-            // the pane, which for a chat is its composer: Escape returns there.
-            runtime.picker_opener = Some(card_control_id(card, "chat-composer"));
+            // the pane, usually its composer: Escape returns there.
+            runtime.picker_opener = Some(keyboard);
             runtime.picker_keyboard = focus.is_some();
             runtime.picker_focus = focus
                 .as_ref()

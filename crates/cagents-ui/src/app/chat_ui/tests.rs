@@ -6451,7 +6451,7 @@ fn permission_keyboard_skips_disabled_actions_and_closes_an_unsent_popup() {
         ),
         false,
     );
-    let composer = crate::app::card_control_id(card, "chat-composer");
+    let composer = app.card_keyboard_focus(card);
     assert!(
         matches!(
             messages.as_slice(),
@@ -27628,10 +27628,11 @@ fn dismissing_a_picker_returns_the_keyboard_to_where_it_opened_from() {
         (false, true)
     );
 
-    // Opened by its shortcut while typing: back to the composer.
+    // Opened by its shortcut: back to where the pane's keyboard was.
+    let keyboard = app.card_keyboard_focus(card);
     drop(app.open_chat_control(GlobalShortcut::ChatModel));
     let (action, opener) = dismissal(&app, MODEL_PICKER_CONTROL);
-    assert_eq!(opener, control("chat-composer"));
+    assert_eq!(opener, keyboard);
     assert_eq!(
         task_focuses(app.handle_chat_ui(action), &opener),
         (true, false)
@@ -27641,7 +27642,7 @@ fn dismissing_a_picker_returns_the_keyboard_to_where_it_opened_from() {
     drop(app.open_chat_control(GlobalShortcut::ChatPermissions));
     let task = app.open_chat_control(GlobalShortcut::ChatPermissions);
     assert!(!chat_runtime(&app, card).permission_picker);
-    assert_eq!(task_focuses(task, &control("chat-composer")), (true, false));
+    assert_eq!(task_focuses(task, &keyboard), (true, false));
 
     // Offered by the blocked-actions control: back to that control.
     drop(app.handle_chat_ui(Action::ResolvePermissions(target)));

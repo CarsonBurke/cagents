@@ -11192,6 +11192,13 @@ impl Cagents {
         event: keyboard::Event,
         captured: bool,
     ) -> (Task<Message>, Projection) {
+        // An account popover's surface answered this Escape before the
+        // window saw it: running the chain too would answer it twice, such
+        // as by closing the menu whose question it withdrew, or cancelling
+        // a rename beneath it.
+        if std::mem::take(&mut self.account_ui.escape_answered) && is_escape_press(&event) {
+            return (Task::none(), Projection::Unchanged);
+        }
         // Letting go of a dictation shortcut held down ends push-to-talk,
         // whatever has the keyboard now.
         if let keyboard::Event::KeyReleased { physical_key, .. } = &event

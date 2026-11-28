@@ -4967,7 +4967,12 @@ impl Application for Editor {
                     for tab in &mut self.tabs {
                         tab.lsp_error = None;
                     }
-                    self.close_notices()
+                    // With nothing left to show, the notices control goes
+                    // too, so the keyboard goes back to the editor.
+                    let focus = self.current().map_or_else(Task::none, |tab| {
+                        tab.runtime.focus_editor(tab.id).map(cosmic::Action::App)
+                    });
+                    Task::batch([self.close_notices(), focus])
                 }
                 Message::Lsp(generation, event) => {
                     if generation != self.lsp.generation() {

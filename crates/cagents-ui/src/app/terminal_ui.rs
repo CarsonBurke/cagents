@@ -224,8 +224,8 @@ mod tests {
         assert!(app.terminal_context.is_none());
         assert_eq!(
             crate::app::tests::task_focuses(task, &opener),
-            (true, false),
-            "the keyboard goes back to the terminal"
+            (false, true),
+            "with its terminal gone, the keyboard stays where it is"
         );
         app.terminal_context = Some(Context {
             card,
@@ -776,8 +776,14 @@ impl Cagents {
                 self.terminal_context = None;
                 return Task::none();
             }
-            Action::DismissContext(_, opener) => {
-                self.terminal_context = None;
+            Action::DismissContext(card, opener) => {
+                // The terminal that opened it may have gone meanwhile, and
+                // focusing a control that is gone blurs every other.
+                if self.terminal_context.take().is_none()
+                    || !matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
+                {
+                    return Task::none();
+                }
                 return crate::ui_controls::return_focus(opener).map(cosmic::Action::App);
             }
             action => action,

@@ -528,11 +528,20 @@ impl Cagents {
                 .into()
             }),
             widget::popover::Position::Top,
-            crate::ui_controls::Close::new(
-                Message::Phone(Action::Menu(false)),
-                widget::Id::new(CONTROL_ID),
-                |opener| Message::Phone(Action::Dismiss(opener)),
-            ),
+            {
+                let close = crate::ui_controls::Close::new(
+                    Message::Phone(Action::Menu(false)),
+                    widget::Id::new(CONTROL_ID),
+                    |opener| Message::Phone(Action::Dismiss(opener)),
+                );
+                // Opened by itself, it never took the keyboard: Escape is
+                // still for wherever the reader is, such as a terminal.
+                if self.phone_ui.opened_itself {
+                    close.only_from_inside()
+                } else {
+                    close
+                }
+            },
         )
     }
 

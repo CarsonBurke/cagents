@@ -8838,7 +8838,9 @@ impl RepositoryRuntime {
                 Task::none()
             }
             RepositoryAction::DismissToolbarOverflow { opener, .. } => {
-                self.toolbar_overflow_open = false;
+                if !std::mem::take(&mut self.toolbar_overflow_open) {
+                    return Task::none();
+                }
                 crate::ui_controls::return_focus(opener)
             }
             RepositoryAction::ZoomFont { .. } => Task::none(),

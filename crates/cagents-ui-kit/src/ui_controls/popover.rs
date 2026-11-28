@@ -25,6 +25,9 @@ use crate::design::{self, space};
 pub struct Close<Message> {
     outside: Message,
     dismiss: Message,
+    /// Whether Escape dismisses it wherever the keyboard is, rather than
+    /// only from inside it.
+    from_anywhere: bool,
 }
 
 impl<Message> Close<Message> {
@@ -38,7 +41,17 @@ impl<Message> Close<Message> {
         Self {
             outside,
             dismiss: dismiss(opener),
+            from_anywhere: true,
         }
+    }
+
+    /// Answers Escape only while the keyboard is inside the popover, as
+    /// one that opened by itself must: the keyboard is still wherever the
+    /// reader was, such as a terminal whose program reads Escape.
+    #[must_use]
+    pub fn only_from_inside(mut self) -> Self {
+        self.from_anywhere = false;
+        self
     }
 
     /// The message a Close control in the popover sends: the one Escape
@@ -310,16 +323,23 @@ fn framed<'a, Message: Clone + 'static>(
     padding: iced::Padding,
     class: cosmic::theme::Container<'static>,
 ) -> Element<'a, Message> {
-    let Close { outside, dismiss } = close;
+    let Close {
+        outside,
+        dismiss,
+        from_anywhere,
+    } = close;
     let mut popup = widget::popover(anchor).position(position).on_close(outside);
     if let Some(content) = content {
         // iced masks the cursor beneath an overlay only when its surface
         // reports a mouse interaction. Include the frame's padding and inert
         // content, which otherwise report None and expose controls beneath.
-        popup = popup.popup(escape_dismisses(
-            crate::interaction::opaque(widget::container(content).padding(padding).class(class)),
-            dismiss,
-        ));
+        let surface =
+            crate::interaction::opaque(widget::container(content).padding(padding).class(class));
+        popup = popup.popup(if from_anywhere {
+            escape_dismisses(surface, dismiss)
+        } else {
+            crate::interaction::focused_escape(surface, move || dismiss.clone())
+        });
     }
     popup.into()
 }
@@ -635,6 +655,14 @@ mod tests {
     /// The messages `events` raise in an open popover whose surface holds
     /// a search field, focused when `focused`, over a base that takes keys.
     fn closes(events: &[cosmic::iced::Event], focused: bool) -> Vec<Closed> {
+        closes_with(events, focused, true)
+    }
+
+    fn closes_with(
+        events: &[cosmic::iced::Event],
+        focused: bool,
+        from_anywhere: bool,
+    ) -> Vec<Closed> {
         use cosmic::iced::advanced::clipboard;
         use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
         use cosmic::iced::{Point, Size, mouse};
@@ -646,6 +674,11 @@ mod tests {
             iced::widget::Space::new().width(20).height(20),
             |_| Some(Closed::Typed),
         );
+        let close = Close::new(
+            Closed::Outside,
+            widget::Id::new("opener"),
+            Closed::Dismissed,
+        );
         let element = popover(
             base,
             Some(
@@ -656,11 +689,11 @@ mod tests {
                     .into(),
             ),
             widget::popover::Position::Point(Point::new(40.0, 40.0)),
-            Close::new(
-                Closed::Outside,
-                widget::Id::new("opener"),
-                Closed::Dismissed,
-            ),
+            if from_anywhere {
+                close
+            } else {
+                close.only_from_inside()
+            },
         );
         let mut ui = UserInterface::build(
             element,
@@ -691,6 +724,22 @@ mod tests {
         let dismissed = vec![Closed::Dismissed(widget::Id::new("opener"))];
         assert_eq!(closes(&[escape()], false), dismissed, "nothing focused");
         assert_eq!(closes(&[escape()], true), dismissed, "its field focused");
+    }
+
+    /// A popover that opened by itself answers Escape only from inside it,
+    /// leaving the key to the window the reader is still in.
+    #[test]
+    fn a_popover_open_by_itself_leaves_escape_outside_it_to_the_window() {
+        assert_eq!(
+            closes_with(&[escape()], false, false),
+            vec![Closed::Typed],
+            "the window beneath reads it"
+        );
+        assert_eq!(
+            closes_with(&[escape()], true, false),
+            vec![Closed::Dismissed(widget::Id::new("opener"))],
+            "from inside, it dismisses"
+        );
     }
 
     /// A press outside closes the popover without naming anywhere to

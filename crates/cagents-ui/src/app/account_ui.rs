@@ -128,6 +128,9 @@ pub(super) struct State {
     /// function of the state and a test can state the time.
     now_ms: Millis,
     popover: Option<AccountId>,
+    /// Whether the open popover or menu has just answered an Escape on its
+    /// own surface, so the key reaching the window after is spent.
+    pub(super) escape_answered: bool,
     cache: Option<Cache>,
     logins: Vec<Login>,
     /// Set before asynchronous CLI discovery/home creation, not after it.
@@ -360,6 +363,7 @@ impl State {
             remote_system_homes: BTreeMap::new(),
             now_ms: now_ms(),
             popover: None,
+            escape_answered: false,
             cache,
             logins: Vec::new(),
             browser_preparing: false,
@@ -1492,6 +1496,9 @@ pub enum Action {
     Popover(Option<AccountId>),
     /// Escape closed the open popover or menu: focus goes back to `opener`.
     Dismiss(widget::Id),
+    /// Escape on the open popover's or menu's own surface: it withdraws the
+    /// question the popover asks, else dismisses it back to `opener`.
+    Escape(widget::Id),
     /// Include a stable usage row in this provider's status-bar preview.
     PreviewRow {
         id: AccountId,
@@ -4384,6 +4391,16 @@ impl Cagents {
                 })
                 .discard()
             }
+            Action::Escape(opener) => {
+                self.account_ui.escape_answered = true;
+                if self.account_forget_asked() {
+                    return self.update_account_ui(Action::RemoveCancel);
+                }
+                if let Some(id) = self.usage_reset_asked(true) {
+                    return self.update_account_ui(Action::ResetCancel(id));
+                }
+                self.update_account_ui(Action::Dismiss(opener))
+            }
             Action::Dismiss(opener) => {
                 let open = self.account_ui.popover.take().is_some()
                     | std::mem::take(&mut self.account_ui.table.add_menu)
@@ -7051,7 +7068,7 @@ impl Cagents {
             crate::ui_controls::Close::new(
                 Message::AccountUi(Action::Popover(None)),
                 chip_id(provider),
-                |opener| Message::AccountUi(Action::Dismiss(opener)),
+                |opener| Message::AccountUi(Action::Escape(opener)),
             ),
         ))
     }

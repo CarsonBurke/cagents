@@ -593,7 +593,8 @@ impl State {
                 self.discussion.submit_error = None;
             }
             Action::DismissReview(opener)
-                if !self.discussion.submitting || !self.discussion.busy =>
+                if self.discussion.review_open
+                    && (!self.discussion.submitting || !self.discussion.busy) =>
             {
                 drop(self.update_discussion(Action::CloseReview));
                 return crate::ui_controls::return_focus(opener);
