@@ -287,7 +287,7 @@ impl Runtime {
             (CopyPart::Output, Some(source)) => {
                 Action::CopyStep(target, id.clone(), CopyPart::Output, source)
             }
-            _ => Action::Copy(target, id.clone(), part.clone()),
+            _ => Action::Copy(target, self.row_target(item), part.clone()),
         };
         // What a command or a tool printed is followed from its end. A patch,
         // an input, and what a read or a search returned are read from the
@@ -338,20 +338,23 @@ impl Runtime {
             tool_text::ToolText::view_logical_with_reader
         };
         let raw = raw.map(|(_, part, description)| {
-            let state = self.copy_state(&item.id, Some(&part));
+            let state = self.row_copy_state(item, Some(&part));
+            let row = self.row_target(item);
             (
-                crate::ui_controls::button::quiet("Copy JSON")
-                    .instead(
-                        "Copied",
-                        matches!(state, super::text_copy::CopyState::Copied),
-                    )
-                    .instead(
-                        "Copy again",
-                        matches!(state, super::text_copy::CopyState::Refused(_)),
-                    )
-                    .description(description)
-                    .on_press(action(Action::Copy(target, id.clone(), part)))
-                    .into(),
+                crate::ui_controls::owned(
+                    (row.clone(), part.clone()),
+                    crate::ui_controls::button::quiet("Copy JSON")
+                        .instead(
+                            "Copied",
+                            matches!(state, super::text_copy::CopyState::Copied),
+                        )
+                        .instead(
+                            "Copy again",
+                            matches!(state, super::text_copy::CopyState::Refused(_)),
+                        )
+                        .description(description)
+                        .on_press(action(Action::Copy(target, row, part))),
+                ),
                 state.is_telling(),
             )
         });
@@ -368,7 +371,7 @@ impl Runtime {
             ),
             Some(caption.to_owned()),
             Some(copy),
-            self.copy_state(&item.id, Some(&part)),
+            self.row_copy_state(item, Some(&part)),
             raw,
         )
     }
@@ -391,7 +394,7 @@ impl Runtime {
         let Some(item) = self.step_items().get(only.index) else {
             return disclosure::Headline::Text(turn.summary.clone());
         };
-        let cached = self.presentation_cache().get(&item.id);
+        let cached = self.presentation_cache().get(self.cache_key(item));
         if let Some(coordinated) = cached.and_then(|cached| cached.coordination.as_deref()) {
             let line = coordinated.summary_naming(&|id| self.listed_agent_name(id));
             return disclosure::Headline::Text(format!(
@@ -456,7 +459,7 @@ impl Runtime {
         let open = || {
             self.step_items()
                 .get(only.index)
-                .is_some_and(|item| self.item_expanded(&item.id))
+                .is_some_and(|item| self.row_expanded(item))
         };
         (!turn.thinking || open()).then_some(only)
     }
@@ -514,7 +517,7 @@ impl Runtime {
                 let mut kinds = turn.steps.iter().filter_map(|step| {
                     self.step_items().get(step.index).map(|item| {
                         self.presentation_cache()
-                            .get(&item.id)
+                            .get(self.cache_key(item))
                             .and_then(|cached| cached.coordination.as_deref())
                             .and_then(Coordinated::glyph)
                             .unwrap_or_else(|| kind_glyph(&item.content))
@@ -631,7 +634,7 @@ impl Runtime {
                 None,
             );
         }
-        let open = self.item_expanded(&item.id);
+        let open = self.row_expanded(item);
         let mut rows = vec![self.step_button(item, cached, open, status)];
         if open {
             rows.push(
@@ -639,7 +642,7 @@ impl Runtime {
                     self.step_detail(item, cached, settings),
                     self.message_copy(item),
                     Alignment::Start,
-                    self.copy_note_shown(&item.id),
+                    self.row_copy_note_shown(item),
                 ))
                 .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
                 .width(Length::Fill)
@@ -757,7 +760,7 @@ impl Runtime {
             status,
             elapsed,
             Some(open),
-            Some(Action::Toggle(target, item.id.clone())),
+            Some(Action::Toggle(target, self.row_target(item))),
         )
     }
 
@@ -1106,7 +1109,7 @@ mod tests {
                     }
                     Message::ChatUi(Action::Toggle(target, id)) if !group => {
                         assert_eq!(*target, runtime.target);
-                        assert_eq!(id, &item.id);
+                        assert_eq!(id.id, item.id);
                     }
                     _ => panic!("the focused header must emit its own disclosure action"),
                 }

@@ -808,7 +808,7 @@ fn recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers() {
         let before = runtime.snapshot.clone();
         // Actual disclosure actions rebuild the cache without any new
         // provider publication. The recorded label stays available.
-        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(Arc::ptr_eq(&before, &runtime.snapshot));
         assert_eq!(
@@ -872,9 +872,13 @@ fn recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers() {
             );
         }
         assert_eq!(messages.len(), 1);
-        assert!(
-            matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
-        );
+        assert!(match &messages[0] {
+            Message::ChatUi(Action::Copy(target, row, CopyPart::Text)) =>
+                *target == runtime.target && row.id == item.id,
+            Message::ChatUi(Action::CopyMessage(target, id, _)) =>
+                *target == runtime.target && id == &item.id,
+            _ => false,
+        });
         drop(footer);
         if child_selected {
             let revision = app.chat_runtime_mut(target).unwrap().child_cache[&item.id].revision;
@@ -1035,7 +1039,11 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
-    drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+    drop(app.handle_chat_ui(Action::Unfold(
+        target,
+        "shared-thought".into(),
+        "output".into(),
+    )));
     assert!(inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct child reasoning"));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
@@ -1045,7 +1053,11 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
     assert!(!runtime.part_unfolded("shared-thought#output"));
     assert!(!inspect(runtime).contains("Distinct parent reasoning"));
     drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
-    drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+    drop(app.handle_chat_ui(Action::Unfold(
+        target,
+        "shared-thought".into(),
+        "output".into(),
+    )));
     assert!(inspect(app.chat_runtime_mut(target).unwrap()).contains("Distinct parent reasoning"));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("native-child".into()))));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
@@ -1054,7 +1066,11 @@ fn recorded_selected_child_actions_preserve_disclosure_of_colliding_parent() {
     assert!(runtime.part_unfolded("shared-thought#output"));
     assert!(inspect(runtime).contains("Distinct child reasoning"));
     drop(app.handle_chat_ui(Action::Toggle(target, "shared-thought".into())));
-    drop(app.handle_chat_ui(Action::Unfold(target, "shared-thought#output".into())));
+    drop(app.handle_chat_ui(Action::Unfold(
+        target,
+        "shared-thought".into(),
+        "output".into(),
+    )));
     drop(app.handle_chat_ui(Action::SelectSubagent(target, None)));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     let runtime = app.chat_runtime_mut(target).unwrap();
@@ -1188,9 +1204,13 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
             );
         }
         assert_eq!(messages.len(), 1);
-        assert!(
-            matches!(&messages[0], Message::ChatUi(Action::Copy(target, id, CopyPart::Text) | Action::CopyMessage(target, id, _)) if *target == runtime.target && id == &item.id)
-        );
+        assert!(match &messages[0] {
+            Message::ChatUi(Action::Copy(target, row, CopyPart::Text)) =>
+                *target == runtime.target && row.id == item.id,
+            Message::ChatUi(Action::CopyMessage(target, id, _)) =>
+                *target == runtime.target && id == &item.id,
+            _ => false,
+        });
         let after = element
             .as_widget_mut()
             .layout(&mut tree, &renderer, &limits);
@@ -5580,7 +5600,7 @@ fn reasoning_disclosure_preserves_keyboard_focus_across_retained_toggles() {
         let id = toggles
             .next()
             .expect("Enter toggles the focused disclosure");
-        assert_eq!(id, "keyboard-thought");
+        assert_eq!(id.id, "keyboard-thought");
         assert!(toggles.next().is_none(), "one key emits one toggle");
         drop(app.handle_chat_ui(Action::Toggle(target, id)));
         assert_eq!(
@@ -5901,18 +5921,21 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             let toggled = dispatch(event(row.clone(), A11yAction::Click));
             assert_eq!(toggled.len(), 1);
             assert!(
-                matches!(&toggled[0], Message::ChatUi(Action::Toggle(actual, id))
-                if *actual == runtime.target && id == &item.id)
+                matches!(&toggled[0], Message::ChatUi(Action::Toggle(actual, row))
+                if *actual == runtime.target && row.id == item.id)
             );
             let Some(copy) = copy else {
                 continue;
             };
             let copied = dispatch(event(copy.clone(), A11yAction::Click));
             assert_eq!(copied.len(), 1);
-            assert!(
-                matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
-                if *actual == runtime.target && id == &item.id)
-            );
+            assert!(match &copied[0] {
+                Message::ChatUi(Action::Copy(actual, row, CopyPart::Text)) =>
+                    *actual == runtime.target && row.id == item.id,
+                Message::ChatUi(Action::CopyMessage(actual, id, _)) =>
+                    *actual == runtime.target && id == &item.id,
+                _ => false,
+            });
             assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
             // Keep the actual widget state mounted through diff. AT focus
             // makes the hover control keyboard-visible without a pointer.
@@ -5943,10 +5966,13 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             assert!(dispatch(event(row, A11yAction::Blur)).is_empty());
             let copied = dispatch(enter.clone());
             assert_eq!(copied.len(), 1);
-            assert!(
-                matches!(&copied[0], Message::ChatUi(Action::Copy(actual, id, CopyPart::Text) | Action::CopyMessage(actual, id, _))
-                if *actual == runtime.target && id == &item.id)
-            );
+            assert!(match &copied[0] {
+                Message::ChatUi(Action::Copy(actual, row, CopyPart::Text)) =>
+                    *actual == runtime.target && row.id == item.id,
+                Message::ChatUi(Action::CopyMessage(actual, id, _)) =>
+                    *actual == runtime.target && id == &item.id,
+                _ => false,
+            });
             assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());
             assert!(
                 dispatch(enter).is_empty(),
@@ -8126,7 +8152,7 @@ fn copy_web_search_native(select_all: bool) {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.cards
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     let runtime = app.chat_runtime_mut(target).unwrap();
     let key = runtime.turns[0].key.clone();
@@ -8280,7 +8306,7 @@ fn actual_web_search_find_indexes_visible_result_snippet() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     app.cards
         .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
-    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
     drop(find_navigation::find_for_test(
         &mut app,

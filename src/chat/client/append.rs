@@ -97,12 +97,28 @@ impl Lineage {
             if previous.is_empty() {
                 return;
             }
-            let previous: std::collections::HashMap<&str, &Arc<Item>> = previous
-                .iter()
-                .map(|item| (item.id.as_str(), item))
-                .collect();
+            let mut ambiguous = std::collections::HashSet::new();
+            let mut old_by_id = std::collections::HashMap::new();
+            for item in previous {
+                if old_by_id.insert(item.id.as_str(), item).is_some() {
+                    ambiguous.insert(item.id.as_str());
+                }
+            }
+            let mut seen = std::collections::HashSet::new();
+            for item in next.iter() {
+                if !seen.insert(item.id.as_str()) {
+                    ambiguous.insert(item.id.as_str());
+                }
+            }
+            // Equal text and display IDs still cannot authorize sharing a
+            // resident allocation between two distinct transcript rows.
+            let ambiguous: std::collections::HashSet<String> =
+                ambiguous.into_iter().map(str::to_owned).collect();
             for item in next {
-                let Some(old) = previous.get(item.id.as_str()) else {
+                if ambiguous.contains(item.id.as_str()) {
+                    continue;
+                }
+                let Some(old) = old_by_id.get(item.id.as_str()) else {
                     continue;
                 };
                 if Arc::ptr_eq(old, item) {
@@ -167,6 +183,20 @@ mod tests {
             at: None,
             started_at: None,
         })
+    }
+    #[test]
+    fn full_refresh_keeps_same_id_rows_separate_even_when_their_text_matches() {
+        let previous = Snapshot {
+            items: vec![text("same text")],
+            ..Snapshot::default()
+        };
+        let mut next = Snapshot {
+            items: vec![text("same text"), text("same text")],
+            ..Snapshot::default()
+        };
+        Lineage::default().adopt(&previous, &mut next);
+        assert!(!Arc::ptr_eq(&next.items[0], &next.items[1]));
+        assert!(!Arc::ptr_eq(&previous.items[0], &next.items[0]));
     }
     #[test]
     fn coalesced_append_proof_drops_bodies_and_refuses_rewrites() {

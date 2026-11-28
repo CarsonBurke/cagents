@@ -518,8 +518,6 @@ pub(super) struct MessageRun {
     each: Vec<(String, RowStatus)>,
     /// The whole of the words they share, for the tooltip and to copy.
     full: Option<String>,
-    /// The first message, whose words copying takes when they share them.
-    first: String,
 }
 
 /// One agent a run of messages went to: every name a send to it went by,
@@ -595,7 +593,6 @@ impl MessageRun {
         let mut agents: Vec<Agent> = Vec::new();
         let mut states = Vec::new();
         let mut each = Vec::new();
-        let mut first = None;
         // How many agents the messages reached between them, and whether
         // one went to every teammate, which is more than this can count.
         let (mut reached, mut everyone) = (0, false);
@@ -604,7 +601,6 @@ impl MessageRun {
             let Kind::Message(message) = &reading.kind else {
                 return None;
             };
-            first.get_or_insert_with(|| item.id.clone());
             let (status, output) = reported(item, coordinated);
             let state = message_state(reading, message, status, output);
             each.push((recipient(message, reading, listed).plain(), state.clone()));
@@ -691,7 +687,6 @@ impl MessageRun {
             state: rollup(states),
             each,
             full,
-            first: first?,
         })
     }
 
@@ -1407,7 +1402,7 @@ fn run_status(run: &Run) -> RowStatus {
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct RowCommand<'a> {
     target: Target,
-    id: &'a str,
+    row: &'a RowTarget,
     copy: bool,
 }
 
@@ -1415,11 +1410,10 @@ impl widget::menu::Action for RowCommand<'_> {
     type Message = Message;
 
     fn message(&self) -> Message {
-        let id = self.id.to_owned();
         action(if self.copy {
-            Action::Copy(self.target, id, CopyPart::Text)
+            Action::Copy(self.target, self.row.clone(), CopyPart::Text)
         } else {
-            Action::Toggle(self.target, id)
+            Action::Toggle(self.target, self.row.clone())
         })
     }
 }
@@ -1430,7 +1424,7 @@ impl widget::menu::Action for RowCommand<'_> {
 struct RunCommand<'a> {
     target: Target,
     key: &'a str,
-    first: &'a str,
+    first: &'a RowTarget,
     copy: bool,
 }
 
@@ -1439,7 +1433,7 @@ impl widget::menu::Action for RunCommand<'_> {
 
     fn message(&self) -> Message {
         action(if self.copy {
-            Action::Copy(self.target, self.first.to_owned(), CopyPart::Text)
+            Action::Copy(self.target, self.first.clone(), CopyPart::Text)
         } else {
             Action::ToggleTurn(self.target, self.key.to_owned())
         })
@@ -1996,7 +1990,7 @@ impl Runtime {
             .unwrap_or_else(|| disclosure::item_duration_ms(item, self.source_now_ms()))
             .and_then(disclosure::shown_duration);
         let content = row_content(row.glyph, words, &row.state, elapsed);
-        let open_tool = self.item_expanded(&item.id);
+        let open_tool = self.row_expanded(item);
         // The detail holds what was said and reported in full, then the
         // command or tool call that carried it.
         let source = if open_tool {
@@ -2004,11 +1998,12 @@ impl Runtime {
         } else {
             "Show details"
         };
-        let (target, id, copy) = (self.target, item.id.clone(), row.copy);
+        let owner = self.row_target(item);
+        let (target, menu_owner, copy) = (self.target, owner.clone(), row.copy);
         let menu = move || {
             let command = |copy| RowCommand {
                 target,
-                id: &id,
+                row: &menu_owner,
                 copy,
             };
             widget::menu::items(
@@ -2034,7 +2029,7 @@ impl Runtime {
         let opens = row.open.is_some();
         let pressed = row
             .open
-            .unwrap_or_else(|| Action::Toggle(self.target, item.id.clone()));
+            .unwrap_or_else(|| Action::Toggle(self.target, self.row_target(item)));
         let mut button = widget::button::custom(content)
             .name(name)
             .class(crate::ui_controls::control_style(false, None))
@@ -2068,7 +2063,7 @@ impl Runtime {
         } else {
             tipped(button)
         };
-        crate::interaction::context_menu_lazy(row, menu)
+        crate::ui_controls::owned(owner, crate::interaction::context_menu_lazy(row, menu))
     }
 
     /// The row a group of messages folds into: how many went to whom, the
@@ -2089,7 +2084,10 @@ impl Runtime {
             .iter()
             .map(|placed| {
                 let item = items.get(placed.index)?;
-                Some((&**item, cache.get(&item.id)?.coordination.as_deref()?))
+                Some((
+                    &**item,
+                    cache.get(self.cache_key(item))?.coordination.as_deref()?,
+                ))
             })
             .collect::<Option<Vec<_>>>()?;
         let run = MessageRun::of(sent, &|id| self.listed_agent_name(id))?;
@@ -2134,8 +2132,8 @@ impl Runtime {
         let row = crate::interaction::tooltip(button, run.tip());
         // As each message's row does: copy the words they share, and show
         // or hide the messages.
-        let (target, key, first, shared) =
-            (self.target, turn.key.clone(), run.first, run.full.is_some());
+        let first = self.row_target(items.get(turn.steps.first()?.index)?);
+        let (target, key, shared) = (self.target, turn.key.clone(), run.full.is_some());
         let shows = if open {
             "Hide messages"
         } else {
@@ -2329,7 +2327,7 @@ impl Runtime {
         settings: markdown::Settings,
         surface: fn(&cosmic::Theme) -> iced::Color,
     ) -> Element<'static, Message> {
-        let key = format!("{}#{part}", item.id);
+        let key = self.fold_key(item, part);
         let open = self.part_unfolded(&key);
         let label = if open { "Show less" } else { unfold }.to_owned();
         let toggle = disclosure::row(
@@ -2339,7 +2337,11 @@ impl Runtime {
             None,
             None,
             Some(open),
-            Some(Action::Unfold(self.target, key)),
+            Some(Action::Unfold(
+                self.target,
+                self.row_target(item),
+                part.to_owned(),
+            )),
         );
         fold::fold(
             prose::content_view(cached, content, settings, self.target, self.find.as_deref()),

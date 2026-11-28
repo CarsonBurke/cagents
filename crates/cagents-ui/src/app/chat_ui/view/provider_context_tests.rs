@@ -344,9 +344,9 @@ fn provider_context_closed_widget_and_catalog_preserve_literal_body() {
                     .is_none(),
                 "collapsed User notice details stay out of selection"
             );
-            drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+            drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
         }
-        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
         assert!(
             !app.chat_runtime_mut(target)
                 .unwrap()

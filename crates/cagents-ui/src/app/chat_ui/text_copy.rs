@@ -27,6 +27,7 @@ pub(super) enum CopyKey {
     Item(String),
     /// The Copy on one block of a step: its input, its output or a change.
     Block(String, CopyPart),
+    Row(RowTarget, CopyPart),
     /// A failure card's Copy details.
     Failure(String),
 }
@@ -49,11 +50,13 @@ impl CopyKey {
         }
     }
 
-    /// The item whose control this is, or "" for a failure card's.
-    pub(super) fn item(&self) -> &str {
+    fn owns_item(&self, runtime: &Runtime, item: &chat::Item) -> bool {
         match self {
-            Self::Item(id) | Self::Block(id, _) => id,
-            Self::Failure(_) => "",
+            Self::Row(row, _) => row.is(item, runtime.selected_subagent.as_deref()),
+            Self::Item(id) | Self::Block(id, _) => {
+                id == &item.id && !runtime.colliding_row_ids.contains(id)
+            }
+            Self::Failure(_) => false,
         }
     }
 }
@@ -157,8 +160,43 @@ impl Runtime {
     }
 
     /// What the Copy for item `id`, or for its `part`, shows.
+    #[cfg(test)]
     pub(super) fn copy_state(&self, id: &str, part: Option<&CopyPart>) -> CopyState {
         self.copy_state_where(|key| key.is(id, part))
+    }
+
+    pub(super) fn row_copy_state(&self, item: &chat::Item, part: Option<&CopyPart>) -> CopyState {
+        self.copy_state_where(|key| {
+            key.owns_item(self, item)
+                && match key {
+                    CopyKey::Row(_, copied) => copied == part.unwrap_or(&CopyPart::Text),
+                    _ => key.is(&item.id, part),
+                }
+        })
+    }
+
+    pub(super) fn row_copy_feedback(&self, item: &chat::Item) -> Option<&CopyFeedback> {
+        self.copy_feedback
+            .as_ref()
+            .filter(|feedback| feedback.key.owns_item(self, item))
+    }
+
+    fn deferred_copy_key(
+        &self,
+        id: String,
+        part: Option<&CopyPart>,
+        source: Option<&chat::TextCopySource>,
+    ) -> CopyKey {
+        if self.colliding_row_ids.contains(&id)
+            && let Some(item) = source.and_then(|source| item_with_source(&self.snapshot, source))
+            && item.id == id
+        {
+            return CopyKey::Row(
+                self.row_target(item),
+                part.cloned().unwrap_or(CopyPart::Text),
+            );
+        }
+        CopyKey::of(id, part)
     }
 
     /// What failure `key`'s Copy details shows.
@@ -596,7 +634,7 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
-        let key = CopyKey::of(id.clone(), part.as_ref());
+        let key = runtime.deferred_copy_key(id.clone(), part.as_ref(), source.as_ref());
         let Some(source) = source.filter(|source| runtime.contains_copy_source(source)) else {
             return runtime.tell_copy(key, Some(UNAVAILABLE.into()));
         };
@@ -667,7 +705,8 @@ impl Cagents {
         let refused = result
             .as_ref()
             .is_err_and(|error| error == chat::TEXT_COPY_CHANGED);
-        let key = CopyKey::of(id.clone(), request.part.as_ref());
+        let key =
+            runtime.deferred_copy_key(id.clone(), request.part.as_ref(), Some(&request.source));
         if refused || !request.snapshot_is_current(&current_snapshot) {
             // It may have been accepted once, before its write found the
             // source changed.

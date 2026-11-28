@@ -930,8 +930,10 @@ fn raw_stamp(runtime: &Runtime) -> RawStamp {
                         .into_iter()
                         .filter_map(|(index, _)| items.get(index))
                         .map(|item| {
-                            let cached =
-                                runtime.presentation_cache().get(&item.id).filter(|cached| {
+                            let cached = runtime
+                                .presentation_cache()
+                                .get(runtime.cache_key(item))
+                                .filter(|cached| {
                                     cached
                                         .item
                                         .as_ref()
@@ -1855,12 +1857,15 @@ fn capture_raw(runtime: &Runtime) -> RawInput {
                     .into_iter()
                     .filter_map(|(index, raw_disclosure)| {
                         let item = all.get(index)?.clone();
-                        let cached = runtime.presentation_cache().get(&item.id).filter(|cached| {
-                            cached
-                                .item
-                                .as_ref()
-                                .is_some_and(|shown| Arc::ptr_eq(shown, &item))
-                        });
+                        let cached = runtime
+                            .presentation_cache()
+                            .get(runtime.cache_key(&item))
+                            .filter(|cached| {
+                                cached
+                                    .item
+                                    .as_ref()
+                                    .is_some_and(|shown| Arc::ptr_eq(shown, &item))
+                            });
                         let mut tools: Vec<_> = tools(cached)
                             .map(|tool| (tool.find_identity(), tool.text.clone()))
                             .collect();
@@ -1961,7 +1966,7 @@ fn small_raw_work(runtime: &Runtime) -> bool {
                     .saturating_mul(8),
             );
         }
-        let cached = runtime.presentation_cache().get(&item.id);
+        let cached = runtime.presentation_cache().get(runtime.cache_key(item));
         for tool in tools(cached) {
             work = work.saturating_add(tool.text.len()).saturating_add(query);
         }
