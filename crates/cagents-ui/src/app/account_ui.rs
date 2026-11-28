@@ -128,6 +128,9 @@ pub(super) struct State {
     /// function of the state and a test can state the time.
     now_ms: Millis,
     popover: Option<AccountId>,
+    /// Whether the open popover or menu has just answered an Escape on its
+    /// own surface, so the key reaching the window after is spent.
+    pub(super) escape_answered: bool,
     cache: Option<Cache>,
     logins: Vec<Login>,
     /// Set before asynchronous CLI discovery/home creation, not after it.
@@ -360,6 +363,7 @@ impl State {
             remote_system_homes: BTreeMap::new(),
             now_ms: now_ms(),
             popover: None,
+            escape_answered: false,
             cache,
             logins: Vec::new(),
             browser_preparing: false,
@@ -1030,6 +1034,11 @@ impl LoginConflict {
     }
 }
 
+/// A provider's status bar chip, which opens its usage popover.
+pub(super) fn chip_id(provider: Provider) -> widget::Id {
+    widget::Id::new(format!("account.chip.{provider:?}"))
+}
+
 /// One admitted probe, separate from the home/login row's owner. Its private
 /// allocation stays alive in every delayed or duplicate callback, so a later
 /// admission cannot reissue its identity. This never crosses a wire or cache.
@@ -1490,6 +1499,11 @@ pub enum Action {
     /// Opens the popover for an account, or closes it with `None` or by
     /// naming the account whose popover is already open.
     Popover(Option<AccountId>),
+    /// Escape closed the open popover or menu: focus goes back to `opener`.
+    Dismiss(widget::Id),
+    /// Escape on the open popover's or menu's own surface: it withdraws the
+    /// question the popover asks, else dismisses it back to `opener`.
+    Escape(widget::Id),
     /// Include a stable usage row in this provider's status-bar preview.
     PreviewRow {
         id: AccountId,
@@ -3363,6 +3377,21 @@ impl Cagents {
     /// The account popups' share of a key event, like the chrome's popups:
     /// a dialog opening closes them, and Escape closes them before anything
     /// behind.
+    /// The control the open account popover or menu returns the keyboard
+    /// to, when one is open.
+    fn account_escape_opener(&self) -> Option<widget::Id> {
+        let state = &self.account_ui;
+        if let Some(id) = &state.popover {
+            return state
+                .account(id)
+                .map(|account| chip_id(account.account.provider));
+        }
+        if state.table.add_menu {
+            return Some(table::add_id());
+        }
+        state.table.menu.as_ref().map(table::menu_id)
+    }
+
     pub(super) fn account_key_event(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
         if self.modal_is_open() {
             for state in &mut self.account_ui.accounts {
@@ -3377,10 +3406,13 @@ impl Cagents {
             self.account_ui.table.close_popups();
             return None;
         }
+        // The popover and menus answer Escape on their own surfaces; this
+        // answers it while they are not drawn, and for a rename.
         is_escape_press(event).then(|| {
-            if self.account_ui.popover.take().is_none() {
-                self.account_ui.table.escape();
+            if let Some(opener) = self.account_escape_opener() {
+                return self.update_account_ui(Action::Dismiss(opener));
             }
+            self.account_ui.table.escape();
             Task::none()
         })
     }
@@ -4363,6 +4395,26 @@ impl Cagents {
                             .await;
                 })
                 .discard()
+            }
+            Action::Escape(opener) => {
+                self.account_ui.escape_answered = true;
+                if self.account_forget_asked() {
+                    return self.update_account_ui(Action::RemoveCancel);
+                }
+                if let Some(id) = self.usage_reset_asked(true) {
+                    return self.update_account_ui(Action::ResetCancel(id));
+                }
+                self.update_account_ui(Action::Dismiss(opener))
+            }
+            Action::Dismiss(opener) => {
+                let open = self.account_ui.popover.take().is_some()
+                    | std::mem::take(&mut self.account_ui.table.add_menu)
+                    | self.account_ui.table.menu.take().is_some();
+                self.account_ui.table.confirm_remove = None;
+                if !open {
+                    return Task::none();
+                }
+                crate::ui_controls::return_focus(opener).map(cosmic::Action::App)
             }
             Action::Popover(id) => {
                 let id = id.filter(|id| self.account_ui.popover.as_ref() != Some(id));
@@ -6996,6 +7048,7 @@ impl Cagents {
                 .align_y(Alignment::Center),
         )
         .name(summary.tooltip.plain())
+        .id(chip_id(provider))
         .selected(open)
         .class(crate::ui_controls::control_style(open, None))
         .height(CHIP_HEIGHT)
@@ -7017,7 +7070,11 @@ impl Cagents {
                 self.account_popover_body(provider, sections)
             }),
             widget::popover::Position::Top,
-            Message::AccountUi(Action::Popover(None)),
+            crate::ui_controls::Close::new(
+                Message::AccountUi(Action::Popover(None)),
+                chip_id(provider),
+                |opener| Message::AccountUi(Action::Escape(opener)),
+            ),
         ))
     }
 
@@ -9232,6 +9289,22 @@ mod tests {
                 .is_none()
                 .then(|| Account::system(Provider::Claude).id())
         );
+    }
+
+    /// Escape returns the keyboard to the control that opened the account
+    /// menu; with none open, it leaves the keyboard alone.
+    #[test]
+    fn dismissing_an_account_menu_returns_to_its_control() {
+        use crate::app::tests::task_focuses;
+        let mut app = context_inspector_test_app(false);
+        app.account_ui.table.add_menu = true;
+        assert_eq!(app.account_escape_opener(), Some(table::add_id()));
+        let task = app.update_account_ui(Action::Dismiss(table::add_id()));
+        assert!(!app.account_ui.table.add_menu);
+        assert_eq!(task_focuses(task, &table::add_id()), (true, false));
+        assert_eq!(app.account_escape_opener(), None);
+        let task = app.update_account_ui(Action::Dismiss(table::add_id()));
+        assert_eq!(task_focuses(task, &table::add_id()), (false, true));
     }
 }
 

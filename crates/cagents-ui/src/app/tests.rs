@@ -16639,3 +16639,70 @@ fn a_stage_refused_for_conflict_markers_asks_before_marking_resolved() {
         Some(MutationKind::Stage)
     );
 }
+
+/// Whether `task` asks for the keyboard to go to `control`.
+///
+/// Focus is a widget operation, not a message. Each operation the task
+/// issues is shown two controls the way a widget tree would show them:
+/// the one asked about, and another that holds the keyboard.
+pub(in crate::app) fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+    task_focuses_from(task, control, &widget::Id::new("the control in use"))
+}
+
+/// Whether `task` focuses `control` while `holder` has the keyboard, and
+/// whether `holder` still has it after, following chained operations.
+pub(in crate::app) fn task_focuses_from(
+    task: Task<Message>,
+    control: &widget::Id,
+    elsewhere: &widget::Id,
+) -> (bool, bool) {
+    use cosmic::iced::advanced::widget::operation::Focusable;
+    use cosmic::iced::futures::StreamExt;
+
+    struct Control(bool);
+    impl Focusable for Control {
+        fn is_focused(&self) -> bool {
+            self.0
+        }
+        fn focus(&mut self) {
+            self.0 = true;
+        }
+        fn unfocus(&mut self) {
+            self.0 = false;
+        }
+    }
+
+    let mut asked = Control(false);
+    let mut holder = Control(true);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+            return;
+        };
+        // Whatever else the task carries may wait on a daemon that is not
+        // there. A focus operation is ready at once, so a short quiet
+        // spell means there is none still to come.
+        while let Ok(Some(action)) =
+            tokio::time::timeout(Duration::from_millis(250), stream.next()).await
+        {
+            if let cosmic::iced::runtime::Action::Widget(mut operation) = action {
+                loop {
+                    let bounds = cosmic::iced::Rectangle::default();
+                    operation.focusable(Some(control), bounds, &mut asked);
+                    operation.focusable(Some(elsewhere), bounds, &mut holder);
+                    match operation.finish() {
+                        cosmic::iced::advanced::widget::operation::Outcome::Chain(next) => {
+                            operation = next;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+        }
+    });
+    runtime.shutdown_background();
+    (asked.0, holder.0)
+}

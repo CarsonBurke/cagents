@@ -12454,3 +12454,32 @@ fn staged_hunks_unstage_and_a_new_file_stages_whole() {
         Some(HunkStaging::File(selection)) if selection.path.as_os_str() == "notes.txt"
     ));
 }
+
+/// Escape closes the toolbar's overflow back on its More control; a press
+/// outside leaves the keyboard alone.
+#[test]
+fn dismissing_the_toolbar_overflow_returns_to_its_control() {
+    use crate::ui_controls::focuses;
+    let directory = tempfile::tempdir().unwrap();
+    let mut runtime = RepositoryRuntime::new(RepositoryView {
+        project: ProjectId::new(),
+        repository: directory.path().into(),
+        worktree: directory.path().into(),
+        selected_file: None,
+    });
+    let card = CardId::new();
+    let more = toolbar_overflow_id(card);
+    drop(runtime.update(RepositoryAction::ToggleToolbarOverflow { card }));
+    assert!(runtime.toolbar_overflow_open);
+    let task = runtime.update(RepositoryAction::DismissToolbarOverflow {
+        card,
+        opener: more.clone(),
+    });
+    assert!(!runtime.toolbar_overflow_open);
+    assert!(focuses(task, &more));
+
+    drop(runtime.update(RepositoryAction::ToggleToolbarOverflow { card }));
+    let task = runtime.update(RepositoryAction::CloseToolbarOverflow { card });
+    assert!(!runtime.toolbar_overflow_open);
+    assert!(!focuses(task, &more));
+}

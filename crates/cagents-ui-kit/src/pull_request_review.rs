@@ -53,6 +53,8 @@ struct QuestionIds {
     discard_in_review: widget::Id,
     discard_in_composer: widget::Id,
     submit: widget::Id,
+    /// Review / Finish review, which opens the review popover.
+    review: widget::Id,
     /// The existing-checkout offer's answers, asked beneath the summary
     /// while the review popover may ask its own, and Check out pull
     /// request, which asks it.
@@ -69,6 +71,7 @@ impl Default for QuestionIds {
             discard_in_review: widget::Id::unique(),
             discard_in_composer: widget::Id::unique(),
             submit: widget::Id::unique(),
+            review: widget::Id::unique(),
             offer_dismiss: widget::Id::unique(),
             offer_confirm: widget::Id::unique(),
             checkout: widget::Id::unique(),

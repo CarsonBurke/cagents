@@ -48,7 +48,11 @@ pub enum Action {
     Event(ReviewEvent),
     /// Shows or hides the review submission popover.
     ToggleReview,
+    /// A press outside closed the review popover.
     CloseReview,
+    /// Escape or Cancel closed the review popover: focus goes back to the
+    /// control that opened it.
+    DismissReview(widget::Id),
     PrepareSubmit,
     CancelSubmit,
     ConfirmSubmit,
@@ -588,6 +592,13 @@ impl State {
                 self.discussion.discard_from_composer = false;
                 self.discussion.submit_error = None;
             }
+            Action::DismissReview(opener)
+                if self.discussion.review_open
+                    && (!self.discussion.submitting || !self.discussion.busy) =>
+            {
+                drop(self.update_discussion(Action::CloseReview));
+                return crate::ui_controls::return_focus(opener);
+            }
             Action::BeginFile(path) if self.drafting_file(&path) => {
                 // The file's draft is already open: take the reader back to it.
                 self.effects.push(Effect::RevealFileDiscussion);
@@ -969,6 +980,7 @@ impl State {
             Action::AcknowledgeUnknown
             | Action::ToggleReview
             | Action::CloseReview
+            | Action::DismissReview(_)
             | Action::CancelSubmit => {}
         }
         ActionTask::none()
@@ -1022,6 +1034,7 @@ impl State {
             cosmic::theme::Button::Standard
         })
         .padding([3, 10])
+        .id(self.question_ids.review.clone())
         .selected(self.discussion.review_open)
         .on_press_maybe(available.then_some(Action::ToggleReview));
         let tip = if !self.has_discussion_authority() {
@@ -1037,7 +1050,7 @@ impl State {
             anchor,
             popup,
             widget::popover::Position::Point(iced::Point::new(0.0, REVIEW_POPUP_OFFSET)),
-            Action::CloseReview,
+            self.review_close(),
         );
         element.map(|action| self.review_action(action))
     }
@@ -1231,7 +1244,8 @@ impl State {
                 }
             }
             rows.push(popup_actions(
-                crate::ui_controls::button::secondary("Cancel").on_press(Action::CloseReview),
+                crate::ui_controls::button::secondary("Cancel")
+                    .on_press(self.review_close().dismiss()),
                 crate::interaction::tooltip(
                     crate::ui_controls::button::primary("Submit review")
                         .instead("Saving…", self.discussion.busy)
@@ -1290,18 +1304,34 @@ impl State {
         }
     }
 
-    /// What Escape does to the review popover: answers its question with
-    /// the question's dismissal, and otherwise closes it.
+    /// How the review popover closes. Escape answers its question with the
+    /// question's dismissal, and otherwise closes it, back on the control
+    /// that opened it.
+    fn review_close(&self) -> crate::ui_controls::Close<Action> {
+        let question = self.review_question();
+        crate::ui_controls::Close::new(
+            Action::CloseReview,
+            self.question_ids.review.clone(),
+            |opener| match question {
+                Some(Question::DiscardPendingReview) => Action::CancelDiscard,
+                Some(_) => Action::CancelSubmit,
+                None => Action::DismissReview(opener),
+            },
+        )
+    }
+
+    /// What Escape does to the open review popover, as its surface answers
+    /// it: see [`Self::review_close`].
     pub fn review_escape(&self) -> Option<super::Action> {
-        if !self.discussion.review_open {
-            return None;
-        }
-        let action = match self.review_question() {
-            Some(Question::DiscardPendingReview) => Action::CancelDiscard,
-            Some(_) => Action::CancelSubmit,
-            None => Action::CloseReview,
-        };
-        Some(self.review_action(action))
+        self.discussion
+            .review_open
+            .then(|| self.review_action(self.review_close().dismiss()))
+    }
+
+    /// The control that opens the review popover, where Escape returns.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn review_control_id(&self) -> widget::Id {
+        self.question_ids.review.clone()
     }
 
     /// The controls that ask the review popover's questions: Discard pending
@@ -2932,6 +2962,27 @@ pub(crate) mod tests {
         }));
         assert_eq!(state.notice.as_deref(), Some("Pending review discarded."));
         assert!(!state.discussion.review_open, "back to the composer");
+    }
+
+    /// Escape or Cancel closes the review popover back on Review, the
+    /// control that opened it; a press outside leaves the keyboard alone.
+    #[test]
+    fn dismissing_the_review_returns_to_its_control() {
+        use crate::ui_controls::focuses;
+        let mut state = ready();
+        let review = state.question_ids.review.clone();
+        drop(state.update_discussion(Action::ToggleReview));
+        let dismiss = state.review_close().dismiss();
+        assert!(matches!(&dismiss, Action::DismissReview(to) if *to == review));
+        assert!(focuses(state.update_discussion(dismiss), &review));
+        assert!(!state.discussion.review_open);
+
+        drop(state.update_discussion(Action::ToggleReview));
+        assert!(!focuses(
+            state.update_discussion(Action::CloseReview),
+            &review
+        ));
+        assert!(!state.discussion.review_open);
     }
 
     #[test]

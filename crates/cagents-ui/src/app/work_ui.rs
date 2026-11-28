@@ -31,6 +31,9 @@ impl Cagents {
             return Task::none();
         };
         match effect {
+            Effect::Focus(opener) => {
+                crate::ui_controls::return_focus(opener).map(cosmic::Action::App)
+            }
             Effect::Refresh => control(
                 transport::Purpose::Read,
                 |client| client.refresh_work_board(),

@@ -97,6 +97,19 @@ impl Table {
     }
 }
 
+/// Add account, which opens the menu of ways to add one.
+pub(in crate::app) fn add_id() -> widget::Id {
+    widget::Id::new("accounts.add")
+}
+
+/// An account row's actions control.
+pub(in crate::app) fn menu_id(account: &AccountId) -> widget::Id {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    account.hash(&mut hasher);
+    widget::Id::new(format!("accounts.menu.{:016x}", hasher.finish()))
+}
+
 pub(in crate::app) fn rename_id() -> widget::Id {
     widget::Id::new("accounts.rename")
 }
@@ -513,6 +526,7 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
             .align_y(Alignment::Center),
     )
     .name("Add account")
+    .id(add_id())
     .selected(state.table.add_menu)
     .class(cosmic::theme::Button::Suggested)
     .padding([space::XS, space::M])
@@ -532,7 +546,11 @@ fn toolbar<'a>(state: &'a State, layout: &Layout, browser_busy: bool) -> Element
                 add_button,
                 state.table.add_menu.then(|| add_menu(state, browser_busy)),
                 widget::popover::Position::Bottom,
-                action(Action::AddMenu(false)),
+                crate::ui_controls::Close::new(
+                    action(Action::AddMenu(false)),
+                    add_id(),
+                    |opener| action(Action::Escape(opener)),
+                ),
             )
         });
     let (title, caption) = match crate::device::selected() {
@@ -1441,6 +1459,7 @@ fn actions<'a>(
     let removing = state.removing.contains(&account.id);
     let menu_button = crate::ui_controls::icon_button(Icon::More, "Account actions")
         .compact()
+        .id(menu_id(&account.id))
         .on_press_maybe(
             (!removing).then(|| Message::AccountUi(Action::Menu(Some(account.id.clone())))),
         );
@@ -1456,7 +1475,11 @@ fn actions<'a>(
             menu_button,
             open.then(|| menu(app, account, project)),
             widget::popover::Position::Bottom,
-            Message::AccountUi(Action::Menu(None)),
+            crate::ui_controls::Close::new(
+                Message::AccountUi(Action::Menu(None)),
+                menu_id(&account.id),
+                |opener| Message::AccountUi(Action::Escape(opener)),
+            ),
         )
     };
     let first: Element<'a, Message> = if removing {
@@ -2436,6 +2459,78 @@ pub(in crate::app) mod tests {
     pub(in crate::app) fn open_menu(app: &Cagents) -> Option<Element<'_, Message>> {
         let id = app.account_ui.table.menu.as_ref()?;
         Some(menu(app, app.account_ui.account(id)?, None))
+    }
+
+    /// Escape in an open account menu, as the window delivers it: first to
+    /// the menu's surface, whose messages are handled before the window's
+    /// key subscription hears the same key, captured. `focus` focuses the
+    /// rendered control with that id first.
+    fn escape_through_the_menu(app: &mut Cagents, account: &AccountId, focus: Option<widget::Id>) {
+        use iced::advanced::{clipboard, widget::operation};
+        use iced::runtime::{UserInterface, user_interface::Cache};
+        use iced::{Event, Point, Size, mouse};
+
+        let mut renderer = crate::app::tests::headless_renderer();
+        let messages = {
+            let state = app.account_ui.account(account).unwrap();
+            let element = actions(app, state, app.account_ui.now_ms, None);
+            let mut ui = UserInterface::build(
+                element,
+                Size::new(700.0, 600.0),
+                Cache::new(),
+                &mut renderer,
+            );
+            if let Some(focus) = focus {
+                ui.operate(&renderer, &mut operation::focusable::focus(focus));
+            }
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Keyboard(crate::app::dialog_ui::tests::key_press(
+                    keyboard::key::Named::Escape,
+                ))],
+                mouse::Cursor::Available(Point::new(690.0, 590.0)),
+                &mut renderer,
+                &mut clipboard::Null,
+                &mut messages,
+            );
+            messages
+        };
+        assert!(!messages.is_empty(), "the menu's surface answers Escape");
+        for message in messages {
+            drop(app.update(message));
+        }
+        drop(app.update(Message::KeyEvent {
+            event: crate::app::dialog_ui::tests::key_press(keyboard::key::Named::Escape),
+            captured: true,
+        }));
+    }
+
+    /// One Escape answers one thing. In a menu asking whether to forget a
+    /// home, it withdraws the question and leaves the menu open; in a menu
+    /// open over a rename, it closes the menu and leaves the rename.
+    #[test]
+    fn one_escape_in_an_account_menu_answers_only_the_innermost_thing() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (account, _home) = linked_home(&mut app);
+        drop(app.update(Message::AccountUi(Action::Menu(Some(account.clone())))));
+        drop(app.update(Message::AccountUi(Action::Remove(account.clone()))));
+        assert!(app.account_forget_asked());
+        escape_through_the_menu(&mut app, &account, Some(forget_cancel_id(&account)));
+        assert!(!app.account_forget_asked(), "the question is withdrawn");
+        assert_eq!(
+            app.account_ui.table.menu.as_ref(),
+            Some(&account),
+            "its menu stays open"
+        );
+
+        app.account_ui.table.rename = Some((account.clone(), "Work".into()));
+        escape_through_the_menu(&mut app, &account, None);
+        assert_eq!(app.account_ui.table.menu, None, "the menu closes");
+        assert!(
+            app.account_ui.table.rename.is_some(),
+            "and the rename beneath it carries on"
+        );
+        assert!(!app.account_ui.escape_answered, "the key is spent once");
     }
 
     #[test]

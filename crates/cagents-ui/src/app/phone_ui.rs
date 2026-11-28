@@ -32,9 +32,15 @@ fn scroll_id() -> widget::Id {
     widget::Id::new("phone-popover-scroll")
 }
 
+/// The status bar's phone control.
+pub(super) const CONTROL_ID: &str = "phone.control";
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Menu(bool),
+    /// Escape closed the popover: focus goes back to `opener`, unless the
+    /// popover opened by itself and never had the keyboard.
+    Dismiss(widget::Id),
     Tick,
     Probed(Box<host::Status>),
     Pair,
@@ -69,6 +75,9 @@ struct Pairing {
 #[derive(Default)]
 pub(super) struct State {
     pub open: bool,
+    /// Whether the popover opened by itself, for a pairing that arrived,
+    /// and so never took the keyboard from anywhere.
+    opened_itself: bool,
     status: Option<host::Status>,
     probing: bool,
     probed_at: Option<Instant>,
@@ -166,9 +175,21 @@ impl Cagents {
 
     pub(super) fn update_phone(&mut self, action: Action) -> Task<Message> {
         match action {
+            Action::Dismiss(opener) => {
+                let returns = self.phone_ui.open && !self.phone_ui.opened_itself;
+                let task = self.update_phone(Action::Menu(false));
+                if !returns {
+                    return task;
+                }
+                Task::batch([
+                    task,
+                    crate::ui_controls::return_focus(opener).map(cosmic::Action::App),
+                ])
+            }
             Action::Menu(open) => {
                 let open = open && self.settings.show_status_bar && !self.modal_is_open();
                 self.phone_ui.open = open;
+                self.phone_ui.opened_itself = false;
                 if open {
                     self.device_ui.menu_open = false;
                     self.dismiss_chat_picker();
@@ -322,6 +343,7 @@ impl Cagents {
                     // The person is looking at the phone; bring the question
                     // to them.
                     tasks.push(self.update_phone(Action::Menu(true)));
+                    self.phone_ui.opened_itself = self.phone_ui.open;
                 }
                 Task::batch(tasks)
             }
@@ -484,6 +506,7 @@ impl Cagents {
         };
         let mut control = crate::ui_controls::icon_button(Icon::Phone, label)
             .compact()
+            .id(widget::Id::new(CONTROL_ID))
             .selected(open)
             .on_press(Message::Phone(Action::Menu(!open)));
         if let Some(tone) = tone {
@@ -505,7 +528,20 @@ impl Cagents {
                 .into()
             }),
             widget::popover::Position::Top,
-            Message::Phone(Action::Menu(false)),
+            {
+                let close = crate::ui_controls::Close::new(
+                    Message::Phone(Action::Menu(false)),
+                    widget::Id::new(CONTROL_ID),
+                    |opener| Message::Phone(Action::Dismiss(opener)),
+                );
+                // Opened by itself, it never took the keyboard: Escape is
+                // still for wherever the reader is, such as a terminal.
+                if self.phone_ui.opened_itself {
+                    close.only_from_inside()
+                } else {
+                    close
+                }
+            },
         )
     }
 
@@ -1077,5 +1113,30 @@ mod tests {
         let mut stopped = network();
         stopped.listening = false;
         assert!(unreachable(&stopped));
+    }
+
+    /// Escape or Close returns the keyboard to the phone control that
+    /// opened the popover; a popover that opened by itself, for a pairing,
+    /// took the keyboard from nowhere and so moves it nowhere.
+    #[test]
+    fn dismissing_returns_to_the_control_unless_the_popover_opened_itself() {
+        use crate::app::tests::task_focuses;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let control = widget::Id::new(CONTROL_ID);
+        for opened_itself in [false, true] {
+            drop(app.update_phone(Action::Menu(true)));
+            assert!(app.phone_ui.open);
+            app.phone_ui.opened_itself = opened_itself;
+            let task = app.update_phone(Action::Dismiss(control.clone()));
+            assert!(!app.phone_ui.open);
+            assert_eq!(
+                task_focuses(task, &control),
+                (!opened_itself, opened_itself),
+                "opened itself: {opened_itself}"
+            );
+        }
+        drop(app.update_phone(Action::Menu(true)));
+        let task = app.update_phone(Action::Menu(false));
+        assert_eq!(task_focuses(task, &control), (false, true), "outside");
     }
 }

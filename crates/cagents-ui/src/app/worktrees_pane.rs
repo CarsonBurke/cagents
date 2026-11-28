@@ -18,6 +18,9 @@ impl Cagents {
             return Task::none();
         };
         match effect {
+            Effect::Focus(opener) => {
+                crate::ui_controls::return_focus(opener).map(cosmic::Action::App)
+            }
             Effect::Layout(layout) => self.update_work_ui(crate::work_ui::Action::Layout(layout)),
             Effect::Sidebar(action) => self.dispatch(Message::Sidebar(action)),
             Effect::FocusPane(card) => self.focus_attention_card(card),

@@ -11,19 +11,108 @@ use cosmic::{
 use super::control_style;
 use crate::design::{self, space};
 
+/// How an open popover closes, and where the keyboard goes when it does.
+///
+/// Escape, or a Close control in the popover, *dismisses* it with the
+/// message built from its opener: wherever keyboard focus was when it
+/// opened, usually the control that opened it. Its handler hands focus back
+/// there with [`return_focus`], so a keyboard reader keeps their place.
+///
+/// A press outside *closes* it with `outside`, and focus stays wherever that
+/// press put it: moving it to the opener would take the keyboard from a
+/// field the press had just focused.
+#[derive(Clone, Debug)]
+pub struct Close<Message> {
+    outside: Message,
+    dismiss: Message,
+    /// Whether Escape dismisses it wherever the keyboard is, rather than
+    /// only from inside it.
+    from_anywhere: bool,
+}
+
+impl<Message> Close<Message> {
+    /// Closes with `outside` on a press outside, and with `dismiss`, told
+    /// the `opener` to return focus to, on Escape.
+    pub fn new(
+        outside: Message,
+        opener: widget::Id,
+        dismiss: impl FnOnce(widget::Id) -> Message,
+    ) -> Self {
+        Self {
+            outside,
+            dismiss: dismiss(opener),
+            from_anywhere: true,
+        }
+    }
+
+    /// Answers Escape only while the keyboard is inside the popover, as
+    /// one that opened by itself must: the keyboard is still wherever the
+    /// reader was, such as a terminal whose program reads Escape.
+    #[must_use]
+    pub fn only_from_inside(mut self) -> Self {
+        self.from_anywhere = false;
+        self
+    }
+
+    /// The message a Close control in the popover sends: the one Escape
+    /// sends.
+    pub fn dismiss(&self) -> Message
+    where
+        Message: Clone,
+    {
+        self.dismiss.clone()
+    }
+}
+
+/// Focus `opener` again, as a dismissed popover's handler does: see
+/// [`Close`].
+pub fn return_focus<T>(opener: widget::Id) -> iced::Task<T> {
+    iced::widget::operation::focus(opener)
+}
+
+/// `content` answering Escape with `dismiss`, as a popover's surface does:
+/// first when the keyboard is inside it, before a focused field can take
+/// the key to blur itself, and otherwise when nothing in it claims the key.
+///
+/// A popover's surface is an overlay, so it sees the key before the window
+/// beneath, such as a terminal whose program reads Escape. While a dialog
+/// is open over it, the surface is not drawn, and the dialog answers.
+pub fn escape_dismisses<'a, Message: Clone + 'a>(
+    content: impl Into<Element<'a, Message>>,
+    dismiss: Message,
+) -> Element<'a, Message> {
+    let unclaimed = dismiss.clone();
+    crate::interaction::focused_escape(
+        crate::interaction::unclaimed_key(content, move |event| {
+            is_escape(event).then(|| unclaimed.clone())
+        }),
+        move || dismiss.clone(),
+    )
+}
+
+fn is_escape(event: &cosmic::iced::keyboard::Event) -> bool {
+    matches!(
+        event,
+        cosmic::iced::keyboard::Event::KeyPressed {
+            key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
+            ..
+        }
+    )
+}
+
 /// Shared anchored popup surface. COSMIC owns placement, outside-click dismissal
 /// and overlay hit testing; all application popovers share the same frame.
 pub fn popover<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     content: Option<Element<'a, Message>>,
     position: widget::popover::Position,
-    on_close: Message,
+    close: Close<Message>,
 ) -> Element<'a, Message> {
     framed(
         anchor,
         content,
         position,
-        on_close,
+        close,
         iced::Padding::new(space::XS),
         design::elevated(),
     )
@@ -42,25 +131,21 @@ pub fn popover_menu<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     items: Option<Vec<MenuItem<'a, Message>>>,
     position: widget::popover::Position,
-    on_close: Message,
+    close: Close<Message>,
 ) -> Element<'a, Message> {
-    let content = items.map(|items| menu_rows(items, on_close.clone()));
+    let content = items.map(menu_rows);
     framed(
         anchor,
         content,
         position,
-        on_close,
+        close,
         iced::Padding::new(design::BORDER_WIDTH),
         cosmic::theme::Container::custom(menu_surface),
     )
 }
 
-/// A [`popover_menu`]'s rows, sized as the native menu sizes them, with
-/// Escape sending `on_close`.
-pub fn menu_rows<'a, Message: Clone + 'static>(
-    items: Vec<MenuItem<'a, Message>>,
-    on_close: Message,
-) -> Element<'a, Message> {
+/// A [`popover_menu`]'s rows, sized as the native menu sizes them.
+pub fn menu_rows<'a, Message: 'a>(items: Vec<MenuItem<'a, Message>>) -> Element<'a, Message> {
     // As wide as the native menu sizes itself for its longest row.
     let width = items
         .iter()
@@ -68,22 +153,11 @@ pub fn menu_rows<'a, Message: Clone + 'static>(
         .fold(MENU_MIN_WIDTH, f32::max);
     // The native menu's column, which rounds the first and last rows'
     // highlight into the surface's corners.
-    let rows = widget::menu::menu_column::MenuColumn::from_vec(
+    widget::menu::menu_column::MenuColumn::from_vec(
         items.into_iter().map(|item| item.element).collect(),
     )
-    .width(Length::Fixed(width));
-    // Escape closes the menu, as it does the native one, before the
-    // surface beneath (a terminal's program, say) can take it.
-    crate::interaction::unclaimed_key(rows, move |event| {
-        matches!(
-            event,
-            cosmic::iced::keyboard::Event::KeyPressed {
-                key: cosmic::iced::keyboard::Key::Named(cosmic::iced::keyboard::key::Named::Escape),
-                ..
-            }
-        )
-        .then(|| on_close.clone())
-    })
+    .width(Length::Fixed(width))
+    .into()
 }
 
 /// The narrowest a native menu draws, and the widest it grows for its
@@ -177,13 +251,13 @@ pub fn scrolling_popover<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     content: Option<Element<'a, Message>>,
     position: widget::popover::Position,
-    on_close: Message,
+    close: Close<Message>,
 ) -> Element<'a, Message> {
     framed(
         anchor,
         content,
         position,
-        on_close,
+        close,
         iced::Padding {
             top: design::BORDER_WIDTH,
             bottom: design::BORDER_WIDTH,
@@ -245,20 +319,27 @@ fn framed<'a, Message: Clone + 'static>(
     anchor: impl Into<Element<'a, Message>>,
     content: Option<Element<'a, Message>>,
     position: widget::popover::Position,
-    on_close: Message,
+    close: Close<Message>,
     padding: iced::Padding,
     class: cosmic::theme::Container<'static>,
 ) -> Element<'a, Message> {
-    let mut popup = widget::popover(anchor)
-        .position(position)
-        .on_close(on_close);
+    let Close {
+        outside,
+        dismiss,
+        from_anywhere,
+    } = close;
+    let mut popup = widget::popover(anchor).position(position).on_close(outside);
     if let Some(content) = content {
         // iced masks the cursor beneath an overlay only when its surface
         // reports a mouse interaction. Include the frame's padding and inert
         // content, which otherwise report None and expose controls beneath.
-        popup = popup.popup(crate::interaction::opaque(
-            widget::container(content).padding(padding).class(class),
-        ));
+        let surface =
+            crate::interaction::opaque(widget::container(content).padding(padding).class(class));
+        popup = popup.popup(if from_anywhere {
+            escape_dismisses(surface, dismiss)
+        } else {
+            crate::interaction::focused_escape(surface, move || dismiss.clone())
+        });
     }
     popup.into()
 }
@@ -296,6 +377,47 @@ pub fn popover_item<'a, Message: Clone + 'a>(
     .on_press(on_press)
 }
 
+/// Whether `task` moves the keyboard to `control`, and off every other
+/// control, at once.
+#[cfg(test)]
+pub(crate) fn focuses<T>(task: iced::Task<T>, control: &widget::Id) -> bool {
+    use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
+    use cosmic::iced::futures::{FutureExt, StreamExt};
+
+    struct Control(bool);
+    impl Focusable for Control {
+        fn is_focused(&self) -> bool {
+            self.0
+        }
+        fn focus(&mut self) {
+            self.0 = true;
+        }
+        fn unfocus(&mut self) {
+            self.0 = false;
+        }
+    }
+
+    let Some(mut stream) = cosmic::iced::runtime::task::into_stream(task) else {
+        return false;
+    };
+    let (mut asked, mut other) = (Control(false), Control(true));
+    while let Some(Some(action)) = stream.next().now_or_never() {
+        let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+            continue;
+        };
+        loop {
+            let bounds = cosmic::iced::Rectangle::default();
+            operation.focusable(Some(control), bounds, &mut asked);
+            operation.focusable(Some(&widget::Id::new("elsewhere")), bounds, &mut other);
+            match operation.finish() {
+                Outcome::Chain(next) => operation = next,
+                _ => break,
+            }
+        }
+    }
+    asked.0 && !other.0
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,7 +444,7 @@ mod tests {
                             .height(anchor.height),
                         Some(iced::widget::Space::new().width(120).height(60).into()),
                         widget::popover::Position::Bottom,
-                        (),
+                        Close::new((), widget::Id::new("opener"), |_| ()),
                     ),
                 ])
                 .spacing(8),
@@ -386,7 +508,7 @@ mod tests {
                 base,
                 Some(iced::widget::Space::new().width(100).height(60).into()),
                 widget::popover::Position::Point(Point::new(40.0, 40.0)),
-                Action::Close,
+                Close::new(Action::Close, widget::Id::new("opener"), |_| Action::Close),
             );
             let mut ui = UserInterface::build(
                 element,
@@ -450,7 +572,7 @@ mod tests {
                 base,
                 Some(content.into()),
                 widget::popover::Position::Point(Point::new(40.0, 40.0)),
-                Action::Close,
+                Close::new(Action::Close, widget::Id::new("opener"), |_| Action::Close),
             );
             let mut ui = UserInterface::build(
                 element,
@@ -486,7 +608,7 @@ mod tests {
             iced::widget::Space::new().width(20).height(20),
             Some(iced::widget::Space::new().width(100).height(60).into()),
             widget::popover::Position::Bottom,
-            (),
+            Close::new((), widget::Id::new("opener"), |_| ()),
         );
         let mut ui = UserInterface::build(
             element,
@@ -505,5 +627,142 @@ mod tests {
             &mut messages,
         );
         assert_eq!(messages, vec![()]);
+    }
+
+    #[derive(Clone, Debug, PartialEq)]
+    enum Closed {
+        Outside,
+        Dismissed(widget::Id),
+        Typed,
+    }
+
+    fn escape() -> cosmic::iced::Event {
+        use cosmic::iced::keyboard;
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        cosmic::iced::Event::Keyboard(keyboard::Event::KeyPressed {
+            key: key.clone(),
+            modified_key: key,
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        })
+    }
+
+    /// The messages `events` raise in an open popover whose surface holds
+    /// a search field, focused when `focused`, over a base that takes keys.
+    fn closes(events: &[cosmic::iced::Event], focused: bool) -> Vec<Closed> {
+        closes_with(events, focused, true)
+    }
+
+    fn closes_with(
+        events: &[cosmic::iced::Event],
+        focused: bool,
+        from_anywhere: bool,
+    ) -> Vec<Closed> {
+        use cosmic::iced::advanced::clipboard;
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Point, Size, mouse};
+
+        let mut renderer = headless_renderer();
+        let field = widget::Id::new("popover.search");
+        // The opener, which, like a terminal beneath, reads every key.
+        let base = crate::interaction::unclaimed_key(
+            iced::widget::Space::new().width(20).height(20),
+            |_| Some(Closed::Typed),
+        );
+        let close = Close::new(
+            Closed::Outside,
+            widget::Id::new("opener"),
+            Closed::Dismissed,
+        );
+        let element = popover(
+            base,
+            Some(
+                widget::text_input("Search", "")
+                    .id(field.clone())
+                    .on_input(|_| Closed::Typed)
+                    .width(100)
+                    .into(),
+            ),
+            widget::popover::Position::Point(Point::new(40.0, 40.0)),
+            if from_anywhere {
+                close
+            } else {
+                close.only_from_inside()
+            },
+        );
+        let mut ui = UserInterface::build(
+            element,
+            Size::new(200.0, 200.0),
+            Cache::new(),
+            &mut renderer,
+        );
+        if focused {
+            let mut focus = cosmic::iced::advanced::widget::operation::focusable::focus(field);
+            ui.operate(&renderer, &mut focus);
+        }
+        let mut messages = Vec::new();
+        let _ = ui.update(
+            events,
+            mouse::Cursor::Available(Point::new(180.0, 160.0)),
+            &mut renderer,
+            &mut clipboard::Null,
+            &mut messages,
+        );
+        messages
+    }
+
+    /// Escape dismisses the popover, naming the opener to return to, from
+    /// wherever the keyboard is: before a focused field in it can take the
+    /// key to blur itself, and before the window beneath can read it.
+    #[test]
+    fn escape_dismisses_back_to_the_opener_before_the_field_or_window_takes_it() {
+        let dismissed = vec![Closed::Dismissed(widget::Id::new("opener"))];
+        assert_eq!(closes(&[escape()], false), dismissed, "nothing focused");
+        assert_eq!(closes(&[escape()], true), dismissed, "its field focused");
+    }
+
+    /// A popover that opened by itself answers Escape only from inside it,
+    /// leaving the key to the window the reader is still in.
+    #[test]
+    fn a_popover_open_by_itself_leaves_escape_outside_it_to_the_window() {
+        assert_eq!(
+            closes_with(&[escape()], false, false),
+            vec![Closed::Typed],
+            "the window beneath reads it"
+        );
+        assert_eq!(
+            closes_with(&[escape()], true, false),
+            vec![Closed::Dismissed(widget::Id::new("opener"))],
+            "from inside, it dismisses"
+        );
+    }
+
+    /// A press outside closes the popover without naming anywhere to
+    /// return to: focus stays where the press put it.
+    #[test]
+    fn a_press_outside_closes_without_returning_focus() {
+        use cosmic::iced::{Event, mouse};
+        assert_eq!(
+            closes(
+                &[Event::Mouse(mouse::Event::ButtonPressed(
+                    mouse::Button::Left
+                ))],
+                false
+            ),
+            vec![Closed::Outside]
+        );
+    }
+
+    /// The task a dismissal's handler returns focuses the opener.
+    #[test]
+    fn return_focus_focuses_the_opener() {
+        let opener = widget::Id::new("opener");
+        assert!(focuses(return_focus::<()>(opener.clone()), &opener));
+        assert!(!focuses(iced::Task::<()>::none(), &opener));
     }
 }

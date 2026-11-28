@@ -756,6 +756,12 @@ pub enum Action {
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     PermissionPicker(Target, bool),
+    /// Opens the permissions from the footer's blocked-permissions control,
+    /// or closes them.
+    ResolvePermissions(Target),
+    /// Escape or Close closed the open account, model or permission picker:
+    /// focus goes back to where it was when the picker opened.
+    DismissPicker(Target, widget::Id),
     ModelQuery(Target, String),
     /// Lists one provider's models in the open model picker, without
     /// choosing anything.
@@ -1154,6 +1160,8 @@ impl Action {
             Self::Scrolled(..) => "Scrolled",
             Self::ModelPicker(..) => "ModelPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
+            Self::ResolvePermissions(..) => "ResolvePermissions",
+            Self::DismissPicker(..) => "DismissPicker",
             Self::ModelQuery(..) => "ModelQuery",
             Self::ModelRail(..) => "ModelRail",
         }
@@ -1231,6 +1239,7 @@ impl Action {
                 | Self::Files(..)
                 | Self::Tick
                 | Self::AccountPicker(_, false)
+                | Self::DismissPicker(..)
                 // The dialog's own controls; a pane's viewer sits under a
                 // dialog like the rest of its pane.
                 | Self::CloseImage(images::ViewerHost::Dialog)
@@ -3937,6 +3946,10 @@ pub(super) struct Runtime {
     account_picker: bool,
     picker_focus: usize,
     picker_keyboard: bool,
+    /// Where the open picker returns the keyboard on Escape, when that is
+    /// not the picker's own control: the composer, for a picker opened from
+    /// it by shortcut or command, or the blocked-permissions control.
+    picker_opener: Option<widget::Id>,
     /// Messages the provider accepted, oldest first, for Up and Down in the
     /// composer to walk through the way a shell does.
     history: Vec<String>,
@@ -3987,6 +4000,12 @@ impl Drop for Runtime {
 
 /// The name the composer accepts for compaction where the provider offers it
 /// as a capability rather than as one of its listed commands.
+/// The composer status line's pickers' own controls, by role.
+pub(super) const ACCOUNT_PICKER_CONTROL: &str = "chat-account-picker";
+pub(super) const MODEL_PICKER_CONTROL: &str = "chat-model-picker";
+pub(super) const PERMISSION_PICKER_CONTROL: &str = "chat-permission-picker";
+/// The footer's control for permissions a conversation was refused.
+pub(super) const PERMISSION_RESOLVE_CONTROL: &str = "chat-permission-resolve";
 pub(super) const COMPACT_COMMAND: &str = "compact";
 /// The `+` menu's search field.
 pub(super) const COMPOSER_SEARCH: &str = "chat-actions-search";
@@ -5618,6 +5637,7 @@ impl Runtime {
             account_picker: false,
             picker_focus: 0,
             picker_keyboard: false,
+            picker_opener: None,
             history: Vec::new(),
             history_images: Vec::new(),
             history_cursor: None,
@@ -7827,6 +7847,44 @@ impl Runtime {
             || self.branch_picker
     }
 
+    /// How a picker opened from its own `control` closes: Escape returns
+    /// the keyboard to where it was when the picker opened, the control
+    /// unless a shortcut or command opened it from elsewhere, and a press
+    /// outside leaves it where the press put it.
+    pub(super) fn picker_close(
+        &self,
+        control: &str,
+        outside: Action,
+    ) -> crate::ui_controls::Close<Message> {
+        let target = self.target;
+        crate::ui_controls::Close::new(
+            Message::ChatUi(outside),
+            self.picker_opener
+                .clone()
+                .unwrap_or_else(|| card_control_id(target.card, control)),
+            move |opener| Message::ChatUi(Action::DismissPicker(target, opener)),
+        )
+    }
+
+    /// Where the open account, model or permission picker returns the
+    /// keyboard on Escape, when one is open.
+    pub(super) fn open_picker_opener(&self) -> Option<widget::Id> {
+        let control = if self.account_picker {
+            ACCOUNT_PICKER_CONTROL
+        } else if self.model_picker.is_some() {
+            MODEL_PICKER_CONTROL
+        } else if self.permission_picker {
+            PERMISSION_PICKER_CONTROL
+        } else {
+            return None;
+        };
+        Some(
+            self.picker_opener
+                .clone()
+                .unwrap_or_else(|| card_control_id(self.target.card, control)),
+        )
+    }
+
     /// The source this runtime can identify, including provider identity
     /// learned after its durable descriptor was installed.
     fn return_session(&self) -> chat::Session {
@@ -8830,6 +8888,16 @@ impl Cagents {
             }
             _ => return Task::none(),
         };
+        // The shortcut that opened a picker closes it as Escape does.
+        if matches!(
+            action,
+            Action::AccountPicker(_, false)
+                | Action::ModelPicker(_, false)
+                | Action::PermissionPicker(_, false)
+        ) && let Some(opener) = runtime.open_picker_opener()
+        {
+            return self.handle_chat_ui(Action::DismissPicker(target, opener));
+        }
         let permission_controls = runtime.permission_controls(
             !runtime.disconnected && !runtime.snapshot.exited && runtime.queued.is_none(),
         );
@@ -8845,8 +8913,12 @@ impl Cagents {
             _ => None,
         };
         self.device_ui.menu_open = false;
+        let keyboard = self.card_keyboard_focus(card);
         let task = self.handle_chat_ui(action);
         if let Some(runtime) = self.chat_runtime_mut(target) {
+            // A shortcut opens the picker from wherever the keyboard is in
+            // the pane, usually its composer: Escape returns there.
+            runtime.picker_opener = Some(keyboard);
             runtime.picker_keyboard = focus.is_some();
             runtime.picker_focus = focus
                 .as_ref()
@@ -14239,11 +14311,11 @@ impl Cagents {
             Action::Ready(target, _) | Action::ReadyAfterExitedQueue(target, ..) => Some(*target),
             _ => None,
         };
+        // A choice returns the keyboard to the composer it was made for.
+        // A press outside leaves it where the press put it, and Escape
+        // returns it to the picker's opener (`DismissPicker`).
         let restore = match &action {
-            Action::AccountPicker(target, false)
-            | Action::PermissionPicker(target, false)
-            | Action::ModelPicker(target, false)
-            | Action::SelectSubagent(target, _)
+            Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
             | Action::DraftModel(target, _, _)
             | Action::Model(target, _)
@@ -14625,6 +14697,7 @@ impl Cagents {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
+                    runtime.picker_opener = None;
                     runtime.account_picker = choosable && runtime.choosing();
                     runtime.model_picker = None;
                     runtime.permission_picker = false;
@@ -16703,7 +16776,12 @@ impl Cagents {
                     runtime.replace_draft(text_editor::Content::new());
                     runtime.error = None;
                     runtime.composer_note = None;
-                    return self.handle_chat_ui(Action::PermissionPicker(target, true));
+                    let task = self.handle_chat_ui(Action::PermissionPicker(target, true));
+                    // Typed in the composer, so Escape returns there.
+                    if let Some(runtime) = self.chat_runtime_mut(target) {
+                        runtime.picker_opener = Some(card_control_id(target.card, "chat-composer"));
+                    }
+                    return task;
                 }
                 if runtime.pastes_pending > 0 {
                     runtime.submit_after_paste = Some(mode);
@@ -16882,11 +16960,43 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
+            Action::ResolvePermissions(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let resolve = card_control_id(target.card, PERMISSION_RESOLVE_CONTROL);
+                if runtime.permission_picker {
+                    return self.handle_chat_ui(Action::DismissPicker(target, resolve));
+                }
+                let task = self.handle_chat_ui(Action::PermissionPicker(target, true));
+                if let Some(runtime) = self.chat_runtime_mut(target) {
+                    runtime.picker_opener = Some(resolve);
+                }
+                return task;
+            }
+            Action::DismissPicker(target, opener) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let open = runtime.account_picker
+                    || runtime.permission_picker
+                    || runtime.model_picker.is_some();
+                runtime.account_picker = false;
+                runtime.permission_picker = false;
+                runtime.model_picker = None;
+                runtime.picker_keyboard = false;
+                runtime.picker_opener = None;
+                if !open {
+                    return Task::none();
+                }
+                return crate::ui_controls::return_focus(opener).map(cosmic::Action::App);
+            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
+                    runtime.picker_opener = None;
                     runtime.permission_picker = open;
                     if open {
                         runtime.model_picker = None;
@@ -19073,6 +19183,7 @@ impl Cagents {
                 runtime.composer_actions = false;
                 runtime.branch_picker = false;
                 runtime.picker_keyboard = false;
+                runtime.picker_opener = None;
                 // A reopened search starts empty: the query a reader typed
                 // last time is not the model they are looking for now.
                 runtime.model_picker = open.then(ModelPicker::default);

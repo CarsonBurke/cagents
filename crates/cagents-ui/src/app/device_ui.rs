@@ -65,6 +65,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::ToggleInProgress
         | SidebarAction::ListHover(_)
         | SidebarAction::ToggleControls
+        | SidebarAction::CloseControls
         | SidebarAction::OpenFirstSearchResult
         | SidebarAction::FocusFirstSearchResult
         | SidebarAction::Resize { .. }
@@ -219,9 +220,14 @@ const CHECKOUT_NOT_LOADED: &str =
 const PULL_REQUESTS_UNAVAILABLE: &str =
     "Pull requests aren't available in a device window yet. Run gh in a terminal on the device.";
 
+/// The status bar's device chooser control.
+pub(super) const MENU_CONTROL_ID: &str = "device.menu";
+
 #[derive(Debug, Clone)]
 pub enum Action {
     Menu(bool),
+    /// Escape closed the device chooser: focus goes back to `opener`.
+    DismissMenu(widget::Id),
     Open,
     OpenAt(PathBuf),
     OpenIn {
@@ -731,6 +737,12 @@ impl Cagents {
     }
 
     pub(super) fn update_device(&mut self, action: Action) -> Task<Message> {
+        if let Action::DismissMenu(opener) = action {
+            if !std::mem::take(&mut self.device_ui.menu_open) {
+                return Task::none();
+            }
+            return crate::ui_controls::return_focus(opener).map(cosmic::Action::App);
+        }
         if let Action::Menu(open) = action {
             self.device_ui.menu_open =
                 open && self.settings.show_status_bar && !self.modal_is_open();
@@ -796,7 +808,9 @@ impl Cagents {
             self.device_ui.diff = None;
         }
         let operation = match action {
-            Action::Menu(_) => unreachable!("device menu handled above"),
+            Action::Menu(_) | Action::DismissMenu(_) => {
+                unreachable!("device menu handled above")
+            }
             Action::Diff(action) => return self.update_device_diff(action),
             Action::Configure => {
                 self.device_ui.open = true;
@@ -1503,6 +1517,7 @@ impl Cagents {
             .align_y(Alignment::Center),
         )
         .name(format!("Device: {label}. Choose a device"))
+        .id(widget::Id::new(MENU_CONTROL_ID))
         .selected(open)
         .class(crate::ui_controls::control_style(open, None))
         .height(20)
@@ -1516,7 +1531,11 @@ impl Cagents {
             anchor,
             open.then(|| self.device_popover(selected)),
             widget::popover::Position::Top,
-            Message::Device(Action::Menu(false)),
+            crate::ui_controls::Close::new(
+                Message::Device(Action::Menu(false)),
+                widget::Id::new(MENU_CONTROL_ID),
+                |opener| Message::Device(Action::DismissMenu(opener)),
+            ),
         )
     }
 
@@ -4225,5 +4244,28 @@ mod tests {
         }));
         assert!(app.device_ui.open);
         assert!(!app.device_ui.choosing);
+    }
+
+    /// Escape returns the keyboard to the device control that opened its
+    /// menu; a press outside the menu leaves it where the press put it.
+    #[test]
+    fn dismissing_the_device_menu_returns_to_its_control() {
+        use crate::app::tests::task_focuses;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let control = widget::Id::new(MENU_CONTROL_ID);
+        drop(app.update_device(Action::Menu(true)));
+        assert!(app.device_ui.menu_open);
+        let task = app.update_device(Action::DismissMenu(control.clone()));
+        assert!(!app.device_ui.menu_open);
+        assert_eq!(task_focuses(task, &control), (true, false));
+        let task = app.update_device(Action::DismissMenu(control.clone()));
+        assert_eq!(
+            task_focuses(task, &control),
+            (false, true),
+            "already closed"
+        );
+        drop(app.update_device(Action::Menu(true)));
+        let task = app.update_device(Action::Menu(false));
+        assert_eq!(task_focuses(task, &control), (false, true), "outside");
     }
 }

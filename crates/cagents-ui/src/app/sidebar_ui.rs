@@ -675,6 +675,7 @@ impl Cagents {
                 }
                 Self::source_control_history_task(self.history_ui.next_page_request(), key, self.sidebar_model.source_control.as_ref().and_then(|source| source.head_oid.as_deref()).and_then(|oid| crate::repository::Oid::parse_object(oid).ok()), page)
             }
+            SidebarAction::CloseControls => Task::none(),
             SidebarAction::ToggleControls => {
                 let target = if self.sidebar_state.controls_expanded() {
                     sidebar::search_focus_id()
