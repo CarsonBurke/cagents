@@ -199,6 +199,14 @@ version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
 }
 
+published_candidates() {
+    jq -rs '
+        .[][] | select(.draft == false) | .tag_name as $tag |
+        ($tag | ltrimstr("v")) as $version |
+        [$tag, any(.assets[]?; .name == "cagents-\($version)-aarch64-apple-darwin.tar.gz")] | @tsv
+    ' | sort -uV
+}
+
 # The releases before this one whose builds check for updates, oldest first,
 # as `TAG GENERATION` lines. Publication takes them from GitHub: a tag pushed
 # but never published is no one's build, and no bridge. Every one must be in
@@ -211,11 +219,7 @@ if "$VERIFY_ONLY"; then
 else
     command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
     candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
-        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '
-            .[][] | select(.draft == false) | .tag_name as $tag |
-            ($tag | ltrimstr("v")) as $version |
-            [$tag, any(.assets[]?; .name == "cagents-\($version)-aarch64-apple-darwin.tar.gz")] | @tsv
-        ') \
+        "repos/$REPOSITORY/releases?per_page=100" | published_candidates) \
         || fail 'cannot list the published releases'
 fi
 while IFS=$'\t' read -r earlier apple_silicon; do
@@ -864,8 +868,14 @@ check_remote_tag
 assert_current_draft
 # Publishing makes this the latest release; never above a newer one, nor a
 # second release of a version.
-newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
-    jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' |
+published_now=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100")
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    # A predecessor may have published the first Mac build during verification.
+    current_candidates=$(published_candidates <<< "$published_now")
+    [[ $current_candidates == "$candidates" ]] \
+        || fail "the published release inventory changed while $TAG was verified; run this again"
+fi
+newer=$(jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' <<< "$published_now" |
     sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
     while IFS= read -r published; do
         version_after "$VERSION" "$published" || printf '%s\n' "$published"
