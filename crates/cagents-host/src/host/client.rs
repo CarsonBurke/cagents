@@ -240,6 +240,30 @@ fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
         &UnixStream,
     ) -> Result<RequestOutcome<R>, WireFailure>,
 ) {
+    serve_connection(
+        stream,
+        client_id,
+        host,
+        handle,
+        #[cfg(test)]
+        false,
+    );
+}
+
+/// Serve a stream owned by an in-process unit test's private fixture. The
+/// kernel peer must be the test process itself to act as the synthetic user.
+#[cfg(test)]
+pub(super) fn serve_fixture_user(stream: UnixStream, client_id: ClientId, host: SharedHost) {
+    serve_connection(stream, client_id, host, process_wire_request, true);
+}
+
+fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    handle: RequestHandler<R>,
+    #[cfg(test)] fixture_user: bool,
+) {
     let registration = Registration::new(Arc::clone(&host), client_id);
     let delivery = Arc::clone(&registration.delivery);
     let Ok(writer_stream) = stream.try_clone() else {
@@ -294,8 +318,13 @@ fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
             let peer = crate::daemon::peer_credentials(&reader)
                 .ok()
                 .filter(|peer| peer.uid == crate::daemon::current_uid() && peer.pid > 0);
-            let requires_session_authority = peer
-                .is_none_or(|peer| crate::daemon::peer_requires_session_authority(&reader, peer));
+            let requires_session_authority = peer.is_none_or(|peer| {
+                #[cfg(test)]
+                if fixture_user && peer.pid == std::process::id() {
+                    return false;
+                }
+                crate::daemon::peer_requires_session_authority(&reader, peer)
+            });
             let pid = peer.map(|peer| peer.pid);
             #[cfg(feature = "development")]
             {

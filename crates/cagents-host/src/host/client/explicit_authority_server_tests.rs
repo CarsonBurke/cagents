@@ -3,7 +3,7 @@
 use super::*;
 use crate::{
     agent_execution::{Authority, Lineage},
-    control::ControlClient,
+    control::{ControlClient, ControlError},
     daemon::{HostLease, RuntimePaths},
     host::state::{HostLock, HostState},
     model::{
@@ -150,7 +150,7 @@ struct PrivateServer {
 }
 
 impl PrivateServer {
-    fn new(root: &Path, lose_first_reply: bool) -> Self {
+    fn start(root: &Path, lose_first_reply: bool) -> (Self, ControlClient) {
         let paths = RuntimePaths::discover().unwrap();
         let proof = HostSessionProof {
             host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
@@ -181,7 +181,10 @@ impl PrivateServer {
             release: release_rx,
         });
         let stop = Arc::new(AtomicBool::new(false));
-        let connections = Arc::new(Mutex::new(Vec::new()));
+        // Give only the bootstrap client fixture user admission. Every
+        // connection on the named listener goes through kernel peer checks.
+        let (bootstrap, bootstrap_server) = UnixStream::pair().unwrap();
+        let connections = Arc::new(Mutex::new(vec![bootstrap_server.try_clone().unwrap()]));
         let accept = {
             let (host, hooks, stop, connections) = (
                 host.clone(),
@@ -190,7 +193,10 @@ impl PrivateServer {
                 connections.clone(),
             );
             thread::spawn(move || {
-                let mut clients = Vec::new();
+                let bootstrap_host = host.clone();
+                let mut clients = vec![thread::spawn(move || {
+                    serve_fixture_user(bootstrap_server, 1, bootstrap_host);
+                })];
                 while !stop.load(Ordering::Acquire) {
                     match crate::descriptor::accept(&listener) {
                         Ok((stream, _)) => {
@@ -218,7 +224,7 @@ impl PrivateServer {
                 clients
             })
         };
-        Self {
+        let server = Self {
             host,
             socket: paths.socket,
             proof,
@@ -231,15 +237,10 @@ impl PrivateServer {
             connections,
             accept: Some(accept),
             _lease: lease,
-        }
-    }
-
-    fn fixture_user(&self) -> ControlClient {
-        let mut client = ControlClient::connect(&self.socket).unwrap();
-        // Predetermined synthetic fixture User bootstrap, never a fallback for
-        // a refused capability or a substitute for the invoking session.
-        client.authenticate(Authority::default()).unwrap();
-        client
+        };
+        let mut bootstrap = ControlClient::from_stream(bootstrap).unwrap();
+        bootstrap.authenticate(Authority::default()).unwrap();
+        (server, bootstrap)
     }
 
     fn issued_authority(&self, source: TerminalId) -> Authority {
@@ -425,8 +426,7 @@ fn live_hosted_reset_has_an_exact_submitter_and_cannot_change_account_lifecycle(
     let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
         return;
     };
-    let server = PrivateServer::new(&root, true);
-    let mut bootstrap = server.fixture_user();
+    let (server, mut bootstrap) = PrivateServer::start(&root, true);
     let caller = terminal(&root, "reset-caller");
     bootstrap.spawn(caller.clone(), Default::default()).unwrap();
 
@@ -482,8 +482,7 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
     let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
         return;
     };
-    let mut server = PrivateServer::new(&root, true);
-    let mut bootstrap = server.fixture_user();
+    let (mut server, mut bootstrap) = PrivateServer::start(&root, true);
     let caller = full_caller(&root);
     bootstrap.spawn(caller.clone(), Default::default()).unwrap();
     let authority = server.issued_authority(caller.id);
@@ -736,9 +735,42 @@ fn actual_server_reauthenticates_the_issued_caller_and_never_replays_accepted_pt
 }
 
 #[test]
+fn fixture_user_admission_is_confined_to_the_opted_in_connection() {
+    let host = Arc::new(HostLock::new(HostState::new(HostSessionProof {
+        host_session_id: "fixture-user-admission".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-incarnation".into(),
+    })));
+    let (fixture, fixture_server) = UnixStream::pair().unwrap();
+    let (ordinary, ordinary_server) = UnixStream::pair().unwrap();
+    let peer = crate::daemon::peer_credentials(&ordinary_server).unwrap();
+    let requires_authority = crate::daemon::peer_requires_session_authority(&ordinary_server, peer);
+
+    thread::scope(|scope| {
+        scope.spawn(|| serve_fixture_user(fixture_server, 1, host.clone()));
+        scope.spawn(|| serve(ordinary_server, 2, host.clone()));
+        let mut fixture = ControlClient::from_stream(fixture).unwrap();
+        let mut ordinary = ControlClient::from_stream(ordinary).unwrap();
+
+        fixture.authenticate(Authority::default()).unwrap();
+        let result = ordinary.authenticate(Authority::default());
+        if requires_authority {
+            assert!(matches!(
+                result,
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::PermissionDenied,
+                    ..
+                })
+            ));
+        } else {
+            result.unwrap();
+        }
+    });
+}
+
+#[test]
 fn hosted_socket_peer_needs_session_authority_for_user_scoped_requests() {
     use crate::agent_execution::Operation;
-    use crate::control::ControlError;
 
     const SOCKET: &str = "CAGENTS_TEST_HOSTED_PEER_SOCKET";
     let name = thread::current().name().unwrap().to_owned();
@@ -778,8 +810,7 @@ fn hosted_socket_peer_needs_session_authority_for_user_scoped_requests() {
     let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
         return;
     };
-    let mut server = PrivateServer::new(&root, false);
-    let mut bootstrap = server.fixture_user();
+    let (mut server, mut bootstrap) = PrivateServer::start(&root, false);
     let mut caller = terminal(&root, "hosted-peer");
     caller.launch.program = std::env::current_exe().unwrap().to_str().unwrap().into();
     caller.launch.arguments = vec!["--exact".into(), name, "--nocapture".into()];
@@ -812,8 +843,7 @@ fn actual_server_refuses_foreign_input_and_reused_or_changed_original_sources_be
     let Some(root) = crate::host::exit_drain_tests::private_runtime_case(&name, None) else {
         return;
     };
-    let mut server = PrivateServer::new(&root, false);
-    let mut bootstrap = server.fixture_user();
+    let (mut server, mut bootstrap) = PrivateServer::start(&root, false);
     let caller = terminal(&root, "caller");
     let sibling = terminal(&root, "sibling");
     bootstrap.spawn(caller.clone(), Default::default()).unwrap();
