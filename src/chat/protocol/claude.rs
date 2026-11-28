@@ -866,6 +866,11 @@ struct Block {
     input: StreamedInput,
 }
 
+struct ManualCompaction {
+    prompt: String,
+    boundary: bool,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -1122,6 +1127,7 @@ struct Claude {
     /// A compaction boundary arrived, so the provider context that follows
     /// is the summary standing in for the turns before it.
     compaction_summary_due: bool,
+    tracked_compaction: Option<ManualCompaction>,
     /// The running main turn received content this version cannot show.
     turn_unsupported_content: bool,
     /// The running main turn produced something the transcript can show.
@@ -1200,6 +1206,7 @@ impl Claude {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![json!({"type":"control_request","request_id":id,"request":request})],
             events: vec![],
         })
@@ -1864,6 +1871,11 @@ impl Claude {
             );
         }
         step.writes.push(frame);
+        if mode == PromptMode::Steer && self.tracked_compaction.take().is_some() {
+            step.compaction = Some(crate::agent_execution::CompactionOutcome::Unconfirmed(
+                "Claude accepted a steer before compaction could be confirmed".into(),
+            ));
+        }
         if !self.busy && mode == PromptMode::Send {
             self.start_turn(&mut step);
             self.status(true, "Claude is working", &mut step);
@@ -1949,6 +1961,7 @@ impl Claude {
         let mut step = Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],
@@ -2019,6 +2032,7 @@ impl Claude {
             return Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![
                     json!({"type":"control_response", "response":{"subtype":"error", "request_id":id, "error":error}}),
                 ],
@@ -4652,6 +4666,25 @@ impl Adapter for Claude {
                 .and_then(|id| self.controls.get(id))
                 .is_some_and(|request| request["_cagents_automatic"] == true)
     }
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let step = self.command(Command::Compact)?;
+        let prompt = step
+            .writes
+            .iter()
+            .find(|frame| frame["type"] == "user")
+            .and_then(|frame| frame["uuid"].as_str())
+            .ok_or("Claude did not prepare a compaction command")?;
+        self.tracked_compaction = Some(ManualCompaction {
+            prompt: prompt.into(),
+            boundary: false,
+        });
+        Ok(step)
+    }
+
+    fn compaction_pending(&self) -> bool {
+        self.tracked_compaction.is_some()
+    }
+
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let mut step = self.receive_frame(frame)?;
         for event in &mut step.events {
@@ -5321,6 +5354,35 @@ impl Claude {
                 // stop took: a stop still unacknowledged when the turn ends
                 // may yet be refused, so the turn's own failure stands.
                 let stopped = !made_way && (self.stop_marked || interruption == Some(true));
+                if self.tracked_compaction.as_ref().is_some_and(|compaction| {
+                    frame["command_uuid"]
+                        .as_str()
+                        .is_none_or(|id| id == compaction.prompt)
+                }) && let Some(compaction) = self.tracked_compaction.take()
+                {
+                    use crate::agent_execution::CompactionOutcome::{
+                        Completed, Failed, Unconfirmed,
+                    };
+                    step.compaction = Some(if stopped || made_way {
+                        Failed("Claude compaction was interrupted".into())
+                    } else if frame["is_error"] == true {
+                        let errors = content_text(&frame["errors"]);
+                        let detail = if !errors.is_empty() {
+                            errors
+                        } else {
+                            frame["result"]
+                                .as_str()
+                                .filter(|text| !text.is_empty())
+                                .unwrap_or("Claude compaction failed")
+                                .into()
+                        };
+                        Failed(detail)
+                    } else if compaction.boundary && frame["subtype"] == "success" {
+                        Completed
+                    } else {
+                        Unconfirmed("Claude did not report a manual compaction boundary".into())
+                    });
+                }
                 if stopped {
                     self.settle_stopped_calls(None, &mut step);
                     if !std::mem::take(&mut self.stop_marked) {
@@ -5496,6 +5558,17 @@ impl Claude {
                 // notifications. Only result settles a turn and its decisions.
                 let state = required(&frame, "state")?;
                 if let Some(id) = frame["command_uuid"].as_str() {
+                    if matches!(state, "cancelled" | "discarded")
+                        && self
+                            .tracked_compaction
+                            .as_ref()
+                            .is_some_and(|compact| compact.prompt == id)
+                    {
+                        self.tracked_compaction = None;
+                        step.compaction = Some(crate::agent_execution::CompactionOutcome::Failed(
+                            "Claude discarded the compaction command".into(),
+                        ));
+                    }
                     if state == "queued" {
                         if let Some(message) = self.submissions.get_mut(id) {
                             message.admitted = true;
@@ -8816,6 +8889,16 @@ impl Claude {
                 {
                     self.compaction_summary_due = true;
                     self.context_usage_stale = true;
+                    // Only the active, root manual command owns this
+                    // ordered boundary, never an automatic compaction.
+                    if frame["compact_metadata"]["trigger"] == "manual"
+                        && let Some(compaction) = &mut self.tracked_compaction
+                        && frame["command_uuid"]
+                            .as_str()
+                            .is_none_or(|id| id == compaction.prompt)
+                    {
+                        compaction.boundary = true;
+                    }
                 }
             }
             // Auxiliary session frames are not transcript data. Each one used
@@ -10443,6 +10526,7 @@ impl Claude {
         let mut step = Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![
                 json!({"type":"control_response", "response":{"subtype":"success", "request_id":id, "response":response}}),
             ],

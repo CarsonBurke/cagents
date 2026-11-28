@@ -1,6 +1,6 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
 use super::retained_actor::journal::OutboxEntry;
-use super::retained_actor::transport::{ActorIdentity, RemoteActor};
+use super::retained_actor::transport::{ActorIdentity, RemoteActor, WeakRemote};
 use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
 use crate::chat::{
     self, Command, Snapshot,
@@ -32,6 +32,27 @@ enum Owner {
     Local(LocalHandle),
     Remote(RemoteActor),
 }
+/// A status receipt must not extend the lifetime of a provider attachment.
+pub struct CompactionOwner(WeakOwner);
+
+enum WeakOwner {
+    Local(std::sync::Weak<super::Inner>),
+    Remote(WeakRemote),
+}
+
+impl CompactionOwner {
+    pub fn upgrade(&self) -> Option<Handle> {
+        match &self.0 {
+            WeakOwner::Local(local) => local
+                .upgrade()
+                .map(|inner| Handle(Owner::Local(LocalHandle(inner)))),
+            WeakOwner::Remote(remote) => {
+                remote.upgrade().map(|remote| Handle(Owner::Remote(remote)))
+            }
+        }
+    }
+}
+
 /// Outcome observed after a fixture proxy has admitted an exact envelope.
 #[cfg(any(test, feature = "test-support"))]
 pub enum RetainedInputOutcome {
@@ -428,6 +449,20 @@ impl Handle {
     }
     /// At the actor, recheck the same idle admission used for courier prompts.
     pub fn try_idle_compact(&self) -> Result<super::IdleCompaction, Rejection> {
+        self.submit_idle_compact(None)
+    }
+
+    pub fn try_tracked_compaction(
+        &self,
+        request: uuid::Uuid,
+    ) -> Result<super::IdleCompaction, Rejection> {
+        self.submit_idle_compact(Some(request))
+    }
+
+    fn submit_idle_compact(
+        &self,
+        request: Option<uuid::Uuid>,
+    ) -> Result<super::IdleCompaction, Rejection> {
         use super::{
             COMPACT_UNSUPPORTED, COMPACTION_PENDING, COURIER_BUSY, IdleCompaction, QueueRefusal,
         };
@@ -436,8 +471,8 @@ impl Handle {
             UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
         };
         match match &self.0 {
-            Owner::Local(local) => local.try_idle_compact(),
-            Owner::Remote(remote) => remote.try_idle_compact(),
+            Owner::Local(local) => local.try_idle_compact(request),
+            Owner::Remote(remote) => remote.try_idle_compact(request),
         } {
             Ok(()) => Ok(IdleCompaction::Submitted),
             Err(Rejection::Refused(error)) if error == COURIER_BUSY => Ok(IdleCompaction::Busy),
@@ -464,6 +499,23 @@ impl Handle {
             Err(error) => Err(error),
         }
     }
+    pub fn compaction_owner(&self) -> CompactionOwner {
+        CompactionOwner(match &self.0 {
+            Owner::Local(local) => WeakOwner::Local(std::sync::Arc::downgrade(&local.0)),
+            Owner::Remote(remote) => WeakOwner::Remote(remote.downgrade()),
+        })
+    }
+
+    pub fn compaction_outcome(
+        &self,
+        request: uuid::Uuid,
+    ) -> Result<Option<crate::agent_execution::CompactionOutcome>, String> {
+        match &self.0 {
+            Owner::Local(local) => Ok(local.compaction_outcome(request)),
+            Owner::Remote(remote) => remote.compaction_outcome(request),
+        }
+    }
+
     /// Exact source recognition is checked by the helper under this attachment epoch.
     pub fn recognize_retained_sources(&self, sources: &[chat::Session]) -> Result<(), String> {
         match &self.0 {

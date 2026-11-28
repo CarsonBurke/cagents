@@ -373,7 +373,9 @@ use crate::{
 /// Version 220 appends the per-model ACP reasoning observations to chat snapshots.
 ///
 /// Version 221 adds per-session context usage and idle compaction requests.
-pub const PROTOCOL_VERSION: u16 = 221;
+///
+/// Version 222 appends tracked compaction requests and outcome replies.
+pub const PROTOCOL_VERSION: u16 = 222;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

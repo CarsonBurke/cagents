@@ -696,6 +696,7 @@ impl ControlClient {
             Operation::SendMessage(_)
             | Operation::Send(_)
             | Operation::Compact(_)
+            | Operation::CompactTracked(_)
             | Operation::Inbox(_)
             | Operation::PeekInbox(_)
             | Operation::AcknowledgeInbox(_)

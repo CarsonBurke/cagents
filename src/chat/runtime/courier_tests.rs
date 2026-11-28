@@ -102,7 +102,10 @@ impl Adapter for GatedAdapter {
                 "unready" => vec![Event::Ready(false)],
                 "compacted" => {
                     self.compaction_pending = false;
-                    Vec::new()
+                    return Ok(Step {
+                        compaction: Some(crate::agent_execution::CompactionOutcome::Completed),
+                        ..Step::default()
+                    });
                 }
                 "waiting" => vec![Event::Waiting(true)],
                 // What the person queued with the provider during a turn, and
@@ -146,11 +149,21 @@ impl Adapter for GatedAdapter {
         })
     }
 
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let mut step = self.command(Command::Compact)?;
+        step.writes
+            .push(json!({"courier_fixture_compaction": true}));
+        Ok(step)
+    }
+
     fn compaction_pending(&self) -> bool {
         self.compaction_pending
     }
 
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
+        if frame["courier_fixture_compaction"] == true {
+            return Ok(Step::default());
+        }
         let text = frame["courier_fixture_prompt"]
             .as_str()
             .ok_or("unexpected fixture pipe frame")?;
@@ -181,14 +194,14 @@ impl RequestRaceFixture {
     }
 
     pub fn with_input_failure(fail_after_input: bool) -> Self {
-        Self::start(fail_after_input, true)
+        Self::start(fail_after_input, true, false)
     }
 
     pub fn without_compaction() -> Self {
-        Self::start(false, false)
+        Self::start(false, false, false)
     }
 
-    fn start(fail_after_input: bool, compact_supported: bool) -> Self {
+    fn start(fail_after_input: bool, compact_supported: bool, exit_on_input: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -201,8 +214,12 @@ impl RequestRaceFixture {
             messages: None,
             unset_environment: Default::default(),
             transport: TransportSpec::JsonLines,
-            program: "/bin/cat".into(),
-            arguments: Vec::new(),
+            program: if exit_on_input { "/bin/sh" } else { "/bin/cat" }.into(),
+            arguments: if exit_on_input {
+                vec!["-c".into(), "IFS= read -r command; exit 7".into()]
+            } else {
+                Vec::new()
+            },
             working_directory: directory.path().into(),
             environment: BTreeMap::from([
                 ("HOME".into(), home.to_string_lossy().into_owned()),
@@ -596,4 +613,31 @@ fn courier_prompt_step_failure_after_queuing_input_is_uncertain() {
     );
     assert_eq!(fixture.prompt_count(), 1);
     fixture.close();
+}
+
+#[test]
+fn tracked_compaction_fails_when_the_provider_exits_after_receiving_it() {
+    use crate::agent_execution::CompactionOutcome;
+    let fixture = RequestRaceFixture::start(false, true, true);
+    let request = uuid::Uuid::new_v4();
+    assert_eq!(
+        fixture.handle.try_tracked_compaction(request),
+        Ok(IdleCompaction::Submitted)
+    );
+    let deadline = Instant::now() + TIMEOUT;
+    while !fixture.handle.is_completed() {
+        assert!(Instant::now() < deadline, "fixture provider did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(matches!(
+        fixture.handle.compaction_outcome(request).unwrap(),
+        Some(CompactionOutcome::Failed(reason)) if reason.contains("exited")
+    ));
+    assert_eq!(
+        fixture
+            .handle
+            .compaction_outcome(uuid::Uuid::new_v4())
+            .unwrap(),
+        None
+    );
 }

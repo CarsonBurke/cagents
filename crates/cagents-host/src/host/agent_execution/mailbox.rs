@@ -22,7 +22,7 @@
 
 mod account_watch;
 mod compact;
-pub(super) use compact::compact;
+pub(super) use compact::{compact, status as compaction_status};
 mod wait;
 
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
@@ -945,6 +945,7 @@ struct WakeState {
     stopped: bool,
     update: UpdateWait,
     compactions: BTreeMap<TerminalId, compact::Pending>,
+    compaction_receipts: BTreeMap<uuid::Uuid, compact::Receipt>,
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -2554,6 +2555,56 @@ mod tests {
         pass();
         assert_eq!(fixture.actor.compaction_count(), 2);
         assert_eq!(fixture.actor.prompt_count(), 0);
+    }
+
+    #[test]
+    fn tracked_compaction_preserves_the_receipt_across_busy_delivery() {
+        use crate::agent_execution::{CompactionState, Operation, Reply};
+        let fixture = Delivering::new(&[]);
+        {
+            let mut state = fixture.host.lock().unwrap();
+            state.execution_registry = Some(fixture.registry.clone());
+            state.mailbox = Some(fixture.courier.clone());
+        }
+        let request = |operation| {
+            let Reply::TrackedCompaction(result) =
+                super::super::process(&fixture.host, Authority::default(), operation).unwrap()
+            else {
+                panic!("expected a tracked receipt");
+            };
+            assert_eq!(result.compaction.session, fixture.session);
+            result
+        };
+        fixture
+            .actor
+            .handle
+            .command(crate::chat::Command::SetModel {
+                model: "busy".into(),
+                reasoning: None,
+            })
+            .unwrap();
+        let target = || Operation::CompactTracked(fixture.session.to_string());
+        let queued = request(target());
+        assert_eq!(queued.compaction.state, CompactionState::Queued);
+        assert_eq!(request(target()), queued);
+        let status = || {
+            request(Operation::CompactionStatus(queued.request.unwrap()))
+                .compaction
+                .state
+        };
+        assert_eq!(status(), CompactionState::Queued);
+        fixture
+            .actor
+            .handle
+            .command(crate::chat::Command::Interrupt)
+            .unwrap();
+        fixture
+            .courier
+            .deliver_compactions(&fixture.host, &BTreeMap::new());
+        assert_eq!(status(), CompactionState::Submitted);
+        fixture.actor.finish_compaction();
+        assert_eq!(status(), CompactionState::Completed);
+        assert_eq!(fixture.actor.compaction_count(), 1);
     }
 
     #[test]

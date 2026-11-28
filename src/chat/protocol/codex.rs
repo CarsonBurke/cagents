@@ -533,6 +533,8 @@ fn create_inner(
             notification_revision: 0,
             busy: false,
             compaction_starting: false,
+            tracked_compaction: None,
+            compaction_attribution_lost: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -606,9 +608,8 @@ enum Pending {
         early: BTreeMap<String, EarlyNotification>,
         early_bytes: usize,
     },
-    /// Compaction rewrites the thread's history and its context occupancy, so
-    /// its acknowledgement is what a re-read hangs off: nothing else on the
-    /// wire announces that the figures a reader was looking at have moved.
+    /// Acknowledges the asynchronous start and triggers the existing
+    /// history/context refresh. The provider reports the turn separately.
     Compact,
     Other,
     FastMode {
@@ -718,6 +719,22 @@ impl ContextConfig {
 }
 
 #[derive(Default)]
+struct TrackedCompaction {
+    /// Even without a waiter, this request holds the attribution fence until
+    /// Codex names and settles its compaction turn or refuses its start.
+    report: bool,
+    /// The candidate ended without identifying itself as our compaction.
+    /// If the caller retries now, the two starts can no longer be separated.
+    uncertain: bool,
+    acknowledged: bool,
+    turn: Option<String>,
+    started: bool,
+    compacted: bool,
+    user_input: bool,
+    outcome: Option<crate::agent_execution::CompactionOutcome>,
+}
+
+#[derive(Default)]
 struct Codex {
     /// The total input of the latest usage reading, which tells a new
     /// request's reading from a repeated one.
@@ -783,6 +800,10 @@ struct Codex {
     /// The server acknowledges submission before its turn starts. Keep
     /// admission closed until the turn is visible or the request is refused.
     compaction_starting: bool,
+    tracked_compaction: Option<TrackedCompaction>,
+    /// Separate starts with empty RPC replies cannot be re-associated after
+    /// an ambiguous retry. The thread remains writable without attribution.
+    compaction_attribution_lost: bool,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
@@ -2526,6 +2547,23 @@ impl Adapter for Codex {
                 .any(|pending| matches!(pending, Pending::Compact))
     }
 
+    fn compaction_admission_pending(&self) -> bool {
+        self.compaction_pending()
+            || self
+                .tracked_compaction
+                .as_ref()
+                .is_some_and(|compaction| !compaction.uncertain)
+            || self.pending.values().any(|pending| {
+                matches!(
+                    pending,
+                    Pending::Turn { .. }
+                        | Pending::QueueAdd
+                        | Pending::QueueList
+                        | Pending::LoginRecovery { .. }
+                )
+            })
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -2583,6 +2621,12 @@ impl Adapter for Codex {
         if !self.ready {
             return Err("Codex native connection is not ready".into());
         }
+        // Other submitted input can start or change work before Codex names
+        // the compaction turn. Preserve that input and relinquish the claim.
+        let competing_input = matches!(
+            command,
+            Command::Prompt { .. } | Command::StartQueued { .. } | Command::ResumeAfterLogin { .. }
+        );
         match command {
             Command::Prompt { text, attachments, mode } => {
                 if !self.direct_input { return Err("This Codex thread does not advertise direct input support".into()); }
@@ -2706,9 +2750,11 @@ impl Adapter for Codex {
                 }), Pending::Other)?;
             }
             Command::Compact => {
-                if !self.capabilities().compact || self.busy || self.compaction_pending() { return Err("Codex compaction requires an idle, writable thread".into()); }
+                if !self.capabilities().compact || self.busy || self.compaction_admission_pending() { return Err("Codex compaction requires an idle, writable thread".into()); }
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
                 self.compaction_starting = true;
+                self.compaction_attribution_lost |= self.tracked_compaction.is_some();
+                self.tracked_compaction = Some(TrackedCompaction::default());
             }
             Command::ResumeAfterLogin { failure, expected } => {
                 if self.busy || self.pending.values().any(|pending| matches!(pending, Pending::Turn { .. } | Pending::LoginRecovery { .. })) {
@@ -2739,8 +2785,26 @@ impl Adapter for Codex {
             Command::DismissPermissionDenial { tool_use_id } => step.events.push(Event::PermissionDenialDismissed { tool_use_id }),
             Command::RefreshPermissions | Command::UpdatePermissionSettings { .. } => return Err("Permission rule settings are available for Claude sessions".into()),
         }
+        if competing_input
+            && !self.compaction_attribution_lost
+            && let Some(compaction) = &mut self.tracked_compaction
+            && compaction.outcome.is_none()
+            && std::mem::take(&mut compaction.report)
+        {
+            step.compaction = Some(crate::agent_execution::CompactionOutcome::Unconfirmed(
+                "Codex accepted other input before compaction could be confirmed".into(),
+            ));
+        }
         Ok(step)
     }
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let step = self.command(Command::Compact)?;
+        if let Some(compaction) = &mut self.tracked_compaction {
+            compaction.report = true;
+        }
+        Ok(step)
+    }
+
     fn held_stop(&self) -> HeldStop {
         self.held_stop
     }
@@ -2765,6 +2829,60 @@ impl Adapter for Codex {
 }
 
 impl Codex {
+    fn publish_compaction(&mut self, step: &mut Step) {
+        if let Some(compaction) = &mut self.tracked_compaction
+            && compaction.acknowledged
+            && let Some(outcome) = compaction.outcome.take()
+        {
+            if compaction.report {
+                step.compaction = Some(outcome);
+            }
+            self.tracked_compaction = None;
+        }
+    }
+
+    fn complete_compaction_turn(&mut self, turn_id: &str, turn: &Value, step: &mut Step) {
+        use crate::agent_execution::CompactionOutcome::{Completed, Failed, Unconfirmed};
+        let Some(compaction) = &mut self.tracked_compaction else {
+            return;
+        };
+        if compaction.turn.as_deref() != Some(turn_id) || compaction.outcome.is_some() {
+            return;
+        }
+        for item in turn["items"].as_array().into_iter().flatten() {
+            compaction.compacted |= item["type"] == "contextCompaction";
+            compaction.user_input |= item["type"] == "userMessage";
+        }
+        if compaction.user_input || !(compaction.started || compaction.compacted) {
+            // This can be an earlier queued turn that Codex interrupted for
+            // compaction. Keep the fence so a later request cannot claim
+            // the actual compaction turn even if it chooses to retry.
+            compaction.uncertain = true;
+            compaction.turn = None;
+            compaction.started = false;
+            compaction.compacted = false;
+            compaction.user_input = false;
+            if std::mem::take(&mut compaction.report) {
+                step.compaction = Some(Unconfirmed(
+                    "Codex did not identify the observed turn as the requested compaction".into(),
+                ));
+            }
+            return;
+        }
+        compaction.outcome = Some(match turn["status"].as_str() {
+            Some("completed") if compaction.compacted => Completed,
+            Some("failed") => Failed(
+                turn["error"]["message"]
+                    .as_str()
+                    .unwrap_or("Codex compaction failed")
+                    .into(),
+            ),
+            Some("interrupted") => Failed("Codex compaction was interrupted".into()),
+            _ => Unconfirmed("Codex did not confirm compaction on the requested turn".into()),
+        });
+        self.publish_compaction(step);
+    }
+
     /// Whether a `turn/start` this thread sent is still unanswered.
     fn starting_turn(&self) -> bool {
         self.pending
@@ -2816,6 +2934,18 @@ impl Codex {
             if let Some(error) = frame.get("error") {
                 if matches!(pending, Pending::Compact) {
                     self.compaction_starting = false;
+                    if self
+                        .tracked_compaction
+                        .take()
+                        .is_some_and(|compaction| compaction.report)
+                    {
+                        step.compaction = Some(crate::agent_execution::CompactionOutcome::Failed(
+                            error["message"]
+                                .as_str()
+                                .unwrap_or("Codex refused compaction")
+                                .into(),
+                        ));
+                    }
                 }
                 if let Pending::LoginRecovery {
                     failure, revision, ..
@@ -3518,7 +3648,18 @@ impl Codex {
                 // Without this the reader pressed a control and the gauge it
                 // exists to move kept its old reading until some later frame
                 // happened to carry a new one.
-                Pending::Compact => self.reread(&mut step)?,
+                Pending::Compact => {
+                    if let Some(compaction) = &mut self.tracked_compaction {
+                        compaction.acknowledged = true;
+                        if self.compaction_attribution_lost {
+                            compaction.outcome = Some(crate::agent_execution::CompactionOutcome::Unconfirmed(
+                                "Codex cannot identify this compaction after an earlier unconfirmed attempt".into(),
+                            ));
+                        }
+                        self.publish_compaction(&mut step);
+                    }
+                    self.reread(&mut step)?;
+                }
                 Pending::QueueAdd => self.read_queue(&mut step)?,
                 Pending::QueueDelete(id) => {
                     step.events.push(Event::QueueRemoval(chat::QueueRemoval {
@@ -3973,6 +4114,12 @@ impl Codex {
                         return Ok(step);
                     }
                     self.compaction_starting = false;
+                    if thread.is_some()
+                        && !self.compaction_attribution_lost
+                        && let Some(compaction) = &mut self.tracked_compaction
+                    {
+                        compaction.turn.get_or_insert_with(|| turn_id.to_owned());
+                    }
                     if !same_model_turn {
                         // A start has no request ID. An outstanding override
                         // cannot be attributed until its exact ACK arrives.
@@ -4031,6 +4178,9 @@ impl Codex {
                         .push(Event::PromptCache(chat::prompt_cache::Evidence::Request));
                 }
                 self.materialized = true;
+                if method == "turn/completed" && thread.is_some() {
+                    self.complete_compaction_turn(turn_id, turn, &mut step);
+                }
                 if method == "turn/completed" && current {
                     use crate::notifications::Kind;
                     let outcome = match turn["status"].as_str() {
@@ -4198,6 +4348,18 @@ impl Codex {
             }
             "item/started" | "item/completed" => {
                 let done = method == "item/completed";
+                if thread.is_some()
+                    && let Some(compaction) = &mut self.tracked_compaction
+                    && compaction
+                        .turn
+                        .as_deref()
+                        .is_some_and(|turn| params["turnId"] == turn)
+                {
+                    let context_compaction = params["item"]["type"] == "contextCompaction";
+                    compaction.started |= context_compaction;
+                    compaction.compacted |= done && context_compaction;
+                    compaction.user_input |= params["item"]["type"] == "userMessage";
+                }
                 if params["item"]["type"] == "collabAgentToolCall" {
                     let value = &params["item"];
                     for id in value["receiverThreadIds"]
@@ -4431,6 +4593,16 @@ impl Codex {
                 let interrupted = self.busy;
                 self.busy = false;
                 self.compaction_starting = false;
+                if thread.is_some()
+                    && self
+                        .tracked_compaction
+                        .take()
+                        .is_some_and(|compaction| compaction.report)
+                {
+                    step.compaction = Some(crate::agent_execution::CompactionOutcome::Failed(
+                        "Codex closed the thread before confirming compaction".into(),
+                    ));
+                }
                 self.subagent_status = Some(
                     self.subagent_status
                         .filter(|status| *status != ToolStatus::Running)
@@ -4525,7 +4697,18 @@ impl Codex {
             "account/updated" => step.events.push(Event::AccountUsage(LiveReport::CodexLogin(
                 account::codex::parse_login_update(params),
             ))),
-            "item/reasoning/summaryPartAdded" | "thread/compacted" => {}
+            "thread/compacted" => {
+                if thread.is_some()
+                    && let Some(compaction) = &mut self.tracked_compaction
+                    && compaction
+                        .turn
+                        .as_deref()
+                        .is_some_and(|turn| params["turnId"] == turn)
+                {
+                    compaction.compacted = true;
+                }
+            }
+            "item/reasoning/summaryPartAdded" => {}
             // Auxiliary app-server notifications are not transcript data.
             // Unknown item types are shown as tool disclosures and unknown
             // requests are visibly rejected above.

@@ -732,6 +732,8 @@ pub enum Operation {
     Resume(String),
     /// Compact a live conversation when it can take the command.
     Compact(String),
+    CompactTracked(String),
+    CompactionStatus(uuid::Uuid),
 }
 
 /// What became of a prompt accepted for an existing agent.
@@ -823,10 +825,10 @@ pub enum Reply {
     Stopped(resume::StoppedSessions),
     Resumed(resume::Resumed),
     Compact(Compaction),
+    TrackedCompaction(TrackedCompaction),
 }
 
-/// Admission of a compaction request. The provider finishes compaction
-/// asynchronously after the command is submitted.
+/// The state of a compaction request for the selected session.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Compaction {
     pub session: TerminalId,
@@ -839,6 +841,33 @@ pub enum CompactionState {
     Queued,
     Unsupported,
     Unconfirmed(String),
+    Completed,
+    Failed(String),
+}
+
+/// The receipt identifies one command on the conversation that accepted it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TrackedCompaction {
+    pub request: Option<uuid::Uuid>,
+    pub compaction: Compaction,
+}
+
+/// Terminal evidence from the actor that dispatched the provider command.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CompactionOutcome {
+    Completed,
+    Failed(String),
+    Unconfirmed(String),
+}
+
+impl From<CompactionOutcome> for CompactionState {
+    fn from(outcome: CompactionOutcome) -> Self {
+        match outcome {
+            CompactionOutcome::Completed => Self::Completed,
+            CompactionOutcome::Failed(reason) => Self::Failed(reason),
+            CompactionOutcome::Unconfirmed(reason) => Self::Unconfirmed(reason),
+        }
+    }
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

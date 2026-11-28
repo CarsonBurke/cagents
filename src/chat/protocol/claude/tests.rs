@@ -16324,3 +16324,38 @@ fn managed_attribution_is_resolved_at_fresh_and_resumed_launch() {
     );
     assert_eq!(settings(&launch), None);
 }
+
+#[test]
+fn tracked_compaction_requires_a_manual_boundary_in_its_root_result() {
+    use crate::agent_execution::CompactionOutcome;
+    for (trigger, parent, success) in [
+        ("manual", None, true),
+        ("auto", None, false),
+        ("manual", Some("child"), false),
+    ] {
+        let mut adapter = Claude {
+            ready: true,
+            commands: vec![SlashCommand {
+                name: "compact".into(),
+                description: String::new(),
+            }],
+            ..Claude::default()
+        };
+        assert!(adapter.tracked_compaction().unwrap().compaction.is_none());
+        let boundary = adapter.receive(json!({"type":"system","subtype":"compact_boundary",
+            "parent_tool_use_id":parent,"compact_metadata":{"trigger":trigger},"uuid":"compaction"
+        })).unwrap();
+        assert!(boundary.compaction.is_none());
+        let result = adapter
+            .receive(json!({"type":"result","subtype":"success","is_error":false,"uuid":"result"}))
+            .unwrap();
+        if success {
+            assert_eq!(result.compaction, Some(CompactionOutcome::Completed));
+        } else {
+            assert!(matches!(
+                result.compaction,
+                Some(CompactionOutcome::Unconfirmed(_))
+            ));
+        }
+    }
+}

@@ -422,6 +422,8 @@ pub struct Step {
     /// Written in order before the next incoming frame is processed.
     pub writes: Vec<Value>,
     pub events: Vec<Event>,
+    /// Private settlement of the adapter's current tracked compaction.
+    pub compaction: Option<crate::agent_execution::CompactionOutcome>,
 }
 /// Account identity verified during initialize on the actual server connection.
 /// A holder can retain it when the account directory is subsequently removed.
@@ -494,10 +496,22 @@ pub trait Adapter: Send {
         None
     }
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let mut step = self.command(Command::Compact)?;
+        step.compaction = Some(crate::agent_execution::CompactionOutcome::Unconfirmed(
+            "This provider does not report compaction outcomes".into(),
+        ));
+        Ok(step)
+    }
     /// A compaction request can be in flight before the provider reports
     /// itself busy. The actor must not admit courier work in that gap.
     fn compaction_pending(&self) -> bool {
         false
+    }
+    /// An earlier provider operation can still start work before this
+    /// compaction. Recheck at dispatch, since the resident can look idle.
+    fn compaction_admission_pending(&self) -> bool {
+        self.compaction_pending()
     }
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.

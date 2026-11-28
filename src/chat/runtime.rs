@@ -32,6 +32,7 @@ use crate::chat::DeliveryKey;
 pub use delivery::Deliveries;
 mod execution;
 mod handle;
+pub use handle::CompactionOwner;
 pub use handle::Handle;
 pub use handle::ReadFailure;
 #[cfg(any(test, feature = "test-support"))]
@@ -165,7 +166,7 @@ enum ActorCommand {
         text: String,
         mailbox: Option<crate::agent_execution::mailbox::FrameEvidence>,
     },
-    IdleCompact,
+    IdleCompact(Option<uuid::Uuid>),
     CloseIfIdle {
         generation: u64,
         /// What a granted close leaves running, decided as it is granted.
@@ -444,6 +445,11 @@ struct RetainedObserver {
     connected: Box<dyn Fn() -> bool + Send + Sync>,
 }
 
+#[derive(Default)]
+struct CompactionReceipts {
+    outcomes: VecDeque<(uuid::Uuid, crate::agent_execution::CompactionOutcome)>,
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -452,6 +458,7 @@ struct Inner {
     agent_addresses: AgentAddresses,
     prompt_cache: PromptCache,
     compaction_pending: Arc<AtomicBool>,
+    compaction_receipts: Arc<Mutex<CompactionReceipts>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
     record_observer: Option<Arc<AtomicBool>>,
@@ -774,6 +781,7 @@ impl LocalHandle {
         let agent_addresses = AgentAddresses::default();
         let prompt_cache = PromptCache::default();
         let compaction_pending = Arc::new(AtomicBool::new(false));
+        let compaction_receipts = Arc::new(Mutex::new(CompactionReceipts::default()));
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
@@ -791,6 +799,7 @@ impl LocalHandle {
             agent_addresses: agent_addresses.clone(),
             prompt_cache: prompt_cache.clone(),
             compaction_pending: compaction_pending.clone(),
+            compaction_receipts: compaction_receipts.clone(),
             visible: visible.clone(),
             observe_next: observe_next.clone(),
             record_observer: record_observer.clone(),
@@ -851,6 +860,8 @@ impl LocalHandle {
                     agent_addresses,
                     prompt_cache,
                     compaction_pending,
+                    compaction_receipts,
+                    tracked_compaction: None,
                     store,
                     visible,
                     observe_next,
@@ -1043,6 +1054,15 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                actor.settle_compaction(if shared_websocket || preserve_holder || !direct_closed || !native_closed {
+                    crate::agent_execution::CompactionOutcome::Unconfirmed(
+                        "The connection to the original provider closed before compaction was confirmed".into(),
+                    )
+                } else {
+                    crate::agent_execution::CompactionOutcome::Failed(
+                        "The provider exited before confirming compaction".into(),
+                    )
+                });
                 if !preserve_holder {
                     // A shared server can keep working after this socket closes.
                     // Keep its last reported transcript and file-edit statuses.
@@ -1196,8 +1216,22 @@ impl LocalHandle {
         })
     }
 
-    pub(crate) fn try_idle_compact(&self) -> Result<(), Rejection> {
-        self.submit_actor_command(ActorCommand::IdleCompact)
+    pub(crate) fn try_idle_compact(&self, request: Option<uuid::Uuid>) -> Result<(), Rejection> {
+        self.submit_actor_command(ActorCommand::IdleCompact(request))
+    }
+
+    pub(crate) fn compaction_outcome(
+        &self,
+        request: uuid::Uuid,
+    ) -> Option<crate::agent_execution::CompactionOutcome> {
+        self.0
+            .compaction_receipts
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .outcomes
+            .iter()
+            .find(|(id, _)| *id == request)
+            .map(|(_, outcome)| outcome.clone())
     }
 
     pub(crate) fn compact_support(&self) -> Option<bool> {
@@ -2801,6 +2835,8 @@ struct Actor {
     agent_addresses: AgentAddresses,
     prompt_cache: PromptCache,
     compaction_pending: Arc<AtomicBool>,
+    compaction_receipts: Arc<Mutex<CompactionReceipts>>,
+    tracked_compaction: Option<uuid::Uuid>,
     store: Arc<Mutex<Store>>,
     visible: Arc<AtomicBool>,
     observe_next: Arc<AtomicBool>,
@@ -3686,14 +3722,18 @@ impl Actor {
                 let _ = refuse("Chat is closing".into());
                 continue;
             }
-            if matches!(
-                command,
-                ActorCommand::IdlePrompt { .. } | ActorCommand::IdleCompact
-            ) && self.adapter.compaction_pending()
-            {
+            if match &command {
+                ActorCommand::IdlePrompt { .. } => self.adapter.compaction_pending(),
+                ActorCommand::IdleCompact(_) => self.adapter.compaction_admission_pending(),
+                _ => false,
+            } {
                 let _ = refuse(COMPACTION_PENDING.into());
                 continue;
             }
+            let tracked_compaction = match &command {
+                ActorCommand::IdleCompact(request) => *request,
+                _ => None,
+            };
             let (run, command) = match command {
                 ActorCommand::RetainedProvider { .. } => {
                     unreachable!("retained inputs normalized above")
@@ -3770,7 +3810,7 @@ impl Actor {
                     mailbox = evidence;
                     (None, handle::mailbox_command(text))
                 }
-                ActorCommand::IdleCompact => {
+                ActorCommand::IdleCompact(_) => {
                     let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
                     if !accepts_courier(&state) {
                         let _ = refuse(COURIER_BUSY.into());
@@ -3979,9 +4019,13 @@ impl Actor {
                 continue;
             }
             let loads_earlier = command == Command::LoadEarlier;
-            let prepared = match run {
-                Some(run) => self.adapter.command_for_run(run, command),
-                None => self.adapter.command(command),
+            let prepared = if tracked_compaction.is_some() {
+                self.adapter.tracked_compaction()
+            } else {
+                match run {
+                    Some(run) => self.adapter.command_for_run(run, command),
+                    None => self.adapter.command(command),
+                }
             };
             match prepared {
                 Ok(step) => {
@@ -3994,6 +4038,9 @@ impl Actor {
                     effects.possible();
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;
+                    }
+                    if let Some(request) = tracked_compaction {
+                        self.tracked_compaction = Some(request);
                     }
                     let result = self.step(step);
                     // Busy before the caller hears back, so whoever checks
@@ -4190,9 +4237,33 @@ impl Actor {
     fn step(&mut self, step: Step) -> Result<(), String> {
         self.apply_step(step, None)
     }
+    fn settle_compaction(&mut self, mut outcome: crate::agent_execution::CompactionOutcome) {
+        use crate::agent_execution::CompactionOutcome::{Completed, Failed, Unconfirmed};
+        if let Some(request) = self.tracked_compaction.take() {
+            const MAX_REASON_BYTES: usize = 2048;
+            match &mut outcome {
+                Failed(reason) | Unconfirmed(reason) => {
+                    reason.truncate(reason.floor_char_boundary(MAX_REASON_BYTES));
+                }
+                Completed => {}
+            }
+            let mut receipts = self
+                .compaction_receipts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if receipts.outcomes.len() == 32 {
+                receipts.outcomes.pop_front();
+            }
+            receipts.outcomes.push_back((request, outcome));
+        }
+    }
+
     /// Applies one frame. `confirmed` is the conversation identity the
     /// provider left the frame with, when the frame changed it.
     fn apply_step(&mut self, step: Step, confirmed: Option<Option<String>>) -> Result<(), String> {
+        if let Some(outcome) = step.compaction {
+            self.settle_compaction(outcome);
+        }
         let suppress_current_notification = step.suppress_current_notification;
         if !suppress_current_notification && let Some(preview) = &step.notification_preview {
             self.state

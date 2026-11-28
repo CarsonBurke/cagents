@@ -2311,6 +2311,8 @@ fn adapter() -> Codex {
         notification_revision: 0,
         busy: false,
         compaction_starting: false,
+        tracked_compaction: None,
+        compaction_attribution_lost: false,
         lifecycle_revision: 0,
         suggestion_turn: None,
         prediction_turn: None,
@@ -7933,4 +7935,214 @@ fn post_turn_compaction_rounds_up_to_the_first_token_at_the_threshold() {
     };
     assert_eq!(config.compact_limit(101), Some(52));
     assert_eq!(config.compact_limit(0), None);
+}
+
+#[test]
+fn tracked_compaction_needs_its_acknowledgement_and_exact_compaction_turn() {
+    use crate::agent_execution::CompactionOutcome;
+    for delayed_ack in [false, true] {
+        let mut adapter = adapter();
+        let request = adapter.tracked_compaction().unwrap();
+        let ack = json!({"id":request.writes[0]["id"],"result":{}});
+        if !delayed_ack {
+            assert!(adapter.receive(ack.clone()).unwrap().compaction.is_none());
+        }
+        assert!(adapter.compaction_pending());
+        let notification = |method, thread, id, status| {
+            json!({"method":method,"params":{"threadId":thread,"turn":{
+                "id":id,"status":status,"items":[]
+            }}})
+        };
+        for (method, thread, turn, status) in [
+            ("turn/started", "foreign", "foreign-turn", "inProgress"),
+            ("turn/completed", "thread-exact", "old-turn", "completed"),
+            ("turn/started", "thread-exact", "compact-turn", "inProgress"),
+            ("turn/completed", "thread-exact", "other-turn", "completed"),
+        ] {
+            assert!(
+                adapter
+                    .receive(notification(method, thread, turn, status))
+                    .unwrap()
+                    .compaction
+                    .is_none()
+            );
+        }
+        let item = adapter
+            .receive(json!({"method":"item/completed","params":{
+                "threadId":"thread-exact","turnId":"compact-turn",
+                "item":{"type":"contextCompaction","id":"compaction"}
+            }}))
+            .unwrap();
+        assert!(item.compaction.is_none());
+        let completed = adapter
+            .receive(notification(
+                "turn/completed",
+                "thread-exact",
+                "compact-turn",
+                "completed",
+            ))
+            .unwrap();
+        if delayed_ack {
+            assert!(completed.compaction.is_none());
+            assert!(adapter.compaction_pending());
+            assert_eq!(
+                adapter.receive(ack).unwrap().compaction,
+                Some(CompactionOutcome::Completed)
+            );
+        } else {
+            assert_eq!(completed.compaction, Some(CompactionOutcome::Completed));
+        }
+        assert!(!adapter.compaction_pending());
+    }
+}
+
+#[test]
+fn tracked_compaction_reports_codex_refusal_or_turn_failure() {
+    use crate::agent_execution::CompactionOutcome;
+    let mut adapter = adapter();
+    let request = adapter.tracked_compaction().unwrap();
+    let refused = adapter
+        .receive(json!({"id":request.writes[0]["id"],"error":{
+            "code":-32603,"message":"Codex refused to compact"
+        }}))
+        .unwrap();
+    assert_eq!(
+        refused.compaction,
+        Some(CompactionOutcome::Failed("Codex refused to compact".into()))
+    );
+
+    for (turn, starts_compacting) in [("compact-turn", true), ("untyped-turn", false)] {
+        let request = adapter.tracked_compaction().unwrap();
+        adapter
+            .receive(json!({"id":request.writes[0]["id"],"result":{}}))
+            .unwrap();
+        adapter
+            .receive(
+                json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{
+                    "id":turn,"status":"inProgress","items":[]
+                }}}),
+            )
+            .unwrap();
+        if starts_compacting {
+            adapter
+                .receive(json!({"method":"item/started","params":{
+                    "threadId":"thread-exact","turnId":turn,
+                    "item":{"type":"contextCompaction","id":"compaction"}
+                }}))
+                .unwrap();
+        }
+        let failed = adapter.receive(json!({"method":"turn/completed","params":{"threadId":"thread-exact","turn":{
+            "id":turn,"status":"failed","items":[],"error":{"message":"Context was too large"}
+        }}})).unwrap();
+        if starts_compacting {
+            assert_eq!(
+                failed.compaction,
+                Some(CompactionOutcome::Failed("Context was too large".into()))
+            );
+        } else {
+            assert!(matches!(
+                failed.compaction,
+                Some(CompactionOutcome::Unconfirmed(_))
+            ));
+        }
+    }
+}
+
+#[test]
+fn tracked_compaction_defers_to_native_queue_writes_and_releases_for_direct_input() {
+    use crate::agent_execution::CompactionOutcome;
+    for retry in [false, true] {
+        let mut adapter = adapter();
+        adapter.queue_available = true;
+        let queued = adapter
+            .command(Command::StartQueued {
+                id: "queued-input".into(),
+            })
+            .unwrap();
+        assert!(adapter.compaction_admission_pending());
+        let queue = adapter
+            .receive(json!({"id":queued.writes[0]["id"],"result":{}}))
+            .unwrap();
+        assert!(adapter.compaction_admission_pending());
+        adapter
+            .receive(json!({"id":queue.writes[0]["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(!adapter.compaction_admission_pending());
+
+        let compact = adapter.tracked_compaction().unwrap();
+        adapter
+            .receive(json!({"id":compact.writes[0]["id"],"result":{}}))
+            .unwrap();
+        let sent = adapter
+            .command(Command::Prompt {
+                text: "continue working".into(),
+                attachments: Vec::new(),
+                mode: PromptMode::Send,
+            })
+            .unwrap();
+        assert!(matches!(
+            sent.compaction,
+            Some(CompactionOutcome::Unconfirmed(_))
+        ));
+        assert!(
+            sent.writes
+                .iter()
+                .any(|frame| frame["method"] == "turn/start")
+        );
+
+        let turn = |id, status| json!({"id":id, "status":status, "items":[]});
+        let notice = |method, turn| json!({"method":method, "params":{"threadId":"thread-exact","turn":turn}});
+        adapter
+            .receive(
+                json!({"id":sent.writes[0]["id"],"result":{"turn":turn("normal","inProgress")}}),
+            )
+            .unwrap();
+        adapter
+            .receive(notice("turn/started", turn("normal", "inProgress")))
+            .unwrap();
+        adapter
+            .receive(notice("turn/completed", turn("normal", "completed")))
+            .unwrap();
+        assert!(!adapter.compaction_pending());
+        if retry {
+            let second = adapter.tracked_compaction().unwrap();
+            assert!(second.compaction.is_none());
+            let ack = adapter
+                .receive(json!({"id":second.writes[0]["id"],"result":{}}))
+                .unwrap();
+            assert!(matches!(
+                ack.compaction,
+                Some(CompactionOutcome::Unconfirmed(_))
+            ));
+        }
+
+        adapter
+            .receive(notice(
+                "turn/started",
+                turn("earlier-compact", "inProgress"),
+            ))
+            .unwrap();
+        let mut completed = turn("earlier-compact", "completed");
+        completed["items"] = json!([{"id":"context","type":"contextCompaction"}]);
+        let settled = adapter
+            .receive(notice("turn/completed", completed))
+            .unwrap();
+        assert!(
+            settled.compaction.is_none(),
+            "the earlier receipt was disowned"
+        );
+        assert!(!adapter.compaction_admission_pending());
+        let next = adapter.tracked_compaction().unwrap();
+        let ack = adapter
+            .receive(json!({"id":next.writes[0]["id"],"result":{}}))
+            .unwrap();
+        if retry {
+            assert!(matches!(
+                ack.compaction,
+                Some(CompactionOutcome::Unconfirmed(_))
+            ));
+        } else {
+            assert!(ack.compaction.is_none());
+        }
+    }
 }

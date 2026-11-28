@@ -92,6 +92,10 @@ impl Reads {
         let actor = self.actor.read().unwrap_or_else(|p| p.into_inner());
         let actor = actor.as_ref()?;
         match request.method.as_str() {
+            "compaction_outcome" => Some(Answer::Value(self.value(request, |args| {
+                let (request,): (uuid::Uuid,) = decode(args)?;
+                Ok(actor.compaction_outcome(request))
+            }))),
             "file_query" => Some(Answer::Value(self.value(request, |args| {
                 let (command,): (Command,) = decode(args)?;
                 actor.file_query(&command)

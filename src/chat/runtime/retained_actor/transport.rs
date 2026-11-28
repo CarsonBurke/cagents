@@ -117,6 +117,7 @@ enum InputPayload {
         text: String,
     },
     IdleCompact,
+    TrackedCompact(uuid::Uuid),
     Command {
         run: Option<crate::model::RunId>,
         command: Command,
@@ -365,6 +366,14 @@ struct Attached {
 }
 #[derive(Clone)]
 pub(crate) struct RemoteActor(Arc<Remote>);
+
+pub(in crate::chat::runtime) struct WeakRemote(std::sync::Weak<Remote>);
+
+impl WeakRemote {
+    pub(in crate::chat::runtime) fn upgrade(&self) -> Option<RemoteActor> {
+        self.0.upgrade().map(RemoteActor)
+    }
+}
 struct Pending {
     identity: InputIdentity,
     payload: Value,
@@ -536,6 +545,10 @@ pub fn fixture_source() -> chat::Session {
     }
 }
 impl RemoteActor {
+    pub(in crate::chat::runtime) fn downgrade(&self) -> WeakRemote {
+        WeakRemote(Arc::downgrade(&self.0))
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture() -> Self {
         Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
@@ -2639,9 +2652,31 @@ impl RemoteActor {
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         self.try_idle_input(InputPayload::IdlePrompt { text })
     }
-    pub(crate) fn try_idle_compact(&self) -> Result<(), Rejection> {
+    pub(crate) fn try_idle_compact(&self, request: Option<uuid::Uuid>) -> Result<(), Rejection> {
+        if let Some(request) = request {
+            match self.try_idle_input(InputPayload::TrackedCompact(request)) {
+                Err(Rejection::Refused(reason)) if reason == UNSUPPORTED_INPUT => {}
+                result => return result,
+            }
+        }
+        // An older helper explicitly refused the new payload before dispatch.
         self.try_idle_input(InputPayload::IdleCompact)
     }
+    pub(crate) fn compaction_outcome(
+        &self,
+        request: uuid::Uuid,
+    ) -> Result<Option<crate::agent_execution::CompactionOutcome>, String> {
+        match self.answer("compaction_outcome", json!([request])) {
+            Ok(Err(reason)) if reason == UNKNOWN_METHOD => Err(
+                "This retained provider was started before compaction outcomes were supported"
+                    .into(),
+            ),
+            Ok(result) => result,
+            Err(_) if !self.state().completed => Ok(None),
+            Err(reason) => Err(reason),
+        }
+    }
+
     fn try_idle_input(&self, payload: InputPayload) -> Result<(), Rejection> {
         let receiver = self
             .enqueue_payload_within(payload, Duration::ZERO)
@@ -4057,8 +4092,13 @@ impl Server {
                         None,
                     ),
                     InputPayload::IdleCompact => {
-                        (super::super::ActorCommand::IdleCompact, None, None)
+                        (super::super::ActorCommand::IdleCompact(None), None, None)
                     }
+                    InputPayload::TrackedCompact(request) => (
+                        super::super::ActorCommand::IdleCompact(Some(request)),
+                        None,
+                        None,
+                    ),
                     InputPayload::Command {
                         run,
                         command,
