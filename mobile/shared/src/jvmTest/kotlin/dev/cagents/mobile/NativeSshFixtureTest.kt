@@ -11,6 +11,7 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeout
 import org.junit.Assume.assumeTrue
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -39,7 +40,7 @@ class NativeSshFixtureTest {
                     try {
                         session.call(Call.Ping)
                         session.call(Call.WatchSessions)
-                        assertEquals(emptyList(), sessions.await().sessions)
+                        assertEquals(emptyList(), withTimeout(15_000) { sessions.await() }.sessions)
                     } finally {
                         session.close()
                         reader.cancelAndJoin()
