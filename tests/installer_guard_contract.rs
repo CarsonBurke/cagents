@@ -2373,7 +2373,12 @@ esac
 exec "$TEST_REAL_CLI" "$@"
 "#,
     );
-    for binary in ["cagents-ui", "cagentsd", "cagents-uninstall"] {
+    for binary in [
+        "cagents-ui",
+        "cagentsd",
+        "cagents-uninstall",
+        "cagents-dictate",
+    ] {
         executable(
             &top.join("bin").join(binary),
             "#!/bin/sh\nprintf 'staged %s\\n' \"$0\" >> \"$TEST_LAUNCHES\"\nexit 90\n",
@@ -2387,6 +2392,7 @@ exec "$TEST_REAL_CLI" "$@"
         "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
         "share/metainfo/dev.cagents.Cagents.metainfo.xml",
         "share/doc/cagents/LICENSE",
+        "share/doc/cagents/THIRD-PARTY-NOTICES",
     ] {
         let file = top.join(relative);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -2462,6 +2468,7 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$TEST_OLD_CLI\"\nprintf '%s\\n' \"$*\"\n",
     );
     fs::copy("/bin/sleep", old.join("cagentsd")).unwrap();
+    executable(&old.join("cagents-dictate"), "#!/bin/sh\nexit 90\n");
     // This version was once staged itself. Its marker must stay obsolete.
     let obsolete = prefix
         .join("versions")
@@ -2624,6 +2631,20 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     launch_route("old");
     owners_untouched(&mut daemon, &mut window);
 
+    let staged_helper = staged_ui.with_file_name("cagents-dictate");
+    let saved_helper = root.join("saved-dictation-helper");
+    fs::rename(&staged_helper, &saved_helper).unwrap();
+    let missing_helper = offer(Some(&staged_ui));
+    assert_eq!(missing_helper["offered"], serde_json::Value::Null);
+    assert!(
+        missing_helper["refused"]
+            .as_str()
+            .unwrap()
+            .contains("bin/cagents-dictate"),
+        "{missing_helper}"
+    );
+    fs::rename(saved_helper, staged_helper).unwrap();
+
     // A present marker must be valid even when selecting the live owner's
     // own tree. Refusal must precede a success receipt or a current change.
     let obsolete_recorded = fs::read(&obsolete).unwrap();
@@ -2719,6 +2740,11 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         select("9.9.8"),
         "is not a complete installation of this prefix",
     );
+    executable(&incomplete.join("cagentsd"), "#!/bin/sh\nexit 90\n");
+    refuse(
+        select("9.9.8"),
+        "Cannot inspect installed bin/cagents-dictate",
+    );
     let elsewhere = root.join("elsewhere");
     let foreign = elsewhere.join("versions/9.9.6/bin");
     fs::create_dir_all(&foreign).unwrap();
@@ -2727,7 +2753,7 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         "cagents install root\n",
     )
     .unwrap();
-    for name in ["cagents", "cagents-ui", "cagentsd"] {
+    for name in ["cagents", "cagents-ui", "cagentsd", "cagents-dictate"] {
         executable(&foreign.join(name), "#!/bin/sh\nexit 90\n");
     }
     std::os::unix::fs::symlink(
@@ -2745,7 +2771,7 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     );
     let unstaged = prefix.join("versions/9.9.7/bin");
     fs::create_dir_all(&unstaged).unwrap();
-    for name in ["cagents", "cagents-ui", "cagentsd"] {
+    for name in ["cagents", "cagents-ui", "cagentsd", "cagents-dictate"] {
         executable(&unstaged.join(name), "#!/bin/sh\nexit 90\n");
     }
     refuse(
@@ -2805,10 +2831,14 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
         .unwrap();
     owners_untouched(&mut daemon, &mut window);
 
-    // Reselect: the staged build and its offer return exactly as staged.
+    // A damaged source still owns its live window and daemon. Reselect the
+    // complete candidate without disturbing either.
+    let old_helper = old.join("cagents-dictate");
+    fs::remove_file(&old_helper).unwrap();
     let output = select(staged);
     assert!(output.status.success(), "{output:?}");
     assert_eq!(current(), Path::new("versions").join(staged));
+    executable(&old_helper, "#!/bin/sh\nexit 90\n");
     assert_eq!(fs::read(&marker).unwrap(), recorded);
     assert_eq!(offer(None)["offered"], staged_ui.to_str().unwrap());
     launch_route("old");
@@ -2899,7 +2929,7 @@ fn selection_withdraws_and_restores_a_staged_build_without_touching_live_owners(
     ] {
         let bin = prefix.join("versions").join(version).join("bin");
         fs::create_dir_all(&bin).unwrap();
-        for name in ["cagents", "cagents-ui", "cagentsd"] {
+        for name in ["cagents", "cagents-ui", "cagentsd", "cagents-dictate"] {
             executable(&bin.join(name), "#!/bin/sh\nexit 90\n");
         }
         let marker = bin.parent().unwrap().join(candidate);

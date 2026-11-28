@@ -619,6 +619,7 @@ fn record_staged_owner(prefix: &Path, version_root: &Path) -> io::Result<()> {
             "staged candidate belongs to another installation",
         ));
     }
+    layout.validated_programs().map_err(io::Error::other)?;
     // A compatible candidate can attach to the preserved daemon, including
     // after an older installed updater completes its reviewed UI handoff.
     // Authenticate both the handshake proof and the kernel socket owner.
@@ -790,7 +791,7 @@ fn selectable_root(prefix: &Path, version_root: &Path) -> io::Result<std::path::
             name.to_string_lossy()
         )));
     }
-    for name in ["cagents", "cagents-ui", "cagentsd"] {
+    for &name in layout.validated_programs().map_err(io::Error::other)? {
         let executable = target.join("bin").join(name);
         let metadata = std::fs::metadata(&executable)?;
         if executable.canonicalize()? != executable
@@ -1909,7 +1910,7 @@ IFS= read -r released <&3
     fn selection_requires_every_companion_to_be_its_exact_executable_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        for companion in ["cagents", "cagents-ui", "cagentsd"] {
+        for companion in ["cagents", "cagents-ui", "cagentsd", "cagents-dictate"] {
             for defect in [
                 "missing",
                 "nonexecutable",
@@ -1918,7 +1919,7 @@ IFS= read -r released <&3
             ] {
                 let root = tempfile::tempdir().unwrap();
                 let prefix = root.path().canonicalize().unwrap();
-                let target = prefix.join("versions/selected");
+                let target = prefix.join("versions/0.2.0+local.selected");
                 let bin = target.join("bin");
                 std::fs::create_dir_all(&bin).unwrap();
                 std::fs::write(
@@ -1926,7 +1927,7 @@ IFS= read -r released <&3
                     "cagents install root\n",
                 )
                 .unwrap();
-                for name in ["cagents", "cagents-ui", "cagentsd"] {
+                for name in ["cagents", "cagents-ui", "cagentsd", "cagents-dictate"] {
                     let path = bin.join(name);
                     std::fs::write(&path, b"fixture").unwrap();
                     std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
@@ -1960,6 +1961,31 @@ IFS= read -r released <&3
                 );
             }
         }
+    }
+
+    #[test]
+    fn selection_still_accepts_a_pre_dictation_local_build() {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().canonicalize().unwrap();
+        let target = prefix.join("versions/0.1.3+local.before");
+        let bin = target.join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::write(
+            prefix.join(".cagents-install-root"),
+            "cagents install root\n",
+        )
+        .unwrap();
+        for name in ["cagents", "cagents-ui", "cagentsd"] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o755)
+                .open(bin.join(name))
+                .unwrap();
+        }
+        assert_eq!(selectable_root(&prefix, &target).unwrap(), target);
     }
 
     #[test]

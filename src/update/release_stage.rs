@@ -2,7 +2,7 @@
 use super::*;
 use std::os::unix::fs::PermissionsExt;
 
-const PROGRAMS: &[&str] = &["cagents", "cagents-ui", "cagentsd", "cagents-dictate"];
+use super::installed::PROGRAMS;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

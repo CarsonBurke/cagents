@@ -42,9 +42,12 @@ fn artifact(job: &str) -> String {
     format!("{job}.linux-handoff.json")
 }
 
-fn request_digest(state: &Path, job: &str) -> Result<String, UpdateError> {
-    let request = read_private(&state.join(format!("{job}.request")), SMALL_ASSET_LIMIT)?;
-    Ok(format!("{:x}", Sha256::digest(request)))
+fn request(state: &Path, job: &str) -> Result<Vec<u8>, UpdateError> {
+    read_private(&state.join(format!("{job}.request")), SMALL_ASSET_LIMIT)
+}
+
+fn request_digest(request: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(request))
 }
 
 impl Handoff {
@@ -79,10 +82,23 @@ impl Handoff {
         Ok(Some(handoff))
     }
 
-    fn verify_target(&self, layout: &InstallLayout) -> Result<(), UpdateError> {
-        if self.target != layout.version_root.join("bin/cagentsd")
-            || installed::stamp(&layout.version_root)? != self.build
-        {
+    fn verify_target(&self, layout: &InstallLayout, state: &Path) -> Result<(), UpdateError> {
+        let request = request(state, &self.job)?;
+        if request_digest(&request) != self.request_digest {
+            return Err(invalid("The approved update request changed"));
+        }
+        let current = match serde_json::from_slice::<UpdateRequest>(&request)? {
+            UpdateRequest::Release(_) | UpdateRequest::ReleaseFromTerminal(_) => {
+                // The signed archive checks the entire tree. Preserve the
+                // core stamp exchanged between workers from different builds.
+                layout.validated_programs()?;
+                installed::core_stamp(&layout.version_root)?
+            }
+            UpdateRequest::Installed { .. } | UpdateRequest::InstalledFromTerminal { .. } => {
+                installed::stamp(&layout.version_root)?
+            }
+        };
+        if self.target != layout.version_root.join("bin/cagentsd") || current != self.build {
             return Err(invalid("The approved replacement executable changed"));
         }
         Ok(())
@@ -93,7 +109,7 @@ impl Handoff {
         if census.transaction != self.job
             || census.source.as_ref() != Some(&self.source)
             || census.digest()? != self.census_digest
-            || request_digest(state, &self.job)? != self.request_digest
+            || request_digest(&request(state, &self.job)?) != self.request_digest
         {
             return Err(invalid(
                 "The approved update request or original census changed",
@@ -118,6 +134,7 @@ pub(super) fn arm(
     target: &Path,
     recovery: &recovery::Context,
     guard: &UiUpdateGuard,
+    local_stamp: Option<&installed::Stamp>,
 ) -> Result<(), UpdateError> {
     let Some(census) = &recovery.census else {
         return Ok(());
@@ -133,17 +150,21 @@ pub(super) fn arm(
         ));
     }
     let layout = locate(target)?;
+    let build = match local_stamp {
+        Some(stamp) => stamp.clone(),
+        None => installed::core_stamp(&layout.version_root)?,
+    };
     let handoff = Handoff {
         job: job.id.clone(),
         worker: Process::read(std::process::id() as i32)?,
         finisher: None,
-        request_digest: request_digest(state, &job.id)?,
+        request_digest: request_digest(&request(state, &job.id)?),
         census_digest: census.digest()?,
         source: checkpoint.proof,
         checkpoint_digest: checkpoint.digest,
         checkpoint_phase: checkpoint.phase,
         target: target.to_owned(),
-        build: installed::stamp(&layout.version_root)?,
+        build,
         windows: guard.reopened_slots(),
         restore_policy: guard.restore_policy(),
         accepted: None,
@@ -229,7 +250,7 @@ pub fn accept(serving: &HostSessionProof) -> Result<Option<String>, UpdateError>
     if handoff.accepted.is_some() || handoff.source.boot_id != serving.boot_id {
         return Ok(None);
     }
-    handoff.verify_target(&layout)?;
+    handoff.verify_target(&layout, &state)?;
     if fs::metadata("/proc/self/exe").map(|m| (m.dev(), m.ino()))? != handoff.build.daemon_inode() {
         return Err(invalid("The successor is not the approved daemon image"));
     }
@@ -333,7 +354,7 @@ pub(crate) fn run_finisher() -> Result<(), UpdateError> {
             "The update finisher received a different or unheld worker lease",
         ));
     }
-    approved.verify_target(&layout)?;
+    approved.verify_target(&layout, &state)?;
     approved.census(&state)?;
     // Close the proof copy before acknowledging. The finisher waits on a
     // fresh description and must never keep the worker's flock alive itself.
@@ -394,7 +415,7 @@ fn finish_windows(
 ) -> Result<Completion, UpdateError> {
     let serving = &accepted.proof;
     let verify_target = || {
-        handoff.verify_target(layout)?;
+        handoff.verify_target(layout, state)?;
         if served_version_root(layout)? != layout.version_root
             || serving.boot_id != handoff.source.boot_id
         {
@@ -497,17 +518,25 @@ mod tests {
         for executable in ["cagentsd", "cagents", "cagents-ui"] {
             fs::write(candidate.join("bin").join(executable), b"fixture").unwrap();
         }
+        installed::write_dictation_fixture(&candidate.join("bin"));
         let source = proof("original");
         let census = serde_json::json!({
             "version": 1, "transaction": id, "source": source, "terminals": [], "chats": [],
         });
         write_state_file(state, &format!("{id}.census.json"), &census).unwrap();
-        write_state_file(state, &format!("{id}.request"), &"reviewed request").unwrap();
+        write_state_file(
+            state,
+            &format!("{id}.request"),
+            &UpdateRequest::Installed {
+                root: candidate.clone(),
+            },
+        )
+        .unwrap();
         let handoff = Handoff {
             job: id.clone(),
             worker,
             finisher: Some(Process::read(std::process::id() as i32).unwrap()),
-            request_digest: request_digest(state, &id).unwrap(),
+            request_digest: request_digest(&request(state, &id).unwrap()),
             census_digest: recovery::Census::load(&recovery::census_path(state, &id))
                 .unwrap()
                 .digest()
@@ -575,6 +604,56 @@ mod tests {
         handoff.census_digest = original;
         write_state_file(state.path(), &format!("{}.request", job.id), &"changed").unwrap();
         assert!(handoff.census(state.path()).is_err());
+    }
+
+    #[test]
+    fn local_handoff_binds_the_helper_and_archive_handoff_accepts_the_core_stamp() {
+        let state = tempfile::tempdir().unwrap();
+        let worker = Process::read(std::process::id() as i32).unwrap();
+        let (job, mut handoff) = saved_handoff(state.path(), worker);
+        let version_root = handoff
+            .target
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_owned();
+        let layout = InstallLayout {
+            prefix: state.path().to_owned(),
+            version_root,
+            version: job.version.clone(),
+        };
+        let helper = layout.version_root.join("bin/cagents-dictate");
+        assert!(handoff.verify_target(&layout, state.path()).is_ok());
+        fs::write(&helper, b"replacement").unwrap();
+        assert!(handoff.verify_target(&layout, state.path()).is_err());
+
+        let asset = Asset {
+            name: "asset".into(),
+            size: 1,
+            sha256: [0; 32],
+        };
+        let release = Release {
+            version: job.version,
+            url: String::new(),
+            notes: String::new(),
+            metadata: [0; 32],
+            required_protocol: None,
+            archive: asset.clone(),
+            checksums: asset.clone(),
+            installer: asset,
+        };
+        write_state_file(
+            state.path(),
+            &format!("{}.request", job.id),
+            &UpdateRequest::Release(release),
+        )
+        .unwrap();
+        handoff.request_digest = request_digest(&request(state.path(), &job.id).unwrap());
+        handoff.build = installed::core_stamp(&layout.version_root).unwrap();
+        assert!(handoff.verify_target(&layout, state.path()).is_ok());
+        fs::remove_file(helper).unwrap();
+        assert!(handoff.verify_target(&layout, state.path()).is_err());
     }
 
     #[test]

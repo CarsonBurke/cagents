@@ -378,6 +378,12 @@ pub(crate) struct InstallLayout {
     version: String,
 }
 
+impl InstallLayout {
+    pub(crate) fn validated_programs(&self) -> Result<&'static [&'static str], UpdateError> {
+        installed::validated_programs(&self.version_root)
+    }
+}
+
 pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
     let executable = executable.canonicalize()?;
     let bin = executable.parent().ok_or_else(unsupported_install)?;
@@ -400,7 +406,9 @@ pub(crate) fn locate(executable: &Path) -> Result<InstallLayout, UpdateError> {
         || meta.uid() != unsafe { libc::geteuid() }
         || meta.len() > 64
         || fs::read_to_string(marker)?.trim_end_matches('\n') != "cagents install root"
-        || !matched_set(bin)
+        || !installed::CORE_PROGRAMS
+            .iter()
+            .all(|name| bin.join(name).is_file())
     {
         return Err(unsupported_install());
     }
@@ -460,14 +468,6 @@ pub(crate) fn stable_ui_bundle(
         return Ok(None);
     }
     Ok(Some(bundle))
-}
-
-/// The three executables are released, installed and spoken as one set: a
-/// version directory holding only some of them cannot host a window.
-fn matched_set(bin: &Path) -> bool {
-    ["cagents", "cagents-ui", "cagentsd"]
-        .iter()
-        .all(|name| bin.join(name).is_file())
 }
 
 struct Installation {
@@ -824,6 +824,7 @@ fn apply_installed_from(window_candidate: Option<&Path>) -> Result<UpdateJob, Up
 }
 
 fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<String, UpdateError> {
+    installed::validated_programs(served)?;
     let source = source::inspect_installed_identity()?;
     let owner = installed_daemon_owner(window)?;
     // A header cannot choose a coordinator. Keep the original socket peer's
@@ -2429,16 +2430,18 @@ fn daemon_protocol_mismatch() -> bool {
 fn superseding_ui_from(executable: &Path) -> Option<PathBuf> {
     let layout = locate(executable).ok()?;
     let served = served_version_root(&layout).ok()?;
-    (served != layout.version_root).then(|| served.join("bin/cagents-ui"))
+    if served == layout.version_root {
+        return None;
+    }
+    installed::validated_programs(&served).ok()?;
+    Some(served.join("bin/cagents-ui"))
 }
 
 /// The version directory this installation currently serves.
 ///
-/// The served tree must be another version of this same installation and as
-/// complete as the one running: closing every window in favour of a tree that
-/// cannot open one is far worse than staying stale. `install.sh` only ever
-/// renames `current` over a finished version directory, so an incomplete
-/// candidate means something else wrote the link.
+/// The served tree must belong to this installation and contain the core
+/// programs. Callers can still identify the served source during repair.
+/// Verify the candidate's full set before selecting a different tree.
 fn served_version_root(layout: &InstallLayout) -> Result<PathBuf, UpdateError> {
     let served = layout.prefix.join("current").canonicalize()?;
     let served_layout = locate(&served.join("bin/cagents-ui"))?;
@@ -2502,6 +2505,7 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
             "only the installed version may reopen saved windows",
         ));
     }
+    layout.validated_programs()?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard
         .prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
@@ -2930,7 +2934,7 @@ fn perform_update(
         )?;
         #[cfg(target_os = "linux")]
         if handoff.is_some() {
-            linux_handoff::arm(state, job, &target_daemon, &recovery, &guard)?;
+            linux_handoff::arm(state, job, &target_daemon, &recovery, &guard, None)?;
         }
         run_installer(
             installation,
@@ -4500,6 +4504,7 @@ mod tests {
             for binary in ["cagents", "cagentsd", "cagents-ui"] {
                 fs::write(bin.join(binary), "fixture").unwrap();
             }
+            super::installed::write_dictation_fixture(&bin);
         }
         std::os::unix::fs::symlink("versions/1.2.3", prefix.join("current")).unwrap();
         let selected = prefix.join("versions/1.2.3/bin/cagents-ui");
@@ -6070,8 +6075,7 @@ finally:
         );
     }
 
-    /// Builds `<root>/{.cagents-install-root,versions/<v>/bin/{cagents,cagents-ui,cagentsd}}`
-    /// and points `current` at `served`.
+    /// Builds complete installations and points `current` at `served`.
     fn install_tree(root: &Path, versions: &[&str], served: &str) {
         fs::write(root.join(".cagents-install-root"), b"cagents install root").unwrap();
         for version in versions {
@@ -6080,6 +6084,7 @@ finally:
             for name in ["cagents", "cagents-ui", "cagentsd"] {
                 fs::write(bin.join(name), b"binary").unwrap();
             }
+            installed::write_dictation_fixture(&bin);
         }
         std::os::unix::fs::symlink(
             root.join("versions").join(served),
@@ -7931,6 +7936,7 @@ mod reconciliation_tests {
         for executable in ["cagents", "cagents-ui", "cagentsd"] {
             fs::write(bin.join(executable), b"fixture").unwrap();
         }
+        installed::write_dictation_fixture(&bin);
         std::os::unix::fs::symlink("versions/0.2.4", prefix.join("current")).unwrap();
         let layout = locate(&bin.join("cagentsd")).unwrap();
         let state = prefix.join(".update");
