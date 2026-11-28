@@ -361,6 +361,7 @@ pub enum Action {
     AccountRestored(CardId, Result<account::remote::RestoredHome, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
+    DraftPermissionResolved(Target, u64, Option<String>),
     /// Opens or closes the account choice.
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
@@ -915,6 +916,7 @@ impl Action {
             | Self::LogicalProseRead(target, ..)
             | Self::MarkdownPrepared(target, ..)
             | Self::LocalPromptPrepared(target, ..)
+            | Self::DraftPermissionResolved(target, ..)
             | Self::ThumbnailLoaded(target, ..)
             | Self::FindGroups(target, ..)
             | Self::FindHighlight(target, ..)
@@ -976,6 +978,7 @@ impl Action {
             Self::RestoreAccount(..) => "RestoreAccount",
             Self::AccountRestored(..) => "AccountRestored",
             Self::DraftSkills(..) => "DraftSkills",
+            Self::DraftPermissionResolved(..) => "DraftPermissionResolved",
             Self::AccountPicker(..) => "AccountPicker",
             Self::DispatchQueued(..) => "DispatchQueued",
             Self::CancelQueued(..) => "CancelQueued",
@@ -1173,6 +1176,7 @@ impl Action {
             Self::Ready(..)
                 | Self::ReadyAfterExitedQueue(..)
                 | Self::DraftStartCheckpointed(..)
+                | Self::DraftPermissionResolved(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -5493,6 +5497,11 @@ impl Runtime {
         if self.target != target {
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
+            if self.draft_permission.pending.is_some() {
+                // A failed first send can restore this recipe under the new
+                // target. The old target's worker cannot answer it.
+                self.draft_permission = DraftPermissionPreview::default();
+            }
             self.target = target;
         }
     }
@@ -5519,11 +5528,14 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let mut draft_permission = DraftPermissionPreview::default();
-        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
+        let permission_mode =
+            match recipe_permission_mode(&session.launch.recipe, session.launch.provider) {
+                PermissionPreview::Known(mode) => mode,
+                PermissionPreview::ReadConfig => None,
+            };
         let mut runtime = Self {
             preparation: preparation::State::default(),
-            draft_permission,
+            draft_permission: DraftPermissionPreview::default(),
             draft_model_chosen: false,
             target,
             session,
@@ -5813,13 +5825,6 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
-    /// The permission mode this draft's launch recipe previews, read from
-    /// provider config only when the recipe changed since the last read.
-    fn draft_permission_mode(&mut self) -> Option<String> {
-        self.draft_permission
-            .get(&self.session.launch.recipe, self.session.launch.provider)
-    }
-
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -7104,11 +7109,7 @@ impl Runtime {
                 .any(|message| &message.id == id)
         });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    self.draft_permission
-                        .get(&self.session.launch.recipe, self.session.launch.provider)
-                });
+            Arc::make_mut(&mut snapshot).permission_mode = self.snapshot.permission_mode.clone();
         }
         if !self.parent_scroll().at_bottom()
             && !snapshot.has_later
@@ -8407,24 +8408,28 @@ fn draft_snapshot(
     }
 }
 
-/// The permission mode a draft's launch recipe previews. Reading it touches
-/// provider config files, so it is computed once per (provider, recipe).
+/// The recipe last considered for a preview, including a resolved absence.
 #[derive(Default)]
 struct DraftPermissionPreview {
-    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+    recipe: Option<(Provider, LaunchRecipe)>,
+    pending: Option<u64>,
+    mode: Option<String>,
 }
 
 impl DraftPermissionPreview {
-    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
-        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
-            && *cached_provider == provider
-            && cached_recipe == recipe
-        {
-            return mode.clone();
-        }
-        let mode = draft_permission_mode(recipe, provider);
-        self.resolved = Some((provider, recipe.clone(), mode.clone()));
-        mode
+    /// Supersede an older read before changing the mode displayed by the draft.
+    fn select(&mut self, provider: Provider, recipe: &LaunchRecipe, mode: Option<String>) {
+        self.recipe = Some((provider, recipe.clone()));
+        self.pending = None;
+        self.mode = mode;
+    }
+
+    fn matches(&self, provider: Provider, recipe: &LaunchRecipe) -> bool {
+        self.recipe
+            .as_ref()
+            .is_some_and(|(old_provider, old_recipe)| {
+                *old_provider == provider && old_recipe == recipe
+            })
     }
 }
 
@@ -8435,7 +8440,12 @@ fn conversation_place() -> String {
         .map_or_else(|| "this computer".to_owned(), |device| device.name.clone())
 }
 
-fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+enum PermissionPreview {
+    Known(Option<String>),
+    ReadConfig,
+}
+
+fn recipe_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> PermissionPreview {
     let arguments = &recipe.arguments;
     match provider {
         Provider::Claude => {
@@ -8443,9 +8453,9 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .iter()
                 .any(|argument| argument == "--dangerously-skip-permissions")
             {
-                return Some("bypassPermissions".into());
+                return PermissionPreview::Known(Some("bypassPermissions".into()));
             }
-            arguments
+            let explicit = arguments
                 .iter()
                 .enumerate()
                 .find_map(|(index, argument)| {
@@ -8469,21 +8479,43 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                             .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
                     })
                     .flatten()
-                })
-                .or_else(|| chat::claude_configured_default_mode(recipe))
-                .or_else(|| Some("manual".into()))
+                });
+            explicit.map_or(PermissionPreview::ReadConfig, |mode| {
+                PermissionPreview::Known(Some(mode))
+            })
         }
-        Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
-        Provider::Omp => None,
+        Provider::Codex => match codex_recipe_policy(recipe) {
+            CodexRecipePolicy::Known(mode) => PermissionPreview::Known(mode.map(str::to_owned)),
+            CodexRecipePolicy::Config { .. } => PermissionPreview::ReadConfig,
+        },
+        Provider::Antigravity | Provider::Muse => {
+            PermissionPreview::Known(chat::acp_permission_mode(recipe, provider))
+        }
+        Provider::Omp => PermissionPreview::Known(None),
     }
 }
 
-/// Preview the launch policy without changing the CLI's configuration. Once
-/// connected, the thread's own reported policy replaces this preview.
-fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    match recipe_permission_mode(recipe, provider) {
+        PermissionPreview::Known(mode) => mode,
+        PermissionPreview::ReadConfig if provider == Provider::Claude => {
+            chat::claude_configured_default_mode(recipe).or_else(|| Some("manual".into()))
+        }
+        PermissionPreview::ReadConfig => codex_draft_permission_mode(recipe),
+    }
+}
+
+enum CodexRecipePolicy<'a> {
+    Known(Option<&'static str>),
+    Config {
+        approval: Option<&'a str>,
+        sandbox: Option<&'a str>,
+    },
+}
+
+fn codex_recipe_policy(recipe: &LaunchRecipe) -> CodexRecipePolicy<'_> {
     if crate::device::is_remote() {
-        return None;
+        return CodexRecipePolicy::Known(None);
     }
     let arguments = &recipe.arguments;
     if arguments.iter().any(|argument| {
@@ -8492,8 +8524,71 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
             "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
         )
     }) {
-        return Some("yolo".into());
+        return CodexRecipePolicy::Known(Some("yolo"));
     }
+    // These recipes are not supported for new native threads. Do not guess
+    // which profile or config override a resumed provider thread uses.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    if arguments.iter().enumerate().any(|(index, argument)| {
+        let override_value = argument.strip_prefix("--config=").or_else(|| {
+            matches!(argument.as_str(), "-c" | "--config")
+                .then(|| arguments.get(index + 1).map(String::as_str))
+                .flatten()
+        });
+        override_value.is_some_and(|value| {
+            value.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
+                )
+            })
+        })
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    let flag = |short: &str, long: &str| {
+        arguments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, argument)| {
+                argument.strip_prefix(&format!("{long}=")).or_else(|| {
+                    (argument == short || argument == long)
+                        .then(|| arguments.get(index + 1).map(String::as_str))
+                        .flatten()
+                })
+            })
+    };
+    let explicit_approval = flag("-a", "--ask-for-approval");
+    let explicit_sandbox = flag("-s", "--sandbox");
+    match (explicit_approval, explicit_sandbox) {
+        (Some(approval), Some(sandbox)) => {
+            CodexRecipePolicy::Known(codex_mode(Some(approval), Some(sandbox)))
+        }
+        (approval, sandbox) => CodexRecipePolicy::Config { approval, sandbox },
+    }
+}
+
+fn codex_mode(approval: Option<&str>, sandbox: Option<&str>) -> Option<&'static str> {
+    match (approval, sandbox) {
+        (Some("never"), Some("danger-full-access")) => Some("yolo"),
+        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite"),
+        (Some("on-request"), Some("read-only")) => Some("readOnly"),
+        _ => None,
+    }
+}
+
+/// Preview the launch policy without changing the CLI's configuration. Once
+/// connected, the thread's own reported policy replaces this preview.
+fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    let (explicit_approval, explicit_sandbox) = match codex_recipe_policy(recipe) {
+        CodexRecipePolicy::Known(mode) => return mode.map(str::to_owned),
+        CodexRecipePolicy::Config { approval, sandbox } => (approval, sandbox),
+    };
     let environment = |name: &str| {
         (!recipe.unset_environment.iter().any(|unset| unset == name))
             .then(|| {
@@ -8522,80 +8617,38 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         .and_then(|contents| contents.parse::<toml::Table>().ok())
         .unwrap_or_default();
 
-    // These recipes are not supported for new native threads. Do not guess
-    // which profile or config override a resumed provider thread uses.
-    if arguments.iter().any(|argument| {
-        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
-    }) {
+    if config.contains_key("profile")
+        || config.contains_key("default_permissions")
+        || config.contains_key("permissions")
+    {
         return None;
     }
-    if arguments.iter().enumerate().any(|(index, argument)| {
-        let override_value = argument.strip_prefix("--config=").or_else(|| {
-            matches!(argument.as_str(), "-c" | "--config")
-                .then(|| arguments.get(index + 1).map(String::as_str))
-                .flatten()
-        });
-        override_value.is_some_and(|value| {
-            value.split_once('=').is_some_and(|(key, _)| {
-                matches!(
-                    key.trim(),
-                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
-                )
-            })
-        })
-    }) {
-        return None;
-    }
-    let flag = |short: &str, long: &str| {
-        arguments
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, argument)| {
-                argument.strip_prefix(&format!("{long}=")).or_else(|| {
-                    (argument == short || argument == long)
-                        .then(|| arguments.get(index + 1).map(String::as_str))
-                        .flatten()
-                })
-            })
-    };
-    let explicit_approval = flag("-a", "--ask-for-approval");
-    let explicit_sandbox = flag("-s", "--sandbox");
-    if explicit_approval.is_none() || explicit_sandbox.is_none() {
-        if config.contains_key("profile")
-            || config.contains_key("default_permissions")
-            || config.contains_key("permissions")
-        {
-            return None;
+    let user_home = environment("HOME").map(PathBuf::from);
+    let user_config = root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
+    for directory in recipe.working_directory.ancestors() {
+        if user_home.as_deref() == Some(directory) {
+            break;
         }
-        let user_home = environment("HOME").map(PathBuf::from);
-        let user_config =
-            root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
-        for directory in recipe.working_directory.ancestors() {
-            if user_home.as_deref() == Some(directory) {
-                break;
-            }
-            let path = directory.join(".codex/config.toml");
-            // The account's own config can also be an ancestor of cwd. It
-            // remains a user layer rather than a second project layer.
-            if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
-                continue;
-            }
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                let project = contents.parse::<toml::Table>().ok()?;
-                if [
-                    "approval_policy",
-                    "sandbox_mode",
-                    "default_permissions",
-                    "permissions",
-                ]
-                .iter()
-                .any(|key| project.contains_key(*key))
-                {
-                    // Trust decides whether Codex loads this layer. Wait
-                    // for its authoritative thread policy rather than guess.
-                    return None;
-                }
+        let path = directory.join(".codex/config.toml");
+        // The account's own config can also be an ancestor of cwd. It
+        // remains a user layer rather than a second project layer.
+        if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let project = contents.parse::<toml::Table>().ok()?;
+            if [
+                "approval_policy",
+                "sandbox_mode",
+                "default_permissions",
+                "permissions",
+            ]
+            .iter()
+            .any(|key| project.contains_key(*key))
+            {
+                // Trust decides whether Codex loads this layer. Wait
+                // for its authoritative thread policy rather than guess.
+                return None;
             }
         }
     }
@@ -8603,12 +8656,7 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         explicit_approval.or_else(|| config.get("approval_policy").and_then(toml::Value::as_str));
     let sandbox =
         explicit_sandbox.or_else(|| config.get("sandbox_mode").and_then(toml::Value::as_str));
-    match (approval, sandbox) {
-        (Some("never"), Some("danger-full-access")) => Some("yolo".into()),
-        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite".into()),
-        (Some("on-request"), Some("read-only")) => Some("readOnly".into()),
-        _ => None,
-    }
+    codex_mode(approval, sandbox).map(str::to_owned)
 }
 
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
@@ -9160,14 +9208,11 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
-        let recipe = moved
-            .as_ref()
-            .map_or(&runtime.session.launch.recipe, |session| {
-                &session.launch.recipe
-            });
-        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
+            snapshot
+                .permission_mode
+                .clone_from(&runtime.snapshot.permission_mode);
         }
         runtime.draft_model_chosen = true;
         runtime.snapshot = Arc::new(snapshot);
@@ -9189,7 +9234,7 @@ impl Cagents {
         self.remember_chat_model(provider, model, reasoning);
         self.replace_chat_conversation(target.card, session);
         let skills = if moved.is_some() {
-            self.load_draft_skills(target)
+            self.load_draft_details(target)
         } else {
             Task::none()
         };
@@ -9300,12 +9345,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
-        self.load_draft_skills(target)
+        self.load_draft_details(target)
     }
 
     /// The managed account `session` was recorded on, when the account list
@@ -9770,6 +9812,55 @@ impl Cagents {
         )
     }
 
+    fn load_draft_details(&mut self, target: Target) -> Task<Message> {
+        Task::batch([
+            self.load_draft_permission(target),
+            self.load_draft_skills(target),
+        ])
+    }
+
+    fn load_draft_permission(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self
+            .chat_card_runtime_mut(target)
+            .filter(|runtime| runtime.is_draft())
+        else {
+            return Task::none();
+        };
+        let provider = runtime.session.launch.provider;
+        let recipe = &runtime.session.launch.recipe;
+        let preview = &mut runtime.draft_permission;
+        if preview.matches(provider, recipe) {
+            // A model choice can replace the draft snapshot without changing its recipe.
+            Arc::make_mut(&mut runtime.snapshot)
+                .permission_mode
+                .clone_from(&preview.mode);
+            return Task::none();
+        }
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        match recipe_permission_mode(recipe, provider) {
+            PermissionPreview::Known(mode) => {
+                snapshot.permission_mode.clone_from(&mode);
+                preview.select(provider, recipe, mode);
+                return Task::none();
+            }
+            PermissionPreview::ReadConfig => {
+                snapshot.permission_mode = None;
+                preview.select(provider, recipe, None);
+            }
+        }
+        static NEXT_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+        preview.pending = Some(read);
+        let recipe = recipe.clone();
+        cosmic::task::future(async move {
+            let mode =
+                tokio::task::spawn_blocking(move || draft_permission_mode(&recipe, provider))
+                    .await
+                    .unwrap_or_default();
+            action(Action::DraftPermissionResolved(target, read, mode))
+        })
+    }
+
     /// Read authored skills on the blocking pool. No daemon or provider is
     /// involved, and a late result cannot replace a different account's list
     /// or the authoritative catalog of a conversation that has started.
@@ -9883,9 +9974,6 @@ impl Cagents {
             }
             runtime.draft_model_chosen = true;
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on,
             // and the composer's note to the launch that refused it.
@@ -9893,14 +9981,13 @@ impl Cagents {
             runtime.composer_note = None;
             runtime.completion.restart(true);
         }
-        if !rehomed {
-            // The skills this window found still answer the draft's home
-            // and directory; another window's model or permission choice
-            // changes neither.
-            return Task::none();
-        }
         let target = runtime.target;
-        self.load_draft_skills(target)
+        if rehomed {
+            self.load_draft_details(target)
+        } else {
+            // The skills still match this provider's home and directory.
+            self.load_draft_permission(target)
+        }
     }
 
     /// Takes the draft out of `card` when another window has started the
@@ -10207,7 +10294,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let mut snapshot = self.chat_draft_snapshot(provider);
+        let snapshot = self.chat_draft_snapshot(provider);
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return Task::none();
         };
@@ -10217,9 +10304,6 @@ impl Cagents {
             to = provider.label(),
             "moved an untouched draft off a provider that isn't installed"
         );
-        snapshot.permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         runtime.snapshot = Arc::new(snapshot);
         runtime.session = session.clone();
         runtime.model_picker = None;
@@ -10231,7 +10315,7 @@ impl Cagents {
         runtime.completion.restart(true);
         let target = runtime.target;
         self.replace_chat_conversation(card, session);
-        Task::batch([self.load_draft_skills(target), self.save_snapshot_soon()])
+        Task::batch([self.load_draft_details(target), self.save_snapshot_soon()])
     }
 
     /// What the start page says when no provider can start a conversation:
@@ -11056,8 +11140,6 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.draft_model_chosen = model_chosen;
-        // The runtime already read its recipe's preview; this is that answer.
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -11076,7 +11158,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([self.load_draft_skills(target), moved])
+        Task::batch([self.load_draft_details(target), moved])
     }
 
     /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
@@ -13831,7 +13913,6 @@ impl Cagents {
             draft_choice::set(&mut draft, &chosen);
         }
         (snapshot.selected_model, snapshot.reasoning) = chosen;
-        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -13849,7 +13930,7 @@ impl Cagents {
         self.observe_agent_activity_for_card(target.card, None);
         Task::batch([
             self.retire_chat(target.card, handle, Some(draft)),
-            self.load_draft_skills(target),
+            self.load_draft_details(target),
         ])
     }
 
@@ -14675,6 +14756,20 @@ impl Cagents {
             }
             Action::OpeningName(card, conversation, title) => {
                 self.opening_name_read(card, conversation, title);
+            }
+            Action::DraftPermissionResolved(target, read, mode) => {
+                if let Some(runtime) = self.chat_card_runtime_mut(target)
+                    && runtime.is_draft()
+                    && runtime.draft_permission.pending == Some(read)
+                    && runtime.draft_permission.matches(
+                        runtime.session.launch.provider,
+                        &runtime.session.launch.recipe,
+                    )
+                {
+                    runtime.draft_permission.pending = None;
+                    runtime.draft_permission.mode.clone_from(&mode);
+                    Arc::make_mut(&mut runtime.snapshot).permission_mode = mode;
+                }
             }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
@@ -18778,12 +18873,17 @@ impl Cagents {
                         // A different launch recipe was never refused.
                         runtime.release_start_block();
                     }
+                    runtime.draft_permission.select(
+                        provider,
+                        &runtime.session.launch.recipe,
+                        Some(mode.clone()),
+                    );
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
                     // Skills found for the earlier launch are not accepted for
                     // this one, so a discovery under way would be dropped.
-                    return self.load_draft_skills(target);
+                    return self.load_draft_details(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }

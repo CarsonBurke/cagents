@@ -756,7 +756,11 @@ fn run(initialized: bool) {
             assert!(
                 matches!(
                     &message,
-                    Message::ChatUi(Action::Retired(_, Ok(())) | Action::DraftSkills(..))
+                    Message::ChatUi(
+                        Action::Retired(_, Ok(()))
+                            | Action::DraftSkills(..)
+                            | Action::DraftPermissionResolved(..)
+                    )
                 ),
                 "unexpected peer task output: {message:?}"
             );
