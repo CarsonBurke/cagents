@@ -612,10 +612,10 @@ fn read(root: &crate::fs_safety::Root, path: &std::path::Path) -> Result<String,
 #[cfg(feature = "host")]
 const MAX_REMOTE_DIFF_SIDE_BYTES: u64 = 2 * 1024 * 1024;
 
-/// Answers a device window's source-control request, as JSON text.
 #[cfg(feature = "host")]
-fn repository(request: crate::repository::RepositoryRequest) -> Result<String, String> {
-    use crate::repository::{CancellationToken, RepositoryService};
+fn select_repository_worktree(
+    request: &mut crate::repository::RepositoryRequest,
+) -> Result<PathBuf, String> {
     let requested = request.worktree();
     let worktree = std::fs::canonicalize(requested).map_err(|error| {
         if matches!(
@@ -630,6 +630,22 @@ fn repository(request: crate::repository::RepositoryRequest) -> Result<String, S
             format!("Couldn't read the device checkout at {}: {error}", requested.display())
         }
     })?;
+    // Confirmed discard must stay in the checkout selected for the mutation
+    // lock, even if the user-facing link changes while the request waits.
+    // Preserve discard's validation of the original absolute path.
+    if let crate::repository::RepositoryRequest::Discard(discard) = request
+        && discard.worktree.is_absolute()
+    {
+        discard.worktree.clone_from(&worktree);
+    }
+    Ok(worktree)
+}
+
+/// Answers a device window's source-control request, as JSON text.
+#[cfg(feature = "host")]
+fn repository(mut request: crate::repository::RepositoryRequest) -> Result<String, String> {
+    use crate::repository::{CancellationToken, RepositoryService};
+    let worktree = select_repository_worktree(&mut request)?;
     // A change waits for any other change to the same worktree, from this
     // window or another, as Device files' Git operations do.
     let too_large = match &request {
@@ -1641,6 +1657,46 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("The device checkout could not be found"));
         assert!(error.contains(checkout.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn device_discard_keeps_the_checkout_selected_for_the_mutation_lock() {
+        use crate::repository::{DiscardRequest, MutationOutcome, RepoPath, RepositoryRequest};
+        use std::{fs, os::unix::fs::symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let original = directory.path().join("original");
+        let replacement = directory.path().join("replacement");
+        for checkout in [&original, &replacement] {
+            fs::create_dir(checkout).unwrap();
+            git_output(checkout, &["init", "-q"]);
+            fs::write(checkout.join("draft.txt"), b"draft\n").unwrap();
+        }
+        let alias = directory.path().join("checkout");
+        symlink("original", &alias).unwrap();
+        let path = RepoPath::parse("draft.txt").unwrap();
+        let mut request = RepositoryRequest::Discard(DiscardRequest {
+            worktree: alias.clone(),
+            tracked: Vec::new(),
+            untracked: vec![path.clone()],
+            confirmed: true,
+        });
+        let selected = select_repository_worktree(&mut request).unwrap();
+        assert_eq!(selected, original.canonicalize().unwrap());
+        fs::remove_file(&alias).unwrap();
+        symlink("replacement", &alias).unwrap();
+
+        let outcome = request
+            .run(
+                &crate::repository::RepositoryService::system("git"),
+                &crate::repository::CancellationToken::new(),
+            )
+            .unwrap()
+            .into_mutation()
+            .unwrap();
+        assert_eq!(outcome, MutationOutcome::Applied { paths: vec![path] });
+        assert!(!original.join("draft.txt").exists());
+        assert_eq!(fs::read(replacement.join("draft.txt")).unwrap(), b"draft\n");
     }
 
     #[test]

@@ -279,6 +279,84 @@ fn text_side(side: &DiffSide) -> &str {
 }
 
 #[test]
+fn symlinked_worktree_supports_snapshot_diff_and_discard() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    let worktree = fixture.root.path().join("work-alias");
+    std::os::unix::fs::symlink("work", &worktree).unwrap();
+    fixture.write("tracked.txt", b"index\n");
+    fixture.git_in_work(&["add", "tracked.txt"]);
+    fixture.commit("initial");
+    fixture.write("tracked.txt", b"worktree\n");
+    fixture.write("draft.txt", b"one\ntwo\n");
+    std::os::unix::fs::symlink("../origin.git", fixture.work().join("external")).unwrap();
+
+    let service = fixture.service();
+    let cancellation = CancellationToken::new();
+    for snapshot in [
+        service.snapshot(&worktree, &cancellation).unwrap(),
+        match service
+            .snapshot_if_changed(&worktree, SnapshotOptions::default(), None, &cancellation)
+            .unwrap()
+        {
+            SnapshotRead::Changed { snapshot, .. } => *snapshot,
+            SnapshotRead::Unchanged => panic!("a first read must return a snapshot"),
+        },
+    ] {
+        let untracked = entry(&snapshot, ChangeArea::Untracked, "draft.txt");
+        assert_eq!(
+            (untracked.added_lines, untracked.removed_lines),
+            (Some(2), Some(0))
+        );
+    }
+
+    let diff = service
+        .diff(
+            &DiffRequest {
+                worktree: worktree.clone(),
+                basis: DiffBasis::IndexToWorktree,
+                path: path("tracked.txt"),
+                old_path: None,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    let DiffContent::Comparison { old, new, .. } = diff else {
+        panic!("expected index-to-worktree comparison, got {diff:?}");
+    };
+    assert_eq!(old.text(), Some("index\n"));
+    assert_eq!(new.text(), Some("worktree\n"));
+
+    let outcome = service
+        .discard(
+            &DiscardRequest {
+                worktree,
+                tracked: vec![PathSelection::new(path("tracked.txt"))],
+                untracked: vec![path("draft.txt"), path("external/HEAD")],
+                confirmed: true,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    let MutationOutcome::PartiallyApplied { paths, failures } = outcome else {
+        panic!("expected a refusal for the symlinked subdirectory, got {outcome:?}");
+    };
+    assert_eq!(paths, vec![path("tracked.txt"), path("draft.txt")]);
+    assert!(matches!(
+        &failures[..],
+        [MutationFailure::Path { path: refused, .. }] if *refused == path("external/HEAD")
+    ));
+    assert_eq!(
+        fs::read(fixture.work().join("tracked.txt")).unwrap(),
+        b"index\n"
+    );
+    assert!(!fixture.work().join("draft.txt").exists());
+    assert!(fixture.root.path().join("origin.git/HEAD").is_file());
+    assert!(!fixture.work().join(".git/index.lock").exists());
+}
+
+#[test]
 fn simultaneous_staged_and_unstaged_state_is_reported_per_area() {
     let Some(fixture) = Fixture::new() else {
         return;
@@ -4439,6 +4517,80 @@ fn discard_blocks_external_staging_under_the_correct_worktree_index_lock() {
 }
 
 #[test]
+fn symlinked_worktree_discard_keeps_using_the_original_index_after_retargeting() {
+    struct RetargetAfterIndexLookup {
+        alias: PathBuf,
+        target: PathBuf,
+    }
+    impl ProcessExecutor for RetargetAfterIndexLookup {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if output.success && command.arguments.iter().any(|arg| arg == "--git-path") {
+                fs::remove_file(&self.alias).unwrap();
+                std::os::unix::fs::symlink(&self.target, &self.alias).unwrap();
+            }
+            Ok(output)
+        }
+    }
+
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("base.txt", b"base\n");
+    fixture.git_in_work(&["add", "base.txt"]);
+    fixture.commit("initial");
+    let linked = fixture.root.path().join("linked");
+    fixture.git_in_work(&[
+        OsStr::new("worktree"),
+        OsStr::new("add"),
+        OsStr::new("-b"),
+        OsStr::new("linked"),
+        linked.as_os_str(),
+    ]);
+    fixture.write("draft.txt", b"untracked in the original checkout\n");
+    fs::write(linked.join("draft.txt"), b"tracked in the other checkout\n").unwrap();
+    fixture.run(&linked, &["add", "draft.txt"]);
+    let alias = fixture.root.path().join("work-alias");
+    std::os::unix::fs::symlink(fixture.work(), &alias).unwrap();
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(RetargetAfterIndexLookup {
+            alias: alias.clone(),
+            target: linked.clone(),
+        }),
+    );
+
+    let outcome = service
+        .discard(
+            &DiscardRequest {
+                worktree: alias.clone(),
+                tracked: Vec::new(),
+                untracked: vec![path("draft.txt")],
+                confirmed: true,
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert_eq!(
+        outcome,
+        MutationOutcome::Applied {
+            paths: vec![path("draft.txt")]
+        }
+    );
+    assert_eq!(fs::read_link(alias).unwrap(), linked);
+    assert!(!fixture.work().join("draft.txt").exists());
+    assert_eq!(
+        fs::read(linked.join("draft.txt")).unwrap(),
+        b"tracked in the other checkout\n"
+    );
+    assert!(!fixture.work().join(".git/index.lock").exists());
+}
+
+#[test]
 fn discard_refuses_foreign_index_lock_and_releases_its_lock_after_path_refusal() {
     let Some(fixture) = Fixture::new() else {
         return;
@@ -5531,15 +5683,17 @@ fn snapshot_reports_a_conflicted_revert() {
 /// still holding conflict markers is refused, staging nothing, until the
 /// user confirms; a resolved one stages as before.
 #[test]
-fn staging_a_conflicted_file_with_markers_needs_confirmation() {
+fn symlinked_worktree_staging_conflict_markers_needs_confirmation() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
     diverged(&fixture);
     fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
     fixture.write("g.txt", b"resolved\n");
+    let worktree = fixture.root.path().join("work-alias");
+    std::os::unix::fs::symlink("work", &worktree).unwrap();
     let request = StageRequest {
-        worktree: fixture.work(),
+        worktree,
         selection: vec![
             PathSelection::new(path("f.txt")),
             PathSelection::new(path("g.txt")),
