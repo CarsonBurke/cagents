@@ -356,7 +356,7 @@ impl Resolver for PublicResolver {
         timeout: NextTimeout,
     ) -> Result<ResolvedSocketAddrs, ureq::Error> {
         let mut addresses = self.empty();
-        for address in DefaultResolver::default().resolve(uri, config, timeout)? {
+        for &address in &DefaultResolver::default().resolve(uri, config, timeout)? {
             if public_address(address.ip()) {
                 addresses.push(address);
             }
