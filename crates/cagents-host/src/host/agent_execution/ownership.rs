@@ -143,7 +143,7 @@ fn running_successor(
     let running = HostedSession::Chat(record.session.clone());
     (record.subscribers.contains_key(&client)
         && record.session.proof.as_ref() == Some(state.proof())
-        && !record.handle.is_completed()
+        && record.provider_running()
         && agent
             .session
             .as_ref()

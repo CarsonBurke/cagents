@@ -396,12 +396,12 @@ fn provider(
         .chats
         .get(&session.id)
         .filter(|record| {
-            record.session.proof == session.proof
-                && record.session.launch.recipe == session.launch.recipe
+            record.provider_running()
+                && crate::agent_execution::same_chat_process(&record.session, session)
         })
         .map(|record| record.handle.clone());
     Ok(Some(match handle {
-        Some(handle) if !handle.is_completed() => {
+        Some(handle) => {
             if handle.is_ready() && !handle.is_idle() {
                 Provider::Busy
             } else {
@@ -1059,9 +1059,8 @@ fn dispatch(
             .chats
             .get(&session.id)
             .filter(|record| {
-                record.session.proof == session.proof
-                    && record.session.launch.recipe == session.launch.recipe
-                    && !record.handle.is_completed()
+                record.provider_running()
+                    && crate::agent_execution::same_chat_process(&record.session, session)
             })
             .ok_or_else(|| {
                 before(
@@ -1576,6 +1575,18 @@ pub(in crate::host) fn given_work(host: &SharedHost, chat: TerminalId) {
 /// refusal leaves the agent with its ended process (still closable) rather
 /// than failing anything; it is logged. Returns whether the agent moved.
 pub(in crate::host) fn follow_restart(host: &SharedHost, started: &chat::Session) -> bool {
+    let live = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&started.id)
+        .is_some_and(|record| {
+            record.provider_running()
+                && crate::agent_execution::same_chat_process(&record.session, started)
+        });
+    if !live {
+        return false;
+    }
     match adopt_resumed(host, started) {
         Ok(true) => {
             // Until it is given work, ending it only reopens the agent's

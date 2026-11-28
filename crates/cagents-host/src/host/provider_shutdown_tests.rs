@@ -202,6 +202,10 @@ impl Drop for ProcessPin {
 }
 
 fn quiet_chat(root: &Path) -> Handle {
+    quiet_chat_transport(root, TransportSpec::JsonLines)
+}
+
+fn quiet_chat_transport(root: &Path, transport: TransportSpec) -> Handle {
     struct Quiet;
     impl Adapter for Quiet {
         fn initialize(&mut self) -> Result<Step, String> {
@@ -220,7 +224,7 @@ fn quiet_chat(root: &Path) -> Handle {
         execution: None,
         messages: None,
         unset_environment: Default::default(),
-        transport: TransportSpec::JsonLines,
+        transport,
         program: "/bin/cat".into(),
         arguments: Vec::new(),
         working_directory: root.to_owned(),
@@ -1711,6 +1715,49 @@ fn a_send_to_a_restarted_chat_lets_its_agent_follow() {
         registry.lock().unwrap().agent(agent.id).unwrap().session,
         Some(HostedSession::Chat(reopened))
     );
+    handle.close().unwrap();
+}
+
+#[test]
+fn a_read_only_history_reader_does_not_take_over_the_agent() {
+    use crate::agent_execution::HostedSession;
+    let directory = tempfile::tempdir().unwrap();
+    let (registry, agent, source, _) = reopenable_agent(
+        directory.path(),
+        crate::agent::Provider::Claude,
+        chat::NativeContinuity::ReconnectOnly,
+    );
+    let restarted = HostSessionProof {
+        host_session_id: HostSessionId::new("first-daemon-again"),
+        host_incarnation: HostIncarnation::new("first-incarnation-again"),
+        ..boot_proof("first")
+    };
+    let reader = chat::Session {
+        proof: Some(restarted.clone()),
+        ..source.clone()
+    };
+    let handle = quiet_chat_transport(directory.path(), TransportSpec::History);
+    assert!(handle.is_read_only_history());
+    assert!(!handle.is_completed());
+    let mut state = HostState::new(restarted);
+    state.install_model(registry);
+    let mut read_only = record(reader.clone(), handle.clone());
+    read_only.subscribers.insert(17, false);
+    state.chats.insert(reader.id, read_only);
+    let host = Arc::new(state::HostLock::new(state));
+
+    // The start callback and a subsequent window request must both leave
+    // the binding intact. The history reader is still available for reads.
+    assert!(!agent_execution::follow_restart(&host, &reader));
+    assert!(send_from_window(&host, reader.id).is_err());
+    let registry = agent_execution::registry(&host).unwrap();
+    let registry = registry.lock().unwrap();
+    assert_eq!(
+        registry.agent(agent.id).unwrap().session,
+        Some(HostedSession::Chat(source))
+    );
+    assert!(!registry.agent_process_ended(agent.id).unwrap());
+    drop(registry);
     handle.close().unwrap();
 }
 
