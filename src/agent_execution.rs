@@ -138,6 +138,8 @@ pub enum AcceptanceError {
     MailboxFull(String),
     #[error("{0}")]
     StoreBusy(String),
+    #[error("An update is in progress. Try sending the prompt again when it finishes.")]
+    UpdateInProgress,
     /// Nothing was accepted; the same request succeeds once a slot frees.
     #[error("{0}")]
     LimitReached(concurrency::LimitReached),

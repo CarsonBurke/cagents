@@ -805,12 +805,7 @@ fn open_for_work(host: &SharedHost) -> Result<(), String> {
     const HELD: &str =
         "The daemon is not starting new work now, as during an update; try again shortly";
     crate::host::client::ensure_control_open(host).map_err(|_| HELD.to_owned())?;
-    let courier = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .mailbox
-        .clone();
-    if courier.is_some_and(|courier| courier.defers_for_update()) {
+    if mailbox::defers_for_update(host) {
         return Err(HELD.into());
     }
     Ok(())
