@@ -1,16 +1,10 @@
 //! Whether a provider's answer can have changed since its account was last
 //! probed.
 //!
-//! Claude and Codex report usage figures that change as the account is
-//! used, so their probes follow the schedule. Antigravity and Muse report
-//! none: their answer is whether the sign-in works, the plan and the models,
-//! which change when the CLI, its sign-in or its model list does. Each of
-//! those leaves a trace on this machine: Antigravity's sign-in is a file
-//! since cagents has it kept in one, though an Antigravity from before
-//! 1.5.18 still keeps it in the desktop keyring. So a probe, which for
-//! Antigravity starts a whole `agy acp` server, is spent only when one of
-//! them changed, or once [`UNCHANGED_FOR`] has passed for what no file
-//! shows: a plan changed elsewhere, or an older Antigravity's sign-in.
+//! Usage figures change as an account is used, so those probes follow the
+//! schedule. Muse reports whether the sign-in works, the plan and the models.
+//! Its probe runs when the CLI, sign-in or catalog changes, or after
+//! [`UNCHANGED_FOR`] has passed in case something changed elsewhere.
 //!
 //! The reader's own refreshes, sign-ins and a conversation's report that
 //! the account needs attention always probe.
@@ -37,37 +31,27 @@ pub(super) fn fingerprint(
     program: &Path,
     environment: &dyn Fn(&str) -> Option<String>,
 ) -> Option<String> {
-    let mut paths = vec![program.to_path_buf()];
-    match account.provider {
-        Provider::Claude | Provider::Codex | Provider::Omp => return None,
-        Provider::Antigravity => {
-            // Its default model, then the sign-in the agents cagents starts
-            // keep in a file (see [`crate::account::credential_storage`]).
-            let home = account.home_directory(environment)?;
-            paths.push(home.join("antigravity-cli/settings.json"));
-            paths.push(antigravity_sign_in(&home));
-        }
-        Provider::Muse => {
-            // Its sign-in, then the catalog its models are read from.
-            paths.push(muse_sign_in(account, environment)?);
-            let catalog = super::muse::data_home(environment)?.join("model-catalog");
-            // Sorted before it is cut short, so a long catalog is read as
-            // the same entries each time.
-            let mut entries = std::fs::read_dir(&catalog)
-                .map(|entries| {
-                    entries
-                        .filter_map(Result::ok)
-                        .map(|entry| entry.path())
-                        .take(4096)
-                        .collect::<Vec<PathBuf>>()
-                })
-                .unwrap_or_default();
-            entries.sort();
-            entries.truncate(256);
-            paths.push(catalog);
-            paths.extend(entries);
-        }
+    if account.provider != Provider::Muse {
+        return None;
     }
+    let mut paths = vec![program.to_path_buf()];
+    paths.push(muse_sign_in(account, environment)?);
+    let catalog = super::muse::data_home(environment)?.join("model-catalog");
+    // Sorted before it is cut short, so a long catalog is read as
+    // the same entries each time.
+    let mut entries = std::fs::read_dir(&catalog)
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .take(4096)
+                .collect::<Vec<PathBuf>>()
+        })
+        .unwrap_or_default();
+    entries.sort();
+    entries.truncate(256);
+    paths.push(catalog);
+    paths.extend(entries);
     let mut digest = Sha256::new();
     for path in paths {
         digest.update(path.as_os_str().as_encoded_bytes());
@@ -121,20 +105,13 @@ pub(super) fn muse_sign_in(
 
 /// Whether an unchanged fingerprint vouches for an answer of `status`.
 ///
-/// A working sign-in stands while nothing it depends on changed. A sign-in
-/// that does not work stands only where the fingerprint covers it: Muse's,
-/// in its sign-in file, but not every Antigravity's - one from before
-/// 1.5.18 keeps it in the keyring - so a signed-out Antigravity is asked
-/// again on schedule, the moment it is most likely to be signed in from
-/// outside cagents. A login refused for having
-/// no allowance changes with a subscription bought elsewhere, and an answer
-/// that could not be had says nothing, so both are asked again.
-pub(super) fn vouches_for(provider: Provider, status: UsageStatus) -> bool {
-    match status {
-        UsageStatus::Ok | UsageStatus::Warning => true,
-        UsageStatus::NeedsLogin => provider == Provider::Muse,
-        UsageStatus::Limited | UsageStatus::Unavailable => false,
-    }
+/// Muse's fingerprint covers its sign-in file. A new subscription can lift
+/// a limit on its own, and a failed check says nothing, so both are asked again.
+pub(super) fn vouches_for(status: UsageStatus) -> bool {
+    matches!(
+        status,
+        UsageStatus::Ok | UsageStatus::Warning | UsageStatus::NeedsLogin
+    )
 }
 
 #[cfg(test)]
@@ -175,30 +152,13 @@ mod tests {
             fingerprint(&Account::system(Provider::Claude), &program, &environment),
             None
         );
-        let agy = Account::system(Provider::Antigravity);
-        let before = fingerprint(&agy, &program, &environment).unwrap();
-        std::fs::create_dir_all(root.join(".gemini/antigravity-cli")).unwrap();
-        std::fs::write(root.join(".gemini/antigravity-cli/settings.json"), b"{}").unwrap();
-        let configured = fingerprint(&agy, &program, &environment).unwrap();
-        assert_ne!(configured, before);
-        // A sign-in, which `agy` kept to file storage writes beside it.
-        std::fs::write(
-            root.join(".gemini/antigravity-cli/antigravity-oauth-token"),
-            b"{}",
-        )
-        .unwrap();
-        assert_ne!(
-            fingerprint(&agy, &program, &environment).unwrap(),
-            configured
+        assert_eq!(
+            fingerprint(
+                &Account::system(Provider::Antigravity),
+                &program,
+                &environment
+            ),
+            None
         );
-    }
-
-    #[test]
-    fn a_signed_out_antigravity_is_asked_again_and_muse_is_not() {
-        assert!(vouches_for(Provider::Muse, UsageStatus::NeedsLogin));
-        assert!(vouches_for(Provider::Antigravity, UsageStatus::Ok));
-        assert!(!vouches_for(Provider::Antigravity, UsageStatus::NeedsLogin));
-        // A subscription bought elsewhere leaves no trace here.
-        assert!(!vouches_for(Provider::Muse, UsageStatus::Limited));
     }
 }

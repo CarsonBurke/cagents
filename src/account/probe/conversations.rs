@@ -65,7 +65,7 @@ pub async fn list(
     let provider = account.provider;
     let label = super::cli_name(provider);
     let arguments: &[&str] = match provider {
-        // Telemetry stays off, as in every Antigravity process cagents runs.
+        // Telemetry stays off for cagents' ACP sessions.
         Provider::Antigravity => &["acp", "--disable-telemetry"],
         // So does contributor mode, as in Muse's native chat.
         Provider::Muse => &["acp", "--contributor-mode", "off"],

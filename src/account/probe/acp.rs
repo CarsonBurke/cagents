@@ -10,14 +10,15 @@
 use std::{
     ffi::OsStr,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use serde_json::{Value, json};
-use tokio::process::Command;
+use tokio::{process::Command, time::Instant};
 
 use super::{CatalogObservation, Identity, Observed, Probed, Session, UsageSnapshot, UsageStatus};
 use crate::{
-    account::Account,
+    account::{Account, UsageWindow, status_for},
     chat::{Model, acp_levels},
 };
 
@@ -46,6 +47,7 @@ pub(super) async fn probe_antigravity(
     account: &Account,
     program: &Path,
     search_path: Option<&OsStr>,
+    deadline: Instant,
 ) -> Result<Probed, String> {
     let home = account
         .resolved_home()
@@ -56,7 +58,8 @@ pub(super) async fn probe_antigravity(
     command
         .args(["acp", "--disable-telemetry", "--app-data-dir"])
         .arg(ANTIGRAVITY_PROBE_DATA);
-    let probed = probe_antigravity_in(data, command).await;
+    let usage = super::command_with_path(account, program, search_path);
+    let probed = probe_antigravity_in(data, command, usage, deadline).await;
     // A probe follows every sign-in, so the sign-in it made is private by
     // the time anyone is told it worked.
     let _ = tokio::task::spawn_blocking(move || keep_sign_in_private(&home)).await;
@@ -116,7 +119,12 @@ fn share_sign_in(data: &Path) {
 /// its timeout, and again before the next probe, for anything a probe cut
 /// short at a moment no cleanup could follow: nothing in `data` is anyone's
 /// conversation.
-async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Probed, String> {
+async fn probe_antigravity_in(
+    data: PathBuf,
+    mut command: Command,
+    mut usage: Command,
+    deadline: Instant,
+) -> Result<Probed, String> {
     let workspace = data.join("workspace");
     // Waited for without blocking a thread, so a probe abandoned by its
     // timeout stops waiting as well, whatever holds the lock.
@@ -155,7 +163,18 @@ async fn probe_antigravity_in(data: PathBuf, mut command: Command) -> Result<Pro
         value: opened,
         observed_at,
     } = result?;
-    Ok(probed("Antigravity", opened, observed_at))
+    if !opened.signed_in {
+        return Ok(signed_out(opened.version.as_deref(), observed_at));
+    }
+    usage.current_dir(&workspace);
+    // Keep time to return the sign-in and catalog if quota stalls, including
+    // on a forced refresh that used part of its budget waiting for admission.
+    let quota_deadline = deadline
+        .checked_sub(Duration::from_secs(1))
+        .unwrap_or_else(Instant::now);
+    let quota =
+        super::antigravity_usage::read(usage, opened.version.as_deref(), quota_deadline).await;
+    Ok(probed(opened, observed_at, quota))
 }
 
 /// The lock a probe of a data directory holds there from before it starts
@@ -221,27 +240,38 @@ impl Drop for Claim {
     }
 }
 
-/// The account as a probe's opened session describes it.
-fn probed(label: &str, opened: Opened, observed_at: u64) -> Probed {
-    if !opened.signed_in {
-        return Probed::state(
-            UsageStatus::NeedsLogin,
-            &format!(
-                "Signed out of {label}. {}",
-                crate::agent::antigravity::sign_in_advice(opened.version.as_deref())
-            ),
-            observed_at,
-            None,
-        );
-    }
-    // A working sign-in with no limits to report: the account is there to
-    // use, so it is listed, and its chip says it reports no limits. An
-    // `Unavailable` system account is one that isn't set up, and isn't shown.
-    let mut snapshot = UsageSnapshot::state(
-        UsageStatus::Ok,
-        format!("{label} does not report usage limits"),
+fn signed_out(version: Option<&str>, observed_at: u64) -> Probed {
+    Probed::state(
+        UsageStatus::NeedsLogin,
+        &format!(
+            "Signed out of Antigravity. {}",
+            crate::agent::antigravity::sign_in_advice(version)
+        ),
         observed_at,
-    );
+        None,
+    )
+}
+
+/// A signed-in account, combining its opened session and quota report.
+fn probed(
+    opened: Opened,
+    observed_at: u64,
+    quota: Result<Observed<Vec<UsageWindow>>, &'static str>,
+) -> Probed {
+    // The session independently confirms sign-in and provides the catalog.
+    let mut snapshot = match quota {
+        Ok(quota) => {
+            let mut snapshot = UsageSnapshot::state(
+                status_for(&quota.value, false, false),
+                "",
+                quota.observed_at,
+            );
+            snapshot.windows = quota.value;
+            snapshot.detail = None;
+            snapshot
+        }
+        Err(detail) => UsageSnapshot::state(UsageStatus::Ok, detail, observed_at),
+    };
     snapshot.plan_display_name = opened.tier.clone();
     Probed {
         // A session opened, so the sign-in works, whoever it belongs to.
@@ -572,47 +602,21 @@ mod tests {
     }
 
     #[test]
-    fn a_signed_out_agent_asks_for_sign_in_and_a_signed_in_one_reports_its_plan() {
-        let signed_out = probed("Antigravity", Opened::default(), 7);
-        assert_eq!(signed_out.snapshot.status, UsageStatus::NeedsLogin);
-        assert!(signed_out.identity.is_none());
+    fn a_signed_out_agent_asks_for_sign_in() {
+        let current = signed_out(None, 7);
+        assert_eq!(current.snapshot.status, UsageStatus::NeedsLogin);
+        assert!(current.identity.is_none());
         // The sign-in it asks for is the one its agents read, apart from
         // the desktop keyring, unless the agent is too old to keep it so.
-        let detail = signed_out.snapshot.detail.unwrap();
+        let detail = current.snapshot.detail.unwrap();
         assert!(
             detail.starts_with("Signed out of Antigravity. "),
             "{detail}"
         );
         assert!(detail.contains("not the desktop keyring"), "{detail}");
-        let outdated = probed(
-            "Antigravity",
-            Opened {
-                version: Some("1.5.15".into()),
-                ..Opened::default()
-            },
-            7,
-        );
+        let outdated = signed_out(Some("1.5.15"), 7);
         let detail = outdated.snapshot.detail.unwrap();
         assert!(detail.contains("agy update"), "{detail}");
-        let signed_in = probed(
-            "Antigravity",
-            Opened {
-                signed_in: true,
-                tier: Some("Google AI Pro".into()),
-                ..Opened::default()
-            },
-            7,
-        );
-        assert_eq!(signed_in.snapshot.status, UsageStatus::Ok);
-        assert!(signed_in.snapshot.windows.is_empty());
-        assert_eq!(
-            signed_in.snapshot.plan_display_name.as_deref(),
-            Some("Google AI Pro")
-        );
-        assert!(super::super::confirms_login(
-            signed_in.identity.as_ref(),
-            signed_in.snapshot.status
-        ));
     }
 
     #[test]
@@ -704,17 +708,31 @@ mod tests {
         fn command(&self) -> Command {
             let mut command = Command::new(&self.program);
             command
-                .args(["acp", "--disable-telemetry", "--app-data-dir"])
-                .arg(ANTIGRAVITY_PROBE_DATA)
                 .env("HOME", self.directory.path())
+                .env("XDG_CONFIG_HOME", self.directory.path().join("config"))
                 .env("FAKE_ACP_SHAPE", "agy")
+                .env("FAKE_ACP_VERSION", "1.5.18")
                 .env("FAKE_ACP_STATE", self.directory.path().join("state"))
+                .current_dir(self.directory.path())
                 .stdin(std::process::Stdio::null())
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .kill_on_drop(true)
                 .process_group(0);
             command
+        }
+
+        async fn probe(&self) -> Result<Probed, String> {
+            self.probe_before(Instant::now() + super::super::TIMEOUT)
+                .await
+        }
+
+        async fn probe_before(&self, deadline: Instant) -> Result<Probed, String> {
+            let mut command = self.command();
+            command
+                .args(["acp", "--disable-telemetry", "--app-data-dir"])
+                .arg(ANTIGRAVITY_PROBE_DATA);
+            probe_antigravity_in(self.data(), command, self.command(), deadline).await
         }
 
         /// The session files left in the probe's data directory.
@@ -729,7 +747,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_probe_reads_each_model_s_levels_and_leaves_no_session_behind() {
+    async fn a_stalled_quota_read_preserves_sign_in_before_the_refresh_deadline() {
+        let agent = Agent::new();
+        agent.mark("quota-hangs");
+        // A forced refresh can reach the probe with most of its time spent.
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let signed_in = tokio::time::timeout_at(deadline, agent.probe_before(deadline))
+            .await
+            .expect("quota gave back the remaining time")
+            .unwrap();
+        assert_eq!(signed_in.snapshot.status, UsageStatus::Ok);
+        assert!(signed_in.snapshot.windows.is_empty());
+        assert_eq!(
+            signed_in.snapshot.detail.as_deref(),
+            Some("Antigravity did not return usage limits in time")
+        );
+        assert_eq!(
+            signed_in.snapshot.plan_display_name.as_deref(),
+            Some("Google AI Pro")
+        );
+        assert!(signed_in.catalog.is_some());
+        assert!(super::super::confirms_login(
+            signed_in.identity.as_ref(),
+            signed_in.snapshot.status
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_probe_reads_model_levels_and_quota_and_leaves_no_session_behind() {
         let agent = Agent::new();
         // What an earlier probe, cut short, left.
         let stale = agent
@@ -737,16 +782,39 @@ mod tests {
             .join("conversations/16a9c3a8-8d41-4d2e-9a1c-8b8e2b0f7c11.db");
         std::fs::create_dir_all(stale.parent().unwrap()).unwrap();
         std::fs::write(&stale, b"").unwrap();
-        let probed = probe_antigravity_in(agent.data(), agent.command())
-            .await
-            .unwrap();
-        assert_eq!(probed.snapshot.status, UsageStatus::Ok);
-        assert_eq!(
-            probed.snapshot.plan_display_name.as_deref(),
-            Some("Google AI Pro")
-        );
+        let outcome = agent.probe().await.unwrap().into_outcome();
+        // Remote probes send this JSON value in a binary device-service reply.
+        use crate::device_service::Reply;
+        let reply = Reply::AccountProbe(serde_json::to_value(&outcome).unwrap());
+        let bytes = postcard::to_allocvec(&reply).unwrap();
+        let Reply::AccountProbe(json) = postcard::from_bytes(&bytes).unwrap() else {
+            panic!("expected an account probe reply");
+        };
+        let decoded = serde_json::from_value(json).unwrap();
+        assert_eq!(outcome, decoded);
+        let super::super::Outcome::Answered {
+            identity,
+            snapshot,
+            catalog,
+        } = decoded
+        else {
+            panic!("expected a quota observation");
+        };
+        assert!(identity.is_some());
+        assert_eq!(snapshot.status, UsageStatus::Warning);
+        assert_eq!(snapshot.windows.len(), 4);
+        assert_eq!(snapshot.detail, None);
+        let remaining = crate::account::info::RemainingWindow::of(&snapshot, snapshot.observed_at);
+        assert_eq!(remaining[0].window.span_secs, Some(5 * 3600));
+        assert!((remaining[0].remaining_fraction - 0.65).abs() < 0.0001);
+        assert!(remaining.iter().all(|row| {
+            row.window.kind == crate::account::WindowKind::Scoped
+                && row.window.resets_at.is_some()
+                && !row.reset_elapsed
+        }));
+        assert_eq!(snapshot.plan_display_name.as_deref(), Some("Google AI Pro"));
         // Each model with its own levels, as the fixture's agy offers them.
-        let catalog = probed.catalog.unwrap();
+        let catalog = catalog.unwrap();
         let levels = catalog
             .models
             .iter()
@@ -763,18 +831,28 @@ mod tests {
         );
         assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
 
+        agent.mark("quota-unavailable");
+        let unavailable = agent.probe().await.unwrap();
+        assert_eq!(unavailable.snapshot.status, UsageStatus::Ok);
+        assert!(unavailable.identity.is_some());
+        assert!(unavailable.catalog.is_some());
+        assert!(unavailable.snapshot.windows.is_empty());
+        assert_eq!(
+            unavailable.snapshot.detail.as_deref(),
+            Some("Antigravity returned no quota figures for this account")
+        );
+
         agent.mark("signed-out");
-        let signed_out = probe_antigravity_in(agent.data(), agent.command())
-            .await
-            .unwrap();
+        let signed_out = agent.probe().await.unwrap();
         assert_eq!(signed_out.snapshot.status, UsageStatus::NeedsLogin);
+        assert!(signed_out.identity.is_none());
     }
 
     #[tokio::test]
     async fn a_probe_abandoned_by_its_timeout_leaves_no_session_behind() {
         let agent = Agent::new();
         agent.mark("hang-probe");
-        let mut probe = Box::pin(probe_antigravity_in(agent.data(), agent.command()));
+        let mut probe = Box::pin(agent.probe());
         // Abandon it once the agent has saved all four entries of the
         // session it will not answer for.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -803,7 +881,8 @@ mod tests {
     async fn a_probe_waits_for_another_rather_than_removing_its_session() {
         let agent = Agent::new();
         agent.mark("hang-probe");
-        let mut first = Box::pin(probe_antigravity_in(agent.data(), agent.command()));
+        let agent = std::sync::Arc::new(agent);
+        let mut first = Box::pin(agent.probe());
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while agent.sessions().len() < SESSION_STORES.len() {
             assert!(
@@ -815,7 +894,8 @@ mod tests {
                 () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
             }
         }
-        let mut second = tokio::spawn(probe_antigravity_in(agent.data(), agent.command()));
+        let second_agent = agent.clone();
+        let mut second = tokio::spawn(async move { second_agent.probe().await });
         tokio::select! {
             _ = &mut second => panic!("the second probe did not wait"),
             () = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
@@ -829,7 +909,7 @@ mod tests {
             .expect("the second probe finished")
             .unwrap()
             .unwrap();
-        assert_eq!(probed.snapshot.status, UsageStatus::Ok);
+        assert_eq!(probed.snapshot.status, UsageStatus::Warning);
         assert_eq!(agent.sessions(), Vec::<PathBuf>::new());
     }
 }

@@ -1007,7 +1007,7 @@ pub enum WindowKind {
     Session,
     /// A weekly allowance shared by everything the account does.
     Weekly,
-    /// A weekly allowance for one model or surface.
+    /// An allowance for one model, model pool or surface.
     Scoped,
     /// A limit the provider reported under a name cagents does not know. It
     /// is still shown, under the provider's own words, rather than dropped.
@@ -1351,7 +1351,7 @@ pub fn tightest<'a>(windows: impl IntoIterator<Item = &'a UsageWindow>) -> Optio
 /// The status a set of windows describes.
 ///
 /// Only a window the whole account depends on makes it Limited: one model's
-/// weekly allowance running out leaves every other model usable, which is a
+/// allowance running out leaves other models usable, which is a
 /// warning about that model rather than an account that cannot work.
 pub fn status_for(
     windows: &[UsageWindow],
