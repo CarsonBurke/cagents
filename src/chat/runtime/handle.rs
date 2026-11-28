@@ -49,7 +49,7 @@ impl Handle {
         Self,
         impl FnOnce(RetainedInputOutcome) -> u64 + Send + 'static,
     ) {
-        let remote = RemoteActor::fixture();
+        let remote = RemoteActor::mailbox_input_fixture();
         let responder = remote.clone();
         (Self(Owner::Remote(remote)), move |outcome| {
             responder.settle_input_fixture(outcome)
@@ -199,15 +199,13 @@ impl Handle {
         RemoteActor::adopt_for_close(record, source, proof, notify)
             .map(|remote| Self(Owner::Remote(remote)))
     }
-    /// Lets the daemon open, with `recognizer`, the frames it sealed in what
-    /// a retained helper built before them shows as a person's prompts. A
-    /// conversation this process owns opens them itself.
-    pub fn open_frames_for_older_helper(
+    /// Recognize older inline frames the helper projects as plain text.
+    pub fn open_retained_mailbox(
         &self,
-        recognizer: &std::sync::Arc<crate::agent_execution::mailbox::Recognizer>,
+        recognizer: std::sync::Arc<crate::agent_execution::mailbox::Recognizer>,
     ) {
         if let Owner::Remote(remote) = &self.0 {
-            remote.open_frames_for_older_helper(recognizer);
+            remote.open_mailbox_frames(recognizer);
         }
     }
     pub fn is_close_only(&self) -> bool {
@@ -396,6 +394,27 @@ impl Handle {
             Owner::Remote(remote) => remote.try_idle_prompt(text),
         }
     }
+    pub fn accepts_mailbox_evidence(&self) -> bool {
+        match &self.0 {
+            Owner::Local(_) => true,
+            Owner::Remote(remote) => remote.accepts_mailbox_evidence(),
+        }
+    }
+    pub fn deliver_mailbox(
+        &self,
+        run: Option<crate::model::RunId>,
+        text: String,
+        evidence: crate::agent_execution::mailbox::FrameEvidence,
+    ) -> Result<(), Rejection> {
+        match &self.0 {
+            Owner::Local(local) => match run {
+                Some(run) => local.command_for_run(run, mailbox_command(text)),
+                None => local.try_idle_prompt(text),
+            },
+            Owner::Remote(remote) => remote.deliver_mailbox(run, text, evidence),
+        }
+    }
+
     /// Exact source recognition is checked by the helper under this attachment epoch.
     pub fn recognize_retained_sources(&self, sources: &[chat::Session]) -> Result<(), String> {
         match &self.0 {
@@ -944,6 +963,14 @@ impl chat::protocol::LaunchCleanup for Handle {
         }
     }
 }
+pub(super) fn mailbox_command(text: String) -> Command {
+    Command::Prompt {
+        text,
+        attachments: Vec::new(),
+        mode: crate::chat::PromptMode::Send,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

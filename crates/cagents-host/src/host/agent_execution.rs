@@ -1282,20 +1282,26 @@ fn dispatch(
     given_work(host, session.id);
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
-    handle
-        .command_for_run(
-            accepted.run.id,
+    let run = accepted.run.id;
+    let submission = if request
+        .idempotency_key
+        .starts_with(crate::agent_execution::MESSAGE_RUN_KEY)
+    {
+        mailbox::deliver_run(host, session.id, run, &handle, request.prompt)
+    } else {
+        handle.command_for_run(
+            run,
             Command::Prompt {
                 text: request.prompt,
                 attachments: Vec::new(),
                 mode: PromptMode::Send,
             },
         )
-        .map_err(|rejection| match rejection {
-            chat::runtime::Rejection::Refused(error) => before(error),
-            chat::runtime::Rejection::Unacknowledged(error) => (State::Interrupted, error),
-        })?;
-    let _ = session;
+    };
+    submission.map_err(|rejection| match rejection {
+        chat::runtime::Rejection::Refused(error) => before(error),
+        chat::runtime::Rejection::Unacknowledged(error) => (State::Interrupted, error),
+    })?;
     Ok(())
 }
 

@@ -66,13 +66,12 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
         true,
         listing.saved.get(&session.session.id),
     )?;
-    let (recognizer, rollouts) = {
-        let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            state.mailbox_seal.as_ref().map(|seal| seal.recognizer()),
-            state.rollouts.clone(),
-        )
-    };
+    let recognizer = super::mailbox::recognizer(host, session.session.id);
+    let rollouts = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .rollouts
+        .clone();
     let (modified, mut history) = source.open(&rollouts)?;
     session.active_at = modified;
     let mut builder = Builder::new(&query);

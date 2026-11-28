@@ -987,6 +987,12 @@ impl Store {
     ) {
         self.messages = seal;
     }
+    pub(super) fn record_mailbox(&self, evidence: crate::agent_execution::mailbox::FrameEvidence) {
+        if let Some(recognizer) = &self.messages {
+            recognizer.record_retained([evidence]);
+        }
+    }
+
     /// Returns the events the store does not own, plus any non-fatal warning raised
     /// while caching. Warnings are events, never errors: the caller must stay alive.
     /// Runtime consumers retain the existing diagnostic-only interface.

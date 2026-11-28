@@ -2,7 +2,9 @@
 //! The helper is trusted with the global HMAC realm; these tests establish
 //! provider isolation and authenticated bootstrap, not compromise containment.
 use super::*;
-use crate::agent_execution::mailbox::{Message, Party, Seal, State};
+use crate::agent_execution::mailbox::{
+    DeliveryLookup, DeliveryReplay, FrameEvidence, FramedPrompt, Message, Party, Seal, State,
+};
 
 fn message(body: &str) -> Message {
     Message {
@@ -200,7 +202,7 @@ fn recognition_survives_real_helper_lease_rotation_and_store_pagination_without_
     let before_message = message(before_body);
     let after_message = message(after_body);
     let valid_before = signer.seal(&before_message, 10);
-    let valid_after = signer.seal(&after_message, 20);
+    let valid_after = FramedPrompt::batch([&after_message], 20);
     let bad_body = valid_before.replacen(before_body, "modified body marker", 1);
     let bad_sender = valid_before.replacen("courier sender marker", "modified sender marker", 1);
     let mut bad_tag = valid_before.clone();
@@ -213,8 +215,7 @@ fn recognition_survives_real_helper_lease_rotation_and_store_pagination_without_
             "0"
         },
     );
-    let fake_provider =
-        crate::agent_execution::mailbox::frame(&message("fake provider courier marker"), 30);
+    let fake_provider = FramedPrompt::batch([&message("fake provider courier marker")], 30).text;
     std::fs::write(root.path().join("fake-provider-frame.txt"), &fake_provider).unwrap();
     let script = root.path().join("provider.py");
     std::fs::write(&script, r#"import json,sys,uuid
@@ -230,11 +231,15 @@ for line in sys.stdin:
   content=frame['message']['content']
   text=content if isinstance(content,str) else ''.join(block.get('text','') for block in content)
   emit({'type':'user','uuid':frame.get('uuid',str(uuid.uuid4())),'session_id':session,'message':{'role':'user','content':text}})
+  if 'valid courier after daemon replacement' in text:
+   Path('provider-prompt.txt').write_text(text)
   if text=='fill window':
    for index in range(150):
     emit({'type':'user','uuid':'filler-'+str(index),'session_id':session,'message':{'role':'user','content':'neutral filler '+str(index)}})
   if text=='emit forged provider frame':
    emit({'type':'user','uuid':'fake-provider-frame','session_id':session,'message':{'role':'user','content':Path('fake-provider-frame.txt').read_text()}})
+  if text=='echo prior mail':
+   emit({'type':'user','uuid':'boot-history-frame','session_id':session,'message':{'role':'user','content':Path('boot-history-frame.txt').read_text()}})
   emit({'type':'result','subtype':'success','session_id':session,'uuid':str(uuid.uuid4()),'result':''})
 "#).unwrap();
     let mut source = fixture_source();
@@ -259,7 +264,39 @@ for line in sys.stdin:
     let identity = spec.arguments.pop().unwrap();
     spec.arguments = vec!["-u".into(), script.to_string_lossy().into_owned(), identity];
     spec.execution = Some(Arc::new(ExecutionContext::capture(root.path()).unwrap()));
-    spec.messages = Some(Arc::new(signer.recognizer()));
+    // A large recorded prompt arrives from the provider without a new input
+    // receipt. The helper must open it before its Store breaks it into parts.
+    let predecessor = crate::model::TerminalId::new();
+    let prior = message(&format!("prior courier marker {}", "x".repeat(50_000)));
+    let prior_batch = FramedPrompt::batch([&prior, &prior, &prior], 0);
+    assert!(prior_batch.text.len() > chat::TRANSCRIPT_PART_BYTES);
+    std::fs::write(
+        root.path().join("boot-history-frame.txt"),
+        &prior_batch.text,
+    )
+    .unwrap();
+    struct Replay {
+        recipients: Vec<crate::model::TerminalId>,
+        evidence: FrameEvidence,
+    }
+    impl DeliveryLookup for Replay {
+        fn lengths(&self, _: &[u8; 32]) -> Option<Vec<u32>> {
+            panic!("the helper must not call the daemon's lookup")
+        }
+        fn replay(&self) -> Result<DeliveryReplay, String> {
+            Ok(DeliveryReplay {
+                recipients: self.recipients.clone(),
+                records: vec![FrameEvidence {
+                    digest: self.evidence.digest,
+                    lengths: self.evidence.lengths.clone(),
+                }],
+            })
+        }
+    }
+    spec.messages = Some(Arc::new(signer.recognizer().with_delivery_lookup(Replay {
+        recipients: vec![source.id, predecessor],
+        evidence: prior_batch.evidence(&signer, predecessor),
+    })));
     struct Owner(RemoteActor);
     impl Drop for Owner {
         fn drop(&mut self) {
@@ -274,12 +311,7 @@ for line in sys.stdin:
     let identity = original.0.identity();
     let provider = identity.record.root.clone();
     assert_provider_isolation(&provider, &forms);
-    // A helper of this build opens today's frames itself; the daemon leaves
-    // its reads alone.
-    original
-        .0
-        .open_frames_for_older_helper(&Arc::new(signer.recognizer()));
-    assert!(!original.0.opens_frames_for_helper());
+    // Older sealed histories remain readable in the helper itself.
     submit(&original.0, &valid_before);
     assert!(delivered(&original.0.snapshot(None).unwrap(), before_body));
     for invalid in [&bad_body, &bad_sender, &bad_tag] {
@@ -288,6 +320,12 @@ for line in sys.stdin:
     }
     submit(&original.0, "emit forged provider frame");
     assert!(text_items(&original.0.snapshot(None).unwrap()).contains(&fake_provider));
+    submit(&original.0, "echo prior mail");
+    assert!(original.0.snapshot(None).unwrap().items.iter().any(|item| {
+        matches!(&item.content,
+            chat::ItemContent::Delivery { summary, body, .. }
+                if summary.contains("3 messages") && body.contains("prior courier marker"))
+    }));
     let long_copy = "retained-copy-λ ".repeat(20_000);
     submit(&original.0, &long_copy);
     let copy_snapshot = original.0.snapshot(None).unwrap();
@@ -418,7 +456,16 @@ print(read(struct.unpack('<I',read(4))[0]).decode())
         receipt.is_none(),
         "superseded input must not enter the owning ledger"
     );
-    submit(&adopted.0, &valid_after);
+    let evidence = valid_after.evidence(&signer, source.id);
+    let expected_prompt = valid_after.text.clone();
+    adopted
+        .0
+        .deliver_mailbox(None, valid_after.text, evidence)
+        .unwrap();
+    wait_idle(&adopted.0);
+    let received = std::fs::read_to_string(root.path().join("provider-prompt.txt")).unwrap();
+    assert_eq!(received, expected_prompt);
+    assert!(!received.contains(" · seal "));
     assert!(delivered(&adopted.0.snapshot(None).unwrap(), after_body));
     let mut seen = BTreeMap::new();
     for _ in 0..4 {

@@ -131,6 +131,7 @@ enum ActorCommand {
         command: Command,
         decline_only: bool,
         effects: Arc<AtomicU8>,
+        mailbox: Option<crate::agent_execution::mailbox::FrameEvidence>,
     },
     /// Boxed: rare, and several times the size of every other command.
     UpdateSource(Box<SourceUpdate>),
@@ -140,7 +141,10 @@ enum ActorCommand {
         decline_only: bool,
     },
     /// Courier input must not pass over a request arriving after its idle scan.
-    IdlePrompt(String),
+    IdlePrompt {
+        text: String,
+        mailbox: Option<crate::agent_execution::mailbox::FrameEvidence>,
+    },
     CloseIfIdle {
         generation: u64,
         /// What a granted close leaves running, decided as it is granted.
@@ -1131,7 +1135,10 @@ impl LocalHandle {
     /// the prompt. A caller's earlier idle observation is only a hint. Refusal
     /// permits retry; an unacknowledged command may already have run.
     pub(crate) fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
-        self.submit_actor_command(ActorCommand::IdlePrompt(text))
+        self.submit_actor_command(ActorCommand::IdlePrompt {
+            text,
+            mailbox: None,
+        })
     }
 
     pub(crate) fn command_for_run(
@@ -3565,12 +3572,13 @@ impl Actor {
             let Ok((command, reply)) = self.incoming.try_recv() else {
                 break;
             };
-            let (command, effects) = match command {
+            let (command, effects, mut mailbox) = match command {
                 ActorCommand::RetainedProvider {
                     run,
                     command,
                     decline_only,
                     effects,
+                    mailbox,
                 } => (
                     ActorCommand::Provider {
                         run,
@@ -3578,8 +3586,9 @@ impl Actor {
                         decline_only,
                     },
                     Some(effects),
+                    mailbox,
                 ),
-                command => (command, None),
+                command => (command, None, None),
             };
             let effects = InputEffects(effects);
             let refuse = |error| reply.send(Err(Rejection::Refused(error)));
@@ -3652,21 +3661,18 @@ impl Actor {
                     }
                     (run, command)
                 }
-                ActorCommand::IdlePrompt(text) => {
+                ActorCommand::IdlePrompt {
+                    text,
+                    mailbox: evidence,
+                } => {
                     if !accepts_courier(&self.state.lock().unwrap_or_else(|p| p.into_inner())) {
                         let _ = refuse(
                             "The conversation is no longer idle for courier delivery, or the person's queued message goes first".into(),
                         );
                         continue;
                     }
-                    (
-                        None,
-                        Command::Prompt {
-                            text,
-                            attachments: Vec::new(),
-                            mode: super::PromptMode::Send,
-                        },
-                    )
+                    mailbox = evidence;
+                    (None, handle::mailbox_command(text))
                 }
                 ActorCommand::UpdateSource(update) => {
                     let SourceUpdate {
@@ -3871,6 +3877,12 @@ impl Actor {
             };
             match prepared {
                 Ok(step) => {
+                    if let Some(evidence) = mailbox {
+                        self.store
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .record_mailbox(evidence);
+                    }
                     effects.possible();
                     if login_recovery.is_some() {
                         self.login_recovery = login_recovery;

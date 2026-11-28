@@ -7,9 +7,8 @@
 //! reads its messages with `cagents inbox`.
 //!
 //! A delivered message is ordinary prompt text, framed so that the agent knows
-//! who sent it and how to answer. The daemon seals the frame, so a window shows
-//! a message as one only when the daemon wrote it, never because a prompt was
-//! made to look like one.
+//! who sent it and how to answer. The daemon records delivery evidence apart
+//! from the prompt, so a window can distinguish mail from a lookalike.
 
 use serde::{Deserialize, Serialize};
 
@@ -280,14 +279,12 @@ fn title(title: &str) -> String {
 }
 
 const OPENING: &str = "[cagents ";
-/// What a retained helper advertises when its [`open`] reads every frame
-/// [`frame`] writes. Raise the number whenever a frame changes in a way an
-/// earlier `open` would not read, as giving the last line its `in a shell`
-/// did, and as handing several messages over in one prompt did: a helper
-/// outlives the daemon that started it, and the daemon opens on its behalf
-/// what a helper without the current number shows.
+/// Legacy wire capability older daemons use to decide who verifies seals.
 #[cfg(feature = "host")]
 pub(crate) const FRAMES_CAPABILITY: &str = "mailbox-frames-3";
+/// Retained helpers with this capability accept evidence alongside input.
+#[cfg(feature = "host")]
+pub(crate) const EVIDENCE_CAPABILITY: &str = "mailbox-digests-1";
 const SEAL: &str = " · seal ";
 /// What separates the sealed frames of a prompt that hands over several
 /// messages at once.
@@ -300,7 +297,7 @@ const REPLY: &str = "[Reply in a shell: ";
 /// histories keep.
 const EARLIER_REPLY: &str = "[Reply: ";
 
-/// The prompt a message becomes at `now`, up to its seal. The first line says
+/// The prompt a message becomes at `now`, before the final bracket. The first line says
 /// who sent it, the last how to answer; the body between them is the sender's
 /// own.
 pub fn frame(message: &Message, now: u64) -> String {
@@ -334,6 +331,94 @@ fn framed(message: &Message, waiting: bool) -> String {
         message.body.trim_end(),
         short(message.id)
     )
+}
+
+/// A complete prompt and the boundaries of the frames the courier wrote.
+/// Boundaries are kept alongside the digest because a sender can quote a
+/// whole frame in its own message.
+#[cfg(feature = "host")]
+pub struct FramedPrompt {
+    pub text: String,
+    lengths: Vec<u32>,
+}
+
+#[cfg(feature = "host")]
+#[derive(Serialize, Deserialize)]
+pub struct FrameEvidence {
+    pub digest: [u8; 32],
+    pub lengths: Vec<u32>,
+}
+
+#[cfg(feature = "host")]
+fn digest(text: &str) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(text.as_bytes()).into()
+}
+
+#[cfg(feature = "host")]
+impl FramedPrompt {
+    pub fn batch<'a>(messages: impl IntoIterator<Item = &'a Message>, now: u64) -> Self {
+        let mut text = String::new();
+        let mut lengths = Vec::new();
+        for message in messages {
+            if !lengths.is_empty() {
+                text.push_str(BETWEEN_FRAMES);
+            }
+            let start = text.len();
+            text.push_str(&frame(message, now));
+            text.push(']');
+            lengths.push((text.len() - start) as u32);
+        }
+        Self { text, lengths }
+    }
+
+    pub fn evidence(&self, seal: &Seal, recipient: TerminalId) -> FrameEvidence {
+        FrameEvidence {
+            digest: seal.delivery_key(recipient, &digest(&self.text)),
+            lengths: self.lengths.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "host")]
+fn open_recorded(mut text: &str, lengths: &[u32]) -> Option<Vec<Opened>> {
+    if !(1..=MAX_PENDING).contains(&lengths.len()) {
+        return None;
+    }
+    let mut opened = Vec::with_capacity(lengths.len());
+    for (index, length) in lengths.iter().enumerate() {
+        if index != 0 {
+            text = text.strip_prefix(BETWEEN_FRAMES)?;
+        }
+        let (frame, rest) = text.split_at_checked(*length as usize)?;
+        opened.push(parse(frame.strip_suffix(']')?)?);
+        text = rest;
+    }
+    text.is_empty().then_some(opened)
+}
+
+/// The title heuristic only needs the shape of a frame. Presentation always
+/// requires authenticated evidence.
+#[cfg(feature = "host")]
+pub(crate) fn looks_like_delivery(text: &str) -> bool {
+    looks_like_recorded(text) || open_all(text, &SealShaped).is_some()
+}
+
+#[cfg(feature = "host")]
+fn looks_like_recorded(text: &str) -> bool {
+    text.starts_with(OPENING)
+        && text.lines().next_back().is_some_and(|line| {
+            let Some(reply) = line.strip_prefix(REPLY) else {
+                return false;
+            };
+            let Some(id) = reply
+                .strip_prefix("cagents reply ")
+                .and_then(|tail| tail.strip_suffix(" \"…\"]"))
+            else {
+                return false;
+            };
+            id.len() == 8 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 /// A sealed frame, opened for display.
@@ -607,10 +692,8 @@ fn markdown_literal(text: &str) -> String {
     escaped
 }
 
-/// The daemon-side signer for courier frames. Retained actors receive only a
-/// recognizer API, through authenticated private bootstrap. That recognizer
-/// still holds the registry-wide symmetric MAC material: matched helper code is
-/// inside the daemon's trusted realm, and this is not compromise containment.
+/// The registry's key for delivered frames. Retained actors receive a legacy
+/// verifier at authenticated bootstrap and new delivery evidence with input.
 #[cfg(feature = "host")]
 pub struct Seal([u8; 32]);
 
@@ -628,7 +711,7 @@ impl Seal {
     }
 
     pub fn recognizer(&self) -> Recognizer {
-        Recognizer(self.0)
+        Recognizer::new(self.0)
     }
 
     /// A truncated HMAC-SHA-256: 128 bits are far beyond what forging one
@@ -644,7 +727,6 @@ impl Seal {
             .collect()
     }
 
-    /// The prompt that delivers `message` at `now`.
     pub fn seal(&self, message: &Message, now: u64) -> String {
         self.sealed(frame(message, now))
     }
@@ -671,18 +753,71 @@ impl Seal {
         self.sealed(framed(message, false))
     }
 
+    /// Queued message runs keep their legacy format on disk so an older
+    /// daemon can dispatch them after rollback. Strip a verified seal only
+    /// at the provider boundary.
+    pub fn unseal_run(&self, text: &str) -> Option<FramedPrompt> {
+        let (framed, _) = text.rsplit_once(SEAL)?;
+        self.recognizer().open(text)?;
+        let (body, reply) = framed.rsplit_once('\n')?;
+        let text = match reply.strip_prefix(EARLIER_REPLY) {
+            Some(command) => format!("{body}\n{REPLY}{command}]"),
+            None => format!("{framed}]"),
+        };
+        let len = text.len() as u32;
+        Some(FramedPrompt {
+            text,
+            lengths: vec![len],
+        })
+    }
+
+    /// Key a text digest to its recipient. Hashing the prompt first lets
+    /// replay check several verified predecessors without rereading its body.
+    pub fn delivery_key(&self, recipient: TerminalId, digest: &[u8; 32]) -> [u8; 32] {
+        use hmac::Mac;
+        let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(&self.0)
+            .expect("HMAC accepts a key of any length");
+        mac.update(b"cagents delivered frame\0");
+        mac.update(recipient.as_uuid().as_bytes());
+        mac.update(digest);
+        mac.finalize().into_bytes().into()
+    }
+
     fn sealed(&self, framed: String) -> String {
         let tag = self.tag(&framed);
         format!("{framed}{SEAL}{tag}]")
     }
 }
 
-/// Recognition authority used by a Store; it exposes no frame-signing method.
-/// HMAC verification remains symmetric, so a compromised holder of this value
-/// could recover the shared signing material. Providers never receive it.
 #[cfg(feature = "host")]
-#[derive(Clone)]
-pub struct Recognizer([u8; 32]);
+pub trait DeliveryLookup: Send + Sync {
+    fn lengths(&self, digest: &[u8; 32]) -> Option<Vec<u32>>;
+    fn replay(&self) -> Result<DeliveryReplay, String>;
+}
+
+#[cfg(feature = "host")]
+#[derive(Default)]
+pub struct DeliveryReplay {
+    pub recipients: Vec<TerminalId>,
+    pub records: Vec<FrameEvidence>,
+}
+
+#[cfg(feature = "host")]
+enum Evidence {
+    LegacyOnly,
+    Durable(Box<dyn DeliveryLookup>),
+    Retained {
+        recipients: Vec<TerminalId>,
+        frames: std::sync::Mutex<std::collections::HashMap<[u8; 32], Vec<u32>>>,
+    },
+}
+
+/// Classifies provider text by legacy MAC or evidence in the current scope.
+#[cfg(feature = "host")]
+pub struct Recognizer {
+    key: [u8; 32],
+    evidence: Evidence,
+}
 
 #[cfg(feature = "host")]
 impl std::fmt::Debug for Recognizer {
@@ -706,8 +841,14 @@ impl std::fmt::Debug for RetainedRecognition {
 
 #[cfg(feature = "host")]
 impl RetainedRecognition {
-    pub(crate) fn into_recognizer(self) -> Recognizer {
-        Recognizer(self.0)
+    pub(crate) fn into_recognizer(self, recipients: Vec<TerminalId>) -> Recognizer {
+        Recognizer {
+            key: self.0,
+            evidence: Evidence::Retained {
+                recipients,
+                frames: Default::default(),
+            },
+        }
     }
 }
 
@@ -717,7 +858,7 @@ impl Seals for Recognizer {
 
     fn start(&self) -> Self::Running {
         use hmac::Mac;
-        hmac::Hmac::new_from_slice(&self.0).expect("HMAC accepts a key of any length")
+        hmac::Hmac::new_from_slice(&self.key).expect("HMAC accepts a key of any length")
     }
 
     fn extend(&self, running: &mut Self::Running, text: &str) {
@@ -734,14 +875,43 @@ impl Seals for Recognizer {
 
 #[cfg(feature = "host")]
 impl Recognizer {
-    /// Explicitly delegate recognition to the trusted retained actor, never to
-    /// its provider. This is a typed API restriction, not asymmetric crypto.
-    pub(crate) fn delegate_to_retained_owner(&self) -> RetainedRecognition {
-        RetainedRecognition(self.0)
+    fn new(key: [u8; 32]) -> Self {
+        Self {
+            key,
+            evidence: Evidence::LegacyOnly,
+        }
     }
 
-    #[cfg(test)]
-    pub(crate) fn open(&self, text: &str) -> Option<Opened> {
+    pub fn with_delivery_lookup(mut self, lookup: impl DeliveryLookup + 'static) -> Self {
+        self.evidence = Evidence::Durable(Box::new(lookup));
+        self
+    }
+
+    pub(crate) fn delivery_replay(&self) -> Result<DeliveryReplay, String> {
+        match &self.evidence {
+            Evidence::Durable(lookup) => lookup.replay(),
+            Evidence::LegacyOnly | Evidence::Retained { .. } => Ok(DeliveryReplay::default()),
+        }
+    }
+
+    /// Set by authenticated bootstrap history or a retained input admitted
+    /// by its adapter. The provider gets only the text.
+    pub(crate) fn record_retained(&self, evidence: impl IntoIterator<Item = FrameEvidence>) {
+        if let Evidence::Retained { frames, .. } = &self.evidence {
+            frames.lock().unwrap_or_else(|p| p.into_inner()).extend(
+                evidence
+                    .into_iter()
+                    .map(|entry| (entry.digest, entry.lengths)),
+            );
+        }
+    }
+
+    /// Delegate legacy verification to the trusted retained actor.
+    pub(crate) fn delegate_to_retained_owner(&self) -> RetainedRecognition {
+        RetainedRecognition(self.key)
+    }
+
+    fn open(&self, text: &str) -> Option<Opened> {
         open(text, |framed, seal| {
             let mut running = self.start();
             self.extend(&mut running, framed);
@@ -749,9 +919,24 @@ impl Recognizer {
         })
     }
 
-    /// As [`open_all`], for the frames this daemon sealed.
     pub(crate) fn open_all(&self, text: &str) -> Option<Vec<Opened>> {
-        open_all(text, self)
+        if !looks_like_recorded(text) {
+            return open_all(text, self);
+        }
+        let text = text.strip_suffix('\n').unwrap_or(text);
+        let digest = digest(text);
+        match &self.evidence {
+            Evidence::LegacyOnly => None,
+            Evidence::Durable(lookup) => open_recorded(text, &lookup.lengths(&digest)?),
+            Evidence::Retained { recipients, frames } => {
+                let frames = frames.lock().unwrap_or_else(|p| p.into_inner());
+                let seal = Seal::new(self.key);
+                let lengths = recipients
+                    .iter()
+                    .find_map(|&recipient| frames.get(&seal.delivery_key(recipient, &digest)))?;
+                open_recorded(text, lengths)
+            }
+        }
     }
 
     /// A user prompt the daemon sealed, as the delivery a window shows.
@@ -835,8 +1020,16 @@ impl Recognizer {
             ServerResponse::ChatUpdate { update, .. } => {
                 for change in &mut update.changes {
                     // A prompt arrives whole; only a reply streams.
-                    if let crate::chat::presentation::ItemChange::Replace(item) = change {
-                        self.recognize(item);
+                    if let crate::chat::presentation::ItemChange::Replace(item) = change
+                        && self.recognize(item)
+                        && let Some(index) = update.order.iter().position(|id| id == &item.id)
+                        && let Some(source) = update
+                            .metadata
+                            .text_copy_sources
+                            .conversation
+                            .get_mut(index)
+                    {
+                        *source = None;
                     }
                 }
             }
@@ -887,9 +1080,6 @@ mod tests {
         }
     }
 
-    /// A frame changed so that an earlier [`open`] would not read it must
-    /// come with a new `FRAMES_CAPABILITY`, or a running helper built before
-    /// the change shows the frame as a person's prompt.
     #[test]
     fn a_frame_names_its_sender_and_how_to_answer() {
         #[cfg(feature = "host")]
@@ -922,6 +1112,52 @@ mod tests {
         let long = title(&"x".repeat(200));
         assert_eq!(long.chars().count(), TITLE_CHARS + 1);
         assert!(long.ends_with('…'));
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn recorded_boundaries_keep_quoted_frames_in_the_message_body() {
+        let nested = FramedPrompt::batch([&message()], 0).text;
+        let mut first = message();
+        first.body = format!("Here is a quoted prompt 🎉\n\n{nested}");
+        let second = message();
+        let prompt = FramedPrompt::batch([&first, &second], 0);
+        let seal = Seal::new([7; 32]);
+        let recipient = TerminalId::new();
+        let recognizer = seal
+            .recognizer()
+            .delegate_to_retained_owner()
+            .into_recognizer(vec![recipient]);
+
+        assert!(recognizer.open_all(&prompt.text).is_none());
+        recognizer.record_retained([prompt.evidence(&seal, recipient)]);
+        let opened = recognizer.open_all(&format!("{}\n", prompt.text)).unwrap();
+        assert_eq!(opened.len(), 2);
+        assert_eq!(opened[0].body, first.body);
+        assert_eq!(opened[1].body, second.body.trim_end());
+        assert!(recognizer.open_all(&nested).is_none());
+        assert!(
+            recognizer
+                .open_all(&prompt.text.replace("🎉", "📝"))
+                .is_none()
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_waiting_run_keeps_its_stored_seal_but_sends_only_the_frame() {
+        let seal = Seal::new([7; 32]);
+        let mut question = message();
+        question.wait_until_ms = Some(10);
+        let stored = seal.seal_run(&question);
+        let prompt = seal.unseal_run(&stored).unwrap();
+        assert_eq!(prompt.text, FramedPrompt::batch([&question], 10).text);
+        let earlier = seal.sealed(framed(&question, false).replace(REPLY, EARLIER_REPLY));
+        assert_eq!(seal.unseal_run(&earlier).unwrap().text, prompt.text);
+        assert!(
+            seal.unseal_run(&stored.replace("Hold off", "Go ahead"))
+                .is_none()
+        );
     }
 
     #[cfg(feature = "host")]

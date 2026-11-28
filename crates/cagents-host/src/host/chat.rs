@@ -2874,12 +2874,7 @@ fn start_publishing(
     // Provider-specific process fields derive from the prepared launch.
     // No environment overlay may follow constructor history/title reads.
     spec.withhold_environment();
-    spec.messages = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .mailbox_seal
-        .as_ref()
-        .map(|seal| Arc::new(seal.recognizer()));
+    spec.messages = crate::host::agent_execution::mailbox::recognizer(host, session.id);
     super::account_lifecycle::ensure_launch_at_directory(
         host,
         &spec.working_directory,
