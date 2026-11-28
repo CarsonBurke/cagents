@@ -1,5 +1,6 @@
-//! Release recoverable paging actors when their last pane or connection leaves.
+//! Release recoverable paging actors once no pane, subscription or pending resolution needs them.
 use super::*;
+use std::sync::mpsc::RecvTimeoutError;
 
 pub(in crate::host) fn start(host: &SharedHost) -> std::io::Result<()> {
     let weak = Arc::downgrade(host);
@@ -7,10 +8,29 @@ pub(in crate::host) fn start(host: &SharedHost) -> std::io::Result<()> {
     thread::Builder::new()
         .name("cagents-history-retirement".into())
         .spawn(move || {
-            while pending.recv().is_ok() {
+            let mut deadline: Option<Instant> = None;
+            while match deadline {
+                Some(expiry) => !matches!(
+                    pending.recv_timeout(expiry.saturating_duration_since(Instant::now())),
+                    Err(RecvTimeoutError::Disconnected)
+                ),
+                None => pending.recv().is_ok(),
+            } {
                 let Some(host) = weak.upgrade() else {
                     return;
                 };
+                // Take the deadline before collecting, so a lease that expires
+                // mid-pass always triggers another reference check. Expiry
+                // removes only the pending Resolve reference.
+                let now = Instant::now();
+                deadline = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .chat_resolutions
+                    .values()
+                    .filter_map(upgrade_resolution::Attempt::history_expiry)
+                    .filter(|expiry| *expiry > now)
+                    .min();
                 if let Err(error) = collect(&host) {
                     tracing::debug!(%error, "Unreferenced history readers were kept");
                 }
