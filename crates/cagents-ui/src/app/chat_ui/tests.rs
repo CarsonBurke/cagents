@@ -2466,6 +2466,72 @@ fn text(body: &str) -> ItemContent {
 }
 
 #[test]
+fn a_new_transcript_window_prunes_parent_and_child_caches_independently() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = live_chat(&mut app, Some("cache-window"));
+    let target = chat_runtime(&app, card).target;
+    let handle = chat_runtime(&app, card).handle().unwrap().clone();
+    let item = |id: &str, body| {
+        Arc::new(chat::Item {
+            id: id.into(),
+            role: chat::Role::Assistant,
+            content: text(body),
+            started_at: None,
+            at: None,
+        })
+    };
+    let mut snapshot = Snapshot {
+        generation: 20,
+        ready: true,
+        items: vec![
+            item("parent-old", "Earlier parent"),
+            item("shared", "Parent"),
+            item("shared", "Another parent row"),
+        ],
+        subagents: vec![chat::Subagent {
+            id: "child".into(),
+            kind: "fixture".into(),
+            description: "Child".into(),
+            status: chat::ToolStatus::Running,
+            background: true,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            items: vec![item("child-old", "Earlier child"), item("shared", "Child")],
+        }],
+        ..Snapshot::default()
+    };
+    app.chat_runtime_mut(target).unwrap().show(true);
+    handle.publish_snapshot_for_test(snapshot.clone());
+    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    preparation::drain_fixture(runtime);
+    assert_eq!(runtime.cache.len(), 3);
+    drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child".into()))));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    preparation::drain_fixture(runtime);
+    assert!(runtime.cache.contains_key("parent-old"));
+    assert!(runtime.child_cache.contains_key("child-old"));
+
+    snapshot.generation += 1;
+    snapshot.items.remove(0);
+    snapshot.subagents[0].items.remove(0);
+    handle.publish_snapshot_for_test(snapshot);
+    drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.cache.len(), 2);
+    for item in &runtime.snapshot.items {
+        let key = row_cache_key(&runtime.parent_cache_keys, item);
+        assert!(Arc::ptr_eq(runtime.cache[key].item.as_ref().unwrap(), item));
+    }
+    assert_eq!(runtime.child_cache.len(), 1);
+    assert!(matches!(
+        &runtime.child_cache["shared"].item.as_ref().unwrap().content,
+        ItemContent::Text { text, .. } if text == "Child"
+    ));
+}
+
+#[test]
 fn hidden_children_prepare_no_transcript_cache_until_their_tab_is_selected() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
     let card = live_chat(&mut app, Some("lazy-child-cache"));

@@ -6766,7 +6766,7 @@ impl Runtime {
                         && expanded.contains(&item.id)
                 })
         };
-        if resume.is_none()
+        let context_changed = resume.is_none()
             && self.preparation.sync_context(
                 self.target,
                 snapshot.session_id.as_deref(),
@@ -6775,30 +6775,25 @@ impl Runtime {
                     .iter()
                     .map(|item| row_cache_key(aliases, item))
                     .collect(),
-            )
-        {
+            );
+        let aliases_changed = resume.is_none() && (had_aliases || !aliases.is_empty());
+        if (context_changed || aliases_changed) && !cache.is_empty() {
             // The same opaque item ID may exist in two different transcripts.
             // Never display another actor/child's old prose while loading it.
-            cache.retain(|_, cached| {
-                cached.reader_context == context
-                    && cached
-                        .item
-                        .as_ref()
-                        .is_some_and(|item| items.iter().any(|current| Arc::ptr_eq(current, item)))
-            });
-            presentation_changed = true;
-        }
-        if resume.is_none() && (had_aliases || !aliases.is_empty()) {
+            let current: HashSet<_> = items.iter().map(Arc::as_ptr).collect();
             cache.retain(|key, cached| {
-                cached.item.as_deref().is_some_and(|item| {
-                    key == row_cache_key(aliases, item)
-                        && (key == &item.id
-                            || items
-                                .iter()
-                                .any(|current| std::ptr::eq(current.as_ref(), item)))
-                })
+                let Some(item) = cached.item.as_ref() else {
+                    return false;
+                };
+                let listed = current.contains(&Arc::as_ptr(item));
+                if context_changed && (cached.reader_context != context || !listed) {
+                    return false;
+                }
+                !aliases_changed
+                    || (key == row_cache_key(aliases, item) && (key == &item.id || listed))
             });
         }
+        presentation_changed |= context_changed;
         let newest = items.len().wrapping_sub(1);
         let start = resume.unwrap_or(0).min(items.len());
         let end = resume.map_or(items.len(), |_| start.saturating_add(128).min(items.len()));
@@ -7546,20 +7541,25 @@ impl Runtime {
                 selected.map_or(&[], |agent| agent.items.as_slice()),
             )
         {
-            self.cache.retain(|id, _| {
-                snapshot
-                    .items
-                    .iter()
-                    .any(|item| row_cache_key(&self.parent_cache_keys, item) == id)
-            });
-            self.child_cache.retain(|id, _| {
-                selected.is_some_and(|agent| {
-                    agent
-                        .items
+            // Index each transcript's presentation keys once per window
+            // change. Distinct rows can share a provider item ID.
+            let retain_listed = |cache: &mut HashMap<String, CachedItem>,
+                                 aliases: &HashMap<usize, String>,
+                                 items: &[Arc<chat::Item>]| {
+                if !cache.is_empty() {
+                    let listed: HashSet<_> = items
                         .iter()
-                        .any(|item| row_cache_key(&self.child_cache_keys, item) == id)
-                })
-            });
+                        .map(|item| row_cache_key(aliases, item))
+                        .collect();
+                    cache.retain(|id, _| listed.contains(id.as_str()));
+                }
+            };
+            retain_listed(&mut self.cache, &self.parent_cache_keys, &snapshot.items);
+            retain_listed(
+                &mut self.child_cache,
+                &self.child_cache_keys,
+                selected.map_or(&[], |agent| agent.items.as_slice()),
+            );
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             self.find_navigation.changed_document();
         }
