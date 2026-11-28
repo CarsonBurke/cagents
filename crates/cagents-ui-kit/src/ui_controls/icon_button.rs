@@ -131,6 +131,9 @@ impl<'a, Message: Clone + 'a> From<IconButton<'a, Message>> for Element<'a, Mess
             .height(scale.target())
             .padding(0)
             .on_press_maybe(on_press);
+        if let Some(description) = label.description() {
+            button = button.description(description);
+        }
         if let Some(id) = id {
             button = button.id(id);
         }

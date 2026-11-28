@@ -4111,17 +4111,17 @@ impl Runtime {
                     .into(),
                     small_icon(
                         Icon::ChevronUp,
-                        "Previous match — Shift+Enter in search",
+                        crate::interaction::find_tips::previous(),
                         Action::FindNext(target, false),
                     ),
                     small_icon(
                         Icon::ChevronDown,
-                        "Next match — Enter in search",
+                        crate::interaction::find_tips::next(),
                         Action::FindNext(target, true),
                     ),
                     small_icon(
                         Icon::Close,
-                        "Close find — Escape",
+                        crate::interaction::find_tips::close(),
                         Action::CloseFind(target),
                     ),
                 ])
@@ -5310,26 +5310,30 @@ impl Runtime {
         // Send now reaches the turn without cancelling it, so while it is on
         // offer Stop points there.
         let instead = match (self.can_send_now(), at_stake > 0) {
-            (true, true) => {
-                ". Send now delivers queued messages without stopping the turn or its subagents."
-            }
-            (true, false) => ". Send now delivers queued messages without cancelling the turn.",
-            (false, _) => "",
+            (true, true) => Some(
+                "Send now delivers queued messages without stopping the turn or its subagents.",
+            ),
+            (true, false) => Some("Send now delivers queued messages without cancelling the turn."),
+            (false, _) => None,
         };
         let tooltip = if armed {
-            Cow::Owned(format!(
-                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc){instead}"
+            crate::interaction::RichTip::new(format!(
+                "Confirm: cancel the active turn and stop {at_stake} background {subagents}"
             ))
         } else if at_stake > 0 {
-            Cow::Owned(format!(
-                "Cancel active turn and its {at_stake} background {subagents} (Esc){instead}"
+            crate::interaction::RichTip::new(format!(
+                "Cancel active turn and its {at_stake} background {subagents}"
             ))
         } else if self.turn_running() {
-            Cow::Owned(format!("Cancel active turn (Esc){instead}"))
+            crate::interaction::RichTip::new("Cancel active turn")
         } else {
-            Cow::Borrowed(
-                "Stop before the turn begins (Esc). Unsent messages return to the composer.",
-            )
+            crate::interaction::RichTip::new("Stop before the turn begins")
+                .note("Unsent messages return to the composer.")
+        }
+        .shortcut("Escape");
+        let tooltip = match instead {
+            Some(instead) => tooltip.note(instead),
+            None => tooltip,
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))

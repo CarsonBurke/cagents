@@ -444,7 +444,7 @@ impl Cagents {
                 )
                 .id(card_control_id(card, "ended.relaunch"))
                 .on_press(relaunch.message(card)),
-            format!("{} (Enter)", relaunch.explanation(session)),
+            crate::interaction::RichTip::new(relaunch.explanation(session)).shortcut("Enter"),
         ));
 
         widget::container(

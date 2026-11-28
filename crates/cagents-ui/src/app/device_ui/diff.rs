@@ -659,12 +659,21 @@ impl Cagents {
         {
             let previous = step_index(index, false).is_some();
             let next = step_index(index, true).is_some_and(|index| index < count);
-            for (icon, label, enabled, forward) in [
-                (Icon::ChevronUp, "Previous change (Alt+Up)", previous, false),
-                (Icon::ChevronDown, "Next change (Alt+Down)", next, true),
+            for (icon, label, chord, enabled, forward) in [
+                (
+                    Icon::ChevronUp,
+                    "Previous change",
+                    "Alt+Up",
+                    previous,
+                    false,
+                ),
+                (Icon::ChevronDown, "Next change", "Alt+Down", next, true),
             ] {
-                let button = crate::ui_controls::icon_button(icon, label)
-                    .on_press_maybe(enabled.then(|| action(Action::Step { forward })));
+                let button = crate::ui_controls::icon_button(
+                    icon,
+                    crate::interaction::RichTip::new(label).shortcut(chord),
+                )
+                .on_press_maybe(enabled.then(|| action(Action::Step { forward })));
                 header.push(button.into());
             }
         }

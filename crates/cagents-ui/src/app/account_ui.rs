@@ -49,7 +49,7 @@ use crate::account::{
     schedule::{self, Millis, Schedule, Trigger},
 };
 use crate::agent::Provider;
-use crate::interaction::{RichTip, TipRow};
+use crate::interaction::{RichTip, TipRow, TipTone};
 use crate::settings::AccountUsageDisplay;
 
 pub(super) mod resets;
@@ -1239,18 +1239,16 @@ impl AccountState {
         )
     }
 
-    fn plan_tooltip(&self) -> Option<String> {
-        let mut text = format!("Plan: {}", self.plan()?);
-        if let Some(tier) = self
+    fn plan_tooltip(&self) -> Option<RichTip<'static>> {
+        let tier = self
             .snapshot
             .as_ref()
             .and_then(|snapshot| snapshot.rate_limit_tier.as_deref())
-            .filter(|tier| !tier.trim().is_empty())
-        {
-            text.push_str("\nReported rate-limit tier: ");
-            text.push_str(tier);
-        }
-        Some(text)
+            .filter(|tier| !tier.trim().is_empty());
+        Some(
+            RichTip::new(format!("Plan: {}", self.plan()?))
+                .rows(tier.map(|tier| TipRow::new("Reported rate-limit tier", tier.to_owned()))),
+        )
     }
 
     /// The login this account is known as: the one it was added with, and
@@ -2157,11 +2155,7 @@ fn chip_with_window(
                 text.push_str(" · ");
                 text.push_str(when);
             }
-            let lead = TipRow::new(window.label.clone(), figure.text.clone()).detail_maybe(
-                remaining
-                    .as_ref()
-                    .map(|remaining| format!("resets in {remaining}")),
-            );
+            let lead = window_row(window, mode, now_seconds);
             let mut tooltip =
                 RichTip::new(name.to_owned()).row(if snapshot.status == UsageStatus::Limited {
                     lead.warning()
@@ -2174,10 +2168,7 @@ fn chip_with_window(
                 .binding_window()
                 .filter(|binding| binding.key != window.key)
             {
-                tooltip = tooltip.row(TipRow::new(
-                    scoped.label.clone(),
-                    usage_figure(scoped.used, mode).text,
-                ));
+                tooltip = tooltip.row(window_row(scoped, mode, now_seconds));
             }
             if snapshot.status == UsageStatus::Limited {
                 tooltip = tooltip.warning("Limited until it resets.");
@@ -2188,7 +2179,7 @@ fn chip_with_window(
             // The row greys these figures once a check fails; the status bar
             // says the same rather than presenting them as current.
             if let Some(failure) = &account.failure {
-                tooltip = tooltip.warning(format!("Last check failed: {failure}"));
+                tooltip = tooltip.error(format!("Last check failed: {failure}"));
             }
             let tone = account.usage_tone(window, now);
             Chip {
@@ -2201,6 +2192,31 @@ fn chip_with_window(
                 tooltip,
             }
         }
+    }
+}
+
+/// A usage window as a tooltip row: its figure, and when it resets. A reset
+/// within the day reads as a countdown; a later one, as the day it falls on,
+/// since the status bar already counts it down. An allowance run out reads
+/// as a warning.
+fn window_row(
+    window: &UsageWindow,
+    mode: AccountUsageDisplay,
+    now_seconds: i64,
+) -> TipRow<'static> {
+    let row = TipRow::new(window.label.clone(), usage_figure(window.used, mode).text).detail_maybe(
+        window.resets_at.filter(|at| *at > now_seconds).map(|at| {
+            if at - now_seconds < 86_400 {
+                format!("resets in {}", account::format_remaining(at - now_seconds))
+            } else {
+                format!("resets {}", account::format_local_moment(at, now_seconds))
+            }
+        }),
+    );
+    if window.used >= 1.0 {
+        row.warning()
+    } else {
+        row
     }
 }
 
@@ -2218,9 +2234,9 @@ pub(super) struct AccountGauge {
     pub label: String,
     /// A row for each window and each kind of limit reset available.
     pub rows: Vec<TipRow<'static>>,
-    /// What to know before trusting the rows: a limit, an old check, a
-    /// failed one. Each is a warning or, when `false`, a note.
-    pub notes: Vec<(String, bool)>,
+    /// What to know before trusting the rows, in its tone: a limit, an old
+    /// check, a failed one.
+    pub notes: Vec<(String, crate::interaction::TipTone)>,
 }
 
 impl AccountGauge {
@@ -2235,16 +2251,11 @@ impl AccountGauge {
 
     /// `tip` with this gauge's rows and notes beneath its title.
     pub fn detail(&self, tip: RichTip<'static>) -> RichTip<'static> {
-        self.notes.iter().fold(
-            tip.rows(self.rows.iter().cloned()),
-            |tip, (note, warning)| {
-                if *warning {
-                    tip.warning(note.clone())
-                } else {
-                    tip.note(note.clone())
-                }
-            },
-        )
+        self.notes
+            .iter()
+            .fold(tip.rows(self.rows.iter().cloned()), |tip, (note, tone)| {
+                tip.note_in(note.clone(), *tone)
+            })
     }
 }
 
@@ -2313,21 +2324,7 @@ fn account_gauge(
         if refilled(window) {
             return TipRow::new(window.label.clone(), "Refilled").detail("since the last check");
         }
-        let row = TipRow::new(window.label.clone(), usage_figure(window.used, mode).text)
-            .detail_maybe(window.resets_at.filter(|at| *at > now_seconds).map(|at| {
-                // A reset within the day reads as a countdown; a later one,
-                // as the day it falls on.
-                if at - now_seconds < 86_400 {
-                    format!("resets in {}", account::format_remaining(at - now_seconds))
-                } else {
-                    format!("resets {}", account::format_local_moment(at, now_seconds))
-                }
-            }));
-        if window.used >= 1.0 {
-            row.warning()
-        } else {
-            row
-        }
+        window_row(window, mode, now_seconds)
     };
     // The ring's own window leads, then the rest as the provider lists them.
     let mut rows: Vec<_> = lead
@@ -2340,29 +2337,26 @@ fn account_gauge(
         )
         .map(row)
         .collect();
+    // Each kind of reset is a row of its own: what it clears, how many, and
+    // when the first expires or why it can't be spent.
     rows.extend(
         account::resets::inventory_groups(&snapshot.resets, now_seconds)
             .into_iter()
-            .enumerate()
-            .map(|(index, group)| {
-                let scope = match account::resets::ordered_scopes(&group.scopes).as_slice() {
-                    [account::resets::ResetScope::Account] => "account".to_owned(),
-                    _ => group.label.clone(),
-                };
-                let expiry = group.next_expiry.map(|at| {
-                    let when = account::format_local_moment(at, now_seconds);
-                    if group.unknown_expiry || group.count > 1 {
-                        format!("first expires {when}")
-                    } else {
-                        format!("expires {when}")
-                    }
-                });
-                let row = TipRow::new(
-                    if index == 0 { "Limit resets" } else { "" },
-                    format!("{} {scope}", group.count),
+            .map(|group| {
+                let scope = account::resets::inventory_scope(&group.scopes);
+                let mut letters = scope.chars();
+                let label = format!(
+                    "{}{} reset{}",
+                    letters
+                        .next()
+                        .map(|first| first.to_uppercase().to_string())
+                        .unwrap_or_default(),
+                    letters.as_str(),
+                    if group.count == 1 { "" } else { "s" }
                 );
-                if group.usable_now {
-                    row.detail_maybe(expiry)
+                let row = TipRow::new(label, group.count.to_string());
+                if account::resets::inventory_usable(&group) {
+                    row.detail_maybe(account::resets::inventory_expiry(&group, now_seconds))
                 } else {
                     row.detail("not usable now").secondary()
                 }
@@ -2372,7 +2366,7 @@ fn account_gauge(
     if limited {
         notes.push((
             "This account can't be used until a limit resets.".to_owned(),
-            true,
+            TipTone::Warning,
         ));
     }
     if old {
@@ -2381,11 +2375,11 @@ fn account_gauge(
                 "As of {}",
                 account::format_local_moment(unix_seconds(snapshot.observed_at), now_seconds)
             ),
-            false,
+            TipTone::Secondary,
         ));
     }
     if let Some(failure) = &account.failure {
-        notes.push((format!("Last check failed: {failure}"), true));
+        notes.push((format!("Last check failed: {failure}"), TipTone::Error));
     }
     let (fraction, mut label) = match lead {
         Some(lead) => {
@@ -7403,13 +7397,13 @@ impl Cagents {
                 .into(),
         ];
         if let Some(plan) = account.plan() {
-            let label = account.plan_tooltip().expect("plan is present");
+            let tip = account.plan_tooltip().expect("plan is present");
             identity.push(crate::interaction::tooltip(
                 crate::ui_controls::labelled(
                     crate::ui_controls::badge(plan, design::Tone::Themed(design::accent_color)),
-                    label.clone(),
+                    tip.plain(),
                 ),
-                label,
+                tip,
             ));
         }
         // Reserve the trailing actions before measuring any identity metadata.
@@ -8831,10 +8825,7 @@ mod tests {
         let gauge =
             account_gauge(&state_with(Some(usage)), NOW, AccountUsageDisplay::Left).unwrap();
         assert!(
-            gauge
-                .text()
-                .lines()
-                .any(|line| line.starts_with("Limit resets: 2 Weekly")),
+            gauge.text().lines().any(|line| line == "Weekly resets: 2"),
             "{}",
             gauge.text()
         );
@@ -16429,13 +16420,13 @@ mod app_tests {
         state.snapshot = Some(snapshot);
         assert_eq!(state.plan().as_deref(), Some("mAX / EDU · Preview!"));
         assert_eq!(
-            state.plan_tooltip().as_deref(),
+            state.plan_tooltip().map(|tip| tip.plain()).as_deref(),
             Some("Plan: mAX / EDU · Preview!\nReported rate-limit tier: default_claude_ultra_17x")
         );
         state.snapshot.as_mut().unwrap().plan_display_name = None;
         assert_eq!(state.plan().as_deref(), Some("Max"));
         assert_eq!(
-            state.plan_tooltip().as_deref(),
+            state.plan_tooltip().map(|tip| tip.plain()).as_deref(),
             Some("Plan: Max\nReported rate-limit tier: default_claude_ultra_17x")
         );
         state.snapshot.as_mut().unwrap().plan = None;
@@ -16482,7 +16473,7 @@ mod app_tests {
                 "{display:?} with {tier}"
             );
             assert_eq!(
-                state.plan_tooltip(),
+                state.plan_tooltip().map(|tip| tip.plain()),
                 Some(format!(
                     "Plan: {expected}\nReported rate-limit tier: {tier}"
                 ))

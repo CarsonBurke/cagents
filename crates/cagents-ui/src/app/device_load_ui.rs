@@ -5,6 +5,7 @@
 //! moves, so a steady device redraws nothing.
 use super::*;
 use crate::device_stats::{CRITICAL_PERCENT, DeviceStats, WARNING_PERCENT};
+use crate::interaction::{RichTip, TipRow};
 use cosmic::iced::futures::SinkExt;
 
 /// What the window knows of its device's load.
@@ -100,44 +101,47 @@ fn size(bytes: u64) -> String {
     }
 }
 
-/// The hover text: what each figure measures, in full.
-pub(super) fn detail(load: &DeviceLoad, device: &str) -> String {
-    let device = match device {
-        "This device" => "this computer",
-        device => device,
+/// The hover text: what each figure measures, in full, under the device's
+/// name.
+pub(super) fn detail(load: &DeviceLoad, device: &str) -> RichTip<'static> {
+    let (title, device) = match device {
+        "This device" => ("This computer".to_owned(), "this computer"),
+        device => (device.to_owned(), device),
     };
     let stats = match load {
-        DeviceLoad::Waiting => return format!("Reading {device}'s load…"),
-        DeviceLoad::Unavailable(reason) => return reason.clone(),
+        DeviceLoad::Waiting => return RichTip::new(format!("Reading {device}'s load…")),
+        DeviceLoad::Unavailable(reason) => return RichTip::new(reason.clone()),
         DeviceLoad::Live(stats) => stats,
     };
-    let mut lines = Vec::with_capacity(4);
-    lines.push(match stats.cpu {
-        Some(cpu) => format!(
-            "CPU {}% · {} core{} · load average {:.1}",
-            cpu.percent,
-            cpu.cores,
-            if cpu.cores == 1 { "" } else { "s" },
-            f64::from(cpu.load_centi) / 100.0
-        ),
-        None => "CPU: measuring…".to_owned(),
-    });
-    lines.push(match stats.memory {
-        Some(memory) => {
-            let mut line = format!("Memory {} of {}", size(memory.used), size(memory.total));
-            if memory.swap_total > 0 {
-                line.push_str(&format!(" · swap {}", size(memory.swap_used)));
-            }
-            line
-        }
-        None => "Memory: unavailable".to_owned(),
-    });
-    lines.push(match stats.disk {
-        Some(disk) => format!("Home disk {} of {}", size(disk.used), size(disk.total)),
-        None => "Home disk: unavailable".to_owned(),
-    });
-    lines.push(format!("On {device}"));
-    lines.join("\n")
+    let missing = |label: &'static str, why: &'static str| TipRow::new(label, why).secondary();
+    RichTip::new(title).rows([
+        match stats.cpu {
+            Some(cpu) => TipRow::new("CPU", format!("{}%", cpu.percent)).detail(format!(
+                "{} core{} · load average {:.1}",
+                cpu.cores,
+                if cpu.cores == 1 { "" } else { "s" },
+                f64::from(cpu.load_centi) / 100.0
+            )),
+            None => missing("CPU", "measuring…"),
+        },
+        match stats.memory {
+            Some(memory) => TipRow::new(
+                "Memory",
+                format!("{} of {}", size(memory.used), size(memory.total)),
+            )
+            .detail_maybe(
+                (memory.swap_total > 0).then(|| format!("swap {}", size(memory.swap_used))),
+            ),
+            None => missing("Memory", "unavailable"),
+        },
+        match stats.disk {
+            Some(disk) => TipRow::new(
+                "Home disk",
+                format!("{} of {}", size(disk.used), size(disk.total)),
+            ),
+            None => missing("Home disk", "unavailable"),
+        },
+    ])
 }
 
 impl Cagents {
@@ -202,7 +206,7 @@ impl Cagents {
                         .align_y(Alignment::Center),
                 )
                 .padding(Padding::from([0.0, space::S])),
-                detail.clone(),
+                detail.plain(),
             ),
             detail,
         )
@@ -399,7 +403,8 @@ mod tests {
             detail(
                 &DeviceLoad::Unavailable("fw16 isn't reporting".into()),
                 "fw16"
-            ),
+            )
+            .plain(),
             "fw16 isn't reporting"
         );
     }
@@ -420,12 +425,12 @@ mod tests {
             total: 1_982_200_000_000,
         });
         assert_eq!(
-            detail(&DeviceLoad::Live(stats), "This device"),
-            "CPU 12% · 16 cores · load average 1.9\nMemory 9.3 GB of 16.0 GB · swap 0.4 GB\n\
-             Home disk 238 GB of 1.98 TB\nOn this computer"
+            detail(&DeviceLoad::Live(stats), "This device").plain(),
+            "This computer\nCPU: 12%, 16 cores · load average 1.9\n\
+             Memory: 9.3 GB of 16.0 GB, swap 0.4 GB\nHome disk: 238 GB of 1.98 TB"
         );
         assert_eq!(
-            detail(&DeviceLoad::Waiting, "This device"),
+            detail(&DeviceLoad::Waiting, "This device").plain(),
             "Reading this computer's load…"
         );
     }

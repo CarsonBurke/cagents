@@ -26,7 +26,7 @@ pub use list_navigation::{reveal_list_selection, selection_offset};
 mod reveal_focus;
 pub use reveal_focus::{focus_group, reveal_focus};
 mod rich_tip;
-pub use rich_tip::{RichTip, TipBody, TipRow, TipTone, chord_keys};
+pub use rich_tip::{RichTip, TipBody, TipRow, TipTone, chord_keys, find as find_tips};
 
 use crate::design::space;
 

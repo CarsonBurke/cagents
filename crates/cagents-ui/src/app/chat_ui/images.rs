@@ -1522,7 +1522,7 @@ impl Gallery {
         let navigation = self.entries.len() > 1;
         let command = |glyph: Icon,
                        label: &'static str,
-                       tip: &'static str,
+                       tip: crate::interaction::TipBody<'static>,
                        message: Option<Action>|
          -> Element<'_, Message> {
             if compact {
@@ -1564,28 +1564,30 @@ impl Gallery {
             command(
                 Icon::Copy,
                 "Copy",
-                if cfg!(target_os = "macos") {
-                    "Copy image (Cmd+C)"
-                } else {
-                    "Copy image (Ctrl+C)"
-                },
+                crate::interaction::RichTip::new("Copy image")
+                    .shortcut(if cfg!(target_os = "macos") {
+                        "Cmd+C"
+                    } else {
+                        "Ctrl+C"
+                    })
+                    .into(),
                 image.map(|image| Action::Image(image, ImageCommand::Copy)),
             ),
             command(
                 Icon::Compress,
                 "Fit",
-                "Fit the image to the viewer",
+                "Fit the image to the viewer".into(),
                 Some(Action::ImageFit(host)),
             ),
             command(
                 Icon::PopOut,
                 "Open externally",
-                "Open in another app",
+                "Open in another app".into(),
                 self.url().map(|_| Action::ImageExternal(host)),
             ),
             icon(
                 Icon::Close,
-                "Close image (Esc)",
+                crate::interaction::RichTip::new("Close image").shortcut("Escape"),
                 true,
                 Action::CloseImage(host),
             ),

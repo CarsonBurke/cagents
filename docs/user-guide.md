@@ -122,21 +122,17 @@ determine which models and permission modes are available.
 
 - Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
   its pane, **Alt+Q** and **Alt+R** move to the previous and next pane,
-  **Alt+W** cycles its width, and **Ctrl+T** creates a native thread
-  tab. These chords are withheld from the terminal program. Other shell keys
-  reach the program unless you bind them to workspace actions.
+  **Alt+W** cycles its width, **Alt+I** toggles its inspector, and **Ctrl+T**
+  creates a native thread tab. These chords are withheld from the terminal
+  program. Other shell keys reach the program unless you bind them to
+  workspace actions.
   **Ctrl+F** finds in the focused terminal,
   chat transcript or editor, and otherwise searches projects. The
   review chords act in pull request and local diff panes.
   `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
   also belong to the workspace.
-- Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
-  `Ctrl+Shift+R`. Close has returned to **Ctrl+W**, and width cycling, after a
-  stop at `Alt+Shift+R`, is now **Alt+W**, beside **Alt+Q** and **Alt+R** for
-  pane navigation. The inspector moved from `Ctrl+Shift+I` to **Alt+I** and
-  the account picker from `Ctrl+Shift+A` to **Ctrl+U**. Customized shortcuts
-  are kept, and older navigation and creation defaults also upgrade where they
-  remain unchanged. See
+- Settings from an older version move to the current defaults wherever they
+  still hold an old default; shortcuts you changed are kept. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far

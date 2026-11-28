@@ -48,6 +48,23 @@ impl TipBody<'_> {
             Self::Rich(tip) => tip.plain(),
         }
     }
+
+    /// What the tooltip says beyond its title, for a control whose
+    /// accessible name is the title: its shortcut, rows and notes, one to a
+    /// line. `None` when the title is all it says.
+    pub fn description(&self) -> Option<String> {
+        let Self::Rich(tip) = self else {
+            return None;
+        };
+        let lines: Vec<String> = tip
+            .shortcut
+            .iter()
+            .map(|chord| format!("Shortcut: {chord}"))
+            .chain(tip.rows.iter().map(TipRow::plain))
+            .chain(tip.notes.iter().map(|(text, _)| text.to_string()))
+            .collect();
+        (!lines.is_empty()).then(|| lines.join("\n"))
+    }
 }
 
 impl<'a> From<&'a str> for TipBody<'a> {
@@ -128,17 +145,39 @@ impl<'a> RichTip<'a> {
         self
     }
 
-    /// A sentence beneath the rows that reports a problem.
+    /// A sentence beneath the rows about something that needs the user,
+    /// such as a limit that stops the account.
     pub fn warning(mut self, text: impl Into<Cow<'a, str>>) -> Self {
         self.notes.push((text.into(), TipTone::Warning));
         self
     }
 
+    /// A sentence beneath the rows that reports a failure.
+    pub fn error(mut self, text: impl Into<Cow<'a, str>>) -> Self {
+        self.notes.push((text.into(), TipTone::Error));
+        self
+    }
+
+    /// A sentence beneath the rows in `tone`.
+    pub fn note_in(mut self, text: impl Into<Cow<'a, str>>, tone: TipTone) -> Self {
+        self.notes.push((text.into(), tone));
+        self
+    }
+
     /// `other`'s rows and notes after this tip's own, for one tooltip that
-    /// speaks for several parts under this tip's title.
+    /// speaks for several parts under this tip's title. A row or note this
+    /// tip already has is not repeated.
     pub fn append(mut self, other: RichTip<'a>) -> Self {
-        self.rows.extend(other.rows);
-        self.notes.extend(other.notes);
+        for row in other.rows {
+            if !self.rows.contains(&row) {
+                self.rows.push(row);
+            }
+        }
+        for note in other.notes {
+            if !self.notes.contains(&note) {
+                self.notes.push(note);
+            }
+        }
         self
     }
 
@@ -195,8 +234,10 @@ pub enum TipTone {
     Primary,
     /// Recedes behind the primary text: labels, qualifiers and notes.
     Secondary,
-    /// Reports a problem the reader should act on.
+    /// Something that needs the reader, such as an allowance run out.
     Warning,
+    /// A failure, such as a check that could not run.
+    Error,
 }
 
 impl<'a> TipRow<'a> {
@@ -275,6 +316,24 @@ impl<'a> TipRow<'a> {
     }
 }
 
+/// A find bar's controls, the same in every pane: their keys act from the
+/// search field.
+pub mod find {
+    use super::RichTip;
+
+    pub fn previous() -> RichTip<'static> {
+        RichTip::new("Previous match").shortcut("Shift+Enter")
+    }
+
+    pub fn next() -> RichTip<'static> {
+        RichTip::new("Next match").shortcut("Enter")
+    }
+
+    pub fn close() -> RichTip<'static> {
+        RichTip::new("Close find").shortcut("Escape")
+    }
+}
+
 /// The keys of `chord` as they are printed on a keyboard, such as `Ctrl`,
 /// `,` for `Comma`, or `+` for the plus key in `Ctrl++`.
 pub fn chord_keys(chord: &str) -> Vec<Cow<'_, str>> {
@@ -288,6 +347,7 @@ pub fn chord_keys(chord: &str) -> Vec<Cow<'_, str>> {
             "Minus" => Cow::Borrowed("-"),
             "PageUp" => Cow::Borrowed("Page Up"),
             "PageDown" => Cow::Borrowed("Page Down"),
+            "Escape" => Cow::Borrowed("Esc"),
             key if key.chars().count() == 1 => Cow::Owned(key.to_uppercase()),
             key => Cow::Borrowed(key),
         })
@@ -306,6 +366,9 @@ const SECONDARY_INK: f32 = 0.64;
 const COLUMN_GAP: f32 = space::M;
 /// Gap between detail rows. Body lines already carry their own leading.
 const ROW_GAP: f32 = space::XXS;
+/// A detailed tip's widest extent: a plain tip's, plus room for a column of
+/// labels beside the values.
+const DETAILED_MAX_WIDTH: f32 = super::TIP_MAX_WIDTH + 80.0;
 
 /// The surface of a rich tip.
 pub(super) fn surface<'a, Message: 'a>(tip: RichTip<'a>) -> Element<'a, Message> {
@@ -339,11 +402,22 @@ pub(super) fn surface<'a, Message: 'a>(tip: RichTip<'a>) -> Element<'a, Message>
             .into_iter()
             .map(|(text, tone)| ink(design::body(text), tone)),
     );
+    // A title alone sits as a plain tip does; details take a little more
+    // room around them.
+    let (padding, max_width) = if detailed {
+        (
+            [space::XS + space::XXS, space::S + space::XXS],
+            DETAILED_MAX_WIDTH,
+        )
+    } else {
+        ([space::XS, space::S], super::TIP_MAX_WIDTH)
+    };
     widget::container(
         widget::column::with_children(sections).spacing(if detailed { space::S } else { 0.0 }),
     )
     .class(design::transparent())
-    .padding([space::XS + space::XXS, space::S + space::XXS])
+    .padding(padding)
+    .max_width(max_width)
     .into()
 }
 
@@ -465,7 +539,7 @@ impl<Message> Widget<Message, Theme, Renderer> for Ink<'_, Message> {
         style.text_color = match self.tone {
             TipTone::Primary => given,
             TipTone::Secondary => scaled(given, SECONDARY_INK),
-            TipTone::Warning => {
+            TipTone::Warning | TipTone::Error => {
                 // The given ink is the surface's own at the tip's opacity.
                 let full: Color = theme.current_container().component.on.into();
                 let strength = if full.a > 0.0 {
@@ -473,7 +547,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Ink<'_, Message> {
                 } else {
                     1.0
                 };
-                scaled(design::warning_color(theme), strength)
+                let tone = if self.tone == TipTone::Error {
+                    design::destructive_color(theme)
+                } else {
+                    design::warning_color(theme)
+                };
+                scaled(tone, strength)
             }
         };
         if self.cap {
@@ -588,9 +667,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Table<'_, Message> {
                 .iter()
                 .map(|node| node.size().height)
                 .fold(0.0, f32::max);
+            // The row's first line: a label or value, which do not wrap.
+            let line = nodes[first..first + COLUMNS - 1]
+                .iter()
+                .map(|node| node.size().height)
+                .fold(0.0, f32::max);
             for (column, node) in nodes[first..first + COLUMNS].iter_mut().enumerate() {
-                // Centered on the row, so a key cap sits level with the text.
-                let top = y + (height - node.size().height) / 2.0;
+                // Text starts at the top, so a wrapped qualifier hangs below
+                // its value; anything shorter than a line, such as key caps,
+                // sits level with it.
+                let top = y + ((line - node.size().height) / 2.0).max(0.0);
                 node.move_to_mut(Point::new(starts[column], top));
                 if node.size().width > 0.0 {
                     width = width.max(starts[column] + node.size().width);
@@ -663,5 +749,38 @@ mod tests {
             "Choose an account (Ctrl+U)\nWeekly: 4% left, resets in 3d\nTerminal: Ctrl+Shift+T\nPinned to this conversation."
         );
         assert_eq!(TipBody::from(tip).title(), "Choose an account");
+    }
+
+    /// A control named by its tip's title still announces the rest of it.
+    #[test]
+    fn a_rich_tip_describes_what_its_title_leaves_out() {
+        let tip = TipBody::from(
+            RichTip::new("Toggle inspector")
+                .shortcut("Alt+I")
+                .error("Last check failed"),
+        );
+        assert_eq!(
+            tip.description().as_deref(),
+            Some("Shortcut: Alt+I\nLast check failed")
+        );
+        assert_eq!(TipBody::from(RichTip::new("Settings")).description(), None);
+        assert_eq!(TipBody::from("Settings").description(), None);
+    }
+
+    /// Previews of one account share its notes; the tip says each once.
+    #[test]
+    fn appending_a_tip_repeats_none_of_its_rows_or_notes() {
+        let part = || {
+            RichTip::new("Claude")
+                .row(TipRow::new("Fable", "0% left"))
+                .warning("Limited until it resets.")
+        };
+        let tip = part()
+            .append(part().row(TipRow::new("Weekly", "4% left")))
+            .append(part());
+        assert_eq!(
+            tip.plain(),
+            "Claude\nFable: 0% left\nWeekly: 4% left\nLimited until it resets."
+        );
     }
 }

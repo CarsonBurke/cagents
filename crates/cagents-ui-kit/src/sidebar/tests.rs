@@ -8933,9 +8933,14 @@ fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
         for child in node.children() {
             assert!(child.bounds().x + child.bounds().width <= width);
         }
+        // The tooltip's title names the control; its shortcut describes it.
         assert!(
-            accessible_names(&renderer, utilities(false, false, &shortcuts, None))
-                .contains(&"Toggle Projects sidebar — Alt+B".to_owned())
+            accessible_descriptions(&renderer, utilities(false, false, &shortcuts, None)).contains(
+                &(
+                    "Toggle Projects sidebar".to_owned(),
+                    "Shortcut: Alt+B".to_owned()
+                )
+            )
         );
     }
 }
@@ -8943,8 +8948,20 @@ fn projects_header_keeps_its_title_and_controls_within_the_minimum_width() {
 /// The accessible names an element publishes, in tree order.
 fn accessible_names(
     renderer: &cosmic::Renderer,
-    mut element: Element<'_, SidebarAction>,
+    element: Element<'_, SidebarAction>,
 ) -> Vec<String> {
+    accessible_descriptions(renderer, element)
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect()
+}
+
+/// Each accessible name an element publishes with its description, empty
+/// when it has none, in tree order.
+fn accessible_descriptions(
+    renderer: &cosmic::Renderer,
+    mut element: Element<'_, SidebarAction>,
+) -> Vec<(String, String)> {
     use cosmic::iced::advanced::mouse;
 
     let mut tree = Tree::new(element.as_widget());
@@ -8961,7 +8978,15 @@ fn accessible_names(
         .root()
         .iter()
         .chain(nodes.children())
-        .filter_map(|node| node.node().label().map(ToOwned::to_owned))
+        .filter_map(|node| {
+            let node = node.node();
+            node.label().map(|label| {
+                (
+                    label.to_owned(),
+                    node.description().unwrap_or_default().to_owned(),
+                )
+            })
+        })
         .collect()
 }
 

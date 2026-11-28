@@ -11189,12 +11189,12 @@ fn find_strip<'a>(
     for (icon, label, action) in [
         (
             Icon::ChevronUp,
-            "Previous match — Shift+Enter in search",
+            crate::interaction::find_tips::previous(),
             RepositoryAction::FindPrevious { card },
         ),
         (
             Icon::ChevronDown,
-            "Next match — Enter in search",
+            crate::interaction::find_tips::next(),
             RepositoryAction::FindNext { card },
         ),
     ] {
@@ -11205,7 +11205,7 @@ fn find_strip<'a>(
         );
     }
     row.push(
-        icon_button(Icon::Close, "Close find — Escape")
+        icon_button(Icon::Close, crate::interaction::find_tips::close())
             .on_press(RepositoryAction::CloseFind { card })
             .into(),
     );

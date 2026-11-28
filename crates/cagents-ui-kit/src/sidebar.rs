@@ -8998,11 +8998,18 @@ fn rail_deletion_badges(
 
 /// A row's tooltip. The rail has no room for the expanded row's "Deleting…"
 /// caption or its failure badge, so its tooltip says what they would.
-fn rail_tooltip(tooltip: &str, deletion: Option<&RowDeletion>, compact: bool) -> String {
+fn rail_tooltip(
+    tooltip: &str,
+    deletion: Option<&RowDeletion>,
+    compact: bool,
+) -> crate::interaction::TipBody<'static> {
+    let tip = crate::interaction::RichTip::new(tooltip.to_owned());
     match deletion.filter(|_| compact) {
-        Some(RowDeletion::Deleting) => format!("{tooltip}\nDeleting…"),
-        Some(RowDeletion::Failed(reason)) => format!("{tooltip}\nCould not delete: {reason}"),
-        None => tooltip.to_owned(),
+        Some(RowDeletion::Deleting) => tip.note("Deleting…").into(),
+        Some(RowDeletion::Failed(reason)) => {
+            tip.error(format!("Could not delete: {reason}")).into()
+        }
+        None => tooltip.to_owned().into(),
     }
 }
 
@@ -13072,7 +13079,7 @@ fn changes_footer<'a>(
         .name(format!("{commit_label} (Ctrl+Enter)"))
         .id(chrome.commit_id.clone())
         .on_press_maybe(can_commit.then_some(commit_action)),
-        format!("{commit_hint} (Ctrl+Enter)"),
+        crate::interaction::RichTip::new(commit_hint).shortcut("Ctrl+Enter"),
     );
 
     if has_subject {
