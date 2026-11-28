@@ -780,6 +780,7 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     drop(app.update(poll(Some(job.id.clone()), job)));
     assert!(!app.notices.has(NoticeKey::StartupRecovery));
     assert!(!app.notices.has(verification));
+    assert_eq!(reported(&app), None);
     assert!(app.startup_terminal_gave_up(card));
     assert_eq!(
         app.startup_gave_up_caption(card),
