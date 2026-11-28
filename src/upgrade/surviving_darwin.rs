@@ -377,13 +377,12 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("codex");
         std::fs::copy("/bin/bash", &executable).unwrap();
-        let child = Child::start(std::process::Command::new(executable).args([
-            "-c",
-            "IFS= read -r barrier",
-            "fixture",
-            "resume",
-            &conversation,
-        ]));
+        std::fs::write(directory.path().join("resume"), b"IFS= read -r barrier\n").unwrap();
+        let child = Child::start(
+            std::process::Command::new(executable)
+                .current_dir(directory.path())
+                .args(["resume", "--model", "MODEL", &conversation]),
+        );
         let survivor = super::scan(&source, u32::MAX, &[]).unwrap().unwrap();
         assert_eq!(survivor.pid, child.pid());
         assert_eq!(survivor.link, SurvivorLink::Conversation);

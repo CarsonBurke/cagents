@@ -362,10 +362,36 @@ impl SurvivorEvidence {
         observed == Some(provider) && self.has_conversation_selector(arguments)
     }
 
+    #[cfg(target_os = "linux")]
+    fn may_own_conversation<'a>(
+        &self,
+        mut arguments: impl Iterator<Item = &'a [u8]> + Clone,
+    ) -> bool {
+        use crate::agent::Provider;
+
+        let Some((provider, _)) = self.exact_identity else {
+            return false;
+        };
+        arguments.next();
+        self.has_conversation_selector(arguments.clone())
+            || (provider == Provider::Codex
+                && arguments
+                    .next()
+                    .and_then(|script| std::str::from_utf8(script).ok())
+                    .and_then(|script| Provider::from_script(Path::new(script)))
+                    == Some(provider)
+                && self.has_conversation_selector(arguments))
+    }
+
     fn has_conversation_selector<'a>(&self, arguments: impl Iterator<Item = &'a [u8]>) -> bool {
+        use crate::agent::Provider;
+
         let Some((provider, id)) = self.exact_identity else {
             return false;
         };
+        if provider == Provider::Codex {
+            return codex_resume_matches(arguments, id);
+        }
         let mut arguments = arguments.peekable();
         while let Some(argument) = arguments.next() {
             let Ok(argument) = std::str::from_utf8(argument) else {
@@ -383,7 +409,7 @@ impl SurvivorEvidence {
                 }
                 continue;
             }
-            let omp_file = provider == crate::agent::Provider::Omp && flag == "--session";
+            let omp_file = provider == Provider::Omp && flag == "--session";
             if provider.is_identity_option(flag) || omp_file {
                 let value = inline.or_else(|| {
                     arguments
@@ -408,6 +434,77 @@ impl SurvivorEvidence {
     fn carries_marker<'a>(&self, mut entries: impl Iterator<Item = &'a [u8]>) -> bool {
         entries.any(|entry| self.markers.iter().any(|marker| entry == marker.as_bytes()))
     }
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid::Uuid) -> bool {
+    use crate::agent::Provider::Codex;
+
+    let matches_id = |argument: &[u8]| {
+        std::str::from_utf8(argument)
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            == Some(id)
+    };
+    let mut arguments = arguments.peekable();
+    let mut exec = false;
+    let mut resuming = false;
+    let mut matched_id = false;
+    while let Some(argument) = arguments.next() {
+        if argument == b"--" {
+            // Clap treats tokens after the separator as positionals. They
+            // cannot introduce a subcommand or change how resume selects it.
+            return resuming && (matched_id || arguments.next().is_some_and(matches_id));
+        }
+        if argument.len() > 1 && argument.starts_with(b"-") {
+            let flag = argument
+                .split(|byte| *byte == b'=')
+                .next()
+                .unwrap_or(argument);
+            if let Ok(flag) = std::str::from_utf8(flag) {
+                if resuming && Codex.is_latest_selector(flag) {
+                    return false;
+                }
+                // These observed CLI options are distinct from the subset
+                // supported in a replayable cagents launch recipe.
+                let takes_value = Codex.is_value_option(flag)
+                    || Codex.is_cwd_option(flag)
+                    || matches!(
+                        flag,
+                        "--image" | "-i" | "--local-provider" | "--enable" | "--disable"
+                    )
+                    || (exec
+                        && matches!(
+                            flag,
+                            "--output-schema"
+                                | "--output-last-message"
+                                | "-o"
+                                | "--color"
+                                | "--thread-source"
+                                | "--cyber-access-program"
+                        ));
+                if takes_value && !argument.contains(&b'=') {
+                    arguments.next_if(|value| *value != b"--");
+                }
+            }
+            continue;
+        }
+        if resuming {
+            if !matched_id {
+                if !matches_id(argument) {
+                    return false;
+                }
+                matched_id = true;
+            }
+        } else if argument == Codex.resume_flag().as_bytes() {
+            resuming = true;
+        } else if !exec && matches!(argument, b"exec" | b"e") {
+            exec = true;
+        } else {
+            return false;
+        }
+    }
+    matched_id
 }
 
 /// A process shows no arguments for a moment while it execs or exits, which on a
@@ -660,10 +757,7 @@ impl<'a> Scan<'a> {
         let arguments = argv.split(|byte| *byte == 0);
         // Only selector candidates need an image lookup. Keep lookup failure
         // separate so a known unit or lineage marker can still prove ownership.
-        let executable_error = if self
-            .evidence
-            .has_conversation_selector(arguments.clone().skip(1))
-        {
+        let executable_error = if self.evidence.may_own_conversation(arguments.clone()) {
             match fs::read_link(path.join("exe")) {
                 Ok(executable) if self.evidence.owns_conversation(&executable, arguments) => {
                     return Ok(Inspected::Survivor(survivor(
@@ -4212,6 +4306,89 @@ mod tests {
         )
         .unwrap();
         assert_eq!(scan(), Some(SurvivorLink::Lineage));
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn codex_survivors_require_an_exact_resume_positional() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = checkpoint(directory.path()).terminals.remove(0).source;
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let other = "12345678-1234-4234-8234-123456789def";
+        source.launch.program = "codex".into();
+        source.launch.arguments = vec!["resume".into(), id.into()];
+        let pid = u32::MAX - 1;
+        readable_process(directory.path(), pid, "S", "PATH=/bin\0", 100);
+        let process = directory.path().join(pid.to_string());
+        for (executable, arguments, owns) in [
+            ("/usr/bin/codex", vec!["resume", id], true),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "--config",
+                    "key=value",
+                    "resume",
+                    "--model",
+                    "MODEL",
+                    id,
+                    "continue",
+                ],
+                true,
+            ),
+            ("/usr/bin/codex", vec!["resume", "--model=MODEL", id], true),
+            ("/usr/bin/codex", vec!["resume", "--", id], true),
+            ("/usr/bin/codex", vec!["resume", id, "--", "--last"], true),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "e",
+                    "resume",
+                    "--image",
+                    "prompt.png",
+                    "--model",
+                    "MODEL",
+                    id,
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/node",
+                vec!["/pkg/codex.js", "resume", "-m", "MODEL", id],
+                true,
+            ),
+            ("/usr/bin/cat", vec!["resume", id], false),
+            ("/usr/bin/codex", vec!["app-server", "resume", id], false),
+            ("/usr/bin/codex", vec!["--", "resume", id], false),
+            ("/usr/bin/codex", vec!["exec", "--", "resume", id], false),
+            ("/usr/bin/codex", vec!["--model", "resume", id], false),
+            ("/usr/bin/codex", vec!["resume", "--model", id], false),
+            ("/usr/bin/codex", vec!["resume", other, id], false),
+            ("/usr/bin/codex", vec!["resume", "--last", id], false),
+            ("/usr/bin/codex", vec!["resume", id, "--last"], false),
+            (
+                "/usr/bin/codex",
+                vec!["exec", "resume", "--last", id],
+                false,
+            ),
+        ] {
+            symlink(executable, process.join("exe")).unwrap();
+            let mut argv = String::from("codex\0");
+            for argument in arguments {
+                argv.push_str(argument);
+                argv.push('\0');
+            }
+            fs::write(process.join("cmdline"), &argv).unwrap();
+            assert_eq!(
+                surviving_process(&source, u32::MAX, directory.path(), &[])
+                    .unwrap()
+                    .map(|found| found.link),
+                owns.then_some(SurvivorLink::Conversation),
+                "{executable} {argv:?}"
+            );
+            fs::remove_file(process.join("exe")).unwrap();
+        }
     }
 
     /// #2365: an unreadable process can't be ruled out, but the refusal names

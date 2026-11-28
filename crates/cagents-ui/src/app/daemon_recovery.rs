@@ -2084,6 +2084,11 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let executable = directory.path().join("codex");
         fs::copy("/bin/bash", &executable).unwrap();
+        fs::write(
+            directory.path().join("resume"),
+            b"printf '%s\\n' \"$$\" > \"$2\"\nIFS= read -r barrier\n",
+        )
+        .unwrap();
         let marker = directory.path().join("writer.pid");
         let mut original = session(directory.path(), &proof("old"));
         let conversation = uuid::Uuid::new_v4().to_string();
@@ -2094,14 +2099,14 @@ mod tests {
         // writer outlive its short-lived launcher so it is outside that
         // replacement's process tree. Its inherited stdin owns its lifetime.
         let mut launcher = Command::new("/usr/bin/python3")
+            .current_dir(directory.path())
             .arg("-c")
             .arg(
                 r#"import os, sys
 if os.fork():
     os._exit(0)
 os.setsid()
-os.execl(sys.argv[1], 'codex', '-c', 'printf "%s\n" "$$" > "$3"; IFS= read -r barrier',
-         'fixture', 'resume', sys.argv[2], sys.argv[3])
+os.execl(sys.argv[1], 'codex', 'resume', sys.argv[2], sys.argv[3])
 "#,
             )
             .arg(executable)
