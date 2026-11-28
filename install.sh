@@ -1217,17 +1217,40 @@ ACTUAL_HASH=$(file_sha256 "$ARCHIVE_PATH")
 
 ARCHIVE_LIST=$DOWNLOAD_DIR/archive.list
 ARCHIVE_VERBOSE=$DOWNLOAD_DIR/archive.verbose
-LC_ALL=C tar -tzf "$ARCHIVE_PATH" > "$ARCHIVE_LIST" || fail 'archive cannot be listed'
-LC_ALL=C tar -tvzf "$ARCHIVE_PATH" > "$ARCHIVE_VERBOSE" || fail 'archive metadata cannot be listed'
-awk '
+case $(LC_ALL=C tar --version 2>/dev/null || :) in
+    'tar (GNU tar) '*)
+        # Numeric owners leave the first double quote to the member name.
+        # C quoting preserves whitespace and escapes embedded record separators.
+        LC_ALL=C tar -tvzf "$ARCHIVE_PATH" --numeric-owner --quoting-style=c > "$ARCHIVE_VERBOSE" \
+            || fail 'archive metadata cannot be listed'
+        quoted_names=1
+        names_output=$ARCHIVE_LIST
+        ;;
+    *)
+        LC_ALL=C tar -tzf "$ARCHIVE_PATH" > "$ARCHIVE_LIST" || fail 'archive cannot be listed'
+        LC_ALL=C tar -tvzf "$ARCHIVE_PATH" > "$ARCHIVE_VERBOSE" || fail 'archive metadata cannot be listed'
+        quoted_names=0
+        names_output=/dev/null
+        ;;
+esac
+LC_ALL=C awk -v quoted="$quoted_names" '
     {
         type = substr($1, 1, 1)
-        last = substr($NF, length($NF), 1)
         if (type != "d" && type != "-") exit 1
+        name = $NF
+        if (quoted) {
+            start = index($0, "\"")
+            if (!start || substr($0, length($0), 1) != "\"") exit 1
+            name = substr($0, start + 1, length($0) - start - 1)
+            # The exact allowlist below contains no names requiring escapes.
+            if (name == "" || index(name, "\"") || index(name, "\\")) exit 1
+        }
+        last = substr(name, length(name), 1)
         if (type == "d" && last != "/") exit 1
         if (type == "-" && last == "/") exit 1
+        if (quoted) print name
     }
-' "$ARCHIVE_VERBOSE" || fail 'archive contains links, special files, or invalid entry types'
+' "$ARCHIVE_VERBOSE" > "$names_output" || fail 'archive contains links, special files, or invalid entry types'
 PREPARED_MARKER=.cagents-prepared-candidate-v1.json
 LOCAL_CANDIDATE_MARKER=.cagents-local-candidate-v1
 LOCAL_SOURCE_MARKER=.cagents-local-source-v1
