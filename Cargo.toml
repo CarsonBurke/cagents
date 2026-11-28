@@ -148,6 +148,7 @@ imara-diff = "0.2.0"
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 percent-encoding = { version = "2.3", optional = true }
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # The mobile bridge validates PNG bytes before staging an attachment.

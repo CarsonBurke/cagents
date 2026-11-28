@@ -1279,6 +1279,7 @@ dependencies = [
  "libghostty-vt",
  "notify 9.0.0-rc.8",
  "object",
+ "p256",
  "percent-encoding",
  "png 0.18.1",
  "portable-pty",

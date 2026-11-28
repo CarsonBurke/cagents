@@ -44,6 +44,8 @@ const LOCK_NAME: &str = ".authorized_keys.cagents-lock";
 /// Under the runtime directory: one directory per pairing.
 const PAIRINGS: &str = "cagents-phone-pairing";
 const ED25519: &str = "ssh-ed25519";
+const ECDSA_P256: &str = "ecdsa-sha2-nistp256";
+const INVALID_PHONE_KEY: &str = "Pairing requires a valid Ed25519 or P-256 public key.";
 
 // Files in a pairing's directory.
 const EXPIRES: &str = "expires";
@@ -83,10 +85,7 @@ impl PublicKey {
         let blob = base64::engine::general_purpose::STANDARD
             .decode(words.next()?)
             .ok()?;
-        let named = blob
-            .get(..4)
-            .map(|length| u32::from_be_bytes(length.try_into().unwrap()) as usize)?;
-        (blob.get(4..4 + named)? == kind.as_bytes()).then(|| Self {
+        (ssh_string(&mut blob.as_slice())? == kind.as_bytes()).then(|| Self {
             kind: kind.to_owned(),
             blob,
         })
@@ -105,10 +104,35 @@ impl PublicKey {
         }
     }
 
-    /// Whether this is a well-formed Ed25519 key, the only kind a phone may
-    /// pair with.
+    /// Whether this is a well-formed Ed25519 public key.
     pub fn is_ed25519(&self) -> bool {
-        self.kind == ED25519 && self.blob.len() == 4 + ED25519.len() + 4 + 32
+        let mut payload = self.payload();
+        self.kind == ED25519
+            && ssh_string(&mut payload).is_some_and(|key| key.len() == 32)
+            && payload.is_empty()
+    }
+
+    fn is_phone_key(&self) -> bool {
+        match self.kind.as_str() {
+            ED25519 => self.is_ed25519(),
+            ECDSA_P256 => {
+                let mut payload = self.payload();
+                ssh_string(&mut payload) == Some(b"nistp256")
+                    && ssh_string(&mut payload).is_some_and(|point| {
+                        // OpenSSH expects an uncompressed SEC1 point.
+                        point.len() == 65
+                            && point[0] == 4
+                            && p256::PublicKey::from_sec1_bytes(point).is_ok()
+                    })
+                    && payload.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        // Both constructors put the type in the first SSH string.
+        &self.blob[4 + self.kind.len()..]
     }
 
     /// OpenSSH's fingerprint, as `ssh-keygen -l` prints it: `SHA256:` and the
@@ -132,6 +156,13 @@ impl PublicKey {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+}
+
+fn ssh_string<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (length, rest) = input.split_first_chunk::<4>()?;
+    let (value, tail) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)?;
+    *input = tail;
+    Some(value)
 }
 
 /// The computer's Ed25519 host key, which the phone pins.
@@ -932,8 +963,8 @@ impl Pairing {
     /// Authorize the phone that asked, with `command`, remove the one-time
     /// line and tell the phone.
     pub fn allow(&self, request: &Request, command: &str) -> Result<Added, String> {
-        if !request.key.is_ed25519() {
-            return Err("Only Ed25519 keys can be paired.".into());
+        if !request.key.is_phone_key() {
+            return Err(INVALID_PHONE_KEY.into());
         }
         if request.key == self.one_time {
             return Err("The phone offered the pairing code's own key.".into());
@@ -1156,8 +1187,8 @@ fn pair(
         Ok(api::PairClientLine::Pair(request)) => request,
         Err(_) => return pair_error("The phone's pairing request wasn't understood."),
     };
-    let Some(key) = PublicKey::parse(&request.key).filter(PublicKey::is_ed25519) else {
-        return pair_error("Only Ed25519 keys can be paired.");
+    let Some(key) = PublicKey::parse(&request.key).filter(PublicKey::is_phone_key) else {
+        return pair_error(INVALID_PHONE_KEY);
     };
     if let Err(message) = record_request(directory, &key, &request.name) {
         return pair_error(message);
