@@ -389,6 +389,10 @@ pub const RETIRED_CHANNEL_WORK: &str =
 /// service turns that retry off for every client that compares against the
 /// other wording.
 pub const DAEMON_BUSY: &str = "The daemon is finishing another operation. Wait for it and retry.";
+/// The parked update listener answered Connect but cannot attach a terminal yet.
+/// Other retryable terminal refusals can represent a committed shutdown.
+pub const UPDATE_RESTORING_TERMINALS: &str =
+    "The application update is still restoring its terminals";
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
     "The terminal changed or still owns work; nothing was closed";

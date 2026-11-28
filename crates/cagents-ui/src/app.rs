@@ -21901,24 +21901,34 @@ fn open_terminal(
             generation: wake.generation,
         });
     };
-    let socket = match socket {
-        Some(socket) => socket,
-        None => crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?,
-    };
     let handle = match mode {
         TerminalStartMode::Attach(proof) => {
+            let socket = match socket {
+                Some(socket) => socket,
+                None => {
+                    crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?
+                }
+            };
             HostedTerminalHandle::connect_at(socket, session.id, Some(proof), wake)
         }
         TerminalStartMode::Spawn(recipe) => {
             let mut session = session.clone();
             session.launch = recipe;
-            HostedTerminalHandle::attach_or_spawn_at(
-                socket,
-                session,
-                config,
-                recovered.expected_host,
-                wake,
-            )
+            match socket {
+                Some(socket) => HostedTerminalHandle::attach_or_spawn_at(
+                    socket,
+                    session,
+                    config,
+                    recovered.expected_host,
+                    wake,
+                ),
+                None => HostedTerminalHandle::attach_or_spawn_ready(
+                    session,
+                    config,
+                    recovered.expected_host,
+                    wake,
+                ),
+            }
         }
     }
     .map_err(|error| error.to_string())?;
