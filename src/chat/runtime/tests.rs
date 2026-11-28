@@ -5726,6 +5726,112 @@ fn only_providers_that_opt_in_tolerate_stdout_noise() {
     assert!(spec.stdout_noise.is_some());
 }
 
+fn provider_with_noisy_stdout(
+    directory: &std::path::Path,
+    provider: crate::agent::Provider,
+    glue_prefix: &str,
+) -> LocalHandle {
+    use std::os::unix::fs::PermissionsExt;
+
+    prepare_python_provider_fixture(directory);
+    let program = directory.join(match provider {
+        crate::agent::Provider::Codex => "codex",
+        crate::agent::Provider::Omp => "omp",
+        _ => unreachable!(),
+    });
+    std::fs::write(
+        &program,
+        include_str!("../../../tests/fixtures/provider-stdout-noise.py"),
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let launch = super::super::Launch {
+        provider,
+        recipe: crate::model::LaunchRecipe {
+            program: program.to_string_lossy().into_owned(),
+            arguments: Vec::new(),
+            working_directory: directory.into(),
+            environment: BTreeMap::from([
+                ("HOME".into(), directory.to_string_lossy().into_owned()),
+                (
+                    "CODEX_HOME".into(),
+                    directory.to_string_lossy().into_owned(),
+                ),
+                ("FIXTURE_GLUE_PREFIX".into(), glue_prefix.into()),
+            ]),
+            unset_environment: Default::default(),
+        },
+        session_id: None,
+        draft_model: None,
+    };
+    let (spec, mut adapter) = super::super::protocol::create(&launch).unwrap();
+    assert!(matches!(spec.transport, TransportSpec::JsonLines));
+    let mut initial = adapter.initialize().unwrap();
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let snapshot = until(&handle, |snapshot| {
+        snapshot.ready || snapshot.error.is_some()
+    });
+    assert!(
+        snapshot.ready && snapshot.error.is_none(),
+        "{provider:?}: {snapshot:?}"
+    );
+    handle
+        .command(Command::Prompt {
+            text: "Exercise wrapper output".into(),
+            attachments: Vec::new(),
+            mode: super::super::PromptMode::Send,
+        })
+        .unwrap();
+    handle
+}
+
+#[test]
+fn codex_and_omp_finish_turns_with_stdout_noise() {
+    for provider in [crate::agent::Provider::Codex, crate::agent::Provider::Omp] {
+        let directory = tempfile::tempdir().unwrap();
+        let handle = provider_with_noisy_stdout(directory.path(), provider, "");
+        let snapshot = until(&handle, |snapshot| {
+            snapshot.error.is_some()
+                || (!snapshot.busy
+                    && snapshot.items.iter().any(|item| {
+                        matches!(&item.content, ItemContent::Text { text, .. }
+                            if text == "The provider answered despite wrapper output.")
+                    }))
+        });
+        handle.close().unwrap();
+        assert!(
+            snapshot.error.is_none() && !snapshot.exited,
+            "{provider:?}: {snapshot:?}"
+        );
+        assert!(handle.failure().is_none());
+    }
+}
+
+#[test]
+fn codex_and_omp_fail_when_noise_shares_a_line_with_turn_completion() {
+    let brace_prefix = "{}".repeat(64);
+    for (prefix, expected) in [
+        (
+            "wrapper omitted a newline: ",
+            "inside one of its conversation messages",
+        ),
+        (brace_prefix.as_str(), "Unsupported provider stdout"),
+    ] {
+        for provider in [crate::agent::Provider::Codex, crate::agent::Provider::Omp] {
+            let directory = tempfile::tempdir().unwrap();
+            let handle = provider_with_noisy_stdout(directory.path(), provider, prefix);
+            let snapshot = until(&handle, |snapshot| snapshot.error.is_some());
+            handle.close().unwrap();
+            let error = snapshot.error.as_deref().unwrap();
+            assert!(
+                error.contains(expected) && error.contains(prefix),
+                "{provider:?}: {error}"
+            );
+        }
+    }
+}
+
 #[test]
 fn a_backlog_beyond_the_frame_budget_drains_after_eof() {
     // Larger than one bounded parse pass and one read, so EOF is observed

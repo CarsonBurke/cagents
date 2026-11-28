@@ -3,7 +3,7 @@
 //! https://github.com/openai/codex/tree/rust-v0.153.4/codex-rs/app-server-protocol
 //! Pending requests are replayed to joining connections with the original ID;
 //! the first answer wins (app-server/src/outgoing_message.rs). Never auto-answer.
-use super::{Adapter, HeldStop, ProcessSpec, ServerIdentity, Step, TransportSpec};
+use super::{Adapter, EmbeddedFrame, HeldStop, ProcessSpec, ServerIdentity, Step, TransportSpec};
 use crate::account::{self, LiveReport};
 use crate::chat::{
     self, Answer, Attachment, Capabilities, ChangeKind, Choice, Command, CommandAction, Event,
@@ -486,6 +486,7 @@ fn create_inner(
     } else {
         spec.arguments.clear();
         spec.arguments.push("app-server".into());
+        spec.stdout_noise = Some(embedded_protocol_frame);
     }
     Ok((
         spec,
@@ -4986,6 +4987,15 @@ fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, String> {
         .as_array()
         .ok_or_else(|| format!("Unsupported Codex frame: missing array {key}"))
 }
+fn embedded_protocol_frame(line: &[u8]) -> EmbeddedFrame {
+    // Codex app-server JSON-RPC omits the version member used by ACP.
+    super::embedded_frame(line, |frame| {
+        let has_id = frame.get("id").is_some();
+        (frame["method"].is_string() && (has_id || frame.get("params").is_some()))
+            || (has_id && (frame.get("result").is_some() || frame.get("error").is_some()))
+    })
+}
+
 fn rpc_id(value: &Value) -> Result<String, String> {
     match value {
         Value::String(_) => Ok(value.to_string()),

@@ -39,6 +39,7 @@ class Case:
     variable: str
     mode: str = "stdio"
     installed: str | None = None
+    name: str | None = None
 
 
 # This is deliberately an explicit inventory: a new executable cannot silently
@@ -68,6 +69,8 @@ CASES = (
     Case("terminal-escape-codex.py", "CODEX_HOME", "version"),
     Case("fake-acp-agent.py", "HOME"),
     Case("omp-child-errors.py", "HOME"),
+    Case("provider-stdout-noise.py", "HOME", "omp-pipe", name="stdout_noise_omp_home"),
+    Case("provider-stdout-noise.py", "CODEX_HOME", "codex-pipe", name="stdout_noise_codex_config"),
     Case("claude-long-history.py", "HOME", "long-history"),
     Case("claude-damaged-history.py", "HOME", "damaged-history"),
     Case("conversation-work.py", "HOME", "conversation"),
@@ -284,6 +287,10 @@ class Home(unittest.TestCase):
             command.extend(("login", "status"))
         elif mode == "acp":
             command.append("acp")
+        elif mode == "omp-pipe":
+            command.extend(("--mode", "rpc-ui"))
+        elif mode == "codex-pipe":
+            command.append("app-server")
         elif mode == "forge":
             command.extend(("auth", "status", "--json", "hosts"))
         elif mode == "open":
@@ -392,10 +399,9 @@ class FixtureEntryContracts(Home):
 
 
 for _case in CASES:
+    _name = _case.name or _case.filename.replace(".", "_").replace("-", "_")
     for _kind in ("unmarked", "unset", "marked"):
-        setattr(FixtureEntryContracts,
-                "test_" + _case.filename.replace(".", "_").replace("-", "_") + "_" + _kind,
-                fixture_contract(_case, _kind))
+        setattr(FixtureEntryContracts, f"test_{_name}_{_kind}", fixture_contract(_case, _kind))
 
 
 class SceneEntryContracts(Home):

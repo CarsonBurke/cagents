@@ -1,7 +1,10 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
-    protocol::{Adapter, HeldStop, MetadataWake, ProcessSpec, SetupError, Step, TransportSpec},
+    protocol::{
+        Adapter, EmbeddedFrame, HeldStop, MetadataWake, ProcessSpec, SetupError, Step,
+        TransportSpec,
+    },
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
@@ -2995,7 +2998,7 @@ struct Actor {
     published_error: Option<String>,
     last_present: Instant,
     first_frame: bool,
-    stdout_noise: Option<fn(&[u8]) -> bool>,
+    stdout_noise: Option<fn(&[u8]) -> EmbeddedFrame>,
     started: Instant,
     startup: StartupBudget,
     write_started: Option<Instant>,
@@ -3446,16 +3449,24 @@ impl Actor {
                         Some(frame)
                     }
                     Err(error) => {
-                        let Some(hides_frame) = self.stdout_noise else {
+                        let Some(embedded_frame) = self.stdout_noise else {
                             return Err(format!(
                                 "Unsupported provider stdout (expected JSON-lines): {error}"
                             ));
                         };
                         let preview = super::protocol::diagnostic_preview(line, 200);
-                        if hides_frame(line) {
-                            return Err(format!(
-                                "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
-                            ));
+                        match embedded_frame(line) {
+                            EmbeddedFrame::Absent => {}
+                            EmbeddedFrame::Present => {
+                                return Err(format!(
+                                    "The agent printed other text inside one of its conversation messages, so the conversation could not continue. This usually comes from a wrapper script or shell startup file. Output: {preview}"
+                                ));
+                            }
+                            EmbeddedFrame::Unchecked => {
+                                return Err(format!(
+                                    "Unsupported provider stdout (expected JSON-lines): {error}. Output: {preview}"
+                                ));
+                            }
                         }
                         garbage_lines += 1;
                         garbage_total = garbage_total.saturating_add(1);

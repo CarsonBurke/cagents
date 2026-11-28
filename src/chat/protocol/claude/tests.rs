@@ -52,7 +52,11 @@ fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
         r#"x{"type":"assistant","message":{"content":[]}}"#,
         r#"{"unterminated {"type":"stream_event","event":{"type":"ping"}}"#,
     ] {
-        assert!(embedded_protocol_frame(line.as_bytes()), "{line}");
+        assert_eq!(
+            embedded_protocol_frame(line.as_bytes()),
+            EmbeddedFrame::Present,
+            "{line}"
+        );
     }
     for line in [
         "plain wrapper diagnostic",
@@ -63,12 +67,17 @@ fn embedded_frames_are_recognized_without_flagging_ordinary_text() {
         r#"logged {"payload":{"type":"result","subtype":"success"}}"#,
         r#"partial {"type":"result","subtype":"succ"#,
     ] {
-        assert!(!embedded_protocol_frame(line.as_bytes()), "{line}");
+        assert_eq!(
+            embedded_protocol_frame(line.as_bytes()),
+            EmbeddedFrame::Absent,
+            "{line}"
+        );
     }
     // The candidate bound holds on a line made of unparsable openers.
-    assert!(!embedded_protocol_frame(
-        format!(r#"{}"type""#, "{".repeat(100_000)).as_bytes()
-    ));
+    assert_eq!(
+        embedded_protocol_frame(format!(r#"{}"type""#, "{".repeat(100_000)).as_bytes()),
+        EmbeddedFrame::Absent,
+    );
 }
 
 #[test]
@@ -703,6 +712,18 @@ fn unknown_frames_do_not_interrupt_a_streamed_turn() {
         );
     }
     adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}})).unwrap();
+    let oversized = format!("future-\u{1b}\n{}", "🦀".repeat(200));
+    let unknown = adapter
+        .receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":oversized}}}))
+        .unwrap();
+    assert!(unknown.events.is_empty());
+    let warning = adapter
+        .unknown_frames
+        .iter()
+        .find(|key| key.starts_with("stream delta:"))
+        .unwrap();
+    assert!(warning.len() <= "stream delta:".len() + 128);
+    assert!(!warning.chars().any(char::is_control));
     let delta = adapter.receive(json!({"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"answer"}}})).unwrap();
     assert!(
         delta
