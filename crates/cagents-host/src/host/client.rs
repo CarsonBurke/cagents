@@ -2337,7 +2337,7 @@ fn process_admitted_request(
             let (terminals, complete) = host
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .list_page(client_id, after, LIST_PAGE_BYTES);
+                .next_terminal_page(client_id, after, LIST_PAGE_BYTES)?;
             Ok((
                 ServerResponse::ListedPage {
                     terminals,

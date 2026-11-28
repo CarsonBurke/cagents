@@ -85,7 +85,7 @@ fn challenge_then_capability(token: &'static str) -> impl FnMut(ClientRequest) -
 }
 
 /// This computer's daemon, vouching for the session.
-fn vouches(request: ClientRequest) -> Result<ServerResponse, ControlError> {
+fn vouches(request: ClientRequest, _: Option<Instant>) -> Result<ServerResponse, ControlError> {
     let ClientRequest::SignDeviceChallenge {
         authority,
         device,
@@ -111,7 +111,7 @@ fn vouches(request: ClientRequest) -> Result<ServerResponse, ControlError> {
 }
 
 /// This computer's daemon, after a person stopped sessions using the device.
-fn refuses(_: ClientRequest) -> Result<ServerResponse, ControlError> {
+fn refuses(_: ClientRequest, _: Option<Instant>) -> Result<ServerResponse, ControlError> {
     let error = ProtocolError::new(
         ProtocolErrorCode::PermissionDenied,
         "Sessions on this computer may not use devx",
@@ -140,7 +140,7 @@ fn a_proved_connection_proves_itself_again_before_any_request_once_due() {
     proved(&mut client, Duration::ZERO);
     assert_eq!(
         client
-            .for_device_with(ClientRequest::List, vouches)
+            .for_device_with(ClientRequest::List, vouches, None)
             .unwrap(),
         ClientRequest::List
     );
@@ -150,7 +150,7 @@ fn a_proved_connection_proves_itself_again_before_any_request_once_due() {
     let before = Instant::now();
     assert_eq!(
         client
-            .for_device_with(ClientRequest::List, vouches)
+            .for_device_with(ClientRequest::List, vouches, None)
             .unwrap(),
         ClientRequest::List
     );
@@ -166,7 +166,7 @@ fn a_refused_renewal_ends_the_connections_use_of_the_device() {
     let (mut client, served) = device(challenge_then_capability("unused"), 1);
     proved(&mut client, CAPABILITY_RENEWAL);
     let error = client
-        .for_device_with(ClientRequest::List, refuses)
+        .for_device_with(ClientRequest::List, refuses, None)
         .unwrap_err();
     assert!(
         matches!(&error, ControlError::DeviceAccess(message) if message == "Sessions on this computer may not use devx"),
@@ -175,6 +175,36 @@ fn a_refused_renewal_ends_the_connections_use_of_the_device() {
     assert!(client.device_peer.is_none());
     drop(client);
     served.join().unwrap();
+}
+
+#[test]
+fn a_terminal_listing_uses_its_deadline_during_device_renewal() {
+    let (client, mut peer) = UnixStream::pair().unwrap();
+    thread::scope(|scope| {
+        let (finished, result) = std::sync::mpsc::channel();
+        scope.spawn(move || {
+            let connect: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            respond(
+                &mut peer,
+                connect.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let renew: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(renew.request, ClientRequest::PeerChallenge);
+            result.recv_timeout(Duration::from_secs(4)).unwrap();
+        });
+        let mut client = ControlClient::from_stream(client).unwrap();
+        proved(&mut client, CAPABILITY_RENEWAL);
+        let result = client.list_until(Instant::now() + Duration::from_secs(2));
+        finished.send(()).unwrap();
+        assert!(matches!(result, Err(ControlError::TerminalListTimeout)));
+        assert!(client.device_peer.is_none());
+    });
 }
 
 const PRIVATE_CHILD: &str = "CAGENTS_TEST_DEVICE_PEER_CHILD";

@@ -114,6 +114,8 @@ use crate::{
 /// The ordinary budget for one control exchange: a connect, a handshake, a
 /// write, or the wait for a reply. Read it through [`io_timeout`].
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
+/// A complete paged inventory shares this budget, even while every page advances.
+const TERMINAL_LIST_TIMEOUT: Duration = Duration::from_secs(30);
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 // Match the window's attachment budget, which gives the daemon time to
@@ -928,6 +930,8 @@ pub enum ControlError {
     },
     #[error("the daemon did not publish a current terminal snapshot before the deadline")]
     SnapshotTimeout,
+    #[error("timed out listing the terminal inventory")]
+    TerminalListTimeout,
     #[error("the daemon returned a terminal list page that does not follow the previous one")]
     StalledListPage,
     #[error("the daemon returned an invalid page for the retired input queue")]
@@ -985,6 +989,12 @@ impl ControlError {
             other => other.to_string(),
         }
     }
+}
+
+#[derive(Clone, Copy)]
+enum RequestDeadline {
+    Request(Instant),
+    TerminalList(Instant),
 }
 
 /// Why a request a person is waiting on did not complete, separating the
@@ -1116,11 +1126,24 @@ pub struct ControlClient {
 }
 
 /// Sends a `SignDeviceChallenge` to this computer's daemon.
-type Signer = fn(ClientRequest) -> Result<ServerResponse, ControlError>;
+type Signer = fn(ClientRequest, Option<Instant>) -> Result<ServerResponse, ControlError>;
 
-fn sign_here(request: ClientRequest) -> Result<ServerResponse, ControlError> {
+fn sign_here(
+    request: ClientRequest,
+    deadline: Option<Instant>,
+) -> Result<ServerResponse, ControlError> {
     let local = crate::terminal::ipc::local_daemon_socket_path().map_err(ControlError::Connect)?;
-    ControlClient::connect(&local)?.request_strict(request)
+    let mut client = match deadline {
+        Some(deadline) => {
+            let now = Instant::now();
+            let handshake = deadline.min(now + io_timeout());
+            let stream = connect_control_socket(&local, handshake.saturating_duration_since(now))
+                .map_err(ControlError::Connect)?;
+            ControlClient::from_stream_with_deadline(stream, handshake)?
+        }
+        None => ControlClient::connect(&local)?,
+    };
+    client.device_proof_request(request, deadline)
 }
 
 /// The capability a connection proved on another device, and what it needs
@@ -1426,19 +1449,42 @@ impl ControlClient {
     }
 
     /// The terminal inventory, read a page at a time so that no reply has to
-    /// hold all of it. A terminal present throughout appears exactly once. An
-    /// update source from before pages answers it in one reply.
+    /// hold all of it. A current daemon refuses pages that cross a terminal
+    /// ownership change; discard the partial result and retry. Older update
+    /// sources may only offer the original unguarded listing.
     pub fn list(&mut self) -> Result<Vec<TerminalDescriptor>, ControlError> {
+        self.list_until(Instant::now() + TERMINAL_LIST_TIMEOUT)
+    }
+
+    fn list_until(&mut self, deadline: Instant) -> Result<Vec<TerminalDescriptor>, ControlError> {
+        let deadline = RequestDeadline::TerminalList(deadline);
         if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
-            return match self.request_strict(ClientRequest::List)? {
+            return match self.request_until(ClientRequest::List, None, deadline)? {
                 ServerResponse::Listed { terminals } => Ok(terminals),
                 response => Err(unexpected_response("a terminal list", &response)),
             };
         }
+        const MAX_RESTARTS: usize = 2;
+        let mut restarts = 0;
         let mut inventory: Vec<TerminalDescriptor> = Vec::new();
         loop {
             let after = inventory.last().map(|terminal| terminal.session.id);
-            match self.request_strict(ClientRequest::ListPage { after })? {
+            let reply = match self.request_until(ClientRequest::ListPage { after }, None, deadline)
+            {
+                Err(ControlError::Remote {
+                    code: ProtocolErrorCode::NotAdmitted,
+                    ref message,
+                    retryable: true,
+                }) if message == crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED
+                    && restarts < MAX_RESTARTS =>
+                {
+                    restarts += 1;
+                    inventory.clear();
+                    continue;
+                }
+                result => result?,
+            };
+            match reply {
                 ServerResponse::ListedPage {
                     terminals,
                     complete,
@@ -3007,16 +3053,11 @@ impl ControlClient {
     /// its next request, whatever it is. This computer's daemon then vouches
     /// for the session as it is now: refusing once agents are denied, the
     /// device unlinked or the session ended, and with its current mode.
-    fn for_device(&mut self, request: ClientRequest) -> Result<ClientRequest, ControlError> {
-        self.for_device_with(request, sign_here)
-    }
-
-    /// [`Self::for_device`], with `sign` asking this computer's daemon to
-    /// vouch for the session.
     fn for_device_with(
         &mut self,
         request: ClientRequest,
         sign: Signer,
+        deadline: Option<Instant>,
     ) -> Result<ClientRequest, ControlError> {
         if let Some(peer) = &self.device_peer
             && peer.proved.elapsed() >= crate::device_trust::CAPABILITY_RENEWAL
@@ -3034,7 +3075,7 @@ impl ControlClient {
             // rather than late.
             let proved = Instant::now();
             self.device_peer = Some(DevicePeer {
-                capability: self.prove_session(session.clone(), &device, sign)?,
+                capability: self.prove_session(session.clone(), &device, sign, deadline)?,
                 proved,
                 session,
                 device,
@@ -3056,7 +3097,7 @@ impl ControlClient {
             Some(peer) => peer.capability.clone(),
             None => {
                 let proved = Instant::now();
-                let peer = self.prove_session(session.clone(), &device.name, sign)?;
+                let peer = self.prove_session(session.clone(), &device.name, sign, deadline)?;
                 self.device_peer = Some(DevicePeer {
                     capability: peer.clone(),
                     proved,
@@ -3080,11 +3121,25 @@ impl ControlClient {
         })
     }
 
+    fn device_proof_request(
+        &mut self,
+        request: ClientRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ServerResponse, ControlError> {
+        match deadline {
+            Some(deadline) => {
+                self.request_until(request, None, RequestDeadline::TerminalList(deadline))
+            }
+            None => self.request_strict(request),
+        }
+    }
+
     fn prove_session(
         &mut self,
         session: Authority,
         device: &str,
         sign: Signer,
+        deadline: Option<Instant>,
     ) -> Result<Authority, ControlError> {
         // A daemon that answered, refusing or unable to use its device
         // links, is not a connection failure: say which computer and why,
@@ -3104,15 +3159,18 @@ impl ControlClient {
                 error => error,
             }
         };
-        let nonce = match self.request_strict(ClientRequest::PeerChallenge)? {
+        let nonce = match self.device_proof_request(ClientRequest::PeerChallenge, deadline)? {
             ServerResponse::PeerChallenge { nonce } => nonce,
             response => return Err(unexpected_response("a device challenge", &response)),
         };
-        let (peer, claim, proof) = match sign(ClientRequest::SignDeviceChallenge {
-            authority: session,
-            device: device.to_owned(),
-            nonce,
-        })
+        let (peer, claim, proof) = match sign(
+            ClientRequest::SignDeviceChallenge {
+                authority: session,
+                device: device.to_owned(),
+                nonce,
+            },
+            deadline,
+        )
         .map_err(answered(
             "This computer could not vouch for the session".to_owned(),
         ))? {
@@ -3120,7 +3178,10 @@ impl ControlClient {
             response => return Err(unexpected_response("a device proof", &response)),
         };
         match self
-            .request_strict(ClientRequest::PeerAuthenticate { peer, claim, proof })
+            .device_proof_request(
+                ClientRequest::PeerAuthenticate { peer, claim, proof },
+                deadline,
+            )
             .map_err(answered(format!(
                 "{device} could not check this computer's proof"
             )))? {
@@ -3187,7 +3248,7 @@ impl ControlClient {
         request: ClientRequest,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        self.request_until(request, None, deadline)
+        self.request_until(request, None, RequestDeadline::Request(deadline))
     }
 
     fn request_attached_with_deadline(
@@ -3196,14 +3257,18 @@ impl ControlClient {
         terminal_id: TerminalId,
         deadline: Instant,
     ) -> Result<ServerResponse, ControlError> {
-        self.request_until(request, Some(terminal_id), deadline)
+        self.request_until(
+            request,
+            Some(terminal_id),
+            RequestDeadline::Request(deadline),
+        )
     }
 
     fn request_until(
         &mut self,
         request: ClientRequest,
         streaming_terminal: Option<TerminalId>,
-        deadline: Instant,
+        deadline: RequestDeadline,
     ) -> Result<ServerResponse, ControlError> {
         let result = self.request_inner(request, streaming_terminal, Some(deadline));
         let read_restored = self.restore_read_timeout();
@@ -3219,12 +3284,47 @@ impl ControlClient {
         &mut self,
         request: ClientRequest,
         streaming_terminal: Option<TerminalId>,
-        deadline: Option<Instant>,
+        deadline: Option<RequestDeadline>,
     ) -> Result<ServerResponse, ControlError> {
-        let request = self.for_device(request)?;
+        let inventory_deadline = match deadline {
+            Some(RequestDeadline::TerminalList(deadline)) => Some(deadline),
+            _ => None,
+        };
+        let inventory_timed_out =
+            || inventory_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if inventory_timed_out() {
+            return Err(ControlError::TerminalListTimeout);
+        }
+        let request = self
+            .for_device_with(request, sign_here, inventory_deadline)
+            .map_err(|error| {
+                if inventory_timed_out() {
+                    ControlError::TerminalListTimeout
+                } else {
+                    error
+                }
+            })?;
+        let (deadline, list_limited) = match deadline {
+            None => (None, false),
+            Some(RequestDeadline::Request(deadline)) => (Some(deadline), false),
+            Some(RequestDeadline::TerminalList(deadline)) => {
+                let per_request = Instant::now() + io_timeout();
+                (Some(deadline.min(per_request)), deadline <= per_request)
+            }
+        };
         #[cfg(feature = "ui")]
         let health_request = crate::daemon_health::begin();
-        let result = self.request_inner_unobserved(request, streaming_terminal, deadline);
+        let result = self
+            .request_inner_unobserved(request, streaming_terminal, deadline)
+            .map_err(|error| {
+                // An exhausted inventory budget can give a responsive daemon
+                // only a few milliseconds for its last page.
+                if list_limited && is_timeout_error(&error) {
+                    ControlError::TerminalListTimeout
+                } else {
+                    error
+                }
+            });
         #[cfg(feature = "ui")]
         crate::daemon_health::request(&self.stream, &result, health_request);
         result
@@ -3586,12 +3686,14 @@ fn reply_error(error: FrameError, timeout: Option<Duration>) -> ControlError {
 /// Whether `error` is a read or write that ran out of time, rather than a
 /// connection the daemon ended or a reply it gave.
 pub fn is_timeout_error(error: &ControlError) -> bool {
-    matches!(error, ControlError::ReplyTimeout { .. })
-        || matches!(
-            error,
-            ControlError::Frame(FrameError::Io(error))
-                if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
-        )
+    matches!(
+        error,
+        ControlError::ReplyTimeout { .. } | ControlError::TerminalListTimeout
+    ) || matches!(
+        error,
+        ControlError::Frame(FrameError::Io(error))
+            if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)
+    )
 }
 
 fn response_from_message(message: ServerMessage) -> Result<ServerResponse, ControlError> {
@@ -6346,7 +6448,9 @@ fn protocol_error(error: ControlError) -> AppError {
         return limit_reached(*code, message.clone(), &refusal);
     }
     let kind = match &error {
-        ControlError::WaitTimeout { .. } | ControlError::SnapshotTimeout => "timeout",
+        ControlError::WaitTimeout { .. }
+        | ControlError::SnapshotTimeout
+        | ControlError::TerminalListTimeout => "timeout",
         ControlError::DeviceAccess(_) => "permission_denied",
         ControlError::Connect(_)
         | ControlError::Configure(_)
@@ -10325,6 +10429,166 @@ mod tests {
             }
             assert_eq!(server.join().unwrap(), expected_after);
         }
+    }
+
+    #[test]
+    fn listing_restarts_after_an_inventory_change_and_discards_partial_rows() {
+        let id = TerminalId::new();
+        let terminal =
+            TerminalDescriptor::relaunchable(id, LaunchRecipe::shell("/".into()).unwrap(), None);
+        for recovers in [true, false] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let pinned = proof("session", "boot", "incarnation");
+            let terminal = terminal.clone();
+            thread::scope(|scope| {
+                scope.spawn(move || {
+                    let handshake: ClientEnvelope =
+                        read_frame(&mut server_stream).unwrap().unwrap();
+                    write_frame(
+                        &mut server_stream,
+                        &connected_envelope(handshake.request_id, pinned.clone(), pinned.clone()),
+                    )
+                    .unwrap();
+                    let answer = |stream: &mut UnixStream, after, message| {
+                        let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+                        assert_eq!(request.request, ClientRequest::ListPage { after });
+                        write_frame(
+                            stream,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(request.request_id),
+                                proof: pinned.clone(),
+                                message,
+                            },
+                        )
+                        .unwrap();
+                    };
+                    for _ in 0..if recovers { 1 } else { 3 } {
+                        answer(
+                            &mut server_stream,
+                            None,
+                            ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals: vec![terminal.clone()],
+                                    complete: false,
+                                },
+                            },
+                        );
+                        answer(
+                            &mut server_stream,
+                            Some(id),
+                            ServerMessage::Error(ProtocolError::new(
+                                ProtocolErrorCode::NotAdmitted,
+                                crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED,
+                                true,
+                            )),
+                        );
+                    }
+                    if recovers {
+                        answer(
+                            &mut server_stream,
+                            None,
+                            ServerMessage::Response {
+                                response: ServerResponse::ListedPage {
+                                    terminals: Vec::new(),
+                                    complete: true,
+                                },
+                            },
+                        );
+                    }
+                });
+                let mut client = ControlClient::from_stream(client_stream).unwrap();
+                if recovers {
+                    assert!(client.list().unwrap().is_empty());
+                } else {
+                    assert!(matches!(
+                        client.list(),
+                        Err(ControlError::Remote {
+                            code: ProtocolErrorCode::NotAdmitted,
+                            ..
+                        }),
+                    ));
+                }
+            });
+        }
+    }
+
+    #[test]
+    fn listing_spends_the_same_deadline_across_a_restart() {
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let root = tempfile::tempdir().unwrap();
+        let terminal_id = TerminalId::new();
+        let terminal = TerminalDescriptor::relaunchable(
+            terminal_id,
+            LaunchRecipe::shell(root.path().canonicalize().unwrap()).unwrap(),
+            None,
+        );
+        thread::scope(|scope| {
+            let (result_sent, result_observed) = std::sync::mpsc::channel();
+            let peer = scope.spawn(move || {
+                let request: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                write_frame(
+                    &mut server,
+                    &connected_envelope(request.request_id, pinned.clone(), pinned.clone()),
+                )
+                .unwrap();
+                let page: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(page.request, ClientRequest::ListPage { after: None });
+                write_frame(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(page.request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ListedPage {
+                                terminals: vec![terminal],
+                                complete: false,
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let page: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(
+                    page.request,
+                    ClientRequest::ListPage {
+                        after: Some(terminal_id)
+                    }
+                );
+                write_frame(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(page.request_id),
+                        proof: pinned,
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::NotAdmitted,
+                            crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED,
+                            true,
+                        )),
+                    },
+                )
+                .unwrap();
+                let restarted: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
+                assert_eq!(restarted.request, ClientRequest::ListPage { after: None });
+                // The retry spends what remains of the original budget.
+                result_observed
+                    .recv_timeout(Duration::from_secs(4))
+                    .unwrap();
+            });
+            let mut client = ControlClient::from_stream(client).unwrap();
+            let budget = Duration::from_secs(2);
+            let result = client.list_until(Instant::now() + budget);
+            result_sent.send(()).unwrap();
+            drop(client);
+            peer.join().unwrap();
+            assert!(
+                matches!(result, Err(ControlError::TerminalListTimeout)),
+                "{result:?}"
+            );
+        });
     }
 
     #[test]

@@ -399,6 +399,10 @@ pub const RETIRED_CHANNEL_WORK: &str =
 /// service turns that retry off for every client that compares against the
 /// other wording.
 pub const DAEMON_BUSY: &str = "The daemon is finishing another operation. Wait for it and retry.";
+/// An inventory reader must drop every collected page and start again.
+pub const TERMINAL_INVENTORY_CHANGED: &str =
+    "The terminal inventory changed while it was being read; start the listing again";
+
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
     "The terminal changed or still owns work; nothing was closed";
@@ -872,9 +876,9 @@ pub enum ClientRequest {
         session: crate::chat::Session,
         execution_environment: ChatExecutionEnvironment,
     },
-    /// The terminal inventory in identity order, starting after `after`. A
-    /// terminal present for the whole listing appears exactly once; one
-    /// spawned or closed meanwhile may or may not.
+    /// Start the terminal inventory with no cursor, then continue in identity
+    /// order from the last row. The daemon refuses a continuation if terminal
+    /// ownership changed after the first page.
     ListPage {
         after: Option<TerminalId>,
     },

@@ -4369,6 +4369,56 @@ fn the_resident_census_names_the_inherited_transcript_during_spawn() {
 }
 
 #[test]
+fn paging_rejects_an_ownership_move_behind_the_cursor() {
+    use crate::{
+        model::LaunchRecipe,
+        terminal::{RenderStreamFixture, TerminalEvent},
+    };
+
+    let (_, host) = panic_test_host("changed-list");
+    let mut ids = [TerminalId::new(), TerminalId::new()];
+    ids.sort();
+    let [low, high] = ids;
+    let recipe = LaunchRecipe::shell("/".into()).unwrap();
+    let terminals = ids.map(|_| RenderStreamFixture::new(|_| {}));
+    {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        for (id, terminal) in ids.into_iter().zip(&terminals) {
+            state.reserve_spawn(id).unwrap();
+            let mut source = TerminalDescriptor::relaunchable(id, recipe.clone(), None).session;
+            source.resume_hint = (id == high).then(|| "conversation".into());
+            state
+                .finish_spawn(1, source, terminal.handle.clone(), false)
+                .unwrap();
+        }
+        let (page, complete) = state.next_terminal_page(1, None, 1).unwrap();
+        assert!(!complete);
+        assert_eq!(page[0].session.id, low);
+        assert!(page[0].session.resume_hint.is_none());
+    }
+
+    let host_ref = Arc::downgrade(&host);
+    for (id, hint) in [(low, Some("conversation".into())), (high, None)] {
+        super::super::state::record_event(&host_ref, id, TerminalEvent::ResumeHintChanged(hint));
+    }
+    let mut state = host.lock().unwrap();
+    let refusal = state.next_terminal_page(1, Some(low), 1).unwrap_err();
+    assert_eq!(
+        refusal.message,
+        crate::terminal_ipc::TERMINAL_INVENTORY_CHANGED
+    );
+    assert!(refusal.retryable);
+    let (page, complete) = state.next_terminal_page(1, None, 1).unwrap();
+    assert!(!complete);
+    assert_eq!(page[0].session.resume_hint.as_deref(), Some("conversation"));
+    let (page, complete) = state.next_terminal_page(1, Some(low), 1).unwrap();
+    assert!(complete);
+    assert_eq!(page[0].session.id, high);
+    assert!(page[0].session.resume_hint.is_none());
+}
+
+#[test]
 fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
     use crate::model::{BootId, HostIncarnation, HostSessionId, TerminalContinuity};
 
@@ -4442,7 +4492,11 @@ fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
     let mut pages = Vec::new();
     let mut after = None;
     loop {
-        let (page, complete) = host.lock().unwrap().list_page(1, after, budget);
+        let (page, complete) = host
+            .lock()
+            .unwrap()
+            .next_terminal_page(1, after, budget)
+            .unwrap();
         after = page.last().map(|terminal| terminal.session.id);
         pages.push(page);
         if complete {
@@ -4452,13 +4506,15 @@ fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
     assert_eq!(pages.iter().map(Vec::len).collect::<Vec<_>>(), [1, 1, 1]);
     assert_eq!(ids(&pages.concat()), ids(&whole));
     // A descriptor larger than the budget still has a page of its own.
-    let (page, complete) = host.lock().unwrap().list_page(1, None, 1);
+    let (page, complete) = host.lock().unwrap().next_terminal_page(1, None, 1).unwrap();
     assert_eq!((ids(&page), complete), (vec![whole[0].session.id], false));
-    // Nothing follows the last terminal.
+    // A cursor other than the one the daemon just returned cannot continue.
     let last = whole.last().map(|terminal| terminal.session.id);
-    assert_eq!(
-        host.lock().unwrap().list_page(1, last, budget),
-        (Vec::new(), true)
+    assert!(
+        host.lock()
+            .unwrap()
+            .next_terminal_page(1, last, budget)
+            .is_err()
     );
 
     // An older CLI still gets the whole inventory in one reply while it fits,
