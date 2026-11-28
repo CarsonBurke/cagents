@@ -415,6 +415,55 @@ impl Handle {
         }
     }
 
+    /// Compaction support once the provider has initialized. An older
+    /// retained helper cannot accept the idle-checked command.
+    pub fn compact_support(&self) -> Option<bool> {
+        match &self.0 {
+            Owner::Local(local) => local.compact_support(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                state.ready.then_some(state.compact.unwrap_or(false))
+            }
+        }
+    }
+    /// At the actor, recheck the same idle admission used for courier prompts.
+    pub fn try_idle_compact(&self) -> Result<super::IdleCompaction, Rejection> {
+        use super::{
+            COMPACT_UNSUPPORTED, COMPACTION_PENDING, COURIER_BUSY, IdleCompaction, QueueRefusal,
+        };
+        use crate::chat::failure::delivery::{
+            CROWDED_INPUT, RECONNECTING_INPUT, RETIRING_INPUT, UNCONFIRMED_INPUT,
+            UNSETTLEABLE_INPUT, UNSETTLED_INPUT, UNSUPPORTED_INPUT,
+        };
+        match match &self.0 {
+            Owner::Local(local) => local.try_idle_compact(),
+            Owner::Remote(remote) => remote.try_idle_compact(),
+        } {
+            Ok(()) => Ok(IdleCompaction::Submitted),
+            Err(Rejection::Refused(error)) if error == COURIER_BUSY => Ok(IdleCompaction::Busy),
+            Err(Rejection::Refused(error))
+                if matches!(error.as_str(), COMPACT_UNSUPPORTED | UNSUPPORTED_INPUT) =>
+            {
+                Ok(IdleCompaction::Unsupported)
+            }
+            Err(Rejection::Refused(error))
+                if error == QueueRefusal::Full.message()
+                    || matches!(
+                        error.as_str(),
+                        COMPACTION_PENDING
+                            | CROWDED_INPUT
+                            | RECONNECTING_INPUT
+                            | RETIRING_INPUT
+                            | UNCONFIRMED_INPUT
+                            | UNSETTLEABLE_INPUT
+                            | UNSETTLED_INPUT
+                    ) =>
+            {
+                Ok(IdleCompaction::Retry)
+            }
+            Err(error) => Err(error),
+        }
+    }
     /// Exact source recognition is checked by the helper under this attachment epoch.
     pub fn recognize_retained_sources(&self, sources: &[chat::Session]) -> Result<(), String> {
         match &self.0 {

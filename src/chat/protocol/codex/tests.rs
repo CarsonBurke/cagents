@@ -2310,6 +2310,7 @@ fn adapter() -> Codex {
         observed_turn_start: None,
         notification_revision: 0,
         busy: false,
+        compaction_starting: false,
         lifecycle_revision: 0,
         suggestion_turn: None,
         prediction_turn: None,
@@ -7416,6 +7417,7 @@ fn optional_questions_survive_turn_completion_until_resolved() {
 fn a_compaction_acknowledgement_re_reads_the_thread() {
     let mut adapter = adapter();
     let requested = adapter.command(Command::Compact).unwrap();
+    assert!(adapter.compaction_pending());
     let start = requested
         .writes
         .iter()
@@ -7424,6 +7426,25 @@ fn a_compaction_acknowledgement_re_reads_the_thread() {
     let acknowledged = adapter
         .receive(json!({"id":start["id"],"result":{}}))
         .unwrap();
+    assert!(
+        adapter.compaction_pending(),
+        "acknowledgement is not a turn start"
+    );
+    let started = adapter
+        .receive(json!({
+            "method": "turn/started",
+            "params": {"threadId": "thread-exact", "turn": {
+                "id": "compact-turn", "status": "inProgress", "items": [],
+            }},
+        }))
+        .unwrap();
+    assert!(!adapter.compaction_pending());
+    assert!(
+        started
+            .events
+            .iter()
+            .any(|event| matches!(event, Event::Status { busy: true, .. }))
+    );
     let methods = acknowledged
         .writes
         .iter()
@@ -7437,6 +7458,20 @@ fn a_compaction_acknowledgement_re_reads_the_thread() {
         methods.contains(&"thread/turns/list".to_owned()),
         "the rewritten history is never asked for: {methods:?}"
     );
+}
+
+#[test]
+fn a_compaction_refusal_releases_admission_without_a_turn() {
+    let mut adapter = adapter();
+    let start = adapter.command(Command::Compact).unwrap();
+    assert!(adapter.compaction_pending());
+    adapter
+        .receive(json!({
+            "id": start.writes[0]["id"],
+            "error": {"code": -32603, "message": "Compaction unavailable"},
+        }))
+        .unwrap();
+    assert!(!adapter.compaction_pending());
 }
 
 /// A plan reaches the surface as the steps it is made of. It used to

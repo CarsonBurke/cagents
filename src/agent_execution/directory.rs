@@ -172,6 +172,31 @@ pub struct Member {
     /// The daemon's estimate of the conversation's prompt cache, when it
     /// hosts the conversation and has seen it make a request.
     pub cache: Option<PromptCache>,
+    /// Latest provider context reading, independent of prompt cache warmth.
+    #[serde(default)]
+    pub context: Option<ContextUsage>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextUsage {
+    pub tokens: u64,
+    /// The auto-compaction budget, or the context window when no earlier
+    /// compaction threshold is known.
+    pub budget: Option<u64>,
+}
+
+impl ContextUsage {
+    pub fn from_usage(usage: &crate::chat::Usage) -> Option<Self> {
+        let budget = usage.context_budget();
+        (usage.context_tokens > 0).then_some(Self {
+            tokens: usage.context_tokens,
+            budget: (budget > 0).then_some(budget),
+        })
+    }
+
+    pub fn used_fraction(self) -> Option<f64> {
+        self.budget.map(|budget| self.tokens as f64 / budget as f64)
+    }
 }
 
 /// When a conversation's prompt cache likely expires. A provider keeps a

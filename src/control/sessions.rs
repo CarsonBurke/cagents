@@ -349,6 +349,7 @@ pub(super) const FIELDS: &[&str] = &[
     "failure",
     "active_at",
     "cache",
+    "context",
 ];
 
 /// A listing of `members` as `--json` reports it: `data`, which names the
@@ -485,6 +486,16 @@ pub(super) fn session_row(
         )
         .put("failure", &member.failure)
         .put("active_at", member.active_at.map(fields::seconds))
+        .put(
+            "context",
+            member.context.map(|context| {
+                Fields::new(detail)
+                    .put("tokens", context.tokens)
+                    .put("budget", context.budget)
+                    .put("used_fraction", context.used_fraction())
+                    .into_value()
+            }),
+        )
         .put_unless(
             "cache",
             cache_json(member, now, detail),
@@ -1167,6 +1178,7 @@ pub(super) mod tests {
             limit: None,
             account: None,
             cache: None,
+            context: None,
         }
     }
 
@@ -1520,6 +1532,7 @@ pub(super) mod tests {
             limit: None,
             account: None,
             cache: None,
+            context: None,
         };
         let mut members = Members {
             channel,

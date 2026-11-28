@@ -494,6 +494,11 @@ pub trait Adapter: Send {
         None
     }
     fn command(&mut self, command: Command) -> Result<Step, String>;
+    /// A compaction request can be in flight before the provider reports
+    /// itself busy. The actor must not admit courier work in that gap.
+    fn compaction_pending(&self) -> bool {
+        false
+    }
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.
     fn answer_declines(&self, _request_id: &str, action: &str) -> bool {

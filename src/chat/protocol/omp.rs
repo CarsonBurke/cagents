@@ -145,6 +145,7 @@ struct Omp {
     child_finished: VecDeque<String>,
     branch_draft: Option<String>,
     branch_request: Option<String>,
+    compact_request: Option<String>,
     configured_reasoning: Option<String>,
     active_model: Option<chat::ActiveModel>,
 }
@@ -293,6 +294,9 @@ impl Omp {
         }
         if kind == "get_branch_messages" {
             self.branch_request = Some(id.clone());
+        }
+        if kind == "compact" {
+            self.compact_request = Some(id.clone());
         }
         json!({"id":id,"type":kind})
     }
@@ -841,6 +845,10 @@ impl Omp {
     }
 }
 impl Adapter for Omp {
+    fn compaction_pending(&self) -> bool {
+        self.compact_request.is_some()
+    }
+
     fn command_for_run(
         &mut self,
         run: crate::model::RunId,
@@ -994,6 +1002,9 @@ impl Adapter for Omp {
             }
             Command::SetFastMode { .. } => return Err("Fast mode is not advertised by this OMP connection".into()),
             Command::SetPermissionMode{..} => return Err("OMP approval policy is configured at launch; use its settings command to change policy.".into()),
+            Command::Compact if self.compaction_pending() => {
+                return Err("OMP is waiting for a compaction reply".into());
+            }
             Command::Compact => step.writes.push(self.request("compact")),
             Command::ResumeAfterLogin { .. } => return Err("Live login verification is available for Codex chats".into()),
             Command::Refresh => return Ok(self.refresh()),
@@ -1140,6 +1151,7 @@ impl Adapter for Omp {
                     "get_subagents" => Some(&mut self.children_request),
                     "set_subagent_subscription" => Some(&mut self.subscription_request),
                     "get_branch_messages" => Some(&mut self.branch_request),
+                    "compact" => Some(&mut self.compact_request),
                     _ => None,
                 };
                 if let Some(pending) = pending {
@@ -3873,9 +3885,18 @@ mod tests {
         };
         let requested = adapter.command(Command::Compact).unwrap();
         assert_eq!(requested.writes[0]["type"], "compact");
+        assert!(adapter.compaction_pending());
+        let stale = adapter
+            .receive(json!({
+                "type":"response","id":"another","command":"compact","success":true,
+            }))
+            .unwrap();
+        assert!(stale.writes.is_empty());
+        assert!(adapter.compaction_pending());
         let step = adapter
             .receive(json!({"type":"response","id":requested.writes[0]["id"],"command":"compact","success":true,"data":{}}))
             .unwrap();
+        assert!(!adapter.compaction_pending());
         let kinds = step
             .writes
             .iter()

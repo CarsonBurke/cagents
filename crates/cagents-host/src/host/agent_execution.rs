@@ -2228,6 +2228,9 @@ pub(super) fn process(
             .map_err(|error| error.to_string()),
         Operation::Stopped(scope) => resume::stopped(host, &authority, scope).map(Reply::Stopped),
         Operation::Resume(handle) => resume::resume(host, &authority, &handle).map(Reply::Resumed),
+        Operation::Compact(handle) => {
+            mailbox::compact(host, &authority, &handle).map(Reply::Compact)
+        }
     }
 }
 

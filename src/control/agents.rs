@@ -695,6 +695,7 @@ impl ControlClient {
             Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
             Operation::SendMessage(_)
             | Operation::Send(_)
+            | Operation::Compact(_)
             | Operation::Inbox(_)
             | Operation::PeekInbox(_)
             | Operation::AcknowledgeInbox(_)
@@ -4787,6 +4788,7 @@ mod tests {
                 ordinary_usage_allowed: None,
             }),
             cache: None,
+            context: None,
         };
         let members = [member];
         assert!(member_of(&members, AgentId::new()).is_none());

@@ -414,6 +414,7 @@ mod tests {
             limit: None,
             account: None,
             cache: None,
+            context: None,
         }
     }
 

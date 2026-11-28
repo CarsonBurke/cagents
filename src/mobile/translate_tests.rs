@@ -265,6 +265,7 @@ fn delegated_sessions_show_their_owners_and_own_task_titles() {
         limit: None,
         account: None,
         cache: None,
+        context: None,
     };
     let translated = session(&member, &HashMap::new());
     assert_eq!(translated.id, id.to_string());

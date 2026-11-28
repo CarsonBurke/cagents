@@ -218,6 +218,7 @@ fn listed_terminal(session: TerminalId) -> ServerResponse {
                 limit: None,
                 account: None,
                 cache: None,
+                context: None,
             }],
         },
         lineage_channel: None,

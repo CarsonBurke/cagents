@@ -4,6 +4,7 @@
 // The host crate's tests share these fixtures; no single build uses each.
 #![cfg_attr(not(test), allow(dead_code))]
 use super::*;
+use crate::chat;
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{Value, json};
 
@@ -13,6 +14,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 #[derive(Default)]
 struct Observed {
     prompts: Mutex<Vec<String>>,
+    compactions: std::sync::atomic::AtomicUsize,
     echoed: Mutex<Vec<String>>,
     /// How many times the actor told the daemon the courier may try again.
     prompt_available: std::sync::atomic::AtomicUsize,
@@ -23,12 +25,26 @@ struct GatedAdapter {
     release: Receiver<()>,
     observed: Arc<Observed>,
     fail_after_input: bool,
+    compact_supported: bool,
+    compaction_pending: bool,
 }
 
 impl Adapter for GatedAdapter {
     fn initialize(&mut self) -> Result<Step, String> {
         Ok(Step {
-            events: vec![Event::Ready(true)],
+            events: vec![
+                Event::Ready(true),
+                Event::Capabilities(chat::Capabilities {
+                    compact: self.compact_supported,
+                    ..Default::default()
+                }),
+                Event::Usage(chat::Usage {
+                    context_tokens: 42_000,
+                    context_limit: 200_000,
+                    compact_limit: Some(168_000),
+                    ..Default::default()
+                }),
+            ],
             ..Step::default()
         })
     }
@@ -36,6 +52,11 @@ impl Adapter for GatedAdapter {
     fn command(&mut self, command: Command) -> Result<Step, String> {
         let events = match command {
             Command::Compact => {
+                self.observed.compactions.fetch_add(1, Ordering::Relaxed);
+                self.compaction_pending = true;
+                Vec::new()
+            }
+            Command::Slash { command } if command == "fixture-request" => {
                 self.entered.send(()).map_err(|error| error.to_string())?;
                 self.release
                     .recv_timeout(TIMEOUT)
@@ -79,6 +100,10 @@ impl Adapter for GatedAdapter {
                     detail: String::new(),
                 }],
                 "unready" => vec![Event::Ready(false)],
+                "compacted" => {
+                    self.compaction_pending = false;
+                    Vec::new()
+                }
                 "waiting" => vec![Event::Waiting(true)],
                 // What the person queued with the provider during a turn, and
                 // the provider taking it.
@@ -121,6 +146,10 @@ impl Adapter for GatedAdapter {
         })
     }
 
+    fn compaction_pending(&self) -> bool {
+        self.compaction_pending
+    }
+
     fn receive(&mut self, frame: Value) -> Result<Step, String> {
         let text = frame["courier_fixture_prompt"]
             .as_str()
@@ -131,7 +160,7 @@ impl Adapter for GatedAdapter {
 }
 
 /// Reusable by the HOST mailbox fixture. The fixture owns only its own
-/// Compact/idle-command workers; callers must retain their mailbox worker.
+/// request/idle-command workers; callers must retain their mailbox worker.
 pub struct RequestRaceFixture {
     pub handle: Handle,
     entered: Receiver<()>,
@@ -152,6 +181,14 @@ impl RequestRaceFixture {
     }
 
     pub fn with_input_failure(fail_after_input: bool) -> Self {
+        Self::start(fail_after_input, true)
+    }
+
+    pub fn without_compaction() -> Self {
+        Self::start(false, false)
+    }
+
+    fn start(fail_after_input: bool, compact_supported: bool) -> Self {
         let directory = tempfile::tempdir().unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -183,6 +220,8 @@ impl RequestRaceFixture {
             release: release_rx,
             observed: observed.clone(),
             fail_after_input,
+            compact_supported,
+            compaction_pending: false,
         };
         let mut initial = adapter.initialize().unwrap();
         // Follow real preflight. Its cfg(test) Store owns a unique private
@@ -222,19 +261,23 @@ impl RequestRaceFixture {
         fixture
     }
 
-    /// Return only once Compact is dequeued and blocked inside the adapter.
+    /// Return only once the command is dequeued and blocked inside the adapter.
     /// The Request event is emitted by its Step after release, not by a test
     /// mutating a resident snapshot.
     pub fn begin_request(&mut self) {
         assert!(self.request.is_none());
         let handle = self.handle.clone();
-        self.request = Some(thread::spawn(move || handle.command(Command::Compact)));
+        self.request = Some(thread::spawn(move || {
+            handle.command(Command::Slash {
+                command: "fixture-request".into(),
+            })
+        }));
         self.entered.recv_timeout(TIMEOUT).unwrap();
         assert!(self.handle.is_idle());
         assert!(self.handle.requests().is_empty());
     }
 
-    /// Under the held Compact gate, the actor cannot consume another command.
+    /// Under the held gate, the actor cannot consume another command.
     /// This observes the actual queue after the courier caller submitted work.
     pub fn wait_for_queued_prompt(&self) {
         assert!(self.request.is_some(), "request barrier must be held");
@@ -294,6 +337,19 @@ impl RequestRaceFixture {
         self.observed
             .prompt_available
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn compaction_count(&self) -> usize {
+        self.observed.compactions.load(Ordering::Relaxed)
+    }
+
+    pub fn finish_compaction(&self) {
+        self.handle
+            .command(Command::SetModel {
+                model: "compacted".into(),
+                reasoning: None,
+            })
+            .unwrap();
     }
 
     pub fn prompt_count(&self) -> usize {
@@ -374,6 +430,41 @@ fn courier_prompt_rechecks_request_published_after_idle_observation() {
     assert!(fixture.prompt_texts().is_empty());
     assert_eq!(fixture.provider_write_count(), 0);
     assert_eq!(fixture.handle.requests()[0].id, REQUEST);
+    fixture.close();
+}
+
+#[test]
+fn compaction_rechecks_actor_admission_and_blocks_courier_until_acknowledged() {
+    let mut fixture = RequestRaceFixture::new();
+    fixture.begin_request();
+    let (reply, result) = crossbeam_channel::bounded(1);
+    let handle = fixture.handle.clone();
+    fixture.attempts.push(thread::spawn(move || {
+        let _ = reply.send(handle.try_idle_compact());
+    }));
+    fixture.wait_for_queued_prompt();
+    fixture.release_request();
+    assert_eq!(
+        result.recv_timeout(TIMEOUT).unwrap(),
+        Ok(IdleCompaction::Busy)
+    );
+    assert_eq!(fixture.compaction_count(), 0);
+    fixture.clear_request();
+
+    assert_eq!(
+        fixture.handle.try_idle_compact(),
+        Ok(IdleCompaction::Submitted)
+    );
+    assert!(!fixture.handle.takes_courier());
+    assert_eq!(fixture.handle.try_idle_compact(), Ok(IdleCompaction::Retry));
+    refused(fixture.handle.try_idle_prompt("mail during compact".into()));
+    assert_eq!(fixture.compaction_count(), 1);
+    assert_eq!(fixture.prompt_count(), 0);
+
+    let announced = fixture.prompt_available_count();
+    fixture.finish_compaction();
+    assert!(fixture.handle.takes_courier());
+    assert_eq!(fixture.prompt_available_count(), announced + 1);
     fixture.close();
 }
 

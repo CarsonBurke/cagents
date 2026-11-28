@@ -532,6 +532,7 @@ fn create_inner(
             observed_turn_start: None,
             notification_revision: 0,
             busy: false,
+            compaction_starting: false,
             lifecycle_revision: 0,
             suggestion_turn: None,
             prediction_turn: None,
@@ -772,6 +773,9 @@ struct Codex {
     observed_turn_start: Option<String>,
     notification_revision: u64,
     busy: bool,
+    /// The server acknowledges submission before its turn starts. Keep
+    /// admission closed until the turn is visible or the request is refused.
+    compaction_starting: bool,
     lifecycle_revision: u64,
     suggestion_turn: Option<String>,
     prediction_turn: Option<String>,
@@ -2507,6 +2511,14 @@ impl Adapter for Codex {
         }
     }
 
+    fn compaction_pending(&self) -> bool {
+        self.compaction_starting
+            || self
+                .pending
+                .values()
+                .any(|pending| matches!(pending, Pending::Compact))
+    }
+
     fn server_identity(&self) -> Option<&ServerIdentity> {
         self.server_identity.as_ref()
     }
@@ -2687,8 +2699,9 @@ impl Adapter for Codex {
                 }), Pending::Other)?;
             }
             Command::Compact => {
-                if !self.capabilities().compact || self.busy { return Err("Codex compaction requires an idle, writable thread".into()); }
+                if !self.capabilities().compact || self.busy || self.compaction_pending() { return Err("Codex compaction requires an idle, writable thread".into()); }
                 self.call(&mut step, "thread/compact/start", json!({"threadId":self.thread}), Pending::Compact)?;
+                self.compaction_starting = true;
             }
             Command::ResumeAfterLogin { failure, expected } => {
                 if self.busy || self.pending.values().any(|pending| matches!(pending, Pending::Turn { .. } | Pending::LoginRecovery { .. })) {
@@ -2794,6 +2807,9 @@ impl Codex {
                 self.history_loading = false;
             }
             if let Some(error) = frame.get("error") {
+                if matches!(pending, Pending::Compact) {
+                    self.compaction_starting = false;
+                }
                 if let Pending::LoginRecovery {
                     failure, revision, ..
                 } = &pending
@@ -3940,6 +3956,7 @@ impl Codex {
                         step.suppress_current_notification = true;
                         return Ok(step);
                     }
+                    self.compaction_starting = false;
                     if !same_model_turn {
                         // A start has no request ID. An outstanding override
                         // cannot be attributed until its exact ACK arrives.
@@ -4397,6 +4414,7 @@ impl Codex {
                 step.events.push(Event::Ready(false));
                 let interrupted = self.busy;
                 self.busy = false;
+                self.compaction_starting = false;
                 self.subagent_status = Some(
                     self.subagent_status
                         .filter(|status| *status != ToolStatus::Running)
