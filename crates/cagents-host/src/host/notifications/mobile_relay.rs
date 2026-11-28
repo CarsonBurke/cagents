@@ -3,7 +3,11 @@
 use std::{
     io,
     path::{Path, PathBuf},
-    sync::mpsc as oneshot,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc as oneshot,
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -118,22 +122,31 @@ fn settings_watch_root(path: &Path) -> Option<&Path> {
     path.ancestors().skip(1).find(|path| path.is_dir())
 }
 
-fn watch_settings(path: &Path, wake: &Sender<()>) -> Option<RecommendedWatcher> {
+fn watch_settings(
+    path: &Path,
+    wake: &Sender<()>,
+    failed: &Arc<AtomicBool>,
+) -> Option<RecommendedWatcher> {
     // Watch the directory because saving settings replaces the file. If the
     // first configuration has not been created, watch its nearest ancestor.
     let root = settings_watch_root(path)?;
     let file = path.to_owned();
     let changed = wake.clone();
+    let failed = Arc::clone(failed);
     let mut watcher = RecommendedWatcher::new(
         move |event: notify::Result<notify::Event>| {
+            if event.is_err() {
+                failed.store(true, Ordering::Release);
+            }
             if event.as_ref().map_or(true, |event| {
                 event.need_rescan() || event.paths.iter().any(|changed| file.starts_with(changed))
             }) {
                 let _ = changed.try_send(());
             }
         },
-        notify::Config::default()
-            .with_event_kinds(EventKindMask::CORE - EventKindMask::MODIFY_META),
+        // A permission repair makes previously unsafe settings usable. The
+        // loader only reads the file, so metadata events cannot feed back.
+        notify::Config::default().with_event_kinds(EventKindMask::CORE),
     )
     .ok()?;
     watcher.watch(root, RecursiveMode::NonRecursive).ok()?;
@@ -155,9 +168,10 @@ fn run(
     let mut journal = None;
     let mut delivery = Delivery::new(Instant::now());
     let (wake, changed) = bounded(1);
+    let watch_failed = Arc::new(AtomicBool::new(false));
     let watch = || {
         (
-            watch_settings(settings_path, &wake),
+            watch_settings(settings_path, &wake, &watch_failed),
             Instant::now() + WATCH_RETRY,
         )
     };
@@ -210,7 +224,12 @@ fn run(
         select_biased! {
             recv(stopping) -> _ => return,
             recv(changed) -> _ => {
-                (watching, watch_retry) = watch();
+                if watch_failed.swap(false, Ordering::AcqRel) {
+                    watching = None;
+                    watch_retry = Instant::now() + WATCH_RETRY;
+                } else if watching.is_some() {
+                    (watching, watch_retry) = watch();
+                }
             }
             recv(commands) -> command => {
                 let Ok(answer) = command else { return };

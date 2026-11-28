@@ -1,6 +1,8 @@
 use std::{
+    fs,
     io::{BufRead, BufReader, Read, Write},
     net::TcpListener,
+    os::unix::fs::PermissionsExt,
     time::SystemTime,
 };
 
@@ -458,7 +460,8 @@ fn settings_watch_wakes_for_initial_creation_and_atomic_opt_out() {
         .join("notify.json");
     assert!(!Settings::load(&config).unwrap().enabled);
     let (wake, changes) = bounded(1);
-    let watching = watch_settings(&config, &wake).expect("watch the existing ancestor");
+    let failed = Arc::new(AtomicBool::new(false));
+    let watching = watch_settings(&config, &wake, &failed).expect("watch the existing ancestor");
 
     Settings::update(&config, |settings| {
         settings.enabled = true;
@@ -472,7 +475,14 @@ fn settings_watch_wakes_for_initial_creation_and_atomic_opt_out() {
     // the ancestor wakes it. Use a fresh channel to discard that first edge.
     drop(watching);
     let (wake, changes) = bounded(1);
-    let _watching = watch_settings(&config, &wake).expect("watch the settings directory");
+    let _watching = watch_settings(&config, &wake, &failed).expect("watch the settings directory");
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o644)).unwrap();
+    changes.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(Settings::load(&config).is_err());
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600)).unwrap();
+    changes.recv_timeout(Duration::from_secs(20)).unwrap();
+    assert!(Settings::load(&config).unwrap().enabled);
+
     Settings::update(&config, |settings| {
         settings.enabled = false;
         Ok(())
