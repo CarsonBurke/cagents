@@ -2349,12 +2349,11 @@ exit 1"#,
                             job.phase == UpdatePhase::Installing
                                 && job.message == WAITING_FOR_STARTUP
                         }),
-                    "write-error" => fs::read_dir(root.path().join("state")).unwrap().any(|row| {
-                        row.unwrap()
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("status-")
-                    }),
+                    // A failed status write removes its temporary file. The
+                    // stderr notice follows the write attempt and persists
+                    // while the original startup command still holds its fences.
+                    "write-error" => fs::read_to_string(&stderr)
+                        .is_ok_and(|text| text.contains(WAITING_FOR_STARTUP)),
                     "panic" => root.path().join("reporter-entered").exists(),
                     _ => unreachable!(),
                 };

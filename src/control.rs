@@ -443,6 +443,7 @@ pub enum TopCommand {
         #[arg(help = "Detached update job ID.")]
         job_id: String,
     },
+    /// Finish an accepted Linux update after the terminal service takes over.
     #[cfg(target_os = "linux")]
     #[command(hide = true)]
     FinishUpdateHandoff,
