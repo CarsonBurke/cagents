@@ -2798,6 +2798,8 @@ fn start_publishing(
     )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
         chat::protocol::codex::create_with_listener_for_start(&process_launch, owned_socket)
+    } else if source.is_some() {
+        chat::protocol::create_for_terminal_handoff(&process_launch)
     } else {
         chat::protocol::create_for_start(&process_launch)
     }

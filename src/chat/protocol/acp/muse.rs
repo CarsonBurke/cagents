@@ -350,6 +350,50 @@ mod tests {
     }
 
     #[test]
+    fn terminal_handoff_requires_the_observed_muse_launcher_and_options() {
+        use crate::chat::protocol::{SetupError, create_for_start, create_for_terminal_handoff};
+
+        let root = tempfile::tempdir().unwrap();
+        install(root.path(), "muse");
+        install(root.path(), UPSTREAM);
+        let path = root.path().to_str().unwrap();
+        let id = "01a1f155-1f9e-7081-b35f-88ead0a9187d";
+        let wrapped = launch_of("muse", &["resume", id], Some(id), path);
+        assert!(matches!(
+            create_for_terminal_handoff(&wrapped),
+            Err(SetupError::Invalid(message)) if message.contains("would bypass the Muse launcher")
+        ));
+        // A separately opened native chat has no terminal policy to retain.
+        assert_eq!(create_for_start(&wrapped).unwrap().0.program, UPSTREAM);
+
+        let observed = launch_of(
+            UPSTREAM,
+            &[
+                "resume",
+                id,
+                "--approval-mode",
+                "never",
+                "--disable-sandbox",
+            ],
+            Some(id),
+            path,
+        );
+        let (spec, mut adapter) = create_for_terminal_handoff(&observed).unwrap();
+        assert_eq!(spec.program, UPSTREAM);
+        assert_eq!(
+            spec.arguments,
+            ["acp", "--contributor-mode", "off", "--disable-sandbox"]
+        );
+        // The wrapper-expanded approval option is applied through ACP.
+        assert_eq!(
+            launch(&observed).unwrap().settings.mode.as_deref(),
+            Some("allowAll")
+        );
+        let initialized = adapter.initialize_for_start().unwrap();
+        assert_eq!(initialized.writes[0]["method"], "initialize");
+    }
+
+    #[test]
     fn prefers_the_upstream_launcher_to_a_wrapper() {
         let root = tempfile::tempdir().unwrap();
         let (wrapped, other) = (root.path().join("bin"), root.path().join("other"));
