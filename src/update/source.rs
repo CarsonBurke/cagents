@@ -743,8 +743,8 @@ pub(crate) struct ReleasedSource {
 /// number: bumping `PROTOCOL_VERSION` must not drop the build users are
 /// running, as 174 once dropped 173. Retire one only on purpose, by moving it
 /// to [`RETIRED_SOURCES`]; `scripts/check-update-sources` requires every
-/// recorded protocol from the oldest pinned one up to the current one to be
-/// in one of the two lists.
+/// protocol recorded since live-update qualification began to be in one of
+/// the two lists when it's older than the current one.
 ///
 /// Historical DTO recordings do not grant admission: every source also needs
 /// the complete readiness, census and recovery flow, and a rehearsal.
@@ -802,8 +802,7 @@ pub(crate) const RELEASED_SOURCES: &[ReleasedSource] = &[
     },
 ];
 
-/// Protocols main served since the oldest pinned source that live updates
-/// deliberately do not start from, and why.
+/// Protocols retired since live-update qualification began, with their reasons.
 #[cfg(test)]
 pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
     (160, "superseded before update sources were pinned"),

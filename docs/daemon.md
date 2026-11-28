@@ -344,14 +344,12 @@ confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
-The candidate drives qualified source daemons through a frozen lifecycle subset:
-the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
-protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
-(`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
-`f016f047b`), 179 (`43f253ef8`), 187 (`ccd4134c6`), 191 (`e8bbb84f2`) and 198
-(the signed 0.2.0 to 0.2.3), and the matched current protocol. A protocol
-bump never drops a pinned build; retiring one is a deliberate change that
-`scripts/check-update-sources` enforces.
+The candidate uses a frozen set of lifecycle requests to update from the
+matched current protocol and from the builds pinned in `RELEASED_SOURCES`
+(`src/update/source.rs`). To retire a pinned source, record the protocol and
+reason in `RETIRED_SOURCES`. `scripts/check-update-sources` requires a decision
+for each historical protocol recorded since live-update qualification began.
+`OLDER_CLIENTS` records the separate set of older CLIs the daemon can serve.
 Every other source protocol, including 160, 165, 174, 176, the candidate
 line's 128, and the intermediate protocols 180 to 186 (superseded without
 qualified installed update sources), is refused before preparation, shutdown or checkpoint changes. Use a cold installation instead: finish and close
