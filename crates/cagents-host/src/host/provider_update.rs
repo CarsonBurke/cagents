@@ -140,7 +140,6 @@ async fn update(
 ) -> Result<Report, String> {
     use ProviderUpdateResult::{Current, Deferred, Skipped, Updated};
 
-    let launcher = install.launcher();
     let manage = matches!(operation, Operation::Manage);
     let prior = install.active().map_err(detail)?;
     let present = match install.validate_launcher() {
@@ -150,11 +149,14 @@ async fn update(
     };
     if let Some(binary) = prior.as_ref().filter(|_| present) {
         *status = install.status(binary.clone());
-        status.version = Some(read_version(Provider::Claude, binary, path).await?);
-        verify_path_version(binary, status.version.as_deref().unwrap())?;
+        let reported = read_version(Provider::Claude, binary, path).await?;
+        verify_path_version(binary, &reported)?;
         if manage {
-            return Ok((Current, selection_help(&launcher, path)));
+            let detail = ensure_catalog(host, install, path, &reported).await;
+            status.version = Some(reported);
+            return Ok((Current, detail));
         }
+        status.version = Some(reported);
     } else if !manage {
         return Err("The managed Claude Code launcher has no verified selection".into());
     }
@@ -180,7 +182,8 @@ async fn update(
                 ));
             }
             std::cmp::Ordering::Equal => {
-                return Ok((Current, None));
+                let detail = ensure_catalog(host, install, path, installed).await;
+                return Ok((Current, detail));
             }
             std::cmp::Ordering::Greater => {}
         }
@@ -220,17 +223,9 @@ async fn update(
     activate(host, install, stage.path(), &binary, operation)?;
 
     *status = install.status(binary);
+    let detail = ensure_catalog(host, install, path, &reported).await;
     status.version = Some(reported);
-    let result = match selection_help(&launcher, path) {
-        Some(message) => Some(message),
-        None => match refresh_catalog(host, &launcher, path).await {
-            Ok(()) => None,
-            Err(error) => Some(format!(
-                "Updated Claude Code, but could not refresh its model catalog: {error}"
-            )),
-        },
-    };
-    Ok((Updated, result))
+    Ok((Updated, detail))
 }
 
 fn verify_path_version(binary: &Path, reported: &str) -> Result<(), String> {
@@ -285,14 +280,30 @@ async fn refresh_catalog(
     probe::refresh_claude_catalog(&account, program, path, &cache).await
 }
 
-fn selection_help(launcher: &Path, path: Option<&OsStr>) -> Option<String> {
-    let selected = probe::find_executable("claude", path);
-    (selected.as_deref() != Some(launcher)).then(|| {
-        format!(
+async fn ensure_catalog(
+    host: &SharedHost,
+    install: &Install,
+    path: Option<&OsStr>,
+    version: &str,
+) -> Option<String> {
+    let launcher = install.launcher();
+    if !install.selected(probe::find_executable("claude", path).as_deref()) {
+        return Some(format!(
             "Put {} first on your PATH to use the managed Claude Code",
             launcher.parent().unwrap().display()
-        )
-    })
+        ));
+    }
+    if install.catalog_is_current(version) {
+        return None;
+    }
+    let result = async {
+        refresh_catalog(host, &launcher, path).await?;
+        install.record_catalog_version(version).map_err(detail)
+    }
+    .await;
+    result
+        .err()
+        .map(|error| format!("Could not refresh the Claude Code model catalog: {error}"))
 }
 
 fn finish(mut status: ProviderStatus, (result, message): Report) -> ProviderStatus {

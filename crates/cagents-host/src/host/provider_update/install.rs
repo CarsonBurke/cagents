@@ -247,6 +247,23 @@ impl Install {
         Ok(())
     }
 
+    pub(super) fn catalog_is_current(&self, version: &str) -> bool {
+        let stamp = self.root.join("catalog-version");
+        let mut stored = String::new();
+        secure_file::open_existing_private_file_readonly(&stamp)
+            .and_then(|file| file.take(65).read_to_string(&mut stored))
+            .is_ok()
+            && stored == version
+    }
+
+    pub(super) fn record_catalog_version(&self, version: &str) -> io::Result<()> {
+        let mut file = tempfile::NamedTempFile::new_in(&self.root)?;
+        file.write_all(version.as_bytes())?;
+        file.as_file().sync_all()?;
+        file.persist(self.root.join("catalog-version"))?;
+        File::open(&self.root)?.sync_all()
+    }
+
     pub(super) fn save(&self, status: &ProviderStatus) -> io::Result<()> {
         let check = Check {
             checked_at: status.last_checked_at,
@@ -258,7 +275,7 @@ impl Install {
         file.flush()?;
         file.as_file().sync_all()?;
         file.persist(self.root.join("last-check.json"))?;
-        Ok(())
+        File::open(&self.root)?.sync_all()
     }
 }
 

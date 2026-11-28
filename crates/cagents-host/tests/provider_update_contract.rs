@@ -74,6 +74,7 @@ case "$1" in
         printf '%s\n' "$version" ;;
     -p)
         test "$DISABLE_UPDATES" = 1
+        test ! -e "$HOME/../releases/reject-catalog"
         read -r init
         case "$init" in *cagents-usage-initialize*) ;; *) exit 91 ;; esac
         printf '{"type":"control_response","response":{"subtype":"success","request_id":"cagents-usage-initialize","response":{"models":[{"value":"fixture-%s","displayName":"Fixture model"}]}}}\n' "$version"
@@ -168,16 +169,12 @@ impl Fixture {
         .collect();
         variables.push((ADOPTED_ENV, "1".into()));
         variables.push(("HTTPS_PROXY", "http://127.0.0.1:1".into()));
-        variables.push((
-            "PATH",
-            std::env::join_paths([
-                self.install().join("bin"),
-                self.path("bin"),
-                "/usr/bin".into(),
-                "/bin".into(),
-            ])
-            .unwrap(),
-        ));
+        let mut paths = Vec::new();
+        if self.path("use-managed-bin").is_file() {
+            paths.push(self.install().join("bin"));
+        }
+        paths.extend([self.path("bin"), "/usr/bin".into(), "/bin".into()]);
+        variables.push(("PATH", std::env::join_paths(paths).unwrap()));
         variables
     }
 
@@ -331,7 +328,7 @@ fn until(mut ready: impl FnMut() -> bool, detail: &str) {
 
 #[test]
 fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
-    use ProviderUpdateResult::{Deferred, Failed, Skipped, Updated};
+    use ProviderUpdateResult::{Current, Deferred, Failed, Skipped, Updated};
 
     let fixture = Fixture::new();
     fixture.expose("1.0.0", "1.0.0");
@@ -347,6 +344,20 @@ fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
         ProviderInstallMethod::CagentsManaged
     );
     assert_eq!(managed.version.as_deref(), Some("1.0.0"));
+    assert!(
+        managed
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("first on your PATH")
+    );
+    assert_eq!(fixture.status().version.as_deref(), Some("0.1.0"));
+
+    fs::write(fixture.path("use-managed-bin"), "").unwrap();
+    drop(daemon);
+    let daemon = fixture.start();
+    let managed = fixture.maintain(Operation::Update);
+    assert_eq!(managed.last_result, Some(Current), "{managed:?}");
     assert_eq!(fixture.status(), managed);
     assert_eq!(fixture.catalog_id(), "fixture-1.0.0");
 
@@ -412,7 +423,46 @@ fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
     assert_eq!(failed.version.as_deref(), Some("2.0.0"));
     assert!(!fixture.install().join("versions/3.0.0").exists());
     drop(daemon);
-    let _daemon = fixture.start();
+    let daemon = fixture.start();
     assert_eq!(fixture.status(), failed);
     assert_eq!(fixture.catalog_id(), "fixture-2.0.0");
+
+    fixture.expose("4.0.0", "4.0.0");
+    let reject_catalog = fixture.path("releases/reject-catalog");
+    fs::write(&reject_catalog, "").unwrap();
+    let updated = fixture.maintain(Operation::Update);
+    assert_eq!(updated.last_result, Some(Updated), "{updated:?}");
+    assert!(
+        updated
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("Could not refresh")
+    );
+    assert_eq!(fixture.catalog_id(), "fixture-2.0.0");
+    fs::remove_file(reject_catalog).unwrap();
+    let repaired = fixture.maintain(Operation::Update);
+    assert_eq!(repaired.last_result, Some(Current), "{repaired:?}");
+    assert_eq!(repaired.error, None);
+    assert_eq!(fixture.catalog_id(), "fixture-4.0.0");
+
+    drop(daemon);
+    fixture.expose("5.0.0", "5.0.0");
+    fs::remove_file(
+        fixture
+            .path("config")
+            .join(STORAGE_NAME)
+            .join("settings.toml"),
+    )
+    .unwrap();
+    let _daemon = fixture.start();
+    until(
+        || {
+            fs::read_to_string(fixture.install().join("catalog-version"))
+                .is_ok_and(|version| version == "5.0.0")
+        },
+        "scheduled provider activation and catalog refresh",
+    );
+    assert_eq!(fixture.status().version.as_deref(), Some("5.0.0"));
+    assert_eq!(fixture.catalog_id(), "fixture-5.0.0");
 }
