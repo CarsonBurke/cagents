@@ -1505,25 +1505,37 @@ impl Store {
         read(&self.path())
     }
 
-    /// Copy an earlier release record to a marker if the current account
-    /// list still records it and the managed home is still kept.
-    #[cfg(any(feature = "host", test))]
-    pub fn try_backfill_released_home(
-        &self,
-        homes: &Homes,
-        provider: Provider,
-        key: Uuid,
-    ) -> io::Result<()> {
-        let _lock = self.try_lock()?;
+    /// Reads the list for the restore sweep and repairs missing markers for
+    /// releases saved by earlier versions or interrupted before marking.
+    /// Keep the lock through marking so an actual registration takes
+    /// precedence over an old release record. Marker failures can be retried
+    /// on the next pass without preventing restoration of other homes.
+    #[cfg(feature = "host")]
+    pub fn load_for_restore(&self, homes: &Homes) -> io::Result<Registry> {
+        let _lock = self.lock()?;
         let registry = read(&self.path())?;
-        if !registry.is_newer()
-            && registry.is_released(key)
-            && registry.find(key).is_none()
-            && homes.is_unregistered(&registry, provider, key)
-        {
-            homes.mark_released(provider, key)?;
+        if registry.is_newer() {
+            return Ok(registry);
         }
-        Ok(())
+        for &key in &registry.released {
+            if registry.find(key).is_some() {
+                continue;
+            }
+            for provider in Account::PROVIDERS {
+                if !homes.is_released(provider, key)
+                    && homes.is_unregistered(&registry, provider, key)
+                    && let Err(error) = homes.mark_released(provider, key)
+                {
+                    tracing::debug!(
+                        provider = provider.executable(),
+                        %key,
+                        %error,
+                        "could not mark a released sign-in's home"
+                    );
+                }
+            }
+        }
+        Ok(registry)
     }
 
     /// Applies `change` to the registry as it stands on disk and writes the
@@ -2786,8 +2798,9 @@ mod tests {
         assert!(store.load().unwrap().find(key).is_none());
     }
 
+    #[cfg(feature = "host")]
     #[test]
-    fn a_release_marker_is_backfilled_only_from_the_locked_current_list() {
+    fn backfill_uses_current_releases_and_skips_registered_or_pending_homes() {
         let directory = tempfile::tempdir().unwrap();
         let store = Store::at(directory.path().join("config"));
         let homes = Homes::at(directory.path().join("accounts"));
@@ -2799,20 +2812,9 @@ mod tests {
         assert!(previous.is_released(key));
         assert!(!homes.is_released(provider, key));
 
-        let lock = store.lock().unwrap();
-        let held = store
-            .try_backfill_released_home(&homes, provider, key)
-            .unwrap_err();
-        assert_eq!(held.kind(), io::ErrorKind::WouldBlock);
-        assert!(!homes.is_released(provider, key));
-        drop(lock);
-
-        // The sweep may have read an older list before another writer
-        // replaced it. Only the list under the lock can authorize the marker.
+        // A release an earlier snapshot saw is no longer in the list.
         store.update(|registry| registry.released.clear()).unwrap();
-        store
-            .try_backfill_released_home(&homes, provider, key)
-            .unwrap();
+        store.load_for_restore(&homes).unwrap();
         assert!(!homes.is_released(provider, key));
 
         store
@@ -2821,21 +2823,36 @@ mod tests {
                 registry.begin(provider, key, 1);
             })
             .unwrap();
-        store
-            .try_backfill_released_home(&homes, provider, key)
-            .unwrap();
+        store.load_for_restore(&homes).unwrap();
         assert!(!homes.is_released(provider, key));
 
+        let (registered, _) = homes.create(provider, None).unwrap();
         let (current, ()) = store
-            .update(|registry| registry.release(key, &homes))
+            .update(|registry| {
+                registry.release(key, &homes);
+                registry.release(registered, &homes);
+                registry
+                    .register(
+                        Registered {
+                            provider: Provider::Codex,
+                            ..restorable(registered, "other@example.com")
+                        },
+                        &[],
+                    )
+                    .unwrap();
+            })
             .unwrap();
-        store
-            .try_backfill_released_home(&homes, provider, key)
-            .unwrap();
+        let loaded = store.load_for_restore(&homes).unwrap();
         assert!(homes.is_released(provider, key));
-        assert_eq!(store.load().unwrap().revision(), current.revision());
+        assert!(!homes.is_released(provider, registered));
+        assert_eq!(loaded.revision(), current.revision());
         fs::remove_file(store.path()).unwrap();
-        assert!(homes.unregistered(&store.load().unwrap()).is_empty());
+        assert!(
+            homes
+                .unregistered(&store.load().unwrap())
+                .iter()
+                .all(|&(_, candidate, _)| candidate != key)
+        );
     }
 
     #[test]
@@ -2884,6 +2901,34 @@ mod tests {
         assert!(homes.mark_released(provider, key).is_err());
         assert!(!homes.is_released(provider, key));
         assert!(fs::symlink_metadata(marker).unwrap().file_type().is_fifo());
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn backfill_retries_a_blocked_marker_without_rewriting_the_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Codex;
+        let (blocked, home) = homes.create(provider, None).unwrap();
+        let (other, _) = homes.create(provider, None).unwrap();
+        let marker = home.with_file_name(format!(".released-{}", blocked.hyphenated()));
+        fs::create_dir(&marker).unwrap();
+        let (before, ()) = store
+            .update(|registry| {
+                registry.release(blocked, &homes);
+                registry.release(other, &homes);
+            })
+            .unwrap();
+
+        assert_eq!(store.load_for_restore(&homes).unwrap(), before);
+        assert!(marker.is_dir());
+        assert!(!homes.is_released(provider, blocked));
+        assert!(homes.is_released(provider, other));
+
+        fs::remove_dir(&marker).unwrap();
+        assert_eq!(store.load_for_restore(&homes).unwrap(), before);
+        assert!(homes.is_released(provider, blocked));
     }
 
     #[test]

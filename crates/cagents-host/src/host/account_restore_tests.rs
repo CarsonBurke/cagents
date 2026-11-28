@@ -168,6 +168,8 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
         drop(sweeping);
         waiting.join().unwrap().unwrap();
     }
+    let marker = released_home.with_file_name(format!(".released-{}", released.hyphenated()));
+    std::fs::create_dir(&marker).unwrap();
     let mut sweep = account_lifecycle::RestoreSweep::default();
     assert!(account_lifecycle::restore_pass(
         &std::sync::Arc::downgrade(&host),
@@ -176,9 +178,17 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
     assert!(sweep.deferred.is_empty(), "every home's check finished");
     assert_eq!(
         sweep.examined,
-        [(Provider::Claude, unfinished)].into(),
-        "only the home left alone is not asked about again"
+        [(Provider::Claude, unfinished), (Provider::Claude, released)].into(),
+        "the sweep remembers the abandoned sign-in even if marking failed"
     );
+    assert!(!homes.is_released(Provider::Claude, released));
+
+    // The next pass retries the marker even though the home was examined.
+    std::fs::remove_dir(&marker).unwrap();
+    assert!(account_lifecycle::restore_pass(
+        &std::sync::Arc::downgrade(&host),
+        &mut sweep
+    ));
 
     let registry = store.load().unwrap();
     assert!(registry.revision() > before.revision());
@@ -263,5 +273,15 @@ fn startup_restores_signed_in_homes_a_lost_registry_no_longer_names() {
             .unwrap()
             .is_empty(),
         "no reservation outlives the sweep"
+    );
+    std::fs::remove_file(store.path()).unwrap();
+    let lost = store.load().unwrap();
+    assert!(!lost.is_released(released));
+    assert!(
+        homes
+            .unregistered(&lost)
+            .iter()
+            .all(|&(_, key, _)| key != released),
+        "the backfilled marker excludes the abandoned sign-in after list loss"
     );
 }
