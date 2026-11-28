@@ -1302,19 +1302,25 @@ fn process_wire_request(
         operation: crate::device_service::Operation::AccountLifecycle { operation },
     } = &request
     {
+        use crate::account::remote::Operation;
         {
             let _shared = gate.shared();
             ensure_control_open(host)?;
+            ensure_startup_recovery_request(host, &request)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
-        let reservation = match operation {
-            crate::account::remote::Operation::Restore { .. } => {
-                super::account_lifecycle::reserve_restore(host, operation)?
-            }
-            _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
-        };
-        let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
-            .map_err(lifecycle_refusal)?;
+        let value = if let Operation::RemovalPlan { id } = operation {
+            crate::account::remote::removal_plan(id)
+        } else {
+            let reservation = match operation {
+                Operation::Restore { .. } => {
+                    super::account_lifecycle::reserve_restore(host, operation)?
+                }
+                _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
+            };
+            crate::account::remote::execute_reserved(operation.clone(), &reservation)
+        }
+        .map_err(lifecycle_refusal)?;
         return Ok((
             ServerResponse::DeviceOperation {
                 reply: crate::device_service::Reply::AccountLifecycle(value),

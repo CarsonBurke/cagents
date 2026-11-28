@@ -160,6 +160,20 @@ impl Registry {
     pub(crate) const PROJECT_CHANNELS_CONFLICT: &'static str =
         "The project's channels changed since they were confirmed; nothing was closed";
 
+    pub(super) fn open_account_panes(&self) -> Result<Vec<crate::model::CardKind>, String> {
+        Ok(views::occupied(&self.db)?
+            .into_iter()
+            .flat_map(|view| view.panes)
+            .map(|pane| pane.kind)
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    crate::model::CardKind::Chat(_) | crate::model::CardKind::Terminal(_)
+                )
+            })
+            .collect())
+    }
+
     /// Opens the registry in this installation's data directory.
     pub(crate) fn open() -> Result<Self, String> {
         let dirs = crate::instance::project_dirs()

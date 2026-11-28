@@ -1,6 +1,8 @@
 mod account_lifecycle;
 #[cfg(test)]
 mod account_remote_tests;
+#[cfg(all(test, target_os = "linux"))]
+mod account_removal_contract_tests;
 #[cfg(test)]
 mod account_restore_tests;
 #[cfg(test)]

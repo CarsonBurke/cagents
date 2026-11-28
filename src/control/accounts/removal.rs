@@ -1,6 +1,9 @@
 use super::super::*;
 use crate::{
-    account::AccountId,
+    account::{
+        AccountId,
+        remote::{Archived, Operation as Lifecycle, RemovalPlan},
+    },
     device_service::{Operation, Reply},
 };
 use serde::Deserialize;
@@ -29,24 +32,13 @@ fn confirm(account: &AccountId, confirmed: bool) -> Result<(), AppError> {
 }
 
 fn execute_with(client: &mut ControlClient, account: AccountId) -> Result<CommandOutput, AppError> {
-    // The existing lifecycle handler owns current-home resolution, live-owner
-    // exclusion and deletion refusal. Never replace it with local file access.
-    client
-        .authenticate(Authority::from_environment())
-        .map_err(protocol_error)?;
-    let Reply::AccountLifecycle(value) = client
-        .device_operation(Operation::AccountLifecycle {
-            operation: crate::account::remote::Operation::Remove {
-                id: account.clone(),
-            },
-        })
-        .map_err(protocol_error)?
-    else {
-        return Err(AppError::new(
-            "account_remove",
-            "Unexpected account removal response; inspect account list before retrying",
-        ));
-    };
+    let value = request(
+        client,
+        Lifecycle::Remove {
+            id: account.clone(),
+        },
+        "account_remove",
+    )?;
     let (registry, error): (Revision, Option<String>) = serde_json::from_value(value)
         .map_err(|error| AppError::new("account_remove", format!("Invalid account removal response: {error}; inspect account list before retrying")))?;
     if let Some(error) = error {
@@ -62,6 +54,89 @@ fn execute_with(client: &mut ControlClient, account: AccountId) -> Result<Comman
         human: format!("Removed account registration: {account}"),
         data: json!({"account": account, "registration_removed": true, "revision": registry.revision}),
     })
+}
+
+pub(super) fn plan(account: AccountId) -> Result<CommandOutput, AppError> {
+    let mut client = control_daemon_client()?;
+    let RemovalPlan { conversations } = read_plan(&mut client, &account)?;
+    Ok(CommandOutput {
+        command: "account.removal-plan",
+        human: format!("{account} has {conversations} saved conversations."),
+        data: json!({"account": account, "conversations": conversations}),
+    })
+}
+
+fn read_plan(client: &mut ControlClient, account: &AccountId) -> Result<RemovalPlan, AppError> {
+    let value = request(
+        client,
+        Lifecycle::RemovalPlan {
+            id: account.clone(),
+        },
+        "account_removal_plan",
+    )?;
+    serde_json::from_value(value).map_err(|error| {
+        AppError::new(
+            "account_removal_plan",
+            format!("Invalid removal plan response: {error}"),
+        )
+    })
+}
+
+pub(super) fn archive(
+    account: AccountId,
+    move_to: Option<AccountId>,
+    confirmed: bool,
+) -> Result<CommandOutput, AppError> {
+    if !confirmed {
+        return Err(AppError::new(
+            "confirmation",
+            "Pass --yes to confirm signing out and archiving the account",
+        ));
+    }
+    let mut client = control_daemon_client()?;
+    let value = request(
+        &mut client,
+        Lifecycle::Archive {
+            id: account.clone(),
+            move_to: move_to.clone(),
+        },
+        "account_archive",
+    )?;
+    let Archived { revision, moved } = serde_json::from_value(value).map_err(|error| {
+        AppError::new(
+            "account_archive",
+            format!("Invalid archive response: {error}. Inspect account list before retrying."),
+        )
+    })?;
+    let human = match &move_to {
+        Some(target) => format!("Copied {moved} conversations to {target} and archived {account}."),
+        None => format!("Archived {account} and kept its conversation history."),
+    };
+    Ok(CommandOutput {
+        command: "account.archive",
+        human,
+        data: json!({"account": account, "archived": true, "moved": moved, "move_to": move_to, "revision": revision}),
+    })
+}
+
+fn request(
+    client: &mut ControlClient,
+    operation: Lifecycle,
+    error_kind: &'static str,
+) -> Result<serde_json::Value, AppError> {
+    client
+        .authenticate(Authority::from_environment())
+        .map_err(protocol_error)?;
+    match client
+        .device_operation(Operation::AccountLifecycle { operation })
+        .map_err(protocol_error)?
+    {
+        Reply::AccountLifecycle(value) => Ok(value),
+        _ => Err(AppError::new(
+            error_kind,
+            "Unexpected account lifecycle response. Inspect account list before retrying.",
+        )),
+    }
 }
 
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
@@ -84,6 +159,37 @@ mod tests {
         };
         assert_eq!(error.kind, "confirmation");
         assert!(error.message.contains("--yes"));
+    }
+
+    #[test]
+    fn archive_requires_confirmation_and_stable_account_ids() {
+        let id = "codex/00000000-0000-4000-8000-000000000001";
+        assert!(Cli::try_parse_from(["cagents", "account", "removal-plan", id]).is_ok());
+        assert!(Cli::try_parse_from(["cagents", "account", "archive", id]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "account",
+                "archive",
+                id,
+                "--move-to",
+                "codex/system",
+                "--yes"
+            ])
+            .is_ok()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "cagents",
+                "account",
+                "archive",
+                id,
+                "--move-to",
+                "/home",
+                "--yes"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

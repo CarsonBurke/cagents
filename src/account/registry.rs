@@ -169,10 +169,13 @@ pub struct Registry {
     system_labels: BTreeMap<String, String>,
     #[serde(default, rename = "account", skip_serializing_if = "Vec::is_empty")]
     accounts: Vec<Registered>,
-    /// Hidden duplicate homes remain registered so saved sessions can resume
-    /// and orphan cleanup never deletes their credentials or history.
+    /// Hidden homes remain registered and keep their provider files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     archived: Vec<Uuid>,
+    /// Explicit archives signed out through the provider CLI. Older duplicate
+    /// archives continue to use their original login for saved sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    signed_out: Vec<Uuid>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pending: Vec<Pending>,
     /// Managed homes whose sign-in was given up - it duplicated an account
@@ -261,6 +264,7 @@ impl Registry {
         for account in self.accounts.iter().chain(&next.accounts) {
             if self.find(account.key) != next.find(account.key)
                 || self.is_archived(account.key) != next.is_archived(account.key)
+                || self.is_signed_out(account.key) != next.is_signed_out(account.key)
             {
                 keys.insert(account.key);
             }
@@ -356,7 +360,11 @@ impl Registry {
     }
 
     pub fn is_archived(&self, key: Uuid) -> bool {
-        self.archived.contains(&key)
+        self.archived.contains(&key) || self.is_signed_out(key)
+    }
+
+    pub fn is_signed_out(&self, key: Uuid) -> bool {
+        self.signed_out.contains(&key)
     }
 
     /// Includes preserved homes for resolving existing session recipes.
@@ -624,7 +632,7 @@ impl Registry {
         }
         let existing = self.accounts.iter().find(|existing| {
             existing.key != managed.key
-                && !self.archived.contains(&existing.key)
+                && !self.is_archived(existing.key)
                 && existing.provider == managed.provider
                 && existing.identity().same_login(&identity)
         })?;
@@ -726,7 +734,7 @@ impl Registry {
         }
         if let Some(existing) = self.accounts.iter().find(|account| {
             account.provider == provider
-                && self.archived.contains(&account.key)
+                && self.is_archived(account.key)
                 && account
                     .linked_home
                     .as_ref()
@@ -738,6 +746,7 @@ impl Registry {
         }) {
             let key = existing.key;
             self.archived.retain(|archived| *archived != key);
+            self.signed_out.retain(|archived| *archived != key);
             return Ok(key);
         }
         self.accounts.push(Registered {
@@ -843,13 +852,36 @@ impl Registry {
             .position(|managed| managed.key == key)?;
         let removed = self.accounts.remove(index);
         self.archived.retain(|archived| *archived != key);
+        self.signed_out.retain(|archived| *archived != key);
+        self.clear_routing_choices(key);
+        Some(removed)
+    }
+
+    fn clear_routing_choices(&mut self, key: Uuid) {
         let key = key.hyphenated().to_string();
         self.defaults.retain(|_, chosen| *chosen != key);
         self.project_defaults.retain(|_, choices| {
             choices.retain(|_, chosen| *chosen != key);
             !choices.is_empty()
         });
-        Some(removed)
+    }
+
+    /// Persists the routing change before invoking the provider. This also
+    /// keeps the account out of routing on builds that predate explicit archive.
+    #[cfg(feature = "host")]
+    pub fn hide_before_sign_out(&mut self, key: Uuid) {
+        if !self.archived.contains(&key) {
+            self.archived.push(key);
+        }
+        self.clear_routing_choices(key);
+    }
+
+    /// Retains the registration after the managed home has been signed out.
+    #[cfg(feature = "host")]
+    pub(crate) fn archive_signed_out(&mut self, key: Uuid) {
+        if !self.is_signed_out(key) {
+            self.signed_out.push(key);
+        }
     }
 
     /// Hides a redundant home while preserving its files and saved-session
@@ -859,7 +891,7 @@ impl Registry {
             return false;
         };
         if duplicate.provider != retained.provider
-            || self.archived.contains(&key)
+            || self.is_archived(key)
             || retained.registry_key() == Some(key)
             || retained.is_brokered()
         {
@@ -870,7 +902,7 @@ impl Registry {
                 if self
                     .find(keep)
                     .is_some_and(|account| account.provider == retained.provider)
-                    && !self.archived.contains(&keep) =>
+                    && !self.is_archived(keep) =>
             {
                 keep.hyphenated().to_string()
             }
@@ -915,6 +947,9 @@ pub enum LaunchAccountError {
         key: Uuid,
         home_kept: bool,
     },
+    Archived {
+        provider: Provider,
+    },
     Unreadable(io::Error),
 }
 
@@ -933,6 +968,11 @@ impl std::fmt::Display for LaunchAccountError {
             Self::Removed { provider, .. } => write!(
                 formatter,
                 "This {} account was removed. Choose another account before continuing.",
+                provider.label()
+            ),
+            Self::Archived { provider } => write!(
+                formatter,
+                "This {} account was archived. Choose another account with this conversation's history.",
                 provider.label()
             ),
             Self::Unreadable(error) => {
@@ -1114,6 +1154,9 @@ impl Store {
             )));
         }
         for (provider, key) in selected {
+            if registry.is_signed_out(key) {
+                return Err(LaunchAccountError::Archived { provider });
+            }
             if !registry.contains_managed_home(homes, provider, key)
                 && !restore_probe_active(provider, key)
             {

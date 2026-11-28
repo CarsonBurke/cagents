@@ -1056,6 +1056,16 @@ pub fn local_window_database_paths() -> io::Result<Vec<PathBuf>> {
     window_database_paths_at(window_database_path(PRIMARY_WINDOW)?, false)
 }
 
+/// Current local windows may still own panes outside the shared workspace.
+#[cfg(feature = "host")]
+pub fn running_local_window_database_paths() -> io::Result<Vec<PathBuf>> {
+    running_window_slots(&runtime_directory()?)?
+        .into_iter()
+        .filter(|slot| !slot.starts_with("device-"))
+        .map(|slot| window_database_path(&slot))
+        .collect()
+}
+
 fn window_database_paths_at(primary: PathBuf, include_devices: bool) -> io::Result<Vec<PathBuf>> {
     // Old inactive snapshots are retained for ordinary reopening/migration.
     // Bound enumeration before allocating paths or opening SQLite stores.

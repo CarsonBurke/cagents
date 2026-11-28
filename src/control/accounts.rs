@@ -55,6 +55,22 @@ pub enum AccountCommand {
         #[arg(long, required = true)]
         yes: bool,
     },
+    /// Count saved conversations in a managed account's home.
+    RemovalPlan {
+        /// Stable account ID from account list on the selected device.
+        account: crate::account::AccountId,
+    },
+    /// Sign out a managed account and keep its history.
+    Archive {
+        /// Stable account ID from account list on the selected device.
+        account: crate::account::AccountId,
+        /// Copy saved conversations to this active account before signing out.
+        #[arg(long)]
+        move_to: Option<crate::account::AccountId>,
+        /// Confirm signing out and removing this account from routing.
+        #[arg(long, required = true)]
+        yes: bool,
+    },
     /// List active accounts.
     #[command(after_help = "Includes any retained caller account. Reads from the selected daemon.")]
     List {
@@ -85,7 +101,9 @@ pub(super) fn hosted_refusal(command: &AccountCommand) -> Option<AppError> {
         )),
         AccountCommand::Link { .. }
         | AccountCommand::Default { .. }
-        | AccountCommand::Remove { .. } => Some(AppError::new(
+        | AccountCommand::Remove { .. }
+        | AccountCommand::RemovalPlan { .. }
+        | AccountCommand::Archive { .. } => Some(AppError::new(
             "permission_denied",
             "Account changes require your own terminal. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents.",
         )),
@@ -110,6 +128,14 @@ pub(super) fn execute(command: AccountCommand) -> Result<CommandOutput, AppError
             selection,
         } => return preferences::execute(provider, selection),
         AccountCommand::Remove { account, yes } => return removal::execute(account, yes),
+        AccountCommand::RemovalPlan { account } => return removal::plan(account),
+        AccountCommand::Archive {
+            account,
+            move_to,
+            yes,
+        } => {
+            return removal::archive(account, move_to, yes);
+        }
         AccountCommand::List { provider } => (list::query(provider), true),
         AccountCommand::Info {
             provider,

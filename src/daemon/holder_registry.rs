@@ -584,6 +584,22 @@ pub(crate) fn observed(kind: Kind) -> io::Result<Vec<Record>> {
     })
 }
 
+/// Same-boot account owners, including surviving work whose holder is gone.
+#[cfg(feature = "host")]
+pub fn observe_account_owners(kind: Kind, boot: &BootId) -> io::Result<Vec<Record>> {
+    let directory = directory(kind).map_err(io::Error::other)?;
+    let Some(entries) = observed_directory(&directory)? else {
+        return Ok(Vec::new());
+    };
+    observe_records(&directory, entries, kind, boot, |record| {
+        (record.application == crate::instance::APPLICATION_ID
+            || recovery_role(&record.application))
+            && (record.holder.is_current()
+                || record.root.is_current()
+                || !ended_with_holder(record))
+    })
+}
+
 /// Same-boot holder evidence for selecting a carried-terminal update. A
 /// native provider can still own work after its holder dies on Darwin, so
 /// include those records when deciding whether this is a terminal-only batch.
