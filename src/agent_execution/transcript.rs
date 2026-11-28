@@ -768,8 +768,8 @@ mod tests {
         assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(one, other);
         assert_eq!(one, cursor("msg_011Ch5wPqUWsnCetdsGqDMp3:0"), "stable");
-        assert!(names(&one, "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
-        assert!(!names(&one[..8], "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+        assert!(matches_cursor(&one, "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+        assert!(!matches_cursor(&one[..8], "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
     }
 
     #[test]
