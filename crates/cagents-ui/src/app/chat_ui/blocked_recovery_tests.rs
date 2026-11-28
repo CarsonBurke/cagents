@@ -1540,6 +1540,86 @@ fn a_first_message_gets_its_send_back_once_the_update_restore_finishes() {
     );
 }
 
+#[test]
+fn update_recovery_rearms_and_releases_waiting_panes_under_a_dialog_or_menu() {
+    use iced::futures::{Stream, StreamExt};
+    use iced::runtime::{Action as RuntimeAction, task::into_stream};
+
+    async fn recovery_message(
+        mut stream: impl Stream<Item = RuntimeAction<cosmic::Action<Message>>> + Unpin,
+    ) -> Message {
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while let Some(message) = stream.next().await {
+                if let RuntimeAction::Output(cosmic::Action::App(
+                    message @ Message::ChatUi(
+                        Action::UpdateRecoveryDue | Action::UpdateRecoveryReady,
+                    ),
+                )) = message
+                {
+                    return message;
+                }
+            }
+            panic!("the watch finished without a recovery message");
+        })
+        .await
+        .expect("the watch must produce a recovery message")
+    }
+
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    for dialog in [true, false] {
+        let (mut app, card) =
+            blocked_app_with(true, true, true, blocked_recovery::Reopen::UpdateRecovery);
+        let focus = app.workspace.focused();
+        drop(app.watch_update_recovery());
+        if dialog {
+            app.device_ui.open = true;
+            assert!(app.modal_is_open());
+        } else {
+            drop(app.update(Message::ChromeUi(chrome_ui::Action::ToggleNewTab)));
+            assert!(app.chrome_ui.is_open());
+            assert!(!app.modal_is_open());
+        }
+
+        let mut watch = into_stream(app.update(Message::ChatUi(Action::UpdateRecoveryAnswered(
+            startup("restoring"),
+        ))))
+        .expect("restoring schedules another question");
+        let ready = || Message::ChatUi(Action::UpdateRecoveryAnswered(startup("ready")));
+
+        // Keep the timer and reply path running even while the window is
+        // preparing for an update. Reopen only once that preparation ends.
+        for prepared in [true, false] {
+            app.update_prepared = prepared;
+            let due = executor.block_on(recovery_message(&mut watch));
+            assert!(matches!(&due, Message::ChatUi(Action::UpdateRecoveryDue)));
+            assert!(into_stream(app.update(due)).is_some(), "ask the daemon");
+            assert!(
+                into_stream(app.watch_update_recovery()).is_none(),
+                "a question is already in flight"
+            );
+            // Supply the reply without running the socket request. It also
+            // schedules the next poll while the pane is still waiting.
+            watch = into_stream(app.update(ready())).expect("ready queues a release");
+            let release = executor.block_on(recovery_message(&mut watch));
+            assert!(matches!(
+                &release,
+                Message::ChatUi(Action::UpdateRecoveryReady)
+            ));
+            drop(app.update(release));
+            assert_eq!(app.waits_on_update_recovery(), prepared);
+            assert_eq!(app.chat_ui.attempt(card).is_none(), prepared);
+        }
+
+        assert_eq!(app.workspace.focused(), focus);
+        assert_eq!(app.modal_is_open(), dialog);
+        assert_eq!(app.chrome_ui.is_open(), !dialog);
+    }
+}
+
 /// A saved conversation the update refused takes no typing it has nowhere to
 /// send (#2905), but keeps its unsent message readable. One whose pane can
 /// start a new conversation in its place, which carries the message, and a

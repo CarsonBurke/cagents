@@ -236,7 +236,9 @@ impl Cagents {
     /// first message is the reader's to send again, so it only gets its Send
     /// back; a saved conversation reopens, as it would have at startup.
     pub(super) fn release_update_recovery(&mut self) -> Task<Message> {
-        if self.chat_ui.update_recovery.wait.holds() {
+        // While the window is preparing to close for another update, keep
+        // the refusals. The watch will try again if the update is cancelled.
+        if self.update_prepared || self.chat_ui.update_recovery.wait.holds() {
             return Task::none();
         }
         let mut releases = Vec::new();
