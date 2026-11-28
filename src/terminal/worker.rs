@@ -22,10 +22,7 @@ use std::{
     collections::{HashMap, VecDeque},
     fs::File,
     io::{BufWriter, Write},
-    os::{
-        fd::{AsRawFd, OwnedFd},
-        unix::fs::FileExt,
-    },
+    os::{fd::AsRawFd, unix::fs::FileExt},
     path::PathBuf,
     rc::Rc,
     sync::{
@@ -6296,6 +6293,8 @@ impl Worker {
 
     #[cfg(target_os = "linux")]
     fn cancel_kernel_input(&self) {
+        use std::os::fd::{FromRawFd, OwnedFd};
+
         // The peer ioctl opens this exact slave without a reusable path or a
         // controlling-terminal change. Flushing TCIFLUSH on the master would
         // discard child output; flushing the peer discards canceled input.
@@ -6314,7 +6313,7 @@ impl Worker {
             return;
         }
         // SAFETY: the successful ioctl returned a fresh owned descriptor.
-        let peer = unsafe { <OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(peer) };
+        let peer = unsafe { OwnedFd::from_raw_fd(peer) };
         if unsafe { libc::tcflush(peer.as_raw_fd(), libc::TCIFLUSH) } < 0 {
             self.error(
                 "cancel terminal input",
