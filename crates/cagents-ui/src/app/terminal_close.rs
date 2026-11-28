@@ -2737,7 +2737,9 @@ pub(in crate::app) mod tests {
             assert!(!app.terminal_close_dialog_visible(), "replaced={replaced}");
 
             app.resume_ui.open = false;
-            drop(app.settle_close_queue());
+            let before = crate::app::terminal_output_tests::projections();
+            drop(app.update(Message::DeviceLoad(device_load_ui::DeviceLoad::Waiting)));
+            assert_eq!(crate::app::terminal_output_tests::projections(), before + 1);
             assert!(
                 !app.workspace.is_hidden(card),
                 "replaced={replaced}: it is back"

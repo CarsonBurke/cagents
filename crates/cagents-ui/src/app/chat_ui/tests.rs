@@ -16237,7 +16237,12 @@ fn a_chat_closed_during_its_return_beside_another_removal_starts_no_terminal() {
         "it waits for the removal under way"
     );
     let _ = app.workspace.cancel_close(pane);
-    let _ = app.update(Message::DismissStatus);
+    let projections = super::super::terminal_output_tests::projections();
+    let _ = app.update(Message::DeviceLoad(device_load_ui::DeviceLoad::Waiting));
+    assert_eq!(
+        super::super::terminal_output_tests::projections() - projections,
+        1
+    );
     assert!(
         !app.card_state(card).unwrap().existence.is_open(),
         "its close runs on its turn: {:?}",

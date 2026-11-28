@@ -89,6 +89,47 @@ fn projections_of(app: &mut Cagents, message: Message) -> usize {
     projections() - before
 }
 
+#[test]
+fn a_device_reading_updates_the_status_bar_without_projecting_the_workspace() {
+    let (mut app, focused, _) = two_pane_app();
+    let load = device_load_ui::DeviceLoad::Live(crate::device_stats::DeviceStats {
+        cpu: Some(crate::device_stats::Cpu {
+            percent: 35,
+            cores: 16,
+            load_centi: 190,
+        }),
+        ..Default::default()
+    });
+
+    assert_eq!(
+        projections_of(&mut app, Message::DeviceLoad(load.clone())),
+        0
+    );
+    assert_eq!(app.device_ui.load, load);
+    assert_eq!(app.workspace.focused(), Some(focused));
+    projection_oracle::assert_projected(&mut app);
+}
+
+#[test]
+fn a_device_reading_projects_a_settings_draft_committed_on_blur() {
+    let (mut app, focused, _) = two_pane_app();
+    drop(app.queue_setting_input(SettingsField::TerminalFontSize, "18".into()));
+    app.settings_pane_focused = true;
+    assert!(app.settings_blur_pending());
+
+    assert_eq!(
+        projections_of(
+            &mut app,
+            Message::DeviceLoad(device_load_ui::DeviceLoad::Waiting)
+        ),
+        1
+    );
+    assert_eq!(app.settings.terminal_font_size, 18.0);
+    assert!(app.settings_pending.is_empty());
+    assert!(app.card_chrome.contains_key(&focused));
+    projection_oracle::assert_projected(&mut app);
+}
+
 /// Switching panes by keyboard, the reader's most frequent shortcut,
 /// projects the workspace once per key, and leaves nothing stale.
 // Spelled from the Linux table.

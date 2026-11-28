@@ -1593,7 +1593,7 @@ pub(super) struct State {
     returns_to_remove: HashSet<CardId>,
     /// Whether one of those waited for another pane's removal to finish, and
     /// goes once it has.
-    returns_await_removal: bool,
+    pub(super) returns_await_removal: bool,
     /// Closed panes a shared view put back, kept out of sight until their
     /// stop settles or their pending removal commits.
     hidden_returns: HashSet<CardId>,
