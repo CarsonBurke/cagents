@@ -268,7 +268,7 @@ fn update(
             (
                 "updated",
                 sent,
-                format!("{name} now runs cagents {version}."),
+                format!("Updated cagents to {version} on {name}."),
             )
         }
         Outcome::Installed { sent } => (
