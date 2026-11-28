@@ -801,7 +801,7 @@ mod tests {
             .append(true)
             .open(&path)
             .unwrap()
-            .write_all(complete[split..].as_bytes())
+            .write_all(&complete.as_bytes()[split..])
             .unwrap();
         assert_eq!(latest()[1].id, "new");
 
