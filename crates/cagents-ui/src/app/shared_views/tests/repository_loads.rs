@@ -234,7 +234,7 @@ impl RestoredWorkspace {
                     repository: None,
                     worktrees: vec![],
                     github: GitHubAvailability::NotAssociated,
-                    review_repository: None,
+                    review_binding: None,
                     head_repositories: HashMap::new(),
                 })),
             })

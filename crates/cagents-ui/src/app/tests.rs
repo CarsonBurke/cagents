@@ -7954,7 +7954,7 @@ fn one_unreadable_project_keeps_every_other_project_listed() {
         }),
         worktrees: Vec::new(),
         github: GitHubAvailability::NotAssociated,
-        review_repository: None,
+        review_binding: None,
         head_repositories: HashMap::new(),
     };
 
@@ -12463,6 +12463,7 @@ pub(super) fn context_inspector_test_app(with_focused_card: bool) -> Cagents {
         workspace_scroll_id: widget::Id::new("workspace-strip-0"),
         github_availability: HashMap::new(),
         review_repositories: HashMap::new(),
+        review_watches: HashMap::new(),
         repository_generations: HashMap::new(),
         repository_pr_cancellations: HashMap::new(),
         repository_load_sequence: 0,
@@ -16028,22 +16029,21 @@ pub(super) fn pull_request_test_app(numbers: &[u64]) -> (Cagents, ProjectId) {
         )],
         Vec::new(),
     ));
-    app.github_availability.insert(
-        project,
-        GitHubAvailability::Ready {
-            repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
-            pull_requests: numbers
-                .iter()
-                .map(|number| {
-                    (
-                        crate::pull_request_review::test_support::pull_request(*number),
-                        Vec::new(),
-                    )
-                })
-                .collect(),
-            refreshed_at: 0,
-        },
-    );
+    let availability = GitHubAvailability::Ready {
+        repository_key: GitHubRepoKey::new("github.com", None, "o", "r").unwrap(),
+        pull_requests: numbers
+            .iter()
+            .map(|number| {
+                (
+                    crate::pull_request_review::test_support::pull_request(*number),
+                    Vec::new(),
+                )
+            })
+            .collect(),
+        refreshed_at: 0,
+    };
+    app.update_review_binding(project, &availability, None);
+    app.github_availability.insert(project, availability);
     (app, project)
 }
 

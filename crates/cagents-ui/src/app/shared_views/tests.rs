@@ -1848,7 +1848,7 @@ fn repository_loads_project_only_their_affected_views() {
             repository: None,
             worktrees: vec![],
             github: GitHubAvailability::NotAssociated,
-            review_repository: None,
+            review_binding: None,
             head_repositories: HashMap::new(),
         });
     }

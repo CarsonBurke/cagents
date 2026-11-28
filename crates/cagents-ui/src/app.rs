@@ -2511,7 +2511,7 @@ pub struct LoadedRepository {
     repository: Option<RepositoryInfo>,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     github: GitHubAvailability,
-    review_repository: Option<GitHubRepoKey>,
+    review_binding: Option<review_request_ui::RepositoryBinding>,
     head_repositories: HashMap<crate::model::WorktreeId, GitHubRepoKey>,
 }
 
@@ -6347,6 +6347,7 @@ pub struct Cagents {
     github_availability: HashMap<ProjectId, GitHubAvailability>,
     /// Locally derived read identity; never grants GitHub mutation authority.
     review_repositories: HashMap<ProjectId, GitHubRepoKey>,
+    review_watches: HashMap<ProjectId, review_request_ui::Watch>,
     /// The generation of the latest load of each project. Every generation is
     /// drawn from `repository_load_sequence`, so generations of different
     /// projects are ordered too: a load that reaches another project's
@@ -17412,6 +17413,7 @@ impl Application for Cagents {
             workspace_scroll_id: widget::Id::new("workspace-strip-0"),
             github_availability: HashMap::new(),
             review_repositories: HashMap::new(),
+            review_watches: HashMap::new(),
             repository_generations: HashMap::new(),
             repository_pr_cancellations: HashMap::new(),
             repository_load_sequence: 0,
@@ -21553,7 +21555,7 @@ fn load_project(
         repository: None,
         worktrees: Vec::new(),
         github: GitHubAvailability::NotAssociated,
-        review_repository: None,
+        review_binding: None,
         head_repositories: HashMap::new(),
     })
 }
@@ -21591,14 +21593,8 @@ fn load_repository(
             Some((record.id, key))
         })
         .collect();
-    let review_repository = service
-        .remotes(&repository.selected_path, &cancellation)
-        .ok()
-        .and_then(|remotes| {
-            pull_request_review::ReviewSource::from_remotes(&repository.selected_path, &remotes)
-        })
-        .map(|source| source.repository);
-    let github_availability = load_repository_github(&repository, false, &cancellation);
+    let (github_availability, review_binding) =
+        load_repository_github(&repository, false, &cancellation);
     // The shared model's own derivation, not a second copy of it: a project
     // this window opened and one the CLI opened are one row in the registry,
     // and two rules for its name would make the sidebar show whichever of them
@@ -21616,7 +21612,7 @@ fn load_repository(
         repository: Some(repository),
         worktrees,
         github: github_availability,
-        review_repository,
+        review_binding,
         head_repositories,
     })
 }
@@ -21629,15 +21625,34 @@ fn load_repository_github(
     repository: &RepositoryInfo,
     revalidate: bool,
     cancellation: &CancellationToken,
-) -> GitHubAvailability {
+) -> (
+    GitHubAvailability,
+    Option<review_request_ui::RepositoryBinding>,
+) {
     let service = RepositoryService::system("git");
     let github = GitHubService::system("gh");
-    (|| {
+    let mut binding = None;
+    let availability = (|| {
         let remotes = service
             .remotes(&repository.selected_path, cancellation)
             .map_err(|error| GitHubAvailability::Failed {
                 detail: error.to_string(),
             })?;
+        let binding = binding.insert(review_request_ui::RepositoryBinding {
+            local: pull_request_review::ReviewSource::from_remotes(
+                &repository.selected_path,
+                &remotes,
+            )
+            .map(|source| source.repository),
+            resolved: None,
+            remotes: remotes
+                .iter()
+                .filter_map(|remote| {
+                    let key = crate::github::remote_repository_key(remote.fetch_url.as_deref()?)?;
+                    Some((remote.name.clone(), key))
+                })
+                .collect(),
+        });
         if !github
             .has_associated_remote(&remotes, cancellation)
             .map_err(GitHubAvailability::from_error)?
@@ -21652,6 +21667,7 @@ fn load_repository_github(
                 cancellation,
             )
             .map_err(GitHubAvailability::from_error)?;
+        binding.resolved = Some(key.clone());
         let validator = match github.sidebar_probe(&key, revalidate, cancellation) {
             // The probe was answered as this account, so it is signed in.
             crate::github::SidebarProbe::Unchanged(pull_requests) => {
@@ -21675,7 +21691,8 @@ fn load_repository_github(
             .map_err(GitHubAvailability::from_error)?;
         Ok(github_ready(key, pull_requests))
     })()
-    .unwrap_or_else(|unavailable| unavailable)
+    .unwrap_or_else(|unavailable| unavailable);
+    (availability, binding)
 }
 
 fn github_ready(
