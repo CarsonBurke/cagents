@@ -1313,6 +1313,23 @@ impl RenderStreamFixture {
         self.commands.len()
     }
 
+    /// Lets a test publish concurrently with a pending viewport capture.
+    pub fn answer_viewport_read(&self, before_reply: impl FnOnce()) {
+        let command = self.commands.recv_timeout(Duration::from_secs(5)).unwrap();
+        let Command::Admitted {
+            permit: _permit,
+            command,
+        } = command
+        else {
+            panic!("expected an admitted worker command");
+        };
+        let Command::ReadViewport { reply, .. } = *command else {
+            panic!("expected a viewport read");
+        };
+        before_reply();
+        reply.send(Ok(self.handle.snapshot())).unwrap();
+    }
+
     /// Takes what a worker would apply next: the host's pending visibility
     /// request, or else the last queued command that sets visibility. Returns
     /// whether it leaves the worker visible. Queued commands are drained.

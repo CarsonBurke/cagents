@@ -3487,13 +3487,62 @@ fn a_request_that_panics_is_answered_and_the_connection_keeps_serving() {
     assert!(host.lock().unwrap().clients.is_empty());
 }
 
+fn replay_terminal(host: &SharedHost) -> (TerminalId, crate::terminal::RenderStreamFixture) {
+    let recipe = crate::model::LaunchRecipe {
+        unset_environment: Default::default(),
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: "/".into(),
+        environment: Default::default(),
+    };
+    let session = crate::model::TerminalSession {
+        recovery_origin: None,
+        predecessor: None,
+        owned_codex_listener: None,
+        id: TerminalId::new(),
+        launch: recipe.clone(),
+        transcript_path: None,
+        resume_hint: None,
+        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+            recipe,
+            last_exit: None,
+        },
+    };
+    let terminal_id = session.id;
+    let fixture = crate::terminal::RenderStreamFixture::new(|_| {});
+    host.lock()
+        .unwrap()
+        .finish_spawn(2, session, fixture.handle.clone(), false)
+        .unwrap();
+    (terminal_id, fixture)
+}
+
+fn send_replay_request(
+    stream: &mut UnixStream,
+    proof: &HostSessionProof,
+    request_id: u64,
+    request: ClientRequest,
+) {
+    FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+        .write(
+            stream,
+            &ClientEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id,
+                proof: Some(proof.clone()),
+                request,
+            },
+        )
+        .unwrap();
+}
+
 /// A terminal's worker can publish an event after a client attaches but
 /// before its reply and replay are queued. That event must still reach the
 /// client after them: ahead of the reply it would make the client retry, and
 /// ahead of the replay it would advance the client's cursor past older events.
 #[test]
 fn a_live_event_follows_the_attach_reply_and_its_replay() {
-    use crate::terminal::{TerminalConfig, TerminalEvent, TerminalHandle};
+    use crate::terminal::TerminalEvent;
 
     fn attach_then_publish(
         host: &SharedHost,
@@ -3516,32 +3565,7 @@ fn a_live_event_follows_the_attach_reply_and_its_replay() {
     }
 
     let (proof, host) = panic_test_host("attach-replay-order");
-    let recipe = crate::model::LaunchRecipe {
-        unset_environment: Default::default(),
-        program: "/bin/cat".into(),
-        arguments: Vec::new(),
-        working_directory: "/".into(),
-        environment: Default::default(),
-    };
-    let session = crate::model::TerminalSession {
-        recovery_origin: None,
-        predecessor: None,
-        owned_codex_listener: None,
-        id: TerminalId::new(),
-        launch: recipe.clone(),
-        transcript_path: None,
-        resume_hint: None,
-        continuity: crate::model::TerminalContinuity::RelaunchAvailable {
-            recipe,
-            last_exit: None,
-        },
-    };
-    let terminal_id = session.id;
-    let handle = TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
-    host.lock()
-        .unwrap()
-        .finish_spawn(2, session, handle.clone(), false)
-        .unwrap();
+    let (terminal_id, _fixture) = replay_terminal(&host);
     crate::host::state::record_event(
         &Arc::downgrade(&host),
         terminal_id,
@@ -3555,29 +3579,19 @@ fn a_live_event_follows_the_attach_reply_and_its_replay() {
     let server_host = Arc::clone(&host);
     let server =
         thread::spawn(move || serve_with(server_stream, 1, server_host, attach_then_publish));
-    let mut writer = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
-    let mut send = |request_id, request| {
-        writer
-            .write(
-                &mut stream,
-                &ClientEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id,
-                    proof: Some(proof.clone()),
-                    request,
-                },
-            )
-            .unwrap();
-    };
-    send(
+    send_replay_request(
+        &mut stream,
+        &proof,
         1,
         ClientRequest::Connect {
             expected_host: Some(proof.clone()),
             resume: Vec::new(),
         },
     );
-    send(
+    send_replay_request(
+        &mut stream,
+        &proof,
         2,
         ClientRequest::Attach {
             terminal_id,
@@ -3624,7 +3638,191 @@ fn a_live_event_follows_the_attach_reply_and_its_replay() {
 
     drop(stream);
     server.join().unwrap();
-    handle.shutdown().unwrap();
+}
+
+#[test]
+fn a_waiting_attach_leaves_live_events_deliverable() {
+    use crate::terminal::TerminalEvent;
+    use std::sync::mpsc;
+
+    let (proof, host) = panic_test_host("attach-replay-admission");
+    let (terminal_id, _fixture) = replay_terminal(&host);
+    let (mut stream, peer) = UnixStream::pair().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let (waiting, entered) = mpsc::channel();
+    let server_host = Arc::clone(&host);
+    let server = thread::spawn(move || {
+        serve_connection(peer, 1, server_host, |host, client, request, stream| {
+            if matches!(request, ClientRequest::Attach { .. }) {
+                waiting.send(()).unwrap();
+            }
+            process_wire_request(host, client, request, Some(stream))
+        });
+    });
+    let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+    send_replay_request(
+        &mut stream,
+        &proof,
+        1,
+        ClientRequest::Connect {
+            expected_host: Some(proof.clone()),
+            resume: Vec::new(),
+        },
+    );
+    assert_eq!(
+        reader
+            .read::<ServerEnvelope>(&mut stream)
+            .unwrap()
+            .unwrap()
+            .request_id,
+        Some(1)
+    );
+
+    // This connection already watches the same terminal it wants to resync.
+    host.lock().unwrap().attach(1, terminal_id).unwrap();
+    let gate = control_gate(&host);
+    let exclusive = gate.exclusive();
+    send_replay_request(
+        &mut stream,
+        &proof,
+        2,
+        ClientRequest::Attach {
+            terminal_id,
+            after_generation: crate::terminal_ipc::SUPPRESS_GRID_REPLAY,
+            after_event_sequence: 1,
+        },
+    );
+    entered.recv_timeout(Duration::from_secs(5)).unwrap();
+    crate::host::state::record_event(
+        &Arc::downgrade(&host),
+        terminal_id,
+        TerminalEvent::ConversationTitleChanged("Published while waiting".into()),
+    );
+    let live = reader.read::<ServerEnvelope>(&mut stream);
+    drop(exclusive);
+    let live = live.unwrap().unwrap();
+    assert!(matches!(
+        live.message,
+        ServerMessage::Event { terminal_id: id, sequence: 1, .. } if id == terminal_id
+    ));
+    assert!(matches!(
+        reader
+            .read::<ServerEnvelope>(&mut stream)
+            .unwrap()
+            .unwrap()
+            .message,
+        ServerMessage::Response {
+            response: ServerResponse::Attached { .. }
+        }
+    ));
+    drop(stream);
+    server.join().unwrap();
+}
+
+#[test]
+fn a_resuming_connect_delivers_live_events_after_each_terminal_replay() {
+    use crate::terminal::{
+        CellSnapshot, RenderSnapshot, RowSnapshot, ScrollSnapshot, TerminalEvent,
+    };
+
+    let (proof, host) = panic_test_host("resume-replay-order");
+    let (first, _first) = replay_terminal(&host);
+    let (second, second_worker) = replay_terminal(&host);
+    // A saved viewport above the bottom needs a worker read, which lets us
+    // publish after both terminals attach but before resume can finish.
+    second_worker.publish_snapshot(RenderSnapshot {
+        generation: 1,
+        rows: 1,
+        columns: 1,
+        lines: vec![Arc::new(RowSnapshot {
+            cells: vec![CellSnapshot::default()],
+            ..RowSnapshot::default()
+        })]
+        .into(),
+        scroll: ScrollSnapshot {
+            total: 2,
+            len: 1,
+            ..ScrollSnapshot::default()
+        },
+        ..RenderSnapshot::empty()
+    });
+    let publish = |title: &str| {
+        for id in [first, second] {
+            crate::host::state::record_event(
+                &Arc::downgrade(&host),
+                id,
+                TerminalEvent::ConversationTitleChanged(title.into()),
+            );
+        }
+    };
+    publish("Before reconnect");
+
+    let (mut stream, peer) = UnixStream::pair().unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server_host = Arc::clone(&host);
+    let server = thread::spawn(move || serve_fixture_user(peer, 1, server_host));
+    send_replay_request(
+        &mut stream,
+        &proof,
+        1,
+        ClientRequest::Connect {
+            expected_host: Some(proof.clone()),
+            resume: [first, second]
+                .map(|terminal_id| ResumeCursor {
+                    terminal_id,
+                    generation: 0,
+                    event_sequence: 0,
+                })
+                .into(),
+        },
+    );
+    second_worker.answer_viewport_read(|| publish("During resume"));
+
+    let mut reader = FrameCodec::new(MAX_FRAME_BYTES);
+    let mut next = || reader.read::<ServerEnvelope>(&mut stream).unwrap().unwrap();
+    let handshake = next();
+    assert_eq!(handshake.request_id, Some(1));
+    assert!(matches!(
+        handshake.message,
+        ServerMessage::Response { response: ServerResponse::Connected { resumed, .. } }
+            if resumed.iter().map(|terminal| terminal.session.id).eq([first, second])
+    ));
+    let mut order = Vec::new();
+    while order.len() < 6 {
+        match next().message {
+            ServerMessage::Event {
+                terminal_id,
+                sequence,
+                ..
+            } => order.push((terminal_id, sequence)),
+            ServerMessage::Synchronized {
+                terminal_id,
+                event_sequence: 1,
+                ..
+            } => {
+                order.push((terminal_id, 0));
+            }
+            ServerMessage::TerminalWorker { .. } | ServerMessage::Snapshot { .. } => {}
+            other => panic!("unexpected resume frame: {other:?}"),
+        }
+    }
+    assert_eq!(
+        order,
+        [
+            (first, 1),
+            (first, 0),
+            (second, 1),
+            (second, 0),
+            (first, 2),
+            (second, 2)
+        ]
+    );
+    drop(stream);
+    server.join().unwrap();
 }
 
 #[test]
