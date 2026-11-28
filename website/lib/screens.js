@@ -2,9 +2,7 @@
 // Every screenshot is a real capture of the native app; screens.json names
 // each one's alt text and the themes it was captured in.
 import { readFileSync } from "node:fs";
-
-const escapeHtml = (text) =>
-  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+import { escapeHtml } from "./html.js";
 
 // The pixel size of a WebP, from its VP8, VP8L or VP8X header.
 export function webpSize(bytes) {

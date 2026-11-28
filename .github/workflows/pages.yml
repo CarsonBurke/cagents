@@ -67,6 +67,9 @@ jobs:
       - name: Test and build website
         run: npm run build
         working-directory: website
+        env:
+          # Reads the latest release to link only the downloads it has.
+          GITHUB_TOKEN: ${{ github.token }}
 
       - name: Upload website artifact
         if: github.event_name != 'pull_request'

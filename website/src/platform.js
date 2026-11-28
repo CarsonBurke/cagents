@@ -6,9 +6,24 @@
 // one. Safari and Firefox don't, and report every Mac as "MacIntel", so a Mac
 // of unknown architecture is offered the Apple Silicon build: Apple has sold
 // no Intel Mac since 2023, and the page says the build is for Apple Silicon.
-export function detectPlatform({ uaPlatform = "", platform = "", userAgent = "", architecture = "", maxTouchPoints = 0 } = {}) {
+//
+// The page also runs this function inline in <head>, before first paint, so
+// it must stay self-contained.
+export function detectPlatform({
+  uaPlatform = "",
+  platform = "",
+  userAgent = "",
+  architecture = "",
+  maxTouchPoints = 0,
+  coarsePointer = false,
+} = {}) {
   const name = (uaPlatform || platform).toLowerCase();
   if (name === "android" || /\bandroid\b/i.test(userAgent)) return "android";
+  // Android's "desktop site" mode reports an X11 Linux browser on a touch
+  // screen with a coarse pointer or an Arm processor.
+  if (name.startsWith("linux") && maxTouchPoints > 0 && (coarsePointer || /arm|aarch64/i.test(platform))) {
+    return "android";
+  }
   if (name === "ios" || /^(iphone|ipad|ipod)/.test(name) || /\b(iphone|ipad|ipod)\b/i.test(userAgent)) return "ios";
   // iPadOS asks for desktop sites as a touch-screen "MacIntel".
   if (name.startsWith("mac") && maxTouchPoints > 1) return "ios";
@@ -37,5 +52,6 @@ export async function currentPlatform(nav = navigator) {
     userAgent: nav.userAgent ?? "",
     architecture,
     maxTouchPoints: nav.maxTouchPoints ?? 0,
+    coarsePointer: globalThis.matchMedia?.("(pointer: coarse)").matches ?? false,
   });
 }

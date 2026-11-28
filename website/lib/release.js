@@ -26,7 +26,9 @@ export const INSTALL_GUIDE = guide;
 // { linux: { href, direct }, mac: …, android: … } for a release from the
 // GitHub API, or for null when the release could not be read.
 export function downloadLinks(release) {
-  const names = new Set((release?.assets ?? []).map((asset) => asset?.name));
+  const names = new Set(
+    (release?.assets ?? []).filter((asset) => (asset?.state ?? "uploaded") === "uploaded").map((asset) => asset?.name),
+  );
   return Object.fromEntries(
     Object.entries(PLATFORMS).map(([platform, { asset, fallback }]) => {
       const direct = names.has(asset);
@@ -36,14 +38,24 @@ export function downloadLinks(release) {
   );
 }
 
-// The latest release, or null if GitHub doesn't answer in time. One
-// unauthenticated request; a failure never fails the build.
-export async function fetchLatestRelease({ fetch = globalThis.fetch, timeout = 8000, log = console.warn } = {}) {
+// The latest release, or null if GitHub doesn't answer in time. One request;
+// a failure never fails the build. CI passes its token, because hosted runners
+// share the unauthenticated rate limit; elsewhere the request is anonymous.
+export async function fetchLatestRelease({
+  fetch = globalThis.fetch,
+  timeout = 8000,
+  token = process.env.GITHUB_TOKEN,
+  log = (message) => console.warn(process.env.GITHUB_ACTIONS ? `::warning::${message}` : message),
+} = {}) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new Error(`no answer within ${timeout} ms`)), timeout);
   try {
     const response = await fetch(RELEASE_API, {
-      headers: { Accept: "application/vnd.github+json", "User-Agent": "cagents-website-build" },
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "cagents-website-build",
+        ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      },
       signal: controller.signal,
     });
     if (!response.ok) throw new Error(`GitHub answered ${response.status}`);

@@ -1,8 +1,6 @@
 // A QR code as an inline SVG, generated when the site builds.
 import { encode } from "uqr";
-
-const escapeHtml = (text) =>
-  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+import { escapeHtml } from "./html.js";
 
 // Dark modules on a white field with the standard four-module quiet zone, in
 // every theme: phone cameras read dark-on-light codes most reliably.
@@ -21,5 +19,6 @@ export function qrSvg(text, { label, quietZone = 4 } = {}) {
     }
   });
   const name = label ? ` role="img" aria-label="${escapeHtml(label)}"` : ` aria-hidden="true"`;
-  return `<svg class="qr" viewBox="0 0 ${extent} ${extent}" shape-rendering="crispEdges"${name}><rect width="${extent}" height="${extent}" fill="#fff" /><path fill="#111" d="${path}" /></svg>`;
+  // --modules lets the page size the code to whole pixels per module.
+  return `<svg class="qr" viewBox="0 0 ${extent} ${extent}" style="--modules: ${extent}" shape-rendering="crispEdges"${name}><rect width="${extent}" height="${extent}" fill="#fff" /><path fill="#111" d="${path}" /></svg>`;
 }

@@ -1,7 +1,8 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import test from "node:test";
-import { renderDownloads } from "../lib/downloads.js";
+import { renderDownloads, SITE, VISITOR_PLATFORMS } from "../lib/downloads.js";
+import { decodeQr } from "./qr-decode.js";
 import { PLATFORMS } from "../lib/release.js";
 import { loadScreens, renderPage, sharedThemes } from "../lib/screens.js";
 
@@ -76,9 +77,15 @@ test("in-page links and repository links lead somewhere", () => {
 
 test("install actions lead to the installation guide, never to a command", () => {
   const guide = "https://github.com/CarsonBurke/cagents/blob/main/docs/installation.md";
-  const installs = [...page.matchAll(/<a class="button primary[^"]*" href="([^"]+)"/g)].map(([, href]) => href);
-  assert.ok(installs.length >= 3, "the navigation, hero and closing band each offer Install");
-  for (const href of installs) assert.equal(href, guide);
+  for (const html of [page, released]) {
+    const installs = [...html.matchAll(/<a class="button primary[^"]*"(?: data-for="([^"]+)")? href="([^"]+)"/g)];
+    const generic = installs.filter(([, platforms]) => !platforms || platforms.split(" ").includes("other"));
+    assert.ok(generic.length >= 3, "the navigation, hero and closing band each offer Install");
+    for (const [, , href] of generic) assert.equal(href, guide);
+    for (const [, , href] of installs) {
+      assert.match(href, /^(?:https:\/\/github\.com\/CarsonBurke\/cagents\/(?:blob\/main\/(?:docs\/installation|mobile\/README)\.md|releases\/latest\/download\/)|#android$)/, href);
+    }
+  }
   for (const platform of ["#install-with-the-verified-installer", "#install-on-apple-silicon-macos"]) {
     assert.ok(page.includes(`href="${guide}${platform}"`), `no platform link to ${platform}`);
   }
@@ -184,15 +191,41 @@ test("download links fall back to guides until the files are released", () => {
     assert.ok(released.includes(`href="https://github.com/CarsonBurke/cagents/releases/latest/download/${asset}"`), asset);
   }
   for (const html of [page, released]) {
-    assert.doesNotMatch(html, /%%|<!--(?:download-offers|qr:)/, "every download placeholder is filled");
-    const offers = JSON.parse(/<script type="application\/json" id="download-offers">([^<]+)<\/script>/.exec(html)[1]);
-    assert.deepEqual(Object.keys(offers).sort(), ["android", "linux", "mac"]);
+    assert.doesNotMatch(html, /%%|<!--(?:platform-script|qr:)/, "every download placeholder is filled");
   }
-  assert.match(page, /Install on Linux/);
-  assert.match(released, /Download for Linux/);
+  assert.match(page, /data-for="linux" href="[^"]+">Install on Linux</);
+  assert.match(released, /data-for="linux" href="[^"]+">Download for Linux</);
+  // Until the APK exists, the Android visitor reads about the app rather than
+  // being promised a download, and sees no note about installing one.
+  assert.match(page, /data-for="android" href="#android">About the Android app</);
+  assert.doesNotMatch(page, /allow installs/);
+  assert.match(released, /allow installs/);
+  // Open Anyway applies only to the downloaded disk image.
+  assert.doesNotMatch(page, /Open Anyway/);
+  assert.match(released, /Open Anyway/);
 });
 
-test("the Android section the QR code opens exists", () => {
+test("the QR code on the page opens the Android section", () => {
   assert.match(page, /<section[^>]* id="android"/);
-  assert.match(page, /<svg class="qr"[^>]*role="img" aria-label="[^"]+"/);
+  const svg = /<svg class="qr"[\s\S]*?<\/svg>/.exec(page)[0];
+  assert.match(svg, /role="img" aria-label="[^"]+"/);
+  assert.equal(decodeQr(svg), `${SITE}#android`);
+});
+
+test("every platform the page shows content for is one the visitor can have", () => {
+  const css = readFileSync(new URL("src/styles.css", root), "utf8");
+  const named = new Set([...page.matchAll(/data-for="([^"]+)"/g)].flatMap(([, list]) => list.split(" ")));
+  for (const platform of named) assert.ok(VISITOR_PLATFORMS.includes(platform), `data-for names ${platform}`);
+  for (const platform of VISITOR_PLATFORMS) {
+    assert.ok(named.has(platform), `nothing on the page is for ${platform} visitors`);
+    assert.ok(css.includes(`:root[data-platform="${platform}"] [data-for]:not([data-for~="${platform}"])`), `styles.css never hides other platforms' content from ${platform} visitors`);
+  }
+  for (const [, platform] of page.matchAll(/data-download-item="(\w+)"/g)) assert.ok(VISITOR_PLATFORMS.includes(platform));
+  // The hero offers each visitor exactly one primary action.
+  const hero = /<section class="hero"[\s\S]*?<\/section>/.exec(page)[0];
+  for (const platform of VISITOR_PLATFORMS) {
+    const shown = [...hero.matchAll(/<a class="button primary" data-for="([^"]+)"/g)].filter(([, list]) => list.split(" ").includes(platform));
+    assert.equal(shown.length, platform === "ios" ? 0 : 1, platform);
+  }
+  assert.match(page, /<head>[\s\S]*<script>\(\(\) => \{\n  const detectPlatform = function detectPlatform[\s\S]*<\/head>/);
 });

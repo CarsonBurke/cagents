@@ -30,6 +30,22 @@ test("every platform falls back to its guide when the release can't be read", ()
   assert.match(PLATFORMS.android.fallback, /mobile\/README\.md$/);
 });
 
+test("an asset still uploading is not linked", () => {
+  const release = { assets: [{ name: "cagents-x86_64.AppImage", state: "new" }] };
+  assert.equal(downloadLinks(release).linux.direct, false);
+});
+
+test("the build sends a token only when it has one", async () => {
+  const seen = [];
+  const fetch = async (_, { headers }) => {
+    seen.push(headers.Authorization);
+    return { ok: true, status: 200, json: async () => releaseWith() };
+  };
+  await fetchLatestRelease({ fetch, token: "secret" });
+  await fetchLatestRelease({ fetch, token: "" });
+  assert.deepEqual(seen, ["Bearer secret", undefined]);
+});
+
 test("all three assets link directly once released", () => {
   const links = downloadLinks(releaseWith(...Object.values(PLATFORMS).map(({ asset }) => asset)));
   for (const [platform, { asset }] of Object.entries(PLATFORMS)) {
@@ -84,6 +100,9 @@ test("each system is offered the build it can run", () => {
     [{ platform: "Linux armv8l", userAgent: "Mozilla/5.0 (Linux; Android 14; Pixel 8)" }, "android"],
     [{ uaPlatform: "Windows", platform: "Win32", architecture: "x86" }, "other"],
     [{ uaPlatform: "Chrome OS", platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; CrOS x86_64 14541.0.0)" }, "other"],
+    [{ platform: "Linux armv8l", userAgent: "Mozilla/5.0 (X11; Linux x86_64)", maxTouchPoints: 5 }, "android"],
+    [{ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux x86_64)", maxTouchPoints: 5, coarsePointer: true }, "android"],
+    [{ platform: "Linux x86_64", userAgent: "Mozilla/5.0 (X11; Linux x86_64)", maxTouchPoints: 10 }, "linux"],
     [{}, "other"],
   ];
   for (const [visitor, expected] of cases) assert.equal(detectPlatform(visitor), expected, JSON.stringify(visitor));
