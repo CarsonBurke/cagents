@@ -3846,8 +3846,8 @@ impl SidebarState {
         if !self.list_hold.is_held() {
             return;
         }
-        let rows: Vec<_> = in_progress_rows(model, self, compact)
-            .into_iter()
+        let rows: Vec<_> = self
+            .held_progress_rows(model, compact)
             .map(InProgressRow::row)
             .collect();
         // What the rail drew since stays drawn as well.
@@ -3878,6 +3878,18 @@ impl SidebarState {
         self.list_hold
             .get()
             .is_some_and(|hold| hold.in_progress.contains(&row))
+    }
+
+    /// Only the expanded section has visible child positions to hold.
+    fn held_progress_rows<'a>(
+        &self,
+        model: &'a SidebarModel,
+        compact: bool,
+    ) -> impl Iterator<Item = InProgressRow<'a>> {
+        (!self.in_progress_collapsed)
+            .then(|| in_progress_rows(model, self, compact))
+            .into_iter()
+            .flatten()
     }
 
     pub fn saved_view(&self) -> SidebarView {
@@ -4930,7 +4942,7 @@ impl SidebarState {
     /// their probes interleave.
     pub fn toggle_in_progress(&mut self) -> bool {
         if self.in_progress_collapsed {
-            self.in_progress_collapsed = false;
+            self.unfold_in_progress();
         } else {
             self.in_progress_fold_pending = !self.in_progress_fold_pending;
         }
@@ -4941,13 +4953,19 @@ impl SidebarState {
     /// whether there was one: a later press may have taken it back.
     pub fn fold_in_progress(&mut self) -> bool {
         let pending = std::mem::take(&mut self.in_progress_fold_pending);
-        self.in_progress_collapsed |= pending;
+        if pending {
+            self.in_progress_collapsed = true;
+            self.release_list_hold();
+        }
         pending
     }
 
     /// Unfolds In progress, so a row in it can be shown, and drops any fold
     /// still waiting on its probe.
     pub fn unfold_in_progress(&mut self) {
+        if self.in_progress_collapsed {
+            self.release_list_hold();
+        }
         self.in_progress_collapsed = false;
         self.in_progress_fold_pending = false;
     }
@@ -5261,8 +5279,12 @@ impl SidebarState {
                 }
             }
             SidebarAction::ToggleInProgress => {
-                self.in_progress_collapsed = !self.in_progress_collapsed;
-                self.in_progress_fold_pending = false;
+                if self.in_progress_collapsed {
+                    self.unfold_in_progress();
+                } else {
+                    self.in_progress_fold_pending = true;
+                    self.fold_in_progress();
+                }
             }
             SidebarAction::ToggleControls => {
                 self.list_hold.release();
@@ -5274,6 +5296,7 @@ impl SidebarState {
                 }
             }
             SidebarAction::CloseControls => {
+                self.release_list_hold();
                 self.controls_expanded = false;
                 self.query.clear();
             }
@@ -14649,26 +14672,20 @@ struct ListHold {
 impl ListHold {
     /// What `state`, holding nothing, shows of `model` now.
     fn capture(model: &SidebarModel, state: &SidebarState, compact: bool) -> Self {
+        let projects = filtered_projects(model, state, compact);
         let mut hold = Self {
             in_progress: crate::interaction::hover_hold::Held::new(
-                in_progress_rows(model, state, compact)
-                    .into_iter()
+                state
+                    .held_progress_rows(model, compact)
                     .map(InProgressRow::row),
             ),
-            hide_read: model.projects.iter().any(|project| {
-                project
-                    .channels
-                    .iter()
-                    .any(|channel| state.channel_listing(channel) != Listing::Live)
-                    || project
-                        .panes
-                        .iter()
-                        .any(|card| state.card_listing(card) != Listing::Live)
-            }),
+            hide_read: lists_kept_attention_rows(&projects),
             ..Self::default()
         };
-        hold.rail = Self::rail_rows(model, state).collect();
-        for project in &model.projects {
+        if compact {
+            hold.rail = Self::rail_rows(model, state).collect();
+        }
+        for project in projects {
             hold.listed.extend(
                 project
                     .channels
@@ -14678,7 +14695,7 @@ impl ListHold {
             );
             hold.listed.extend(
                 project
-                    .panes
+                    .cards
                     .iter()
                     .filter(|card| state.lists_card(card))
                     .map(|card| SelectionRow::Card(card.id)),
@@ -14692,19 +14709,25 @@ impl ListHold {
         model: &'a SidebarModel,
         state: &'a SidebarState,
     ) -> impl Iterator<Item = SelectionRow> + 'a {
-        model.projects.iter().flat_map(move |project| {
-            let channels = project
-                .channels
-                .iter()
-                .filter(move |channel| compact_rail_shows_channel(state, channel))
-                .map(|channel| SelectionRow::Channel(channel.id));
-            let worktrees = project
-                .worktrees
-                .iter()
-                .filter(move |worktree| compact_rail_shows_worktree(state, project.id, worktree))
-                .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id));
-            channels.chain(worktrees)
-        })
+        model
+            .projects
+            .iter()
+            .filter(|project| project.unreachable.is_none())
+            .flat_map(move |project| {
+                let channels = project
+                    .channels
+                    .iter()
+                    .filter(move |channel| compact_rail_shows_channel(state, channel))
+                    .map(|channel| SelectionRow::Channel(channel.id));
+                let worktrees = project
+                    .worktrees
+                    .iter()
+                    .filter(move |worktree| {
+                        compact_rail_shows_worktree(state, project.id, worktree)
+                    })
+                    .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id));
+                channels.chain(worktrees)
+            })
     }
 }
 
@@ -14791,7 +14814,7 @@ pub fn pane_row_place(
 /// one holds whatever needs the user or was dealt with there.
 fn in_progress_rows<'a>(
     model: &'a SidebarModel,
-    state: &'a SidebarState,
+    state: &SidebarState,
     compact: bool,
 ) -> Vec<InProgressRow<'a>> {
     if state.filter != SidebarFilter::Attention {
@@ -14803,11 +14826,11 @@ fn in_progress_rows<'a>(
         fold(state.query.trim())
     };
     let mut rows = Vec::new();
-    for project in model
+    let reachable = model
         .projects
         .iter()
-        .filter(|project| project.unreachable.is_none())
-    {
+        .filter(|project| project.unreachable.is_none());
+    for project in reachable.clone() {
         let project_matches = query.is_empty() || project.matches(query.as_ref());
         let matches =
             |title: &str| project_matches || search_score(title, query.as_ref()).is_some();
@@ -14841,14 +14864,18 @@ fn in_progress_rows<'a>(
             }),
         );
     }
-    let Some(hold) = state.list_hold.get() else {
+    let Some(hold) = state
+        .list_hold
+        .get()
+        .filter(|_| !state.in_progress_collapsed)
+    else {
         return rows;
     };
     // Held rows keep their slots whatever their agents have done since;
     // only a row that went, or is going, gives its slot up. One pass finds
     // them all, however many rows are held.
     let mut held = BTreeMap::new();
-    for project in &model.projects {
+    for project in reachable {
         for channel in &project.channels {
             let row = SelectionRow::Channel(channel.id);
             if channel.deletion != Some(RowDeletion::Deleting) && hold.in_progress.contains(&row) {
