@@ -1671,7 +1671,12 @@ impl Codex {
                         });
                         continue;
                     }
-                    Some("image") => "Image attachment".to_owned(),
+                    Some("image") => {
+                        let Some(name) = input["url"].as_str().and_then(image_url_file_name) else {
+                            continue;
+                        };
+                        name
+                    }
                     // A skill is named in the text it was queued with.
                     Some("skill") if inputs.iter().any(|input| input["type"] == "text") => continue,
                     Some("skill" | "mention") => format!(
@@ -5053,6 +5058,26 @@ fn arguments(value: &Value) -> String {
         value => value.to_string(),
     }
 }
+fn image_file_name(path: &str) -> Option<&str> {
+    std::path::Path::new(path)
+        .file_name()?
+        .to_str()
+        .filter(|name| !name.trim().is_empty())
+}
+
+fn image_url_file_name(url: &str) -> Option<String> {
+    // Inline images can carry megabytes and have no file name.
+    if url
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let url = url::Url::parse(url).ok()?;
+    let name = url.path_segments()?.next_back()?;
+    (!name.is_empty()).then(|| name.to_owned())
+}
+
 fn parse_item(value: &Value, done: bool, turn: &str) -> Result<Vec<Item>, String> {
     parse_item_with_windows(value, done, turn, |_, _| {})
 }
@@ -5162,30 +5187,35 @@ fn parse_item_with_windows(
                         false,
                         Role::User,
                     )),
-                    "localImage" | "image" => items.push(Item {
-                        id: part_id,
-                        role: Role::User,
-                        content: ItemContent::Image {
-                            reference: references.get(&index).cloned(),
-                            path: if unverified.contains_key(&index) {
-                                String::new()
+                    "localImage" | "image" => {
+                        let local = content["path"].as_str();
+                        let remote = content["url"].as_str();
+                        let source = local.or(remote).ok_or("Missing image path")?;
+                        let reference = references.remove(&index);
+                        let (path, description) = if let Some(reason) = unverified.remove(&index) {
+                            (String::new(), reason)
+                        } else {
+                            let description = if let Some(reference) = &reference {
+                                reference.label()
+                            } else if let Some(path) = local {
+                                image_file_name(path).unwrap_or_default().into()
                             } else {
-                                content["path"]
-                                    .as_str()
-                                    .or_else(|| content["url"].as_str())
-                                    .ok_or("Missing image path")?
-                                    .into()
+                                image_url_file_name(source).unwrap_or_default()
+                            };
+                            (source.into(), description)
+                        };
+                        items.push(Item {
+                            id: part_id,
+                            role: Role::User,
+                            content: ItemContent::Image {
+                                reference,
+                                path,
+                                description,
                             },
-                            description: unverified.get(&index).cloned().unwrap_or_else(|| {
-                                references
-                                    .get(&index)
-                                    .map(|reference| reference.label())
-                                    .unwrap_or_else(|| "User attachment".into())
-                            }),
-                        },
-                        started_at: None,
-                        at: None,
-                    }),
+                            started_at: None,
+                            at: None,
+                        });
+                    }
                     // A skill or a mention part names what the text beside it
                     // already names, so it adds nothing to show.
                     "skill" | "mention" => {}
@@ -5327,23 +5357,20 @@ fn parse_item_with_windows(
             String::new(),
             images::readable(&value["output"]),
         ),
-        "imageView" => vec![Item {
-            id: id.into(),
-            role: Role::Assistant,
-            content: ItemContent::Image {
-                reference: None,
-                path: string(value, "path")?.into(),
-                // The file it looked at, which is what a reader would call it.
-                description: std::path::Path::new(string(value, "path")?)
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .filter(|name| !name.is_empty())
-                    .unwrap_or("Image")
-                    .into(),
-            },
-            started_at: None,
-            at: None,
-        }],
+        "imageView" => {
+            let path = string(value, "path")?;
+            vec![Item {
+                id: id.into(),
+                role: Role::Assistant,
+                content: ItemContent::Image {
+                    reference: None,
+                    path: path.into(),
+                    description: image_file_name(path).unwrap_or_default().into(),
+                },
+                started_at: None,
+                at: None,
+            }]
+        }
         "imageGeneration" => {
             let path = value["savedPath"]
                 .as_str()
