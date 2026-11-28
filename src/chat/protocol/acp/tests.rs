@@ -4054,3 +4054,45 @@ fn a_turn_refused_for_its_sign_in_resumes_once_signed_in() {
     other.profile = &muse::PROFILE;
     assert!(resume(&mut other, &failure).is_err());
 }
+
+#[test]
+fn tracked_compaction_distinguishes_acp_prompt_completion_from_compaction() {
+    use crate::agent_execution::CompactionOutcome;
+    let mut acp = adapter(&[], None);
+    let session = ready(&mut acp);
+    acp.receive(update(
+        &session,
+        json!({
+            "sessionUpdate":"available_commands_update",
+            "availableCommands":[{"name":"compact","description":"Compact context"}]
+        }),
+    ))
+    .unwrap();
+    let compact = only_write(&acp.tracked_compaction().unwrap()).clone();
+    let step = acp
+        .receive(reply(&compact, json!({"stopReason":"end_turn"})))
+        .unwrap();
+    assert!(matches!(
+        step.compaction,
+        Some(CompactionOutcome::Unconfirmed(_))
+    ));
+    let compact = only_write(&acp.tracked_compaction().unwrap()).clone();
+    let step = acp
+        .receive(refusal(&compact, -32603, "compaction refused"))
+        .unwrap();
+    assert!(
+        matches!(step.compaction, Some(CompactionOutcome::Failed(reason)) if reason.contains("compaction refused"))
+    );
+
+    acp.tracked_compaction().unwrap();
+    let steer = only_write(&acp.command(send("wait", PromptMode::Steer)).unwrap()).clone();
+    acp.command(Command::Interrupt).unwrap();
+    let cancelled = acp
+        .receive(reply(&steer, json!({"stopReason":"cancelled"})))
+        .unwrap();
+    assert!(matches!(
+        cancelled.compaction,
+        Some(CompactionOutcome::Failed(_))
+    ));
+    assert!(!acp.compaction_pending());
+}

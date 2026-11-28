@@ -378,6 +378,7 @@ struct Acp {
     segment_ids: HashMap<String, u32>,
     next_item: u64,
     turn: Option<Turn>,
+    tracked_compaction: Option<u64>,
     permissions: BTreeMap<String, Permission>,
     next_permission: u64,
     usage: chat::Usage,
@@ -417,6 +418,7 @@ impl Acp {
             segment_ids: HashMap::new(),
             next_item: 0,
             turn: None,
+            tracked_compaction: None,
             permissions: BTreeMap::new(),
             next_permission: 0,
             usage: chat::Usage::default(),
@@ -994,6 +996,22 @@ impl Acp {
             }
             Err(error) => (Kind::Failed, Some(self.failure(error))),
         };
+        // Cancelling a steered turn can settle it through a different
+        // prompt's receipt. The provider may never reply to the original.
+        if self
+            .tracked_compaction
+            .is_some_and(|id| turn.requests.contains(&id))
+        {
+            use crate::agent_execution::CompactionOutcome::{Failed, Unconfirmed};
+            self.tracked_compaction = None;
+            step.compaction = Some(if kind == Kind::Cancelled {
+                Failed("The provider cancelled compaction".into())
+            } else {
+                Unconfirmed(
+                    "The provider settled another prompt before confirming compaction".into(),
+                )
+            });
+        }
         for (id, content) in self.calls.stop_running() {
             step.events.push(Event::Item(tool_item(id, content)));
         }
@@ -1178,7 +1196,29 @@ impl Acp {
                 }
                 self.advance_settings(step);
             }
-            Pending::Prompt => self.answered(id, outcome, step),
+            Pending::Prompt => {
+                if self.tracked_compaction == Some(id) {
+                    self.tracked_compaction = None;
+                    use crate::agent_execution::CompactionOutcome::{Failed, Unconfirmed};
+                    // ACP confirms how a prompt ended but does not report
+                    // whether a slash command replaced the model's context.
+                    step.compaction = Some(match outcome {
+                        Err(error) => Failed(self.failure(error)),
+                        Ok(result) if result["stopReason"] == "end_turn" => Unconfirmed(
+                            "This provider finished /compact without confirming context compaction"
+                                .into(),
+                        ),
+                        Ok(result) => Failed(format!(
+                            "{} ended /compact with {}",
+                            self.profile.label,
+                            result["stopReason"]
+                                .as_str()
+                                .unwrap_or("an unknown stop reason")
+                        )),
+                    });
+                }
+                self.answered(id, outcome, step);
+            }
         }
     }
 
@@ -2245,6 +2285,19 @@ impl Adapter for Acp {
                 Err("Permission rule settings are available for Claude sessions".into())
             }
         }
+    }
+
+    fn tracked_compaction(&mut self) -> Result<Step, String> {
+        let step = self.command(Command::Compact)?;
+        self.tracked_compaction = self
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.requests.first().copied());
+        Ok(step)
+    }
+
+    fn compaction_pending(&self) -> bool {
+        self.tracked_compaction.is_some()
     }
 
     fn receive(&mut self, frame: Value) -> Result<Step, String> {

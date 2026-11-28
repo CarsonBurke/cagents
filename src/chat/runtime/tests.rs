@@ -683,6 +683,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![serde_json::json!({"final":true})],
                 events: vec![
                     Event::Execution {
@@ -701,6 +702,7 @@ fn notification_final_provider_proof_survives_a_pending_transcript_flush_failure
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![
                     Event::Execution {
@@ -3578,6 +3580,7 @@ impl Adapter for Echo {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![json!({"text": "hello"})],
             events: Vec::new(),
         })
@@ -3589,6 +3592,7 @@ impl Adapter for Echo {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![json!({"text": " world"})],
             events: Vec::new(),
         })
@@ -3597,6 +3601,7 @@ impl Adapter for Echo {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: Vec::new(),
             events: vec![Event::TextDelta {
                 id: "echo".into(),
@@ -4246,6 +4251,7 @@ fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({})],
                 events: Vec::new(),
             })
@@ -4257,6 +4263,7 @@ fn an_account_report_reaches_the_surfaces_without_touching_the_conversation() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![Event::AccountUsage(report())],
             })
@@ -4330,6 +4337,7 @@ fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({})],
                 // As a reopened history says of the agents it started.
                 events: vec![address("a1892b93e88999a7d", "toolu_relocate")],
@@ -4342,6 +4350,7 @@ fn an_agent_address_reaches_the_surfaces_once_and_never_the_snapshot() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![
                     // Said again, and a later agent's first word.
@@ -4409,6 +4418,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({})],
                 events: Vec::new(),
             })
@@ -4421,6 +4431,7 @@ fn a_frame_confirms_its_conversation_before_announcing_its_outcome() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![
                     Event::Session {
@@ -4586,6 +4597,7 @@ impl Adapter for WebSocketFixture {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({"interrupt": true})],
                 events: Vec::new(),
             })

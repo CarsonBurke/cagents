@@ -367,7 +367,7 @@ pub enum TopCommand {
     Send(SendArgs),
     /// Compact one or more live conversations.
     #[command(
-        after_help = "A busy conversation compacts after its turn and any queued follow-ups. Submitted means the daemon handed off the command. Queued requests apply to the current live conversation and expire if it or the daemon stops."
+        after_help = "A busy conversation compacts after its turn and any queued follow-ups. Submitted means the daemon handed off the command. Use --wait to report provider-confirmed outcomes. A wait timeout leaves requests queued or running."
     )]
     Compact(compact::CompactArgs),
     /// Message another session and wait for its reply.

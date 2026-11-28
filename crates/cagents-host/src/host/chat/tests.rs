@@ -2839,6 +2839,7 @@ fn automatic_handoff_fences_idle_state_and_confirms_the_same_conversation() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![
                     Event::Ready(true),
@@ -2925,6 +2926,7 @@ done
     let mut initial = Step {
         suppress_current_notification: false,
         notification_preview: None,
+        compaction: None,
         writes: vec![json!({"ready": true})],
         events: vec![
             Event::Ready(true),
@@ -3143,6 +3145,7 @@ fn account_recovery_requires_provider_confirmation_not_the_resume_hint() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({"id":"saved-conversation"})],
                 events: Vec::new(),
             })
@@ -3151,6 +3154,7 @@ fn account_recovery_requires_provider_confirmation_not_the_resume_hint() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![Event::Session {
                     id: value["id"].as_str().unwrap().to_owned(),
@@ -3233,6 +3237,7 @@ impl Adapter for ActiveFixture {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: Vec::new(),
             events: if matches!(command, Command::Interrupt) {
                 vec![Event::Status {
@@ -3339,6 +3344,7 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
     let mut initial = Step {
         suppress_current_notification: false,
         notification_preview: None,
+        compaction: None,
         writes: Vec::new(),
         events: vec![Event::Status {
             busy: true,
@@ -3533,6 +3539,7 @@ impl Adapter for Echo {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: vec![json!({"tick": true})],
             events: Vec::new(),
         })
@@ -3542,6 +3549,7 @@ impl Adapter for Echo {
         Ok(Step {
             suppress_current_notification: false,
             notification_preview: None,
+            compaction: None,
             writes: Vec::new(),
             events: vec![Event::Waiting(self.0)],
         })
@@ -3617,6 +3625,7 @@ fn control_client_closes_chat_as(slow: bool, return_terminal: bool, provider: Pr
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({"interrupt": true})],
                 events: Vec::new(),
             })
@@ -3625,6 +3634,7 @@ fn control_client_closes_chat_as(slow: bool, return_terminal: bool, provider: Pr
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![if value.get("ready").is_some() {
                     Event::Session {
@@ -3835,6 +3845,7 @@ fn agent_addresses_reach_every_subscriber_and_each_new_one() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: vec![json!({"tick": true})],
                 events: Vec::new(),
             })
@@ -3843,6 +3854,7 @@ fn agent_addresses_reach_every_subscriber_and_each_new_one() {
             Ok(Step {
                 suppress_current_notification: false,
                 notification_preview: None,
+                compaction: None,
                 writes: Vec::new(),
                 events: vec![Event::AgentAddress(chat::AgentAddress {
                     address: "a1892b93e88999a7d".into(),

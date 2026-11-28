@@ -244,7 +244,8 @@ fn agent_access(operation: &AgentOperation) -> Access<'static> {
         | O::Members(_)
         | O::Sessions(_)
         | O::Context { .. }
-        | O::Stopped(_) => Access::Open,
+        | O::Stopped(_)
+        | O::CompactionStatus(_) => Access::Open,
         O::Submit(_)
         | O::Close(_)
         | O::Console { .. }
@@ -254,7 +255,8 @@ fn agent_access(operation: &AgentOperation) -> Access<'static> {
         | O::Prompt { .. }
         | O::Deliver(_)
         | O::Resume(_)
-        | O::Compact(_) => Access::Held,
+        | O::Compact(_)
+        | O::CompactTracked(_) => Access::Held,
     }
 }
 

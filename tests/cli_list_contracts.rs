@@ -36,6 +36,7 @@ enum Listing {
     Terminals,
     TerminalShow,
     Sessions,
+    Compact,
     Work,
 }
 
@@ -50,6 +51,7 @@ impl Listing {
             Self::Terminals => &["terminal", "list"],
             Self::TerminalShow => &["terminal", "show", "00000000-0000-4000-8000-000000000001"],
             Self::Sessions => &["sessions"],
+            Self::Compact => &["compact", "fixture", "--wait"],
             // The noun alone lists, as `work ls` does.
             Self::Work => &["work"],
         }
@@ -57,6 +59,28 @@ impl Listing {
 
     fn reply(self, request: ClientRequest, populated: bool) -> ServerResponse {
         match (self, request) {
+            (Self::Compact, ClientRequest::Agent { operation, .. }) => {
+                use agent_execution::{Compaction, CompactionState, Reply, TrackedCompaction};
+                let receipt = Uuid::from_u128(42);
+                let state = match operation {
+                    Operation::CompactTracked(target) => {
+                        assert_eq!(target, "fixture");
+                        CompactionState::Queued
+                    }
+                    Operation::CompactionStatus(request) => {
+                        assert_eq!(request, receipt);
+                        CompactionState::Completed
+                    }
+                    _ => panic!("Unexpected compaction operation {operation:?}"),
+                };
+                ServerResponse::Agent(Reply::TrackedCompaction(TrackedCompaction {
+                    request: Some(receipt),
+                    compaction: Compaction {
+                        session: "00000000-0000-4000-8000-000000000001".parse().unwrap(),
+                        state,
+                    },
+                }))
+            }
             // The fixture session is in no channel, so no pane shows it.
             (Self::Sessions, ClientRequest::ReadWorkspaceModel) => ServerResponse::WorkspaceModel {
                 model: Default::default(),
@@ -489,6 +513,13 @@ fn output_with(listing: Listing, populated: bool, json: bool, extra: &[&str]) ->
                                 }
                             )
                     }
+                    Listing::Compact => matches!(
+                        request.request,
+                        ClientRequest::Agent {
+                            operation: Operation::CompactTracked(_),
+                            ..
+                        }
+                    ),
                     Listing::Sessions => {
                         populated
                             && !selected_fields
@@ -1278,4 +1309,16 @@ fn an_unknown_field_is_a_json_usage_error_naming_the_fields() {
     );
     assert!(output.stdout.is_empty());
     assert!(!runtime.exists());
+}
+
+#[test]
+fn compact_wait_reports_completion_for_the_queued_receipt() {
+    let result: serde_json::Value =
+        serde_json::from_str(&output(Listing::Compact, false, true)).unwrap();
+    assert_eq!(result["data"]["outcome"], "succeeded");
+    assert_eq!(result["data"]["sessions"][0]["state"], "completed");
+    assert_eq!(
+        result["data"]["sessions"][0]["session"],
+        "00000000-0000-4000-8000-000000000001"
+    );
 }

@@ -2228,8 +2228,13 @@ pub(super) fn process(
             .map_err(|error| error.to_string()),
         Operation::Stopped(scope) => resume::stopped(host, &authority, scope).map(Reply::Stopped),
         Operation::Resume(handle) => resume::resume(host, &authority, &handle).map(Reply::Resumed),
-        Operation::Compact(handle) => {
-            mailbox::compact(host, &authority, &handle).map(Reply::Compact)
+        Operation::Compact(handle) => mailbox::compact(host, &authority, &handle, false)
+            .map(|result| Reply::Compact(result.compaction)),
+        Operation::CompactTracked(handle) => {
+            mailbox::compact(host, &authority, &handle, true).map(Reply::TrackedCompaction)
+        }
+        Operation::CompactionStatus(request) => {
+            mailbox::compaction_status(host, &authority, request).map(Reply::TrackedCompaction)
         }
     }
 }
