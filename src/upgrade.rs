@@ -325,23 +325,197 @@ impl SurvivorEvidence {
         }
     }
 
-    fn names_conversation<'a>(&self, mut arguments: impl Iterator<Item = &'a [u8]>) -> bool {
-        self.exact_identity.is_some_and(|(provider, id)| {
-            arguments.any(|argument| {
-                std::str::from_utf8(argument).ok().is_some_and(|argument| {
-                    uuid::Uuid::parse_str(argument).ok() == Some(id)
-                        || provider
-                            .session_file_id(Path::new(argument))
-                            .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
-                            == Some(id)
-                })
-            })
-        })
+    /// Check the observed image and its own selector before treating an
+    /// external process as the conversation's provider.
+    fn owns_conversation<'a>(
+        &self,
+        executable: &Path,
+        mut arguments: impl Iterator<Item = &'a [u8]>,
+    ) -> bool {
+        use crate::agent::Provider;
+
+        let Some((provider, _)) = self.exact_identity else {
+            return false;
+        };
+        let Some(name) = executable.file_name().and_then(|name| name.to_str()) else {
+            return false;
+        };
+        let name = name.strip_suffix(" (deleted)").unwrap_or(name);
+        arguments.next(); // argv[0] is supplied by the caller, not the kernel.
+        let observed = if Provider::is_interpreter(name) {
+            arguments
+                .next()
+                .and_then(|script| std::str::from_utf8(script).ok())
+                .and_then(|script| Provider::from_script(Path::new(script)))
+        } else if matches!(
+            name,
+            "codex-aarch64-apple-darwin"
+                | "codex-x86_64-apple-darwin"
+                | "codex-aarch64-unknown-linux-musl"
+                | "codex-x86_64-unknown-linux-musl"
+        ) {
+            Some(Provider::Codex)
+        } else if executable
+            .parent()
+            .is_some_and(|directory| directory.ends_with("claude/versions"))
+            && name
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_digit())
+        {
+            Some(Provider::Claude)
+        } else {
+            Provider::from_program(name)
+        };
+        observed == Some(provider) && self.has_conversation_selector(arguments)
+    }
+
+    fn may_own_conversation<'a>(
+        &self,
+        mut arguments: impl Iterator<Item = &'a [u8]> + Clone,
+    ) -> bool {
+        use crate::agent::Provider;
+
+        let Some((provider, _)) = self.exact_identity else {
+            return false;
+        };
+        arguments.next();
+        self.has_conversation_selector(arguments.clone())
+            || (provider == Provider::Codex
+                && arguments
+                    .next()
+                    .and_then(|script| std::str::from_utf8(script).ok())
+                    .and_then(|script| Provider::from_script(Path::new(script)))
+                    == Some(provider)
+                && self.has_conversation_selector(arguments))
+    }
+
+    fn has_conversation_selector<'a>(&self, arguments: impl Iterator<Item = &'a [u8]>) -> bool {
+        use crate::agent::Provider;
+
+        let Some((provider, id)) = self.exact_identity else {
+            return false;
+        };
+        if provider == Provider::Codex {
+            return codex_resume_matches(arguments, id);
+        }
+        let mut arguments = arguments.peekable();
+        while let Some(argument) = arguments.next() {
+            let Ok(argument) = std::str::from_utf8(argument) else {
+                continue;
+            };
+            if argument == "--" {
+                break;
+            }
+            let (flag, inline) = argument
+                .split_once('=')
+                .map_or((argument, None), |(flag, value)| (flag, Some(value)));
+            if provider.is_value_option(flag) || provider.is_cwd_option(flag) {
+                if inline.is_none() {
+                    arguments.next_if(|value| *value != b"--");
+                }
+                continue;
+            }
+            let omp_file = provider == Provider::Omp && flag == "--session";
+            if provider.is_identity_option(flag) || omp_file {
+                let value = inline.or_else(|| {
+                    arguments
+                        .next_if(|value| !value.starts_with(b"-"))
+                        .and_then(|value| std::str::from_utf8(value).ok())
+                });
+                if value.is_some_and(|value| {
+                    uuid::Uuid::parse_str(value).ok() == Some(id)
+                        || (omp_file
+                            && provider
+                                .session_file_id(Path::new(value))
+                                .and_then(|locator| uuid::Uuid::parse_str(&locator).ok())
+                                == Some(id))
+                }) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn carries_marker<'a>(&self, mut entries: impl Iterator<Item = &'a [u8]>) -> bool {
         entries.any(|entry| self.markers.iter().any(|marker| entry == marker.as_bytes()))
     }
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid::Uuid) -> bool {
+    use crate::agent::Provider::Codex;
+
+    let is_option = |argument: &[u8]| argument.len() > 1 && argument.starts_with(b"-");
+    let matches_id = |argument: &[u8]| {
+        std::str::from_utf8(argument)
+            .ok()
+            .and_then(|value| uuid::Uuid::parse_str(value).ok())
+            == Some(id)
+    };
+    let mut arguments = arguments.peekable();
+    let mut exec = false;
+    let mut resuming = false;
+    let mut matched_id = false;
+    while let Some(argument) = arguments.next() {
+        if argument == b"--" {
+            // Clap treats tokens after the separator as positionals. They
+            // cannot introduce a subcommand or change how resume selects it.
+            return resuming && (matched_id || arguments.next().is_some_and(matches_id));
+        }
+        if is_option(argument) {
+            let flag = argument
+                .split(|byte| *byte == b'=')
+                .next()
+                .unwrap_or(argument);
+            if let Ok(flag) = std::str::from_utf8(flag) {
+                if resuming && Codex.is_latest_selector(flag) {
+                    return false;
+                }
+                // These observed CLI options are distinct from the subset
+                // supported in a replayable cagents launch recipe.
+                let image = matches!(flag, "--image" | "-i");
+                let takes_value = Codex.is_value_option(flag)
+                    || Codex.is_cwd_option(flag)
+                    || image
+                    || matches!(flag, "--local-provider" | "--enable" | "--disable")
+                    || (exec
+                        && matches!(
+                            flag,
+                            "--output-schema"
+                                | "--output-last-message"
+                                | "-o"
+                                | "--color"
+                                | "--thread-source"
+                                | "--cyber-access-program"
+                        ));
+                if takes_value && !argument.contains(&b'=') {
+                    arguments.next_if(|value| !is_option(value));
+                    // Only exec's resume subcommand uses a single image operand.
+                    if image && !(exec && resuming) {
+                        while arguments.next_if(|value| !is_option(value)).is_some() {}
+                    }
+                }
+            }
+            continue;
+        }
+        if resuming {
+            if !matched_id {
+                if !matches_id(argument) {
+                    return false;
+                }
+                matched_id = true;
+            }
+        } else if argument == Codex.resume_flag().as_bytes() {
+            resuming = true;
+        } else if !exec && matches!(argument, b"exec" | b"e") {
+            exec = true;
+        } else {
+            return false;
+        }
+    }
+    matched_id
 }
 
 /// A process shows no arguments for a moment while it execs or exits, which on a
@@ -591,19 +765,27 @@ impl<'a> Scan<'a> {
             }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
-        if self
-            .evidence
-            .names_conversation(argv.split(|byte| *byte == 0))
-        {
-            return Ok(Inspected::Survivor(survivor(
-                &path,
-                pid,
-                SurvivorLink::Conversation,
-                format!(
-                    "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
-                ),
-            )));
-        }
+        let arguments = argv.split(|byte| *byte == 0);
+        // Only selector candidates need an image lookup. Keep lookup failure
+        // separate so a known unit or lineage marker can still prove ownership.
+        let executable_error = if self.evidence.may_own_conversation(arguments.clone()) {
+            match fs::read_link(path.join("exe")) {
+                Ok(executable) if self.evidence.owns_conversation(&executable, arguments) => {
+                    return Ok(Inspected::Survivor(survivor(
+                        &path,
+                        pid,
+                        SurvivorLink::Conversation,
+                        format!(
+                            "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
+                        ),
+                    )));
+                }
+                Ok(_) => None,
+                Err(error) => Some(error),
+            }
+        } else {
+            None
+        };
         if let Some(unit) = self.unit {
             let cgroup = match fs::read_to_string(path.join("cgroup")) {
                 Ok(cgroup) => cgroup,
@@ -640,9 +822,19 @@ impl<'a> Scan<'a> {
         let environment = match fs::read(path.join("environ")) {
             Ok(environment) => environment,
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                // A leader may have exited while its threads still own the
+                // conversation. A vanished process entry is stronger evidence.
+                if let Some(error) = executable_error
+                    && !path.join("stat").try_exists().is_ok_and(|exists| !exists)
+                {
+                    return Err(process_error(error));
+                }
                 return Ok(Inspected::Unrelated);
             }
             Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                if let Some(error) = executable_error {
+                    return Err(process_error(error));
+                }
                 if self.in_user_manager(pid) || self.in_unmarked_session(pid) {
                     return Ok(Inspected::Unrelated);
                 }
@@ -692,6 +884,9 @@ impl<'a> Scan<'a> {
                     session.id
                 ),
             )));
+        }
+        if let Some(error) = executable_error {
+            return Err(process_error(error));
         }
         // Terminal branding and another terminal's marker can be inherited by
         // detached browsers and services. Neither proves ownership of this
@@ -4022,7 +4217,7 @@ mod tests {
         use std::os::unix::fs::{FileTypeExt, symlink};
 
         let directory = tempfile::tempdir().unwrap();
-        let mut source = checkpoint(directory.path()).terminals.remove(0).source;
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
         let process = directory.path().join("42");
         fs::create_dir_all(process.join("fd")).unwrap();
         // A double-forked crash handler need not be its own session leader.
@@ -4078,14 +4273,6 @@ mod tests {
         fs::remove_file(process.join("fd/0")).unwrap();
         assert!(ensure_no_surviving_process(&source, u32::MAX, directory.path()).is_err());
         symlink("/dev/null", process.join("fd/0")).unwrap();
-
-        // An exact conversation selector is stronger than helper evidence.
-        let id = "12345678-1234-4234-8234-123456789abc";
-        source.launch.program = "codex".into();
-        source.launch.arguments = vec!["resume".into(), id.into()];
-        fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
-        let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
-        assert!(error.contains("agent session still has a live process"));
     }
 
     /// A synthetic `/proc/<pid>/stat`. PIDs above `i32::MAX` keep the real
@@ -4131,6 +4318,189 @@ mod tests {
         fs::write(process.join("comm"), "fish\n").unwrap();
         fs::write(process.join("cmdline"), b"fish\0").unwrap();
         fs::write(process.join("environ"), environment).unwrap();
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn transcript_readers_are_not_conversation_survivors() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = checkpoint(directory.path()).terminals.remove(0).source;
+        let id = "12345678-1234-4234-8234-123456789abc";
+        source.launch.program = "claude".into();
+        source.launch.arguments = vec!["--resume".into(), id.into()];
+        let pid = u32::MAX - 1;
+        readable_process(directory.path(), pid, "S", "PATH=/bin\0", 100);
+        let process = directory.path().join(pid.to_string());
+        let scan = || {
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+                .unwrap()
+                .map(|found| found.link)
+        };
+
+        for (executable, argv, expected) in [
+            (
+                "/usr/bin/tail",
+                format!("tail\0-f\0/tmp/{id}.jsonl\0"),
+                None,
+            ),
+            (
+                "/usr/bin/watch",
+                format!("watch\0--exec\0cat\0/tmp/{id}.jsonl\0"),
+                None,
+            ),
+            ("/usr/bin/cat", format!("claude\0--resume\0{id}\0"), None),
+            ("/usr/bin/claude", format!("claude\0--model\0{id}\0"), None),
+            (
+                "/usr/bin/claude",
+                format!("claude\0--resume\0--\0--resume\0{id}\0"),
+                None,
+            ),
+            (
+                "/usr/bin/claude",
+                format!("claude\0--print\0--resume={id}\0"),
+                Some(SurvivorLink::Conversation),
+            ),
+            (
+                "/home/user/.local/share/claude/versions/2.1.317 (deleted)",
+                format!("claude\0--session-id\0{id}\0"),
+                Some(SurvivorLink::Conversation),
+            ),
+            (
+                "/usr/bin/node",
+                format!("node\0/pkg/@anthropic-ai/claude-code/cli.js\0-r\0{id}\0"),
+                Some(SurvivorLink::Conversation),
+            ),
+        ] {
+            symlink(executable, process.join("exe")).unwrap();
+            fs::write(process.join("cmdline"), &argv).unwrap();
+            assert_eq!(scan(), expected, "{executable} {argv:?}");
+            fs::remove_file(process.join("exe")).unwrap();
+        }
+
+        fs::write(process.join("cmdline"), format!("claude\0--resume\0{id}\0")).unwrap();
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Incomplete(_))
+        ));
+        fs::write(
+            process.join("environ"),
+            format!("CAGENTS_RECOVERY_ORIGIN={}\0", source.id),
+        )
+        .unwrap();
+        assert_eq!(scan(), Some(SurvivorLink::Lineage));
+        fs::write(
+            process.join("cmdline"),
+            format!("tail\0-f\0/tmp/{id}.jsonl\0"),
+        )
+        .unwrap();
+        assert_eq!(scan(), Some(SurvivorLink::Lineage));
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn codex_survivors_require_an_exact_resume_positional() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = checkpoint(directory.path()).terminals.remove(0).source;
+        let id = "12345678-1234-4234-8234-123456789abc";
+        let other = "12345678-1234-4234-8234-123456789def";
+        source.launch.program = "codex".into();
+        source.launch.arguments = vec!["resume".into(), id.into()];
+        let pid = u32::MAX - 1;
+        readable_process(directory.path(), pid, "S", "PATH=/bin\0", 100);
+        let process = directory.path().join(pid.to_string());
+        for (executable, arguments, owns) in [
+            ("/usr/bin/codex", vec!["resume", id], true),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "--config",
+                    "key=value",
+                    "resume",
+                    "--model",
+                    "MODEL",
+                    id,
+                    "continue",
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/codex-x86_64-unknown-linux-musl",
+                vec!["resume", "--model=MODEL", id],
+                true,
+            ),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "resume", "--image", "one.png", "two.png", "--model", "MODEL", id,
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/codex",
+                vec!["resume", "--image=one.png", id],
+                true,
+            ),
+            ("/usr/bin/codex", vec!["resume", "--", id], true),
+            ("/usr/bin/codex", vec!["resume", id, "--", "--last"], true),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "e",
+                    "resume",
+                    "--model",
+                    "MODEL",
+                    "--image",
+                    "prompt.png",
+                    id,
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/node",
+                vec!["/pkg/codex.js", "resume", "-m", "MODEL", id],
+                true,
+            ),
+            ("/usr/bin/cat", vec!["resume", id], false),
+            ("/usr/bin/codex-app-server", vec!["resume", id], false),
+            ("/usr/bin/codex", vec!["app-server", "resume", id], false),
+            ("/usr/bin/codex", vec!["--", "resume", id], false),
+            ("/usr/bin/codex", vec!["exec", "--", "resume", id], false),
+            ("/usr/bin/codex", vec!["--model", "resume", id], false),
+            ("/usr/bin/codex", vec!["resume", "--model", id], false),
+            (
+                "/usr/bin/codex",
+                vec!["resume", "--image", "one.png", id, "--model", "MODEL"],
+                false,
+            ),
+            ("/usr/bin/codex", vec!["resume", other, id], false),
+            ("/usr/bin/codex", vec!["resume", "--last", id], false),
+            ("/usr/bin/codex", vec!["resume", id, "--last"], false),
+            (
+                "/usr/bin/codex",
+                vec!["exec", "resume", "--last", id],
+                false,
+            ),
+        ] {
+            symlink(executable, process.join("exe")).unwrap();
+            let mut argv = String::from("codex\0");
+            for argument in arguments {
+                argv.push_str(argument);
+                argv.push('\0');
+            }
+            fs::write(process.join("cmdline"), &argv).unwrap();
+            assert_eq!(
+                surviving_process(&source, u32::MAX, directory.path(), &[])
+                    .unwrap()
+                    .map(|found| found.link),
+                owns.then_some(SurvivorLink::Conversation),
+                "{executable} {argv:?}"
+            );
+            fs::remove_file(process.join("exe")).unwrap();
+        }
     }
 
     /// #2365: an unreadable process can't be ruled out, but the refusal names
