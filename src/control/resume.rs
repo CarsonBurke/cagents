@@ -78,7 +78,12 @@ pub(super) fn resume(arguments: ResumeArgs) -> Result<CommandOutput, AppError> {
             continue;
         }
         results.push(match request(Operation::Resume(session.clone())) {
-            Ok(Reply::Resumed(resumed)) => Outcome::Resumed(resumed),
+            Ok(Reply::Resumed(mut resumed)) => {
+                if let Some(note) = &mut resumed.note {
+                    format::qualify_diagnostic(note);
+                }
+                Outcome::Resumed(resumed)
+            }
             Ok(_) => Outcome::Failed {
                 session,
                 reason: "Unexpected reply from the daemon".into(),

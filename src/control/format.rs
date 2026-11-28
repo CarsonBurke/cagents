@@ -291,19 +291,23 @@ fn daemon_hint_start(message: &str) -> Option<usize> {
         return Some(start);
     }
 
-    let (reason, tail) = message.rsplit_once(" with `cagents resume ")?;
+    let (reason, tail) = message.rsplit_once("`cagents resume ")?;
     let (session, rest) = tail.split_once('`')?;
     session.parse::<crate::model::TerminalId>().ok()?;
     let is_recovery = match rest {
         ", or message another session from `cagents sessions --all`" => {
-            reason.ends_with(". Resume its conversation first")
+            reason.ends_with(". Resume its conversation first with ")
         }
         "; message another session from `cagents sessions --all` meanwhile" => {
-            reason.ends_with(". The person can resume its conversation")
+            reason.ends_with(". The person can resume its conversation with ")
         }
         "" => reason.ends_with(
-            "The daemon restarted since its provider last ran, so it cannot tell whether that process still writes the conversation. Once it has ended, resume it",
+            "The daemon restarted since its provider last ran, so it cannot tell whether that process still writes the conversation. Once it has ended, resume it with ",
         ),
+        " to reopen the conversation and its terminal before sending a prompt" => {
+            reason == "Run " || reason.ends_with("Cannot reopen the agent's conversation: Run ")
+        }
+        " again to restore the paired terminal" => reason.ends_with(". Run "),
         _ => false,
     };
     is_recovery.then_some(reason.len())
@@ -414,12 +418,22 @@ mod tests {
         for message in [
             before.clone(),
             format!("Not sent: Earlier message: {before}. Send this once it has"),
+            format!(
+                "Cannot reopen the agent's conversation: Run `cagents resume {session}` to reopen the conversation and its terminal before sending a prompt"
+            ),
         ] {
             assert_eq!(
                 qualify(&message),
                 message.replace("`cagents resume", "`cagents --device=-desk resume")
             );
         }
+        let earlier = "The provider mentioned `cagents resume`.";
+        let retry = "again to restore the paired terminal";
+        let before = format!("{earlier} Run `cagents resume {session}` {retry}");
+        assert_eq!(
+            qualify(&before),
+            format!("{earlier} Run `cagents --device=-desk resume {session}` {retry}")
+        );
         let before = "No session or agent matches `cagents sessions --all`; list them with `cagents sessions --all`";
         assert_eq!(
             qualify(before),
