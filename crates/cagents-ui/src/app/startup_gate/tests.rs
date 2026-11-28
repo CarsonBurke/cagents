@@ -743,12 +743,11 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     assert_eq!(app.recheck_startup(check).units(), 0);
     assert!(answer.try_recv().unwrap().starts_with("error: "));
     let card = cards[0];
-    let CardKind::Terminal(terminal) = &app.card_state(card).unwrap().kind else {
-        panic!("the saved terminal changed kind");
-    };
-    let pane_failure = "the saved terminal holder did not answer";
-    app.startup_attach_failed(card, terminal.id, pane_failure.into());
     app.startup_gate.retries.expire_window();
+    let pane_failure = app
+        .startup_terminal_latest(card)
+        .expect("the first startup scan recorded this pane's wait")
+        .to_owned();
     assert!(app.startup_terminal_gave_up(card));
     assert_eq!(app.startup_gave_up_caption(card), RETAINED_TERMINAL_CAPTION);
 
@@ -765,7 +764,7 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     app.finish_startup_recheck(check, settings, saved);
     let report = answer.try_recv().unwrap();
     assert!(report.starts_with("ready-with-pane-notes: "), "{report}");
-    assert!(report.contains(pane_failure), "{report}");
+    assert!(report.contains(&pane_failure), "{report}");
     let pane_note = app.status.take().unwrap();
     app.notices.record(pane_note.clone());
     assert!(app.card_state(card).is_some());
@@ -784,7 +783,7 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     assert!(app.startup_terminal_gave_up(card));
     assert_eq!(
         app.startup_gave_up_caption(card),
-        unavailable_terminal_caption(Some(pane_failure))
+        unavailable_terminal_caption(Some(&pane_failure))
     );
     assert!(app.notices.recent().any(|entry| entry.notice == pane_note));
     assert!(
