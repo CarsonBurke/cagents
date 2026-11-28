@@ -468,14 +468,14 @@ enum HistoryPart {
     Gap(f32),
 }
 
-enum TurnRow<'a> {
+enum TurnRow {
     Part {
         part: Option<TurnPart>,
         descriptor: virtualized::Descriptor,
         rhythm: Option<Rhythm>,
         footer: f32,
     },
-    Notice(&'a failure::Incident),
+    Notice(usize),
     Alias(iced::advanced::widget::Id),
 }
 
@@ -486,7 +486,7 @@ struct HistoryKey {
     turns: revised::Stamp,
     expanded: revised::Stamp,
     failures: (u64, revised::Stamp, revised::Stamp),
-    cards: Vec<(usize, bool)>,
+    cards: Vec<Option<bool>>,
     width: u32,
     previous: Option<Rhythm>,
     footer: u32,
@@ -3349,8 +3349,8 @@ impl Runtime {
                     let steps_shown = self.steps_shown(turn);
                     let notices = self.placed_turn_notices(turn);
                     let select_notices = |builder: &mut selection::DocumentBuilder, rows| {
-                        for (_, incident) in notices.iter().filter(|(before, _)| *before == rows) {
-                            self.selection_failure(builder, incident);
+                        for &(_, index) in notices.iter().filter(|(before, _)| *before == rows) {
+                            self.selection_failure(builder, &self.failure_ui.incidents[index]);
                         }
                     };
                     select_notices(&mut builder, 0);
@@ -6497,13 +6497,12 @@ impl Runtime {
         let incidents = &self.failure_ui.incidents;
         let cards = incidents
             .iter()
-            .enumerate()
-            .filter(|(_, incident)| {
-                !incident.active_recovery
+            .map(|incident| {
+                (!incident.active_recovery
                     && incident.child_scope.is_none()
-                    && incident.anchor.is_some()
+                    && incident.anchor.is_some())
+                .then(|| self.failure_notice_is_card(incident, reset_controls))
             })
-            .map(|(index, incident)| (index, self.failure_notice_is_card(incident, reset_controls)))
             .collect();
         let key = HistoryKey {
             target: self.target,
@@ -6558,12 +6557,10 @@ impl Runtime {
                                 footer,
                             )
                         }
-                        TurnRow::Notice(incident) => {
-                            let &(index, card) = key
-                                .cards
-                                .iter()
-                                .find(|&&(index, _)| std::ptr::eq(&incidents[index], incident))
-                                .expect("a placed notice has a recorded layout");
+                        TurnRow::Notice(index) => {
+                            let incident = &incidents[index];
+                            let card =
+                                key.cards[index].expect("a placed notice has a recorded layout");
                             let anchor = self.find_anchor(&format!("failure:{}", incident.key));
                             let (descriptor, rhythm) =
                                 self.notice_descriptor(incident, card, anchor);
@@ -6675,12 +6672,16 @@ impl Runtime {
     fn turn_notices<'s>(
         &'s self,
         turn: &'s turn::Turn,
-    ) -> impl Iterator<Item = &'s failure::Incident> + 's {
-        self.failure_ui.incidents.iter().filter(move |incident| {
-            !incident.active_recovery
-                && incident.child_scope.is_none()
-                && incident.anchor.as_ref() == Some(&turn.key)
-        })
+    ) -> impl Iterator<Item = (usize, &'s failure::Incident)> + 's {
+        self.failure_ui
+            .incidents
+            .iter()
+            .enumerate()
+            .filter(move |(_, incident)| {
+                !incident.active_recovery
+                    && incident.child_scope.is_none()
+                    && incident.anchor.as_ref() == Some(&turn.key)
+            })
     }
 
     /// Every item a row of `turn` draws, with its slot, in drawing order.
@@ -6760,10 +6761,7 @@ impl Runtime {
     /// it: those up to the last, in drawing order, that holds an item at or
     /// before the notice's own. A notice with no item of its own follows
     /// them all.
-    pub(super) fn placed_turn_notices<'s>(
-        &'s self,
-        turn: &'s turn::Turn,
-    ) -> Vec<(usize, &'s failure::Incident)> {
+    pub(super) fn placed_turn_notices(&self, turn: &turn::Turn) -> Vec<(usize, usize)> {
         let mut notices = self.turn_notices(turn).peekable();
         if notices.peek().is_none() {
             return Vec::new();
@@ -6775,7 +6773,7 @@ impl Runtime {
             }
         });
         notices
-            .map(|incident| (notice_rows_before(&firsts, incident.at), incident))
+            .map(|(index, incident)| (notice_rows_before(&firsts, incident.at), index))
             .collect()
     }
 
@@ -6844,12 +6842,12 @@ impl Runtime {
             .into()
     }
 
-    fn describe_turn_rows<'a>(
-        &'a self,
-        turn: &'a turn::Turn,
+    fn describe_turn_rows(
+        &self,
+        turn: &turn::Turn,
         content_width: f32,
         notices: bool,
-        mut emit: impl FnMut(TurnRow<'a>),
+        mut emit: impl FnMut(TurnRow),
     ) {
         use std::hash::{Hash, Hasher};
         let placed = if notices {
@@ -6857,9 +6855,9 @@ impl Runtime {
         } else {
             Vec::new()
         };
-        let push_notices = |emit: &mut dyn FnMut(TurnRow<'a>), before: usize| {
-            for (_, incident) in placed.iter().filter(|(rows, _)| *rows == before) {
-                emit(TurnRow::Notice(incident));
+        let push_notices = |emit: &mut dyn FnMut(TurnRow), before: usize| {
+            for &(_, index) in placed.iter().filter(|(rows, _)| *rows == before) {
+                emit(TurnRow::Notice(index));
             }
         };
         let items = &self.snapshot.items;

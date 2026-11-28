@@ -1264,6 +1264,86 @@ mod tests {
     }
 
     #[test]
+    fn retained_and_owned_rows_agree_on_the_first_scroll_while_preparing() {
+        let renderer = crate::app::tests::headless_renderer();
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let mut viewport = Viewport {
+            top: 0.0,
+            height: 720.0,
+            bottom: true,
+        };
+        let estimate = |index| 64.0 + (index % 7) as f32 * 32.0;
+        let mut owned_tree = None;
+        let mut retained_tree = None;
+        let mut rows: Rc<[Descriptor]> = (0..128)
+            .map(|index| Descriptor::new(index as u64 + 1, 0, estimate(index), None))
+            .collect();
+        for pass in 0..4 {
+            if pass == 1 {
+                let mut changed = rows.to_vec();
+                changed[125].estimate += 96.0;
+                rows = changed.into();
+            }
+            let revision = move |index| u64::from(pass >= 2 && matches!(index, 122 | 125 | 127));
+            let display = move |index, revision| {
+                let height = estimate(index) + if revision == 1 { 96.0 } else { 0.0 };
+                widget::Space::new().height(height).into()
+            };
+            let window = Rc::new(Cell::new(Some(viewport)));
+            let mut owned = column(
+                rows.iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        let revision = revision(index);
+                        Row::new(row.key, revision, row.estimate, None, move || {
+                            display(index, revision)
+                        })
+                    })
+                    .collect(),
+                window.clone(),
+            );
+            let mut retained = column_with_body(
+                vec![],
+                Some(Body {
+                    start: 0,
+                    rows: rows.clone(),
+                    revision: Box::new(revision),
+                    build: Box::new(display),
+                }),
+                window,
+            );
+            let owned_tree = owned_tree.get_or_insert_with(|| Tree::new(&owned));
+            let retained_tree = retained_tree.get_or_insert_with(|| Tree::new(&retained));
+            owned_tree.diff(owned.as_widget_mut());
+            retained_tree.diff(retained.as_widget_mut());
+            let owned = owned.as_widget_mut().layout(owned_tree, &renderer, &limits);
+            let retained = retained
+                .as_widget_mut()
+                .layout(retained_tree, &renderer, &limits);
+            let original = owned_tree.state.downcast_ref::<State>();
+            let cached = retained_tree.state.downcast_ref::<State>();
+            assert_eq!(
+                cached.offsets.values, original.offsets.values,
+                "pass {pass}"
+            );
+            assert_eq!(cached.mounted, original.mounted, "pass {pass}");
+            assert_eq!(retained.size(), owned.size(), "pass {pass}");
+            assert!(
+                retained
+                    .children()
+                    .iter()
+                    .map(layout::Node::bounds)
+                    .eq(owned.children().iter().map(layout::Node::bounds)),
+                "mounted row bounds on pass {pass}"
+            );
+            if pass == 1 {
+                viewport.bottom = false;
+                viewport.top = owned.size().height - viewport.height - 160.0;
+            }
+        }
+    }
+
+    #[test]
     fn measured_shrink_keeps_mounted_flow_until_parent_refresh_and_offscreen_evicts() {
         use std::cell::RefCell;
 
