@@ -2492,18 +2492,18 @@ impl UiUpdateGuard {
         executable: &Path,
     ) -> io::Result<Option<String>> {
         let running = running_window_slots(&self.runtime)?;
-        let mut missing = Vec::new();
-        for slot in slots {
-            if running.contains(slot) {
-                continue;
+        self.relaunch_selected_windows(slots, executable, |guard, slot| {
+            if running.iter().any(|running| running == slot) {
+                return Ok(false);
             }
             #[cfg(target_os = "linux")]
-            if self.reconnecting_slot(slot, executable)? {
-                continue;
+            if guard.reconnecting_slot(slot, executable)? {
+                return Ok(false);
             }
-            missing.push(slot.clone());
-        }
-        self.relaunch_windows_with_notes(&missing, executable)
+            #[cfg(not(target_os = "linux"))]
+            let _ = guard;
+            Ok(true)
+        })
     }
 
     #[cfg(target_os = "linux")]
@@ -2572,16 +2572,35 @@ impl UiUpdateGuard {
     }
 
     fn relaunch_windows_with_notes(
-        mut self,
+        self,
         slots: &[String],
         executable: &Path,
     ) -> io::Result<Option<String>> {
+        self.relaunch_selected_windows(slots, executable, |_, _| Ok(true))
+    }
+
+    fn relaunch_selected_windows(
+        mut self,
+        slots: &[String],
+        executable: &Path,
+        should_launch: impl Fn(&Self, &str) -> io::Result<bool>,
+    ) -> io::Result<Option<String>> {
+        let mut planned = Vec::new();
+        let mut errors = Vec::new();
+        for slot in slots {
+            match should_launch(&self, slot) {
+                Ok(true) => planned.push(slot),
+                Ok(false) => (),
+                Err(error) => errors.push((slot.clone(), error.to_string())),
+            }
+        }
+        let assessed = planned.len() + errors.len();
         self.prepared.clear();
         self.release_launch_fence()?;
         self.closed.clear();
         let mut notes = Vec::new();
         let mut failures = Vec::new();
-        for slot in slots {
+        for slot in planned {
             match launch_window_at(executable, false, Some(slot), None, self.restore_policy) {
                 Ok(Some(note)) => notes.push((slot.clone(), note)),
                 Ok(None) => {}
@@ -2589,7 +2608,7 @@ impl UiUpdateGuard {
             }
         }
         let devices = || crate::device::list().unwrap_or_default();
-        let (errors, device_notes) = split_relaunch_failures(failures, |slot| {
+        let (launch_errors, device_notes) = split_relaunch_failures(failures, |slot| {
             window_device_identity(&self.runtime, slot, &devices())
                 .ok()
                 .flatten()
@@ -2598,6 +2617,7 @@ impl UiUpdateGuard {
                 // that shows nothing may be this build's fault.
                 .filter(|_| device_reconnect_shown(slot))
         });
+        errors.extend(launch_errors);
         notes.extend(device_notes);
         let errors: Vec<_> = errors
             .iter()
@@ -2607,11 +2627,11 @@ impl UiUpdateGuard {
             .iter()
             .map(|(window, note)| (window.as_str(), note.clone()))
             .collect();
-        let notes = (!notes.is_empty()).then(|| relaunch_failure(slots.len(), &notes));
+        let notes = (!notes.is_empty()).then(|| relaunch_failure(assessed, &notes));
         if errors.is_empty() {
             Ok(notes)
         } else {
-            let mut error = relaunch_failure(slots.len(), &errors);
+            let mut error = relaunch_failure(assessed, &errors);
             if let Some(notes) = notes {
                 error.push('\n');
                 error.push_str(&notes);
@@ -5179,6 +5199,24 @@ mod tests {
                     .lines()
                     .any(|arg| arg == RESTORE_EXISTING_ONLY_ARGUMENT)
             );
+
+            #[cfg(target_os = "linux")]
+            {
+                let broken = crate::device::scoped_window_slot("unavailable", PRIMARY_WINDOW);
+                let lock = device_reconnect_lock_path(&broken).unwrap();
+                fs::create_dir(&lock).unwrap();
+                fs::remove_file(&arguments).unwrap();
+                let mut guard = UiUpdateGuard::acquire().unwrap();
+                guard.set_recovery_restore_only();
+                let failure = guard
+                    .relaunch_missing_windows(&[broken.clone(), PRIMARY_WINDOW.into()], &executable)
+                    .unwrap_err();
+                assert!(failure.to_string().contains(&broken));
+                let arguments = fs::read_to_string(&arguments).unwrap();
+                assert!(arguments.contains("--window\nprimary\n"));
+                assert!(arguments.contains(RESTORE_EXISTING_ONLY_ARGUMENT));
+                assert!(lock.is_dir(), "failed ownership evidence must be preserved");
+            }
 
             // A later ordinary launch from this same process has no recovery
             // argv or environment policy to inherit.
