@@ -192,6 +192,7 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
         kept_chat_drafts: HashMap::new(),
         returned_chat_queues: Default::default(),
         stopping_chats: Vec::new(),
+        pending_chat_pane_removals: Default::default(),
         agent_updates: BTreeMap::new(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),

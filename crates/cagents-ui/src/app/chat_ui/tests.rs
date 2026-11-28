@@ -13471,7 +13471,7 @@ fn a_pane_a_view_brings_back_after_its_stop_goes_once_it_is_placed() {
         app.card_state(card).map(|state| state.existence.is_open()),
         app.workspace.order().any(|placed| placed == card),
         app.cards.contains_key(&card),
-        app.chat_ui.stopped_returns,
+        app.chat_ui.returns_to_remove,
         app.status,
         app.shared_views.pending,
     );

@@ -161,8 +161,8 @@ impl Cagents {
         if project.kind == ProjectKind::Folder || (main == root && !separate) {
             return Some((project.id, None));
         }
-        // A checkout the daemon would refuse, such as one removed since the
-        // rows were listed, is offered as listed and refused there.
+        // Retain the row's spelling if its checkout cannot be resolved.
+        // Opening it still requires protection for that directory.
         let repository = if crate::device::is_remote() {
             project.repository.clone()
         } else {

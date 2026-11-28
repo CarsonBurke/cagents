@@ -425,6 +425,15 @@ impl Cagents {
             CardKind::Chat(canonical) if listed => self.shared_chat_close(pane.id, canonical),
             _ => None,
         };
+        let mut presentation = if listed
+            && let Some(source) = self.durable.pending_chat_pane_removals.get(&pane.id)
+            && !matches!(&pane.kind, CardKind::Chat(canonical)
+                if background_close::returned_pane_source_matches(source, canonical))
+        {
+            self.release_reused_pane_removal(pane.id)
+        } else {
+            Task::none()
+        };
         if resolve_upgrade
             && close.is_none()
             && let CardKind::Chat(canonical) = &pane.kind
@@ -440,7 +449,10 @@ impl Cagents {
                 card.kind = pane.kind.clone();
             }
             return (
-                self.start_shared_chat_upgrade(pane.id, source, canonical.clone()),
+                Task::batch([
+                    presentation,
+                    self.start_shared_chat_upgrade(pane.id, source, canonical.clone()),
+                ]),
                 None,
             );
         }
@@ -448,7 +460,6 @@ impl Cagents {
             .pending_chat_admissions
             .remove(&pane.id);
         let mut saved_copy = None;
-        let mut presentation = Task::none();
         // Card IDs are presentation identity, not proof that a replacement
         // conversation owns the old draft. Keep an incompatible source beside
         // the current pane, with its original descriptor and content intact.
@@ -494,7 +505,10 @@ impl Cagents {
             self.set_presence(retained, self.exposure(pane.id), Residency::Hot);
             self.retain_local_pane(retained);
             self.cards.insert(retained, CardRuntime::Chat(runtime));
-            presentation = self.checkpoint_retained_chat_copy(pane.id, retained);
+            presentation = Task::batch([
+                presentation,
+                self.checkpoint_retained_chat_copy(pane.id, retained),
+            ]);
             saved_copy = Some(retained);
             let position = self.workspace.order().position(|id| id == pane.id);
             if let Some(index) = position {
@@ -535,10 +549,15 @@ impl Cagents {
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();
         }
-        if !resolve_upgrade && !matches!(close, Some(background_close::SharedChatClose::Stopped)) {
+        if !resolve_upgrade
+            && !matches!(
+                close,
+                Some(background_close::SharedChatClose::RemoveReturned)
+            )
+        {
             // Failed exact lineage is not permission to restart either actor.
             // Keep the source copy inert and leave the canonical pane's retry
-            // explicit. Only a completed stop can take the pane away here.
+            // explicit. A returned pane already due to close can still go.
             let kept_here = self
                 .chat_ui
                 .drafts
