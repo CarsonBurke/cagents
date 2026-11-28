@@ -3163,6 +3163,12 @@ impl ClientHandle {
                         continue;
                     }
                     let mut failure = start_failure(error);
+                    if intent == Intent::Start && failure.recovery == super::Recovery::UpdateStopped
+                    {
+                        // This was already an explicit start of the saved
+                        // conversation. The same action cannot recover it.
+                        failure.recovery = super::Recovery::Blocked;
+                    }
                     if intent == Intent::RestoreExisting && !failure.recovery.is_blocked() {
                         // An ordinary recovery attachment cannot enter the
                         // account-recovery path, whose callback starts a

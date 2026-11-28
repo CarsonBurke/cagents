@@ -1800,6 +1800,13 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         track(id);
         ids.insert(thread, id);
     }
+    let pane_session = host.lock().unwrap().chats[&ids[stalled]].current_session();
+    assert_eq!(pane_session.proof.as_ref(), Some(&proof));
+    assert_eq!(pane_session.launch.session_id.as_deref(), Some(stalled));
+    assert_eq!(
+        pane_session.native_continuity,
+        NativeContinuity::ReconnectOnly
+    );
     use crate::update::impact::Disposition;
     verify_agent_run_warning(&host, &root, ids[retained], Disposition::Continues, &[]);
     let (agent, queued) = verify_agent_run_warning(
@@ -1990,22 +1997,42 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         );
     }
 
-    // Reopening a stopped conversation starts it again, and it no longer
-    // needs attention.
+    // Use the framed client that the pane uses. Its ordinary restore only
+    // attaches, and Reopen sends an explicit Start with the saved descriptor.
+    let connect = |session, intent| {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let host = updated.clone();
+        let serving =
+            thread::spawn(move || super::super::client::serve_fixture_user(peer, 1, host));
+        let result =
+            crate::chat::client::ClientHandle::fixture_connect(stream, session, intent, None);
+        (result, serving)
+    };
     fs::remove_file(root.join(format!("stall-{stalled}"))).unwrap();
-    let mut reopen = saved(stalled).source;
-    reopen.proof = None;
-    super::super::client::process_request(
-        &updated,
-        0,
-        crate::terminal::ipc::ClientRequest::ChatStart {
-            session: reopen,
-            source: None,
-            terminate_source: false,
-            execution_environment: Default::default(),
-        },
-    )
-    .unwrap();
+    let (restored, serving) = connect(pane_session.clone(), crate::chat::Intent::RestoreExisting);
+    let refused_restore = restored.err().expect("the update stopped this pane");
+    assert_eq!(
+        refused_restore.recovery,
+        crate::chat::Recovery::UpdateStopped
+    );
+    serving.join().unwrap();
+
+    // A stale Codex pane can still claim durable continuity and match its
+    // stopped identity. The durable path must refuse to start another owner.
+    let mut durable_alias = pane_session.clone();
+    durable_alias.native_continuity = saved(retained).source.native_continuity;
+    assert!(durable_alias.native_continuity.retains_provider());
+    assert!(durable_alias.has_valid_native_continuity());
+    let (stale, serving) = connect(durable_alias, crate::chat::Intent::Start);
+    let refused_start = stale.err().expect("a durable start must not relaunch");
+    assert_eq!(refused_start.recovery, crate::chat::Recovery::Blocked);
+    assert_eq!(refused_start.message, refused_restore.message);
+    serving.join().unwrap();
+    assert!(!updated.lock().unwrap().chats.contains_key(&ids[stalled]));
+    assert_eq!(store().unattached().unwrap().len(), 2);
+
+    let (reopened, serving) = connect(pane_session, crate::chat::Intent::Start);
+    let reopened = reopened.unwrap();
     let handle = updated.lock().unwrap().chats[&ids[stalled]].handle.clone();
     track(ids[stalled]);
     wait_until(
@@ -2015,6 +2042,10 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     let unattached = store().unattached().unwrap();
     assert_eq!(unattached.len(), 1);
     assert_eq!(unattached[0].id, ids[refused]);
+    assert_eq!(reopened.session().id, ids[stalled]);
+    reopened.close().unwrap();
+    drop(reopened);
+    serving.join().unwrap();
 
     // The restored ones are attached as their panes would attach them.
     for thread in [retained, restarted] {
@@ -2038,7 +2069,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         )
         .unwrap();
     }
-    for thread in [retained, restarted, stalled] {
+    for thread in [retained, restarted] {
         assert!(matches!(
             super::super::client::process_request(
                 &updated,
