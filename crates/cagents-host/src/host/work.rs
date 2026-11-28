@@ -27,7 +27,10 @@ mod transcript;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
     path::{Path, PathBuf},
-    sync::{Arc, Condvar, Mutex, MutexGuard, Weak},
+    sync::{
+        Arc, Condvar, Mutex, MutexGuard, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
     thread::JoinHandle,
     time::{Duration, Instant},
 };
@@ -35,6 +38,7 @@ use std::{
 use super::{
     agent_execution,
     delivery::{DeliveryQueue, Outbound},
+    file_revision::FileRevision,
     state::{ClientId, HostLock, SharedHost},
 };
 use crate::{
@@ -73,7 +77,8 @@ const LIVE_SESSION: Duration = Duration::from_secs(2 * SESSION_SAMPLE.as_secs())
 const LIVE_EDIT: Duration = Duration::from_secs(2 * IDLE_POLL.as_secs());
 /// How often an agent's work in one worktree is written down.
 const SESSION_STAMP: Duration = Duration::from_secs(60);
-const MODEL_REFRESH: Duration = Duration::from_secs(30);
+const PROJECT_RETRY: Duration = Duration::from_secs(30);
+const SETTINGS_REFRESH: Duration = Duration::from_secs(30);
 /// A project counts as being read for this long after a request, or after a
 /// watched conversation last needed its facts.
 const READ_WINDOW: Duration = Duration::from_secs(120);
@@ -828,6 +833,7 @@ struct Inner {
     /// Signalled whenever a scan or poll completes; requests wait on it.
     updated: Condvar,
     scanner: Signal,
+    project_generation: AtomicU64,
     forge: Signal,
     /// Wakes the publisher when the board may have changed.
     publisher: Signal,
@@ -866,6 +872,7 @@ impl Service {
                 tracing::warn!(%error, "Work board pins and session history will not persist");
             })
             .ok();
+        let mut preference = StalePreference::default();
         let mut shared = Shared {
             projects: BTreeMap::new(),
             listings: forge::Listings::default(),
@@ -874,7 +881,7 @@ impl Service {
             in_use: Arc::default(),
             tickets: BTreeMap::new(),
             linear_unavailable: None,
-            stale_after_days: stale_after_days(),
+            stale_after_days: preference.read(crate::instance::settings_path().as_deref()),
             board_read_at: None,
             watching: false,
             restored: BTreeMap::new(),
@@ -901,6 +908,7 @@ impl Service {
             shared: Mutex::new(shared),
             updated: Condvar::new(),
             scanner: Signal::default(),
+            project_generation: AtomicU64::new(1),
             forge: Signal::default(),
             publisher: Signal::default(),
             publication: Mutex::new(Publication::default()),
@@ -917,7 +925,7 @@ impl Service {
         service.threads.push(
             std::thread::Builder::new()
                 .name("work-scanner".into())
-                .spawn(move || scanner.scan_loop())
+                .spawn(move || scanner.scan_loop(preference))
                 .map_err(|error| error.to_string())?,
         );
         let forge = handle.clone();
@@ -980,6 +988,7 @@ impl Handle {
             }),
             updated: Condvar::new(),
             scanner: Signal::default(),
+            project_generation: AtomicU64::new(1),
             forge: Signal::default(),
             publisher: Signal::default(),
             publication: Mutex::new(Publication::default()),
@@ -1005,14 +1014,52 @@ impl Drop for Service {
     }
 }
 
-fn stale_after_days() -> u16 {
-    let Some(path) = crate::instance::settings_path() else {
-        return crate::work::DEFAULT_STALE_AFTER_DAYS;
-    };
-    crate::work::stale_after_days(&path).unwrap_or_else(|error| {
-        tracing::warn!(%error, "the Work board's stale window falls back to its default");
-        crate::work::DEFAULT_STALE_AFTER_DAYS
-    })
+#[derive(Default)]
+struct StalePreference {
+    cached: Option<(FileRevision, u16)>,
+}
+
+impl StalePreference {
+    fn read(&mut self, path: Option<&Path>) -> u16 {
+        let Some(path) = path else {
+            return crate::work::DEFAULT_STALE_AFTER_DAYS;
+        };
+        let revision = match std::fs::metadata(path) {
+            Ok(metadata) => FileRevision::of(&metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.cached = None;
+                return crate::work::DEFAULT_STALE_AFTER_DAYS;
+            }
+            Err(_) => None,
+        };
+        if let Some((cached, days)) = self.cached
+            && Some(cached) == revision
+        {
+            return days;
+        }
+        self.cached = None;
+        match crate::work::stale_after_days(path) {
+            Ok(days) => {
+                // The settings writer replaces the file, so qualify the read
+                // with the version both before and after it.
+                if let Some(revision) = revision
+                    && git_watch::supports_file_revisions(path)
+                    && std::fs::metadata(path)
+                        .ok()
+                        .as_ref()
+                        .and_then(FileRevision::of)
+                        == Some(revision)
+                {
+                    self.cached = Some((revision, days));
+                }
+                days
+            }
+            Err(error) => {
+                tracing::warn!(%error, "the Work board's stale window falls back to its default");
+                crate::work::DEFAULT_STALE_AFTER_DAYS
+            }
+        }
+    }
 }
 
 fn now_unix_ms() -> u64 {
@@ -1065,6 +1112,8 @@ fn git_project(project: ModelProject) -> Option<(PathBuf, String)> {
     (project.kind == ProjectKind::Git).then_some((project.repository, project.name))
 }
 
+type SelectedProjects = Vec<(PathBuf, String)>;
+
 /// Live sessions with their directories canonicalized, so a session started
 /// through a symlink still lands on its worktree.
 fn live_sessions(host: &SharedHost) -> Vec<board::LiveSession> {
@@ -1081,6 +1130,16 @@ fn live_sessions(host: &SharedHost) -> Vec<board::LiveSession> {
 }
 
 impl Handle {
+    /// A committed workspace edit changed the project rows the scanner uses.
+    pub(super) fn projects_changed(&self) {
+        self.0.project_generation.fetch_add(1, Ordering::Release);
+        self.0.scanner.notify();
+    }
+
+    fn project_generation(&self) -> u64 {
+        self.0.project_generation.load(Ordering::Acquire)
+    }
+
     fn shared(&self) -> MutexGuard<'_, Shared> {
         self.0.shared.lock().unwrap_or_else(|p| p.into_inner())
     }
@@ -1126,7 +1185,7 @@ impl Handle {
     }
 
     /// The repositories `scope` covers, read from the open project rows.
-    fn resolve(&self, host: &SharedHost, scope: &Scope) -> Result<Vec<(PathBuf, String)>, String> {
+    fn resolve(&self, host: &SharedHost, scope: &Scope) -> Result<SelectedProjects, String> {
         let projects = open_projects(host)?;
         let path = match scope {
             Scope::All => return Ok(projects.into_iter().filter_map(git_project).collect()),
@@ -1151,22 +1210,44 @@ impl Handle {
         Ok(vec![(project.repository, project.name)])
     }
 
+    /// A request must not restore a closed project or an old project name
+    /// after the scanner consumes its edit. Resolve outside the shared lock,
+    /// then keep it from validation to the update. A later edit's scanner
+    /// pass has to acquire the same lock after the update.
+    fn trackable_projects(
+        &self,
+        mut resolve: impl FnMut() -> Result<SelectedProjects, String>,
+    ) -> Result<(SelectedProjects, MutexGuard<'_, Shared>), String> {
+        loop {
+            let before = self.project_generation();
+            let selected = resolve();
+            let shared = self.shared();
+            if self.project_generation() == before {
+                return Ok((selected?, shared));
+            }
+        }
+    }
+
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
-        let selected = self.resolve(host, scope)?;
+        let (selected, mut shared) = self.trackable_projects(|| self.resolve(host, scope))?;
         // Settling wakes the poller to reconsider the projects read.
-        self.shared().read_board(&selected);
-        self.settle(&selected, fresh);
+        shared.read_board(&selected);
+        self.settle(&selected, fresh, shared);
         Ok(self.assemble(host, &selected))
     }
 
     /// Waits, within a bound, for what a board of `selected` needs: each
     /// project's first scan, and with `fresh` a scan and a forge poll that
     /// start after this call.
-    fn settle(&self, selected: &[(PathBuf, String)], fresh: bool) {
+    fn settle(
+        &self,
+        selected: &[(PathBuf, String)],
+        fresh: bool,
+        mut shared: MutexGuard<'_, Shared>,
+    ) {
         let deadline = Instant::now() + if fresh { FRESH_WAIT } else { FIRST_SCAN_WAIT };
-        let mut targets = Vec::new();
-        {
-            let mut shared = self.shared();
+        let targets = {
+            let mut targets = Vec::new();
             for (repository, name) in selected {
                 let tracked = shared.track(repository, name);
                 let recent = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < FRESH_ENOUGH);
@@ -1220,7 +1301,9 @@ impl Handle {
                 }
                 targets.push((repository.clone(), scan, poll));
             }
-        }
+            targets
+        };
+        drop(shared);
         self.0.scanner.notify();
         self.0.forge.notify();
         let shared = self.shared();
@@ -1309,8 +1392,8 @@ impl Handle {
         client: ClientId,
         delivery: Weak<DeliveryQueue>,
     ) -> Result<(u64, Board), String> {
-        let selected = self.resolve(host, &Scope::All)?;
-        self.settle(&selected, false);
+        let (selected, shared) = self.trackable_projects(|| self.resolve(host, &Scope::All))?;
+        self.settle(&selected, false, shared);
         let mut publication = self.publication();
         publication.watchers.insert(client, delivery);
         let stale = {
@@ -1387,26 +1470,22 @@ impl Handle {
             publication.sent = None;
             return UNWATCHED;
         }
-        let selected = match self.resolve(host, &Scope::All) {
-            Ok(selected) => selected,
-            Err(error) => {
-                tracing::debug!(%error, "the Work board could not read the open projects");
-                return REPUBLISH_RETRY;
-            }
-        };
-        let untracked = {
-            let mut shared = self.shared();
-            let untracked = selected
-                .iter()
-                .any(|(repository, _)| !shared.projects.contains_key(repository));
-            for (repository, name) in &selected {
-                shared.track(repository, name);
-            }
-            untracked
-        };
+        let (selected, mut shared) =
+            match self.trackable_projects(|| self.resolve(host, &Scope::All)) {
+                Ok(tracked) => tracked,
+                Err(error) => {
+                    tracing::debug!(%error, "the Work board could not read the open projects");
+                    return REPUBLISH_RETRY;
+                }
+            };
+        let untracked = selected
+            .iter()
+            .any(|(repository, _)| !shared.projects.contains_key(repository));
+        for (repository, name) in &selected {
+            shared.track(repository, name);
+        }
+        drop(shared);
         if untracked {
-            // A project opened since the last pass is scanned now rather than
-            // at the next model refresh.
             self.0.scanner.notify();
         }
         let board = self.assemble(host, &selected);
@@ -1611,7 +1690,7 @@ impl Handle {
         self.0.scanner.notify();
     }
 
-    fn scan_loop(&self) {
+    fn scan_loop(&self, preference: StalePreference) {
         let signal = Arc::downgrade(&self.0);
         let monitor = git_watch::Monitor::start(move || {
             if let Some(inner) = signal.upgrade() {
@@ -1624,11 +1703,9 @@ impl Handle {
         .ok();
         let mut scanner = Scanner {
             monitor,
-            configured: BTreeMap::new(),
-            stamped: HashMap::new(),
-            sessions: Vec::new(),
-            sampled: None,
-            refreshed: None,
+            preference,
+            settings_checked: Some(Instant::now()),
+            ..Scanner::default()
         };
         while let Some(observed) = self.0.scanner.observe() {
             let Some(host) = self.0.host.upgrade() else {
@@ -1878,6 +1955,7 @@ impl Handle {
 }
 
 /// State only the scanner thread touches.
+#[derive(Default)]
 struct Scanner {
     monitor: Option<git_watch::Monitor>,
     configured: BTreeMap<ProjectId, ConfiguredWatch>,
@@ -1886,7 +1964,10 @@ struct Scanner {
     /// The live sessions as last sampled.
     sessions: Vec<board::LiveSession>,
     sampled: Option<Instant>,
-    refreshed: Option<Instant>,
+    preference: StalePreference,
+    settings_checked: Option<Instant>,
+    project_generation: u64,
+    project_retry: Option<Instant>,
 }
 
 struct ConfiguredWatch {
@@ -1898,12 +1979,31 @@ struct ConfiguredWatch {
 impl Scanner {
     fn tick(&mut self, handle: &Handle, host: &SharedHost) -> Duration {
         let now = Instant::now();
-        if self
-            .refreshed
-            .is_none_or(|refreshed| refreshed.elapsed() >= MODEL_REFRESH)
+        let generation = handle.project_generation();
+        if generation != self.project_generation
+            || self.project_retry.is_some_and(|retry| retry <= now)
         {
-            self.refreshed = Some(now);
-            self.refresh(handle, host);
+            self.project_generation = generation;
+            self.project_retry = Some(now + PROJECT_RETRY);
+            if self.refresh_projects(handle, host) {
+                self.project_retry = None;
+            }
+        }
+        if self
+            .settings_checked
+            .is_none_or(|checked| checked.elapsed() >= SETTINGS_REFRESH)
+        {
+            self.settings_checked = Some(now);
+            let days = self
+                .preference
+                .read(crate::instance::settings_path().as_deref());
+            let mut shared = handle.shared();
+            if shared.stale_after_days != days {
+                shared.stale_after_days = days;
+                drop(shared);
+                handle.0.publisher.notify();
+                handle.projection_changed();
+            }
         }
         self.drain(handle);
         if self
@@ -1919,36 +2019,36 @@ impl Scanner {
     }
 
     /// Tracks the open Git projects, forgetting closed ones.
-    fn refresh(&mut self, handle: &Handle, host: &SharedHost) {
-        let projects: Vec<_> = match open_projects(host) {
-            Ok(projects) => projects.into_iter().filter_map(git_project).collect(),
-            Err(error) => {
-                tracing::debug!(%error, "the Work board could not read the open projects");
-                return;
-            }
-        };
-        let stale_after_days = stale_after_days();
-        let mut shared = handle.shared();
-        let unchanged = shared.stale_after_days == stale_after_days
-            && shared.projects.len() == projects.len()
+    fn refresh_projects(&self, handle: &Handle, host: &SharedHost) -> bool {
+        let (projects, mut shared) =
+            match handle.trackable_projects(|| handle.resolve(host, &Scope::All)) {
+                Ok(tracked) => tracked,
+                Err(error) => {
+                    tracing::debug!(%error, "the Work board could not read the open projects");
+                    return false;
+                }
+            };
+        let unchanged = shared.projects.len() == projects.len()
             && projects.iter().all(|(repository, name)| {
                 shared
                     .projects
                     .get(repository)
                     .is_some_and(|tracked| tracked.name == *name)
             });
-        shared.stale_after_days = stale_after_days;
-        shared
-            .projects
-            .retain(|repository, _| projects.iter().any(|(open, _)| open == repository));
-        for (repository, name) in &projects {
-            shared.track(repository, name);
+        if !unchanged {
+            shared
+                .projects
+                .retain(|repository, _| projects.iter().any(|(open, _)| open == repository));
+            for (repository, name) in &projects {
+                shared.track(repository, name);
+            }
         }
         drop(shared);
-        if !unchanged {
-            handle.0.publisher.notify();
-            handle.projection_changed();
-        }
+        // A request may already have adopted a new name or project. The
+        // committed change still needs to reach the board and conversations.
+        handle.changed();
+        handle.projection_changed();
+        true
     }
 
     fn drain(&mut self, handle: &Handle) {
@@ -2177,11 +2277,14 @@ impl Scanner {
                 .map_or(Duration::ZERO, |sampled| sampled.elapsed()),
         );
         next = next.min(
-            MODEL_REFRESH.saturating_sub(
-                self.refreshed
-                    .map_or(Duration::ZERO, |refreshed| refreshed.elapsed()),
+            SETTINGS_REFRESH.saturating_sub(
+                self.settings_checked
+                    .map_or(Duration::ZERO, |checked| checked.elapsed()),
             ),
         );
+        if let Some(retry) = self.project_retry {
+            next = next.min(retry.saturating_duration_since(Instant::now()));
+        }
         if let Some(scan) = shared.until_scan(Instant::now()) {
             next = next.min(scan);
         }
@@ -2325,19 +2428,102 @@ mod tests {
             handle.resolve(&host, &Scope::Project(folder)).unwrap_err(),
             "Folder is not a Git project"
         );
-        let mut scanner = Scanner {
-            monitor: None,
-            configured: BTreeMap::new(),
-            stamped: HashMap::new(),
-            sessions: Vec::new(),
-            sampled: None,
-            refreshed: None,
-        };
-        scanner.refresh(&handle, &host);
+        assert!(Scanner::default().refresh_projects(&handle, &host));
         assert_eq!(
             handle.shared().projects.keys().collect::<Vec<_>>(),
             vec![&repo]
         );
+    }
+
+    #[test]
+    fn work_scanner_reads_projects_on_committed_changes() {
+        use crate::workspace_model::ModelEdit;
+
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(
+            super::super::model::Registry::at(&directory.path().join("registry.sqlite3")).unwrap(),
+        ));
+        let host = super::super::service::test_host();
+        let handle = Handle::idle(Arc::downgrade(&host));
+        {
+            let mut state = host.lock().unwrap();
+            state.work = Some(handle.clone());
+            state.execution_registry = Some(registry.clone());
+        }
+        let mut scanner = Scanner {
+            settings_checked: Some(Instant::now()),
+            ..Scanner::default()
+        };
+        let project = directory.path().join("repo");
+        let edit = |edit| {
+            let applied = registry.lock().unwrap().apply_delta(&edit).unwrap();
+            assert!(applied.changed);
+            host.lock().unwrap().announce_model_edit(
+                0,
+                applied.receipt.sequence,
+                &edit,
+                &applied.receipt.effects,
+            );
+        };
+        scanner.tick(&handle, &host);
+        assert!(handle.shared().projects.is_empty());
+        edit(ModelEdit::OpenProject {
+            repository: project.clone(),
+            name: "Repo".into(),
+            kind: ProjectKind::Git,
+        });
+        assert_ne!(scanner.project_generation, handle.project_generation());
+        scanner.tick(&handle, &host);
+        assert_eq!(handle.shared().projects[&project].name, "Repo");
+        assert_eq!(scanner.project_generation, handle.project_generation());
+
+        // With no project edge, a later scanner tick needs no registry read.
+        host.lock().unwrap().execution_registry = None;
+        scanner.tick(&handle, &host);
+        assert!(scanner.project_retry.is_none());
+        host.lock().unwrap().execution_registry = Some(registry.clone());
+
+        let mut first_read = true;
+        let (selected, shared) = handle
+            .trackable_projects(|| {
+                let selected = handle.resolve(&host, &Scope::All);
+                if std::mem::take(&mut first_read) {
+                    // An older board request may have resolved its project just
+                    // before the close and resumed after the scanner applied it.
+                    edit(ModelEdit::CloseProject {
+                        repository: project.clone(),
+                    });
+                    scanner.tick(&handle, &host);
+                }
+                selected
+            })
+            .unwrap();
+        assert!(
+            selected.is_empty(),
+            "discard the pre-close project snapshot"
+        );
+        assert!(shared.projects.is_empty());
+    }
+
+    #[test]
+    fn work_settings_snapshot_follows_replacement_and_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("settings.toml");
+        let replacement = directory.path().join("settings.new");
+        let mut preference = StalePreference::default();
+        std::fs::write(&path, "work_stale_after_days = 14\n").unwrap();
+        assert_eq!(preference.read(Some(&path)), 14);
+        assert!(preference.cached.is_some());
+        assert_eq!(preference.read(Some(&path)), 14);
+        std::fs::write(&replacement, "work_stale_after_days = 21\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        assert_eq!(preference.read(Some(&path)), 21);
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(
+            preference.read(Some(&path)),
+            crate::work::DEFAULT_STALE_AFTER_DAYS
+        );
+        assert!(preference.cached.is_none());
     }
 
     fn polling_handle() -> Handle {
@@ -2854,7 +3040,7 @@ mod tests {
             tracked.polled(rate_limited(Duration::from_secs(600)), 1_000, false);
             tracked.last_poll = Some(Instant::now() - forge::WATCHED_INTERVAL);
         }
-        handle.settle(&selected, false);
+        handle.settle(&selected, false, handle.shared());
         assert!(!handle.shared().projects[&selected[0].0].poll_requested);
 
         handle
@@ -2863,7 +3049,7 @@ mod tests {
             .get_mut(&selected[0].0)
             .unwrap()
             .paused_until = Some(crate::github::polling::now());
-        handle.settle(&selected, false);
+        handle.settle(&selected, false, handle.shared());
         assert!(handle.shared().projects[&selected[0].0].poll_requested);
     }
 
@@ -2887,7 +3073,7 @@ mod tests {
         };
         // watch() settles the initial board before registering its watch.
         // Focus changes reconnect this way; they are not explicit refreshes.
-        handle.settle(&selected, false);
+        handle.settle(&selected, false, handle.shared());
         {
             let mut shared = handle.shared();
             shared.set_watching(true);
@@ -2901,7 +3087,7 @@ mod tests {
             .get_mut(&selected[0].0)
             .unwrap()
             .failures = 0;
-        handle.settle(&selected, false);
+        handle.settle(&selected, false, handle.shared());
         assert!(handle.shared().projects[&selected[0].0].poll_requested);
     }
 

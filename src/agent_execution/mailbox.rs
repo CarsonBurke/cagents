@@ -757,17 +757,34 @@ impl Recognizer {
     /// A user prompt the daemon sealed, as the delivery a window shows.
     /// Whether it was one.
     pub fn recognize(&self, item: &mut crate::chat::Item) -> bool {
+        if let Some(content) = self.recognized_content(item) {
+            item.content = content;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// A recognized delivery from a borrowed transcript item.
+    pub fn recognized(&self, item: &crate::chat::Item) -> Option<crate::chat::Item> {
+        let content = self.recognized_content(item)?;
+        Some(crate::chat::Item {
+            id: item.id.clone(),
+            role: item.role,
+            content,
+            started_at: item.started_at,
+            at: item.at,
+        })
+    }
+
+    fn recognized_content(&self, item: &crate::chat::Item) -> Option<crate::chat::ItemContent> {
         if !may_be_frame(item) {
-            return false;
+            return None;
         }
         let crate::chat::ItemContent::Text { text, .. } = &item.content else {
-            return false;
+            return None;
         };
-        let Some(opened) = self.open_all(text) else {
-            return false;
-        };
-        item.content = delivery(opened);
-        true
+        self.open_all(text).map(delivery)
     }
 
     /// Opens the frames among `snapshot`'s items, copying only those it
@@ -775,11 +792,7 @@ impl Recognizer {
     /// helper opens has none: its source would copy the frame back.
     pub(crate) fn recognize_snapshot(&self, snapshot: &mut crate::chat::Snapshot) {
         for (index, item) in snapshot.items.iter_mut().enumerate() {
-            if !may_be_frame(item) {
-                continue;
-            }
-            let mut opened = crate::chat::Item::clone(item);
-            if self.recognize(&mut opened) {
+            if let Some(opened) = self.recognized(item) {
                 *item = std::sync::Arc::new(opened);
                 if let Some(source) = snapshot.text_copy_sources.conversation.get_mut(index) {
                     *source = None;

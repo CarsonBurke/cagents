@@ -1161,12 +1161,10 @@ impl Handle {
             .working_directory
             .clone();
         let directory = std::fs::canonicalize(&directory).unwrap_or(directory);
-        let selected = self
-            .resolve(host, &crate::work::Scope::Project(directory.clone()))
-            .ok();
-        let mut shared = self.shared();
-        let watching = shared.watching;
-        let project = selected.and_then(|selected| {
+        let scope = crate::work::Scope::Project(directory.clone());
+        let resolved = self.trackable_projects(|| self.resolve(host, &scope));
+        let project = resolved.ok().and_then(|(selected, mut shared)| {
+            let watching = shared.watching;
             let (repository, name) = selected.into_iter().next()?;
             if !read {
                 return shared.projects.get(&repository).map(ProjectFacts::of);
