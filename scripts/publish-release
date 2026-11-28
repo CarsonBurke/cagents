@@ -807,21 +807,22 @@ while IFS= read -r asset; do
     "$found" || fail "owned draft contains an unexpected asset: $asset"
 done <<< "$existing_assets"
 
-assert_current_draft() {
+read_owned_draft() {
     local current
-    current=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+    current=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID") || return
     assert_owned_draft "$current"
+    printf '%s\n' "$current"
 }
-assert_current_draft
+release=$(read_owned_draft)
 if [[ -z $PROMOTE ]]; then
     upload_assets=()
     for asset in "${ASSETS[@]}"; do upload_assets+=("$WORK_DIR/upload/$asset"); done
     gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
 
-    release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
-    assert_owned_draft "$release"
+    release=$(read_owned_draft)
     actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
     [[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
+    DRAFT_ASSETS=$(draft_assets "$release")
     mkdir "$WORK_DIR/downloaded"
     # gh uses authentication for private repositories and draft asset downloads.
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
@@ -847,7 +848,6 @@ cp -- "$WORK_DIR/downloaded/$OWN_METADATA.sig" "$WORK_DIR/served/release-metadat
 check_checksums "$WORK_DIR/served"
 check_metadata "$WORK_DIR/served"
 check_remote_tag
-assert_current_draft
 # Publishing makes this the latest release; never above a newer one, nor a
 # second release of a version.
 newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
@@ -857,13 +857,12 @@ newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_
         version_after "$VERSION" "$published" || printf '%s\n' "$published"
     done)
 [[ -z $newer ]] || fail "refusing to publish $TAG: $(head -n1 <<< "$newer") is published already"
+release=$(read_owned_draft)
+[[ $(draft_assets "$release") == "$DRAFT_ASSETS" ]] \
+    || fail "the draft of $TAG changed while it was verified; run this again"
 if "$DRAFT"; then
     printf 'Verified %s as a draft; rehearse its update, then publish it.\n' "$TAG"
     exit 0
-fi
-if [[ -n $PROMOTE ]]; then
-    [[ $(draft_assets "$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")") == "$DRAFT_ASSETS" ]] \
-        || fail "the draft of $TAG changed while it was verified; run this again"
 fi
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
     -F draft=false --jq .html_url
