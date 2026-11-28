@@ -1273,9 +1273,9 @@ fn observed_edge_burst_timing() {
     report_phases(phases);
 }
 
-/// Edges that change something, as an agent start brings them: an agent
-/// record, renamed each time, for an agent placed in one channel. Each runs
-/// the complete reconciliation, which the phases split.
+/// Agent inventory edges in one channel: the first installs an agent, and
+/// subsequent edges change its command handle. Reports the separate phases
+/// for any edge that still needs a complete reconciliation.
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn changing_edge_timing() {

@@ -7195,12 +7195,12 @@ fn reconciling_unchanged_navigation_orders_keeps_the_sidebar_revision() {
 /// reconciliation that adopts what they installed.
 fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<ModelUpdate>) {
     let created = shared(ChannelId::new(), repository, "Spawned", 1);
-    // The agent's start, then its rename: each edge changes its record, as
+    // The agent's start, then its close: each edge changes its record, as
     // an edge that changed nothing would skip the reconciliation.
     let mut agent = crate::agent_execution::Agent::fixture_placed_in(created.id);
     agent.spec.target.repository = repository.to_path_buf();
-    let mut renamed = agent.clone();
-    renamed.name = Some("worker".into());
+    let mut stopped = agent.clone();
+    stopped.closed = true;
     let agents_changed =
         |sequence: u64, agent: &crate::agent_execution::Agent| ModelUpdate::Changed {
             sequence: baseline.sequence + sequence,
@@ -7234,7 +7234,7 @@ fn spawn_burst(baseline: &WorkspaceModel, repository: &Path) -> (ChannelId, Vec<
             },
         },
         agents_changed(2, &agent),
-        agents_changed(3, &renamed),
+        agents_changed(3, &stopped),
     ];
     (created.id, edges)
 }
@@ -7509,6 +7509,45 @@ fn unchanged_edges_reconcile_only_when_the_worktree_topology_changes() {
     assert_ne!(app.shared_views.reconciled_topology, revision);
 }
 
+#[test]
+fn an_agent_handle_change_keeps_the_already_projected_pane() {
+    let (mut app, original, pane, channel) = managed_display_fixture();
+    drop(app.reconcile_workspace_model());
+    drop(app.select_channel(channel));
+    drop(app.focus_workspace_card(pane.id));
+    drop(app.project_workspace(true));
+    assert_eq!(app.workspace.focused(), Some(pane.id));
+    let identity = app.workspace_model.identity;
+    let sequence = app.workspace_model.sequence;
+    let agent_edge = |sequence, agent| {
+        changed_edge(
+            identity,
+            sequence,
+            ModelEdit::AgentsChanged,
+            EditEffects {
+                agents: vec![agent],
+                ..Default::default()
+            },
+            vec![],
+        )
+    };
+    let mut renamed = original.clone();
+    renamed.name = Some("reviewer".into());
+    let before = complete_reconciliations();
+    drop(app.update(Message::WorkspaceModelObserved(agent_edge(
+        sequence + 2,
+        renamed.clone(),
+    ))));
+    assert_eq!(complete_reconciliations(), before);
+    assert_eq!(app.workspace_model.agents, [renamed.clone()]);
+    assert_eq!(app.durable.active_channel, Some(channel));
+    assert_eq!(app.workspace.focused(), Some(pane.id));
+    assert_eq!(app.card_chrome[&pane.id].title, pane.title);
+    // The name-only edge still advances the shared row's clock.
+    assert!(!reconciles(&mut app, agent_edge(sequence + 1, original)));
+    assert_eq!(app.workspace_model.agents, [renamed]);
+}
+
 /// A copy of an edge this window already installed, such as the observer's
 /// echo of its own receipt, changes no row and no view, so it skips the
 /// complete reconciliation. Each kind an agent start produces is covered, and
@@ -7574,8 +7613,8 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
         agents: vec![agent.clone()],
         ..Default::default()
     };
-    let mut renamed = agent.clone();
-    renamed.name = Some("worker".into());
+    let mut stopped = agent.clone();
+    stopped.closed = true;
     let other = ChannelId::new();
     let seed = ModelEdit::SeedView {
         scope: Scope::Channel(other),
@@ -7624,7 +7663,7 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
                 12,
                 ModelEdit::AgentsChanged,
                 EditEffects {
-                    agents: vec![renamed.clone()],
+                    agents: vec![stopped.clone()],
                     ..Default::default()
                 },
                 vec![],
@@ -7634,7 +7673,7 @@ fn an_edge_that_changes_nothing_skips_the_complete_reconciliation() {
                 13,
                 ModelEdit::AgentsChanged,
                 EditEffects {
-                    agents: vec![renamed],
+                    agents: vec![stopped.clone()],
                     ..Default::default()
                 },
                 vec![],
