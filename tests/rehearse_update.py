@@ -1351,7 +1351,8 @@ class ShownUpdateOutcome(unittest.TestCase):
                 text = tooltips.get(pointer["x"], shown or "Channels")
                 if pointer["popover"]:
                     text = "Application notices " + tooltips.get("popover", "")
-                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800], "focused": True},
+                                      "runs": [{"text": text}]})
             return 0, ""
         rehearsal.call = call
         return rehearsal
@@ -1389,6 +1390,57 @@ class ShownUpdateOutcome(unittest.TestCase):
             self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
             self.assertIn("would prove nothing", rehearsal.errors[0])
 
+    def test_header_scan_reuses_only_identical_ocr_frames_from_the_focused_window(self):
+        import rehearse_update_run as run
+        rehearsal = run.Rehearsal("/private", "fixture")
+        window = {"id": 1, "size": [1280, 800], "focused": True}
+        initial = {"window": window, "frame": "initial", "source": "ocr", "runs": []}
+        tooltip = {"window": window, "frame": "tooltip", "source": "ocr",
+                   "runs": [{"text": "Update failed: fixture"}]}
+        frames = {"initial": b"same", "unchanged": b"same", "changed": b"tooltip", "tooltip": b"tooltip"}
+        def observed(path, **geometry):
+            return 0, json.dumps({"window": window | geometry, "frame": path})
+
+        answers = iter([
+            (0, ""), observed("unchanged"),
+            (0, ""), observed("changed"), (0, json.dumps(tooltip)),
+            (0, ""), observed("changed"),
+            (0, ""), observed("changed", focused=False),
+        ])
+        with patch.object(rehearsal, "frame_pixels", side_effect=frames.get), \
+                patch.object(rehearsal, "call", side_effect=answers) as call:
+            scan = rehearsal.header_observations(window, initial, 21, 24, 96, 120)
+            self.assertEqual(next(scan), (1160, initial))
+            self.assertEqual(next(scan), (1136, tooltip))
+            # The open/read/close/read notices flow reuses the same driver
+            # screenshot filename after the scan gives the result back.
+            frames["tooltip"] = b"closed popover"
+            self.assertEqual(list(scan), [(1112, tooltip), (1088, None)])
+
+        self.assertEqual([step.args for step in call.call_args_list], [
+            ("drive", "hover", "1160,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "hover", "1136,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "--json", "observe"),
+            ("drive", "hover", "1112,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "hover", "1088,21"), ("drive", "--json", "observe", "--no-text"),
+        ])
+
+    def test_header_scan_reads_accessibility_observations_even_when_the_pixels_match(self):
+        import rehearse_update_run as run
+        rehearsal = run.Rehearsal("/private", "fixture")
+        window = {"id": 1, "size": [1280, 800], "focused": True}
+        initial = {"window": window, "frame": "same", "source": "a11y+ocr", "runs": []}
+        tooltip = initial | {"runs": [{"text": "Update failed: fixture"}]}
+        with patch.object(rehearsal, "frame_pixels") as pixels, \
+                patch.object(rehearsal, "call", side_effect=[(0, ""), (0, json.dumps(tooltip))]) as call:
+            results = list(rehearsal.header_observations(window, initial, 21, 24, 24, 120))
+
+        pixels.assert_not_called()
+        self.assertEqual(results, [(1160, tooltip)])
+        self.assertEqual([step.args for step in call.call_args_list], [
+            ("drive", "hover", "1160,21"), ("drive", "--json", "observe"),
+        ])
+
     def test_a_notices_popover_that_does_not_open_is_an_unknown_outcome(self):
         import rehearse_update_run as run
         with tempfile.TemporaryDirectory() as directory:
@@ -1423,7 +1475,8 @@ class ShownUpdateOutcome(unittest.TestCase):
             shown = iter(["Channels", "Channels", "Update failed: protocol 203"])
             def call(*args, **_):
                 if args[:2] == ("drive", "--json"):
-                    return 0, json.dumps({"window": {"id": 1}, "runs": [{"text": next(shown, "Channels")}]})
+                    return 0, json.dumps({"window": {"id": 1, "focused": True},
+                                          "runs": [{"text": next(shown, "Channels")}]})
                 return 0, ""
             rehearsal.call = call
             with patch.object(run.time, "sleep"):
@@ -1458,7 +1511,8 @@ class ShownUpdateOutcome(unittest.TestCase):
                 order.append("launch")
                 windows["main"] = {"id": 1, "pid": 10 if same_window else 11}
             elif args[:2] == ("drive", "--json") and tooltips is None:
-                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": shown}]})
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800], "focused": True},
+                                      "runs": [{"text": shown}]})
             return watched(*args, **kwargs)
         rehearsal.call = call
         rehearsal.open_windows = lambda slots: [call("launch", slot) for slot in slots]
