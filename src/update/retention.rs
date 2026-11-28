@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, ffi::OsStr, time::SystemTime};
 const KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const COMPLETE: &str = ".complete";
 
-fn canonical_id(id: &str) -> bool {
+pub(super) fn canonical_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
 }
 

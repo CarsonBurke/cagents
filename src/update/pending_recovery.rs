@@ -198,7 +198,7 @@ pub(crate) fn run(
         in_flight: Vec::new(),
         recorded_by: Some(crate::version().into()),
     };
-    write_job(&state, &job)?;
+    write_new_job(&state, &job)?;
     let result = (|| {
         // The sealed receipt binds the target path/hash and exact checkpoint.
         // Verify the entire matched set again before routing current to it.
