@@ -12729,7 +12729,8 @@ impl Cagents {
                     browser.lifecycle = lifecycle;
                 }
             }
-            BrowserEvent::Error(_) => {
+            BrowserEvent::Error(error) => {
+                tracing::warn!(card = ?id, %error, "browser operation failed");
                 self.status = Some(TransientNotice::error(
                     "A browser operation failed".to_owned(),
                 ));
@@ -18913,7 +18914,8 @@ impl Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { .. } => {
+            Message::BrowserError { card, message } => {
+                tracing::warn!(?card, %message, "browser widget operation failed");
                 self.status = Some(TransientNotice::error("A browser operation failed".to_owned()));
                 Task::none()
             }
@@ -21440,8 +21442,9 @@ fn browser_command(
     status: &mut Option<TransientNotice>,
 ) -> Task<Message> {
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
-        && command(&browser.handle).is_err()
+        && let Err(error) = command(&browser.handle)
     {
+        tracing::warn!(?card, %error, "browser command failed");
         *status = Some(TransientNotice::error(
             "A browser operation failed".to_owned(),
         ));

@@ -366,11 +366,7 @@ impl Cagents {
                             .file_name()
                             .map(|name| name.to_string_lossy().into_owned())
                             .unwrap_or_default();
-                        let folder = path
-                            .parent()
-                            .and_then(Path::file_name)
-                            .map(|name| name.to_string_lossy().into_owned())
-                            .unwrap_or_else(|| "Downloads".to_owned());
+                        let folder = folder_name(&path);
                         document.saved = Some(path);
                         self.status = Some(TransientNotice::success(format!(
                             "Saved {name} to {folder}"
@@ -560,11 +556,25 @@ impl Cagents {
             }
             (None, fetch) => {
                 let name = display_name(&document.document, fetch);
-                let detail = match fetch {
-                    Fetch::Failed(message) => message.clone(),
-                    _ => format!("{name} · {}", document.document.content_type),
+                let (title, detail) = match (fetch, &document.saved) {
+                    (Fetch::Failed(message), _) => (
+                        "The browser can't show this file".to_owned(),
+                        message.clone(),
+                    ),
+                    // Once saved, the panel says where the file went, so the
+                    // reader knows what Open and Show in folder act on.
+                    (_, Some(saved)) => (
+                        format!("Saved to {}", folder_name(saved)),
+                        saved
+                            .file_name()
+                            .map_or(name, |name| name.to_string_lossy().into_owned()),
+                    ),
+                    _ => (
+                        "The browser can't show this file".to_owned(),
+                        format!("{name} · {}", document.document.content_type),
+                    ),
                 };
-                crate::ui_controls::placeholder("The browser can't show this file")
+                crate::ui_controls::placeholder(title)
                     .icon(Icon::TextFile)
                     .detail(detail)
                     .action(self.browser_document_fallbacks(card, document))
@@ -640,4 +650,12 @@ impl Cagents {
         };
         widget::row::with_children(buttons).spacing(space::S).into()
     }
+}
+
+/// The name of the folder a saved file went into, such as Downloads.
+fn folder_name(path: &Path) -> String {
+    path.parent()
+        .and_then(Path::file_name)
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "Downloads".to_owned())
 }
