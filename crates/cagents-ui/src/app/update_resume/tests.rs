@@ -637,11 +637,13 @@ fn saved_provider_history_is_checked_before_showing_claiming_and_sending() {
         Offer,
         Claim,
         Dispatch,
+        Never,
     }
     for when in [
         Continued::Offer,
         Continued::Claim,
         Continued::Dispatch,
+        Continued::Never,
     ] {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat_for_provider(&mut app, Provider::Claude, Some(RESUME_SESSION));
@@ -691,14 +693,21 @@ fn saved_provider_history_is_checked_before_showing_claiming_and_sending() {
             }
             let take = app.update_update_resume(Action::Resume(id));
             let dispatch = app.update_update_resume(reply(take));
-            if when == Continued::Dispatch {
+            if when == Continued::Dispatch || when == Continued::Never {
                 assert!(held(&app, card).is_some());
                 assert_eq!(sent(&app, card), None);
-                write_resume_input(&mut history, AFTER_INPUT);
+                if when == Continued::Dispatch {
+                    write_resume_input(&mut history, AFTER_INPUT);
+                }
                 drop(app.update_update_resume(reply(dispatch)));
             }
         }
         assert!(offered(&app).is_empty());
+        if when == Continued::Never {
+            assert!(sent(&app, card).is_some_and(|message| message.contains("carry on")));
+            assert_eq!(handled(&app), vec![id]);
+            continue;
+        }
         assert_eq!(sent(&app, card), None);
         assert_eq!(held(&app, card), None);
         assert_eq!(handled(&app), vec![id]);

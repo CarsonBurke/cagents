@@ -85,17 +85,23 @@ if sys.argv[2] == 'continued-shots':
         if isinstance(content, list):
             return '\n'.join(block.get('text', '') for block in content)
         return content
-    matches = []
+    targets = {'Watch CI on the release branch.': 1, 'Rename the old settings keys.': 2}
+    matches = {}
     for path in config.glob('projects/*/*.jsonl'):
         rows = [json.loads(line) for line in path.read_text().splitlines()]
         for row in rows:
-            if row.get('type') == 'user' and prompt(row) == 'Watch CI on the release branch.':
-                matches.append((path, row, rows[-1]))
-    [(path, previous, tail)] = matches
+            if row.get('type') == 'user' and prompt(row) in targets:
+                index = targets[prompt(row)]
+                assert index not in matches
+                matches[index] = (path, row, rows[-1])
+    for index in targets.values():
+        _, previous, _ = matches[index]
+        session = previous['sessionId']
+        turn = previous.get('message', {}).get('id') or previous['uuid']
+        assert str(uuid.UUID(turn)) == turn
+        in_flight[index]['resume_point'] = {'provider': 'Claude', 'session': session, 'turn': turn}
+    path, previous, tail = matches[1]
     session = previous['sessionId']
-    turn = previous.get('message', {}).get('id') or previous['uuid']
-    assert str(uuid.UUID(turn)) == turn
-    in_flight[1]['resume_point'] = {'provider': 'Claude', 'session': session, 'turn': turn}
     new_turn = str(uuid.uuid5(uuid.UUID(session), 'continued outside cagents'))
     with path.open('a') as stream:
         stream.write(json.dumps({
