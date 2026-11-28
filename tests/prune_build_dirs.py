@@ -583,12 +583,14 @@ print(json.dumps([[str(path) for path in pruner.default_roots()],
         self.assertFalse(leftover.exists())
         self.assertTrue(live.exists())
 
-    def incremental(self, target, crate, profile="debug"):
+    def incremental(self, target, crate, profile="debug", lock=True):
         """A crate's incremental directory as rustc leaves it: a finalized
         session beside its lock file."""
         session = target / profile / "incremental" / crate / "s-h0abc1def-1x2y3z-0123456789abcdef"
         session.mkdir(parents=True)
         (target / profile / ".fingerprint").mkdir(exist_ok=True)
+        if lock:
+            (target / profile / ".cargo-lock").write_text("")
         (session / "query-cache.bin").write_bytes(b"x" * 8192)
         (session.parent / "s-h0abc1def-1x2y3z.lock").write_text("")
         return session.parent
@@ -691,6 +693,15 @@ print(json.dumps([[str(path) for path in pruner.default_roots()],
         self.prune()
         self.assertTrue(linked.exists())
         self.assertTrue(package.exists())
+
+    def test_incremental_state_in_a_profile_without_a_build_lock_stays(self):
+        target = self.target(self.roots / "lane/target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa", profile="release", lock=False)
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        output = self.prune()
+        self.assertTrue(crate.exists())
+        self.assertIn(f"keep {crate}: its profile has no build lock", output)
 
     def test_an_interrupted_incremental_removal_is_finished(self):
         target = self.target(self.roots / "lane/target")

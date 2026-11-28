@@ -675,8 +675,8 @@ def main() -> int:
         """Bounds the incremental state of a build directory that stays: a
         crate's goes once nothing has written it since cutoff, or, once
         nothing has for --incremental-grace-hours, when the crates written
-        more recently fill the budget, as an
-        offload slot's lease bounds a slot. Each is renamed aside unless a
+        more recently fill the budget, as an offload slot's lease bounds a
+        slot. Each is renamed aside under its profile's Cargo locks unless a
         rustc holds it, so a compile that starts later finds none rather
         than part of one, and put back if a rustc locked or wrote to it
         meanwhile. Returns how many went and their bytes."""
@@ -697,15 +697,31 @@ def main() -> int:
                 # budget, the one that crosses it included.
                 kept_bytes += bytes_
                 continue
+            try:
+                if not leftover and rustc_holds(crate):
+                    note(f"keep {crate}: a rustc compiles it")
+                    kept_bytes += bytes_
+                    continue
+            except OSError:
+                continue
+            if not arguments.apply:
+                print(f"would remove {crate} ({bytes_ / 2**30:.1f} GiB, {reason})", flush=True)
+                count, size = count + 1, size + bytes_
+                continue
             aside = crate if leftover else \
                 crate.with_name(f".{crate.name}.cagents-pruned-{os.getpid()}")
             # Cargo's locks on the profile keep its builds out while this
-            # looks and renames: rustc opens a crate's directory by path from
-            # before it locks its session until it finishes. A build waiting
-            # for them waits no longer than that. Rustc run without Cargo
-            # holds its session's lock.
-            with held([lock for lock in (profile / name for name in LOCK_NAMES)
-                       if lock.exists()]) as free:
+            # renames: rustc opens a crate's directory by path from before it
+            # locks its session until it finishes. They are held only to look
+            # for a rustc and rename, so a build waiting for them waits no
+            # longer than that. A profile without them, which no build has
+            # used yet, is not trimmed.
+            locks = [lock for lock in (profile / name for name in LOCK_NAMES) if lock.exists()]
+            if not locks and not leftover:
+                note(f"keep {crate}: its profile has no build lock")
+                kept_bytes += bytes_
+                continue
+            with held(locks) as free:
                 if not free:
                     note(f"keep {crate}: a build holds its profile's lock")
                     kept_bytes += bytes_
@@ -715,29 +731,28 @@ def main() -> int:
                         note(f"keep {crate}: a rustc compiles it")
                         kept_bytes += bytes_
                         continue
-                except OSError:
-                    continue
-                if not arguments.apply:
-                    print(f"would remove {crate} ({bytes_ / 2**30:.1f} GiB, {reason})", flush=True)
-                    count, size = count + 1, size + bytes_
-                    continue
-                try:
                     if aside != crate:
                         os.rename(crate, aside)
                 except OSError as error:
                     print(f"failed to remove {crate}: {error}", file=sys.stderr, flush=True)
                     failed = True
                     continue
-                # A rustc that locked it as it was renamed, or a write since
-                # it was measured, keeps it; so does a look that fails.
+                # A rustc that locked it as it was renamed keeps it; so does
+                # a look that fails.
                 try:
-                    used = not leftover and (rustc_holds(aside) or survey(aside, newest) is None)
+                    used = not leftover and rustc_holds(aside)
                 except OSError:
                     used = True
                 if used:
                     if put_back(aside, crate):
                         note(f"keep {crate}: used while it was being removed")
                     continue
+            # After them, anything that wrote to it since it was measured
+            # keeps it too.
+            if not leftover and survey(aside, newest) is None:
+                if put_back(aside, crate):
+                    note(f"keep {crate}: written while it was being removed")
+                continue
             try:
                 shutil.rmtree(aside)
             except OSError as error:

@@ -595,33 +595,28 @@ with open({str(self.prunes)!r}, 'a') as out:
         # Before the first lane's tests, after them, and on a tick with nothing to do.
         self.assertEqual(calls, [[start, 0], [start, len(self.tested())], [start, len(self.tested())]])
 
-    def started_prunes(self, count):
-        """The pruner's starts, once there are count: it runs detached."""
-        deadline = time.monotonic() + 30
-        while time.monotonic() < deadline:
-            lines = self.prunes.read_text().splitlines() if self.prunes.exists() else []
-            if len(lines) >= count:
-                return [json.loads(line) for line in lines]
-            time.sleep(0.05)
-        self.fail(f"the pruner started fewer than {count} times")
+    def prunes_started(self):
+        return [json.loads(line) for line in self.prunes.read_text().splitlines()] \
+            if self.prunes.exists() else []
 
-    def test_the_sentinels_build_directory_is_trimmed_hourly_in_the_background(self):
-        # The first tick makes the checkout, which has nothing to trim before.
+    def test_the_sentinels_build_directory_is_trimmed_hourly_after_its_builds(self):
         self.tick()
-        self.assertFalse(self.prunes.exists())
-        self.now += 1
-        self.tick()
-        (arguments, roots), = self.started_prunes(1)
-        self.assertEqual(roots, str(self.repo / ".worktrees/main-build-sentinel"))
+        (arguments, roots), = self.prunes_started()
+        checkout = self.repo / ".worktrees/main-build-sentinel"
+        self.assertEqual(roots.split(":"), [str(checkout),
+                                            f"/var/tmp/cargo-build{checkout.resolve()}"])
         self.assertIn("--apply", arguments)
+        # A lock of its own: the host's pruner runs, which builds wait for, go on.
+        self.assertEqual(arguments[arguments.index("--lock") + 1], str(self.state / "build-trim.lock"))
+        # After the commit's lanes, which a trim at their start would find
+        # holding every lock.
+        self.assertTrue(self.tested())
         self.now += sentinel.BUILD_TRIM_SECONDS - 1
         self.tick()
+        self.assertEqual(len(self.prunes_started()), 1)
         self.now += 1
         self.tick()
-        self.assertEqual(len(self.started_prunes(2)), 2)
-        # The tick within the hour started none.
-        time.sleep(0.5)
-        self.assertEqual(len(self.prunes.read_text().splitlines()), 2)
+        self.assertEqual(len(self.prunes_started()), 2)
 
     def test_a_host_without_the_prebuild_service_still_tests(self):
         (self.bin / "systemctl").write_text("#!/bin/sh\nexit 5\n")
