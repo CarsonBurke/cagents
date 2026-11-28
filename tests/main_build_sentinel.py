@@ -316,7 +316,7 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertIn(f"- `{commits[1]}` (host break): host", comment[4])
         self.assertIn(f"- `{commits[4]}` (cli warning): cli", comment[4])
 
-    def test_a_tip_failing_only_on_warnings_is_built_before_the_bisection_moves_the_checkout(self):
+    def test_evidence_returns_to_the_checked_tip_after_bisection(self):
         self.with_evidence_tool()
         self.tick()
         self.commit("merge one")
@@ -328,6 +328,10 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertTrue(any(entry[:3] == ["issue", "comment", "42"] for entry in self.recorded()))
         self.assertTrue((self.state / "builds" / tip).is_dir())
         self.assertFalse((self.state / "builds" / warned).exists())
+        calls = self.recorded()
+        bisection = next(index for index, call in enumerate(calls) if call[:2] == [warned, "host"])
+        evidence = next(index for index, call in enumerate(calls) if call[:2] == [tip, "evidence"])
+        self.assertLess(bisection, evidence)
 
     def test_a_tip_failing_since_an_earlier_failure_is_not_bisected(self):
         self.tick()
@@ -640,6 +644,27 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         self.assertTrue(any(entry[:4] == ["issue", "create", "--title", sentinel.TEST_TITLE]
                             for entry in self.recorded()))
         self.assertNotIn("tests_pending", json.loads((self.state / "state.json").read_text()))
+
+    def test_a_failing_test_is_reported_before_optional_build_admission(self):
+        self.with_evidence_tool()
+        self.tick()
+        (self.origin / "failing-host").touch()
+        (self.origin / "busy-evidence").touch()
+        tip = self.commit("a failed test while all evidence build slots are busy")
+        self.now += 120
+        with patch.dict(os.environ):
+            os.environ.pop("CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS", None)
+            self.tick()
+        calls = self.recorded()
+        report = next(index for index, call in enumerate(calls)
+                      if call[:4] == ["issue", "create", "--title", sentinel.TEST_TITLE])
+        evidence = next(index for index, call in enumerate(calls) if call[:2] == [tip, "evidence"])
+        self.assertLess(report, evidence)
+        self.assertEqual(calls[evidence][2]["admission_timeout"], "120")
+        self.assertFalse((self.state / "builds" / tip).exists())
+        state = json.loads((self.state / "state.json").read_text())
+        self.assertEqual(state["tested"], tip)
+        self.assertNotIn("tests_pending", state)
 
     def test_a_required_commit_is_tested_once_and_its_verdict_returned(self):
         self.tick()
@@ -990,7 +1015,12 @@ if sys.argv[1:] == ["__build-arguments"]:
 assert sys.argv[1] == "--task" and sys.argv[3:5] == ["build", "before"], sys.argv
 sha = subprocess.check_output(["git", "-C", sys.argv[5], "rev-parse", "HEAD"], text=True).strip()
 with open(os.environ["SENTINEL_CALLS"], "a") as out:
-    out.write(json.dumps([sha, "evidence", sys.argv[1:]]) + "\\n")
+    out.write(json.dumps([sha, "evidence", {
+        "arguments": sys.argv[1:],
+        "admission_timeout": os.environ.get("CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS"),
+    }]) + "\\n")
+if Path(sys.argv[5], "busy-evidence").exists():
+    sys.exit(124)
 if Path(sys.argv[5], "broken-evidence").exists():
     sys.exit(101)
 target = Path(sys.argv[2], "target-before", "dev-runtime")
