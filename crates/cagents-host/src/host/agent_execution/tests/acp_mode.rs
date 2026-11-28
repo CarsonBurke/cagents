@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::Value;
 
+#[path = "../../../../tests/support/acp_settings.rs"]
+mod acp_settings;
+
 fn install_fixture_provider(root: &Path, program: &str, shape: &str) -> std::path::PathBuf {
     let state = root.join("acp").join(shape);
     std::fs::create_dir_all(&state).unwrap();
@@ -59,21 +62,22 @@ fn delegated_acp_provider_confirms_its_mode_before_receiving_a_prompt() {
     let muse = install_fixture_provider(root, "muse", "muse");
     std::fs::write(agy.join("initial-mode"), "auto").unwrap();
     let person = Authority::default();
-    let spawn = |authority: &Authority, key: &str, provider, mode: &str, settings| {
-        let mut request = request.clone();
-        let Destination::New(spec) = &mut request.destination else {
-            unreachable!()
+    let spawn =
+        |authority: &Authority, key: &str, provider, mode: &str, settings: Option<(&str, &str)>| {
+            let mut request = request.clone();
+            let Destination::New(spec) = &mut request.destination else {
+                unreachable!()
+            };
+            spec.provider = provider;
+            spec.permission_mode = Some(mode.into());
+            if let Some((model, effort)) = settings {
+                spec.model = Some(model.into());
+                spec.reasoning_effort = Some(effort.into());
+            }
+            request.idempotency_key = key.into();
+            submit(&host, authority, request).unwrap()
         };
-        spec.provider = provider;
-        spec.permission_mode = Some(mode.into());
-        if settings {
-            spec.model = Some("gemini-3.8-flash".into());
-            spec.reasoning_effort = Some("medium".into());
-        }
-        request.idempotency_key = key.into();
-        submit(&host, authority, request).unwrap()
-    };
-    let parent = spawn(&person, "parent", Provider::Claude, "default", false);
+    let parent = spawn(&person, "parent", Provider::Claude, "default", None);
     assert_eq!(settled(&host, parent.run.id).state, State::Succeeded);
     let caller = agent_authority(&host, parent.agent.id);
 
@@ -82,7 +86,7 @@ fn delegated_acp_provider_confirms_its_mode_before_receiving_a_prompt() {
             Provider::Antigravity,
             "default",
             &agy,
-            true,
+            Some(("gemini-3.8-flash", "medium")),
             &[
                 ("model", "gemini-3.8-flash"),
                 ("thought_level", "medium"),
@@ -93,7 +97,7 @@ fn delegated_acp_provider_confirms_its_mode_before_receiving_a_prompt() {
             Provider::Muse,
             "manual",
             &muse,
-            false,
+            None,
             &[("mode", "promptUnmatched")][..],
         ),
     ] {
@@ -120,6 +124,42 @@ fn delegated_acp_provider_confirms_its_mode_before_receiving_a_prompt() {
         assert!(close(&host, &caller, child.agent.id).unwrap().closed);
     }
 
+    let first = frames(&agy).len();
+    let planned = spawn(
+        &caller,
+        "plan",
+        Provider::Antigravity,
+        "plan",
+        Some(("gemini-4-neon", "high")),
+    );
+    let run = settled(&host, planned.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    let followup = "Describe the tradeoffs without making changes.";
+    let (sent, _) = prompt(
+        &host,
+        &caller,
+        Submit {
+            name: None,
+            destination: Destination::Existing(planned.agent.id),
+            prompt: followup.into(),
+            idempotency_key: "plan-followup".into(),
+        },
+        false,
+    )
+    .unwrap();
+    let run = settled(&host, sent.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    acp_settings::assert_turns(
+        &frames(&agy)[first..],
+        &[
+            ("model", "gemini-4-neon"),
+            ("thought_level", "high"),
+            ("mode", "plan"),
+        ],
+        &[request.prompt.as_str(), followup],
+    );
+    assert!(close(&host, &caller, planned.agent.id).unwrap().closed);
+
     for (marker, contents, error, requested) in [
         ("unavailable-mode", "plan", "does not offer the mode", false),
         ("reject-mode", "", "Mode change refused by fixture", true),
@@ -127,7 +167,7 @@ fn delegated_acp_provider_confirms_its_mode_before_receiving_a_prompt() {
     ] {
         std::fs::write(agy.join(marker), contents).unwrap();
         let first = frames(&agy).len();
-        let child = spawn(&caller, marker, Provider::Antigravity, "plan", false);
+        let child = spawn(&caller, marker, Provider::Antigravity, "plan", None);
         let run = settled(&host, child.run.id);
         assert_eq!(run.state, State::Failed, "{run:?}");
         assert!(

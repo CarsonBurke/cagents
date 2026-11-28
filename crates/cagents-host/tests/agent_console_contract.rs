@@ -1,3 +1,5 @@
+#[path = "support/acp_settings.rs"]
+mod acp_settings;
 #[path = "support/cli.rs"]
 mod cli;
 #[path = "support/hosted_agent_cleanup.rs"]
@@ -312,11 +314,190 @@ impl Drop for Fixture {
 }
 
 #[test]
+fn acp_spawn_passes_provider_settings_through_the_cli() {
+    use cagents::{
+        agent::Provider,
+        agent_execution::{Authority, Destination, Operation, Reply, directory},
+        descriptor,
+        terminal::ipc::{ProtocolError, ProtocolErrorCode},
+    };
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    for directory in ["home", "run", "data", "config", "cache", "tmp", "project"] {
+        fs::create_dir(root.path().join(directory)).unwrap();
+    }
+    let runtime = root.path().join("run");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let listener =
+        descriptor::with_socket_address(&socket, |address| descriptor::bind(address)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let project = root.path().join("project");
+    let authority = Authority::from_environment();
+    let proof = HostSessionProof {
+        host_session_id: "acp-cli-contract".into(),
+        host_incarnation: "acp-cli-incarnation".into(),
+        boot_id: "acp-cli-boot".into(),
+    };
+
+    for (provider, model, reasoning, mode) in [
+        (Provider::Antigravity, "gemini-4-neon", "high", "plan"),
+        (Provider::Muse, "muse-spark-1.2", "xhigh", "manual"),
+    ] {
+        let prompt = "Read the private checkout.";
+        let deadline = Instant::now() + Duration::from_secs(10);
+        thread::scope(|scope| {
+            let verify = scope.spawn(|| {
+                let mut stream = loop {
+                    match descriptor::accept(&listener) {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "CLI never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept private CLI: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut exchange = |message| {
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert_eq!(request.version, PROTOCOL_VERSION);
+                    let expected_proof =
+                        (!matches!(request.request, ClientRequest::Connect { .. }))
+                            .then_some(&proof);
+                    assert_eq!(request.proof.as_ref(), expected_proof);
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                    request.request
+                };
+                let response = |response| ServerMessage::Response { response };
+                assert!(matches!(
+                    exchange(response(ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![]
+                    })),
+                    ClientRequest::Connect { .. }
+                ));
+                let context = directory::Context {
+                    sessions: directory::Sessions {
+                        caller: None,
+                        scope: directory::Scope::Project(project.clone()),
+                        sessions: vec![],
+                    },
+                    lineage_channel: None,
+                };
+                let ClientRequest::Agent {
+                    authority: actual,
+                    operation:
+                        Operation::Context {
+                            scope: directory::Scope::Containing(path),
+                            standing: false,
+                        },
+                } = exchange(response(ServerResponse::Agent(Reply::Context(context))))
+                else {
+                    panic!("expected a project context request");
+                };
+                assert!(actual == authority);
+                assert_eq!(path, project);
+
+                let refusal = ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    "private CLI fixture observed the submission",
+                    false,
+                );
+                let ClientRequest::Agent {
+                    authority: actual,
+                    operation: Operation::Submit(submit),
+                } = exchange(ServerMessage::Error(refusal))
+                else {
+                    panic!("expected a spawn submission");
+                };
+                assert!(actual == authority);
+                assert_eq!(submit.prompt, prompt);
+                let Destination::New(spec) = submit.destination else {
+                    panic!("expected a new agent")
+                };
+                assert_eq!(spec.target.repository, project);
+                assert_eq!(spec.target.directory, project);
+                assert_eq!(spec.provider, provider);
+                assert_eq!(spec.model.as_deref(), Some(model));
+                assert_eq!(spec.reasoning_effort.as_deref(), Some(reasoning));
+                assert_eq!(spec.permission_mode.as_deref(), Some(mode));
+            });
+            let spec = private_cli_capture::private_cli(root.path()).args([
+                "--no-start",
+                "agent",
+                "spawn",
+                "--provider",
+                provider.executable(),
+                "--directory",
+                project.to_str().unwrap(),
+                "--model",
+                model,
+                "--reasoning-effort",
+                reasoning,
+                "--permission-mode",
+                mode,
+                prompt,
+            ]);
+            let output = private_cli_capture::capture(spec, deadline).unwrap();
+            verify.join().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("private CLI fixture observed the submission"),
+                "{error}"
+            );
+        });
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires an external User session to drive the shipped CLI and daemon together"
+)]
 #[cfg_attr(
     target_os = "macos",
     ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
 )]
 fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
+    use cagents::agent_execution::Authority;
+
+    assert_eq!(
+        Authority::from_environment(),
+        Authority::default(),
+        "run the full CLI and daemon qualification from an external User session"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use cagents::daemon;
+        let (_caller, observer) = UnixStream::pair().unwrap();
+        let peer = daemon::peer_credentials(&observer).unwrap();
+        assert!(
+            !daemon::peer_requires_session_authority(&observer, peer),
+            "run the full CLI and daemon qualification from an external User session"
+        );
+    }
     if retained_fixture::run_isolated() {
         return;
     }
@@ -431,47 +612,7 @@ fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        // A reload would reset the fixture's controls even for the same session ID.
-        let traffic: Vec<_> = frames
-            .iter()
-            .filter(|frame| {
-                matches!(
-                    frame["method"].as_str(),
-                    Some(
-                        "session/set_config_option"
-                            | "session/set_mode"
-                            | "session/set_model"
-                            | "session/load"
-                            | "session/resume"
-                            | "session/prompt"
-                    )
-                )
-            })
-            .collect();
-        assert_eq!(
-            traffic.len(),
-            settings.len() + prompts.len(),
-            "{log:?}: {traffic:?}"
-        );
-        let (configuration, turns) = traffic.split_at(settings.len());
-        let session = turns[0]["params"]["sessionId"].as_str().unwrap();
-        for (frame, (option, value)) in configuration.iter().zip(settings) {
-            assert_eq!(frame["method"], "session/set_config_option", "{frame}");
-            assert_eq!(frame["params"]["sessionId"], session, "{frame}");
-            assert_eq!(frame["params"]["configId"], *option, "{frame}");
-            assert_eq!(frame["params"]["value"], *value, "{frame}");
-        }
-        for (frame, text) in turns.iter().zip(prompts) {
-            assert_eq!(frame["method"], "session/prompt", "{frame}");
-            assert_eq!(frame["params"]["sessionId"], session, "{frame}");
-            let blocks = frame["params"]["prompt"].as_array().unwrap();
-            assert!(
-                blocks.iter().any(|block| block["text"]
-                    .as_str()
-                    .is_some_and(|body| body.contains(text))),
-                "{frame}"
-            );
-        }
+        acp_settings::assert_turns(&frames, settings, prompts);
     }
 }
 
