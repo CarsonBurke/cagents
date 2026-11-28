@@ -332,7 +332,6 @@ fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
                 "fixture_home.py",
                 include_str!("../../../scripts/fixture_home.py"),
             ),
-            ("config/muse", "auth.json", r#"{"fixture":true}"#),
         ] {
             let path = root.join(directory);
             fs::create_dir_all(&path).unwrap();
@@ -343,6 +342,12 @@ fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
         Fixture::install_program(root, "agy", provider);
         Fixture::install_program(root, "muse-upstream", provider);
         Fixture::install_program(root, "muse", "#!/bin/sh\nexec muse-upstream \"$@\"\n");
+        let login = Fixture::command(root, &root.join("bin/muse-upstream"))
+            .env("FAKE_ACP_LOGIN_SECONDS", "0")
+            .arg("login")
+            .output()
+            .unwrap();
+        assert!(login.status.success(), "Muse fixture login: {login:?}");
     });
 
     let project = fixture.root.path().join("project");
