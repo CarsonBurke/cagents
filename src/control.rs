@@ -1263,6 +1263,7 @@ impl ControlClient {
     /// Handshake with a daemon that may still be restoring behind its bound
     /// listener. The reply may arrive as late as `deadline`, and never gets
     /// less time than an ordinary handshake.
+    #[cfg(any(not(target_os = "macos"), test))]
     pub(crate) fn from_stream_until(
         stream: UnixStream,
         deadline: Instant,
