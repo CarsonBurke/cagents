@@ -26,7 +26,15 @@ impl WaylandFlush {
         dispatch: impl FnOnce() -> calloop::Result<()>,
     ) -> calloop::Result<()> {
         self.flush(connection, handle)?;
-        dispatch()?;
+        if let Err(error) = dispatch() {
+            // A Wayland source error can be wrapped in a generic calloop
+            // error. The backend keeps the original failure if it lost the
+            // connection during dispatch.
+            return Err(connection
+                .backend()
+                .last_error()
+                .map_or(error, |cause| connection_error(cause).into()));
+        }
 
         // The compositor can drain requests without sending any new events.
         // Retry on the writable wakeup even if the caller is about to stop polling.
@@ -74,10 +82,16 @@ pub fn flush_pending(connection: &Connection) -> Result<bool> {
     match connection.flush() {
         Ok(()) => Ok(false),
         Err(WaylandError::Io(error)) if error.kind() == ErrorKind::WouldBlock => Ok(true),
-        Err(WaylandError::Io(error)) => Err(error),
-        Err(WaylandError::Protocol(error)) => {
+        Err(error) => Err(connection_error(error)),
+    }
+}
+
+fn connection_error(error: WaylandError) -> std::io::Error {
+    match error {
+        WaylandError::Io(error) => error,
+        WaylandError::Protocol(error) => {
             tracing::error!("Wayland protocol error: {error}");
-            Err(std::io::Error::from_raw_os_error(libc::EPROTO))
+            std::io::Error::from_raw_os_error(libc::EPROTO)
         }
     }
 }
