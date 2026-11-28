@@ -18,6 +18,10 @@
 #   require-tests COMMIT
 #                 Require that passing commit status on GitHub. Exits 3
 #                 when GitHub reports no passing status and 1 on errors.
+#   prepared-bundle COMMIT
+#                 Find a live, smoke-tested Linux bundle for COMMIT from a
+#                 successful manual release build on main in this repository.
+#                 Writes run_id= and artifact_id= to $GITHUB_OUTPUT on a hit.
 #   keygen        Make the Actions signing key in memory, store it as the
 #                 release environment's secret RELEASE_SIGNING_KEY, and its
 #                 public half and the keys releases may then trust as the
@@ -197,6 +201,37 @@ require_tests() {
     fi
 }
 
+prepared_bundle() {
+    local commit=$1 repository_id=${GITHUB_REPOSITORY_ID:-} runs run attempt name artifact
+    [[ $commit =~ ^[0-9a-f]{40}$ && $repository_id =~ ^[1-9][0-9]*$ ]] \
+        || fail 'prepared-bundle needs a full commit SHA and GITHUB_REPOSITORY_ID'
+    runs=$(gh api --method GET "repos/$REPOSITORY/actions/workflows/release.yml/runs" \
+        -f branch=main -f event=workflow_dispatch -f status=success -f "head_sha=$commit" -F per_page=100 \
+        | jq -r --arg sha "$commit" --argjson repo "$repository_id" '
+            .workflow_runs[]
+            | select(.path == ".github/workflows/release.yml" and .head_branch == "main"
+                and .event == "workflow_dispatch" and .status == "completed" and .conclusion == "success"
+                and .head_sha == $sha and .repository.id == $repo and .head_repository.id == $repo)
+            | [.id, .run_attempt] | @tsv
+        ') || fail 'cannot list prepared release builds'
+    while IFS=$'\t' read -r run attempt; do
+        [[ $run =~ ^[1-9][0-9]*$ && $attempt =~ ^[1-9][0-9]*$ ]] || continue
+        name=qualified-linux-$attempt
+        artifact=$(gh api --method GET "repos/$REPOSITORY/actions/runs/$run/artifacts" -f "name=$name" \
+            | jq -r --arg name "$name" --arg sha "$commit" --argjson run "$run" --argjson repo "$repository_id" '
+                [.artifacts[] | select(.name == $name and .expired == false and (.workflow_run as $source
+                    | $source.id == $run and $source.repository_id == $repo and $source.head_repository_id == $repo
+                    and $source.head_sha == $sha and $source.head_branch == "main"))]
+                | select(length == 1) | .[0].id
+            ') || fail "cannot list prepared release artifacts for run $run"
+        [[ $artifact =~ ^[1-9][0-9]*$ ]] || continue
+        output "run_id=$run" "artifact_id=$artifact"
+        notice "Reusing the smoke-tested Linux bundle for $commit from release run $run."
+        return
+    done <<< "$runs"
+    notice "No prepared Linux bundle for $commit. Building and smoke-testing the tag."
+}
+
 sign() {
     local dist=$1 version=$2 commit=$3 private public
     [[ $version =~ $VERSION_PATTERN && $commit =~ ^[0-9a-f]{40}$ ]] || fail 'sign needs DIR VERSION COMMIT'
@@ -252,6 +287,7 @@ case ${1:-} in
     admit) (($# == 2)) || fail 'usage: admit TAG'; admit "$2" ;;
     record-tests) (($# == 2)) || fail 'usage: record-tests COMMIT'; record_tests "$2" ;;
     require-tests) (($# == 2)) || fail 'usage: require-tests COMMIT'; require_tests "$2" ;;
+    prepared-bundle) (($# == 2)) || fail 'usage: prepared-bundle COMMIT'; prepared_bundle "$2" ;;
     sign) (($# == 4)) || fail 'usage: sign DIR VERSION COMMIT'; sign "$2" "$3" "$4" ;;
     -h|--help) sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p;}' "$0" ;;
     *) fail 'use release-actions --help for usage' ;;

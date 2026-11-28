@@ -7,7 +7,7 @@ name: Release
 # published only once its update is rehearsed:
 #   scripts/release rehearse VERSION --from-draft
 #   scripts/release publish VERSION --actions
-# Run by hand, it only builds the chosen commit, to rehearse a release build.
+# Run by hand on main, it builds and smoke-tests that exact commit for later use.
 # See docs/releasing.md#signing-in-github-actions.
 on:
   push:
@@ -64,7 +64,7 @@ jobs:
         run: scripts/release-actions require-tests "$COMMIT"
 
   build:
-    name: Build the release
+    name: Qualify the Linux bundle
     needs: admit
     # A rehearsal, run by hand, has no admission and is never signed.
     if: >-
@@ -72,6 +72,9 @@ jobs:
       || (github.event_name == 'workflow_dispatch' && needs.admit.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 350
+    permissions:
+      actions: read
+      contents: read
     steps:
       - name: Check out the tagged commit with its history and tags
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
@@ -83,9 +86,41 @@ jobs:
         # publication compares the tag object with origin's.
         if: github.ref_type == 'tag'
         run: git fetch --no-tags --force origin "+$GITHUB_REF:$GITHUB_REF"
+      - name: Find the tagged commit's prepared bundle
+        id: prepared
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT: ${{ needs.admit.outputs.commit }}
+        run: scripts/release-actions prepared-bundle "$COMMIT"
+      - name: Take the prepared artifact by ID
+        if: steps.prepared.outputs.artifact_id != ''
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          github-token: ${{ github.token }}
+          run-id: ${{ steps.prepared.outputs.run_id }}
+          artifact-ids: ${{ steps.prepared.outputs.artifact_id }}
+          path: ${{ runner.temp }}/prepared-dist
+      - name: Verify the prepared files and refresh their release notes
+        if: steps.prepared.outputs.artifact_id != ''
+        env:
+          VERSION: ${{ needs.admit.outputs.version }}
+          COMMIT: ${{ needs.admit.outputs.commit }}
+        run: |
+          dist="$RUNNER_TEMP/prepared-dist"
+          scripts/release-metadata check --dir "$dist" --version "$VERSION" --source-commit "$COMMIT"
+          protocol=$(jq -er .protocol "$dist/release-metadata.json")
+          previous=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' "$COMMIT^" 2>/dev/null) || previous=
+          scripts/release-metadata notes --repository "$GITHUB_WORKSPACE" ${previous:+--from "$previous"} \
+            --to "$COMMIT" > "$RUNNER_TEMP/release-notes.md"
+          rm -- "$dist/release-metadata.json"
+          scripts/release-metadata write --dir "$dist" --version "$VERSION" --source-commit "$COMMIT" \
+            --protocol "$protocol" --notes "$RUNNER_TEMP/release-notes.md"
       - name: Prepare the runner for rootless release builds
+        if: steps.prepared.outputs.artifact_id == ''
         run: .github/release-runner-setup
-      - name: Build, package and smoke-test the tagged source
+      - name: Build, package and smoke-test the release source
+        if: steps.prepared.outputs.artifact_id == ''
         env:
           CAGENTS_RELEASE_CACHE: /mnt/cagents/release-cache
           CAGENTS_RELEASE_SMOKE_CACHE: /mnt/cagents/smoke-cache
@@ -95,10 +130,10 @@ jobs:
       - name: Keep the bundle for signing
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: bundle
-          path: /mnt/cagents/dist/
+          name: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && format('qualified-linux-{0}', github.run_attempt) || 'bundle' }}
+          path: ${{ steps.prepared.outputs.artifact_id != '' && format('{0}/prepared-dist', runner.temp) || '/mnt/cagents/dist/' }}
           if-no-files-found: error
-          retention-days: 1
+          retention-days: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && 7 || 1 }}
 
   sign:
     name: Sign the metadata
