@@ -52,7 +52,7 @@ pub enum Outcome {
     AlreadyCompatible { running: bool },
     /// The device now runs this computer's build. `sent` is the archive's
     /// size when it had to be uploaded.
-    Updated { sent: Option<u64> },
+    Updated { sent: Option<u64>, version: String },
     /// The device had no cagents; it now has this computer's build, and its
     /// daemon starts with the first connection.
     Installed { sent: u64 },
@@ -188,6 +188,12 @@ pub fn update(
         .map(|(version, digest)| (version.as_str(), digest.as_str()));
     session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
+    let updated = || Outcome::Updated {
+        sent,
+        version: release
+            .map_or(local.version.as_str(), |(version, _)| version)
+            .to_owned(),
+    };
     match (daemon_state(), release) {
         (Daemon::Stopped, Some((version, _))) => {
             let selected = Remote::probe(&session, device, version)?;
@@ -198,7 +204,7 @@ pub fn update(
                     .as_deref()
                     == Some(version)
             {
-                Ok(Outcome::Updated { sent })
+                Ok(updated())
             } else {
                 Err(io::Error::other(format!(
                     "Could not verify the installed update on {}",
@@ -206,7 +212,7 @@ pub fn update(
                 )))
             }
         }
-        (Daemon::Compatible | Daemon::Stopped, _) => Ok(Outcome::Updated { sent }),
+        (Daemon::Compatible | Daemon::Stopped, _) => Ok(updated()),
         (Daemon::Speaks(actual), _) => Err(io::Error::other(format!(
             "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs.",
             name = device.name
@@ -1023,7 +1029,9 @@ impl Session {
             return Err(io::Error::other(format!(
                 "{name}'s daemon did not switch to cagents {version}. The device reported the reason above.{staged}",
                 name = device.name,
-                version = crate::version()
+                version = release
+                    .map(|(version, _)| version)
+                    .unwrap_or(crate::version())
             )));
         }
         Ok(())

@@ -214,7 +214,7 @@ fn update(
     use crate::device::provision::{Outcome, Step};
     let device = saved(name)?;
     crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
-    let version = crate::version();
+    let mut version = crate::version().to_owned();
     let terminal = io::stderr().is_terminal();
     // Without a terminal, such as under the app, each tenth is a line of its own.
     let mut reported_tenth = None;
@@ -260,11 +260,17 @@ fn update(
             None,
             format!("{name}'s cagents already uses protocol {protocol}. Nothing changed."),
         ),
-        Outcome::Updated { sent } => (
-            "updated",
+        Outcome::Updated {
             sent,
-            format!("{name} now runs cagents {version}."),
-        ),
+            version: installed,
+        } => {
+            version = installed;
+            (
+                "updated",
+                sent,
+                format!("{name} now runs cagents {version}."),
+            )
+        }
         Outcome::Installed { sent } => (
             "installed",
             Some(sent),
