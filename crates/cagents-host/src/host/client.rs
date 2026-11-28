@@ -8,7 +8,7 @@ use std::{
 };
 
 use crate::{
-    model::HostSessionProof,
+    model::{HostSessionProof, TerminalId},
     terminal_ipc::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, LIST_PAGE_BYTES,
         MAX_CLIENT_FRAME_BYTES, MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS,
@@ -22,7 +22,7 @@ use crate::{
 use super::{
     control_gate::{self, ControlGate, Exclusive, Shared, WaitFailure},
     delivery::DeliveryQueue,
-    state::{ClientId, SharedHost, send_error, spawn_terminal},
+    state::{ClientId, HostState, SharedHost, send_error, spawn_terminal},
 };
 
 mod project_sessions;
@@ -408,9 +408,7 @@ fn serve_connection_inner<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 break;
             }
             connected = true;
-            // A resumed terminal's live events follow its handshake and replay.
-            // Held messages are not coalesced, so hold only to resume.
-            let hold = (!resume.is_empty()).then(|| delivery.hold_broadcasts());
+            let hold = (!resume.is_empty()).then(|| delivery.replay_hold());
             let (resumed, replay) = match prepare_resume(&host, client_id, resume) {
                 Ok(prepared) => prepared,
                 Err(error) => {
@@ -468,9 +466,7 @@ fn serve_connection_inner<R: Into<crate::terminal_ipc::PreparedResponse>>(
                 ..
             }
         );
-        // An attached terminal's live events follow its reply and replay.
-        let hold =
-            matches!(request, ClientRequest::Attach { .. }).then(|| delivery.hold_broadcasts());
+        let hold = matches!(request, ClientRequest::Attach { .. }).then(|| delivery.replay_hold());
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -2536,7 +2532,7 @@ fn process_admitted_request(
         } => {
             let (terminal, events, worker) = {
                 let mut state = host.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                let terminal = state.attach(client_id, terminal_id)?;
+                let terminal = attach_for_replay(&mut state, client_id, terminal_id)?;
                 state.resume_presentation(client_id, terminal_id, after_generation);
                 let events = state.replay_events(terminal_id, after_event_sequence)?;
                 let worker = state.worker_marker(terminal_id)?;
@@ -3085,6 +3081,20 @@ fn process_admitted_request(
     }
 }
 
+/// Start the hold at the attachment's replay cut, after admission and while
+/// publishers still cannot observe the new subscription.
+fn attach_for_replay(
+    state: &mut HostState,
+    client_id: ClientId,
+    terminal_id: TerminalId,
+) -> Result<TerminalDescriptor, ProtocolError> {
+    let terminal = state.attach(client_id, terminal_id)?;
+    if let Some(delivery) = state.clients.get(&client_id) {
+        delivery.hold_terminal(terminal_id);
+    }
+    Ok(terminal)
+}
+
 fn prepare_resume(
     host: &SharedHost,
     client_id: ClientId,
@@ -3124,7 +3134,7 @@ fn prepare_resume(
         }
         let (terminal, events, worker) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let Ok(terminal) = state.attach(client_id, cursor.terminal_id) else {
+            let Ok(terminal) = attach_for_replay(&mut state, client_id, cursor.terminal_id) else {
                 continue;
             };
             state.resume_presentation(client_id, cursor.terminal_id, cursor.generation);

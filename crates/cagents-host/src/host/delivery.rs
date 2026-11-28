@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io,
     sync::{Arc, Condvar, Mutex, OnceLock},
 };
@@ -295,27 +295,17 @@ fn bulk_page(message: &ServerMessage) -> bool {
     )
 }
 
-#[derive(Debug)]
-struct QueueState {
+#[derive(Debug, Default)]
+struct Pending {
     messages: VecDeque<Outbound>,
-    /// Absolute queue position of the newest coalescible message of each kind,
-    /// so `push` never scans the queue. A position is `popped` plus the index
-    /// in `messages`; both are monotonic, so an entry can only be stale, never
-    /// wrong, and a stale entry is discarded on lookup.
+    /// Absolute position of the newest coalescible message of each kind,
+    /// measured from the start of this queue's lifetime.
     slots: BTreeMap<SlotKey, u64>,
     popped: u64,
-    queued_bulk_pages: usize,
-    /// What a backpressure disconnect discarded, left for the writer to
-    /// free. Pushes come from threads holding the host lock, and the
-    /// discarded messages can be full terminal frames.
-    discarded: VecDeque<Outbound>,
-    /// Unsolicited messages that wait while a [`BroadcastHold`] is held.
-    held: Option<VecDeque<Outbound>>,
-    close_after_drain: bool,
-    aborted: bool,
+    bulk_pages: usize,
 }
 
-impl QueueState {
+impl Pending {
     /// The queue index of the newest coalescible message for `key`, if it is
     /// still queued.
     fn slot(&mut self, key: SlotKey) -> Option<usize> {
@@ -336,7 +326,7 @@ impl QueueState {
             self.slots.insert(key, position);
         }
         if bulk_page(message.message()) {
-            self.queued_bulk_pages += 1;
+            self.bulk_pages += 1;
         }
         self.messages.push_back(message);
     }
@@ -349,42 +339,177 @@ impl QueueState {
             self.slots.remove(&key);
         }
         if bulk_page(message.message()) {
-            self.queued_bulk_pages -= 1;
+            self.bulk_pages -= 1;
         }
         self.popped += 1;
         Some(message)
     }
 
-    /// Empties the queue, returning its messages for the caller to free
+    /// Updates a pending slot, or returns the message for normal admission.
+    // Returning the message avoids cloning even large notification payloads.
+    #[allow(clippy::result_large_err)]
+    fn coalesce(&mut self, message: Outbound) -> Result<(), Outbound> {
+        if let Some(key) = coalescible(message.message())
+            && let Some(index) = self.slot(key)
+        {
+            match message.message() {
+                ServerMessage::Event {
+                    event: crate::terminal_ipc::WireTerminalEvent::Bell,
+                    ..
+                } if self.messages[index].proof == message.proof => {
+                    // Keep the earliest sequence and its queue position. A
+                    // newer sequence here would overtake intervening exit or
+                    // metadata events, which clients would then reject as old.
+                    return Ok(());
+                }
+                ServerMessage::Redraw {
+                    terminal_id,
+                    generation,
+                } => {
+                    let existing = &mut self.messages[index];
+                    if let ServerMessage::Redraw {
+                        generation: queued, ..
+                    } = existing.message()
+                    {
+                        if generation > queued {
+                            existing.payload = Payload::Direct(ServerMessage::Redraw {
+                                terminal_id: *terminal_id,
+                                generation: *generation,
+                            });
+                        }
+                        return Ok(());
+                    }
+                }
+                ServerMessage::ChatChanged { .. } | ServerMessage::MobileChanged { .. }
+                    if self.messages[index].message() == message.message() =>
+                {
+                    return Ok(());
+                }
+                ServerMessage::ChatActivity { generation, .. } => {
+                    let generation = *generation;
+                    let existing = &self.messages[index];
+                    let same_proof = existing.proof == message.proof;
+                    let queued = match existing.message() {
+                        ServerMessage::ChatActivity {
+                            generation: queued, ..
+                        } => Some(*queued),
+                        _ => None,
+                    };
+                    if let Some(queued) = queued
+                        && same_proof
+                    {
+                        if generation >= queued {
+                            self.messages[index] = message;
+                        }
+                        return Ok(());
+                    }
+                }
+                ServerMessage::WorkBoard { revision, .. } => {
+                    let existing = &self.messages[index];
+                    if existing.proof == message.proof
+                        && let ServerMessage::WorkBoard {
+                            revision: queued, ..
+                        } = existing.message()
+                    {
+                        // These are complete snapshots. A later board may
+                        // replace an earlier publication in place, but never
+                        // a correlated reply or another daemon's proof.
+                        if revision >= queued {
+                            self.messages[index] = message;
+                        }
+                        return Ok(());
+                    }
+                }
+                // A complete reading, so a slow reader keeps only the newest.
+                ServerMessage::DeviceStats { revision, .. } => {
+                    let existing = &self.messages[index];
+                    if existing.proof == message.proof
+                        && let ServerMessage::DeviceStats {
+                            revision: queued, ..
+                        } = existing.message()
+                    {
+                        if revision >= queued {
+                            self.messages[index] = message;
+                        }
+                        return Ok(());
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        Err(message)
+    }
+}
+
+#[derive(Debug, Default)]
+struct HeldBroadcasts {
+    terminals: BTreeSet<TerminalId>,
+    pending: Pending,
+}
+
+impl HeldBroadcasts {
+    fn contains(&self, message: &Outbound) -> bool {
+        if message.request_id.is_some() {
+            return false;
+        }
+        let terminal = match message.message() {
+            ServerMessage::Event { terminal_id, .. }
+            | ServerMessage::Redraw { terminal_id, .. }
+            | ServerMessage::Snapshot { terminal_id, .. }
+            | ServerMessage::TerminalObserved { terminal_id, .. }
+            | ServerMessage::TerminalWorker { terminal_id, .. } => terminal_id,
+            // The peer stops reading here. Keep the notice behind any
+            // terminal frames already held for delivery.
+            ServerMessage::HostShuttingDown => return !self.terminals.is_empty(),
+            _ => return false,
+        };
+        self.terminals.contains(terminal)
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueueState {
+    ready: Pending,
+    held: Option<HeldBroadcasts>,
+    /// What a backpressure disconnect discarded, left for the writer to
+    /// free. Pushes come from threads holding the host lock, and the
+    /// discarded messages can be full terminal frames.
+    discarded: VecDeque<Outbound>,
+    close_after_drain: bool,
+    aborted: bool,
+}
+
+impl QueueState {
+    /// Empties both queues, returning their messages for the caller to free
     /// once no lock is held.
     #[must_use = "the discarded messages are to be freed outside the lock"]
     fn discard(&mut self) -> VecDeque<Outbound> {
-        self.popped += self.messages.len() as u64;
-        self.slots.clear();
-        self.queued_bulk_pages = 0;
-        let mut discarded = std::mem::take(&mut self.messages);
-        if let Some(held) = self.held.as_mut() {
-            discarded.append(held);
+        let mut discarded = std::mem::take(&mut self.ready).messages;
+        if let Some(mut held) = self.held.take() {
+            discarded.append(&mut held.pending.messages);
         }
         discarded
     }
 
     /// Messages queued or held, which together are bounded by the capacity.
     fn backlog(&self) -> usize {
-        self.messages.len() + self.held.as_ref().map_or(0, VecDeque::len)
+        self.ready.messages.len()
+            + self
+                .held
+                .as_ref()
+                .map_or(0, |held| held.pending.messages.len())
     }
 }
 
-/// Holds this client's unsolicited messages, such as live terminal events,
-/// behind the replies its connection is queueing; see
-/// [`DeliveryQueue::hold_broadcasts`].
-#[must_use = "unsolicited messages are held only while this lives"]
-pub(crate) struct BroadcastHold<'a> {
+/// Keeps an attaching terminal's live broadcasts behind its reply and replay.
+#[must_use = "terminal broadcasts are held only while this lives"]
+pub(crate) struct ReplayHold<'a> {
     queue: &'a DeliveryQueue,
 }
 
-impl BroadcastHold<'_> {
-    /// Queues `message` ahead of the held messages.
+impl ReplayHold<'_> {
+    /// Queues a replay frame ahead of the held live messages.
     pub(crate) fn push(&self, message: impl Into<Outbound>) -> Result<(), DeliveryError> {
         let mut state = self.queue.lock();
         if state.aborted || state.close_after_drain {
@@ -394,20 +519,10 @@ impl BroadcastHold<'_> {
     }
 }
 
-impl Drop for BroadcastHold<'_> {
+impl Drop for ReplayHold<'_> {
     fn drop(&mut self) {
         let mut state = self.queue.lock();
-        let held = state.held.take().unwrap_or_default();
-        let mut refused = VecDeque::new();
-        for message in held {
-            if state.aborted || state.close_after_drain {
-                refused.push_back(message);
-            } else {
-                let _ = self.queue.admit(&mut state, message);
-            }
-        }
-        drop(state);
-        drop(refused);
+        self.queue.release_hold(&mut state);
     }
 }
 
@@ -427,16 +542,7 @@ impl DeliveryQueue {
         Self {
             client_id,
             capacity: capacity.max(1),
-            state: Mutex::new(QueueState {
-                messages: VecDeque::new(),
-                slots: BTreeMap::new(),
-                popped: 0,
-                queued_bulk_pages: 0,
-                discarded: VecDeque::new(),
-                held: None,
-                close_after_drain: false,
-                aborted: false,
-            }),
+            state: Mutex::new(QueueState::default()),
             available: Condvar::new(),
             older: OnceLock::new(),
         }
@@ -470,33 +576,49 @@ impl DeliveryQueue {
         if state.aborted || state.close_after_drain {
             return Err(DeliveryError::Closed);
         }
-        if message.request_id.is_none() && state.held.is_some() {
-            if state.backlog() >= self.capacity {
+        let backlog = state.backlog();
+        if let Some(held) = state.held.as_mut().filter(|held| held.contains(&message)) {
+            let message = match held.pending.coalesce(message) {
+                Ok(()) => return Ok(()),
+                Err(message) => message,
+            };
+            if backlog >= self.capacity {
                 return Err(self.overflow(&mut state, message));
             }
-            if let Some(held) = state.held.as_mut() {
-                held.push_back(message);
-            }
+            held.pending.enqueue(message);
             return Ok(());
         }
         self.admit(&mut state, message)
     }
 
-    /// Defers every unsolicited message pushed while the returned hold lives,
-    /// queueing them after what is pushed through the hold. A connection
-    /// holds broadcasts while it attaches a terminal and queues its reply and
-    /// replay: a live event published after the attachment would otherwise
-    /// overtake them, refusing the handshake or advancing the client's cursor
-    /// past events still waiting in the replay. Replies are never held, and
-    /// held messages count toward the queue's capacity; they are not
-    /// coalesced until released. Closing the queue sends them at once.
-    pub(crate) fn hold_broadcasts(&self) -> BroadcastHold<'_> {
+    /// Opens a replay scope on the connection. Until the admitted attach
+    /// selects a terminal, all broadcasts continue to the writer.
+    pub(crate) fn replay_hold(&self) -> ReplayHold<'_> {
         let mut state = self.lock();
-        debug_assert!(state.held.is_none(), "one connection holds at a time");
+        debug_assert!(state.held.is_none(), "one replay per connection");
         if !state.aborted && !state.close_after_drain {
-            state.held.get_or_insert_with(VecDeque::new);
+            state.held = Some(HeldBroadcasts::default());
         }
-        BroadcastHold { queue: self }
+        ReplayHold { queue: self }
+    }
+
+    /// Called under the host lock with attachment, before its replay cut
+    /// becomes visible to publishers. Multiple terminals may share a reply.
+    pub(crate) fn hold_terminal(&self, terminal: TerminalId) {
+        if let Some(held) = self.lock().held.as_mut() {
+            held.terminals.insert(terminal);
+        }
+    }
+
+    fn release_hold(&self, state: &mut QueueState) {
+        if let Some(held) = state.held.take() {
+            // These messages already consumed their queue capacity. Append
+            // them without merging into slots ahead of the replay.
+            for message in held.pending.messages {
+                state.ready.enqueue(message);
+            }
+            self.available.notify_one();
+        }
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, QueueState> {
@@ -508,102 +630,16 @@ impl DeliveryQueue {
     /// Queues `message` in order, coalescing it or disconnecting the client
     /// when its backlog is full.
     fn admit(&self, state: &mut QueueState, message: Outbound) -> Result<(), DeliveryError> {
-        // Coalesce through the indexed slot instead of scanning the queue.
-        if let Some(key) = coalescible(message.message())
-            && let Some(index) = state.slot(key)
-        {
-            match message.message() {
-                ServerMessage::Event {
-                    event: crate::terminal_ipc::WireTerminalEvent::Bell,
-                    ..
-                } if state.messages[index].proof == message.proof => {
-                    // Keep the earliest sequence and its queue position. A
-                    // newer sequence here would overtake intervening exit or
-                    // metadata events, which clients would then reject as old.
-                    return Ok(());
-                }
-                ServerMessage::Redraw {
-                    terminal_id,
-                    generation,
-                } => {
-                    let existing = &mut state.messages[index];
-                    if let ServerMessage::Redraw {
-                        generation: queued, ..
-                    } = existing.message()
-                    {
-                        if generation > queued {
-                            existing.payload = Payload::Direct(ServerMessage::Redraw {
-                                terminal_id: *terminal_id,
-                                generation: *generation,
-                            });
-                        }
-                        return Ok(());
-                    }
-                }
-                ServerMessage::ChatChanged { .. } | ServerMessage::MobileChanged { .. }
-                    if state.messages[index].message() == message.message() =>
-                {
-                    return Ok(());
-                }
-                ServerMessage::ChatActivity { generation, .. } => {
-                    let generation = *generation;
-                    let existing = &state.messages[index];
-                    let same_proof = existing.proof == message.proof;
-                    let queued = match existing.message() {
-                        ServerMessage::ChatActivity {
-                            generation: queued, ..
-                        } => Some(*queued),
-                        _ => None,
-                    };
-                    if let Some(queued) = queued
-                        && same_proof
-                    {
-                        if generation >= queued {
-                            state.messages[index] = message;
-                        }
-                        return Ok(());
-                    }
-                }
-                ServerMessage::WorkBoard { revision, .. } => {
-                    let existing = &state.messages[index];
-                    if existing.proof == message.proof
-                        && let ServerMessage::WorkBoard {
-                            revision: queued, ..
-                        } = existing.message()
-                    {
-                        // These are complete snapshots. A later board may
-                        // replace an earlier publication in place, but never
-                        // a correlated reply or another daemon's proof.
-                        if revision >= queued {
-                            state.messages[index] = message;
-                        }
-                        return Ok(());
-                    }
-                }
-                // A complete reading, so a slow reader keeps only the newest.
-                ServerMessage::DeviceStats { revision, .. } => {
-                    let existing = &state.messages[index];
-                    if existing.proof == message.proof
-                        && let ServerMessage::DeviceStats {
-                            revision: queued, ..
-                        } = existing.message()
-                    {
-                        if revision >= queued {
-                            state.messages[index] = message;
-                        }
-                        return Ok(());
-                    }
-                }
-                _ => {}
-            }
-        }
-
+        let message = match state.ready.coalesce(message) {
+            Ok(()) => return Ok(()),
+            Err(message) => message,
+        };
         let bulk_backlog =
-            bulk_page(message.message()) && state.queued_bulk_pages >= MAX_QUEUED_BULK_PAGES;
+            bulk_page(message.message()) && state.ready.bulk_pages >= MAX_QUEUED_BULK_PAGES;
         if state.backlog() >= self.capacity || bulk_backlog {
             return Err(self.overflow(state, message));
         }
-        state.enqueue(message);
+        state.ready.enqueue(message);
         self.available.notify_one();
         Ok(())
     }
@@ -617,7 +653,7 @@ impl DeliveryQueue {
             client = self.client_id,
             queued,
             capacity = self.capacity,
-            bulk_pages = state.queued_bulk_pages,
+            bulk_pages = state.ready.bulk_pages,
             "disconnecting a cagents daemon client that fell behind its delivery queue"
         );
         let proof = Arc::clone(&message.proof);
@@ -628,7 +664,7 @@ impl DeliveryQueue {
             "a queue closes when it overflows, so it overflows once"
         );
         state.discarded = discarded;
-        state.enqueue(Outbound {
+        state.ready.enqueue(Outbound {
             encoded_response: None,
             version: PROTOCOL_VERSION,
             request_id: None,
@@ -670,7 +706,7 @@ impl DeliveryQueue {
             if state.aborted {
                 return None;
             }
-            if let Some(message) = state.dequeue() {
+            if let Some(message) = state.ready.dequeue() {
                 let Some(client) = self.older.get() else {
                     return Some(message);
                 };
@@ -709,21 +745,12 @@ impl DeliveryQueue {
 
     #[cfg(test)]
     pub(crate) fn queued(&self) -> usize {
-        self.state
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .messages
-            .len()
+        self.lock().backlog()
     }
 
     pub(crate) fn close_after_drain(&self) {
         let mut state = self.lock();
-        // What was held is still sent, ahead of the close.
-        for message in state.held.take().unwrap_or_default() {
-            if self.admit(&mut state, message).is_err() {
-                break;
-            }
-        }
+        self.release_hold(&mut state);
         state.close_after_drain = true;
         self.available.notify_all();
     }
@@ -739,7 +766,7 @@ impl DeliveryQueue {
         if !state.aborted {
             tracing::warn!(
                 client = self.client_id,
-                queued = state.messages.len(),
+                queued = state.ready.messages.len(),
                 %reason,
                 "aborting a cagents daemon client delivery queue"
             );
@@ -1135,9 +1162,9 @@ mod tests {
         queue.push(work_board(4)).unwrap();
         {
             let state = queue.state.lock().unwrap();
-            assert_eq!(state.messages.len(), 3);
-            assert_eq!(state.slots.len(), 1);
-            assert_eq!(state.queued_bulk_pages, 0);
+            assert_eq!(state.ready.messages.len(), 3);
+            assert_eq!(state.ready.slots.len(), 1);
+            assert_eq!(state.ready.bulk_pages, 0);
         }
         assert_eq!(queue.pop().unwrap().request_id, Some(1));
         let published = queue.pop().unwrap();
@@ -1191,18 +1218,18 @@ mod tests {
             queue.push(reply(2, page.clone())).unwrap();
             queue.push(work_board(3)).unwrap();
             queue.push(work_board(4)).unwrap();
-            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
+            assert_eq!(queue.state.lock().unwrap().ready.bulk_pages, 2);
             let first = queue.pop().unwrap();
             assert_eq!(first.request_id, Some(1));
             assert!(matches!(first.into_message(),
                 ServerMessage::Response { response } if response == page
             ));
-            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
+            assert_eq!(queue.state.lock().unwrap().ready.bulk_pages, 1);
             queue
                 .push(reply(3, ServerResponse::ChatListed { sessions: vec![] }))
                 .unwrap();
             assert_eq!(queue.pop().unwrap().request_id, Some(2));
-            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
+            assert_eq!(queue.state.lock().unwrap().ready.bulk_pages, 1);
             assert!(matches!(
                 queue.pop().unwrap().into_message(),
                 ServerMessage::WorkBoard { revision: 4, .. }
@@ -1211,8 +1238,8 @@ mod tests {
             assert_eq!(queue.push(reply(5, page.clone())), Err(DeliveryError::Full));
             {
                 let state = queue.state.lock().unwrap();
-                assert_eq!(state.queued_bulk_pages, 0);
-                assert!(state.slots.is_empty());
+                assert_eq!(state.ready.bulk_pages, 0);
+                assert!(state.ready.slots.is_empty());
             }
             let ServerMessage::Error(error) = queue.pop().unwrap().into_message() else {
                 panic!("bulk overflow must explain why the connection closed")
@@ -1437,6 +1464,7 @@ mod tests {
                 .map(|queued| match queued.into_message() {
                     ServerMessage::Event { sequence, .. } => format!("event {sequence}"),
                     ServerMessage::Response { .. } => "reply".into(),
+                    ServerMessage::HostShuttingDown => "shutdown".into(),
                     ServerMessage::Error(error) => format!("{:?}", error.code),
                     other => panic!("{other:?}"),
                 })
@@ -1444,7 +1472,8 @@ mod tests {
         };
 
         let queue = DeliveryQueue::new(7, 8);
-        let hold = queue.hold_broadcasts();
+        let hold = queue.replay_hold();
+        queue.hold_terminal(id);
         // A live event from the terminal's worker thread.
         queue.push(event(2)).unwrap();
         queue.push(reply.clone()).unwrap();
@@ -1455,7 +1484,8 @@ mod tests {
 
         // Held messages count toward the bound on what a client may owe.
         let queue = DeliveryQueue::new(7, 2);
-        let hold = queue.hold_broadcasts();
+        let hold = queue.replay_hold();
+        queue.hold_terminal(id);
         queue.push(event(2)).unwrap();
         hold.push(event(1)).unwrap();
         assert_eq!(queue.push(event(3)), Err(DeliveryError::Full));
@@ -1463,14 +1493,81 @@ mod tests {
         drop(hold);
         assert_eq!(order(&queue), ["QueueFull"]);
 
-        // Closing still sends what was held, ahead of the close.
+        // A shutdown notice makes the peer stop reading, so the writer
+        // must drain earlier held frames before sending it.
         let queue = DeliveryQueue::new(7, 8);
-        let hold = queue.hold_broadcasts();
+        let hold = queue.replay_hold();
+        queue.hold_terminal(id);
         queue.push(event(1)).unwrap();
+        let mut shutdown = redraw(id, 0);
+        shutdown.message = ServerMessage::HostShuttingDown;
+        queue.push(shutdown).unwrap();
         queue.close_after_drain();
         assert_eq!(queue.push(event(2)), Err(DeliveryError::Closed));
         drop(hold);
-        assert_eq!(order(&queue), ["event 1"]);
+        assert_eq!(order(&queue), ["event 1", "shutdown"]);
+    }
+
+    #[test]
+    fn replay_holds_only_its_terminals_and_coalesces_after_the_replay_boundary() {
+        use crate::terminal_ipc::WireTerminalEvent;
+
+        let id = TerminalId::new();
+        let other = TerminalId::new();
+        let queue = DeliveryQueue::new(7, 7);
+        let hold = queue.replay_hold();
+
+        // Arming the hold must not update an earlier slot across the reply.
+        queue.push(redraw(id, 1)).unwrap();
+        queue.hold_terminal(id);
+        queue.push(redraw(other, 2)).unwrap();
+        queue.push(redraw(id, 2)).unwrap();
+        let mut unrelated = redraw(id, 0);
+        unrelated.message = ServerMessage::ChatChanged { chat_id: id };
+        queue.push(unrelated).unwrap();
+        let event = |sequence, event| {
+            let mut envelope = redraw(id, 0);
+            envelope.message = ServerMessage::Event {
+                terminal_id: id,
+                sequence,
+                event,
+            };
+            envelope
+        };
+        queue.push(event(2, WireTerminalEvent::Bell)).unwrap();
+        queue
+            .push(event(
+                3,
+                WireTerminalEvent::TitleChanged {
+                    title: "Live".into(),
+                },
+            ))
+            .unwrap();
+        let mut reply = redraw(id, 0);
+        reply.request_id = Some(1);
+        reply.message = ServerMessage::Response {
+            response: ServerResponse::Accepted,
+        };
+        queue.push(reply).unwrap();
+        assert_eq!(queue.queued(), 7);
+        queue.push(redraw(id, 3)).unwrap();
+        queue.push(redraw(id, 2)).unwrap();
+        queue.push(event(4, WireTerminalEvent::Bell)).unwrap();
+        assert_eq!(queue.queued(), 7);
+
+        let next = || queue.pop().unwrap().into_message();
+        assert_eq!(next(), redraw(id, 1).message);
+        assert_eq!(next(), redraw(other, 2).message);
+        assert_eq!(next(), ServerMessage::ChatChanged { chat_id: id });
+        assert_eq!(queue.pop().unwrap().request_id, Some(1));
+        hold.push(event(1, WireTerminalEvent::Bell)).unwrap();
+        drop(hold);
+        queue.close_after_drain();
+        assert_eq!(next(), event(1, WireTerminalEvent::Bell).message);
+        assert_eq!(next(), redraw(id, 3).message);
+        assert_eq!(next(), event(2, WireTerminalEvent::Bell).message);
+        assert!(matches!(next(), ServerMessage::Event { sequence: 3, .. }));
+        assert!(queue.pop().is_none());
     }
 
     /// Pushes come from threads holding the host lock. An overflow discards
