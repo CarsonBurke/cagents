@@ -361,6 +361,62 @@ class Prebuild(unittest.TestCase):
         # The second failure is final.
         self.assertEqual(len(self.builds()), 2)
 
+    def test_idle_maintenance_trims_only_owned_failure_logs(self):
+        self.store.prepare()
+        self.verdict(self.first, True)
+        verdict = self.sentinel / "verdicts" / f"{self.first}.json"
+        now = time.time()
+
+        def failed_log(digit, size, age):
+            log = self.store.failures / f"{digit * 40}.log"
+            log.write_bytes(b"x" * size)
+            os.utime(log, (now - age, now - age))
+            return log
+
+        expired = failed_log("0", 1, prebuild.FAILURE_LOG_SECONDS + 1)
+        failure_record = expired.with_suffix(".json")
+        failure_record.write_text('{"attempts": 2, "log_tail": "details"}\n')
+        over_count = failed_log("1", 0, 40)
+        over_budget = failed_log("2", 5, 15)
+        recent = failed_log("3", 3, 20)
+        newest = failed_log("4", 3, 10)
+        outside = self.root / "outside.log"
+        outside.write_text("outside log")
+        symlink = self.store.failures / ("5" * 40 + ".log")
+        symlink.symlink_to(outside)
+        hardlink = self.store.failures / ("6" * 40 + ".log")
+        hardlink.hardlink_to(outside)
+        unrelated = self.store.failures / "notes.log"
+        unrelated.write_text("operator notes")
+
+        with patch.multiple(prebuild, FAILURE_LOG_BYTES=7, FAILURE_LOG_COUNT=2):
+            self.assertEqual(self.run_once(), 0)
+        self.assertEqual(self.builds(), [])
+        self.assertFalse(expired.exists())
+        self.assertFalse(over_budget.exists())
+        self.assertFalse(over_count.exists())
+        self.assertEqual(recent.read_bytes(), b"xxx")
+        self.assertEqual(newest.read_bytes(), b"xxx")
+        self.assertEqual(json.loads(failure_record.read_text()), {"attempts": 2, "log_tail": "details"})
+        self.assertEqual(json.loads(verdict.read_text()), {"sha": self.first, "passed": True})
+        self.assertEqual(symlink.readlink(), outside)
+        self.assertEqual(hardlink.stat().st_ino, outside.stat().st_ino)
+        self.assertEqual(outside.read_text(), "outside log")
+        self.assertEqual(unrelated.read_text(), "operator notes")
+
+    def test_a_failure_over_the_budget_keeps_a_bounded_unicode_tail_and_retry_state(self):
+        self.store.prepare()
+        build_log = self.root / "build.log"
+        tail = "\U0001f642" * prebuild.FAILURE_TAIL_CHARACTERS
+        build_log.write_bytes(b"older output\n" + tail.encode())
+        with patch.object(prebuild, "FAILURE_LOG_BYTES", 128):
+            self.store.fail(self.first, "build failed", build_log)
+        failure = self.store.failure(self.first)
+        self.assertEqual(failure["log_tail"], tail)
+        self.assertEqual(failure["attempts"], 1)
+        self.assertEqual(self.store.final_failure(self.first), failure)
+        self.assertFalse((self.store.failures / f"{self.first}.log").exists())
+
     def test_a_bundle_naming_another_commit_is_a_failure_not_a_bundle(self):
         self.compiled(self.first)
         (self.root / "other-commit").touch()
@@ -761,9 +817,13 @@ class Prebuild(unittest.TestCase):
     def test_another_run_holding_the_store_leaves_it_alone(self):
         self.compiled(self.first)
         self.store.prepare()
+        log = self.store.failures / f"{self.first}.log"
+        log.write_text("complete log")
+        os.utime(log, (0, 0))
         with (self.store.root / "lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             self.assertEqual(self.run_once(), 0)
+        self.assertEqual(log.read_text(), "complete log")
         self.assertEqual(self.builds(), [])
 
     def test_wait_reports_a_bundle_or_a_failure(self):
@@ -771,8 +831,18 @@ class Prebuild(unittest.TestCase):
         (self.root / "fail").touch()
         self.run_once()
         arguments = [PROGRAM_PATH, "--repository", str(self.repository), "--store", str(self.store.root)]
-        with patch.object(sys, "argv", [*arguments, "wait", self.first]):
-            self.assertEqual(prebuild.main(), 1)
+        log = self.store.failures / f"{self.first}.log"
+        for full_log_available in (True, False):
+            if not full_log_available:
+                os.utime(log, (0, 0))
+                self.assertEqual(self.run_once(), 0)
+                self.assertFalse(log.exists())
+            with patch.object(sys, "argv", [*arguments, "wait", self.first]), \
+                    contextlib.redirect_stdout(io.StringIO()) as output:
+                self.assertEqual(prebuild.main(), 1)
+            self.assertIn(str(log.with_suffix(".json")), output.getvalue())
+            self.assertEqual(str(log) in output.getvalue(), full_log_available)
+            self.assertIn("the build broke", self.store.failure(self.first)["log_tail"])
         # A request clears the failure, to build it again.
         (self.root / "fail").unlink()
         with patch.object(sys, "argv", [*arguments, "request", self.first]):

@@ -1118,8 +1118,12 @@ without giving up its build slot. `wait SHA [--timeout S]` blocks until the
 commit is bundled or fails. `status` lists bundles, the build running,
 requests and failures. A failed build is tried once more an hour later, in case the host
 rather than the commit failed. After that, only a request builds it again.
-Both commands refuse a commit with a failing test verdict. Build failure logs
-are under `failures/` in the store.
+Both commands refuse a commit with a failing test verdict. On startup and after
+publishing a failure log, the prebuild service removes full logs in `failures/`
+that are older than 30 days or exceed its budget of 32 logs and 128 MiB.
+It gives the most recently written logs priority. The failure record keeps
+the retry state and the last 4,000 characters of output. `wait` points to that
+record even after the full log expires.
 
 Install the service on fw16 beside the sentinel, in
 `~/.config/systemd/user/cagents-prebuild.service`:
