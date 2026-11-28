@@ -914,6 +914,111 @@ class BundledCeditor(unittest.TestCase):
             self.assertEqual(evidence['window'], observation)
 
 
+class SeedEvidence(unittest.TestCase):
+    def test_ended_provider_requires_exact_exit_and_preserved_agent(self):
+        import rehearse_update_run as scenario
+
+        before = {'agent':'a','id':'chat','run':'run','state':'idle','run_state':'succeeded'}
+        exited = {**before,'state':'exited'}
+        owner = {'agent':{'id':'a','name':'codex-ended','session':{'Chat':{'id':'chat'}}},
+                 'run':{'id':'run','state':'Succeeded'}}
+        for label, rows, code, status, live, passed in (
+            ('absent', [], 0, owner, False, True),
+            ('exited', [exited], 0, owner, False, True),
+            ('failed inventory', [], 1, owner, False, False),
+            ('malformed inventory', None, 0, owner, False, False),
+            ('session without identity', [{}], 0, owner, False, False),
+            ('duplicate session identities', [exited,exited], 0, owner, False, False),
+            ('still idle', [before], 0, owner, False, False),
+            ('provider still live', [], 0, owner, True, False),
+            ('replaced chat', [{**exited,'id':'other'}], 0, owner, False, False),
+            ('replaced run', [], 0, {**owner,'run':{'id':'other','state':'Succeeded'}}, False, False),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix='ru-ended-',dir='/var/tmp') as directory:
+                root = Path(directory)
+                registry = root/'rt/cagents/native-holders'
+                registry.mkdir(parents=True)
+                (registry/'chat.json').write_text(json.dumps({
+                    'terminal':'chat','holder':{'pid':200,'start':20},'root':{'pid':300,'start':30},
+                }))
+                rehearsal = scenario.Rehearsal(root,SCRIPT)
+                killed = False
+                def kill(*_args):
+                    nonlocal killed
+                    killed = True
+                def identity(pid):
+                    return (pid,pid//10) if not killed or live else None
+                def cli(*args, **_kwargs):
+                    if args==('--no-start','sessions','--all'):
+                        return (code if killed else 0), {'data':{'sessions':rows if killed else [before]}}
+                    self.assertEqual(args,('--no-start','agent','status','a'))
+                    return 0, {'data':status}
+                ticks = iter(range(200))
+                with patch.object(rehearsal,'cli',side_effect=cli), \
+                        patch.object(Path,'read_bytes',return_value=f'HOME={root}/home\0'.encode()), \
+                        patch.object(scenario,'process_identity',side_effect=identity), \
+                        patch.object(scenario.os,'getpgid',return_value=300), \
+                        patch.object(scenario.os,'killpg') as kill_group, \
+                        patch.object(scenario.os,'kill',side_effect=kill) as kill_holder, \
+                        patch.object(scenario.time,'monotonic',side_effect=lambda:next(ticks)), \
+                        patch.object(scenario.time,'sleep'):
+                    evidence = rehearsal.end_provider('codex-ended','a')
+                kill_group.assert_called_once_with(300,signal.SIGKILL)
+                kill_holder.assert_called_once_with(200,signal.SIGKILL)
+                self.assertEqual(evidence['exit']==0,passed)
+                self.assertEqual(not rehearsal.errors,passed)
+                if passed:
+                    self.assertEqual(evidence['after'],rows[0] if rows else None)
+                    self.assertEqual(evidence['killed_identities'],[(200,20),(300,30)])
+
+    def test_seed_records_untitled_chat_before_it_is_renamed_and_accepts_succeeded_codex(self):
+        import argparse
+        import rehearse_update_run as scenario
+
+        parser = argparse.ArgumentParser()
+        scenario.seed_options(parser)
+        args = parser.parse_args(['--untitled','1','--no-console','--no-child','--ended-provider'])
+        with tempfile.TemporaryDirectory(prefix='ru-seed-',dir='/var/tmp') as directory:
+            root = Path(directory)
+            rehearsal = scenario.Rehearsal(root,SCRIPT)
+            agents = {'chat-alpha':'claude','codex-alpha':'codex','codex-ended':'ended',
+                      'Untitled conversation 1':'untitled'}
+            initial = {'id':'untitled-chat','agent':'untitled'}
+            renamed = {**initial,'title':'Untitled conversation 1'}
+            sessions = [renamed, *({'id':f'{name}-chat','agent':name} for name in ('claude','codex','ended'))]
+            listed = [{'id':agent,'name':name,'state':'succeeded'} for name,agent in agents.items()]
+            untitled_observations = []
+            def cli(*argv, **_kwargs):
+                if argv[:2]==('agent','spawn'):
+                    name = argv[argv.index('--name')+1] if '--name' in argv else argv[-1]
+                    return 0, {'data':{'agent':{'id':agents[name]}}}
+                if argv[:2]==('channel','spawn'):
+                    return 0, {'data':{'channel':{'id':'channel'}}}
+                if argv==('--no-start','sessions','--all'):
+                    untitled_observations.append(initial)
+                    return 0, {'data':{'sessions':[initial]}}
+                if argv==('sessions','--all'):
+                    return 0, {'data':{'sessions':sessions}}
+                return 0, {'data':{argv[0]+'s':[]}}
+            def agent_record(agent_id, **_kwargs):
+                return {'agent':{'id':agent_id,'session':{'Chat':{'id':f'{agent_id}-chat'}}}}
+            def end_provider(name, agent_id):
+                self.assertEqual((name,agent_id),('codex-ended','ended'))
+                self.assertEqual(untitled_observations,[initial])
+                return {'state':'ended-provider','exit':0}
+            with patch.object(rehearsal,'require_fixture_state'), \
+                    patch.object(rehearsal,'cli',side_effect=cli), \
+                    patch.object(rehearsal,'listed_agents',return_value=listed), \
+                    patch.object(rehearsal,'agent_record',side_effect=agent_record), \
+                    patch.object(rehearsal,'end_provider',side_effect=end_provider), \
+                    patch.object(scenario.time,'sleep'), redirect_stdout(io.StringIO()):
+                self.assertFalse(rehearsal.seed(args))
+            seeds = json.loads((root/'seeds.json').read_text())
+            evidence = next(row for row in seeds['items'] if row['state']=='untitled-chat-1')
+            self.assertEqual(evidence['untitled_chat'],initial)
+            self.assertEqual(evidence['verified_chats'],[renamed])
+
+
 class ScaleSeed(unittest.TestCase):
     def module(self):
         spec = importlib.util.spec_from_file_location('rehearsal_scale', REPOSITORY/'scripts/rehearse_update_run.py')
@@ -1126,39 +1231,6 @@ class ChatViews(unittest.TestCase):
             write(cancelled, status)
             self.assertIn('update did not report the candidate first-frame failure',
                           scenario.expected_refusal(root,'window-startup','old'))
-
-            before['target'] = {'version':'new'}
-            ended = {'state':'ended-provider', 'name':'codex-ended', 'exit':0,
-                     'chat_id':next(iter(before['sessions'])), 'agent_id':next(iter(before['agents']))}
-            (root/'seeds.json').write_text(json.dumps({'items':[ended]}))
-            ended_status = {**status, 'refusal':{'sessions':[{
-                'title':'codex-ended · Ended provider · alpha',
-                'reason':'Its provider is still starting. Wait for it to finish, then try the update again.',
-            }], 'blockers':[]}}
-            write(cancelled, ended_status)
-            self.assertEqual(scenario.expected_refusal(root,'ended-provider','old'), [])
-            for name, mutate in {
-                'target':lambda job:job.update(version='different'),
-                'phase':lambda job:job.update(phase='Complete'),
-                'missing refusal':lambda job:job.pop('refusal'),
-                'expired':lambda job:job['refusal'].update(expired=True),
-                'extra blocker':lambda job:job['refusal']['blockers'].append('other blocked work'),
-                'extra session':lambda job:job['refusal']['sessions'].append({}),
-                'different session':lambda job:job['refusal']['sessions'][0].update(title='codex-alpha'),
-                'different reason':lambda job:job['refusal']['sessions'][0].update(reason='provider stopped'),
-            }.items():
-                with self.subTest(name=name):
-                    candidate = copy.deepcopy(ended_status)
-                    mutate(candidate)
-                    write(cancelled, candidate)
-                    self.assertTrue(scenario.expected_refusal(root,'ended-provider','old'))
-            write(after, ended_status)
-            self.assertIn('ended-provider refusal sent an interrupt request',
-                          scenario.expected_refusal(root,'ended-provider','old'))
-            write(cancelled, ended_status)
-            (root/'seeds.json').write_text(json.dumps({'items':[{**ended,'exit':1}]}))
-            self.assertIn('ended-provider refusal lacks the original ended Codex chat',
-                          scenario.expected_refusal(root,'ended-provider','old'))
 
             # The current installer's --stage-only selects the candidate before the
             # update; a refusal must keep that staged current and its deferred owner.
@@ -1384,7 +1456,8 @@ class ShownUpdateOutcome(unittest.TestCase):
                 text = tooltips.get(pointer["x"], shown or "Channels")
                 if pointer["popover"]:
                     text = "Application notices " + tooltips.get("popover", "")
-                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": text}]})
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800], "focused": True},
+                                      "runs": [{"text": text}]})
             return 0, ""
         rehearsal.call = call
         return rehearsal
@@ -1422,6 +1495,57 @@ class ShownUpdateOutcome(unittest.TestCase):
             self.assertIsNone(rehearsal.header_offers_update("2.0.0"))
             self.assertIn("would prove nothing", rehearsal.errors[0])
 
+    def test_header_scan_reuses_only_identical_ocr_frames_from_the_focused_window(self):
+        import rehearse_update_run as run
+        rehearsal = run.Rehearsal("/private", "fixture")
+        window = {"id": 1, "size": [1280, 800], "focused": True}
+        initial = {"window": window, "frame": "initial", "source": "ocr", "runs": []}
+        tooltip = {"window": window, "frame": "tooltip", "source": "ocr",
+                   "runs": [{"text": "Update failed: fixture"}]}
+        frames = {"initial": b"same", "unchanged": b"same", "changed": b"tooltip", "tooltip": b"tooltip"}
+        def observed(path, **geometry):
+            return 0, json.dumps({"window": window | geometry, "frame": path})
+
+        answers = iter([
+            (0, ""), observed("unchanged"),
+            (0, ""), observed("changed"), (0, json.dumps(tooltip)),
+            (0, ""), observed("changed"),
+            (0, ""), observed("changed", focused=False),
+        ])
+        with patch.object(rehearsal, "frame_pixels", side_effect=frames.get), \
+                patch.object(rehearsal, "call", side_effect=answers) as call:
+            scan = rehearsal.header_observations(window, initial, 21, 24, 96, 120)
+            self.assertEqual(next(scan), (1160, initial))
+            self.assertEqual(next(scan), (1136, tooltip))
+            # The open/read/close/read notices flow reuses the same driver
+            # screenshot filename after the scan gives the result back.
+            frames["tooltip"] = b"closed popover"
+            self.assertEqual(list(scan), [(1112, tooltip), (1088, None)])
+
+        self.assertEqual([step.args for step in call.call_args_list], [
+            ("drive", "hover", "1160,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "hover", "1136,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "--json", "observe"),
+            ("drive", "hover", "1112,21"), ("drive", "--json", "observe", "--no-text"),
+            ("drive", "hover", "1088,21"), ("drive", "--json", "observe", "--no-text"),
+        ])
+
+    def test_header_scan_reads_accessibility_observations_even_when_the_pixels_match(self):
+        import rehearse_update_run as run
+        rehearsal = run.Rehearsal("/private", "fixture")
+        window = {"id": 1, "size": [1280, 800], "focused": True}
+        initial = {"window": window, "frame": "same", "source": "a11y+ocr", "runs": []}
+        tooltip = initial | {"runs": [{"text": "Update failed: fixture"}]}
+        with patch.object(rehearsal, "frame_pixels") as pixels, \
+                patch.object(rehearsal, "call", side_effect=[(0, ""), (0, json.dumps(tooltip))]) as call:
+            results = list(rehearsal.header_observations(window, initial, 21, 24, 24, 120))
+
+        pixels.assert_not_called()
+        self.assertEqual(results, [(1160, tooltip)])
+        self.assertEqual([step.args for step in call.call_args_list], [
+            ("drive", "hover", "1160,21"), ("drive", "--json", "observe"),
+        ])
+
     def test_a_notices_popover_that_does_not_open_is_an_unknown_outcome(self):
         import rehearse_update_run as run
         with tempfile.TemporaryDirectory() as directory:
@@ -1456,7 +1580,8 @@ class ShownUpdateOutcome(unittest.TestCase):
             shown = iter(["Channels", "Channels", "Update failed: protocol 203"])
             def call(*args, **_):
                 if args[:2] == ("drive", "--json"):
-                    return 0, json.dumps({"window": {"id": 1}, "runs": [{"text": next(shown, "Channels")}]})
+                    return 0, json.dumps({"window": {"id": 1, "focused": True},
+                                          "runs": [{"text": next(shown, "Channels")}]})
                 return 0, ""
             rehearsal.call = call
             with patch.object(run.time, "sleep"):
@@ -1491,7 +1616,8 @@ class ShownUpdateOutcome(unittest.TestCase):
                 order.append("launch")
                 windows["main"] = {"id": 1, "pid": 10 if same_window else 11}
             elif args[:2] == ("drive", "--json") and tooltips is None:
-                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800]}, "runs": [{"text": shown}]})
+                return 0, json.dumps({"window": {"id": 1, "size": [1280, 800], "focused": True},
+                                      "runs": [{"text": shown}]})
             return watched(*args, **kwargs)
         rehearsal.call = call
         rehearsal.open_windows = lambda slots: [call("launch", slot) for slot in slots]

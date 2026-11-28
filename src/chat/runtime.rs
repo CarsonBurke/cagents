@@ -1,4 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
+#[cfg(target_os = "linux")]
+use super::native_holder::NativeExit;
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, HeldStop, MetadataWake, ProcessSpec, SetupError, Step, TransportSpec},
@@ -40,6 +42,8 @@ pub use handle::RetainedInputOutcome;
 /// Process evidence only, without the reader lease: no retirement authority.
 pub use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
+#[cfg(target_os = "linux")]
+pub(super) use retained_actor::execution_exit::native_holder_exit;
 #[cfg(any(test, feature = "test-support"))]
 pub use retained_actor::journal::ContinuityLoss;
 pub use retained_actor::journal::OutboxEntry;
@@ -484,6 +488,8 @@ struct Inner {
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    native_exit_pending: Arc<AtomicBool>,
     history_only: bool,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     /// Milliseconds a launched server spent blocked behind another process's
@@ -496,12 +502,42 @@ struct Inner {
 }
 
 enum NativeOwnership {
-    New(Box<super::Session>, BTreeMap<String, String>),
+    New(
+        Box<super::Session>,
+        BTreeMap<String, String>,
+        Option<UpgradeRestoreQueueBudget>,
+    ),
     Adopted(
         Box<super::native_holder::Holder>,
         crate::daemon::holder_registry::Process,
     ),
 }
+
+/// File-lock wait shared by the daemon's entire upgrade restore. An actor
+/// charges each sample as it waits, even before it can publish a chat.
+#[derive(Clone)]
+pub struct UpgradeRestoreQueueBudget(Arc<AtomicU64>);
+
+impl Default for UpgradeRestoreQueueBudget {
+    fn default() -> Self {
+        const LIMIT: Duration = Duration::from_secs(60);
+        Self(Arc::new(AtomicU64::new(LIMIT.as_nanos() as u64)))
+    }
+}
+
+impl UpgradeRestoreQueueBudget {
+    fn exhausted_after(&self, waited: Duration) -> bool {
+        let nanos = u64::try_from(waited.as_nanos()).unwrap_or(u64::MAX);
+        let before = self
+            .0
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                Some(remaining.saturating_sub(nanos))
+            })
+            .expect("the lock queue budget debit always updates the counter");
+        nanos >= before
+    }
+}
+
 /// Why the provider actor did not queue a command.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum QueueRefusal {
@@ -567,6 +603,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         recovery_environment: BTreeMap<String, String>,
+        upgrade_queue_budget: Option<UpgradeRestoreQueueBudget>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         let id = source.launch.session_id.clone();
@@ -576,7 +613,11 @@ impl LocalHandle {
             initial,
             store,
             id,
-            Some(NativeOwnership::New(Box::new(source), recovery_environment)),
+            Some(NativeOwnership::New(
+                Box::new(source),
+                recovery_environment,
+                upgrade_queue_budget,
+            )),
             notify,
         )
     }
@@ -685,9 +726,11 @@ impl LocalHandle {
         // Compare the reconstructible launch context, before the daemon adds
         // its transient capability and matched CLI path. Never persist those
         // additions or weaken comparisons of the user's selected environment.
-        let recovery_environment = match &ownership {
-            Some(NativeOwnership::New(_, environment)) => environment.clone(),
-            _ => spec.environment.clone(),
+        let (recovery_environment, upgrade_queue_budget) = match &ownership {
+            Some(NativeOwnership::New(_, environment, budget)) => {
+                (environment.clone(), budget.clone())
+            }
+            _ => (spec.environment.clone(), None),
         };
         if !matches!(spec.transport, TransportSpec::History)
             && !matches!(&ownership, Some(NativeOwnership::Adopted(..)))
@@ -741,13 +784,15 @@ impl LocalHandle {
         };
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let native_exit_pending = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let startup_budget = StartupBudget::current();
         #[cfg(any(test, feature = "test-support"))]
         let idle_frame_buffer_capacity = Arc::new(AtomicUsize::new(usize::MAX));
         let native_holder = match ownership {
-            Some(NativeOwnership::New(source, _))
+            Some(NativeOwnership::New(source, _, _))
                 if matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { .. }) =>
             {
                 Some(super::native_holder::spawn(spec.clone(), *source)?)
@@ -825,6 +870,8 @@ impl LocalHandle {
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
+            #[cfg(target_os = "linux")]
+            native_exit_pending: native_exit_pending.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             provider_process: provider_process.clone(),
             startup_lock_wait: startup_lock_wait.clone(),
@@ -848,6 +895,7 @@ impl LocalHandle {
                     child: None,
                     native_holder,
                     startup_lock_wait,
+                    upgrade_queue_budget,
                     reconnect_only_reported: false,
                     command_stops: 0,
                     expected_native_peer,
@@ -971,6 +1019,17 @@ impl LocalHandle {
                         || (unexpected_loss && native_installed.load(Ordering::Acquire)))
                         && !release_native.load(Ordering::Acquire)
                         || (adopted_native && !native_installed.load(Ordering::Acquire)));
+                #[cfg(target_os = "linux")]
+                let abandoned_holder = preserve_holder
+                    && unexpected_loss
+                    && native_installed.load(Ordering::Acquire)
+                    && !preserve_native.load(Ordering::Acquire)
+                    && actor.native_holder.as_mut().is_some_and(|holder| {
+                        matches!(holder.retire_after_transport_loss(), Ok(NativeExit::Exited))
+                    });
+                #[cfg(target_os = "macos")]
+                let abandoned_holder = false;
+                let preserve_holder = preserve_holder && !abandoned_holder;
                 if let Err(error) = result {
                     // A lost local actor does not prove that the retained
                     // provider turn failed. Recovery must obtain its outcome.
@@ -998,7 +1057,8 @@ impl LocalHandle {
                         actor.publish_current_attention(evidence);
                     }
                 }
-                let had_provider = actor.child.is_some() || actor.native_holder.is_some();
+                let had_native_holder = actor.native_holder.is_some();
+                let had_provider = actor.child.is_some() || had_native_holder;
                 let mut direct_closed = true;
                 let code = actor.child.as_mut().and_then(|child| {
                     let code = child
@@ -1039,7 +1099,9 @@ impl LocalHandle {
                     code
                 });
                 let native_closed = if let Some(mut holder) = actor.native_holder.take() {
-                    if preserve_holder {
+                    if abandoned_holder {
+                        true
+                    } else if preserve_holder {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
@@ -1055,6 +1117,12 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                #[cfg(target_os = "linux")]
+                let deferred_native_exit = (preserve_holder || !native_closed)
+                    && !actor.stop.load(Ordering::Acquire)
+                    && !preserve_native.load(Ordering::Acquire);
+                #[cfg(target_os = "linux")]
+                native_exit_pending.store(deferred_native_exit, Ordering::Release);
                 actor.settle_compaction(if shared_websocket || preserve_holder || !direct_closed || !native_closed {
                     crate::agent_execution::CompactionOutcome::Unconfirmed(
                         "The connection to the original provider closed before compaction was confirmed".into(),
@@ -1077,6 +1145,9 @@ impl LocalHandle {
                         tracing::warn!(%error, "steps left running could not be marked stopped");
                     }
                     let mut state = actor.state.lock().unwrap_or_else(|p| p.into_inner());
+                    if had_native_holder && native_closed {
+                        state.native_continuity = super::NativeContinuity::ReconnectOnly;
+                    }
                     stop_snapshot_subagents(&mut state);
                     if !shared_websocket {
                         stop_snapshot_steps(&mut state);
@@ -1117,6 +1188,10 @@ impl LocalHandle {
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
+                }
+                #[cfg(target_os = "linux")]
+                if deferred_native_exit {
+                    crate::daemon::wake();
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -1276,7 +1351,7 @@ impl LocalHandle {
         if exiting
             && matches!(
                 command,
-                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh | Command::Seek { .. }
             )
         {
             let cached = page_command(&self.0.store, &command).map_err(Rejection::Refused)?;
@@ -1635,6 +1710,7 @@ impl LocalHandle {
                     state.has_earlier = window.has_earlier;
                     state.has_later = window.has_later;
                     fill = store.wants_fill();
+                    state.history = window.history;
                 }
                 Err(error) => {
                     state.error = Some(format!("Cannot page owned transcript cache: {error}"))
@@ -1700,6 +1776,7 @@ impl LocalHandle {
                         state.has_earlier = window.has_earlier;
                         state.has_later = window.has_later;
                         fill = store.wants_fill();
+                        state.history = window.history;
                         window.changes
                     }
                     Err(error) => {
@@ -1852,6 +1929,78 @@ impl LocalHandle {
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
     }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn native_exit_pending(&self) -> bool {
+        self.0.native_installed.load(Ordering::Acquire)
+            && self.0.native_exit_pending.load(Ordering::Acquire)
+            && !self.0.stop.load(Ordering::Acquire)
+            && !self.0.preserve_native.load(Ordering::Acquire)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settle_lost_native_owner(&self) -> NativeExit {
+        if !self.native_exit_pending() {
+            return NativeExit::Unobservable;
+        }
+        // Keep explicit Close serialized with the retry and let the worker
+        // publish its own result first. The worker's wake can reach lifecycle
+        // maintenance before its thread has returned.
+        let Ok(worker) = self.0.worker.try_lock() else {
+            return NativeExit::Pending;
+        };
+        if !self.native_exit_pending() {
+            return NativeExit::Unobservable;
+        }
+        if !worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            return NativeExit::Pending;
+        }
+        let mut retained = self
+            .0
+            .retained_native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let mut detached = self
+            .0
+            .detached_native
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        let settled = match (retained.as_mut(), detached.as_ref()) {
+            (Some(holder), None) => holder.retire_after_transport_loss(),
+            (None, Some(owner)) => owner.retire_after_transport_loss(),
+            _ => Ok(NativeExit::Unobservable),
+        };
+        match settled {
+            Ok(NativeExit::Exited) => {}
+            Ok(NativeExit::Unobservable) => {
+                self.0.native_exit_pending.store(false, Ordering::Release);
+                return NativeExit::Unobservable;
+            }
+            Ok(exit) => return exit,
+            Err(_) => return NativeExit::Pending,
+        }
+        retained.take();
+        detached.take();
+        let generation = {
+            let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
+            state.native_continuity = super::NativeContinuity::ReconnectOnly;
+            state.generation += 1;
+            state.generation
+        };
+        // A provider that outlived its worker might have consumed its queue.
+        // Do not recover the actor's last unconfirmed copy of that input.
+        self.0.completed.store(true, Ordering::Release);
+        self.0.native_exit_pending.store(false, Ordering::Release);
+        drop(detached);
+        drop(retained);
+        drop(worker);
+        (self.0.notify)(Update::Observed { generation });
+        if self.0.visible.load(Ordering::Acquire) {
+            (self.0.notify)(Update::Presentation);
+        }
+        NativeExit::Exited
+    }
+
     fn exited_recovery_queue(&self) -> Option<Arc<[super::QueuedMessage]>> {
         self.0
             .exited_recovery_queue
@@ -2059,6 +2208,10 @@ impl LocalHandle {
     }
     pub(crate) fn commit_native_installation(&self) {
         self.0.native_installed.store(true, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        if self.native_exit_pending() {
+            crate::daemon::wake();
+        }
     }
 
     pub(crate) fn native_continuity(&self) -> super::NativeContinuity {
@@ -2822,6 +2975,7 @@ struct Actor {
     child: Option<ChildGuard>,
     native_holder: Option<super::native_holder::Holder>,
     startup_lock_wait: Arc<AtomicU64>,
+    upgrade_queue_budget: Option<UpgradeRestoreQueueBudget>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
     /// Commands memory exhaustion stopped while this actor ran.
@@ -3924,7 +4078,7 @@ impl Actor {
             };
             if matches!(
                 command,
-                Command::LoadEarlier | Command::LoadLater | Command::Refresh
+                Command::LoadEarlier | Command::LoadLater | Command::Refresh | Command::Seek { .. }
             ) {
                 match page_command(&self.store, &command) {
                     Ok(cached) => {
@@ -4824,6 +4978,7 @@ fn page_command(store: &Mutex<Store>, command: &Command) -> Result<bool, String>
     match command {
         Command::LoadEarlier => store.earlier(),
         Command::LoadLater => store.later(),
+        Command::Seek { index } => store.seek(*index),
         Command::Refresh => {
             store.latest();
             Ok(false)
@@ -5053,6 +5208,7 @@ fn apply_projected_event(
             state.opening_title = None;
             state.has_earlier = false;
             state.has_later = false;
+            state.history = Default::default();
             state.history_loading = false;
             state.detail = reason;
             state.busy = false;
@@ -5306,7 +5462,12 @@ fn apply_projected_event(
                 agent.items.retain(|item| !ids.contains(&item.id));
             }
         }
-        Event::History { items, has_earlier } | Event::LatestHistory { items, has_earlier } => {
+        Event::History {
+            items, has_earlier, ..
+        }
+        | Event::LatestHistory {
+            items, has_earlier, ..
+        } => {
             state.history_loading = false;
             let mut run = Vec::new();
             let mut after = None;

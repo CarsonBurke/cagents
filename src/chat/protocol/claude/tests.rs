@@ -140,6 +140,7 @@ fn saved_untyped_blocks_are_skipped_but_live_frames_stay_strict() {
         {"type":"text","text":"Still readable"},
     ]);
     let record = HistoryRecord {
+        stop_markers: Vec::new(),
         frame: frame(content),
         tool_calls: HashMap::new(),
         gap: None,
@@ -5153,6 +5154,7 @@ fn saved_instructions_without_their_call_load_nowhere() {
     adapter
         .history_message(
             &HistoryRecord {
+                stop_markers: Vec::new(),
                 frame: json!({"type":"assistant","uuid":"call","message":{"id":"msg-call","role":"assistant","content":[{"type":"tool_use","id":"toolu_skill","name":"Skill","input":{"skill":"release-notes"}}]}}),
                 tool_calls: HashMap::new(),
                 gap: None,
@@ -5164,6 +5166,7 @@ fn saved_instructions_without_their_call_load_nowhere() {
     adapter
         .history_message(
             &HistoryRecord {
+                stop_markers: Vec::new(),
                 frame: json!({"type":"user","uuid":"instructions","isMeta":true,"sourceToolUseID":"toolu_skill","message":{"role":"user","content":[{"type":"text","text":SKILL_BODY}]}}),
                 tool_calls: HashMap::new(),
                 gap: None,
@@ -9354,6 +9357,7 @@ fn history_notification_rendering_does_not_settle_live_owners() {
     let frame = notification_frame("old-history", "tool-one", "task-one", "completed");
     let expected = delivery(&frame);
     let record = HistoryRecord {
+        stop_markers: Vec::new(),
         frame: frame.clone(),
         tool_calls: HashMap::new(),
         gap: None,
@@ -10599,45 +10603,69 @@ fn interrupted_ack_does_not_claim_turn_or_background_task_finished() {
 #[test]
 fn correlated_run_keeps_its_identity_when_interrupt_ack_follows_the_next_prompt() {
     use crate::agent_execution::ProviderEvent;
-    let mut adapter = Claude {
-        ready: true,
-        ..Claude::default()
-    };
-    let first = crate::model::RunId::new();
-    let prompt = |text: &str| Command::Prompt {
-        text: text.into(),
-        attachments: Vec::new(),
-        mode: PromptMode::Send,
-    };
-    adapter
-        .command_for_run(first, prompt("first prompt"))
-        .unwrap();
-    let interrupt = adapter.command(Command::Interrupt).unwrap();
-    let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
-    let settled = adapter
-        .receive(json!({"type":"result","uuid":"first-result","is_error":false}))
-        .unwrap();
-    assert!(settled.events.iter().any(|event| matches!(event,
-        Event::Execution { run, event: ProviderEvent::Settled } if *run == first)));
-    assert!(!settled.events.iter().any(|event| matches!(
-        event,
-        Event::Execution {
-            event: ProviderEvent::Finished { .. },
-            ..
+    for second_settled in [false, true] {
+        const SESSION: &str = "b5d3e388-294b-425d-a53c-1a9e1edd015e";
+        let private = tempfile::tempdir().unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            session_id: Some(SESSION.into()),
+            stop_marker_root: Some(private.path().into()),
+            ..Claude::default()
+        };
+        let first = crate::model::RunId::new();
+        let prompt = |text: &str| Command::Prompt {
+            text: text.into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        let first_prompt = adapter
+            .command_for_run(first, prompt("first prompt"))
+            .unwrap();
+        let first_prompt = first_prompt.writes[0]["uuid"].as_str().unwrap();
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let request_id = interrupt.writes[0]["request_id"].as_str().unwrap();
+        let settled = adapter
+            .receive(
+                json!({"type":"result","uuid":"first-result","subtype":"success",
+                "terminal_reason":"aborted_streaming","is_error":false}),
+            )
+            .unwrap();
+        assert!(settled.events.iter().any(|event| matches!(event,
+            Event::Execution { run, event: ProviderEvent::Settled } if *run == first)));
+        assert!(!settled.events.iter().any(|event| matches!(
+            event,
+            Event::Execution {
+                event: ProviderEvent::Finished { .. },
+                ..
+            }
+        )));
+        let second = crate::model::RunId::new();
+        adapter
+            .command_for_run(second, prompt("second prompt"))
+            .unwrap();
+        let second_result = json!({"type":"result","uuid":"second-result","is_error":false});
+        if second_settled {
+            assert!(adapter.receive(second_result.clone()).unwrap().events.iter().any(|event| matches!(event,
+                Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *run == second)));
         }
-    )));
-    let second = crate::model::RunId::new();
-    adapter
-        .command_for_run(second, prompt("second prompt"))
-        .unwrap();
-    let ack = adapter.receive(reply(request_id, json!({}))).unwrap();
-    assert!(ack.events.iter().any(|event| matches!(event,
-        Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Cancelled } } if *run == first)));
-    let second_result = adapter
-        .receive(json!({"type":"result","uuid":"second-result","is_error":false}))
-        .unwrap();
-    assert!(second_result.events.iter().any(|event| matches!(event,
-        Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *run == second)));
+        let ack = adapter.receive(reply(request_id, json!({}))).unwrap();
+        assert!(ack.suppress_current_notification);
+        assert!(ack.events.iter().any(|event| matches!(event,
+            Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Cancelled } } if *run == first)));
+        assert_eq!(last_status(&ack), None);
+        assert!(last_items(&ack.events).is_empty());
+        let saved = stop_markers::load(private.path(), SESSION).unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].id, "first-result:stopped");
+        assert_eq!(
+            saved[0].anchors.first().map(String::as_str),
+            Some(first_prompt)
+        );
+        if !second_settled {
+            assert!(adapter.receive(second_result).unwrap().events.iter().any(|event| matches!(event,
+                Event::Execution { run, event: ProviderEvent::Finished { outcome: crate::notifications::Kind::Succeeded } } if *run == second)));
+        }
+    }
 }
 
 #[test]
@@ -14742,6 +14770,7 @@ fn a_saved_stop_reads_as_the_live_one() {
         json!({"type":"user","uuid":"next","parent_tool_use_id":null,"message":{"role":"user","content":"Carry on differently"}}),
     ] {
         let record = HistoryRecord {
+            stop_markers: Vec::new(),
             frame,
             tool_calls: HashMap::new(),
             gap: None,
@@ -14922,9 +14951,9 @@ fn stopping_a_foreground_agent_settles_its_running_call_in_its_transcript() {
             .events,
     );
     adapter.command(Command::Interrupt).unwrap();
-    // A second press asks for what the first did, and is no failure.
+    // A second press resends an unanswered stop.
     let again = adapter.command(Command::Interrupt).unwrap();
-    assert!(again.writes.is_empty(), "{:?}", again.writes);
+    assert_eq!(again.writes[0]["request"]["subtype"], "interrupt");
     events.extend(
         adapter
             .receive(json!({"type":"user","uuid":"agent-refusal","parent_tool_use_id":null,"tool_use_result":"User rejected tool use","message":{"role":"user","content":[
@@ -15119,6 +15148,267 @@ fn an_acknowledged_stop_ends_its_turn_stopped_though_it_succeeded() {
             .events,
     );
     assert_stopped_turn(&events, "an acknowledged stop of a turn that succeeded");
+}
+
+#[test]
+fn a_confirmed_stop_survives_reopening_without_a_provider_record() {
+    const SESSION: &str = "4a6def45-da52-4c57-a1bc-1932312dab8e";
+    let private = tempfile::tempdir().unwrap();
+    let root = private.path().join("stop-markers");
+    let mut adapter = Claude {
+        ready: true,
+        session_id: Some(SESSION.into()),
+        stop_marker_root: Some(root.clone()),
+        ..Claude::default()
+    };
+    let prompt = adapter
+        .send_prompt("Check the logs".into(), vec![], PromptMode::Send)
+        .unwrap()
+        .writes
+        .pop()
+        .unwrap();
+    let call = stop_call();
+    adapter.receive(call.clone()).unwrap();
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    adapter
+        .receive(reply(
+            interrupt.writes[0]["request_id"].as_str().unwrap(),
+            json!({}),
+        ))
+        .unwrap();
+    let step = adapter
+        .receive(
+            json!({"type":"result","uuid":"done","subtype":"success","is_error":false,
+            "command_uuid":prompt["uuid"]}),
+        )
+        .unwrap();
+    assert_stopped_turn(&step.events, "live");
+
+    let mut transcript = tempfile::NamedTempFile::new_in(private.path()).unwrap();
+    writeln!(transcript, "{prompt}").unwrap();
+    writeln!(transcript, "{call}").unwrap();
+    let after = |index| {
+        json!({"type":"user","uuid":format!("later-{index}"),
+        "message":{"role":"user","content":format!("Later prompt {index}")}})
+    };
+    for index in 0..100 {
+        writeln!(transcript, "{}", after(index)).unwrap();
+    }
+
+    let mut history = History::index_for_start(
+        transcript.reopen().unwrap(),
+        SESSION,
+        4096,
+        16,
+        stop_markers::load(&root, SESSION).unwrap(),
+    )
+    .unwrap();
+    let mut replay = Claude::default();
+    let mut latest = Step::default();
+    for record in history.page().unwrap() {
+        replay.history_message(&record, &mut latest).unwrap();
+    }
+    assert!(
+        !last_items(&latest.events)
+            .iter()
+            .any(|item| chat::is_stopped_notice(&item.content))
+    );
+    let mut earlier = Step::default();
+    for record in history.page().unwrap() {
+        replay.history_message(&record, &mut earlier).unwrap();
+    }
+    let earlier = last_items(&earlier.events);
+    let last = earlier.last().unwrap();
+    assert_eq!(last.id, "done:stopped");
+    assert!(chat::is_stopped_notice(&last.content));
+    assert_eq!(earlier[earlier.len() - 2].id, "toolu_stop");
+}
+
+#[test]
+fn a_provider_stop_record_replaces_only_its_own_fallback_on_replay() {
+    for scheduled in [false, true] {
+        let mut transcript = tempfile::NamedTempFile::new().unwrap();
+        for frame in [
+            json!({"type":"user","uuid":"prompt","message":{"role":"user","content":"Check the logs"}}),
+            stop_call(),
+            stop_refusal(),
+        ] {
+            writeln!(transcript, "{frame}").unwrap();
+        }
+        if scheduled {
+            let prompt = json!({"type":"user","uuid":"scheduled","isMeta":true,
+                "promptSource":"system","turnOrigin":"scheduled",
+                "message":{"role":"user","content":"Continue from where you left off."}});
+            writeln!(transcript, "{prompt}").unwrap();
+        }
+        let record = stop_record_frame("recorded-stop", "[Request interrupted by user]");
+        writeln!(transcript, "{record}").unwrap();
+        let mut history = History::index_for_start(
+            transcript.reopen().unwrap(),
+            "4a6def45-da52-4c57-a1bc-1932312dab8e",
+            4096,
+            16,
+            vec![StopReceipt {
+                id: "fallback:stopped".into(),
+                anchors: vec!["call-carrier".into()],
+            }],
+        )
+        .unwrap();
+        let mut adapter = Claude::default();
+        let mut replay = Step::default();
+        for record in history.page().unwrap() {
+            adapter.history_message(&record, &mut replay).unwrap();
+        }
+        let ids = last_items(&replay.events)
+            .into_iter()
+            .filter(|item| chat::is_stopped_notice(&item.content))
+            .map(|item| item.id)
+            .collect::<Vec<_>>();
+        let expected = if scheduled {
+            &["fallback:stopped", "recorded-stop:0"][..]
+        } else {
+            &["recorded-stop:0"][..]
+        };
+        assert_eq!(ids, expected, "scheduled {scheduled}");
+    }
+}
+
+#[test]
+fn a_late_interrupt_reply_cannot_mark_a_completed_turn_stopped() {
+    for result in [
+        json!({"type":"result","uuid":"done","subtype":"success","is_error":false}),
+        json!({"type":"result","uuid":"done","subtype":"success","is_error":false,"stop_reason":"tool_use"}),
+    ] {
+        const SESSION: &str = "de21a018-2647-4f02-9008-b69175d12d4a";
+        let private = tempfile::tempdir().unwrap();
+        let mut adapter = Claude {
+            ready: true,
+            session_id: Some(SESSION.into()),
+            stop_marker_root: Some(private.path().into()),
+            ..Claude::default()
+        };
+        adapter
+            .send_prompt("Review the logs".into(), vec![], PromptMode::Send)
+            .unwrap();
+        let interrupt = adapter.command(Command::Interrupt).unwrap();
+        let settled = adapter.receive(result).unwrap();
+        assert_eq!(last_status(&settled), Some((false, "Claude turn complete")));
+        let ack = adapter
+            .receive(reply(
+                interrupt.writes[0]["request_id"].as_str().unwrap(),
+                json!({}),
+            ))
+            .unwrap();
+        assert_eq!(last_status(&ack), None);
+        assert!(last_items(&ack.events).is_empty());
+        assert!(
+            stop_markers::load(private.path(), SESSION)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn a_refused_stop_leaves_the_aborted_result_visible() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    let interrupt = adapter.command(Command::Interrupt).unwrap();
+    let result = adapter.receive(stopped_result()).unwrap();
+    assert!(errors(&result.events).is_empty());
+    let rejected = adapter
+        .receive(json!({"type":"control_response","response":{
+            "request_id":interrupt.writes[0]["request_id"],"subtype":"error","error":"already ended"
+        }}))
+        .unwrap();
+    assert!(
+        errors(&rejected.events)
+            .iter()
+            .any(|message| message.starts_with("[ede_diagnostic]"))
+    );
+    assert!(rejected.events.iter().any(|event| matches!(
+        event,
+        Event::TurnFinished {
+            outcome: crate::notifications::Kind::Failed,
+            ..
+        }
+    )));
+    assert!(last_items(&rejected.events).is_empty());
+}
+
+#[test]
+fn a_retry_can_confirm_a_stop_after_its_result() {
+    let mut adapter = Claude {
+        ready: true,
+        busy: true,
+        ..Claude::default()
+    };
+    adapter.receive(stop_call()).unwrap();
+    adapter
+        .receive(approval("background-1", "Bash", json!({"command":"true"})))
+        .unwrap();
+    let first = adapter.command(Command::Interrupt).unwrap();
+    let retry = adapter.command(Command::Interrupt).unwrap();
+    let third = adapter.command(Command::Interrupt).unwrap();
+    assert!(third.writes.is_empty());
+    let first = first.writes[0]["request_id"].as_str().unwrap();
+    let retry = retry.writes[0]["request_id"].as_str().unwrap();
+    assert_ne!(first, retry);
+    let result = adapter.receive(stopped_result()).unwrap();
+    assert!(errors(&result.events).is_empty());
+    assert_eq!(
+        last_status(&result),
+        Some((true, "Claude turn ended; decisions remain"))
+    );
+    assert!(adapter.outcome_pending());
+    let refused = adapter
+        .receive(json!({"type":"control_response","response":{
+            "request_id":retry,"subtype":"error","error":"already settled"
+        }}))
+        .unwrap();
+    assert!(refused.events.is_empty());
+    assert!(adapter.outcome_pending());
+
+    let ack = adapter.receive(reply(first, json!({}))).unwrap();
+    assert!(!adapter.outcome_pending());
+    assert!(errors(&ack.events).is_empty());
+    let items = last_items(&ack.events);
+    assert_eq!(
+        items
+            .iter()
+            .find(|item| item.id == "toolu_stop")
+            .unwrap()
+            .content
+            .status(),
+        Some(ToolStatus::Stopped)
+    );
+    assert!(
+        items
+            .iter()
+            .any(|item| item.id == "stopped-result:stopped"
+                && chat::is_stopped_notice(&item.content))
+    );
+    assert!(ack.events.iter().any(|event| matches!(
+        event,
+        Event::TurnFinished {
+            outcome: crate::notifications::Kind::Cancelled,
+            ..
+        }
+    )));
+    let answered = adapter
+        .command(Command::Answer {
+            request_id: "background-1".into(),
+            action: "deny".into(),
+            answers: vec![],
+        })
+        .unwrap();
+    assert_eq!(
+        last_status(&answered),
+        Some((false, chat::TURN_INTERRUPTED))
+    );
 }
 
 /// Claude Code's own stream for two Reads of large PNGs, recorded from the

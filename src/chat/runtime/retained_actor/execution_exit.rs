@@ -4,7 +4,10 @@ use crate::{daemon::holder_registry::Process, pinned_process::PinnedProcess};
 use std::io;
 
 pub(super) enum Observation {
-    Running,
+    Running {
+        #[cfg(target_os = "linux")]
+        pin: PinnedProcess,
+    },
     Exited(ExecutionExit),
 }
 
@@ -93,6 +96,43 @@ fn abandoned_with_policy(
             Err(error) => return Err(format!("Cannot establish exact process absence: {error}")),
         }
     }
+    groups_empty(proc, &groups, false)
+}
+
+/// A local holder that lost its transport has exact identities for its
+/// launcher and server. Once their execution ends, a parent's wait can
+/// still be outstanding. Keep the exit pins through the survivor scan.
+#[cfg(target_os = "linux")]
+pub(in crate::chat) fn native_holder_exit(
+    holder: &Process,
+    root: &Process,
+    server: &Process,
+) -> Result<crate::chat::native_holder::NativeExit, String> {
+    use crate::chat::native_holder::NativeExit;
+
+    let server = (server != root).then_some(server);
+    let mut exits = Vec::with_capacity(3);
+    let mut groups = Vec::with_capacity(3);
+    for process in [Some(holder), Some(root), server].into_iter().flatten() {
+        match observe(process)? {
+            Observation::Running { pin } => return Ok(NativeExit::Waiting(pin)),
+            Observation::Exited(exit) => exits.push(exit),
+        }
+        groups.push(process.pid);
+    }
+    if groups_empty(std::path::Path::new("/proc"), &groups, true)? {
+        Ok(NativeExit::Exited)
+    } else {
+        Ok(NativeExit::Pending)
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn groups_empty(
+    proc: &std::path::Path,
+    groups: &[i32],
+    allow_exited: bool,
+) -> Result<bool, String> {
     let entries = std::fs::read_dir(proc)
         .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
     for entry in entries {
@@ -131,11 +171,26 @@ fn abandoned_with_policy(
         ) else {
             return Err(format!("Process {pid} has an unreadable group identity"));
         };
-        if [group, session].iter().any(|id| groups.contains(id)) {
+        if [group, session].iter().any(|id| groups.contains(id))
+            && !(allow_exited && group_member_exited(pid)?)
+        {
             return Ok(false);
         }
     }
     Ok(true)
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn group_member_exited(pid: i32) -> Result<bool, String> {
+    // /proc stat can describe a zombie thread-group leader whose other
+    // threads are still alive. Poll the process, not its leader's state.
+    match PinnedProcess::open_unreaped(pid as u32) {
+        Ok(process) => process.exited().map_err(|error| error.to_string()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(true),
+        Err(error) => Err(format!(
+            "Cannot pin process {pid} in the native holder's group: {error}"
+        )),
+    }
 }
 
 pub(super) fn observe(expected: &Process) -> Result<Observation, String> {
@@ -166,7 +221,10 @@ pub(super) fn observe(expected: &Process) -> Result<Observation, String> {
     }
     match pin.exited() {
         Ok(true) => Ok(Observation::Exited(ExecutionExit { _pidfd: Some(pin) })),
-        Ok(false) => Ok(Observation::Running),
+        Ok(false) => Ok(Observation::Running {
+            #[cfg(target_os = "linux")]
+            pin,
+        }),
         Err(error) => Err(format!(
             "Cannot observe exact retained helper exit: {error}"
         )),
@@ -197,14 +255,20 @@ mod tests {
                 .unwrap(),
         );
         let identity = Process::read(owner.0.id() as i32).unwrap();
-        assert!(matches!(observe(&identity).unwrap(), Observation::Running));
+        assert!(matches!(
+            observe(&identity).unwrap(),
+            Observation::Running { .. }
+        ));
         let mut old = identity.clone();
         old.start += 1;
         assert!(matches!(observe(&old).unwrap(), Observation::Exited(_)));
-        assert!(matches!(observe(&identity).unwrap(), Observation::Running));
+        assert!(matches!(
+            observe(&identity).unwrap(),
+            Observation::Running { .. }
+        ));
         owner.0.kill().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while matches!(observe(&identity).unwrap(), Observation::Running) {
+        while matches!(observe(&identity).unwrap(), Observation::Running { .. }) {
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
         }

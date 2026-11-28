@@ -603,5 +603,27 @@ mod tests {
             .map(|(_, source)| read(&store, source.as_ref().unwrap()).unwrap())
             .collect();
         assert_eq!(copies, vec![text, "distinct answer".into()]);
+        let mut residents = window.items;
+        let original: Vec<_> = residents
+            .iter()
+            .filter(|item| item.id == collision)
+            .cloned()
+            .collect();
+        store
+            .apply(Event::Item(item("later", "A later answer")))
+            .unwrap();
+        let updated = store.window_reusing(&mut residents).unwrap();
+        let current: Vec<_> = updated
+            .items
+            .iter()
+            .filter(|item| item.id == collision)
+            .collect();
+        assert_eq!(current.len(), 2);
+        for (current, original) in current.into_iter().zip(original) {
+            assert!(
+                std::sync::Arc::ptr_eq(current, &original),
+                "the same transcript occurrence keeps its own allocation"
+            );
+        }
     }
 }

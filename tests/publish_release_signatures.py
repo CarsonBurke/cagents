@@ -4,6 +4,7 @@
 nothing reaches the network."""
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -152,6 +153,12 @@ if arguments[:2] == ["release", "download"]:
         ids[f"{arguments[2]}/{swap.read_text().strip()}"] = 999
         (state / "ids.json").write_text(json.dumps(ids))
         swap.unlink()
+    publish = state / "publish-after-download" / arguments[2]
+    if publish.exists():
+        predecessor = release(publish.read_text().strip())
+        predecessor["draft"] = False
+        save(predecessor)
+        publish.unlink()
 elif arguments[:2] == ["release", "upload"]:
     files = [value for value in arguments[3:] if value.startswith("/")]
     for path in files:
@@ -214,7 +221,7 @@ class PublisherSignatures(unittest.TestCase):
         self.checkout = self.directory / "checkout"
         scripts = self.checkout / "scripts"
         scripts.mkdir(parents=True)
-        for name in ("publish-release", "release-metadata"):
+        for name in ("publish-release", "release-metadata", "package-android"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         # Artifact smoke has its own suite; here it only must be reached.
         (scripts / "smoke-release-artifacts").write_text("#!/bin/sh\nexit 0\n")
@@ -256,10 +263,11 @@ class PublisherSignatures(unittest.TestCase):
         self.git("commit", "-q", "-m", f"release {version}")
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
 
-    def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False) -> Path:
+    def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False,
+               android: bool = False, appimage: bool = False) -> Path:
         """A complete bundle of VERSION, its metadata signed by SIGNERS in
-        order; another VARIANT is another build of it. With MACOS it also
-        carries the Apple Silicon build."""
+        order; another VARIANT is another build of it. MACOS, ANDROID and
+        APPIMAGE add their platform assets."""
         dist = Path(tempfile.mkdtemp(prefix=f"dist-{version}-", dir=self.directory))
         cagents_archive(dist / f"cagents-{version}-{TARGET}.tar.gz", "cagents", version, "dev.cagents.Cagents")
         cagents_archive(dist / f"cagents-browserless-{version}-{TARGET}.tar.gz", "cagents-browserless", version,
@@ -270,6 +278,9 @@ class PublisherSignatures(unittest.TestCase):
                      f"cagents-browserless-{version}-sizes.txt"):
             (dist / name).write_text(name + variant)
         (dist / "install.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
+        if appimage:
+            for name in (f"cagents-{version}-x86_64.AppImage", "cagents-x86_64.AppImage"):
+                (dist / name).write_bytes(b"offline AppImage fixture")
 
         def sums(manifest: str, names: list[str]):
             lines = subprocess.run(["sha256sum", "--", *names], cwd=dist, check=True, text=True,
@@ -284,6 +295,11 @@ class PublisherSignatures(unittest.TestCase):
             macos_archive(dist / f"cagents-{version}-aarch64-apple-darwin.tar.gz", version)
             (dist / "install-macos.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
             sums("SHA256SUMS-macos", [f"cagents-{version}-aarch64-apple-darwin.tar.gz", "install-macos.sh"])
+        if android:
+            apk_names = [f"cagents-android-{version}.apk", "cagents-android.apk"]
+            for name in apk_names:
+                (dist / name).write_bytes(b"fixture APK")
+            sums("SHA256SUMS-android", apk_names)
         commit = self.git("rev-parse", f"v{version}^{{commit}}").strip()
         subprocess.run([sys.executable, "-I", str(self.checkout / "scripts/release-metadata"), "write",
                         "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
@@ -349,14 +365,14 @@ class PublisherSignatures(unittest.TestCase):
                                "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
-    def drafted(self, macos: bool = False) -> Path:
+    def drafted(self, macos: bool = False, android: bool = False, appimage: bool = False) -> Path:
         """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
         release workflow leaves it; its bundle."""
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         self.bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
                                               "release-metadata.json.sig": "release-metadata.json.sig"})
-        release = self.bundle("0.2.5", ["new"], macos=macos)
+        release = self.bundle("0.2.5", ["new"], macos=macos, android=android, appimage=appimage)
         result = self.publish("0.2.5", release, "--draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified v0.2.5 as a draft", result.stdout)
@@ -433,6 +449,42 @@ class PublisherSignatures(unittest.TestCase):
         self.release("0.2.7", ["old", "new"], generation=1)
         self.assertRefused(self.verify("0.2.7", self.bundle("0.2.7", ["new"])), "follows the one before")
 
+    def test_a_new_generation_keeps_the_previous_generations_macos_build(self):
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
+        bridge = self.bundle("0.2.4", ["old"])
+        metadata = ("release-metadata.json", "release-metadata.json.sig")
+        self.published("0.2.4", bridge, {name: name for name in metadata})
+        macos = self.bundle("0.2.5", ["new"], macos=True)
+        macos_assets = ("cagents-0.2.5-aarch64-apple-darwin.tar.gz", "install-macos.sh", "SHA256SUMS-macos")
+        self.published("0.2.5", macos, {name: name for name in macos_assets})
+
+        self.release("0.2.6", ["new"])
+        ordinary = self.publish("0.2.6", self.bundle("0.2.6", ["new"]))
+        self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+
+        self.release("0.2.7", ["new", "next"], generation=3)
+        candidate = self.bundle("0.2.7", ["new"])
+        self.assertRefused(self.publish("0.2.7", candidate, "--draft"), "needs the Apple Silicon build")
+        draft = self.directory / "github/releases/v0.2.7"
+        self.assertFalse(draft.exists())
+        candidate = self.bundle("0.2.7", ["new"], macos=True)
+        accepted = self.publish("0.2.7", candidate, "--draft")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        carried = draft / "assets/release-metadata-2.json"
+        self.assertEqual(carried.read_bytes(), (candidate / "release-metadata.json").read_bytes())
+
+    def test_a_macos_release_published_during_bridge_validation_keeps_the_draft(self):
+        self.drafted(macos=True)
+        self.release("0.2.6", ["new", "next"], generation=3)
+        pending = self.directory / "github/publish-after-download/v0.2.6"
+        pending.parent.mkdir(parents=True)
+        pending.write_text("v0.2.5\n")
+        candidate = self.bundle("0.2.6", ["new"])
+        self.assertRefused(self.publish("0.2.6", candidate), "the published release inventory changed")
+        draft = self.directory / "github/releases/v0.2.6/release.json"
+        self.assertIn('"draft": true', draft.read_text())
+        self.assertRefused(self.publish("0.2.6", candidate), "needs the Apple Silicon build")
+
     def test_publication_carries_the_bridge_as_the_bridge_release_serves_it(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         bridge = self.bundle("0.2.4", ["old"])
@@ -507,6 +559,18 @@ class PublisherSignatures(unittest.TestCase):
         result = self.promote("0.2.5", digest)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_an_asset_uploaded_again_while_publishing_keeps_the_draft(self):
+        release = self.drafted()
+        swap = self.directory / "github/swap-after-download/v0.2.5"
+        swap.parent.mkdir(parents=True)
+        swap.write_text("install.sh\n")
+        state = self.directory / "github/releases/v0.2.5/release.json"
+        self.assertRefused(self.publish("0.2.5", release), "the draft of v0.2.5 changed while it was verified")
+        self.assertIn('"draft": true', state.read_text())
+        result = self.publish("0.2.5", release)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"draft": false', state.read_text())
+
     def test_publication_never_puts_a_release_above_a_newer_one(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         bridge = self.bundle("0.2.4", ["old"])
@@ -574,6 +638,40 @@ class PublisherSignatures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual((served / "SHA256SUMS-macos").read_bytes(), (release / "SHA256SUMS-macos").read_bytes())
 
+    def android_tools(self):
+        tools = self.directory / "android-tools"
+        tools.mkdir()
+        fingerprint = "a" * 64
+        aapt = "#!/bin/sh\necho \"package: name='dev.cagents.mobile' versionCode='2005' versionName='0.2.5'\"\n"
+        apksigner = f"#!/bin/sh\necho 'Signer #1 certificate SHA-256 digest: {fingerprint}'\n"
+        for name, script in (("aapt", aapt), ("apksigner", apksigner)):
+            (tools / name).write_text(script)
+            (tools / name).chmod(0o755)
+        self.environment.update(CAGENTS_ANDROID_BUILD_TOOLS=str(tools), CAGENTS_ANDROID_SIGNER_SHA256=fingerprint)
+
+    def test_verify_only_requires_the_trusted_android_signer_and_all_assets(self):
+        self.android_tools()
+        bridge = self.bridges(release_metadata=self.bundle("0.2.4", ["old"]))
+        dist = self.bundle("0.2.5", ["new"], android=True)
+        result = self.verify("0.2.5", dist, "--bridge", str(bridge))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        del self.environment["CAGENTS_ANDROID_SIGNER_SHA256"]
+        self.assertRefused(self.verify("0.2.5", dist, "--bridge", str(bridge)), "set CAGENTS_ANDROID_SIGNER_SHA256")
+        (dist / "cagents-android.apk").unlink()
+        self.assertRefused(self.verify("0.2.5", dist, "--bridge", str(bridge)), "expected assets")
+
+    def test_a_draft_with_both_platforms_carries_the_stable_android_alias(self):
+        self.android_tools()
+        release = self.drafted(macos=True, android=True)
+        served = self.directory / "github/releases/v0.2.5/assets"
+        names = ("cagents-android-0.2.5.apk", "cagents-android.apk", "SHA256SUMS-android")
+        for name in names:
+            self.assertEqual((served / name).read_bytes(), (release / name).read_bytes())
+        digest = hashlib.sha256((release / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((served / "cagents-android.apk").read_bytes(), b"fixture APK")
+
     def restamp(self, dist: Path, signers: list[str]):
         """Rewrites DIST's macOS checksums and metadata after a change, and signs it again."""
         version = dist.name.split("-")[1]
@@ -587,6 +685,82 @@ class PublisherSignatures(unittest.TestCase):
                         "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
                        check=True, capture_output=True, timeout=HANG_GUARD)
         self.sign(dist, signers)
+
+    def test_archive_validation_ignores_user_tar_options(self):
+        bridge = self.bridges(release_metadata=self.bundle("0.2.4", ["old"]))
+        candidate = self.bundle("0.2.5", ["new"])
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        result = self.verify("0.2.5", candidate, "--bridge", str(bridge))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_appimage_release_includes_both_names_in_linux_checksums(self):
+        dist = self.bundle("0.2.4", ["old"], appimage=True)
+        accepted = self.verify("0.2.4", dist)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("Validated v0.2.4: 18 assets", accepted.stdout)
+
+        manifest = dist / "SHA256SUMS"
+        original = manifest.read_text()
+        alias = "cagents-x86_64.AppImage"
+        manifest.write_text("".join(line for line in original.splitlines(keepends=True)
+                                    if not line.rstrip().endswith(f"  {alias}")))
+        self.assertRefused(self.verify("0.2.4", dist), "SHA256SUMS has missing")
+
+        manifest.write_text(original)
+        (dist / alias).unlink()
+        self.assertRefused(self.verify("0.2.4", dist), "expected assets")
+
+    def test_the_appimage_draft_retains_both_names_on_promotion(self):
+        bundle = self.drafted(appimage=True)
+        draft = self.directory / "github/releases/v0.2.5"
+        image = "cagents-0.2.5-x86_64.AppImage"
+        alias = "cagents-x86_64.AppImage"
+        self.assertIn(f"/releases/download/v0.2.5/{image}", (draft / "release.json").read_text())
+        digest = hashlib.sha256((bundle / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in (image, alias, "SHA256SUMS"):
+            self.assertEqual((draft / "assets" / name).read_bytes(), (bundle / name).read_bytes())
+
+    def test_terminal_install_notes_stop_when_checksums_fail(self):
+        self.drafted(appimage=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "terminal-install-commands"
+        tools.mkdir()
+        for name, command in (("curl", "exit 0"), ("sha256sum", "exit 1"),
+                              ("sh", "echo 'installer was invoked'")):
+            path = tools / name
+            path.write_text(f"#!/bin/sh\n{command}\n")
+            path.chmod(0o755)
+        result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                env={"PATH": f"{tools}:{os.defpath}"}, text=True,
+                                capture_output=True, timeout=HANG_GUARD)
+        self.assertNotIn("installer was invoked", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_macos_terminal_notes_stop_at_the_first_failed_step(self):
+        self.drafted(macos=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"].split("## macOS\n", 1)[1]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "macos-terminal-commands"
+        tools.mkdir()
+        for name, command in (("curl", "printf '%s\\n' \"$1\""),
+                              ("shasum", "exit 1"),
+                              ("sh", "echo 'installer was invoked'")):
+            tool = tools / name
+            tool.write_text(f"#!/bin/sh\n{command}\n")
+            tool.chmod(0o755)
+        environment = {"PATH": f"{tools}:{os.defpath}"}
+
+        for expected in ("--disable", ""):
+            with self.subTest(first_download=bool(expected)):
+                result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                        env=environment, text=True, capture_output=True, timeout=HANG_GUARD)
+                self.assertEqual(result.stdout.strip(), expected)
+                self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])

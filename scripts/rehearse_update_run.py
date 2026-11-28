@@ -805,20 +805,6 @@ def expected_refusal(root, kind, old_version):
         errors.append('update did not report the interruption settlement bound')
     if kind=='window-startup' and 'could not present its first window frame' not in message:
         errors.append('update did not report the candidate first-frame failure')
-    if kind=='ended-provider':
-        seeds = json.loads((root/'seeds.json').read_text())['items']
-        ended = [row for row in seeds if row.get('state')=='ended-provider']
-        if (len(ended)!=1 or ended[0].get('exit')!=0 or ended[0].get('name')!='codex-ended'
-                or ended[0].get('chat_id') not in before['sessions']
-                or ended[0].get('agent_id') not in before['agents']):
-            errors.append('ended-provider refusal lacks the original ended Codex chat')
-        refusal = status.get('refusal') or {}
-        sessions = refusal.get('sessions',[])
-        if (not target.get('version') or target.get('version')!=before.get('target',{}).get('version')
-                or refusal.get('expired',False) is not False or refusal.get('blockers')!=[]
-                or len(sessions)!=1 or sessions[0].get('title','').split(' · ',1)[0]!='codex-ended'
-                or sessions[0].get('reason')!='Its provider is still starting. Wait for it to finish, then try the update again.'):
-            errors.append('expected only the codex-ended still-starting refusal')
     current = root/'home/.local/share/cagents-install/current'
     staged = root/'staged-candidate.json'
     if staged.exists():
@@ -853,7 +839,7 @@ def expected_refusal(root, kind, old_version):
     started, finished = target.get('started',0), target.get('finished',0)
     events = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=started]
     interrupts = [row for row in events if row.get('event')=='request' and row.get('method')=='turn/interrupt']
-    if kind in ('cancel','window-startup','ended-provider'):
+    if kind in ('cancel','window-startup'):
         if interrupts:
             errors.append(f'{kind} refusal sent an interrupt request')
     else:
@@ -921,7 +907,34 @@ class Rehearsal:
             raise ValueError(f'agent {agent_id} is closed')
         return record
 
-    def end_provider(self, name):
+    def session_rows(self):
+        """Return valid inventory, keeping a failed lookup distinct from an empty list."""
+        code, listing = self.cli('--no-start','sessions','--all',check=False)
+        data = listing.get('data') if isinstance(listing,dict) and listing.get('ok') is not False else None
+        rows = data.get('sessions') if isinstance(data,dict) else None
+        if code or not isinstance(rows,list) or not all(
+                isinstance(row,dict) and isinstance(row.get('id'),str) and row['id'] for row in rows):
+            return None
+        if len({row['id'] for row in rows})!=len(rows):
+            return None
+        return rows
+
+    def verify_untitled_chat(self, entry):
+        # A finished first prompt can assign a title. Capture the initial row
+        # while seeding this chat, before other providers have to settle.
+        agent_id = entry['response'].get('data',{}).get('agent',{}).get('id')
+        deadline = time.monotonic()+30
+        while agent_id and time.monotonic()<deadline:
+            matches = [row for row in self.session_rows() or [] if row.get('agent')==agent_id]
+            if matches:
+                if len(matches)==1 and matches[0].get('id') and not matches[0].get('title'):
+                    entry['untitled_chat'] = matches[0]
+                    return
+                break
+            time.sleep(.1)
+        self.errors.append(f'{entry["state"]}: did not verify an untitled conversation')
+
+    def end_provider(self, name, agent_id):
         """Kill the named Codex chat's provider after its first turn, as a crash would.
 
         The daemon then holds a conversation whose provider already stopped with
@@ -930,54 +943,71 @@ class Rehearsal:
         """
         import signal
         entry = {'state':'ended-provider','name':name,'exit':1}
+        if not agent_id:
+            self.errors.append(f'{name}: the seeded agent was not identified')
+            return entry
         fixture = self.root/'codex-fixture.json'
         pause = json.loads(fixture.read_text()).get('pause',0) if fixture.exists() else 0
         deadline = time.monotonic()+pause+60
-        def row():
-            _, listing = self.cli('sessions','--all',check=False)
-            agents = [a for a in self.listed_agents(start=True) if a['name']==name]
-            rows = [r for r in listing.get('data',{}).get('sessions',[])
-                    if len(agents)==1 and r.get('agent')==agents[0]['id']]
-            return rows[0] if len(rows)==1 else None
         while True:
-            chat = row()
+            rows = [row for row in self.session_rows() or [] if row.get('agent')==agent_id]
+            chat = rows[0] if len(rows)==1 else None
             # Its first turn is done and its provider sits idle on a recorded thread.
-            if chat and chat.get('state')=='idle' and chat.get('run_state')=='succeeded':
+            if (chat and chat.get('id') and chat.get('run')
+                    and str(chat.get('state')).lower()=='idle' and str(chat.get('run_state')).lower()=='succeeded'):
                 break
             if time.monotonic() >= deadline:
                 self.errors.append(f'{name}: its first turn never finished, so its provider was not ended')
                 entry['chat'] = chat
                 return entry
             time.sleep(.5)
-        entry['agent_id'], entry['chat_id'], entry['before'] = chat['agent'], chat['id'], chat
+        entry['agent_id'], entry['chat_id'], entry['before'] = agent_id, chat['id'], chat
         try:
             record = json.loads((self.root/'rt/cagents/native-holders'/f'{chat["id"]}.json').read_text())
+            if record['terminal']!=chat['id']:
+                raise ValueError('native holder belongs to a different chat')
+            identities = [(record[role]['pid'],record[role]['start']) for role in ('holder','root')]
             for role in ('holder','root'):
                 process = record[role]
                 proc = Path(f'/proc/{process["pid"]}')
                 env = proc.joinpath('environ').read_bytes().split(b'\0')
-                stat = proc.joinpath('stat').read_text().rsplit(')',1)[1].split()
-                if f'HOME={self.root}/home'.encode() not in env or int(stat[19]) != process['start']:
+                if f'HOME={self.root}/home'.encode() not in env or process_identity(process['pid'])!=(process['pid'],process['start']):
                     raise ValueError(f'{role} {process["pid"]} is not this chat\'s provider process')
+            if os.getpgid(record['root']['pid'])!=record['root']['pid']:
+                raise ValueError('provider does not lead its own process group')
             # The provider's whole process group, then its holder, as a crash leaves them.
-            os.killpg(os.getpgid(record['root']['pid']), signal.SIGKILL)
+            os.killpg(record['root']['pid'], signal.SIGKILL)
             os.kill(record['holder']['pid'], signal.SIGKILL)
             entry['killed_pids'] = [record['root']['pid'], record['holder']['pid']]
-        except (OSError,ValueError,KeyError) as error:
+            entry['killed_identities'] = identities
+        except (OSError,ValueError,KeyError,TypeError) as error:
             self.errors.append(f'{name}: could not end its provider: {error}')
             return entry
         deadline = time.monotonic()+30
         while time.monotonic() < deadline:
-            chat = row()
-            if chat and chat.get('state')!='idle':
-                break
+            rows = self.session_rows()
+            if rows is not None:
+                matched = [row for row in rows if row.get('id')==chat['id'] or row.get('agent')==agent_id]
+                entry['after'] = matched[0] if len(matched)==1 else None
+                exited = (len(matched)==1 and matched[0].get('id')==chat['id']
+                          and matched[0].get('agent')==agent_id and str(matched[0].get('state')).lower()=='exited')
+                if (not matched or exited) and all(process_identity(pid)!=(pid,start) for pid,start in identities):
+                    code, status = self.cli('--no-start','agent','status',agent_id,check=False)
+                    entry['verified_status'] = status
+                    try:
+                        agent = records.agent_record(status)
+                    except ValueError:
+                        agent = {}
+                    owner = agent.get('agent',{})
+                    session = owner.get('session')
+                    bound = session.get('Chat') if isinstance(session,dict) else None
+                    if (code==0 and owner.get('id')==agent_id and owner.get('name')==name and not owner.get('closed')
+                            and isinstance(bound,dict) and bound.get('id')==chat['id'] and agent.get('run')==chat['run']
+                            and str(agent.get('state')).lower()=='succeeded'):
+                        entry['exit'] = 0
+                        return entry
             time.sleep(.5)
-        entry['after'] = chat
-        _, entry['verified_status'] = self.cli('agent','status',entry['agent_id'],check=False)
-        if not chat or chat.get('state')=='idle':
-            self.errors.append(f'{name}: the daemon never reported its provider stopped')
-        else:
-            entry['exit'] = 0
+        self.errors.append(f'{name}: could not verify the original provider stopped and its agent was preserved')
         return entry
 
     def listed_agents(self, *, start=False):
@@ -1166,9 +1196,14 @@ class Rehearsal:
     def observe_window(self, window):
         """Focuses WINDOW and observes its text, or None if another was observed."""
         self.call('wm', 'action', 'focus-window', '--id', window['id'])
-        _, text = self.call('drive', '--json', 'observe', timeout=30)
+        return self.observe_focused_window(window)
+
+    def observe_focused_window(self, window, *, with_text=True):
+        flags = () if with_text else ('--no-text',)
+        _, text = self.call('drive', '--json', 'observe', *flags, timeout=30)
         observation = json.loads(text)
-        return observation if observation['window']['id'] == window['id'] else None
+        observed = observation['window']
+        return observation if observed['id'] == window['id'] and observed.get('focused') else None
 
     def verify_bundled_ceditor(self, version):
         """Launch through the installed command and check the window and matched service."""
@@ -1212,6 +1247,46 @@ class Rehearsal:
 
     HEADER = {'row': 21, 'step': 24, 'span': 420, 'right': 120}
 
+    @staticmethod
+    def frame_pixels(path):
+        if not isinstance(path, str) or not path:
+            return None
+        try:
+            from PIL import Image
+            with Image.open(path) as image:
+                return image.size, image.convert('RGB').tobytes()
+        except (ImportError, OSError, TypeError):
+            return None
+
+    def ocr_frame(self, observation):
+        # An accessibility observation can change even when pixels don't.
+        if observation.get('source') == 'ocr':
+            return self.frame_pixels(observation.get('frame'))
+        return None
+
+    def header_observations(self, window, observation, row, step, span, right):
+        """Move over every header position, reusing OCR for identical frames."""
+        width = observation['window']['size'][0]
+        pixels = self.ocr_frame(observation)
+        for x in range(width-right, max(width-right-span, 0), -step):
+            self.call('drive', 'hover', f'{x},{row}', timeout=30)
+            if pixels is not None:
+                frame = self.observe_focused_window(window, with_text=False)
+                if frame is None:
+                    yield x, None
+                    return
+                if self.frame_pixels(frame.get('frame')) == pixels:
+                    yield x, observation
+                    continue
+            observation = self.observe_focused_window(window)
+            if observation is None:
+                yield x, None
+                return
+            # Opening a notices popover can overwrite the driver's frame
+            # before the caller requests the next header position.
+            pixels = self.ocr_frame(observation)
+            yield x, observation
+
     def header_offers_update(self, version):
         """Before an in-app update, finds the main window's update control by
         the same hover scan inspect_header uses afterwards, so that finding
@@ -1219,12 +1294,10 @@ class Rehearsal:
         window = self.mapped()['main']
         observation = self.observe_window(window)
         if observation is not None:
-            width = observation['window']['size'][0]
-            first = width-self.HEADER['right']
-            for x in range(first, max(first-self.HEADER['span'], 0), -self.HEADER['step']):
-                self.call('drive', 'hover', f'{x},{self.HEADER["row"]}', timeout=30)
-                observation = self.observe_window(window)
-                words = ' '.join(run.get('text','') for run in (observation or {}).get('runs',[]))
+            for _, observation in self.header_observations(window, observation, **self.HEADER):
+                if observation is None:
+                    break
+                words = ' '.join(run.get('text','') for run in observation.get('runs',[]))
                 if visible_phrase(words, 'Update to') and version in words:
                     self.call('drive', 'hover', '850,750', timeout=30, check=False)
                     return words
@@ -1247,11 +1320,8 @@ class Rehearsal:
         if observation is None:
             return evidence
         evidence['observed'] = True
-        width = observation['window']['size'][0]
         seen = set()
-        for x in range(width-right, max(width-right-span, 0), -step):
-            self.call('drive', 'hover', f'{x},{row}', timeout=30)
-            observation = self.observe_window(window)
+        for x, observation in self.header_observations(window, observation, row, step, span, right):
             if observation is None:
                 evidence['observed'] = False
                 break
@@ -1916,7 +1986,7 @@ class Rehearsal:
     def seed(self, args):
         self.require_fixture_state()
         evidence = []
-        def seed(name, argv, project=None, provider=None):
+        def seed(name, argv, project=None, provider=None, *, wait=True):
             if provider:
                 (self.root/'home/.claude'/(Path(provider).stem+'.started')).unlink(missing_ok=True)
                 source = Path(__file__).resolve().parents[1]/'tests/fixtures'/provider
@@ -1936,7 +2006,7 @@ class Rehearsal:
                     entry['fixture_started'] = marker.read_text() if marker.exists() else None
                     if not marker.exists():
                         self.errors.append(f'{name}: fixture launch was not observed')
-                else:
+                elif wait:
                     time.sleep(.2)
             finally:
                 if provider:
@@ -1954,6 +2024,7 @@ class Rehearsal:
         seed('named-chat', ['agent','spawn','--provider','claude','--surface','chat','--name','chat-alpha',*placement,'Seeded alpha chat'], 'alpha')
         if not args.no_console:
             seed('console', ['agent','spawn','--provider','claude','--surface','terminal','--name','console-alpha','Seeded console'], 'alpha')
+        ended_chat = None
         if not args.no_codex:
             codex_channel = seed('codex-channel', ['channel','spawn','--repository',alpha,'--title','Codex rehearsal'])
             codex_channel_id = codex_channel['response']['data']['channel']['id']
@@ -1961,15 +2032,16 @@ class Rehearsal:
                                '--channel',codex_channel_id,'Offline Codex rehearsal'], 'alpha')
             if args.ended_provider:
                 ended_channel = seed('ended-provider-channel', ['channel','spawn','--repository',alpha,'--title','Ended provider'])
-                seed('ended-provider-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-ended',
-                                            '--channel',ended_channel['response']['data']['channel']['id'],
-                                            'Provider ends after this turn'], 'alpha')
+                ended_chat = seed('ended-provider-chat', ['agent','spawn','--provider','codex','--surface','chat','--name','codex-ended',
+                                                         '--channel',ended_channel['response']['data']['channel']['id'],
+                                                         'Provider ends after this turn'], 'alpha')
         for index in range(args.untitled):
             # Empty channel title is the product's actual untitled state.
             channel = seed(f'untitled-channel-{index+1}', ['channel','spawn','--repository',beta])
             channel_id = channel['response'].get('data',{}).get('channel',{}).get('id')
             placement = ['--channel',channel_id] if channel_id else []
-            seed(f'untitled-chat-{index+1}', ['agent','spawn','--provider','claude','--surface','chat',*placement,f'Untitled conversation {index+1}'], 'beta')
+            chat = seed(f'untitled-chat-{index+1}', ['agent','spawn','--provider','claude','--surface','chat',*placement,f'Untitled conversation {index+1}'], 'beta', wait=False)
+            self.verify_untitled_chat(chat)
         seed('shell', ['terminal','spawn','--cwd',alpha])
         if not args.no_child:
             seed('long-lived-child', ['terminal','spawn','--cwd',alpha,'--','bash','-c',
@@ -2018,18 +2090,16 @@ class Rehearsal:
             while True:
                 matching = [a for a in self.listed_agents(start=True) if a['name'] == 'codex-alpha']
                 states = [a['state'] for a in matching]
-                if states and all(state in ('running','idle') for state in states):
+                if states and all(state in ('running','idle','succeeded') for state in states):
                     break
                 if time.monotonic() >= deadline or any(state in ('failed','interrupted') for state in states):
-                    self.errors.append('Codex did not reach Running/Idle; see verified agent status and logs/codex-provider.jsonl')
+                    self.errors.append('Codex neither became ready nor finished its first turn; see verified agent status and logs/codex-provider.jsonl')
                     break
                 time.sleep(.5)
             for entry in evidence:
                 if entry['state'] == 'codex-chat' and matching:
                     _, status = self.cli('agent','status',matching[0]['id'],check=False)
                     entry['verified_status'] = status
-        if args.ended_provider:
-            evidence.append(self.end_provider('codex-ended'))
         # After the Codex startup check: seeding takes minutes, longer than its turn.
         if args.scale_chats:
             self.seed_scale(args, seed)
@@ -2055,8 +2125,6 @@ class Rehearsal:
                 entry['verified_chats'] = [row for row in sessions if row['id']==chat_id]
                 if not entry['verified_agents']:
                     self.errors.append(f'{entry["state"]}: agent absent from OLD inventory')
-                if entry['state'].startswith('untitled-chat') and (not entry['verified_chats'] or any(row.get('title') for row in entry['verified_chats'])):
-                    self.errors.append(f'{entry["state"]}: did not verify an untitled conversation')
                 if entry['state'] in ('no-provider-init','provider-exits-mid-turn'):
                     _, entry['verified_status'] = self.cli('agent','status',agent_id,check=False)
             if terminal_id:
@@ -2065,6 +2133,9 @@ class Rehearsal:
                     self.errors.append(f'{entry["state"]}: terminal absent from OLD inventory')
             if channel_id:
                 entry['verified_channels'] = [c for c in channel_list.get('data',{}).get('channels',[]) if c['id']==channel_id]
+        if ended_chat is not None:
+            agent_id = ended_chat['response'].get('data',{}).get('agent',{}).get('id')
+            evidence.append(self.end_provider('codex-ended',agent_id))
         if args.uncarryable:
             # Local jobs normally carry even through legacy preparation. Make
             # its preservation directory unavailable, reversibly, to exercise
@@ -2532,7 +2603,7 @@ def main():
     run.add_argument('--new-terminal-after-restore',action='store_true',help='after verified existing-only reopening deliberately stop the private daemon, then open and use a new terminal through the same native UI')
     run.add_argument('--expect-terminal-restart-failure',action='store_true',help='before example only: require the native new-terminal action to fail with no daemon after the deliberate stop')
     run.add_argument('--reopen-timeout',type=float,default=45)
-    run.add_argument('--expect-refusal',choices=('interrupt','cancel','window-startup','ended-provider'),help='require the exact refusal and unchanged old service, install, windows and inventory')
+    run.add_argument('--expect-refusal',choices=('interrupt','cancel','window-startup'),help='require the exact refusal and unchanged old service, install, windows and inventory')
     run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
     run.add_argument('--plain-restart',action='store_true',help='after verified recovery, crash only the private daemon and start it normally; verify the original census again')
     run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')
@@ -2558,8 +2629,6 @@ def main():
     staged.add_argument('installer')
     staged.add_argument('--record',metavar='STAGE_LOG')
     args=parser.parse_args()
-    if args.command=='run' and args.expect_refusal=='ended-provider' and not args.ended_provider:
-        parser.error('--expect-refusal ended-provider requires --ended-provider')
     if args.command=='run' and args.natural_idle and (requires_working(args) or args.no_codex
             or args.working or args.yes or args.upgrade_arg or args.fail_new_daemon or args.expect_refusal
             or any(getattr(args,flag) for flag in ('no_init','exit_mid_turn','ignore_term','uncarryable','unreachable'))

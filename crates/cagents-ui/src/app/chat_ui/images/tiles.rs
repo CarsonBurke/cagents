@@ -163,9 +163,10 @@ impl Runtime {
     /// opens it in the viewer, or what stands in for it until it is read.
     fn image_tile(&self, item: &chat::Item, number: usize) -> Element<'static, Message> {
         let label = label(&item.content, number);
-        let cached = self.presentation_cache().get(&item.id);
+        let cached = self.presentation_cache().get(self.cache_key(item));
         // `sync` stops every read the transcript no longer wants.
         let loading = cached.is_some_and(|cached| cached.image_source.is_some());
+        let owner = self.row_target(item);
         let (picture, press, tip): (Element<'static, Message>, _, _) =
             match cached.map(|cached| (cached, &cached.image)) {
                 Some((_, Some(handle))) => (
@@ -174,7 +175,7 @@ impl Runtime {
                         .width(Length::Fill)
                         .height(Length::Fill)
                         .into(),
-                    Some(Action::OpenImage(self.target, item.id.clone())),
+                    Some(Action::OpenImage(self.target, owner.clone())),
                     label.clone(),
                 ),
                 Some((cached, None)) if cached.image_unavailable => (
@@ -184,18 +185,18 @@ impl Runtime {
                 ),
                 Some((cached, None)) if cached.image_wait.is_some() => (
                     design::caption("Waiting for preview memory…").into(),
-                    Some(Action::OpenImage(self.target, item.id.clone())),
+                    Some(Action::OpenImage(self.target, owner.clone())),
                     label.clone(),
                 ),
                 // Read in a moment; the empty tile already holds its room.
                 Some(_) if loading => (
                     widget::Space::new().into(),
-                    Some(Action::OpenImage(self.target, item.id.clone())),
+                    Some(Action::OpenImage(self.target, owner.clone())),
                     label.clone(),
                 ),
                 _ => (
                     design::caption("Load preview").into(),
-                    Some(Action::LoadImage(self.target, item.id.clone())),
+                    Some(Action::LoadImage(self.target, owner.clone())),
                     format!("{label} · Load preview"),
                 ),
             };
@@ -225,6 +226,7 @@ impl Runtime {
         );
         // Above, clear of the caption beneath that it would cover.
         let tile = crate::interaction::tooltip_above(tile, tip);
+        let tile = crate::ui_controls::owned(owner, tile);
         match cached.and_then(|cached| cached.image.as_ref()) {
             Some(handle) => {
                 let image = ImageRef::Transcript(self.target, handle.id());
@@ -255,7 +257,9 @@ impl Runtime {
             return self.run_around(items(self).iter().collect(), id);
         }
         let all = &self.snapshot.items;
-        let Some(index) = all.iter().position(|item| item.id == id) else {
+        let Some(index) = all.iter().position(|item| {
+            matches!(item.content, ItemContent::Image { .. }) && self.cache_key(item) == id
+        }) else {
             return Vec::new();
         };
         let Some(turn) = self.turns.iter().find(|turn| {
@@ -284,7 +288,9 @@ impl Runtime {
         members: Vec<&'a Arc<chat::Item>>,
         id: &str,
     ) -> Vec<&'a Arc<chat::Item>> {
-        let Some(at) = members.iter().position(|item| item.id == id) else {
+        let Some(at) = members.iter().position(|item| {
+            matches!(item.content, ItemContent::Image { .. }) && self.cache_key(item) == id
+        }) else {
             return Vec::new();
         };
         if !self.tiled(members[at]) {

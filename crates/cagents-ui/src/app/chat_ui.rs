@@ -11,7 +11,7 @@ use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
 use std::sync::{
-    Mutex,
+    Mutex, Weak,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
@@ -149,6 +149,7 @@ mod thumbnails;
 mod tool_text;
 mod tool_title;
 mod turn;
+mod unloaded;
 mod update_recovery;
 mod view;
 mod virtualized;
@@ -195,13 +196,20 @@ fn small_icon<'a>(
     label: impl Into<crate::interaction::TipBody<'a>>,
     message: Action,
 ) -> Element<'a, Message> {
-    crate::ui_controls::icon_button(name, label)
+    let owner = match &message {
+        Action::Copy(_, row, part) => Some((row.clone(), part.clone())),
+        _ => None,
+    };
+    let control = crate::ui_controls::icon_button(name, label)
         .compact()
         .on_press(action(message))
         // Muted at rest: these sit at the foot of every answer, and drawn in the
         // text color they competed with the answer for attention.
-        .tone(crate::design::Tone::Themed(crate::design::muted_icon_color))
-        .into()
+        .tone(crate::design::Tone::Themed(crate::design::muted_icon_color));
+    match owner {
+        Some(owner) => crate::ui_controls::owned(owner, control),
+        None => control.into(),
+    }
 }
 
 /// One message waiting above the composer.
@@ -217,6 +225,65 @@ pub enum QueueEntry {
 pub struct Target {
     pub card: CardId,
     pub generation: u64,
+}
+
+/// A row in the active transcript. Opaque IDs can coincide with generated
+/// part IDs, so only the immutable item allocation identifies this row.
+#[derive(Debug, Clone)]
+pub struct RowTarget {
+    id: String,
+    item: Weak<chat::Item>,
+    child: Option<String>,
+    #[cfg(test)]
+    test_by_id: bool,
+}
+
+/// Only duplicate display IDs need presentation aliases. Keep both the
+/// provider's IDs and the immutable source items unchanged.
+fn row_cache_key<'a>(aliases: &'a HashMap<usize, String>, item: &'a chat::Item) -> &'a str {
+    aliases
+        .get(&(std::ptr::from_ref(item) as usize))
+        .map_or(&item.id, String::as_str)
+}
+
+fn requires_row_identity(collisions: &HashSet<String>, id: &str) -> bool {
+    collisions.contains(id) || chat::TranscriptPart::parse(id).is_some()
+}
+
+impl PartialEq for RowTarget {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id && self.child == other.child && self.item.ptr_eq(&other.item)
+    }
+}
+impl Eq for RowTarget {}
+impl std::hash::Hash for RowTarget {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(&(&self.id, &self.child, self.item.as_ptr()), state);
+    }
+}
+
+impl RowTarget {
+    fn is(&self, item: &chat::Item, child: Option<&str>) -> bool {
+        self.child.as_deref() == child && std::ptr::eq(self.item.as_ptr(), item)
+    }
+}
+
+#[cfg(test)]
+impl From<String> for RowTarget {
+    fn from(id: String) -> Self {
+        Self {
+            id,
+            item: Weak::new(),
+            child: None,
+            test_by_id: true,
+        }
+    }
+}
+#[cfg(test)]
+impl From<&str> for RowTarget {
+    fn from(id: &str) -> Self {
+        id.to_owned().into()
+    }
 }
 
 #[derive(Clone)]
@@ -362,6 +429,7 @@ pub enum Action {
     AccountRestored(CardId, Result<account::remote::RestoredHome, String>),
     /// Installed skills read without starting the draft's provider.
     DraftSkills(Target, chat::Launch, Vec<chat::Skill>),
+    DraftPermissionResolved(Target, u64, Option<String>),
     /// Opens or closes the account choice.
     AccountPicker(Target, bool),
     /// Takes the next step of sending a draft's first message.
@@ -464,7 +532,7 @@ pub enum Action {
     /// Looks again at a message the provider took once its turn has had
     /// time to begin, as no report may come to show it never will.
     CommandsDue(Target),
-    Toggle(Target, String),
+    Toggle(Target, RowTarget),
     /// Opens or closes one group's step strip, addressed by the id of the item
     /// that started the group.
     ToggleTurn(Target, String),
@@ -490,8 +558,8 @@ pub enum Action {
         Result<String, String>,
     ),
     /// Shows the whole of one folded part of a coordination card, addressed
-    /// by the card's item id and the part's name, or folds it again.
-    Unfold(Target, String),
+    /// by the exact row and the part's name, or folds it again.
+    Unfold(Target, RowTarget, String),
     /// Brings forward the open session whose id starts with the given one,
     /// as an agent addressed it in a command.
     OpenSession(String),
@@ -502,12 +570,17 @@ pub enum Action {
     SessionLinkOpened(Result<(), String>),
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
-    Copy(Target, String, CopyPart),
-    CopyMessage(Target, String, Option<chat::TextCopySource>),
+    Copy(Target, RowTarget, CopyPart),
+    CopyMessage(Target, RowTarget, Option<chat::TextCopySource>),
     /// Copies a step whose row shows only an excerpt of its output, reading
     /// the whole output from its source.
-    CopyStep(Target, String, CopyPart, chat::TextCopySource),
-    MessageCopied(Target, String, text_copy::Request, Result<String, String>),
+    CopyStep(Target, RowTarget, CopyPart, chat::TextCopySource),
+    MessageCopied(
+        Target,
+        RowTarget,
+        text_copy::Request,
+        Result<String, String>,
+    ),
     /// A complete message read for a window that shows only part of it.
     LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
@@ -521,8 +594,8 @@ pub enum Action {
     OpenDocumentFrom(Target, Option<PathBuf>, String),
     OpenChangedFile(Target, PathBuf),
     ChangedFileResolved(Target, u64, PathBuf, Result<PathBuf, String>),
-    OpenImage(Target, String),
-    LoadImage(Target, String),
+    OpenImage(Target, RowTarget),
+    LoadImage(Target, RowTarget),
     ImageLoaded(Target, Arc<chat::Item>, u64, images::Loaded),
     /// A Markdown image came near the viewport and may need loading.
     LoadFigure(Target, u64),
@@ -544,6 +617,7 @@ pub enum Action {
     /// The whole picture the viewer the host shows, opened as the given
     /// serial, read for the entry the string names.
     ViewerLoaded(images::ViewerHost, u64, String, images::Loaded),
+    ResumeImageViewer(Target, u64),
     ImageFit(images::ViewerHost),
     ImageExternal(images::ViewerHost),
     /// A context menu, viewer control or shortcut acting on displayed pixels.
@@ -916,6 +990,7 @@ impl Action {
             | Self::LogicalProseRead(target, ..)
             | Self::MarkdownPrepared(target, ..)
             | Self::LocalPromptPrepared(target, ..)
+            | Self::DraftPermissionResolved(target, ..)
             | Self::ThumbnailLoaded(target, ..)
             | Self::FindGroups(target, ..)
             | Self::FindHighlight(target, ..)
@@ -977,6 +1052,7 @@ impl Action {
             Self::RestoreAccount(..) => "RestoreAccount",
             Self::AccountRestored(..) => "AccountRestored",
             Self::DraftSkills(..) => "DraftSkills",
+            Self::DraftPermissionResolved(..) => "DraftPermissionResolved",
             Self::AccountPicker(..) => "AccountPicker",
             Self::DispatchQueued(..) => "DispatchQueued",
             Self::CancelQueued(..) => "CancelQueued",
@@ -1077,6 +1153,7 @@ impl Action {
             Self::CloseImage(..) => "CloseImage",
             Self::ImageNext(..) => "ImageNext",
             Self::ViewerLoaded(..) => "ViewerLoaded",
+            Self::ResumeImageViewer(..) => "ResumeImageViewer",
             Self::ImageFit(..) => "ImageFit",
             Self::ImageExternal(..) => "ImageExternal",
             Self::Image(..) => "Image",
@@ -1174,6 +1251,7 @@ impl Action {
             Self::Ready(..)
                 | Self::ReadyAfterExitedQueue(..)
                 | Self::DraftStartCheckpointed(..)
+                | Self::DraftPermissionResolved(..)
                 | Self::FindAvailable
                 | Self::FindGroups(..)
                 | Self::FindHighlight(..)
@@ -1250,6 +1328,7 @@ impl Action {
                 | Self::Image(images::ImageRef::Viewer(images::ViewerHost::Dialog, _), _)
                 // A read finishing is no input, so it lands in any viewer.
                 | Self::ViewerLoaded(..)
+                | Self::ResumeImageViewer(..)
                 | Self::ImageCopied(..)
         )
     }
@@ -2521,19 +2600,17 @@ impl CachedItem {
             })
     }
     /// Marks this message to be prepared again with the current labels, and
-    /// gives the id to forget its preparation by. What is shown stays until
-    /// the worker returns the relabelled text, as when the syntax theme
-    /// changes.
-    fn relabel(&mut self) -> Option<String> {
+    /// says whether its preparation can be restarted. What is shown stays
+    /// until the worker returns the relabelled text.
+    fn relabel(&mut self) -> bool {
         // A closed report and a diagnostic are not prepared until shown, and
         // then with the labels of the time.
-        if self.diagnostic || self.report_expanded == Some(false) {
-            return None;
+        if self.diagnostic || self.report_expanded == Some(false) || self.item.is_none() {
+            return false;
         }
-        let id = self.item.as_ref()?.id.clone();
         self.preparing = true;
         self.revision = Self::next_revision();
-        Some(id)
+        true
     }
     /// What `item`'s row says it did, when this presentation was formed from
     /// that very call. A presentation of an earlier state of the call, or one
@@ -3309,6 +3386,10 @@ enum HistoryNavigation {
     EarlierExplicit,
     NewerEdge,
     Latest,
+    /// The reader moved into history outside the loaded window.
+    Seek,
+    /// The current request must finish before its next provider page.
+    ContinueSeek,
 }
 
 #[derive(Clone, Copy)]
@@ -3799,10 +3880,10 @@ pub(super) struct Runtime {
     /// publication does not invent an unread message while scrolled back.
     last_presented_tail: Option<(String, ChangeToken)>,
     /// Only the latest explicitly requested preview is retained outside recency.
-    preview_request: Option<String>,
+    preview_request: Option<RowTarget>,
     /// The rest of the requested preview's gallery, read with it so a tile
     /// in an older gallery loads the gallery rather than one tile at a time.
-    preview_gallery: Vec<String>,
+    preview_gallery: Vec<RowTarget>,
     /// The palette the cache's code blocks are highlighted in.
     syntax_theme: crate::settings::EditorSyntaxTheme,
     /// How the conversation's pull request links read, from what the window
@@ -3887,6 +3968,15 @@ pub(super) struct Runtime {
     /// once the transcript settles it, or the reader edits the text.
     draft_echo: Option<(u64, DraftEcho)>,
     expanded: Revised<HashSet<String>>,
+    /// The rare duplicate IDs in the active window need independent widget
+    /// keys and disclosure choices. The ordinary persisted keys remain opaque.
+    colliding_row_ids: HashSet<String>,
+    parent_cache_keys: HashMap<usize, String>,
+    child_cache_keys: HashMap<usize, String>,
+    row_expansions: Vec<(RowTarget, bool)>,
+    row_unfolded: HashSet<(RowTarget, String)>,
+    find_expanded_rows: HashSet<RowTarget>,
+    find_unfolded_rows: HashSet<(RowTarget, String)>,
     /// Each child's own disclosures, stamped separately so pruning departed
     /// children never disturbs the selected child's.
     child_expanded: HashMap<String, Revised<HashSet<String>>>,
@@ -3980,6 +4070,11 @@ pub(super) struct Runtime {
     /// id, so a view parses each input once rather than on every frame.
     denial_inputs: std::cell::RefCell<HashMap<String, Arc<str>>>,
     scroll: view::Scroll,
+    /// The height each unloaded item of the main transcript is given.
+    history_estimate: std::cell::Cell<view::HistoryEstimate>,
+    /// The conversation index the window was last moved to, while the
+    /// reader is still in the unloaded history around it.
+    sought: Option<u64>,
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
     deferred_page: Option<HistoryNavigation>,
@@ -5497,6 +5592,11 @@ impl Runtime {
         if self.target != target {
             self.cancel_attachment_jobs();
             self.attachment_chooser_pending = None;
+            if self.draft_permission.pending.is_some() {
+                // A failed first send can restore this recipe under the new
+                // target. The old target's worker cannot answer it.
+                self.draft_permission = DraftPermissionPreview::default();
+            }
             self.target = target;
         }
     }
@@ -5523,11 +5623,14 @@ impl Runtime {
         visible: bool,
         syntax_theme: crate::settings::EditorSyntaxTheme,
     ) -> Self {
-        let mut draft_permission = DraftPermissionPreview::default();
-        let permission_mode = draft_permission.get(&session.launch.recipe, session.launch.provider);
+        let permission_mode =
+            match recipe_permission_mode(&session.launch.recipe, session.launch.provider) {
+                PermissionPreview::Known(mode) => mode,
+                PermissionPreview::ReadConfig => None,
+            };
         let mut runtime = Self {
             preparation: preparation::State::default(),
-            draft_permission,
+            draft_permission: DraftPermissionPreview::default(),
             draft_model_chosen: false,
             target,
             session,
@@ -5619,6 +5722,13 @@ impl Runtime {
             attachment_chooser_pending: None,
             draft_echo: None,
             expanded: Revised::default(),
+            colliding_row_ids: HashSet::new(),
+            parent_cache_keys: HashMap::new(),
+            child_cache_keys: HashMap::new(),
+            row_expansions: Vec::new(),
+            row_unfolded: HashSet::new(),
+            find_expanded_rows: HashSet::new(),
+            find_unfolded_rows: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
@@ -5658,6 +5768,8 @@ impl Runtime {
             selection_document: Default::default(),
             denial_inputs: Default::default(),
             scroll: view::Scroll::default(),
+            history_estimate: Default::default(),
+            sought: None,
             subagent_scroll: HashMap::new(),
             page_request: None,
             deferred_page: None,
@@ -5688,6 +5800,8 @@ impl Runtime {
         self.page_request = None;
         self.deferred_page = None;
         self.scroll = view::Scroll::default();
+        self.history_estimate.take();
+        self.sought = None;
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
         self.selection_document.get_mut().clear();
@@ -5698,6 +5812,13 @@ impl Runtime {
         self.child_find_disclosure.clear();
         self.opened = Revised::default();
         self.expanded = Revised::default();
+        self.colliding_row_ids.clear();
+        self.parent_cache_keys.clear();
+        self.child_cache_keys.clear();
+        self.row_expansions.clear();
+        self.row_unfolded.clear();
+        self.find_expanded_rows.clear();
+        self.find_unfolded_rows.clear();
         self.child_expanded.clear();
         self.child_unfolded.clear();
         self.answers.clear();
@@ -5818,13 +5939,6 @@ impl Runtime {
         self.merge_attachments(written);
         Some(queued.draft)
     }
-    /// The permission mode this draft's launch recipe previews, read from
-    /// provider config only when the recipe changed since the last read.
-    fn draft_permission_mode(&mut self) -> Option<String> {
-        self.draft_permission
-            .get(&self.session.launch.recipe, self.session.launch.provider)
-    }
-
     /// A conversation that has not started, showing `snapshot` until it does.
     fn draft(
         target: Target,
@@ -6266,7 +6380,7 @@ impl Runtime {
         let mut changed = false;
         // Each prepared message knows what it links to, so this reads no
         // text. One still being prepared is checked when it arrives.
-        for cached in self.cache.values_mut().chain(self.child_cache.values_mut()) {
+        for (id, cached) in self.cache.iter_mut().chain(self.child_cache.iter_mut()) {
             if cached
                 .pull_request_links
                 .iter()
@@ -6274,8 +6388,8 @@ impl Runtime {
             {
                 continue;
             }
-            if let Some(id) = cached.relabel() {
-                self.preparation.forget(&id);
+            if cached.relabel() {
+                self.preparation.forget(id);
                 changed = true;
             }
         }
@@ -6354,6 +6468,30 @@ impl Runtime {
             None => self.expanded.contains(id),
         }
     }
+    fn row_expanded(&self, item: &chat::Item) -> bool {
+        if self
+            .find_expanded_rows
+            .iter()
+            .any(|row| row.is(item, self.selected_subagent.as_deref()))
+        {
+            return true;
+        }
+        self.row_expansions
+            .iter()
+            .find_map(|(row, open)| {
+                row.is(item, self.selected_subagent.as_deref())
+                    .then_some(*open)
+            })
+            .unwrap_or_else(|| {
+                !requires_row_identity(&self.colliding_row_ids, &item.id)
+                    && self.item_expanded(&item.id)
+            })
+    }
+
+    fn fold_key(&self, item: &chat::Item, part: &str) -> String {
+        format!("{}#{part}", self.cache_key(item))
+    }
+
     fn part_unfolded(&self, key: &str) -> bool {
         match &self.selected_subagent {
             Some(child) => self
@@ -6363,9 +6501,25 @@ impl Runtime {
             None => self.unfolded.contains(key),
         }
     }
+
+    fn row_part_unfolded(&self, item: &chat::Item, part: &str) -> bool {
+        self.row_unfolded_parts(item).any(|open| open == part)
+            || (!requires_row_identity(&self.colliding_row_ids, &item.id)
+                && self.part_unfolded(&self.fold_key(item, part)))
+    }
+
+    fn row_unfolded_parts<'a>(&'a self, item: &'a chat::Item) -> impl Iterator<Item = &'a str> {
+        self.row_unfolded
+            .iter()
+            .chain(&self.find_unfolded_rows)
+            .filter_map(|(row, part)| {
+                row.is(item, self.selected_subagent.as_deref())
+                    .then_some(part.as_str())
+            })
+    }
     fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
         self.presentation_cache()
-            .get(&item.id)
+            .get(self.cache_key(item))
             .filter(|cached| {
                 !cached.placeholder
                     && cached
@@ -6376,6 +6530,15 @@ impl Runtime {
             .prompt
             .as_deref()
     }
+    fn cache_key<'a>(&'a self, item: &'a chat::Item) -> &'a str {
+        let keys = if self.selected_subagent.is_some() {
+            &self.child_cache_keys
+        } else {
+            &self.parent_cache_keys
+        };
+        row_cache_key(keys, item)
+    }
+
     fn presentation_cache(&self) -> &HashMap<String, CachedItem> {
         if self.selected_subagent.is_some() {
             &self.child_cache
@@ -6390,20 +6553,80 @@ impl Runtime {
             &mut self.cache
         }
     }
-    fn active_item(&self, id: &str) -> Option<&Arc<chat::Item>> {
-        let items = match self.selected_subagent.as_deref() {
-            Some(id) => {
-                &self
-                    .snapshot
-                    .subagents
-                    .iter()
-                    .find(|agent| agent.id == id)?
-                    .items
-            }
-            None => &self.snapshot.items,
-        };
-        items.iter().find(|item| item.id == id)
+    fn active_items(&self) -> Option<&[Arc<chat::Item>]> {
+        match self.selected_subagent.as_deref() {
+            Some(id) => self
+                .snapshot
+                .subagents
+                .iter()
+                .find(|agent| agent.id == id)
+                .map(|agent| agent.items.as_slice()),
+            None => Some(&self.snapshot.items),
+        }
     }
+
+    fn active_item(&self, id: &str) -> Option<&Arc<chat::Item>> {
+        self.active_items()?.iter().find(|item| item.id == id)
+    }
+
+    fn row_target(&self, item: &chat::Item) -> RowTarget {
+        let owner = self
+            .presentation_cache()
+            .get(self.cache_key(item))
+            .and_then(|cached| cached.item.as_ref())
+            .filter(|cached| std::ptr::eq(cached.as_ref(), item))
+            .or_else(|| {
+                self.active_items()?
+                    .iter()
+                    .find(|row| std::ptr::eq(row.as_ref(), item))
+            });
+        RowTarget {
+            id: item.id.clone(),
+            item: owner.map_or_else(Weak::new, Arc::downgrade),
+            child: self.selected_subagent.clone(),
+            #[cfg(test)]
+            test_by_id: false,
+        }
+    }
+
+    fn action_item(&self, row: &RowTarget) -> Option<&Arc<chat::Item>> {
+        #[cfg(test)]
+        if row.test_by_id {
+            return self.active_item(&row.id);
+        }
+        self.active_items()?
+            .iter()
+            .find(|item| row.is(item, self.selected_subagent.as_deref()))
+    }
+
+    fn preview_requested(&self, item: &chat::Item) -> bool {
+        self.preview_request
+            .as_ref()
+            .is_some_and(|row| row.is(item, self.selected_subagent.as_deref()))
+    }
+
+    fn coordination_for(&self, item: &chat::Item) -> Option<&coordination::Coordinated> {
+        let cached = self.presentation_cache().get(self.cache_key(item))?;
+        cached
+            .item
+            .as_deref()
+            .filter(|owner| std::ptr::eq(*owner, item))?;
+        cached.coordination.as_deref()
+    }
+
+    fn inline_copy_text(&self, row: &RowTarget, part: CopyPart) -> Option<String> {
+        let item = self.action_item(row)?;
+        if matches!(part, CopyPart::Text)
+            && let Some(copy) = self
+                .coordination_for(item)
+                .filter(|card| card.is_card())
+                .and_then(coordination::Coordinated::copy_text)
+        {
+            return Some(copy);
+        }
+        self.item_copy_text(part, &item.content)
+    }
+
     fn prepare_child_cache(&mut self, snapshot: &Snapshot) {
         self.prepare_transcript_cache(snapshot);
     }
@@ -6485,12 +6708,76 @@ impl Runtime {
         let (items, busy) = selected.map_or((snapshot.items.as_slice(), snapshot.busy), |agent| {
             (agent.items.as_slice(), agent.is_running())
         });
+        let aliases = if context.is_some() {
+            &mut self.child_cache_keys
+        } else {
+            &mut self.parent_cache_keys
+        };
+        let had_aliases = !aliases.is_empty();
+        if resume.is_none() {
+            self.colliding_row_ids.clear();
+            let mut primary = HashMap::new();
+            for item in items {
+                let current = primary.entry(item.id.as_str()).or_insert(item);
+                if !Arc::ptr_eq(current, item) {
+                    self.colliding_row_ids.insert(item.id.clone());
+                    // Prefer the opaque provider item over a prose part where
+                    // possible so ID-only provider operations retain its key.
+                    if !matches!(item.content, ItemContent::Text { .. })
+                        || matches!(current.content, ItemContent::Text { .. })
+                    {
+                        *current = item;
+                    }
+                }
+            }
+            aliases.clear();
+            if !self.colliding_row_ids.is_empty() {
+                for item in items {
+                    if Arc::ptr_eq(primary[item.id.as_str()], item) {
+                        continue;
+                    }
+                    let address = Arc::as_ptr(item) as usize;
+                    let mut alias = format!("\0chat-row:{address}");
+                    while primary.contains_key(alias.as_str()) {
+                        alias.push('0');
+                    }
+                    aliases.insert(address, alias);
+                }
+            }
+            self.row_expansions
+                .retain(|(row, _)| row.item.strong_count() != 0);
+            self.row_unfolded
+                .retain(|(row, _)| row.item.strong_count() != 0);
+            self.find_expanded_rows
+                .retain(|row| row.item.strong_count() != 0);
+            self.find_unfolded_rows
+                .retain(|(row, _)| row.item.strong_count() != 0);
+        }
+        let row_expanded = |item: &chat::Item| {
+            if self
+                .find_expanded_rows
+                .iter()
+                .any(|row| row.is(item, context.as_deref()))
+            {
+                return true;
+            }
+            self.row_expansions
+                .iter()
+                .find_map(|(row, open)| row.is(item, context.as_deref()).then_some(*open))
+                .unwrap_or_else(|| {
+                    !requires_row_identity(&self.colliding_row_ids, &item.id)
+                        && expanded.contains(&item.id)
+                })
+        };
         if resume.is_none()
-            && self.preparation.context(
+            && self.preparation.sync_context(
                 self.target,
                 snapshot.session_id.as_deref(),
                 context.as_deref(),
-                items,
+                items
+                    .iter()
+                    .map(|item| row_cache_key(aliases, item))
+                    .collect(),
             )
         {
             // The same opaque item ID may exist in two different transcripts.
@@ -6503,6 +6790,17 @@ impl Runtime {
                         .is_some_and(|item| items.iter().any(|current| Arc::ptr_eq(current, item)))
             });
             presentation_changed = true;
+        }
+        if resume.is_none() && (had_aliases || !aliases.is_empty()) {
+            cache.retain(|key, cached| {
+                cached.item.as_deref().is_some_and(|item| {
+                    key == row_cache_key(aliases, item)
+                        && (key == &item.id
+                            || items
+                                .iter()
+                                .any(|current| std::ptr::eq(current.as_ref(), item)))
+                })
+            });
         }
         let newest = items.len().wrapping_sub(1);
         let start = resume.unwrap_or(0).min(items.len());
@@ -6526,6 +6824,7 @@ impl Runtime {
         for position in walk {
             let index = newest - position;
             let item = &items[index];
+            let key = row_cache_key(aliases, item);
             let report = matches!(
                 &item.content,
                 ItemContent::Delivery {
@@ -6537,7 +6836,7 @@ impl Runtime {
             // parent or selected child is working. Its Ready must retire the
             // worker owner instead of retaining a streaming canonical copy.
             let growing = busy && index == newest && !report;
-            if cache.get(&item.id).is_some_and(|cached| {
+            if cache.get(key).is_some_and(|cached| {
                 cached.diagnostic
                     && cached
                         .item
@@ -6548,7 +6847,7 @@ impl Runtime {
             }
             if failure::diagnostic_item(provider, item) {
                 let unchanged = cache
-                    .get(&item.id)
+                    .get(key)
                     .and_then(|cached| cached.item.as_ref())
                     .is_some_and(|previous| Arc::ptr_eq(previous, item));
                 if !unchanged {
@@ -6565,13 +6864,13 @@ impl Runtime {
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
-                    cache.insert(item.id.clone(), cached);
+                    cache.insert(key.to_owned(), cached);
                     presentation_changed = true;
                 }
                 continue;
             }
-            if report && !expanded.contains(&item.id) {
-                let unchanged = cache.get(&item.id).is_some_and(|cached| {
+            if report && !row_expanded(item) {
+                let unchanged = cache.get(key).is_some_and(|cached| {
                     cached.report_expanded == Some(false)
                         && cached
                             .item
@@ -6579,21 +6878,21 @@ impl Runtime {
                             .is_some_and(|old| Arc::ptr_eq(old, item))
                 });
                 if !unchanged {
-                    let previous = cache.remove(&item.id);
+                    let previous = cache.remove(key);
                     let mut cached =
                         CachedItem::updated(&item.content, theme, previous, false, false, None);
                     cached.item = Some(item.clone());
                     cached.reader_memory = self.scroll_memory.clone();
                     cached.figures = self.figures.shared(context.is_some());
                     cached.reader_context.clone_from(&context);
-                    cache.insert(item.id.clone(), cached);
+                    cache.insert(key.to_owned(), cached);
                     presentation_changed = true;
                 }
                 continue;
             }
             let report_reveal = report
                 && cache
-                    .get(&item.id)
+                    .get(key)
                     .is_none_or(|cached| cached.report_expanded != Some(true));
             let coordinated = chat::coordination::may_recognize(item, provider);
             let reader_only = !reader_proofs.is_empty()
@@ -6608,7 +6907,7 @@ impl Runtime {
                 // Shape/role/context changes and unknown full replacements
                 // retain ordinary admitted worker preparation.
                 let previous = cache
-                    .get(&item.id)
+                    .get(key)
                     .filter(|cached| {
                         !cached.placeholder
                             && cached.coordination.is_none()
@@ -6631,25 +6930,25 @@ impl Runtime {
                         item,
                         growing,
                         theme,
-                        cache[&item.id].preparing,
-                        cache[&item.id].source.provisional(),
+                        cache[key].preparing,
+                        cache[key].source.provisional(),
                         &mut retired_metadata,
                     );
                 if metadata_reused {
                     let old = cache
-                        .get_mut(&item.id)
+                        .get_mut(key)
                         .unwrap()
                         .item
                         .replace(item.clone())
                         .unwrap();
                     retired_metadata.push(old);
                 }
-                let current = cache.get(&item.id);
+                let current = cache.get(key);
                 let exact = current
                     .and_then(|cached| cached.item.as_ref())
                     .is_some_and(|previous| Arc::ptr_eq(previous, item));
                 let pending = current.is_some_and(|cached| cached.preparing)
-                    || self.preparation.contains(&item.id);
+                    || self.preparation.contains(key);
                 let proven_from_cache = current
                     .and_then(|cached| cached.item.as_ref())
                     .is_some_and(|previous| {
@@ -6663,7 +6962,7 @@ impl Runtime {
                 // worker; the last proven prefix remains visible meanwhile.
                 if !metadata_reused && (pending || !exact || report_reveal) {
                     let replaced = self.preparation.stage_reusing(
-                        item,
+                        (key, item),
                         growing && (!reader_only || coordinated),
                         theme,
                         |old, new| known_append(handle.as_ref(), &self.logical_prose, old, new),
@@ -6682,7 +6981,7 @@ impl Runtime {
                     // The answer being written, then the rows the reader
                     // returns to, then everything else from the newest back.
                     self.preparation.rank(
-                        &item.id,
+                        key,
                         if growing {
                             0
                         } else if reading.contains(&item.id) {
@@ -6704,17 +7003,17 @@ impl Runtime {
                             item,
                             theme,
                             cache
-                                .get(&item.id)
+                                .get(key)
                                 .filter(|cached| cached.reader_context == context),
                         );
-                        cache.insert(item.id.clone(), replacement);
+                        cache.insert(key.to_owned(), replacement);
                         presentation_changed = true;
                     }
-                    if !cache.contains_key(&item.id) {
+                    if !cache.contains_key(key) {
                         presentation_changed = true;
                     }
                     let cached = cache
-                        .entry(item.id.clone())
+                        .entry(key.to_owned())
                         .or_insert_with(|| CachedItem::preparing(item, theme));
                     cached.preparing = true;
                     if report {
@@ -6746,13 +7045,13 @@ impl Runtime {
             let token = ChangeToken::of(&item.content);
             let mut image_changed = false;
             let append_proven = cache
-                .get(&item.id)
+                .get(key)
                 .and_then(|cached| cached.item.as_ref())
                 .filter(|previous| !Arc::ptr_eq(previous, item))
                 .is_some_and(|previous| {
                     known_append(handle.as_ref(), &self.logical_prose, previous, item)
                 });
-            if let Some(cached) = cache.get_mut(&item.id) {
+            if let Some(cached) = cache.get_mut(key) {
                 cached.reader_memory = self.scroll_memory.clone();
                 cached.figures = self.figures.shared(context.is_some());
                 cached.reader_context.clone_from(&context);
@@ -6794,12 +7093,12 @@ impl Runtime {
                     continue;
                 }
             }
-            let previous = cache.remove(&item.id).filter(|_| !image_changed);
+            let previous = cache.remove(key).filter(|_| !image_changed);
             let mut cached = CachedItem::updated(
                 &item.content,
                 theme,
                 previous,
-                expanded.contains(&item.id),
+                row_expanded(item),
                 growing,
                 None,
             );
@@ -6811,14 +7110,15 @@ impl Runtime {
             cached.reader_memory = self.scroll_memory.clone();
             cached.figures = self.figures.shared(context.is_some());
             cached.reader_context.clone_from(&context);
-            cache.insert(item.id.clone(), cached);
+            cache.insert(key.to_owned(), cached);
             presentation_changed = true;
         }
         let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
         for position in returning.iter().copied().chain(start..end) {
             let index = newest - position;
             let item = &items[index];
-            if let Some(cached) = cache.get_mut(&item.id)
+            let key = row_cache_key(aliases, item);
+            if let Some(cached) = cache.get_mut(key)
                 && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
             {
                 cached.stamp = item
@@ -6872,7 +7172,7 @@ impl Runtime {
             return;
         };
         let managed = self.preparation.contains(id);
-        let expanded = self.item_expanded(id);
+        let expanded = self.row_expanded(prepared.item());
         if self
             .presentation_cache()
             .get(id)
@@ -6907,8 +7207,8 @@ impl Runtime {
                 .pull_request_links
                 .iter()
                 .any(|key| !parsed_with.reads_alike(&labels, key));
-        if stale && let Some(id) = cached.relabel() {
-            self.preparation.forget(&id);
+        if stale && cached.relabel() {
+            self.preparation.forget(id);
             if self.visible.load(Ordering::Relaxed) {
                 let snapshot = self.snapshot.clone();
                 self.prepare_transcript_cache(&snapshot);
@@ -7064,7 +7364,7 @@ impl Runtime {
             && Arc::ptr_eq(&self.snapshot, &snapshot)
             && selected_items
                 .iter()
-                .all(|item| self.presentation_cache().contains_key(&item.id))
+                .all(|item| self.presentation_cache().contains_key(self.cache_key(item)))
         {
             return;
         }
@@ -7109,11 +7409,7 @@ impl Runtime {
                 .any(|message| &message.id == id)
         });
         if snapshot.permission_mode.is_none() && snapshot.session_id.is_none() {
-            Arc::make_mut(&mut snapshot).permission_mode =
-                self.snapshot.permission_mode.clone().or_else(|| {
-                    self.draft_permission
-                        .get(&self.session.launch.recipe, self.session.launch.provider)
-                });
+            Arc::make_mut(&mut snapshot).permission_mode = self.snapshot.permission_mode.clone();
         }
         if !self.parent_scroll().at_bottom()
             && !snapshot.has_later
@@ -7121,14 +7417,16 @@ impl Runtime {
             && !snapshot.history_loading
             && snapshot.items.last().is_some_and(|item| {
                 let token = ChangeToken::of(&item.content);
-                self.cache.get(&item.id).map_or_else(
-                    || {
-                        self.last_presented_tail
-                            .as_ref()
-                            .is_none_or(|(id, previous)| id != &item.id || *previous != token)
-                    },
-                    |cached| cached.token != token,
-                )
+                self.cache
+                    .get(row_cache_key(&self.parent_cache_keys, item))
+                    .map_or_else(
+                        || {
+                            self.last_presented_tail
+                                .as_ref()
+                                .is_none_or(|(id, previous)| id != &item.id || *previous != token)
+                        },
+                        |cached| cached.token != token,
+                    )
             })
         {
             self.unseen_activity = true;
@@ -7251,10 +7549,19 @@ impl Runtime {
                 selected.map_or(&[], |agent| agent.items.as_slice()),
             )
         {
-            self.cache
-                .retain(|id, _| snapshot.items.iter().any(|item| &item.id == id));
+            self.cache.retain(|id, _| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| row_cache_key(&self.parent_cache_keys, item) == id)
+            });
             self.child_cache.retain(|id, _| {
-                selected.is_some_and(|agent| agent.items.iter().any(|item| &item.id == id))
+                selected.is_some_and(|agent| {
+                    agent
+                        .items
+                        .iter()
+                        .any(|item| row_cache_key(&self.child_cache_keys, item) == id)
+                })
             });
             self.presentation_revision = self.presentation_revision.wrapping_add(1);
             self.find_navigation.changed_document();
@@ -7350,7 +7657,9 @@ impl Runtime {
             // parent footers. Updating a stamp never examines the body.
             let today = chat::now_ms().and_then(|now| chat::local_time((now / 1000) as i64));
             for item in &snapshot.items {
-                if let Some(cached) = self.cache.get_mut(&item.id)
+                if let Some(cached) = self
+                    .cache
+                    .get_mut(row_cache_key(&self.parent_cache_keys, item))
                     && cached.stamp.as_ref().map(|stamp| stamp.0) != item.at
                 {
                     cached.stamp = item
@@ -7507,7 +7816,7 @@ impl Runtime {
 
     fn restore_find_disclosures(&mut self) {
         self.restore_failure_find();
-        let collapsed =
+        let mut collapsed =
             self.find_disclosure
                 .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         // Restoring reads a child's disclosures before it writes them; an
@@ -7522,6 +7831,29 @@ impl Runtime {
             );
             if self.selected_subagent.as_ref() == Some(&child) {
                 child_collapsed = restored;
+            }
+        }
+        self.find_unfolded_rows.clear();
+        for row in self.find_expanded_rows.drain() {
+            let Some(item) = row.item.upgrade() else {
+                continue;
+            };
+            let (keys, cache, collapsed) = match &row.child {
+                None => (&self.parent_cache_keys, &self.cache, &mut collapsed),
+                Some(child) if self.selected_subagent.as_ref() == Some(child) => (
+                    &self.child_cache_keys,
+                    &self.child_cache,
+                    &mut child_collapsed,
+                ),
+                Some(_) => continue,
+            };
+            let key = row_cache_key(keys, &item);
+            if cache
+                .get(key)
+                .and_then(|cached| cached.item.as_ref())
+                .is_some_and(|cached| Arc::ptr_eq(cached, &item))
+            {
+                collapsed.push(key.to_owned());
             }
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
@@ -8414,24 +8746,28 @@ fn draft_snapshot(
     }
 }
 
-/// The permission mode a draft's launch recipe previews. Reading it touches
-/// provider config files, so it is computed once per (provider, recipe).
+/// The recipe last considered for a preview, including a resolved absence.
 #[derive(Default)]
 struct DraftPermissionPreview {
-    resolved: Option<(Provider, LaunchRecipe, Option<String>)>,
+    recipe: Option<(Provider, LaunchRecipe)>,
+    pending: Option<u64>,
+    mode: Option<String>,
 }
 
 impl DraftPermissionPreview {
-    fn get(&mut self, recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
-        if let Some((cached_provider, cached_recipe, mode)) = &self.resolved
-            && *cached_provider == provider
-            && cached_recipe == recipe
-        {
-            return mode.clone();
-        }
-        let mode = draft_permission_mode(recipe, provider);
-        self.resolved = Some((provider, recipe.clone(), mode.clone()));
-        mode
+    /// Supersede an older read before changing the mode displayed by the draft.
+    fn select(&mut self, provider: Provider, recipe: &LaunchRecipe, mode: Option<String>) {
+        self.recipe = Some((provider, recipe.clone()));
+        self.pending = None;
+        self.mode = mode;
+    }
+
+    fn matches(&self, provider: Provider, recipe: &LaunchRecipe) -> bool {
+        self.recipe
+            .as_ref()
+            .is_some_and(|(old_provider, old_recipe)| {
+                *old_provider == provider && old_recipe == recipe
+            })
     }
 }
 
@@ -8442,7 +8778,12 @@ fn conversation_place() -> String {
         .map_or_else(|| "this computer".to_owned(), |device| device.name.clone())
 }
 
-fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+enum PermissionPreview {
+    Known(Option<String>),
+    ReadConfig,
+}
+
+fn recipe_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> PermissionPreview {
     let arguments = &recipe.arguments;
     match provider {
         Provider::Claude => {
@@ -8450,9 +8791,9 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                 .iter()
                 .any(|argument| argument == "--dangerously-skip-permissions")
             {
-                return Some("bypassPermissions".into());
+                return PermissionPreview::Known(Some("bypassPermissions".into()));
             }
-            arguments
+            let explicit = arguments
                 .iter()
                 .enumerate()
                 .find_map(|(index, argument)| {
@@ -8476,21 +8817,43 @@ fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<St
                             .map(|mode| if mode == "default" { "manual" } else { mode }.to_owned())
                     })
                     .flatten()
-                })
-                .or_else(|| chat::claude_configured_default_mode(recipe))
-                .or_else(|| Some("manual".into()))
+                });
+            explicit.map_or(PermissionPreview::ReadConfig, |mode| {
+                PermissionPreview::Known(Some(mode))
+            })
         }
-        Provider::Codex => codex_draft_permission_mode(recipe),
-        Provider::Antigravity | Provider::Muse => chat::acp_permission_mode(recipe, provider),
-        Provider::Omp => None,
+        Provider::Codex => match codex_recipe_policy(recipe) {
+            CodexRecipePolicy::Known(mode) => PermissionPreview::Known(mode.map(str::to_owned)),
+            CodexRecipePolicy::Config { .. } => PermissionPreview::ReadConfig,
+        },
+        Provider::Antigravity | Provider::Muse => {
+            PermissionPreview::Known(chat::acp_permission_mode(recipe, provider))
+        }
+        Provider::Omp => PermissionPreview::Known(None),
     }
 }
 
-/// Preview the launch policy without changing the CLI's configuration. Once
-/// connected, the thread's own reported policy replaces this preview.
-fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+fn draft_permission_mode(recipe: &LaunchRecipe, provider: Provider) -> Option<String> {
+    match recipe_permission_mode(recipe, provider) {
+        PermissionPreview::Known(mode) => mode,
+        PermissionPreview::ReadConfig if provider == Provider::Claude => {
+            chat::claude_configured_default_mode(recipe).or_else(|| Some("manual".into()))
+        }
+        PermissionPreview::ReadConfig => codex_draft_permission_mode(recipe),
+    }
+}
+
+enum CodexRecipePolicy<'a> {
+    Known(Option<&'static str>),
+    Config {
+        approval: Option<&'a str>,
+        sandbox: Option<&'a str>,
+    },
+}
+
+fn codex_recipe_policy(recipe: &LaunchRecipe) -> CodexRecipePolicy<'_> {
     if crate::device::is_remote() {
-        return None;
+        return CodexRecipePolicy::Known(None);
     }
     let arguments = &recipe.arguments;
     if arguments.iter().any(|argument| {
@@ -8499,8 +8862,71 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
             "--yolo" | "--dangerously-bypass-approvals-and-sandbox"
         )
     }) {
-        return Some("yolo".into());
+        return CodexRecipePolicy::Known(Some("yolo"));
     }
+    // These recipes are not supported for new native threads. Do not guess
+    // which profile or config override a resumed provider thread uses.
+    if arguments.iter().any(|argument| {
+        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    if arguments.iter().enumerate().any(|(index, argument)| {
+        let override_value = argument.strip_prefix("--config=").or_else(|| {
+            matches!(argument.as_str(), "-c" | "--config")
+                .then(|| arguments.get(index + 1).map(String::as_str))
+                .flatten()
+        });
+        override_value.is_some_and(|value| {
+            value.split_once('=').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
+                )
+            })
+        })
+    }) {
+        return CodexRecipePolicy::Known(None);
+    }
+    let flag = |short: &str, long: &str| {
+        arguments
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(index, argument)| {
+                argument.strip_prefix(&format!("{long}=")).or_else(|| {
+                    (argument == short || argument == long)
+                        .then(|| arguments.get(index + 1).map(String::as_str))
+                        .flatten()
+                })
+            })
+    };
+    let explicit_approval = flag("-a", "--ask-for-approval");
+    let explicit_sandbox = flag("-s", "--sandbox");
+    match (explicit_approval, explicit_sandbox) {
+        (Some(approval), Some(sandbox)) => {
+            CodexRecipePolicy::Known(codex_mode(Some(approval), Some(sandbox)))
+        }
+        (approval, sandbox) => CodexRecipePolicy::Config { approval, sandbox },
+    }
+}
+
+fn codex_mode(approval: Option<&str>, sandbox: Option<&str>) -> Option<&'static str> {
+    match (approval, sandbox) {
+        (Some("never"), Some("danger-full-access")) => Some("yolo"),
+        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite"),
+        (Some("on-request"), Some("read-only")) => Some("readOnly"),
+        _ => None,
+    }
+}
+
+/// Preview the launch policy without changing the CLI's configuration. Once
+/// connected, the thread's own reported policy replaces this preview.
+fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
+    let (explicit_approval, explicit_sandbox) = match codex_recipe_policy(recipe) {
+        CodexRecipePolicy::Known(mode) => return mode.map(str::to_owned),
+        CodexRecipePolicy::Config { approval, sandbox } => (approval, sandbox),
+    };
     let environment = |name: &str| {
         (!recipe.unset_environment.iter().any(|unset| unset == name))
             .then(|| {
@@ -8529,80 +8955,38 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         .and_then(|contents| contents.parse::<toml::Table>().ok())
         .unwrap_or_default();
 
-    // These recipes are not supported for new native threads. Do not guess
-    // which profile or config override a resumed provider thread uses.
-    if arguments.iter().any(|argument| {
-        matches!(argument.as_str(), "-p" | "--profile") || argument.starts_with("--profile=")
-    }) {
+    if config.contains_key("profile")
+        || config.contains_key("default_permissions")
+        || config.contains_key("permissions")
+    {
         return None;
     }
-    if arguments.iter().enumerate().any(|(index, argument)| {
-        let override_value = argument.strip_prefix("--config=").or_else(|| {
-            matches!(argument.as_str(), "-c" | "--config")
-                .then(|| arguments.get(index + 1).map(String::as_str))
-                .flatten()
-        });
-        override_value.is_some_and(|value| {
-            value.split_once('=').is_some_and(|(key, _)| {
-                matches!(
-                    key.trim(),
-                    "approval_policy" | "sandbox_mode" | "default_permissions" | "permissions"
-                )
-            })
-        })
-    }) {
-        return None;
-    }
-    let flag = |short: &str, long: &str| {
-        arguments
-            .iter()
-            .enumerate()
-            .rev()
-            .find_map(|(index, argument)| {
-                argument.strip_prefix(&format!("{long}=")).or_else(|| {
-                    (argument == short || argument == long)
-                        .then(|| arguments.get(index + 1).map(String::as_str))
-                        .flatten()
-                })
-            })
-    };
-    let explicit_approval = flag("-a", "--ask-for-approval");
-    let explicit_sandbox = flag("-s", "--sandbox");
-    if explicit_approval.is_none() || explicit_sandbox.is_none() {
-        if config.contains_key("profile")
-            || config.contains_key("default_permissions")
-            || config.contains_key("permissions")
-        {
-            return None;
+    let user_home = environment("HOME").map(PathBuf::from);
+    let user_config = root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
+    for directory in recipe.working_directory.ancestors() {
+        if user_home.as_deref() == Some(directory) {
+            break;
         }
-        let user_home = environment("HOME").map(PathBuf::from);
-        let user_config =
-            root.and_then(|root| std::fs::canonicalize(root.join("config.toml")).ok());
-        for directory in recipe.working_directory.ancestors() {
-            if user_home.as_deref() == Some(directory) {
-                break;
-            }
-            let path = directory.join(".codex/config.toml");
-            // The account's own config can also be an ancestor of cwd. It
-            // remains a user layer rather than a second project layer.
-            if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
-                continue;
-            }
-            if let Ok(contents) = std::fs::read_to_string(path) {
-                let project = contents.parse::<toml::Table>().ok()?;
-                if [
-                    "approval_policy",
-                    "sandbox_mode",
-                    "default_permissions",
-                    "permissions",
-                ]
-                .iter()
-                .any(|key| project.contains_key(*key))
-                {
-                    // Trust decides whether Codex loads this layer. Wait
-                    // for its authoritative thread policy rather than guess.
-                    return None;
-                }
+        let path = directory.join(".codex/config.toml");
+        // The account's own config can also be an ancestor of cwd. It
+        // remains a user layer rather than a second project layer.
+        if user_config.is_some() && std::fs::canonicalize(&path).ok() == user_config {
+            continue;
+        }
+        if let Ok(contents) = std::fs::read_to_string(path) {
+            let project = contents.parse::<toml::Table>().ok()?;
+            if [
+                "approval_policy",
+                "sandbox_mode",
+                "default_permissions",
+                "permissions",
+            ]
+            .iter()
+            .any(|key| project.contains_key(*key))
+            {
+                // Trust decides whether Codex loads this layer. Wait
+                // for its authoritative thread policy rather than guess.
+                return None;
             }
         }
     }
@@ -8610,12 +8994,7 @@ fn codex_draft_permission_mode(recipe: &LaunchRecipe) -> Option<String> {
         explicit_approval.or_else(|| config.get("approval_policy").and_then(toml::Value::as_str));
     let sandbox =
         explicit_sandbox.or_else(|| config.get("sandbox_mode").and_then(toml::Value::as_str));
-    match (approval, sandbox) {
-        (Some("never"), Some("danger-full-access")) => Some("yolo".into()),
-        (Some("on-request"), Some("workspace-write")) => Some("workspaceWrite".into()),
-        (Some("on-request"), Some("read-only")) => Some("readOnly".into()),
-        _ => None,
-    }
+    codex_mode(approval, sandbox).map(str::to_owned)
 }
 
 fn set_draft_permission_mode(recipe: &mut LaunchRecipe, provider: Provider, mode: &str) {
@@ -9167,14 +9546,11 @@ impl Cagents {
             })
         });
         let mut snapshot = draft_snapshot(provider, models, model.clone(), reasoning.clone());
-        let recipe = moved
-            .as_ref()
-            .map_or(&runtime.session.launch.recipe, |session| {
-                &session.launch.recipe
-            });
-        snapshot.permission_mode = runtime.draft_permission.get(recipe, provider);
         if moved.is_none() {
             snapshot.skills.clone_from(&runtime.snapshot.skills);
+            snapshot
+                .permission_mode
+                .clone_from(&runtime.snapshot.permission_mode);
         }
         runtime.draft_model_chosen = true;
         runtime.snapshot = Arc::new(snapshot);
@@ -9196,7 +9572,7 @@ impl Cagents {
         self.remember_chat_model(provider, model, reasoning);
         self.replace_chat_conversation(target.card, session);
         let skills = if moved.is_some() {
-            self.load_draft_skills(target)
+            self.load_draft_details(target)
         } else {
             Task::none()
         };
@@ -9307,12 +9683,9 @@ impl Cagents {
         runtime.session = session.clone();
         runtime.release_start_block();
         Arc::make_mut(&mut runtime.snapshot).skills.clear();
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, account.provider);
         runtime.completion.restart(true);
         self.replace_chat_conversation(target.card, session);
-        self.load_draft_skills(target)
+        self.load_draft_details(target)
     }
 
     /// The managed account `session` was recorded on, when the account list
@@ -9777,6 +10150,55 @@ impl Cagents {
         )
     }
 
+    fn load_draft_details(&mut self, target: Target) -> Task<Message> {
+        Task::batch([
+            self.load_draft_permission(target),
+            self.load_draft_skills(target),
+        ])
+    }
+
+    fn load_draft_permission(&mut self, target: Target) -> Task<Message> {
+        let Some(runtime) = self
+            .chat_card_runtime_mut(target)
+            .filter(|runtime| runtime.is_draft())
+        else {
+            return Task::none();
+        };
+        let provider = runtime.session.launch.provider;
+        let recipe = &runtime.session.launch.recipe;
+        let preview = &mut runtime.draft_permission;
+        if preview.matches(provider, recipe) {
+            // A model choice can replace the draft snapshot without changing its recipe.
+            Arc::make_mut(&mut runtime.snapshot)
+                .permission_mode
+                .clone_from(&preview.mode);
+            return Task::none();
+        }
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        match recipe_permission_mode(recipe, provider) {
+            PermissionPreview::Known(mode) => {
+                snapshot.permission_mode.clone_from(&mode);
+                preview.select(provider, recipe, mode);
+                return Task::none();
+            }
+            PermissionPreview::ReadConfig => {
+                snapshot.permission_mode = None;
+                preview.select(provider, recipe, None);
+            }
+        }
+        static NEXT_READ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let read = NEXT_READ.fetch_add(1, Ordering::Relaxed);
+        preview.pending = Some(read);
+        let recipe = recipe.clone();
+        cosmic::task::future(async move {
+            let mode =
+                tokio::task::spawn_blocking(move || draft_permission_mode(&recipe, provider))
+                    .await
+                    .unwrap_or_default();
+            action(Action::DraftPermissionResolved(target, read, mode))
+        })
+    }
+
     /// Read authored skills on the blocking pool. No daemon or provider is
     /// involved, and a late result cannot replace a different account's list
     /// or the authoritative catalog of a conversation that has started.
@@ -9890,9 +10312,6 @@ impl Cagents {
             }
             runtime.draft_model_chosen = true;
         }
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         if rehomed {
             // A failed start's reason belongs to the account it failed on,
             // and the composer's note to the launch that refused it.
@@ -9900,14 +10319,13 @@ impl Cagents {
             runtime.composer_note = None;
             runtime.completion.restart(true);
         }
-        if !rehomed {
-            // The skills this window found still answer the draft's home
-            // and directory; another window's model or permission choice
-            // changes neither.
-            return Task::none();
-        }
         let target = runtime.target;
-        self.load_draft_skills(target)
+        if rehomed {
+            self.load_draft_details(target)
+        } else {
+            // The skills still match this provider's home and directory.
+            self.load_draft_permission(target)
+        }
     }
 
     /// Takes the draft out of `card` when another window has started the
@@ -10055,6 +10473,12 @@ impl Cagents {
                     },
                 )
             }
+            // End of a window that is not the conversation's newest is not
+            // the end: it is the newest history the reader wants.
+            Named::End if runtime.selected_subagent.is_none() && runtime.snapshot.has_later => {
+                let target = runtime.target;
+                return Some(self.handle_chat_action(Action::Latest(target)));
+            }
             Named::Home | Named::End => {
                 let edge = if *key == Named::Home {
                     scroll::Edge::Start
@@ -10065,15 +10489,24 @@ impl Cagents {
                 runtime
                     .scroll_memory
                     .request_edge(runtime.selected_subagent.as_deref(), edge);
-                return Some(
-                    scroll::snap_to_edge(
-                        runtime.target,
-                        edge,
-                        runtime.find_navigation.guard(),
-                        runtime.find_navigation.document_epoch(),
-                    )
-                    .map(cosmic::Action::App),
-                );
+                let snap = scroll::snap_to_edge(
+                    runtime.target,
+                    edge,
+                    runtime.find_navigation.guard(),
+                    runtime.find_navigation.document_epoch(),
+                )
+                .map(cosmic::Action::App);
+                // The conversation's start is outside the window: move the
+                // window there, and the reader to its first item.
+                if edge == scroll::Edge::Start
+                    && runtime.selected_subagent.is_none()
+                    && runtime.snapshot.history.earlier() > 0
+                {
+                    let target = runtime.target;
+                    let start = runtime.history_start();
+                    return Some(Task::batch([snap, self.follow_into_history(target, start)]));
+                }
+                return Some(snap);
             }
             _ => return None,
         };
@@ -10214,7 +10647,7 @@ impl Cagents {
                 return Task::none();
             }
         };
-        let mut snapshot = self.chat_draft_snapshot(provider);
+        let snapshot = self.chat_draft_snapshot(provider);
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
             return Task::none();
         };
@@ -10224,9 +10657,6 @@ impl Cagents {
             to = provider.label(),
             "moved an untouched draft off a provider that isn't installed"
         );
-        snapshot.permission_mode = runtime
-            .draft_permission
-            .get(&session.launch.recipe, provider);
         runtime.snapshot = Arc::new(snapshot);
         runtime.session = session.clone();
         runtime.model_picker = None;
@@ -10238,7 +10668,7 @@ impl Cagents {
         runtime.completion.restart(true);
         let target = runtime.target;
         self.replace_chat_conversation(card, session);
-        Task::batch([self.load_draft_skills(target), self.save_snapshot_soon()])
+        Task::batch([self.load_draft_details(target), self.save_snapshot_soon()])
     }
 
     /// What the start page says when no provider can start a conversation:
@@ -11063,8 +11493,6 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.draft_model_chosen = model_chosen;
-        // The runtime already read its recipe's preview; this is that answer.
-        Arc::make_mut(&mut runtime.snapshot).permission_mode = runtime.draft_permission_mode();
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
         self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
@@ -11083,7 +11511,7 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([self.load_draft_skills(target), moved])
+        Task::batch([self.load_draft_details(target), moved])
     }
 
     /// Keep the warm hidden chats within [`warm`]'s budget, releasing the
@@ -13838,7 +14266,6 @@ impl Cagents {
             draft_choice::set(&mut draft, &chosen);
         }
         (snapshot.selected_model, snapshot.reasoning) = chosen;
-        snapshot.permission_mode = runtime.draft_permission.get(&draft.launch.recipe, provider);
         let handle = match std::mem::replace(&mut runtime.connection, Connection::Draft) {
             Connection::Live(handle) => Some(handle),
             Connection::Draft | Connection::AwaitingAdmission | Connection::Connecting => None,
@@ -13856,7 +14283,7 @@ impl Cagents {
         self.observe_agent_activity_for_card(target.card, None);
         Task::batch([
             self.retire_chat(target.card, handle, Some(draft)),
-            self.load_draft_skills(target),
+            self.load_draft_details(target),
         ])
     }
 
@@ -13895,6 +14322,17 @@ impl Cagents {
         let Some(runtime) = self.chat_runtime_mut(target) else {
             return Task::none();
         };
+        // A window that holds the item sought has answered the seek, so a
+        // later one to the same item, after paging moved the window off it,
+        // is sent again.
+        let history = runtime.snapshot.history;
+        if runtime.sought.is_some_and(|index| {
+            index
+                .checked_sub(history.before)
+                .is_some_and(|offset| offset < runtime.window_items().count() as u64)
+        }) {
+            runtime.sought = None;
+        }
         if !runtime.commands.is_idle()
             || runtime.queued.is_some()
             || runtime.disconnected
@@ -13902,8 +14340,16 @@ impl Cagents {
         {
             return Task::none();
         }
-        let Some(page) = runtime.deferred_page.take() else {
-            return Task::none();
+        let page = match runtime.deferred_page.take() {
+            Some(page) => page,
+            // A reader held at the start while its history is fetched is
+            // what asks for the next page. A refresh, a reconnect or a
+            // subagent read meanwhile can drop what was deferred; the reader
+            // still waiting there resumes it.
+            None if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Start) => {
+                HistoryNavigation::Seek
+            }
+            None => return Task::none(),
         };
         match page {
             HistoryNavigation::Latest
@@ -13927,7 +14373,12 @@ impl Cagents {
                     LatestReader::Preserve,
                 )
             }
-            HistoryNavigation::Latest => Task::none(),
+            // Home since: the reader waits at the start instead.
+            HistoryNavigation::Latest
+                if runtime.scroll_memory.edge(None) != Some(scroll::Edge::Start) =>
+            {
+                Task::none()
+            }
             HistoryNavigation::NewerEdge
                 if runtime.parent_scroll().prefetch_later() && runtime.snapshot.has_later =>
             {
@@ -13941,8 +14392,107 @@ impl Cagents {
             {
                 self.chat_send(target, Command::LoadEarlier, false)
             }
+            HistoryNavigation::Seek | HistoryNavigation::ContinueSeek
+                if runtime.snapshot.history_loading =>
+            {
+                runtime.deferred_page = Some(page);
+                Task::none()
+            }
+            HistoryNavigation::Seek
+            | HistoryNavigation::ContinueSeek
+            | HistoryNavigation::Latest => {
+                let sought = if runtime.scroll_memory.edge(None) == Some(scroll::Edge::Start) {
+                    (runtime.snapshot.history.earlier() > 0).then(|| runtime.history_start())
+                } else {
+                    runtime.history_index(runtime.parent_scroll())
+                };
+                match sought {
+                    Some(sought) => self.follow_into_history(target, sought),
+                    None => Task::none(),
+                }
+            }
             _ => Task::none(),
         }
+    }
+
+    /// Brings the history the reader moved to, outside the loaded window,
+    /// into it.
+    fn follow_into_history(&mut self, target: Target, sought: view::Sought) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        match sought {
+            view::Sought::Cached { index, at } => self.seek_history(target, index, Some(at)),
+            // The provider hands history over a page at a time, back from
+            // the oldest it has handed over. The window goes there, and each
+            // page that arrives is followed by the next until it reaches the
+            // reader, who waits in the space standing for it.
+            view::Sought::Unfetched => {
+                if !runtime.snapshot.has_earlier {
+                    return Task::none();
+                }
+                runtime.scroll_memory.release(scroll::Edge::Latest);
+                runtime.scroll_memory.cancel_landing();
+                if !runtime.commands.is_idle()
+                    || runtime.queued.is_some()
+                    || runtime.disconnected
+                    || runtime.snapshot.history_loading
+                {
+                    runtime.deferred_page = Some(HistoryNavigation::Seek);
+                    return Task::none();
+                }
+                runtime.deferred_page = Some(HistoryNavigation::ContinueSeek);
+                if runtime.snapshot.history.before > 0 {
+                    return self.seek_history(target, 0, None);
+                }
+                self.chat_send(target, Command::LoadEarlier, false)
+            }
+            // The reader at the conversation's start stays there, as Home
+            // keeps them, while the window moves to its first item: the
+            // space standing for unloaded history above them is gone once
+            // it is all loaded, and nothing else would place them.
+            view::Sought::Start => {
+                runtime
+                    .scroll_memory
+                    .request_edge(runtime.selected_subagent.as_deref(), scroll::Edge::Start);
+                let start = runtime.history_start();
+                self.follow_into_history(target, start)
+            }
+            // The reader at the conversation's end is at its newest history,
+            // as End takes them there.
+            view::Sought::Latest => self.handle_chat_action(Action::Latest(target)),
+        }
+    }
+
+    /// Moves the transcript window to the conversation's item at `index`,
+    /// unless that is where it is already being moved.
+    fn seek_history(&mut self, target: Target, index: u64, landing: Option<f32>) -> Task<Message> {
+        let Some(runtime) = self.chat_runtime_mut(target) else {
+            return Task::none();
+        };
+        runtime.scroll_memory.release(scroll::Edge::Latest);
+        if !runtime.commands.is_idle()
+            || runtime.queued.is_some()
+            || runtime.disconnected
+            || runtime.snapshot.history_loading
+        {
+            // A provider page can insert items ahead of an index. Recompute
+            // it from the reader's position after the page arrives.
+            runtime.scroll_memory.cancel_landing();
+            runtime.deferred_page = Some(HistoryNavigation::Seek);
+            return Task::none();
+        }
+        if let Some(at) = landing {
+            runtime.scroll_memory.land(index, at);
+            if runtime.deferred_page == Some(HistoryNavigation::ContinueSeek) {
+                runtime.deferred_page = None;
+            }
+        }
+        if runtime.sought == Some(index) {
+            return Task::none();
+        }
+        runtime.sought = Some(index);
+        self.chat_send(target, Command::Seek { index }, false)
     }
 
     fn chat_send(&mut self, target: Target, command: Command, clear_draft: bool) -> Task<Message> {
@@ -14683,6 +15233,20 @@ impl Cagents {
             Action::OpeningName(card, conversation, title) => {
                 self.opening_name_read(card, conversation, title);
             }
+            Action::DraftPermissionResolved(target, read, mode) => {
+                if let Some(runtime) = self.chat_card_runtime_mut(target)
+                    && runtime.is_draft()
+                    && runtime.draft_permission.pending == Some(read)
+                    && runtime.draft_permission.matches(
+                        runtime.session.launch.provider,
+                        &runtime.session.launch.recipe,
+                    )
+                {
+                    runtime.draft_permission.pending = None;
+                    runtime.draft_permission.mode.clone_from(&mode);
+                    Arc::make_mut(&mut runtime.snapshot).permission_mode = mode;
+                }
+            }
             Action::DraftSkills(target, launch, skills) => {
                 if let Some(runtime) = self.chat_card_runtime_mut(target)
                     && runtime.is_draft()
@@ -15389,6 +15953,10 @@ impl Cagents {
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
                             runtime.deferred_page = None;
+                            // A seek the old handle took may never have
+                            // reached the daemon, so the same one is sent
+                            // again rather than awaited.
+                            runtime.sought = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
                             runtime.error = None;
@@ -17667,13 +18235,23 @@ impl Cagents {
                     }
                     (Err(error), None) => {
                         if pending.page == Some(view::Page::Latest) {
-                            runtime.scroll_memory.clear_latest();
+                            runtime.scroll_memory.release(scroll::Edge::Latest);
                             runtime.scroll_memory.cancel_preserve(pending.id);
                         }
-                        if pending.page.is_some() {
+                        if pending.page.is_some() || pending.seeks() {
                             runtime.page_request = None;
                             runtime.earlier_asked = None;
                             runtime.later_asked = None;
+                            runtime.sought = None;
+                            // Stop the failed request's own continuation.
+                            // A newer gesture still gets to choose the next window.
+                            if runtime.deferred_page != Some(HistoryNavigation::Seek) {
+                                runtime.scroll_memory.release(scroll::Edge::Start);
+                                runtime.scroll_memory.cancel_landing();
+                                if runtime.deferred_page == Some(HistoryNavigation::ContinueSeek) {
+                                    runtime.deferred_page = None;
+                                }
+                            }
                         }
                         // A message the provider did not take goes back to
                         // the composer, and so does any written after it:
@@ -17763,67 +18341,84 @@ impl Cagents {
                 // and its report settles the message then.
                 return Task::batch([self.next_chat_command(target), self.dispatch_queued(target)]);
             }
-            Action::Toggle(target, id) => {
+            Action::Toggle(target, row) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_navigation.cancel();
-                    let expanded = if let Some(child) = &runtime.selected_subagent {
-                        if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
-                            disclosure.manual_item(&id);
-                        }
-                        runtime.child_expanded.entry(child.clone()).or_default()
-                    } else {
-                        runtime.find_disclosure.manual_item(&id);
-                        &mut runtime.expanded
+                    let Some(item) = runtime.action_item(&row).cloned() else {
+                        return Task::none();
                     };
-                    let expanded = expanded.edit();
-                    let open = !expanded.remove(&id);
-                    if open {
-                        expanded.insert(id.clone());
-                    }
-                    if runtime.selected_subagent.is_none() {
-                        runtime.follow_lone_step(&id, open);
-                    }
-                    if runtime.active_item(&id).is_some_and(|item| {
-                        matches!(
-                            &item.content,
-                            ItemContent::Delivery {
-                                kind: chat::DeliveryKind::Report,
-                                ..
+                    let id = item.id.clone();
+                    let open = !runtime.row_expanded(&item);
+                    runtime.find_navigation.cancel();
+                    if requires_row_identity(&runtime.colliding_row_ids, &id) {
+                        let row = runtime.row_target(&item);
+                        runtime.find_expanded_rows.remove(&row);
+                        runtime
+                            .row_expansions
+                            .retain(|(current, _)| current != &row);
+                        runtime.row_expansions.push((row, open));
+                    } else {
+                        let expanded = if let Some(child) = &runtime.selected_subagent {
+                            if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
+                                disclosure.manual_item(&id);
                             }
-                        )
-                    }) {
+                            runtime.child_expanded.entry(child.clone()).or_default()
+                        } else {
+                            runtime.find_disclosure.manual_item(&id);
+                            &mut runtime.expanded
+                        };
+                        let expanded = expanded.edit();
+                        if open {
+                            expanded.insert(id.clone());
+                        } else {
+                            expanded.remove(&id);
+                        }
+                        if runtime.selected_subagent.is_none() {
+                            runtime.follow_lone_step(&id, open);
+                        }
+                    }
+                    if matches!(
+                        &item.content,
+                        ItemContent::Delivery {
+                            kind: chat::DeliveryKind::Report,
+                            ..
+                        }
+                    ) {
                         let snapshot = runtime.snapshot.clone();
                         runtime.prepare_transcript_cache(&snapshot);
                         return Task::none();
                     }
-                    if let Some(item) = runtime.active_item(&id).cloned().filter(|item| {
-                        CachedItem::prose(&item.content).is_none()
-                            || runtime
-                                .presentation_cache()
-                                .get(&id)
-                                .is_some_and(|cached| cached.coordination.is_some())
-                    }) {
+                    if CachedItem::prose(&item.content).is_none()
+                        || runtime.coordination_for(&item).is_some()
+                    {
                         // A collapsed item can still be awaiting authenticated
                         // bookmark-prefix verification. Opening it must not
                         // replace that owner with an unverified cold reader;
                         // completion installs using the current disclosure.
+                        let key = runtime.cache_key(&item).to_owned();
                         if runtime
                             .presentation_cache()
-                            .get(&id)
-                            .is_some_and(|cached| cached.preparing)
+                            .get(&key)
+                            .is_some_and(|cached| {
+                                cached.preparing
+                                    || cached
+                                        .item
+                                        .as_ref()
+                                        .is_some_and(|owner| !Arc::ptr_eq(owner, &item))
+                            })
                         {
                             return Task::none();
                         }
-                        let previous = runtime.presentation_cache_mut().remove(&id);
-                        let cached = CachedItem::updated(
+                        let previous = runtime.presentation_cache_mut().remove(&key);
+                        let mut cached = CachedItem::updated(
                             &item.content,
                             runtime.syntax_theme,
                             previous,
-                            runtime.item_expanded(&id),
+                            open,
                             false,
                             None,
                         );
-                        runtime.presentation_cache_mut().insert(id.clone(), cached);
+                        cached.item = Some(item);
+                        runtime.presentation_cache_mut().insert(key, cached);
                     }
                 }
             }
@@ -17839,8 +18434,8 @@ impl Cagents {
                         if runtime.strip_stands_for_step(turn)
                             && let Some(item) = runtime.snapshot.items.get(turn.steps[0].index)
                         {
-                            let id = item.id.clone();
-                            return self.handle_chat_action(Action::Toggle(target, id));
+                            let row = runtime.row_target(item);
+                            return self.handle_chat_action(Action::Toggle(target, row));
                         }
                         runtime.find_disclosure.manual_turn(&key);
                         runtime.opened.edit().insert(key, open);
@@ -18010,12 +18605,24 @@ impl Cagents {
                         }
                         runtime.refresh_find();
                     }
-                    runtime.deferred_page = None;
+                    // Paging toward a reader waiting in the main transcript's
+                    // history waits while they read a subagent, and resumes
+                    // once they are back there; paging at an edge they
+                    // scrolled to does not.
+                    if !matches!(
+                        runtime.deferred_page,
+                        Some(HistoryNavigation::Seek | HistoryNavigation::ContinueSeek)
+                    ) {
+                        runtime.deferred_page = None;
+                    }
                     runtime.selection_document.get_mut().clear();
                     let snapshot = runtime.snapshot.clone();
                     runtime.prepare_transcript_cache(&snapshot);
                     runtime.refresh_find();
                     images::sync(runtime);
+                    if runtime.selected_subagent.is_none() {
+                        return self.resume_history_navigation(target);
+                    }
                 }
             }
             Action::CopyMessage(target, id, source) => {
@@ -18037,38 +18644,35 @@ impl Cagents {
                     runtime.install_snapshot(raw, clock);
                 }
             }
-            Action::Copy(target, id, part) => {
-                text_copy::invalidate();
+            Action::Copy(target, row, part) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                let key = text_copy::CopyKey::of(id.clone(), Some(&part));
-                // The body itself lives in the snapshot; only the extracted
-                // code blocks are the cache's own.
-                let text = runtime.active_item(&id).and_then(|item| {
-                    let card = runtime
-                        .presentation_cache()
-                        .get(&item.id)
-                        .and_then(|cached| cached.coordination.as_deref())
-                        .filter(|coordinated| coordinated.is_card());
-                    match card {
-                        // A message read from a file copies as the
-                        // command that sent it.
-                        Some(card) if matches!(part, CopyPart::Text) => card
-                            .copy_text()
-                            .or_else(|| runtime.item_copy_text(part, &item.content)),
-                        _ => runtime.item_copy_text(part, &item.content),
-                    }
-                });
+                let key = text_copy::CopyKey::Row(row.clone(), part.clone());
+                let text = runtime.inline_copy_text(&row, part);
                 if let Some(text) = text {
+                    text_copy::invalidate();
                     return Task::batch([
                         iced::clipboard::write(text).map(cosmic::Action::App),
                         runtime.tell_copy(key, None),
                     ]);
                 }
             }
-            Action::Unfold(target, key) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
+            Action::Unfold(target, row, part) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(item) = runtime.action_item(&row)
+                {
+                    if requires_row_identity(&runtime.colliding_row_ids, &item.id) {
+                        let choice = (runtime.row_target(item), part);
+                        runtime.find_navigation.cancel();
+                        if !runtime.find_unfolded_rows.remove(&choice)
+                            && !runtime.row_unfolded.remove(&choice)
+                        {
+                            runtime.row_unfolded.insert(choice);
+                        }
+                        return Task::none();
+                    }
+                    let key = runtime.fold_key(item, &part);
                     runtime.find_navigation.cancel();
                     let unfolded = if let Some(child) = &runtime.selected_subagent {
                         if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {
@@ -18147,9 +18751,13 @@ impl Cagents {
             Action::OpenSharedDocument(target, raw) => {
                 return self.handle_chat_ui(Action::OpenDocument(target, raw.to_string()));
             }
-            Action::LoadImage(target, id) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    images::request(runtime, &id);
+            Action::LoadImage(target, row) => {
+                if let Some(runtime) = self.chat_runtime_mut(target)
+                    && let Some(item) = runtime.action_item(&row)
+                    && matches!(item.content, ItemContent::Image { .. })
+                {
+                    let key = runtime.cache_key(item).to_owned();
+                    images::request(runtime, &key);
                 }
             }
             Action::LoadFigure(target, id) => {
@@ -18206,6 +18814,7 @@ impl Cagents {
             | Action::CloseImage(_)
             | Action::ImageNext(..)
             | Action::ViewerLoaded(..)
+            | Action::ResumeImageViewer(..)
             | Action::ImageFit(_)
             | Action::ImageExternal(_) => {
                 return self.image_viewer_action(&action).unwrap_or_else(Task::none);
@@ -18319,6 +18928,9 @@ impl Cagents {
                 };
                 runtime.find_navigation.cancel();
                 if runtime.selected_subagent.is_none() {
+                    runtime.scroll_memory.cancel_landing();
+                    runtime.sought = None;
+                    runtime.deferred_page = None;
                     if !runtime.commands.is_idle() {
                         runtime
                             .scroll_memory
@@ -18650,7 +19262,7 @@ impl Cagents {
                         // so the composer stays usable while it shows.
                         runtime.show_image(images::Gallery::attachment(
                             runtime.selected_subagent.clone(),
-                            attachment.label(),
+                            attachment,
                             handle,
                         ));
                         return self.focus_image_viewer(target);
@@ -18785,12 +19397,17 @@ impl Cagents {
                         // A different launch recipe was never refused.
                         runtime.release_start_block();
                     }
+                    runtime.draft_permission.select(
+                        provider,
+                        &runtime.session.launch.recipe,
+                        Some(mode.clone()),
+                    );
                     Arc::make_mut(&mut runtime.snapshot).permission_mode = Some(mode);
                     let session = runtime.session.clone();
                     self.replace_chat_conversation(target.card, session);
                     // Skills found for the earlier launch are not accepted for
                     // this one, so a discovery under way would be dropped.
-                    return self.load_draft_skills(target);
+                    return self.load_draft_details(target);
                 }
                 return self.chat_send(target, Command::SetPermissionMode { mode }, false);
             }
@@ -19133,6 +19750,29 @@ impl Cagents {
                 runtime.scroll = scroll;
                 if scroll.at_bottom() && !runtime.snapshot.has_later {
                     runtime.unseen_activity = false;
+                }
+                let sought = runtime.history_index(scroll);
+                if sought.is_none() {
+                    // Reports queue behind the moves that make them, so one
+                    // from a moment ago in unloaded history can have asked
+                    // to land after the reader came back. The rows they see
+                    // now place them when the window arrives.
+                    runtime.scroll_memory.cancel_landing();
+                    runtime.sought = None;
+                    if matches!(
+                        runtime.deferred_page,
+                        Some(HistoryNavigation::Seek | HistoryNavigation::ContinueSeek)
+                    ) {
+                        runtime.deferred_page = None;
+                    }
+                }
+                // A track click, a drag of the thumb or a fast fling can take
+                // the reader past what is loaded. A page from the window's
+                // edge would not reach them, so the window moves to them.
+                if let Some(sought) = sought {
+                    runtime.earlier_asked = None;
+                    runtime.later_asked = None;
+                    return self.follow_into_history(target, sought);
                 }
                 // Pages are fetched ahead of the reader, within a couple of
                 // screens of a loaded edge rather than at it.

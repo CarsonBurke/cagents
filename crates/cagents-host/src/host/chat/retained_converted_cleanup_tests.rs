@@ -176,6 +176,7 @@ fn pending_converted_cleanup_preserves_independent_terminal_worker() {
     original.lock().unwrap().native_actor_startups.insert(
         id,
         retained_actor::Startup {
+            local: false,
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),

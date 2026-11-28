@@ -703,12 +703,28 @@ impl State {
         self.deferred = None;
         self.last_deferred = false;
     }
+    #[cfg(test)]
     pub(super) fn context(
         &mut self,
         target: Target,
         session: Option<&str>,
         selected: Option<&str>,
         items: &[Arc<chat::Item>],
+    ) -> bool {
+        self.sync_context(
+            target,
+            session,
+            selected,
+            items.iter().map(|item| item.id.as_str()).collect(),
+        )
+    }
+
+    pub(super) fn sync_context(
+        &mut self,
+        target: Target,
+        session: Option<&str>,
+        selected: Option<&str>,
+        ids: HashSet<&str>,
     ) -> bool {
         let context = (
             target,
@@ -729,7 +745,6 @@ impl State {
             }
             self.context = Some(context);
         }
-        let ids: HashSet<_> = items.iter().map(|item| item.id.as_str()).collect();
         self.entries.retain(|id, entry| {
             let retain = ids.contains(id.as_str());
             if !retain {
@@ -844,7 +859,7 @@ impl State {
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
     ) -> bool {
-        self.stage_reusing(item, growing, theme, append, HashMap::new)
+        self.stage_reusing((&item.id, item), growing, theme, append, HashMap::new)
     }
 
     /// `append` is proof from the immutable source publication, not a tail
@@ -852,7 +867,7 @@ impl State {
     /// new lineage and cancels both queued and currently parsing old input.
     pub(super) fn stage_reusing(
         &mut self,
-        item: &Arc<chat::Item>,
+        (key, item): (&str, &Arc<chat::Item>),
         growing: bool,
         theme: crate::settings::EditorSyntaxTheme,
         append: impl Fn(&Arc<chat::Item>, &Arc<chat::Item>) -> bool,
@@ -864,21 +879,21 @@ impl State {
         };
         if self
             .errors
-            .get(&item.id)
+            .get(key)
             .is_some_and(|(old, _)| old.as_ptr() == Arc::as_ptr(item))
         {
             return false;
         }
-        self.errors.remove(&item.id);
+        self.errors.remove(key);
         if bytes > QUEUED_BYTES
             || (bytes > SOURCE_BYTES && CachedItem::prose(&item.content).is_some())
         {
-            if let Some(entry) = self.entries.get(&item.id) {
+            if let Some(entry) = self.entries.get(key) {
                 entry.shared.cancel();
             }
-            self.remove(&item.id);
+            self.remove(key);
             self.errors.insert(
-                item.id.clone(),
+                key.to_owned(),
                 (
                     Arc::downgrade(item),
                     "This message is too large to display.".into(),
@@ -886,7 +901,7 @@ impl State {
             );
             return true;
         }
-        if let Some(entry) = self.entries.get_mut(&item.id) {
+        if let Some(entry) = self.entries.get_mut(key) {
             let mut latest = entry
                 .shared
                 .latest
@@ -924,7 +939,7 @@ impl State {
             }
             entry.shared.cancel();
         }
-        self.remove(&item.id);
+        self.remove(key);
         let lease = Arc::new(Lease::default());
         if self
             .entries
@@ -939,7 +954,7 @@ impl State {
             return true;
         }
         self.entries.insert(
-            item.id.clone(),
+            key.to_owned(),
             Entry {
                 run: next_attempt(),
                 running: true,

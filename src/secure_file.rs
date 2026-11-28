@@ -4,7 +4,6 @@ use std::{
     os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt},
     path::Path,
 };
-#[cfg(any(feature = "host", feature = "ui"))]
 use std::{
     fs::{File, OpenOptions},
     os::unix::fs::OpenOptionsExt,
@@ -13,9 +12,7 @@ use std::{
 const PRIVATE_DIRECTORY_MODE: u32 = 0o700;
 #[cfg(any(feature = "host", feature = "ui"))]
 const PRIVATE_FILE_MODE: u32 = 0o600;
-#[cfg(any(feature = "host", feature = "ui"))]
 const O_NOFOLLOW: i32 = libc::O_NOFOLLOW;
-#[cfg(any(feature = "host", feature = "ui"))]
 const O_NONBLOCK: i32 = libc::O_NONBLOCK;
 
 fn storage_error(path: &Path, message: impl std::fmt::Display) -> io::Error {
@@ -160,7 +157,6 @@ pub fn prepare_private_directory(path: &Path) -> io::Result<()> {
     validate_owned_directory(path)
 }
 
-#[cfg(any(feature = "host", feature = "ui"))]
 fn validate_owned_regular_file(path: &Path, metadata: &fs::Metadata) -> io::Result<()> {
     if !metadata.is_file() {
         return Err(storage_error(path, "expected a regular file"));
@@ -213,7 +209,6 @@ pub(crate) fn open_existing_private_file(path: &Path) -> io::Result<File> {
 
 /// Inspection must not repair permissions or change the receipt's metadata.
 /// An unsafe or multiply linked file is unavailable, never silently migrated.
-#[cfg(any(feature = "ui", feature = "host"))]
 pub fn open_existing_private_file_readonly(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(true)

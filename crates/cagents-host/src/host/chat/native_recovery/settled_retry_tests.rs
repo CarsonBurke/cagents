@@ -699,7 +699,7 @@ fn with_private_socket<T>(fixture: &Fixture, operation: impl FnOnce() -> T) -> T
             }
             let host = host.clone();
             readers.push(thread::spawn(move || {
-                crate::host::client::serve(stream, client, host)
+                crate::host::client::serve_fixture_user(stream, client, host)
             }));
         }
         for reader in readers {

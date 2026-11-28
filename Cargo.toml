@@ -148,6 +148,7 @@ imara-diff = "0.2.0"
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
 notify = "=9.0.0-rc.8"
+p256 = { version = "0.13", default-features = false, features = ["arithmetic"] }
 percent-encoding = { version = "2.3", optional = true }
 portable-pty = { version = "0.9", features = ["serde_support"], optional = true }
 # The mobile bridge validates PNG bytes before staging an attachment.
@@ -167,7 +168,7 @@ serde = { version = "1.0", features = ["derive", "rc"] }
 semver = { version = "1.0", features = ["serde"] }
 serde_bytes = "0.11"
 serde_ignored = "0.1"
-serde_json = "1.0"
+serde_json = { version = "1.0", features = ["raw_value"] }
 serde_path_to_error = "0.1"
 sha2 = "0.10"
 # `cagents device update` sends this computer's installed tree as a release

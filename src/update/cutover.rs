@@ -1255,8 +1255,9 @@ mod tests {
             phase: Phase::Restoring,
             digest: "c".repeat(64),
         };
-        let eligible =
-            |intent, checkpoint| checkpoint_retirement_matches(state, intent, checkpoint).unwrap();
+        let eligible = |intent: &Intent, checkpoint: &CheckpointStatus| {
+            checkpoint_retirement_matches(state, intent, checkpoint).unwrap()
+        };
         assert!(!eligible(&selected, &checkpoint));
         let record = RestoredCheckpoint {
             version: 1,

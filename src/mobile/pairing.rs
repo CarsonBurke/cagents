@@ -21,7 +21,7 @@
 
 use std::{
     fs,
-    io::{self, BufRead, Write},
+    io::{self, BufRead, Read, Write},
     os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::mpsc,
@@ -44,6 +44,8 @@ const LOCK_NAME: &str = ".authorized_keys.cagents-lock";
 /// Under the runtime directory: one directory per pairing.
 const PAIRINGS: &str = "cagents-phone-pairing";
 const ED25519: &str = "ssh-ed25519";
+const ECDSA_P256: &str = "ecdsa-sha2-nistp256";
+const INVALID_PHONE_KEY: &str = "Pairing requires a valid Ed25519 or P-256 public key.";
 
 // Files in a pairing's directory.
 const EXPIRES: &str = "expires";
@@ -83,10 +85,7 @@ impl PublicKey {
         let blob = base64::engine::general_purpose::STANDARD
             .decode(words.next()?)
             .ok()?;
-        let named = blob
-            .get(..4)
-            .map(|length| u32::from_be_bytes(length.try_into().unwrap()) as usize)?;
-        (blob.get(4..4 + named)? == kind.as_bytes()).then(|| Self {
+        (ssh_string(&mut blob.as_slice())? == kind.as_bytes()).then(|| Self {
             kind: kind.to_owned(),
             blob,
         })
@@ -105,10 +104,35 @@ impl PublicKey {
         }
     }
 
-    /// Whether this is a well-formed Ed25519 key, the only kind a phone may
-    /// pair with.
+    /// Whether this is a well-formed Ed25519 public key.
     pub fn is_ed25519(&self) -> bool {
-        self.kind == ED25519 && self.blob.len() == 4 + ED25519.len() + 4 + 32
+        let mut payload = self.payload();
+        self.kind == ED25519
+            && ssh_string(&mut payload).is_some_and(|key| key.len() == 32)
+            && payload.is_empty()
+    }
+
+    fn is_phone_key(&self) -> bool {
+        match self.kind.as_str() {
+            ED25519 => self.is_ed25519(),
+            ECDSA_P256 => {
+                let mut payload = self.payload();
+                ssh_string(&mut payload) == Some(b"nistp256")
+                    && ssh_string(&mut payload).is_some_and(|point| {
+                        // OpenSSH expects an uncompressed SEC1 point.
+                        point.len() == 65
+                            && point[0] == 4
+                            && p256::PublicKey::from_sec1_bytes(point).is_ok()
+                    })
+                    && payload.is_empty()
+            }
+            _ => false,
+        }
+    }
+
+    fn payload(&self) -> &[u8] {
+        // Both constructors put the type in the first SSH string.
+        &self.blob[4 + self.kind.len()..]
     }
 
     /// OpenSSH's fingerprint, as `ssh-keygen -l` prints it: `SHA256:` and the
@@ -132,6 +156,13 @@ impl PublicKey {
     pub fn kind(&self) -> &str {
         &self.kind
     }
+}
+
+fn ssh_string<'a>(input: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let (length, rest) = input.split_first_chunk::<4>()?;
+    let (value, tail) = rest.split_at_checked(u32::from_be_bytes(*length) as usize)?;
+    *input = tail;
+    Some(value)
 }
 
 /// The computer's Ed25519 host key, which the phone pins.
@@ -628,9 +659,115 @@ impl AuthorizedKeys {
         })
     }
 
+    fn topic_path(&self, key: &PublicKey) -> io::Result<PathBuf> {
+        // OpenSSH permits an owned ~/.ssh symlink. Anchor the private
+        // sidecar at the validated directory it points to.
+        let directory = self.directory().canonicalize()?;
+        crate::secure_file::validate_owned_directory(&directory)?;
+        let name =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&key.blob));
+        Ok(directory.join("cagents-notify").join(name))
+    }
+
+    fn read_topic(&self, key: &PublicKey) -> io::Result<String> {
+        let path = self.topic_path(key)?;
+        crate::secure_file::reject_symlink_components(&path)?;
+        let file = crate::secure_file::open_existing_private_file_readonly(&path)?;
+        let mut topic = String::new();
+        file.take(33).read_to_string(&mut topic)?;
+        if topic.len() != 32
+            || !topic
+                .bytes()
+                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Invalid mobile relay topic",
+            ));
+        }
+        Ok(topic)
+    }
+
+    /// Called under the authorized_keys lock. A new pairing rotates any topic
+    /// left behind by an interrupted edit or an externally removed SSH key.
+    fn ensure_topic(&self, key: &PublicKey, rotate: bool) -> Result<(), String> {
+        if !rotate {
+            match self.read_topic(key) {
+                Ok(_) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(_) => {
+                    return Err("Could not read the phone's private notification topic".into());
+                }
+            }
+        }
+        let path = self
+            .topic_path(key)
+            .map_err(|_| "Could not find private phone notification storage")?;
+        crate::secure_file::prepare_private_directory(path.parent().expect("topic directory"))
+            .map_err(|_| "Could not prepare private phone notification storage")?;
+        let mut random = [0u8; 16];
+        getrandom::fill(&mut random)
+            .map_err(|_| "Could not generate a private notification topic")?;
+        let topic: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
+        replace(&path, &topic, 0o600)
+            .map_err(|_| "Could not save the phone's private notification topic".into())
+    }
+
+    /// Resolve a live pairing at the point of use. Revoking the phone's SSH
+    /// key also makes the pairing's topic unavailable to the relay.
+    pub fn notification_topic(
+        &self,
+        fingerprint: &str,
+        relay: &url::Url,
+    ) -> Result<String, &'static str> {
+        self.check(false)
+            .map_err(|_| "Could not read phone pairings")?;
+        let phones = self.phones().map_err(|_| "Could not read phone pairings")?;
+        let phone = phones
+            .into_iter()
+            .find(|phone| phone.restricted && phone.key.fingerprint() == fingerprint)
+            .ok_or("The selected phone is no longer paired")?;
+        let secret = self
+            .read_topic(&phone.key)
+            .map_err(|_| "The selected phone has no readable notification topic")?;
+        // Each relay gets a separate 128-bit topic, so a previous relay
+        // never learns the topic used after changing servers.
+        let mut hash = Sha256::new();
+        hash.update(b"cagents mobile relay topic v1\0");
+        hash.update(secret.as_bytes());
+        hash.update(relay.origin().ascii_serialization().as_bytes());
+        let topic = hash.finalize()[..16]
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        Ok(topic)
+    }
+
+    /// Add the topic for a phone paired before this version, after the person
+    /// explicitly selects it for notifications.
+    pub fn prepare_notification_phone(&self, key: &PublicKey) -> Result<(), String> {
+        self.edit(|current| {
+            if !current
+                .lines()
+                .filter_map(parse_line)
+                .any(|line| line.key == *key && is_phone_line(&line) && line.restricted())
+            {
+                return Err("The selected phone is no longer paired".into());
+            }
+            self.ensure_topic(key, false)?;
+            Ok((None, ()))
+        })
+    }
+
     /// Remove every bridge line for `key`. Its other lines, if any, stay.
     pub fn remove_phone(&self, key: &PublicKey) -> Result<(), String> {
         self.edit(|current| {
+            // Revocation must still work if this optional file cannot be removed.
+            if let Ok(path) = self.topic_path(key)
+                && crate::secure_file::reject_symlink_components(&path).is_ok()
+            {
+                let _ = fs::remove_file(path);
+            }
             let next = current
                 .split_inclusive('\n')
                 .filter(|line| {
@@ -932,8 +1069,8 @@ impl Pairing {
     /// Authorize the phone that asked, with `command`, remove the one-time
     /// line and tell the phone.
     pub fn allow(&self, request: &Request, command: &str) -> Result<Added, String> {
-        if !request.key.is_ed25519() {
-            return Err("Only Ed25519 keys can be paired.".into());
+        if !request.key.is_phone_key() {
+            return Err(INVALID_PHONE_KEY.into());
         }
         if request.key == self.one_time {
             return Err("The phone offered the pairing code's own key.".into());
@@ -943,6 +1080,11 @@ impl Pairing {
             for line in without.lines().filter_map(parse_line) {
                 if line.key == request.key {
                     if is_phone_line(&line) {
+                        if self.keys.ensure_topic(&request.key, false).is_err() {
+                            tracing::warn!(
+                                "Could not prepare the paired phone's notification topic"
+                            );
+                        }
                         return Ok((Some(without), Added::AlreadyPaired));
                     }
                     return Err(
@@ -952,6 +1094,7 @@ impl Pairing {
                     );
                 }
             }
+            self.keys.ensure_topic(&request.key, true)?;
             let next = appended(&without, &phone_line(&request.key, &request.name, command));
             Ok((Some(next), Added::Added))
         })?;
@@ -1156,8 +1299,8 @@ fn pair(
         Ok(api::PairClientLine::Pair(request)) => request,
         Err(_) => return pair_error("The phone's pairing request wasn't understood."),
     };
-    let Some(key) = PublicKey::parse(&request.key).filter(PublicKey::is_ed25519) else {
-        return pair_error("Only Ed25519 keys can be paired.");
+    let Some(key) = PublicKey::parse(&request.key).filter(PublicKey::is_phone_key) else {
+        return pair_error(INVALID_PHONE_KEY);
     };
     if let Err(message) = record_request(directory, &key, &request.name) {
         return pair_error(message);

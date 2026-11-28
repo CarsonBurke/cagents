@@ -22,9 +22,11 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
+    ops::{Deref, DerefMut},
     os::{
         fd::{AsRawFd, BorrowedFd},
         unix::{
@@ -34,7 +36,7 @@ use std::{
     },
     path::{Path, PathBuf},
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{Arc, Mutex, OnceLock},
 };
 #[cfg(target_os = "linux")]
 use std::{os::fd::FromRawFd, os::unix::process::CommandExt};
@@ -79,6 +81,93 @@ pub struct Census {
     /// nothing was under way, so their bytes are unchanged.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub in_flight: Vec<crate::update::in_flight::InFlight>,
+}
+
+/// A census embedded in durable JSON evidence. Carry the original JSON value
+/// through receipts and records so every reader verifies the same bytes.
+#[derive(Clone)]
+pub struct StoredCensus {
+    value: Census,
+    original: Option<Arc<serde_json::value::RawValue>>,
+}
+
+impl std::fmt::Debug for StoredCensus {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.value, formatter)
+    }
+}
+
+impl From<Census> for StoredCensus {
+    fn from(value: Census) -> Self {
+        Self {
+            value,
+            original: None,
+        }
+    }
+}
+
+impl StoredCensus {
+    fn hash(&self) -> Result<String, serde_json::Error> {
+        match &self.original {
+            Some(original) => Ok(digest(original.get().as_bytes())),
+            None => serde_json::to_vec(&self.value).map(|bytes| digest(&bytes)),
+        }
+    }
+
+    pub(crate) fn same_bytes(&self, other: &Self) -> Result<bool, serde_json::Error> {
+        match (&self.original, &other.original) {
+            (Some(left), Some(right)) => Ok(left.get() == right.get()),
+            _ => Ok(self.hash()? == other.hash()?),
+        }
+    }
+
+    fn freeze(&mut self) -> Result<(), serde_json::Error> {
+        if self.original.is_none() {
+            self.original = Some(serde_json::value::to_raw_value(&self.value)?.into());
+        }
+        Ok(())
+    }
+}
+
+impl Deref for StoredCensus {
+    type Target = Census;
+
+    fn deref(&self) -> &Census {
+        &self.value
+    }
+}
+
+impl DerefMut for StoredCensus {
+    fn deref_mut(&mut self) -> &mut Census {
+        self.original = None;
+        &mut self.value
+    }
+}
+
+impl PartialEq for StoredCensus {
+    fn eq(&self, other: &Self) -> bool {
+        self.value == other.value
+    }
+}
+
+impl Serialize for StoredCensus {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match &self.original {
+            Some(original) => original.serialize(serializer),
+            None => self.value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for StoredCensus {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let original = Box::<serde_json::value::RawValue>::deserialize(deserializer)?;
+        let value = serde_json::from_str(original.get()).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            value,
+            original: Some(original.into()),
+        })
+    }
 }
 
 #[cfg(all(feature = "host", any(test, target_os = "macos")))]
@@ -332,6 +421,24 @@ impl Census {
         record
     }
 
+    fn with_historical_pages(&self) -> Cow<'_, Self> {
+        if self.snapshots.len() >= self.chats.len() {
+            return Cow::Borrowed(self);
+        }
+        let mut census = self.clone();
+        census.snapshots.extend(
+            self.chats
+                .iter()
+                .filter(|source| !self.snapshots.iter().any(|saved| &saved.source == *source))
+                .map(|source| super::floor::StoppedSnapshot {
+                    source: source.clone(),
+                    snapshot: crate::chat::Snapshot::default(),
+                    limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
+                }),
+        );
+        Cow::Owned(census)
+    }
+
     /// Recovery later saves this capture's pages beside the stopped-pane
     /// evidence already retained for its source, shortening pages to fit.
     /// Its identity evidence must fit there unshortened.
@@ -458,7 +565,7 @@ pub(crate) struct Authority {
     #[serde(default)]
     reviewed: Option<DaemonImpact>,
     source: HostSessionProof,
-    census: Census,
+    census: StoredCensus,
     #[serde(default)]
     windows: Vec<String>,
     expected: Vec<(SessionKind, TerminalId)>,
@@ -470,6 +577,13 @@ pub(crate) struct Authority {
     daemon_path: PathBuf,
     target: PathBuf,
     target_hash: String,
+}
+
+#[cfg(any(all(target_os = "macos", feature = "host"), test))]
+impl Authority {
+    fn same_evidence(&self, other: &Self) -> bool {
+        self == other && self.census.same_bytes(&other.census).unwrap_or(false)
+    }
 }
 
 /// Disk evidence alone never grants the automatic prepare/ACK authority.
@@ -491,7 +605,7 @@ struct CapturedCensus {
     source: HostSessionProof,
     #[serde(default)]
     checkpoint_hash: Option<String>,
-    census: Census,
+    census: StoredCensus,
     windows: Vec<String>,
 }
 
@@ -535,7 +649,7 @@ impl CaptureProducer {
 pub(crate) struct PendingRecovery {
     pub source: HostSessionProof,
     pub checkpoint_hash: String,
-    pub census: Census,
+    pub census: StoredCensus,
     pub windows: Vec<String>,
     pub original_census_complete: bool,
     producer: Option<CaptureProducer>,
@@ -674,7 +788,7 @@ impl Authority {
             job_request_hash: hash(),
             reviewed: Some(reviewed.clone()),
             source: source.clone(),
-            census: census.clone(),
+            census: census.clone().into(),
             windows: windows.to_vec(),
             expected: checkpointed_owners(reviewed),
             checkpoint_path: path(),
@@ -973,7 +1087,7 @@ pub(crate) fn capture_before_floor(
             }),
             source: source.clone(),
             checkpoint_hash: None,
-            census: census.clone(),
+            census: census.clone().into(),
             windows: guard.prepared_window_slots().to_vec(),
         },
     )
@@ -1102,7 +1216,7 @@ impl PendingRecovery {
                         .collect(),
                     ..Default::default()
                 };
-                (census, Vec::new())
+                (census.into(), Vec::new())
             }
         };
         let pending = Self {
@@ -1254,21 +1368,13 @@ impl PendingRecovery {
                 self.windows = capture.windows;
             }
         }
-        self.census.terminals = original.terminals;
-        self.census.chats = original.chats;
-        for source in &self.census.chats {
-            if !self
-                .census
-                .snapshots
-                .iter()
-                .any(|saved| saved.source == *source)
-            {
-                self.census.snapshots.push(super::floor::StoppedSnapshot {
-                    source: source.clone(), snapshot: crate::chat::Snapshot::default(),
-                    limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
-                });
-            }
+        if self.census.terminals != original.terminals || self.census.chats != original.chats {
+            self.census.terminals = original.terminals;
+            self.census.chats = original.chats;
         }
+        // A matching Proposed capture already carries the original bytes.
+        // Derive its historical pages only for recovery.
+        self.census.freeze().map_err(|error| error.to_string())?;
         self.producer = Some(CaptureProducer::ExplicitCensus {
             transaction: original.transaction,
             census_hash: digest(&bytes),
@@ -1285,16 +1391,7 @@ impl PendingRecovery {
             return Ok(None);
         };
         let pending = pending.with_original_census(path)?;
-        persist_bound_capture(
-            &pending.checkpoint_path,
-            &CapturedCensus {
-                producer: pending.producer.clone(),
-                source: pending.source.clone(),
-                checkpoint_hash: Some(pending.checkpoint_hash.clone()),
-                census: pending.census.clone(),
-                windows: pending.windows.clone(),
-            },
-        )?;
+        pending.bind_manual_census()?;
         let bytes =
             read_checkpoint(&pending.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         pending.validate(&bytes)?;
@@ -1313,8 +1410,24 @@ impl PendingRecovery {
         .is_some())
     }
 
+    fn bind_manual_census(&self) -> Result<(), String> {
+        self.census
+            .with_historical_pages()
+            .validate_capture(&self.source)?;
+        persist_bound_capture(
+            &self.checkpoint_path,
+            &CapturedCensus {
+                producer: self.producer.clone(),
+                source: self.source.clone(),
+                checkpoint_hash: Some(self.checkpoint_hash.clone()),
+                census: self.census.clone(),
+                windows: self.windows.clone(),
+            },
+        )
+    }
+
     pub(crate) fn authorize_manual(
-        mut self,
+        self,
         selected_hash: &str,
         yes: bool,
         state: &Path,
@@ -1345,32 +1458,7 @@ impl PendingRecovery {
         let bytes =
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
-        // Missing historical transcript capture is represented honestly. This
-        // creates a paused history descriptor, never a provider launch recipe.
-        for source in &self.census.chats {
-            if !self
-                .census
-                .snapshots
-                .iter()
-                .any(|saved| saved.source == *source)
-            {
-                self.census.snapshots.push(super::floor::StoppedSnapshot {
-                    source: source.clone(), snapshot: crate::chat::Snapshot::default(),
-                    limitation: Some("Paused after an incomplete update. A transcript page was not captured before shutdown. The original conversation identity is retained; no provider was started. Resume explicitly to inspect its stored history.".into()),
-                });
-            }
-        }
-        self.census.validate_capture(&self.source)?;
-        persist_bound_capture(
-            &self.checkpoint_path,
-            &CapturedCensus {
-                producer: self.producer.clone(),
-                source: self.source.clone(),
-                checkpoint_hash: Some(self.checkpoint_hash.clone()),
-                census: self.census.clone(),
-                windows: self.windows.clone(),
-            },
-        )?;
+        self.bind_manual_census()?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
         let cli =
@@ -1416,7 +1504,7 @@ impl PendingRecovery {
             source: self.source.clone(),
             target: target.clone(),
             target_hash: target_hash.clone(),
-            census_hash: digest(&serde_json::to_vec(&self.census).map_err(|e| e.to_string())?),
+            census_hash: self.census.hash().map_err(|e| e.to_string())?,
             windows: windows.to_vec(),
         };
         let carried = request.carried_windows(state)?;
@@ -1511,7 +1599,7 @@ impl Preparation {
                 }),
                 source: daemon.capability.proof.clone(),
                 checkpoint_hash: None,
-                census: census.clone(),
+                census: census.clone().into(),
                 windows: guard.prepared_window_slots().to_vec(),
             },
         )?;
@@ -1524,7 +1612,7 @@ impl Preparation {
                 job_request_hash,
                 reviewed: Some(daemon.clone()),
                 source: daemon.capability.proof.clone(),
-                census,
+                census: census.into(),
                 windows: guard.prepared_window_slots().to_vec(),
                 expected: checkpointed_owners(daemon),
                 checkpoint_path: store.path,
@@ -1748,7 +1836,7 @@ impl ReadyPlanEvidence<'_> {
 
     #[cfg(feature = "host")]
     pub(crate) fn same_authority(&self, authority: &Authority) -> bool {
-        self.authority.as_ref() == authority
+        self.authority.same_evidence(authority)
     }
 
     pub(crate) fn claim_exists(&self) -> Result<bool, String> {
@@ -2375,7 +2463,7 @@ fn read_verified_record_identity(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -2402,7 +2490,10 @@ fn read_verified_record_identity(
         || target_hash.is_some_and(|hash| record.target_hash != hash)
         || record.target.as_deref() != Some(target)
         || executable_hash(target)? != record.target_hash
-        || &record.census != census
+        || !record
+            .census
+            .same_bytes(census)
+            .map_err(|error| error.to_string())?
         || record.successor.as_ref() != Some(serving)
         || !serving.is_complete()
     {
@@ -2426,7 +2517,7 @@ fn read_verified_record(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -2679,7 +2770,7 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
         job_request_hash: String::new(),
         reviewed: Some(daemon.clone()),
         source: daemon.capability.proof.clone(),
-        census: census.clone(),
+        census: census.clone().into(),
         windows: Vec::new(),
         expected: checkpointed_owners(daemon),
         checkpoint_path: PathBuf::new(),
@@ -3227,7 +3318,7 @@ pub struct RecoveryRecord {
     windows: Vec<String>,
     pub source: HostSessionProof,
     pub checkpoint_hash: String,
-    pub census: Census,
+    pub census: StoredCensus,
     pub adopted_terminals: Vec<TerminalId>,
     pub adopted_chats: Vec<TerminalId>,
     #[serde(default)]
@@ -3280,7 +3371,7 @@ pub struct AlreadyRecovered {
     pub(crate) job: String,
     pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
-    pub census: Census,
+    pub census: StoredCensus,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
@@ -3341,7 +3432,7 @@ fn validate_settled_identity(
             .parent()
             .ok_or("Prepared checkpoint has no directory")?,
     )?;
-    record.census.validate_evidence(&record.source)?;
+    let _ = record.recovery_census()?;
     record.validate_census()?;
     let layout = crate::update::locate(target).map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
@@ -4636,6 +4727,18 @@ fn validate_reviewed(
 }
 
 impl RecoveryRecord {
+    /// Derive the view used for recovery and its paused pages while preserving
+    /// the stored census that authorizes the request.
+    pub fn recovery_census(&self) -> Result<Cow<'_, Census>, String> {
+        let census = if matches!(self.origin, Origin::ExplicitRecovery { .. }) {
+            self.census.with_historical_pages()
+        } else {
+            Cow::Borrowed(&*self.census)
+        };
+        census.validate_evidence(&self.source)?;
+        Ok(census)
+    }
+
     fn normalized_issued_chat(&self, descriptor: &Session) -> Session {
         let mut normalized = descriptor.clone();
         let Some(after) = normalized.terminal.as_mut() else {
@@ -4893,7 +4996,7 @@ impl Inherited {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
     if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
         return Ok(None);
@@ -4908,7 +5011,10 @@ fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>
         || capture.source != authority.source
         || capture.checkpoint_hash.as_deref() != Some(authority.checkpoint_hash.as_str())
         || capture.windows != authority.windows
-        || capture.census != authority.census
+        || !capture
+            .census
+            .same_bytes(&authority.census)
+            .map_err(|error| error.to_string())?
     {
         return Err(
             "Prepared authority changed its acknowledged inventory or saved windows".into(),
@@ -5612,6 +5718,7 @@ fn validate_request_origin(authority: &Authority, request: &[u8]) -> Result<(), 
             validate_reviewed(reviewed, &authority.source, &authority.request_identity)?;
         }
         (Origin::ExplicitRecovery { checkpoint }, None) => {
+            let request_hash = digest(request);
             let request: ManualRequest =
                 serde_json::from_slice(request).map_err(|e| e.to_string())?;
             if request.version != 1
@@ -5621,11 +5728,9 @@ fn validate_request_origin(authority: &Authority, request: &[u8]) -> Result<(), 
                 || request.source != authority.source
                 || request.target != authority.target
                 || request.target_hash != authority.target_hash
-                || request.census_hash
-                    != digest(&serde_json::to_vec(&authority.census).map_err(|e| e.to_string())?)
+                || request.census_hash != authority.census.hash().map_err(|e| e.to_string())?
                 || request.windows != authority.windows
-                || digest(&serde_json::to_vec(&request).map_err(|e| e.to_string())?)
-                    != authority.request_identity
+                || request_hash != authority.request_identity
             {
                 return Err("Explicit recovery does not match its exact authorized checkpoint, request and target".into());
             }
@@ -5709,6 +5814,9 @@ pub fn fixture_settled_outcome(
     let bytes = read_checkpoint(checkpoint)?.ok_or("Fixture has no checkpoint")?;
     super::handoff::validate_checkpoint_bytes(&bytes)?;
     census.validate_evidence(source)?;
+    let mut census = StoredCensus::from(census);
+    census.freeze().map_err(|error| error.to_string())?;
+    let census_hash = census.hash().map_err(|error| error.to_string())?;
     let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
     let state = crate::update::locate(&target)
         .map_err(|e| e.to_string())?
@@ -5724,7 +5832,7 @@ pub fn fixture_settled_outcome(
         source: source.clone(),
         target: target.clone(),
         target_hash: executable_hash(&target)?,
-        census_hash: digest(&serde_json::to_vec(&census).map_err(|e| e.to_string())?),
+        census_hash: census_hash.clone(),
         windows: Vec::new(),
     };
     let request = serde_json::to_vec(&request).map_err(|e| e.to_string())?;
@@ -5788,7 +5896,7 @@ pub fn fixture_settled_outcome(
         &CapturedCensus {
             producer: Some(CaptureProducer::ExplicitCensus {
                 transaction: job,
-                census_hash: digest(&serde_json::to_vec(&census).map_err(|e| e.to_string())?),
+                census_hash,
             }),
             source: source.clone(),
             checkpoint_hash: Some(hash.clone()),

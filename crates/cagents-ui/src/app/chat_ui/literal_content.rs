@@ -267,7 +267,7 @@ impl Content {
 }
 impl Runtime {
     pub(super) fn prepared_literal(&self, item: &chat::Item) -> Option<&Content> {
-        let cached = self.presentation_cache().get(&item.id)?;
+        let cached = self.presentation_cache().get(self.cache_key(item))?;
         (!cached.placeholder
             && cached
                 .item
@@ -416,7 +416,7 @@ pub(super) fn notice_body(
     let Some(notice) = runtime.prepared_literal(item).and_then(Content::notice) else {
         return design::caption("Loading notice…").into();
     };
-    let text = notice.body.shown(runtime.item_expanded(&item.id));
+    let text = notice.body.shown(runtime.row_expanded(item));
     settings.text_size = design::TEXT_CAPTION.into();
     settings.style.font = iced::Font::MONOSPACE;
     let identity = selection::logical_identity(&item.id, &[2]);

@@ -360,9 +360,8 @@ pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
     // the outer model sequence without supplying either of these collections.
     pub(super) snapshot_sequence: u64,
-    /// [`Cagents::worktree_roots_digest`] as the last complete
-    /// reconciliation read it.
-    pub(super) reconciled_roots: u64,
+    /// The worktree topology revision the last complete reconciliation read.
+    pub(super) reconciled_topology: u64,
     pub(super) terminal_source_workers: HashMap<
         CardId,
         (
@@ -636,7 +635,7 @@ impl State {
         let Self {
             removals,
             snapshot_sequence,
-            reconciled_roots: _,
+            reconciled_topology: _,
             terminal_source_workers,
             scope_absences,
             view_sequences,

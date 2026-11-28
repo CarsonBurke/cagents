@@ -198,13 +198,21 @@ elif [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     build_target() {
         product=$1
         shift
-        /usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
+        if [ -n "${CAGENTS_RELEASE_CARGO_TIMINGS_DIR:-}" ]; then
+            set -- "$@" --timings
+        fi
+        artifact=$(/usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --profile "$PROFILE" \
             --target-dir "$TARGET_DIR" \
             --target "$RELEASE_TARGET" \
-            "$@"
+            "$@") || return "$?"
+        if [ -n "${CAGENTS_RELEASE_CARGO_TIMINGS_DIR:-}" ]; then
+            cp -- "$TARGET_DIR/cargo-timings/cargo-timing.html" \
+                "$CAGENTS_RELEASE_CARGO_TIMINGS_DIR/$VARIANT-$product.html" || return "$?"
+        fi
+        printf '%s\n' "$artifact"
     }
 
     # Keep package feature sets disjoint. A single invocation would unify
@@ -488,6 +496,7 @@ install -m 0644 "$ROOT_DIR/packaging/THIRD-PARTY-NOTICES" "$SHARE_DIR/doc/cagent
 
 
 install -d -m 0755 "$DIST_DIR"
+PACKAGE_STARTED=$(date +%s)
 PORTABLE_TAR=$WORK_DIR/portable.tar
 (
     cd "$WORK_DIR"
@@ -589,6 +598,7 @@ done
 find "$DEB_ROOT" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 
 SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH dpkg-deb --root-owner-group --build "$DEB_ROOT" "$DIST_DIR/$DEB_NAME"
+printf '%s archive and Debian package took %ss\n' "$VARIANT" "$(($(date +%s) - PACKAGE_STARTED))"
 
 INSTALLED_BYTES=0
 for binary in $BINARIES; do

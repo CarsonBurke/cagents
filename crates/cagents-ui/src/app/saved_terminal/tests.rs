@@ -339,7 +339,6 @@ fn saved_user_intents_are_blocked_by_modals_and_update_but_results_can_settle() 
         Command::Reconnect,
         Command::Relaunch,
         Command::CopyDetails,
-        Command::Transcript,
         Command::Folder,
         Command::NewTerminal,
         Command::Close,
@@ -718,7 +717,6 @@ fn scoped_saved_controls_cannot_dispatch_user_commands_but_user_recovery_remains
     for command in [
         Command::Reconnect,
         Command::Relaunch,
-        Command::Transcript,
         Command::Folder,
         Command::NewTerminal,
         Command::Close,
@@ -751,7 +749,6 @@ fn scoped_saved_controls_cannot_dispatch_user_commands_but_user_recovery_remains
     for command in [
         Command::Reconnect,
         Command::Relaunch,
-        Command::Transcript,
         Command::Folder,
         Command::NewTerminal,
         Command::Close,

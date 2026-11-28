@@ -163,24 +163,20 @@ case $command in
     cleanup) rm -rf "$root" ;;
     run)
         git -C "$(dirname "$0")" rev-parse HEAD >> "$FIXTURE/rehearse-heads.log" || exit 99
-        feed= case_name=rehearse default_status='{"phase": "Complete"}'
+        feed=
         while (($#)); do
             [[ $1 == --feed ]] && feed=$2
-            if [[ $1 == --expect-refusal && $2 == ended-provider ]]; then
-                case_name=refusal
-                default_status='{"phase": "Failed", "refusal": {"sessions": [{"title": "codex-ended"}]}}'
-            fi
             [[ $1 != --new-dir ]] || cat "$2"/cagents-*.tar.gz > "$FIXTURE/rehearsed-archive"
             shift
         done
         [[ -z $feed ]] || ls "$feed/download" | sed "s|^|feed $feed offers |" >> "$FIXTURE/rehearse-feed.log"
         [[ -z $feed ]] || ls "$feed/latest/download" | sed "s|^|feed $feed latest |" >> "$FIXTURE/rehearse-feed.log"
         mkdir -p "$root/home/.local/share/cagents-install/.update"
-        outcome=$(cat "$FIXTURE/$case_name-outcome" 2>/dev/null || echo PASS)
+        outcome=$(cat "$FIXTURE/rehearse-outcome" 2>/dev/null || echo PASS)
         printf 'Total duration: 61.2s\nOutcome: %s\n' "$outcome" > "$root/report.txt"
         [[ $outcome == PASS ]] || printf 'Regressions / evidence gaps:\nthe shell terminal is gone\n\nSteps\n' >> "$root/report.txt"
-        cat "$FIXTURE/$case_name-status" 2>/dev/null > "$root/home/.local/share/cagents-install/.update/status.json" \
-            || echo "$default_status" > "$root/home/.local/share/cagents-install/.update/status.json"
+        cat "$FIXTURE/rehearse-status" 2>/dev/null > "$root/home/.local/share/cagents-install/.update/status.json" \
+            || echo '{"phase": "Complete"}' > "$root/home/.local/share/cagents-install/.update/status.json"
         [[ ! -e $FIXTURE/rehearse-plants ]] || mkdir -p "$(cat "$FIXTURE/rehearse-plants")"
         if [[ -e $FIXTURE/rehearse-hangs ]]; then
             trap 'echo stopped >> "$FIXTURE/rehearse-stopped"; exit 143' TERM
@@ -426,6 +422,54 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn(f"unpin {self.fix}", self.log("prebuild.log"))
         self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
 
+    def test_cut_only_attaches_prepared_android_assets_for_its_source(self):
+        self.set_version("0.2.5")
+        shutil.copy2(ROOT / "scripts/package-android", self.repo / "scripts/package-android")
+        commit = self.commit("feat(android): package the companion APK")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(commit, version="0.2.5")
+        assets = self.root / "android-assets"
+        assets.mkdir()
+        apk, alias = "cagents-android-0.2.5.apk", "cagents-android.apk"
+        content = b"fixture APK"
+        for name in (apk, alias):
+            (assets / name).write_bytes(content)
+        sha = hashlib.sha256(content).hexdigest()
+        manifest = f"{sha}  {apk}\n{sha}  {alias}\n"
+        (assets / "SHA256SUMS-android").write_text(manifest)
+        receipt = assets / "android-build-receipt"
+        manifest_hash = hashlib.sha256(manifest.encode()).hexdigest()
+        receipt.write_text(f"{self.fix}\n{manifest_hash}\n")
+        args = ("cut", "--commit", commit, "--android-assets", str(assets))
+        refused = self.release(*args)
+        self.assertIn("receipt does not match", refused.stderr)
+        self.assertEqual(self.git("tag", "--list", "v0.2.5"), "")
+        self.assertFalse((self.root / "bundles/0.2.5").exists())
+
+        receipt.write_text(f"{commit}\n{manifest_hash}\n")
+        fingerprint = "a" * 64
+        self.env["CAGENTS_ANDROID_BUILD_TOOLS"] = str(self.bin)
+        self.env["CAGENTS_ANDROID_SIGNER_SHA256"] = fingerprint
+        self.tool(self.bin / "aapt", "#!/bin/sh\n"
+                  "echo \"package: name='dev.cagents.mobile' versionCode='2005' versionName='0.2.5'\"\n")
+        self.tool(self.bin / "apksigner", "#!/bin/sh\n"
+                  f"echo 'Signer #1 certificate SHA-256 digest: {fingerprint}'\n")
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = self.root / "bundles/0.2.5"
+        metadata = json.loads((bundle / "release-metadata.json").read_text())
+        self.assertEqual(metadata["source_commit"], commit)
+        self.assertEqual(metadata["assets"][apk], metadata["assets"][alias])
+        self.assertIn("SHA256SUMS-android", metadata["assets"])
+        self.assertFalse((bundle / receipt.name).exists())
+        self.assertEqual(self.git("rev-parse", "v0.2.5^{commit}"), commit)
+
+    def test_actions_cut_refuses_prepared_android_assets(self):
+        result = self.release("cut", "--actions", "--android-assets", "/fixture")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--android-assets is for local cut and build", result.stderr)
+        self.assertEqual(self.log("prebuild.log"), [])
+
     def test_wait_prebuilds_the_tip_and_requires_its_tests(self):
         self.bundle(self.feature)
         self.bundle(self.fix, where=self.root / "waiting")
@@ -591,7 +635,8 @@ class ReleaseCut(unittest.TestCase):
 
     def test_rehearse_updates_the_published_release_to_the_cut_with_the_cut_commits_harness(self):
         self.cut_signed()
-        operator = self.commit("test: teach the operator harness the separate refusal case")
+        (self.repo / "scripts/release-rehearsal-capabilities.txt").write_text("ended-provider\n")
+        self.commit("test: declare a capability in the operator checkout")
         self.git("push", "-q", "origin", "main")
         result = self.release("rehearse", "0.2.4")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -600,7 +645,7 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn("Update status: Complete", result.stdout)
         self.assertRegex(result.stdout, r"Rehearsed 0\.2\.3 to 0\.2\.4 in \d+ min \d+ s")
         harness = self.host / "repo/.worktrees/.rehearse-release"
-        upgrade, refusal = [line for line in self.log("rehearse.log") if " run " in line]
+        upgrade, = [line for line in self.log("rehearse.log") if " run " in line]
         old = self.host / ".cache/cagents-release-rehearsal/0.2.3"
         new = self.host / ".cache/cagents-release-rehearsal/cut-0.2.4"
         feed = self.host / ".cache/cagents-release-rehearsal/feed-0.2.4"
@@ -608,9 +653,7 @@ class ReleaseCut(unittest.TestCase):
                    f"--old-installer {old}/install.sh --new-dir {new} --new-version 0.2.4 "
                    f"--new-installer {new}/install.sh --answer yes")
         self.assertEqual(upgrade, f"{command} --feed {feed} --empty-window --restart-after-update")
-        self.assertEqual(refusal, f"{command} --ended-provider --expect-refusal ended-provider --feed {feed}")
-        self.assertEqual(self.log("rehearse-heads.log"), [self.fix, operator])
-        self.assertIn("Update status: Failed refused", result.stdout)
+        self.assertEqual(self.log("rehearse-heads.log"), [self.fix])
         # The feed the published build read offered the signed cut; it goes once the rehearsal passes.
         self.assertIn(f"feed {feed} offers v0.2.4", self.log("rehearse-feed.log"))
         self.assertFalse(feed.exists())
@@ -622,8 +665,7 @@ class ReleaseCut(unittest.TestCase):
         cache = self.host / ".cache/cagents-release-rehearsal"
         self.assertEqual(sorted(path.name for path in cache.iterdir()), ["0.2.3", "lock", "passed-0.2.4.txt"])
         report = (cache / "passed-0.2.4.txt").read_text()
-        self.assertEqual(report.count("Outcome: PASS"), 2)
-        self.assertIn("Expected ended-provider refusal from 0.2.3:", report)
+        self.assertEqual(report.count("Outcome: PASS"), 1)
         self.assertFalse((self.root / "cr").exists())
         self.assertFalse(harness.exists())
         # The published release is fetched once and kept.
@@ -631,37 +673,46 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(self.release("rehearse", "0.2.4").returncode, 0)
         self.assertEqual(sum(line.startswith("release download") for line in self.log("gh.log")), 1)
 
-    def test_successful_upgrade_coverage_still_includes_ended_providers_for_other_sources(self):
-        self.cut_signed()
-        (self.root / "published").write_text("v0.2.2\n")
-        result = self.release("rehearse", "0.2.4")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        run, = [line for line in self.log("rehearse.log") if " run " in line]
-        self.assertIn("--old-version 0.2.2", run)
-        self.assertIn("--ended-provider", run)
-        self.assertNotIn("--expect-refusal", run)
-        self.assertEqual(self.log("rehearse-heads.log"), [self.fix])
-
-    def test_expected_ended_provider_refusal_must_pass_before_recording_qualification(self):
-        self.cut_signed()
-        passed = self.host / ".cache/cagents-release-rehearsal/passed-0.2.4.txt"
-        for filename, contents, diagnostic in (
-            ("refusal-status", '{"phase":"Failed"}', "the update ended Failed, not Failed refused"),
-            ("refusal-outcome", "FAIL\n", "the shell terminal is gone"),
-        ):
-            with self.subTest(filename=filename):
-                success = self.release("rehearse", "0.2.4")
-                self.assertEqual(success.returncode, 0, success.stderr)
-                self.assertTrue(passed.exists())
-                fault = self.root / filename
-                fault.write_text(contents)
-                result = self.release("rehearse", "0.2.4")
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("Update status: Complete", result.stdout)
-                self.assertIn(diagnostic, result.stdout + result.stderr)
-                self.assert_rehearsal_report_kept(result, self.root / "cr")
-                self.assertFalse(passed.exists())
-                fault.unlink()
+    def test_rehearsal_reads_ended_provider_capability_from_the_published_source_tag(self):
+        candidate = self.bundle(self.fix, where=self.root / "candidate", version="0.2.6")
+        bundle = self.root / "bundles/0.2.6"
+        shutil.copytree(candidate, bundle)
+        (bundle / "release-metadata.json.sig").write_text("fixture signature\n")
+        self.git("tag", "v0.2.4", self.fix)
+        self.git("tag", "v0.2.5", self.fix)  # A stale local copy has no capability.
+        self.git("push", "-q", "origin", "refs/tags/v0.2.4")
+        publisher = self.root / "publisher"
+        self.git("clone", "-q", "--branch", "main", str(self.origin), str(publisher))
+        self.git("config", "user.name", "fixture", cwd=publisher)
+        self.git("config", "user.email", "fixture@example.invalid", cwd=publisher)
+        marker = publisher / "scripts/release-rehearsal-capabilities.txt"
+        marker.write_text("ended-provider\n")
+        self.git("add", str(marker.relative_to(publisher)), cwd=publisher)
+        self.git("commit", "-qm", "test: publish the ended-provider capability", cwd=publisher)
+        self.git("tag", "-a", "v0.2.5", "-m", "published fixture", cwd=publisher)
+        self.git("push", "-q", "origin", "refs/tags/v0.2.5", cwd=publisher)
+        self.git("push", "-q", "origin", f"{self.fix}:refs/tags/v0.2.2")
+        self.git("fetch", "-q", "--no-tags", "origin", "main")
+        fetch_head = (self.repo / ".git/FETCH_HEAD").read_bytes()
+        refs = self.git("for-each-ref", "refs/tags", "refs/remotes")
+        for version, supported in (("0.2.2", False), ("0.2.4", False), ("0.2.5", True)):
+            with self.subTest(version=version):
+                (self.root / "published").write_text(f"v{version}\n")
+                result = self.release("rehearse", "0.2.6")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                run = [line for line in self.log("rehearse.log") if " run " in line][-1]
+                self.assertIn(f"--old-version {version}", run)
+                self.assertEqual("--ended-provider" in run, supported)
+                self.assertNotIn("--expect-refusal", run)
+        self.assertEqual(len(self.log("rehearse-heads.log")), 3)
+        self.assertEqual(self.git("for-each-ref", "refs/tags", "refs/remotes"), refs)
+        self.assertEqual((self.repo / ".git/FETCH_HEAD").read_bytes(), fetch_head)
+        # A supported source must still pass the entire matrix and finish Complete.
+        (self.root / "rehearse-status").write_text('{"phase":"Failed","refusal":{"title":"codex-ended"}}')
+        result = self.release("rehearse", "0.2.6")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the update ended Failed refused, not Complete", result.stderr)
+        self.assertFalse((self.host / ".cache/cagents-release-rehearsal/passed-0.2.6.txt").exists())
 
     def test_release_rehearsal_launches_the_editor_when_the_cut_bundles_it(self):
         (self.repo / "crates/ceditor/build.rs").touch()
@@ -674,9 +725,8 @@ class ReleaseCut(unittest.TestCase):
             with self.subTest(mode=mode):
                 result = self.release("rehearse", "0.2.4", *mode)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                run, refusal = [line for line in self.log("rehearse.log") if " run " in line][-2:]
+                run = [line for line in self.log("rehearse.log") if " run " in line][-1]
                 self.assertIn("--bundled-ceditor", run.split())
-                self.assertNotIn("--bundled-ceditor", refusal.split())
 
     def test_the_default_root_and_a_harness_at_another_commit(self):
         self.cut_signed()
@@ -706,7 +756,7 @@ class ReleaseCut(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Replacing the earlier rehearsal", result.stdout)
         commands = [line.split()[1] for line in self.log("rehearse.log")]
-        self.assertEqual(commands, ["cleanup", "run", "cleanup", "run", "cleanup"])
+        self.assertEqual(commands, ["cleanup", "run", "cleanup"])
 
     def test_a_rehearsal_whose_update_failed_or_was_refused_does_not_pass_either_way(self):
         # Reopened windows would show "Update failed" or "Update not
@@ -809,9 +859,8 @@ class ReleaseCut(unittest.TestCase):
         result = self.release("rehearse", "0.2.4", "--staged")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Rehearsing the staged update", result.stdout)
-        run, refusal = [line for line in self.log("rehearse.log") if " run " in line]
+        run, = [line for line in self.log("rehearse.log") if " run " in line]
         self.assertTrue(run.endswith("--answer yes"), run)
-        self.assertEqual(refusal, f"{run} --ended-provider --expect-refusal ended-provider")
         self.assertIn("--staged and --from-draft are for rehearse", self.release("publish", "0.2.4", "--staged").stderr)
 
     def test_a_failed_rehearsal_reports_what_regressed(self):
@@ -1309,9 +1358,8 @@ printf '%s\n' '{pinned / "zig"}'
         result = self.release("rehearse", "0.2.4", "--from-draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Rehearsing the in-app update from 0.2.3 to 0.2.4 as drafted on GitHub", result.stdout)
-        run, refusal = [line for line in self.log("rehearse.log") if " run " in line]
+        run, = [line for line in self.log("rehearse.log") if " run " in line]
         self.assertIn("--bundled-ceditor", run.split())
-        self.assertIn("--expect-refusal ended-provider", refusal)
         # The host fetched what the updater reads of the draft; nothing went from here.
         self.assertIn("release download v0.2.4 -R CarsonBurke/cagents", "\n".join(self.log("gh.log")))
         self.assertEqual((self.root / "rehearsed-archive").read_bytes(),
@@ -1321,7 +1369,7 @@ printf '%s\n' '{pinned / "zig"}'
         self.assertIn(f"feed {feed} offers v0.2.4", served)
         self.assertEqual([line for line in served if " latest " in line],
                          [f"feed {feed} latest {name}" for name in ("release-metadata-2.json", "release-metadata-2.json.sig",
-                                                                     "release-metadata.json", "release-metadata.json.sig")] * 2)
+                                                                     "release-metadata.json", "release-metadata.json.sig")])
         # The pass names the metadata it updated to, as the draft serves it.
         digest = hashlib.sha256((draft / "release-metadata-2.json").read_bytes()).hexdigest()
         passed = (self.host / ".cache/cagents-release-rehearsal/passed-0.2.4.txt").read_text().splitlines()

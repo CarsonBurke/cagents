@@ -642,6 +642,8 @@ need_command awk
 need_command mktemp
 need_command sed
 need_command tar
+# Archive validation and extraction use the options selected by this installer.
+unset TAR_OPTIONS
 need_command readlink
 [ -z "$PREPARE_CANDIDATE" ] || need_command sync
 
@@ -652,7 +654,8 @@ private_hint() {
         || printf '; for a private repository, sign in with gh auth login --hostname github.com'
 }
 
-CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
+# curl only skips its default configuration when --disable is first.
+CURL_OPTIONS="--disable --proto =https --tlsv1.2 --fail --location --silent --show-error"
 AUTHENTICATED_GH=0
 if [ -z "$VERSION" ] || [ -z "$LOCAL_ARCHIVE" ] || [ -z "$LOCAL_CHECKSUMS" ]; then
     validate_repository
@@ -1214,17 +1217,40 @@ ACTUAL_HASH=$(file_sha256 "$ARCHIVE_PATH")
 
 ARCHIVE_LIST=$DOWNLOAD_DIR/archive.list
 ARCHIVE_VERBOSE=$DOWNLOAD_DIR/archive.verbose
-LC_ALL=C tar -tzf "$ARCHIVE_PATH" > "$ARCHIVE_LIST" || fail 'archive cannot be listed'
-LC_ALL=C tar -tvzf "$ARCHIVE_PATH" > "$ARCHIVE_VERBOSE" || fail 'archive metadata cannot be listed'
-awk '
+case $(LC_ALL=C tar --version 2>/dev/null || :) in
+    'tar (GNU tar) '*)
+        # Numeric owners leave the first double quote to the member name.
+        # C quoting preserves whitespace and escapes embedded record separators.
+        LC_ALL=C tar -tvzf "$ARCHIVE_PATH" --numeric-owner --quoting-style=c > "$ARCHIVE_VERBOSE" \
+            || fail 'archive metadata cannot be listed'
+        quoted_names=1
+        names_output=$ARCHIVE_LIST
+        ;;
+    *)
+        LC_ALL=C tar -tzf "$ARCHIVE_PATH" > "$ARCHIVE_LIST" || fail 'archive cannot be listed'
+        LC_ALL=C tar -tvzf "$ARCHIVE_PATH" > "$ARCHIVE_VERBOSE" || fail 'archive metadata cannot be listed'
+        quoted_names=0
+        names_output=/dev/null
+        ;;
+esac
+LC_ALL=C awk -v quoted="$quoted_names" '
     {
         type = substr($1, 1, 1)
-        last = substr($NF, length($NF), 1)
         if (type != "d" && type != "-") exit 1
+        name = $NF
+        if (quoted) {
+            start = index($0, "\"")
+            if (!start || substr($0, length($0), 1) != "\"") exit 1
+            name = substr($0, start + 1, length($0) - start - 1)
+            # The exact allowlist below contains no names requiring escapes.
+            if (name == "" || index(name, "\"") || index(name, "\\")) exit 1
+        }
+        last = substr(name, length(name), 1)
         if (type == "d" && last != "/") exit 1
         if (type == "-" && last == "/") exit 1
+        if (quoted) print name
     }
-' "$ARCHIVE_VERBOSE" || fail 'archive contains links, special files, or invalid entry types'
+' "$ARCHIVE_VERBOSE" > "$names_output" || fail 'archive contains links, special files, or invalid entry types'
 PREPARED_MARKER=.cagents-prepared-candidate-v1.json
 LOCAL_CANDIDATE_MARKER=.cagents-local-candidate-v1
 LOCAL_SOURCE_MARKER=.cagents-local-source-v1
@@ -1301,13 +1327,14 @@ validate_version_members "$TOP_LEVEL" 0 < "$ARCHIVE_LIST" \
 # mutation. Re-entry reuses these downloaded assets and is authorized only by
 # the actual inherited lock, never by this environment marker alone.
 CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
-tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
-    || fail 'could not extract the verified update coordinator'
 # Source-pane preflight runs the matched host beside the selected coordinator.
 # A fresh install (or an old CLI without the guard) uses this extracted pair.
 CANDIDATE_INSPECTOR=$DOWNLOAD_DIR/cagentsd
-tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagentsd" > "$CANDIDATE_INSPECTOR" \
-    || fail 'could not extract the verified source inspector'
+tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" \
+    --strip-components=2 -C "$DOWNLOAD_DIR" -- "$TOP_LEVEL/bin/cagents" "$TOP_LEVEL/bin/cagentsd" \
+    || fail 'could not extract the verified update coordinator and source inspector'
+mv -T -- "$DOWNLOAD_DIR/cagents" "$CANDIDATE_COORDINATOR" \
+    || fail 'could not name the verified update coordinator'
 chmod 0700 "$CANDIDATE_COORDINATOR" "$CANDIDATE_INSPECTOR"
 supports_install_guard() {
     [ -x "$1" ] \

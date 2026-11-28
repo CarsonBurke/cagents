@@ -234,6 +234,78 @@ fn enter_relaunches(ended_at_unix_ms: i64, now_unix_ms: i64) -> bool {
     now_unix_ms.saturating_sub(ended_at_unix_ms) >= ENTER_RELAUNCH_GRACE_MS
 }
 
+/// Where a terminal action originated, including the launch in that pane.
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct TerminalSource {
+    pub(super) card: CardId,
+    terminal: TerminalId,
+    launch: LaunchRecipe,
+}
+
+impl std::fmt::Debug for TerminalSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerminalSource")
+            .field("card", &self.card)
+            .field("terminal", &self.terminal)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TerminalSource {
+    fn new(card: CardId, session: &TerminalSession) -> Self {
+        Self {
+            card,
+            terminal: session.id,
+            launch: session.launch.clone(),
+        }
+    }
+
+    pub(super) fn current(app: &Cagents, card: CardId) -> Option<Self> {
+        let state = app
+            .card_state(card)
+            .filter(|state| state.existence.is_open())?;
+        if app.pane_close_owned(card) || matches!(app.residency(card), Residency::Hydrating { .. })
+        {
+            return None;
+        }
+        let CardKind::Terminal(session) = &state.kind else {
+            return None;
+        };
+        Some(Self::new(card, session))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputIntent {
+    source: TerminalSource,
+    path: PathBuf,
+}
+
+impl OutputIntent {
+    fn new(card: CardId, session: &TerminalSession) -> Option<Self> {
+        Some(Self {
+            source: TerminalSource::new(card, session),
+            path: session.transcript_path.clone()?,
+        })
+    }
+
+    pub(super) fn open(self, app: &mut Cagents) -> Task<Message> {
+        let card = self.source.card;
+        if TerminalSource::current(app, card).as_ref() != Some(&self.source)
+            || app
+                .ended_terminal(card)
+                .and_then(|session| session.transcript_path.as_ref())
+                != Some(&self.path)
+        {
+            return Task::none();
+        }
+        match Url::from_file_path(&self.path) {
+            Ok(url) => app.open_document_link(Some(card), url.as_str()),
+            Err(()) => Task::none(),
+        }
+    }
+}
+
 impl Cagents {
     /// The primary action an ended terminal's card offers.
     pub(super) fn terminal_relaunch(
@@ -419,13 +491,13 @@ impl Cagents {
             .align_y(Alignment::Center);
 
         let mut actions: Vec<Element<'a, Message>> = Vec::with_capacity(3);
-        if session.transcript_path.is_some() {
-            actions.push(
+        if let Some(intent) = OutputIntent::new(card, session).map(Box::new) {
+            actions.push(crate::ui_controls::owned(
+                intent.clone(),
                 crate::ui_controls::icon_button(Icon::OpenFile, "Open saved output")
-                    .on_press(Message::OpenTerminalOutput(card))
-                    .id(card_control_id(card, "ended.output"))
-                    .into(),
-            );
+                    .on_press(Message::OpenTerminalOutput(intent))
+                    .id(card_control_id(card, "ended.output")),
+            ));
         }
         actions.push(
             crate::ui_controls::button::secondary("Close")
@@ -512,7 +584,6 @@ impl Cagents {
                     .into();
             }
         };
-        let saved = session.is_some_and(|session| session.transcript_path.is_some());
         let mut children: Vec<Element<'a, Message>> = vec![
             crate::ui_controls::passive_icon(Icon::Terminal, design::STATUS_ICON_SIZE),
             design::heading("Output not available").into(),
@@ -521,12 +592,15 @@ impl Cagents {
                 .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                 .into(),
         ];
-        if saved {
-            children.push(
+        if let Some(intent) = session
+            .and_then(|session| OutputIntent::new(card, session))
+            .map(Box::new)
+        {
+            children.push(crate::ui_controls::owned(
+                intent.clone(),
                 crate::ui_controls::button::quiet("Open saved output")
-                    .on_press_maybe(session.map(|_| Message::OpenTerminalOutput(card)))
-                    .into(),
-            );
+                    .on_press(Message::OpenTerminalOutput(intent)),
+            ));
         }
         widget::container(
             widget::column::with_children(children)
@@ -901,5 +975,32 @@ mod tests {
             "Run fish again in /work"
         );
         assert_eq!(TerminalRelaunch::Resume.label(), "Resume session");
+    }
+
+    #[test]
+    fn a_queued_output_action_cannot_open_a_replacement_transcript() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.durable.cards[0].id;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.continuity = TerminalContinuity::Exited {
+            last_exit: crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            },
+        };
+        session.transcript_path = Some("/fixture/original.log".into());
+        let intent = OutputIntent::new(card, session).unwrap();
+        session.transcript_path = Some("/fixture/replacement.log".into());
+        assert!(app.ended_terminal(card).is_some());
+        assert_eq!(intent.clone().open(&mut app).units(), 0);
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.transcript_path = Some(intent.path.clone());
+        session.id = TerminalId::new();
+        assert_eq!(intent.open(&mut app).units(), 0);
     }
 }

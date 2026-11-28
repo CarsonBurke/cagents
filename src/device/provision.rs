@@ -18,7 +18,10 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{Device, control_path, quote, remote_executable, ssh};
-use crate::terminal_ipc::PROTOCOL_VERSION;
+use crate::{
+    control::{ControlClient, ControlError},
+    terminal_ipc::PROTOCOL_VERSION,
+};
 
 /// The installer of this very build, which knows its own archive layout.
 const INSTALLER: &str = include_str!("../../install.sh");
@@ -75,8 +78,8 @@ pub enum Step<'a> {
 
 /// The device's daemon, as seen through its bridge without starting it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Daemon {
-    Compatible,
+enum Daemon<Build = ()> {
+    Compatible(Build),
     Speaks(u16),
     Stopped,
     /// It could not be reached for another reason; the device's own update
@@ -107,7 +110,7 @@ pub fn check(device: &Device) -> io::Result<(Check, Option<String>)> {
     let local = Local::current()?;
     let session = Session::open(device)?;
     let remote = Remote::probe(&session, device, &local.version)?;
-    let daemon = daemon_state();
+    let daemon = daemon_state(super::existing_socket_path());
     if let Some(protocol) = newer(&remote, &daemon) {
         return Ok((Check::Newer { protocol }, None));
     }
@@ -140,7 +143,7 @@ pub fn update(
     progress(Step::Inspecting);
     let session = Session::open(device)?;
     let remote = Remote::probe(&session, device, &local.version)?;
-    let daemon = daemon_state();
+    let daemon = daemon_state(super::existing_socket_path());
     let plan = plan(device, &local, &remote, &daemon)?;
     let mac_release = verify_mac_release(device, &local.version, &plan.action)?;
     if let Some(note) = &plan.note {
@@ -160,7 +163,7 @@ pub fn update(
     let sent = match &plan.action {
         Action::Nothing => {
             return Ok(Outcome::AlreadyCompatible {
-                running: daemon == Daemon::Compatible,
+                running: matches!(daemon, Daemon::Compatible(_)),
             });
         }
         Action::Upgrade { .. } | Action::MacRelease { .. } => None,
@@ -172,6 +175,12 @@ pub fn update(
     };
     let cli = match plan.action {
         Action::Install { upgrade: false, .. } => {
+            progress(Step::Verifying);
+            verify_selected_installation(
+                device,
+                &local.version,
+                Remote::probe(&session, device, &local.version)?,
+            )?;
             return Ok(Outcome::Installed {
                 sent: sent.unwrap_or_default(),
             });
@@ -188,40 +197,62 @@ pub fn update(
         .map(|(version, digest)| (version.as_str(), digest.as_str()));
     session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
-    let updated = || Outcome::Updated {
+    let version = release.map_or(local.version.as_str(), |(version, _)| version);
+    verify_update(
+        device,
+        version,
+        daemon_build(super::existing_socket_path()),
+        || Remote::probe(&session, device, version),
+    )?;
+    Ok(Outcome::Updated {
         sent,
-        version: release
-            .map_or(local.version.as_str(), |(version, _)| version)
-            .to_owned(),
-    };
-    match (daemon_state(), release) {
-        (Daemon::Stopped, Some((version, _))) => {
-            let selected = Remote::probe(&session, device, version)?;
-            if selected.protocol == Some(PROTOCOL_VERSION)
-                && selected
-                    .installation
-                    .and_then(|found| found.current)
-                    .as_deref()
-                    == Some(version)
-            {
-                Ok(updated())
-            } else {
-                Err(io::Error::other(format!(
-                    "Could not verify the installed update on {}",
-                    device.name
-                )))
-            }
-        }
-        (Daemon::Compatible | Daemon::Stopped, _) => Ok(updated()),
-        (Daemon::Speaks(actual), _) => Err(io::Error::other(format!(
-            "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs.",
-            name = device.name
+        version: version.to_owned(),
+    })
+}
+
+fn verify_update(
+    device: &Device,
+    version: &str,
+    daemon: Daemon<String>,
+    probe: impl FnOnce() -> io::Result<Remote>,
+) -> io::Result<()> {
+    let name = &device.name;
+    match daemon {
+        Daemon::Stopped => verify_selected_installation(device, version, probe()?),
+        Daemon::Compatible(actual) if actual == version => Ok(()),
+        Daemon::Compatible(actual) => Err(io::Error::other(format!(
+            "{name} still runs cagents {actual} after the update to {version}. Run `cagents --device {name} daemon status` to inspect the serving daemon."
         ))),
-        (Daemon::Unknown(error), _) => Err(io::Error::other(format!(
-            "{name}'s update finished, but this computer could not reach its daemon: {error}",
-            name = device.name
+        Daemon::Speaks(actual) => Err(io::Error::other(format!(
+            "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs."
+        ))),
+        Daemon::Unknown(error) => Err(io::Error::other(format!(
+            "{name}'s update finished, but this computer could not reach its daemon: {error}"
         ))),
     }
+}
+
+fn verify_selected_installation(
+    device: &Device,
+    version: &str,
+    selected: Remote,
+) -> io::Result<()> {
+    if selected.protocol == Some(PROTOCOL_VERSION)
+        && selected.installation.as_ref().is_some_and(|installation| {
+            installation.marked
+                && installation.current.as_deref() == Some(version)
+                && selected.resolved.as_deref()
+                    == Some(
+                        format!("{}/versions/{version}/bin/cagents", installation.prefix).as_str(),
+                    )
+        })
+    {
+        return Ok(());
+    }
+    Err(io::Error::other(format!(
+        "Could not verify that {} selected cagents {version}. Check that its SSH executable ({}) resolves to the installer-selected build.",
+        device.name, device.executable,
+    )))
 }
 
 fn verify_mac_release(
@@ -582,7 +613,7 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
     let version = local.version();
     let refuse = |message: String| Err(io::Error::new(io::ErrorKind::Unsupported, message));
     match daemon {
-        Daemon::Compatible => {
+        Daemon::Compatible(_) => {
             return Ok(Plan {
                 action: Action::Nothing,
                 note: None,
@@ -764,15 +795,29 @@ fn newer(remote: &Remote, daemon: &Daemon) -> Option<u16> {
     .filter(|actual| *actual > PROTOCOL_VERSION)
 }
 
-fn daemon_state() -> Daemon {
-    let socket = match super::existing_socket_path() {
+fn daemon_state(socket: io::Result<Option<PathBuf>>) -> Daemon {
+    inspect_daemon(socket, |_| Ok(()))
+}
+
+fn daemon_build(socket: io::Result<Option<PathBuf>>) -> Daemon<String> {
+    inspect_daemon(socket, |mut client| client.daemon_version())
+}
+
+fn inspect_daemon<T>(
+    socket: io::Result<Option<PathBuf>>,
+    connected: impl FnOnce(ControlClient) -> Result<T, ControlError>,
+) -> Daemon<T> {
+    let socket = match socket {
         Ok(Some(socket)) => socket,
         Ok(None) => return Daemon::Unknown("no device is selected".into()),
         Err(error) => return Daemon::Unknown(error.to_string()),
     };
-    match crate::control::ControlClient::connect(&socket) {
-        Ok(_) => Daemon::Compatible,
-        Err(crate::control::ControlError::UnsupportedVersion { actual }) => Daemon::Speaks(actual),
+    match ControlClient::connect(&socket) {
+        Ok(client) => match connected(client) {
+            Ok(value) => Daemon::Compatible(value),
+            Err(error) => Daemon::Unknown(error.to_string()),
+        },
+        Err(ControlError::UnsupportedVersion { actual }) => Daemon::Speaks(actual),
         Err(_) if super::existing_daemon_missing() => Daemon::Stopped,
         Err(error) => Daemon::Unknown(error.to_string()),
     }

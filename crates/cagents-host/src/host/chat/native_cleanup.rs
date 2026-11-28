@@ -259,7 +259,9 @@ fn close_retained_inner(
         }
         (state.proof().clone(), pending, actor, named)
     };
+    let mut local_startup = None;
     let result = (|| {
+        local_startup = super::retained_actor::prove_local_startup_closed(host, source, &named)?;
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let mut receipt = match &pending {
             Some(pending) => chat::native_holder::closed_source_for_owner(
@@ -280,7 +282,14 @@ fn close_retained_inner(
                 Some(record) if !chat::native_holder::retire_abandoned(&record)? => record,
                 // The owner ended without a receipt and left nothing to
                 // adopt. The resident, if any, is removed below.
-                _ => return super::settle_lost_execution(host, source, &proof),
+                _ => {
+                    return super::settle_lost_execution_after_startup(
+                        host,
+                        source,
+                        &proof,
+                        local_startup.as_ref(),
+                    );
+                }
             },
         };
         let read_owned_receipt =
@@ -463,7 +472,12 @@ fn close_retained_inner(
         if !has_receipt {
             // The paired holder has its own close proof. It must be gone
             // before the lost-execution check scans for remaining writers.
-            return super::settle_lost_execution(host, source, &proof);
+            return super::settle_lost_execution_after_startup(
+                host,
+                source,
+                &proof,
+                local_startup.as_ref(),
+            );
         }
         chat::native_holder::confirm_pair_closed(
             source,
@@ -512,6 +526,9 @@ fn close_retained_inner(
             notifications.retire(source.id);
         }
         drop(state);
+        if let Some(startup) = local_startup {
+            super::retained_actor::forget_startup(host, &startup.source, &startup.context);
+        }
         super::super::state::retire_unattached_upgrade_chat(host, source.id);
         super::super::state::retire_recovered_upgrade_chat(host, source.id);
     }

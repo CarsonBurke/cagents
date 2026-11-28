@@ -95,6 +95,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::WatchWork
         | R::WatchDeviceStats
         | R::WatchConversationPullRequests { .. }
@@ -102,7 +103,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
             crate::work::Request::Board { .. }
             | crate::work::Request::RemovalPlan { .. }
             | crate::work::Request::Snapshots { .. }
-            | crate::work::Request::Pin { .. },
+            | crate::work::Request::Pin { .. }
+            | crate::work::Request::PinCard { .. },
         )
         // Admitted only so its handler can explain that it was removed.
         | R::RetiredChannelWork

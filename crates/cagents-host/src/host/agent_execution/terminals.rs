@@ -122,6 +122,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::ChatStart { .. }
         | R::ChatStartInPane { .. }
         | R::ChatRecoverAccount { .. }
@@ -156,7 +157,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         // A window's status bar; a session keeping the sampler running would
         // be a cost nobody sees.
         | R::WatchDeviceStats
-        | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
+        | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::PinCard { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }
     }

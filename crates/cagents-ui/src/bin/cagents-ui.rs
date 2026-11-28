@@ -635,6 +635,11 @@ fn run(options: Options<'_>, first_frame_probe: bool) -> Result<(), Box<dyn std:
                 notice_shown = true;
                 show_startup_wait_notice(StartupWaitKind::Daemon);
             })?;
+        // Only the process that owns the window should start renderer preparation.
+        #[cfg(target_os = "linux")]
+        if !first_frame_probe {
+            cagents_ui::gpu_wake::start();
+        }
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
         } else {

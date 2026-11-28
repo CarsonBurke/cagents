@@ -129,7 +129,8 @@ What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
 running, on protocols before 199, an agent waiting for approval or for
 an answer reads as waiting, and on protocols before 201, a conversation's
-usage leaves out where it auto-compacts.
+usage leaves out where it auto-compacts. A snapshot sent before protocol 225 also
+leaves out its count of the history outside the loaded window.
 An admitted CLI from before protocol 179 receives store contention as a
 retryable `Internal` error so it can decode the reply. One from before protocol 188
 receives a refusal that came before anything changed (`not_admitted`) as
@@ -344,14 +345,12 @@ confirmation. The final check also waits behind previously
 accepted provider commands, so a queued prompt cannot masquerade as idle.
 
 `daemon upgrade` uses the served candidate's worker and this same confirmation.
-The candidate drives qualified source daemons through a frozen lifecycle subset:
-the installed builds pinned in `RELEASED_SOURCES` (`src/update/source.rs`),
-protocol 156 (the `991daa43e` desktop build), 173 (`43678f2fb`), 175
-(`c73002744`), 177 (`374370965`), 178 (`3b1e81a4d`, also served by
-`f016f047b`), 179 (`43f253ef8`), 187 (`ccd4134c6`), 191 (`e8bbb84f2`) and 198
-(the signed 0.2.0 to 0.2.3), and the matched current protocol. A protocol
-bump never drops a pinned build; retiring one is a deliberate change that
-`scripts/check-update-sources` enforces.
+The candidate uses a frozen set of lifecycle requests to update from the
+matched current protocol and from the builds pinned in `RELEASED_SOURCES`
+(`src/update/source.rs`). To retire a pinned source, record the protocol and
+reason in `RETIRED_SOURCES`. `scripts/check-update-sources` requires a decision
+for each historical protocol recorded since live-update qualification began.
+`OLDER_CLIENTS` records the separate set of older CLIs the daemon can serve.
 Every other source protocol, including 160, 165, 174, 176, the candidate
 line's 128, and the intermediate protocols 180 to 186 (superseded without
 qualified installed update sources), is refused before preparation, shutdown or checkpoint changes. Use a cold installation instead: finish and close
@@ -616,8 +615,9 @@ still running.
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The
 allowlist is `VERIFIED_CODEX_VERSIONS` in `chat/native_holder.rs`, currently
-Codex **0.157.1**, **0.160.1**, **0.161.0** and **0.162.0**. It names exact versions, so every Codex
-update leaves it behind until that version is qualified.
+Codex **0.157.1**, **0.160.1**, **0.161.0**, **0.162.0**, and **0.172.0**.
+It names exact versions, so every Codex update leaves it behind until that
+version is qualified.
 
 A Codex conversation on any other version does not acquire this claim, and its
 server does not outlive the daemon. When the daemon crashes, is killed, or

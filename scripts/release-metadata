@@ -22,13 +22,15 @@ the next generation (see docs/releasing.md#trust-generations).
         features and fixes, with their pull request numbers
   feed --dir DIR --feed FEED [--generation G] [--bridge BRIDGE]
         lay out DIR as a file feed: FEED/download/vV/* and, when V is the
-        newest there, FEED/latest/download/* (copies; DIR is unchanged). The
+        newest there, FEED/latest/download points to it. DIR is unchanged. The
         metadata appears under the names of generation G (default 2) and every
         older one; BRIDGE holds, under their published names, older releases'
         metadata to carry instead under some of those names
 """
 
 import argparse
+import fcntl
+import filecmp
 import hashlib
 import json
 import os
@@ -135,6 +137,25 @@ def darwin_target(version: str, names: set[str]) -> dict | None:
     }
 
 
+def check_android(directory: Path, version: str, assets: dict):
+    apk = f"cagents-android-{version}.apk"
+    alias = "cagents-android.apk"
+    checksums = "SHA256SUMS-android"
+    expected = {apk, alias, checksums}
+    present = {name for name in assets if name in {alias, checksums}
+               or (name.startswith("cagents-android-") and name.endswith(".apk"))}
+    if not present:
+        return
+    if present != expected:
+        raise Refused(f"Android assets must be exactly {apk}, {alias} and {checksums}")
+    if assets[apk] != assets[alias]:
+        raise Refused(f"{alias} differs from {apk}")
+    sha = assets[apk]["sha256"]
+    manifest = f"{sha}  {apk}\n{sha}  {alias}\n".encode("ascii")
+    if (directory / checksums).read_bytes() != manifest:
+        raise Refused(f"{checksums} does not match the two APKs")
+
+
 def build(directory: Path, version: str, source_commit: str, protocol: int, notes: str) -> dict:
     if not VERSION.match(version):
         raise Refused("version must be a stable semantic version without a leading v")
@@ -154,6 +175,15 @@ def build(directory: Path, version: str, source_commit: str, protocol: int, note
     darwin = darwin_target(version, names)
     if darwin is not None:
         targets.append(darwin)
+    appimage = f"cagents-{version}-x86_64.AppImage"
+    appimage_alias = "cagents-x86_64.AppImage"
+    image_names = {appimage, appimage_alias}
+    if names & image_names and not image_names <= names:
+        raise Refused(f"a Linux AppImage release needs {appimage} and {appimage_alias}")
+    assets = {path.name: {"size": path.stat().st_size, "sha256": digest(path)} for path in files}
+    check_android(directory, version, assets)
+    if appimage in assets and assets[appimage] != assets[appimage_alias]:
+        raise Refused(f"{appimage_alias} differs from the versioned AppImage")
     return {
         "schema_version": SCHEMA,
         "repository": REPOSITORY,
@@ -161,7 +191,7 @@ def build(directory: Path, version: str, source_commit: str, protocol: int, note
         "source_commit": source_commit,
         "protocol": protocol,
         "notes": notes,
-        "assets": {path.name: {"size": path.stat().st_size, "sha256": digest(path)} for path in files},
+        "assets": assets,
         "targets": targets,
     }
 
@@ -170,13 +200,22 @@ def encode(metadata: dict) -> bytes:
     return (json.dumps(metadata, indent=2, sort_keys=True) + "\n").encode()
 
 
+def unique_json_object(fields: list[tuple[str, object]]) -> dict[str, object]:
+    result = {}
+    for name, value in fields:
+        if name in result:
+            raise Refused(f"{METADATA} contains a duplicate JSON field {name!r}")
+        result[name] = value
+    return result
+
+
 def check(directory: Path, version: str | None, source_commit: str | None) -> str:
     path = directory / METADATA
     raw = path.read_bytes()
     try:
-        metadata = json.loads(raw)
-    except json.JSONDecodeError as error:
-        raise Refused(f"{METADATA} is not JSON: {error}") from None
+        metadata = json.loads(raw.decode("utf-8"), object_pairs_hook=unique_json_object)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        raise Refused(f"{METADATA} is not UTF-8 JSON: {error}") from None
     if not isinstance(metadata, dict) or metadata.get("schema_version") != SCHEMA:
         raise Refused(f"{METADATA} is not schema {SCHEMA}")
     if version is not None and metadata.get("version") != version:
@@ -189,7 +228,8 @@ def check(directory: Path, version: str | None, source_commit: str | None) -> st
             or not isinstance(metadata.get("assets"), dict)):
         raise Refused(f"{METADATA} lacks its notes, protocol or assets")
     expected = build(directory, metadata.get("version", ""), metadata.get("source_commit", ""), protocol, notes)
-    if metadata != expected:
+    # JSON preserves the type distinctions that Python equality collapses.
+    if encode(metadata) != encode(expected):
         listed, present = set(metadata.get("assets", {})), set(expected["assets"])
         if listed != present:
             raise Refused(f"{METADATA} lists {sorted(listed ^ present)} differently from the release files")
@@ -228,6 +268,41 @@ def notes(repository: Path, start: str | None, end: str) -> str:
     return "\n".join(lines).strip() + "\n" if lines else ""
 
 
+def files_match(directory: Path, sources: dict[str, Path]) -> bool:
+    if directory.is_symlink() or not directory.is_dir():
+        return False
+    if {path.name for path in directory.iterdir()} != sources.keys():
+        return False
+    for name, source in sources.items():
+        path = directory / name
+        if path.is_symlink() or not path.is_file() or not filecmp.cmp(path, source, shallow=False):
+            return False
+    return True
+
+
+def select_latest(latest: Path, target: Path) -> None:
+    latest.parent.mkdir(exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".staging-", dir=latest.parent) as directory:
+        staged = Path(directory) / "download"
+        staged.symlink_to(target, target_is_directory=True)
+        if latest.is_symlink() or not latest.is_dir():
+            staged.replace(latest)
+            return
+
+        # Older feeds kept a real directory here. Preserve its contents if
+        # converting the selector fails before it can commit.
+        retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest.parent))
+        legacy = retired / "download"
+        latest.rename(legacy)
+        try:
+            staged.replace(latest)
+        except OSError:
+            legacy.rename(latest)
+            retired.rmdir()
+            raise
+        shutil.rmtree(retired)
+
+
 def feed(directory: Path, destination: Path, generation: int, bridge: Path | None) -> None:
     metadata = json.loads((directory / METADATA).read_bytes())
     check(directory, None, None)
@@ -252,38 +327,36 @@ def feed(directory: Path, destination: Path, generation: int, bridge: Path | Non
         published_names[name], published_names[f"{name}.sig"] = source
     downloads = destination / "download"
     release = downloads / f"v{version}"
-    if release.exists():
-        raise Refused(f"{release} already exists; a feed never replaces a release")
+    latest = destination / "latest/download"
+    files = {path.name: path for path in payloads(directory)} | published_names
     downloads.mkdir(parents=True, exist_ok=True)
-    # Each directory appears whole, so a reader never sees half a release.
-    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=downloads))
-    for path in payloads(directory):
-        shutil.copyfile(path, staging / path.name)
-    for name, path in published_names.items():
-        shutil.copyfile(path, staging / name)
-    staging.chmod(0o755)
-    staging.rename(release)
-    published = sorted(
-        (path.name[1:] for path in downloads.iterdir()
-         if path.name.startswith("v") and VERSION.match(path.name[1:])),
-        key=version_key,
-    )
-    if published[-1] == version:
-        latest = destination / "latest"
-        latest.mkdir(exist_ok=True)
-        staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=latest))
-        for name in published_names:
-            shutil.copyfile(release / name, staging / name)
-        staging.chmod(0o755)
-        previous = latest / "download"
-        if previous.exists():
-            retired = Path(tempfile.mkdtemp(prefix=".retired-", dir=latest))
-            previous.rename(retired / "download")
-            staging.rename(previous)
-            shutil.rmtree(retired)
+    lock = os.open(downloads / ".feed.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(lock, "rb+") as lock_file:
+        fcntl.flock(lock_file, fcntl.LOCK_EX)
+        target = Path(os.path.relpath(downloads.resolve() / release.name, latest.parent.resolve()))
+        newest = max(
+            (path.name[1:] for path in downloads.iterdir() if path.name.startswith("v")
+             and VERSION.fullmatch(path.name[1:]) and not path.is_symlink() and path.is_dir()),
+            key=version_key, default=version,
+        )
+        newest = max(newest, version, key=version_key)
+        if release.exists() or release.is_symlink():
+            # A failed latest update may already have published the tag.
+            # Resume only the selector change and keep the tagged bytes.
+            selected = (latest.is_symlink() and latest.readlink() == target
+                        or files_match(latest, published_names))
+            if newest != version or selected or not files_match(release, files):
+                raise Refused(f"{release} already exists; a feed never replaces a release")
         else:
-            staging.rename(previous)
-    print(f"Feed {destination} now offers {published[-1]}")
+            with tempfile.TemporaryDirectory(prefix=".staging-", dir=downloads) as directory:
+                staging = Path(directory)
+                for name, source in files.items():
+                    shutil.copyfile(source, staging / name)
+                staging.chmod(0o755)
+                staging.rename(release)
+        if newest == version:
+            select_latest(latest, target)
+    print(f"Feed {destination} now offers {newest}")
 
 
 def main() -> int:

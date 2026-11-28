@@ -183,6 +183,9 @@ done
 while IFS= read -r frame; do
   case "$frame" in
     *'"type":"control_request"'*)
+      case "$frame" in
+        *'"subtype":"interrupt"'*) printf 'interrupt\n' >> "$HOME/../interrupts" ;;
+      esac
       id=${frame#*'"request_id":"'}
       id=${id%%'"'*}
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
@@ -2796,6 +2799,7 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
     };
     spec.provider = Provider::Codex;
     let server_root = root.clone();
+    let (pane_saved, confirm_thread) = std::sync::mpsc::channel();
     let server = std::thread::spawn(move || {
         let deadline = Instant::now() + Duration::from_secs(20);
         let socket = loop {
@@ -2828,21 +2832,18 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
                     json!({"userAgent":"codex/0.157.1", "codexHome":server_root.join("home/.codex")})
                 }
                 "thread/start" => {
+                    // Keep the provider's identity unconfirmed until the test
+                    // has saved the undisplayed pane.
+                    confirm_thread
+                        .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                        .expect("pane was not saved before confirming the thread");
                     json!({"thread":{"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}}})
                 }
                 // The adapter reads Codex's effective configuration for where it compacts.
                 "config/read" => json!({"config":{}}),
                 "model/list" | "skills/list" => json!({"data":[]}),
                 "thread/queue/list" | "thread/list" => json!({"data":[],"nextCursor":null}),
-                "turn/start" => {
-                    // Hold the turn until the test has saved the pane, so the
-                    // run's outcome is what reports the confirmed thread.
-                    while !server_root.join("release-turn").exists() {
-                        assert!(Instant::now() < deadline, "turn was never released");
-                        std::thread::sleep(Duration::from_millis(10));
-                    }
-                    json!({"turn":{"id":"owned-turn"}})
-                }
+                "turn/start" => json!({"turn":{"id":"owned-turn"}}),
                 "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
                 method => panic!("unexpected Codex request {method}"),
             };
@@ -2901,7 +2902,7 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
             }],
         })
         .unwrap();
-    std::fs::write(root.join("release-turn"), "").unwrap();
+    pane_saved.send(()).unwrap();
     let run = settled(&host, accepted.run.id);
     assert_eq!(run.state, State::Succeeded, "{run:?}");
     let db = rusqlite::Connection::open(&path).unwrap();
@@ -7690,6 +7691,63 @@ fn a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles() {
     assert_eq!(next.state, State::Succeeded, "{next:?}");
     assert_eq!(prompts(root), 2);
     drop(courier);
+}
+
+#[test]
+fn a_late_follow_up_interrupt_leaves_the_already_dispatched_prompt_running() {
+    if isolated("a_late_follow_up_interrupt_leaves_the_already_dispatched_prompt_running").is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let agent = first.agent.id;
+    let (next, receipt) = prompt(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(agent),
+            prompt: "ASK_PERMISSION for the next run".into(),
+            idempotency_key: "late-interrupt-follow-up".into(),
+            ..request
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    // The worker can finish the old turn and the courier can dispatch the
+    // queued prompt between its acceptance and admission of the interrupt.
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    assert!(matches!(start(&host, &next).unwrap(), Start::Sent { .. }));
+    let asked = pending_requests(&host, agent);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+
+    interrupt_ahead(&host, agent, next.run.id, Some(first.run.id)).unwrap();
+
+    process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent,
+            command: Control::Answer {
+                request_id: asked.id.clone(),
+                action: "allow".into(),
+                answers: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, next.run.id).state, State::Succeeded);
+    assert!(!root.join("interrupts").exists());
 }
 
 #[test]

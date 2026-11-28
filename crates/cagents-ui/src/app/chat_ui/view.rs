@@ -449,6 +449,9 @@ thread_local! {
 
 /// Sets a gap's key apart from the key of the row it precedes.
 const GAP_KEY: u64 = 0x9e37_79b9_7f4a_7c15;
+/// The rows standing for unloaded history before and after the window.
+const HISTORY_BEFORE_KEY: u64 = 0x6869_7374_6f72_7900;
+const HISTORY_AFTER_KEY: u64 = 0x6869_7374_6f72_7901;
 
 /// How many of an exchange's rows a notice at item `at` follows, given the
 /// first item each row draws, in drawing order: every row up to the last
@@ -1435,6 +1438,10 @@ pub enum Page {
 /// The transcript is anchored to its bottom, because a conversation grows at
 /// the newest end. The anchoring wrapper measures the actual top offset and
 /// reports it even when the loaded page fits entirely inside the viewport.
+///
+/// The content can begin and end with [`Unloaded`] space standing for the
+/// history outside the loaded window, so the scrollbar spans the whole
+/// conversation. The loaded window is what lies between them.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Scroll {
     from_top: f32,
@@ -1443,6 +1450,8 @@ pub struct Scroll {
     /// What of the window a page keeps, where it was last laid out. Unknown
     /// until the transcript has laid out its rows.
     kept: Option<Kept>,
+    /// The space standing for history before and after the loaded window.
+    unloaded: Unloaded,
 }
 
 /// Where the halves a page keeps end, in the transcript's laid-out
@@ -1458,6 +1467,40 @@ pub(super) struct Kept {
     pub newer_start: f32,
 }
 
+/// The heights of the space that stands for unloaded history before and
+/// after the loaded window, at an estimated height per item.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Unloaded {
+    pub before: f32,
+    pub after: f32,
+}
+
+/// What a reader in history outside the loaded window is looking at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Sought {
+    /// The item at `index` of the cached conversation, which starts `at`
+    /// below the viewport's top.
+    Cached { index: u64, at: f32 },
+    /// History the provider has still to hand over, a page at a time back
+    /// from the newest of it.
+    Unfetched,
+    /// The conversation's first item, which the reader reads down from its
+    /// start, as Home takes them there.
+    Start,
+    /// The conversation's newest history, which the reader reads up from
+    /// its end.
+    Latest,
+}
+
+/// Where in the unloaded history the reader is looking.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum Unseen {
+    /// This fraction of the way through the history before the window.
+    Before(f32),
+    /// This fraction of the way through the history after the window.
+    After(f32),
+}
+
 impl Scroll {
     pub(super) fn new(from_top: f32, content: f32, window: f32) -> Self {
         Self {
@@ -1465,10 +1508,14 @@ impl Scroll {
             content,
             window,
             kept: None,
+            unloaded: Unloaded::default(),
         }
     }
     pub(super) fn with_kept(self, kept: Option<Kept>) -> Self {
         Self { kept, ..self }
+    }
+    pub(super) fn with_unloaded(self, unloaded: Unloaded) -> Self {
+        Self { unloaded, ..self }
     }
     /// How far the transcript can be scrolled.
     fn travel(self) -> f32 {
@@ -1522,16 +1569,31 @@ impl Scroll {
         (self.window * 0.9).max(1.0)
     }
 
+    /// The loaded window's height, between the unloaded space around it.
+    pub(super) fn loaded(self) -> f32 {
+        (self.content - self.unloaded.before - self.unloaded.after).max(0.0)
+    }
+
+    /// How far the viewport's top is below the loaded window's top.
+    fn into_loaded(self) -> f32 {
+        self.from_top - self.unloaded.before
+    }
+
+    /// How far the viewport's bottom is above the loaded window's bottom.
+    fn short_of_loaded_end(self) -> f32 {
+        self.content - self.unloaded.after - (self.from_top + self.window)
+    }
+
     /// Whether the next earlier page should be fetched now, ahead of the
-    /// reader. Short of the very top this waits until the whole viewport is
-    /// in the half the page keeps, so what is on screen never leaves the
-    /// window. Items differ in height and are not drawn in item order within
-    /// an exchange, so that half is where its rows were drawn. Until they
-    /// have been, only the edge asks.
+    /// reader. Short of the conversation's very top this waits until the
+    /// whole viewport is in the half the page keeps, so what is on screen
+    /// never leaves the window. Items differ in height and are not drawn in
+    /// item order within an exchange, so that half is where its rows were
+    /// drawn. Until they have been, only the conversation's top asks.
     pub(super) fn prefetch_earlier(self) -> bool {
-        self.at_top()
+        (self.unloaded.before <= 0.0 && self.at_top())
             || self.kept.is_some_and(|kept| {
-                self.from_top <= self.prefetch_reach()
+                self.into_loaded() <= self.prefetch_reach()
                     && self.from_top + self.window <= kept.older_end
             })
     }
@@ -1539,17 +1601,123 @@ impl Scroll {
     /// Whether the next newer page should be fetched now, the mirror of
     /// [`Self::prefetch_earlier`].
     pub(super) fn prefetch_later(self) -> bool {
-        self.at_bottom()
+        (self.unloaded.after <= 0.0 && self.at_bottom())
             || self.kept.is_some_and(|kept| {
-                self.travel() - self.from_top <= self.prefetch_reach()
+                self.short_of_loaded_end() <= self.prefetch_reach()
                     && self.from_top >= kept.newer_start
             })
+    }
+
+    /// Where the reader is looking when it is at history that is not
+    /// loaded, rather than at the window or its edge: the middle of the
+    /// viewport is in the space that stands for it. A slide cannot keep
+    /// what is on screen, so the window has to move there instead.
+    pub(super) fn unseen(self) -> Option<Unseen> {
+        let middle = self.from_top + self.window * 0.5;
+        let after_top = self.content - self.unloaded.after;
+        if self.unloaded.before > 0.0 && middle < self.unloaded.before {
+            Some(Unseen::Before(
+                (middle / self.unloaded.before).clamp(0.0, 1.0),
+            ))
+        } else if self.unloaded.after > 0.0 && middle > after_top {
+            Some(Unseen::After(
+                ((middle - after_top) / self.unloaded.after).clamp(0.0, 1.0),
+            ))
+        } else {
+            None
+        }
     }
 
     /// How far from a loaded edge a page is fetched: far enough that wheel
     /// and Page Up reading does not reach the edge before the page arrives.
     fn prefetch_reach(self) -> f32 {
         self.window * PREFETCH_SCREENS
+    }
+}
+
+/// The height given to each unloaded item: the average of what the loaded
+/// windows measured.
+///
+/// A window is measured once, when the next one replaces it, or once it has
+/// been laid out if it was the first: an estimate that followed every layout
+/// would move the scrollbar's thumb while the reader holds still. Averaging
+/// every window measured lets each new one move the estimate less, so the
+/// space for history far from the reader barely changes as they read on.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct HistoryEstimate {
+    /// The window the estimate is for: the items before it, and its length.
+    window: Option<(u64, usize)>,
+    /// What the windows before it measured, together.
+    measured: Sample,
+    /// What the window measured, when it is the first and nothing else has.
+    early: Option<Sample>,
+    /// The estimate for the window is decided.
+    settled: bool,
+}
+
+/// The height of some laid-out items, and how many they were.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct Sample {
+    height: f64,
+    items: u64,
+}
+
+impl Sample {
+    fn add(self, other: Option<Self>) -> Self {
+        other.map_or(self, |other| Self {
+            height: self.height + other.height,
+            items: self.items + other.items,
+        })
+    }
+}
+
+impl HistoryEstimate {
+    /// About a short answer with its gap, before anything is measured.
+    const DEFAULT: f32 = 160.0;
+    const MIN: f32 = 40.0;
+    const MAX: f32 = 2_000.0;
+
+    /// The estimate for `window`, given that `loaded` is the height of the
+    /// window last laid out.
+    pub(super) fn update(self, window: (u64, usize), loaded: f32) -> Self {
+        let changed = self.window != Some(window);
+        if !changed && self.settled {
+            return self;
+        }
+        // The layout observed is that of the window the estimate was taken
+        // for, which is the previous one when the window has just changed.
+        let sample = self
+            .window
+            .map(|(_, count)| count)
+            .filter(|count| *count > 0 && loaded > 0.0)
+            .map(|count| Sample {
+                height: f64::from(loaded),
+                items: count as u64,
+            });
+        if !changed {
+            return Self {
+                early: sample,
+                settled: sample.is_some(),
+                ..self
+            };
+        }
+        // A window measured early is measured again as it is replaced, and
+        // counted once.
+        let measured = self.measured.add(sample.or(self.early));
+        Self {
+            window: Some(window),
+            measured,
+            early: None,
+            settled: measured.items > 0,
+        }
+    }
+
+    pub(super) fn per_item(self) -> f32 {
+        let sample = self.measured.add(self.early);
+        if sample.items == 0 {
+            return Self::DEFAULT;
+        }
+        ((sample.height / sample.items as f64) as f32).clamp(Self::MIN, Self::MAX)
     }
 }
 
@@ -2188,6 +2356,109 @@ impl SelectionDocument {
 }
 
 impl Runtime {
+    /// The space standing for the main transcript's history outside the
+    /// loaded window, so its scrollbar spans the whole conversation.
+    ///
+    /// That includes the history the provider has not handed over, when it
+    /// says how much there is, so the scrollbar stands for the conversation
+    /// from when it is opened.
+    pub(super) fn unloaded_history(&self) -> Unloaded {
+        let history = self.snapshot.history;
+        let (before, after) = (history.earlier(), history.after);
+        if before == 0 && after == 0 {
+            return Unloaded::default();
+        }
+        let estimate = self.history_estimate.get().update(
+            (history.before, self.window_items().count()),
+            self.parent_scroll().loaded(),
+        );
+        self.history_estimate.set(estimate);
+        Unloaded {
+            before: super::unloaded::height(before, estimate.per_item()),
+            after: super::unloaded::height(after, estimate.per_item()),
+        }
+    }
+
+    /// Where `scroll` has the reader in history outside the loaded window.
+    ///
+    /// At either end of the conversation that is its first or newest item,
+    /// where the reader reads on from it, rather than the item an estimate
+    /// puts beside the middle of the viewport. That holds however little
+    /// history the space at that end stands for, even when the middle of
+    /// the viewport is past it among the loaded rows.
+    pub(super) fn history_index(&self, scroll: Scroll) -> Option<Sought> {
+        let history = self.snapshot.history;
+        let unfetched = history.unfetched.unwrap_or(0);
+        if scroll.unloaded.before > 0.0 && history.earlier() > 0 && scroll.at_top() {
+            return Some(Sought::Start);
+        }
+        if scroll.unloaded.after > 0.0 && history.after > 0 && scroll.at_bottom() {
+            return Some(Sought::Latest);
+        }
+        let unseen = scroll.unseen()?;
+        let (first, count, fraction) = match unseen {
+            Unseen::Before(fraction) => (0, history.earlier(), fraction),
+            Unseen::After(fraction) => (
+                unfetched + history.before + self.window_items().count() as u64,
+                history.after,
+                fraction,
+            ),
+        };
+        if count == 0 {
+            return None;
+        }
+        let position = f64::from(fraction) * count as f64;
+        let offset = (position.floor() as u64).min(count - 1);
+        // The oldest history is the provider's, before what is cached.
+        let Some(index) = (first + offset).checked_sub(unfetched) else {
+            return Some(Sought::Unfetched);
+        };
+        let within = (position - offset as f64) as f32 * self.history_estimate.get().per_item();
+        Some(Sought::Cached {
+            index,
+            at: scroll.window_height() * 0.5 - within,
+        })
+    }
+
+    /// The conversation's first item, which is the provider's when it has
+    /// history still to hand over.
+    pub(super) fn history_start(&self) -> Sought {
+        if self.snapshot.history.unfetched.unwrap_or(0) > 0 {
+            Sought::Unfetched
+        } else {
+            Sought::Cached { index: 0, at: 0.0 }
+        }
+    }
+
+    /// The loaded item the reader asked to land on in history that was not
+    /// loaded, once the window holds it.
+    pub(super) fn landing_item(&self) -> Option<&str> {
+        let index = self.scroll_memory.landing()?;
+        let offset = index.checked_sub(self.snapshot.history.before)?;
+        let row = self.window_items().nth(usize::try_from(offset).ok()?)?;
+        Some(self.snapshot.items[row].id.as_str())
+    }
+
+    /// The row each of the window's items starts at. History counts a long
+    /// message once, where the window has a row for each of its parts; the
+    /// first row stands for its item even when it is a later part.
+    pub(super) fn window_items(&self) -> impl Iterator<Item = usize> + '_ {
+        // The item the rows so far belong to; a part of it continues it.
+        let mut current = None;
+        self.snapshot
+            .items
+            .iter()
+            .enumerate()
+            .filter_map(move |(row, item)| {
+                let part = chat::TranscriptPart::parse(&item.id);
+                if part.as_ref().is_some_and(|part| current == Some(part.item)) {
+                    return None;
+                }
+                current = Some(part.map_or(item.id.as_str(), |part| part.item));
+                Some(row)
+            })
+    }
+
     pub(super) fn document_link_origin(&self) -> Option<PathBuf> {
         self.selected_subagent
             .is_none()
@@ -3100,7 +3371,7 @@ impl Runtime {
         if item.role == chat::Role::User && !matches!(item.content, ItemContent::Delivery { .. }) {
             if matches!(item.content, ItemContent::Text { .. }) {
                 if let Some(prompt) = self.prepared_prompt(item) {
-                    let text = prompt.shown(self.item_expanded(&item.id));
+                    let text = prompt.shown(self.row_expanded(item));
                     builder.indexed(&item.id, &[2], text.plain(), text.plain_prefixes());
                 }
             } else if matches!(item.content, ItemContent::Image { .. }) {
@@ -3116,7 +3387,7 @@ impl Runtime {
             }
             return;
         }
-        let Some(cached) = self.presentation_cache().get(&item.id) else {
+        let Some(cached) = self.presentation_cache().get(self.cache_key(item)) else {
             return;
         };
         if cached.placeholder {
@@ -3130,21 +3401,21 @@ impl Runtime {
                     kind: chat::DeliveryKind::Notice,
                     ..
                 }
-            ) && !self.item_expanded(&item.id)
+            ) && !self.row_expanded(item)
                 && !matches!(&item.content, ItemContent::Delivery { summary, .. } if summary.starts_with("Monitor event: "))
             {
                 return;
             }
-            literal.catalog(builder, item, self.item_expanded(&item.id));
+            literal.catalog(builder, item, self.row_expanded(item));
             return;
         }
         if literal_content::Prepared::required(&item.content) {
             return;
         }
-        if slot == turn::Slot::Thinking && !self.item_expanded(&item.id) {
+        if slot == turn::Slot::Thinking && !self.row_expanded(item) {
             return;
         }
-        if matches!(item.content, ItemContent::Delivery { .. }) && !self.item_expanded(&item.id) {
+        if matches!(item.content, ItemContent::Delivery { .. }) && !self.row_expanded(item) {
             return;
         }
         if matches!(
@@ -3166,13 +3437,13 @@ impl Runtime {
         // open detail.
         if let Some(coordinated) = &cached.coordination
             && detail
-            && self.item_expanded(&item.id)
+            && self.row_expanded(item)
         {
             for (index, content) in coordinated.contents().enumerate() {
                 builder.markdown(&item.id, &[1, index as u32], content.items());
             }
         }
-        if detail && self.item_expanded(&item.id) {
+        if detail && self.row_expanded(item) {
             if let Some(input) = &cached.tool_input {
                 builder.indexed(
                     &item.id,
@@ -3216,8 +3487,9 @@ impl Runtime {
         use std::hash::{Hash, Hasher};
         let mut revision = crate::fingerprint::hasher();
         (
+            std::ptr::from_ref(item),
             cached.revision,
-            self.item_expanded(&item.id),
+            self.row_expanded(item),
             self.child_find_revision(),
             dark,
             cached.shows_figures().then(|| self.figures.version()),
@@ -3230,7 +3502,7 @@ impl Runtime {
                 cached.image_source.is_some(),
                 cached.image_wait.is_some(),
                 cached.image_unavailable,
-                self.preview_request.as_deref() == Some(item.id.as_str()),
+                self.preview_requested(item),
             )
                 .hash(&mut revision);
         }
@@ -3251,6 +3523,14 @@ impl Runtime {
                 reasoning_elapsed(&agent.items, index, finished, None),
             )
                 .hash(&mut revision);
+        }
+        self.row_copy_feedback(item)
+            .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
+            .hash(&mut revision);
+        if cached.coordination.is_some() {
+            let mut unfolded: Vec<_> = self.row_unfolded_parts(item).collect();
+            unfolded.sort_unstable();
+            unfolded.hash(&mut revision);
         }
         revision.finish()
     }
@@ -3344,6 +3624,11 @@ impl Runtime {
             crate::performance::ui_trace::Phase::View,
             "transcript",
         );
+        let unloaded = if selected.is_none() {
+            self.unloaded_history()
+        } else {
+            Unloaded::default()
+        };
         let mut transcript = VirtualRows::new();
         let mut selected_identity: Option<Element<'_, Message>> = None;
         if let Some(agent) = selected {
@@ -3447,7 +3732,7 @@ impl Runtime {
                     }
                     continue;
                 }
-                let Some(cached) = self.child_cache.get(&item.id) else {
+                let Some(cached) = self.child_cache.get(self.cache_key(item)) else {
                     continue;
                 };
                 // As in the lead's transcript, a thought with nothing to
@@ -3473,7 +3758,7 @@ impl Runtime {
                     let mut aliases = Vec::with_capacity(2 * run);
                     for (offset, picture) in pictures.iter().enumerate() {
                         picture.id.hash(&mut revision);
-                        if let Some(cached) = self.child_cache.get(&picture.id) {
+                        if let Some(cached) = self.child_cache.get(self.cache_key(picture)) {
                             self.child_item_revision(
                                 agent,
                                 index + offset,
@@ -3531,6 +3816,9 @@ impl Runtime {
                 use std::hash::{Hash, Hasher};
                 let mut key = crate::fingerprint::hasher();
                 ("selected-child-item", &item.id).hash(&mut key);
+                if self.colliding_row_ids.contains(&item.id) {
+                    index.hash(&mut key);
+                }
                 let revision = self.child_item_revision(
                     agent,
                     index,
@@ -3576,7 +3864,7 @@ impl Runtime {
                                     .filter(|coordinated| coordinated.is_card())
                                 {
                                     let raw = self
-                                        .item_expanded(&item.id)
+                                        .row_expanded(item)
                                         .then(|| self.step_detail(item, cached, markdown_settings));
                                     self.coordination_card(item, coordinated, raw)
                                 } else {
@@ -3620,7 +3908,22 @@ impl Runtime {
                 }
             }
         } else {
-            if snapshot.has_earlier {
+            // History the transcript cache holds is space the scrollbar
+            // spans; only history the provider still has to send is asked
+            // for with a control.
+            if unloaded.before > 0.0 {
+                let height = unloaded.before;
+                transcript.lazy(
+                    HISTORY_BEFORE_KEY,
+                    u64::from(height.to_bits()),
+                    height,
+                    Vec::new(),
+                    // Set apart as the paging control it stands in for.
+                    Some(Rhythm::Opening),
+                    0.0,
+                    move || super::unloaded::space(height),
+                );
+            } else if snapshot.has_earlier {
                 transcript.push(paging_view(
                     target,
                     Page::Earlier,
@@ -3702,7 +4005,19 @@ impl Runtime {
                     .into(),
                 );
             }
-            if snapshot.has_later {
+            if unloaded.after > 0.0 {
+                let height = unloaded.after;
+                transcript.lazy(
+                    HISTORY_AFTER_KEY,
+                    u64::from(height.to_bits()),
+                    height,
+                    Vec::new(),
+                    // Set apart as the paging control it stands in for.
+                    Some(Rhythm::Opening),
+                    0.0,
+                    move || super::unloaded::space(height),
+                );
+            } else if snapshot.has_later {
                 transcript.push(paging_view(
                     target,
                     Page::Newer,
@@ -3951,7 +4266,7 @@ impl Runtime {
                                 }
                                 .is_some_and(|item| {
                                     self.presentation_cache()
-                                        .get(&item.id)
+                                        .get(self.cache_key(item))
                                         .is_none_or(|cached| cached.placeholder)
                                 })
                             }
@@ -3977,7 +4292,7 @@ impl Runtime {
                             .iter()
                             .filter(|item| {
                                 self.presentation_cache()
-                                    .get(&item.id)
+                                    .get(self.cache_key(item))
                                     .is_none_or(|cached| cached.placeholder)
                             })
                             .map(|item| item.id.as_str())
@@ -3998,6 +4313,8 @@ impl Runtime {
                                 index: snapshot.items.len() / 2,
                                 items: snapshot.items.len(),
                             }),
+                            unloaded,
+                            landing: self.landing_item(),
                         }
                     } else {
                         scroll::History::default()
@@ -6560,7 +6877,7 @@ impl Runtime {
             let Some(item) = items.get(index) else {
                 continue;
             };
-            let cached = self.cache.get(&item.id);
+            let cached = self.cache.get(row_cache_key(&self.parent_cache_keys, item));
             // A delivery is drawn once its body is parsed, as an answer is.
             if matches!(item.content, ItemContent::Delivery { .. }) && cached.is_none() {
                 visit(Placement::Unplaced(item));
@@ -6602,7 +6919,7 @@ impl Runtime {
             };
             let cached = Some(item)
                 .filter(|item| self.failure_ui.item(&item.id).is_none())
-                .and_then(|item| self.cache.get(&item.id));
+                .and_then(|item| self.cache.get(row_cache_key(&self.parent_cache_keys, item)));
             visit(match cached {
                 Some(prepared)
                     if placed.slot == turn::Slot::Card && prepared.coordination.is_some() =>
@@ -6622,9 +6939,16 @@ impl Runtime {
         let mut key = crate::fingerprint::hasher();
         match part {
             TurnPart::Steps => (1u8, &turn.key).hash(&mut key),
-            TurnPart::Prompt(index) => (2u8, &self.snapshot.items[index].id).hash(&mut key),
-            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
-                (3u8, &self.snapshot.items[turn.prose[prose].index].id).hash(&mut key)
+            TurnPart::Prompt(index) | TurnPart::Card(index) | TurnPart::Prose(index) => {
+                let (kind, index) = match part {
+                    TurnPart::Prompt(_) => (2u8, index),
+                    _ => (3u8, turn.prose[index].index),
+                };
+                let item = &self.snapshot.items[index];
+                (kind, &item.id).hash(&mut key);
+                if self.colliding_row_ids.contains(&item.id) {
+                    index.hash(&mut key);
+                }
             }
             TurnPart::Gallery { .. } => (
                 4u8,
@@ -6711,7 +7035,7 @@ impl Runtime {
                     item.id.hash(&mut hasher);
                     coordinating |= self.hash_turn_item(
                         placed.index,
-                        self.cache.get(&item.id),
+                        self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
                         Some(placed.slot),
                         now,
                         &mut hasher,
@@ -6731,7 +7055,13 @@ impl Runtime {
                         continue;
                     };
                     item.id.hash(&mut hasher);
-                    self.hash_turn_item(index, self.cache.get(&item.id), None, now, &mut hasher);
+                    self.hash_turn_item(
+                        index,
+                        self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
+                        None,
+                        now,
+                        &mut hasher,
+                    );
                 }
                 false
             }
@@ -6786,9 +7116,10 @@ impl Runtime {
         // The latest observation can change at provider heartbeat speed even
         // when the rendered content and elapsed second are unchanged.
         (
+            Arc::as_ptr(item),
             item.started_at.or(item.at),
             slot,
-            self.item_expanded(&item.id),
+            self.row_expanded(item),
         )
             .hash(hasher);
         if item.content.is_step() {
@@ -6820,9 +7151,7 @@ impl Runtime {
         // Only this item's controls change on copy: which of them its last
         // copy answers at, and what it said there. Copying again refreshes
         // how long that shows without changing what is drawn.
-        self.copy_feedback
-            .as_ref()
-            .filter(|feedback| feedback.key.item() == item.id)
+        self.row_copy_feedback(item)
             .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
             .hash(hasher);
         cached
@@ -6835,7 +7164,7 @@ impl Runtime {
                     cached.stamp.as_ref().map(|(_, label, full)| (label, full)),
                     cached.image.as_ref().map(iced::widget::image::Handle::id),
                     cached.image_source.is_some(),
-                    self.preview_request.as_deref() == Some(item.id.as_str()),
+                    self.preview_requested(item),
                     cached.image_wait.is_some(),
                     cached.image_unavailable,
                 )
@@ -6878,10 +7207,11 @@ impl Runtime {
             .unfolded
             .iter()
             .filter(|key| {
-                key.strip_prefix(item.id.as_str())
+                key.strip_prefix(row_cache_key(&self.parent_cache_keys, item))
                     .is_some_and(|part| part.starts_with('#'))
             })
             .map(String::as_str)
+            .chain(self.row_unfolded_parts(item))
             .collect();
         unfolded.sort_unstable();
         unfolded.hash(hasher);
@@ -6892,7 +7222,7 @@ impl Runtime {
     /// coordination row carries its actions in its context menu instead.
     fn prose_action_footer(&self, item: &chat::Item, cached: &CachedItem, slot: turn::Slot) -> f32 {
         if slot == turn::Slot::Thinking
-            && !(self.item_expanded(&item.id)
+            && !(self.row_expanded(item)
                 && cached
                     .reasoning
                     .as_ref()
@@ -6918,14 +7248,21 @@ impl Runtime {
         let items = &self.snapshot.items;
         let placed = |index: usize| {
             let item = items.get(index)?;
-            Some((item, self.cache.get(&item.id)?))
+            Some((
+                item,
+                self.cache
+                    .get(row_cache_key(&self.parent_cache_keys, item))?,
+            ))
         };
         match part {
             TurnPart::Prompt(index) => {
                 let Some(item) = items.get(index) else {
                     return widget::Space::new().into();
                 };
-                let body = match (&item.content, self.cache.get(&item.id)) {
+                let body = match (
+                    &item.content,
+                    self.cache.get(row_cache_key(&self.parent_cache_keys, item)),
+                ) {
                     // Never in the user's own bubble.
                     (ItemContent::Delivery { .. }, Some(cached)) => {
                         self.delivery_view(item, cached, settings)
@@ -6968,8 +7305,18 @@ impl Runtime {
                         if self.failure_ui.item(&item.id).is_some() {
                             continue;
                         }
-                        let key = selection::logical_identity(&item.id, &[9]);
-                        let revision = cached.revision;
+                        let key = if self.colliding_row_ids.contains(&item.id) {
+                            selection::logical_identity(&item.id, &[9, placed_step.index as u32])
+                        } else {
+                            selection::logical_identity(&item.id, &[9])
+                        };
+                        let revision = {
+                            use std::hash::{Hash, Hasher};
+                            let mut revision = crate::fingerprint::hasher();
+                            (cached.revision, Arc::as_ptr(item), self.row_expanded(item))
+                                .hash(&mut revision);
+                            revision.finish()
+                        };
                         // Header elements are cheap owned metadata; only a
                         // mounted row creates their widget tree and geometry.
                         // A message keeps the row it has alone, its
@@ -6977,7 +7324,7 @@ impl Runtime {
                         let row = match cached.coordination.as_deref() {
                             Some(coordinated) if turn.messages => {
                                 let raw = self
-                                    .item_expanded(&item.id)
+                                    .row_expanded(item)
                                     .then(|| self.step_detail(item, cached, settings));
                                 self.coordination_card(item, coordinated, raw)
                             }
@@ -7022,7 +7369,7 @@ impl Runtime {
                 let body = match (&cached.coordination, &item.content) {
                     (Some(coordinated), _) if part == TurnPart::Card(prose) => {
                         let raw = self
-                            .item_expanded(&item.id)
+                            .row_expanded(item)
                             .then(|| self.step_detail(item, cached, settings));
                         self.coordination_card(item, coordinated, raw)
                     }
@@ -7451,27 +7798,34 @@ impl Runtime {
     }
 
     /// Whether item `id`'s own Copy is saying what its copy did.
+    #[cfg(test)]
     pub(super) fn copy_note_shown(&self, id: &str) -> bool {
         self.copy_state(id, None).is_telling()
     }
 
+    pub(super) fn row_copy_note_shown(&self, item: &chat::Item) -> bool {
+        self.row_copy_state(item, None).is_telling()
+    }
+
     pub(super) fn message_copy(&self, item: &chat::Item) -> Element<'static, Message> {
-        let state = self.copy_state(&item.id, None);
+        let state = self.row_copy_state(item, None);
         let mut controls = vec![small_icon(
             state.icon(),
             state.label("Copy this message"),
             if item.logical_copy_body().is_some()
                 && !self
-                    .presentation_cache()
-                    .get(&item.id)
-                    .and_then(|cached| cached.coordination.as_deref())
+                    .coordination_for(item)
                     .is_some_and(|card| card.is_card())
             {
-                Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+                Action::CopyMessage(
+                    self.target,
+                    self.row_target(item),
+                    self.message_copy_source(item),
+                )
             } else if let Some(source) = self.excerpted_output_source(item) {
-                Action::CopyStep(self.target, item.id.clone(), CopyPart::Text, source)
+                Action::CopyStep(self.target, self.row_target(item), CopyPart::Text, source)
             } else {
-                Action::Copy(self.target, item.id.clone(), CopyPart::Text)
+                Action::Copy(self.target, self.row_target(item), CopyPart::Text)
             },
         )];
         // What the copy did, beside the Copy that made it. It stands in for
@@ -7480,7 +7834,7 @@ impl Runtime {
             controls.push(said);
         } else if let Some((at, stamp, full)) = self
             .presentation_cache()
-            .get(&item.id)
+            .get(self.cache_key(item))
             .and_then(|cached| cached.stamp.as_ref())
             && item.at == Some(*at)
         {
@@ -7765,7 +8119,7 @@ impl Runtime {
             self.prompt_text(item)
         };
         let long = prepared.map_or(pending_long, |prompt| prompt.long);
-        let expanded = self.item_expanded(&item.id);
+        let expanded = self.row_expanded(item);
         let logical = selectable_prose::Logical {
             identity: selection::logical_identity(&item.id, &[2]),
             start: 0,
@@ -7773,7 +8127,7 @@ impl Runtime {
         let body: Element<'static, Message> = if attachment {
             // Empty unowned paths also represent documents and refused image
             // receipts. Keep their descriptor instead of a generic read error.
-            if let Some(cached) = self.presentation_cache().get(&item.id)
+            if let Some(cached) = self.presentation_cache().get(self.cache_key(item))
                 && matches!(&item.content, ItemContent::Image { path, reference, .. }
                     if reference.is_some() || !path.is_empty())
             {
@@ -7794,7 +8148,7 @@ impl Runtime {
                             None,
                             Some(logical),
                             self.presentation_cache()
-                                .get(&item.id)
+                                .get(self.cache_key(item))
                                 .map(|cached| &cached.flow_cache),
                         )
                     } else if let ItemContent::Image {
@@ -7818,7 +8172,7 @@ impl Runtime {
                     design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
                 settings.style.font = iced::Font::default();
                 if text.len() > 2048 {
-                    let flow = self.presentation_cache()[&item.id]
+                    let flow = self.presentation_cache()[self.cache_key(item)]
                         .flow_cache
                         .markdown_entry(logical.identity, text.clone(), settings.style);
                     selectable_prose::flow_source(
@@ -7854,7 +8208,7 @@ impl Runtime {
                         None,
                         None,
                         Some(expanded),
-                        Some(Action::Toggle(self.target, item.id.clone())),
+                        Some(Action::Toggle(self.target, self.row_target(item))),
                     ),
                 ])
                 .spacing(step::GAP_S)
@@ -7868,7 +8222,7 @@ impl Runtime {
             message,
             self.message_copy(item),
             Alignment::End,
-            self.copy_note_shown(&item.id),
+            self.row_copy_note_shown(item),
         ))
         .align_x(Alignment::End)
         .width(Length::Fill)
@@ -8024,7 +8378,7 @@ impl Runtime {
         else {
             return self.prompt_view(item);
         };
-        let expanded = self.item_expanded(&item.id);
+        let expanded = self.row_expanded(item);
         let notice = if *kind == chat::DeliveryKind::Notice {
             let Some(notice) = self
                 .prepared_literal(item)
@@ -8110,7 +8464,7 @@ impl Runtime {
             failed.then_some(chat::ToolStatus::Failed.into()),
             trailing,
             disclosure.then_some(expanded),
-            disclosure.then(|| Action::Toggle(self.target, item.id.clone())),
+            disclosure.then(|| Action::Toggle(self.target, self.row_target(item))),
         );
         let heading_row = crate::interaction::tooltip(heading_row, heading.clone());
         let mut rows = Vec::new();
@@ -8166,7 +8520,7 @@ impl Runtime {
                     .into(),
                 self.message_copy(item),
                 Alignment::Start,
-                self.copy_note_shown(&item.id),
+                self.row_copy_note_shown(item),
             )
         };
         widget::container(body)
@@ -8206,7 +8560,7 @@ impl Runtime {
                 .map_or("", |(_, rest)| rest.trim_start_matches(['\r', '\n']));
             (delivery_has_body(None, body, remainder), false)
         };
-        delivery_actions(has_body, monitor, long, self.item_expanded(&item.id))
+        delivery_actions(has_body, monitor, long, self.row_expanded(item))
     }
 
     /// An assistant answer, its reasoning, its narration, or a system notice.
@@ -8248,7 +8602,7 @@ impl Runtime {
                 prose::view(cached, settings, self.target, self.find.as_deref()),
                 self.message_copy(item),
                 Alignment::Start,
-                self.copy_note_shown(&item.id),
+                self.row_copy_note_shown(item),
             ))
             .max_width(design::READABLE_MEASURE)
             .width(Length::Fill)
@@ -8276,7 +8630,7 @@ impl Runtime {
             let finished = reasoning_finished(items, busy, index);
             let preview = cached.reasoning.as_ref();
             let has_text = preview.is_some_and(|preview| !preview.first.is_empty());
-            let expanded = has_text && self.item_expanded(&item.id);
+            let expanded = has_text && self.row_expanded(item);
             let mut elapsed = reasoning_elapsed(items, index, finished, finished_at);
             let label = if has_text {
                 let preview = preview.expect("reasoning text has a prepared preview");
@@ -8304,7 +8658,7 @@ impl Runtime {
                 (!finished).then_some(chat::ToolStatus::Running.into()),
                 elapsed,
                 has_text.then_some(expanded),
-                has_text.then(|| Action::Toggle(target, item.id.clone())),
+                has_text.then(|| Action::Toggle(target, self.row_target(item))),
             );
             let mut rows = vec![header];
             if expanded {
@@ -8313,7 +8667,7 @@ impl Runtime {
                         prose::view(cached, settings, target, self.find.as_deref()),
                         self.message_copy(item),
                         Alignment::Start,
-                        self.copy_note_shown(&item.id),
+                        self.row_copy_note_shown(item),
                     ))
                     .padding([step::GAP_S, step::GAP_M])
                     .max_width(design::READABLE_MEASURE)
@@ -8348,7 +8702,7 @@ impl Runtime {
             prose::view(cached, settings, self.target, self.find.as_deref()),
             self.message_copy(item),
             Alignment::Start,
-            self.copy_note_shown(&item.id),
+            self.row_copy_note_shown(item),
         ))
         .max_width(design::READABLE_MEASURE)
         .width(Length::Fill)

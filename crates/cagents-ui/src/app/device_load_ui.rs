@@ -391,6 +391,16 @@ mod tests {
     }
 
     #[test]
+    fn a_device_reading_updates_the_bar_without_projecting_the_workspace() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let before = crate::app::terminal_output_tests::projections();
+        let load = reading(35, 40, 25);
+        drop(app.update(Message::DeviceLoad(load.clone())));
+        assert_eq!(app.device_ui.load, load);
+        assert_eq!(crate::app::terminal_output_tests::projections(), before);
+    }
+
+    #[test]
     fn an_unknown_device_shows_no_figures() {
         for load in [DeviceLoad::Waiting, DeviceLoad::Unavailable("x".into())] {
             assert!(

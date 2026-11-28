@@ -5,10 +5,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "release-metadata"
 loader = importlib.machinery.SourceFileLoader("release_metadata", str(SCRIPT))
@@ -59,6 +61,11 @@ class ReleaseMetadata(unittest.TestCase):
                          {"cagents": {"archive": ARCHIVE, "installer": "install.sh", "checksums": "SHA256SUMS"}})
         self.assertEqual(run("check", "--dir", str(self.release), "--version", VERSION,
                              "--source-commit", COMMIT).stdout.strip(), printed)
+
+        compact = json.dumps(written, separators=(",", ":")).encode()
+        (self.release / "release-metadata.json").write_bytes(compact)
+        self.assertEqual(run("check", "--dir", str(self.release)).stdout.strip(),
+                         hashlib.sha256(compact).hexdigest())
 
     def test_a_published_release_lists_every_product(self):
         for name in (f"cagents_{VERSION}_amd64.deb", f"cagents-browserless-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
@@ -124,6 +131,54 @@ class ReleaseMetadata(unittest.TestCase):
         self.assertIn("install-macos.sh", refused.stderr)
         self.assertFalse((self.release / "release-metadata.json").exists())
 
+    def test_android_assets_include_both_names_and_the_checksums(self):
+        apk, alias = f"cagents-android-{VERSION}.apk", "cagents-android.apk"
+        for name in (apk, alias):
+            (self.release / name).write_bytes(b"fixture APK")
+        sha = hashlib.sha256(b"fixture APK").hexdigest()
+        checksums = self.release / "SHA256SUMS-android"
+        checksums.write_text(f"{sha}  {apk}\n{sha}  {alias}\n")
+        self.write()
+        assets = json.loads((self.release / "release-metadata.json").read_bytes())["assets"]
+        self.assertEqual(assets[apk], assets[alias])
+        self.assertEqual(assets[apk]["sha256"], sha)
+        self.assertIn(checksums.name, assets)
+        run("check", "--dir", str(self.release))
+
+    def test_android_assets_refuse_a_partial_wrong_version_or_mismatched_set(self):
+        apk, alias = f"cagents-android-{VERSION}.apk", "cagents-android.apk"
+        (self.release / alias).write_bytes(b"wrong alias")
+        self.assertIn(apk, self.write(check=False).stderr)
+        (self.release / f"cagents-android-1.2.2.apk").write_bytes(b"wrong version")
+        self.assertIn(apk, self.write(check=False).stderr)
+        (self.release / "cagents-android-1.2.2.apk").unlink()
+        (self.release / apk).write_bytes(b"fixture APK")
+        (self.release / "SHA256SUMS-android").write_text("invalid\n")
+        self.assertIn("differs from", self.write(check=False).stderr)
+        (self.release / alias).write_bytes(b"fixture APK")
+        self.assertIn("does not match the two APKs", self.write(check=False).stderr)
+        self.assertFalse((self.release / "release-metadata.json").exists())
+
+    def test_a_linux_appimage_needs_its_identical_versioned_and_stable_names(self):
+        image = self.release / f"cagents-{VERSION}-x86_64.AppImage"
+        alias = self.release / "cagents-x86_64.AppImage"
+        image.write_bytes(b"AppImage fixture")
+        refused = self.write(check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn(alias.name, refused.stderr)
+
+        alias.write_bytes(b"another image")
+        refused = self.write(check=False)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("differs from the versioned AppImage", refused.stderr)
+
+        alias.write_bytes(image.read_bytes())
+        self.write()
+        written = json.loads((self.release / "release-metadata.json").read_bytes())
+        self.assertEqual(written["assets"][image.name], written["assets"][alias.name])
+        self.assertEqual(written["targets"][0]["products"]["cagents"]["archive"], ARCHIVE)
+        self.assertEqual(run("check", "--dir", str(self.release)).returncode, 0)
+
     def test_check_refuses_a_changed_added_or_removed_file(self):
         self.write()
         for change, message in (
@@ -153,6 +208,42 @@ class ReleaseMetadata(unittest.TestCase):
         old["schema_version"] = 1
         path.write_text(json.dumps(old))
         self.assertIn("not schema 2", run("check", "--dir", str(self.release), check=False).stderr)
+
+    def test_check_rejects_float_and_boolean_encodings_for_integer_fields(self):
+        (self.release / ARCHIVE).write_bytes(b"x")
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_bytes()
+        for field, value in (("schema_version", 2.0), ("size", 1.0), ("size", True)):
+            with self.subTest(field=field, value=value):
+                metadata = json.loads(raw)
+                target = metadata if field == "schema_version" else metadata["assets"][ARCHIVE]
+                target[field] = value
+                path.write_text(json.dumps(metadata))
+                result = run("check", "--dir", str(self.release), check=False)
+                self.assertEqual(result.returncode, 1)
+
+    def test_check_rejects_duplicate_json_fields(self):
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_text()
+        duplicate = raw.replace('"schema_version": 2,', '"schema_version": 2,\n  "schema_version": 2,', 1)
+        self.assertNotEqual(duplicate, raw)
+        path.write_text(duplicate)
+        result = run("check", "--dir", str(self.release), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("duplicate JSON field", result.stderr)
+
+    def test_check_requires_utf8_json_without_a_byte_order_mark(self):
+        self.write()
+        path = self.release / "release-metadata.json"
+        raw = path.read_text(encoding="utf-8")
+        for encoding in ("utf-8-sig", "utf-16", "utf-32"):
+            with self.subTest(encoding=encoding):
+                path.write_bytes(raw.encode(encoding))
+                result = run("check", "--dir", str(self.release), check=False)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("not UTF-8 JSON", result.stderr)
 
     def test_write_refuses_bad_input(self):
         cases = (
@@ -249,6 +340,85 @@ class ReleaseMetadata(unittest.TestCase):
         result = run("feed", "--dir", str(bridge), "--feed", str(self.root / "other"),
                      "--bridge", str(self.release), check=False)
         self.assertIn("not older than", result.stderr)
+
+    def test_feed_retry_advances_latest_without_replacing_the_tagged_release(self):
+        older = self.root / "older"
+        older.mkdir()
+        for name in (ARCHIVE.replace(VERSION, "1.2.2"), "install.sh", "SHA256SUMS"):
+            (older / name).write_bytes(b"old")
+        run("write", "--dir", str(older), "--version", "1.2.2", "--source-commit", COMMIT, "--protocol", "196")
+        (older / metadata.SIGNATURE).write_text("old signature")
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("new signature")
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                feed = self.root / str(legacy)
+                run("feed", "--dir", str(older), "--feed", str(feed))
+                latest = feed / "latest/download"
+                if legacy and latest.is_symlink():
+                    tagged_old = latest.resolve()
+                    latest.unlink()
+                    latest.mkdir()
+                    for path in tagged_old.glob("release-metadata*"):
+                        shutil.copyfile(path, latest / path.name)
+                tagged = feed / f"download/v{VERSION}"
+                fail_next_move = True
+
+                def fail_before_selection(move):
+                    def interrupted(source, destination):
+                        nonlocal fail_next_move
+                        if fail_next_move and destination == latest:
+                            fail_next_move = False
+                            raise OSError("fixture interrupted latest selection")
+                        return move(source, destination)
+                    return interrupted
+
+                with (patch.object(Path, "rename", fail_before_selection(Path.rename)),
+                      patch.object(Path, "replace", fail_before_selection(Path.replace)),
+                      self.assertRaisesRegex(OSError, "interrupted latest")):
+                    metadata.feed(self.release, feed, 2, None)
+
+                inode = tagged.stat().st_ino
+                self.assertEqual((tagged / ARCHIVE).read_bytes(), b"archive")
+                old_latest = (latest / metadata.METADATA).read_bytes() if latest.is_dir() else None
+                result = run("feed", "--dir", str(self.release), "--feed", str(feed), check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tagged.stat().st_ino, inode)
+                self.assertEqual(old_latest, (older / metadata.METADATA).read_bytes())
+                self.assertEqual((latest / metadata.METADATA).read_bytes(),
+                                 (self.release / metadata.METADATA).read_bytes())
+
+    def test_feed_retry_repairs_missing_latest_only_for_a_matching_tagged_release(self):
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("signature")
+        feed = self.root / "feed"
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        latest = feed / "latest/download"
+        if latest.is_symlink():
+            latest.unlink()
+        else:
+            shutil.rmtree(latest)
+        tagged_archive = feed / f"download/v{VERSION}" / ARCHIVE
+        tagged_archive.write_bytes(b"different archive")
+        refused = run("feed", "--dir", str(self.release), "--feed", str(feed), check=False)
+        self.assertIn("never replaces", refused.stderr)
+        self.assertEqual(tagged_archive.read_bytes(), b"different archive")
+        self.assertFalse(latest.exists())
+        tagged_archive.write_bytes(b"archive")
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        self.assertEqual((latest / metadata.METADATA).read_bytes(), (self.release / metadata.METADATA).read_bytes())
+
+    def test_feed_supports_a_latest_directory_reached_by_symlink(self):
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("signature")
+        feed = self.root / "feed"
+        feed.mkdir()
+        latest = self.root / "elsewhere/latest"
+        latest.mkdir(parents=True)
+        (feed / "latest").symlink_to(latest, target_is_directory=True)
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        self.assertEqual((latest / "download" / metadata.METADATA).read_bytes(),
+                         (self.release / metadata.METADATA).read_bytes())
 
     def test_feed_refuses_unsigned_metadata(self):
         self.write()

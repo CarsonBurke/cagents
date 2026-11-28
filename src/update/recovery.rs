@@ -1284,7 +1284,10 @@ pub(super) fn require_prepared_scope(
     target: &Path,
 ) -> Result<(), UpdateError> {
     if settled.source != pending.source
-        || settled.census != pending.census
+        || !settled
+            .census
+            .same_bytes(&pending.census)
+            .map_err(|error| invalid(error.to_string()))?
         || settled.witness.checkpoint_hash != pending.checkpoint_hash
         || settled.witness.target != target
     {
@@ -1899,6 +1902,13 @@ pub(super) struct Context {
     pub census: Option<Census>,
 }
 impl Context {
+    pub(super) fn retained_source(&self, replaces_daemon: bool) -> Option<HostSessionProof> {
+        self.census
+            .as_ref()
+            .filter(|_| !replaces_daemon)
+            .and_then(|census| census.source.clone())
+    }
+
     pub fn capture(&mut self, state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
         let census = Census::capture(job.id.clone(), BusyPatience::for_one_run())?;
         census.save(&census_path(state, &job.id))?;

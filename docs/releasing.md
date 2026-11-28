@@ -3,6 +3,7 @@
 - [Building a release](#building-a-release)
 - [Artifacts](#artifacts)
 - [macOS](#macos)
+- [Android](#android)
 - [Native platform roadmap](#native-platform-roadmap)
 - [Publishing](#publishing)
 - [Signing](#signing)
@@ -69,9 +70,16 @@ limited to one per 2 GiB of available memory; set it lower on a shared host.
 Download and build temporary files stay in its private
 disk cache. The next build reclaims recognized scratch left by interrupted
 runs after taking the cache lock. A supervisor keeps that lock through
-sandbox teardown. The cache also keeps one checkout of the source. Each build
-rewrites only the files that changed, so Cargo
-recompiles only the crates they belong to.
+sandbox teardown. The cache keeps a source-only checkout of the selected
+commit. Each build rewrites only changed files so Cargo can reuse unaffected
+crates. Use a full checkout for automatic release notes, or pass
+`--notes FILE` to build from a shallow checkout.
+
+Add `--timings` to `release:build` to retain Cargo's unit reports for each
+product and variant. The builder prints their directory inside its private
+build cache. The build log also gives the archive packaging and offline smoke
+times. Keep the Cargo job count and toolchain the same when comparing an
+empty target directory with a build after switching commits.
 
 ## Native integrated browser capability smoke
 
@@ -91,8 +99,14 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
+- with a Linux AppImage build, `cagents-${VERSION}-x86_64.AppImage` and its
+  byte-identical `cagents-x86_64.AppImage` alias. Both are covered by
+  `SHA256SUMS` and the signed metadata. The alias provides the
+  [latest download](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-x86_64.AppImage).
 - with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
   `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
+- with an [Android build](#android), `cagents-android-${VERSION}.apk`,
+  `cagents-android.apk`, and `SHA256SUMS-android`, which covers both names
 - `release-metadata-2.json`: the version, source commit, daemon protocol,
   release notes, and every other asset's size and SHA-256 (schema 2)
 - `release-metadata-2.json.sig`: its signature (see [Signing](#signing))
@@ -224,6 +238,105 @@ fw16 verdict and Linux bundle for that same commit. When cut waits for main's
 tip and the exact tip already has a passing test verdict, it prepares macOS
 while waiting for the Linux bundle.
 
+## Android
+
+The Android companion ships with local releases that include `--android-assets`.
+Once the public download is enabled, include the APKs in every new latest release
+so the [stable download link](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-android.apk)
+keeps working. Use the local release path for Android.
+
+### Set up Android signing on fw16
+
+The release operator provisions the Android signing key for `dev.cagents.mobile`
+once. Use a private directory outside Git, owned by the build user with mode
+`0700`. The packager reads a PKCS#12 keystore named `release.p12` with the key
+alias `cagents-android`, a one-line password in `store.pass`, and the pinned
+certificate fingerprint in `signer.sha256`. Give all three files mode `0600`.
+Android uses this key for in-place app upgrades. Release metadata uses its
+own signing key.
+
+Run this once from a private Bash shell on fw16 with JDK 21. It prompts for a
+new keystore password and refuses to overwrite an existing signing directory.
+
+```sh
+(
+  set -euo pipefail
+  umask 077
+  signing_dir="$HOME/.config/cagents/android-signing"
+  mkdir -p -- "$(dirname -- "$signing_dir")"
+  mkdir -m 700 -- "$signing_dir"
+  cd -- "$signing_dir"
+  read -r -s -p 'Android keystore password: ' android_password
+  printf '\n'
+  printf '%s\n' "$android_password" > store.pass
+  unset android_password
+  keytool -genkeypair -storetype PKCS12 -keystore release.p12 \
+    -storepass:file store.pass -alias cagents-android -keyalg RSA \
+    -keysize 3072 -validity 10000 -dname 'CN=Cagents Android Release'
+  keytool -exportcert -storetype PKCS12 -keystore release.p12 \
+    -storepass:file store.pass -alias cagents-android |
+    sha256sum | cut -d ' ' -f 1 > signer.sha256
+)
+```
+
+Keep an encrypted backup of the keystore and retain its password separately.
+Keep a trusted copy of the public fingerprint on the release workstation.
+Recover the same key and certificate when moving build hosts or changing
+keystore protection. A change of signing key requires an [Android signing
+lineage](https://developer.android.com/tools/apksigner) created while the old
+key is still available. Qualify that migration on the supported Android
+versions and update the packager and verifier together before changing the
+pin. Losing the key without a lineage leaves existing users with a reinstall
+and fresh pairing.
+
+### Build and attach the APKs
+
+Choose the exact trusted commit whose Linux bundle you will cut. On fw16,
+run from a checkout containing that commit with Python 3.11+, JDK 21, and the
+Android SDK configured as for `mobile:build`. Packaging and offline
+verification use Build Tools 36.0.0 under `ANDROID_HOME` (by default
+`~/Android/Sdk`). Set `CAGENTS_ANDROID_BUILD_TOOLS` to an absolute Build Tools
+directory to select another installation.
+
+```sh
+mise run mobile:release -- --ref "$sha" \
+  --signing-dir "$HOME/.config/cagents/android-signing" \
+  --output "/var/tmp/cagents-android-$sha"
+```
+
+Gradle creates the unsigned release APK from the exported commit. The
+packager checks the keystore against the pinned certificate, signs with
+`apksigner`, then verifies the signature and the APK's production package
+ID and version. The APK gets `versionName` from the Cargo release version and
+`versionCode` from `MAJOR * 1000000 + MINOR * 1000 + PATCH`. Minor and patch
+must be below 1000 and the result must be in Android's supported range.
+
+Copy the output directory, including its build receipt, from fw16 to the
+release workstation over SSH. The release workstation needs Python 3.11+,
+Java and the SDK Build Tools for offline APK verification. When you set it
+up, copy only the public fingerprint from the signing directory over an
+authenticated SSH connection and keep that trusted copy for future releases.
+
+```sh
+mkdir -p "$HOME/.config/cagents"
+scp fw16:.config/cagents/android-signing/signer.sha256 "$HOME/.config/cagents/android-signer.sha256"
+```
+
+For each cut, use that fingerprint to verify the supplied APKs.
+
+```sh
+scp -r "fw16:/var/tmp/cagents-android-$sha" /var/tmp/
+export CAGENTS_ANDROID_SIGNER_SHA256="$(cat "$HOME/.config/cagents/android-signer.sha256")"
+mise run release -- cut --commit "$sha" --android-assets "/var/tmp/cagents-android-$sha"
+```
+
+`release build VERSION` also takes `--android-assets`. Both commands
+require the build receipt to match the selected source commit, verify the
+APK and both checksums, then add the three assets to release metadata.
+`release:verify` checks the APKs offline using the same public fingerprint.
+See [Install on Android](../mobile/README.md#install-on-android) for sideloading
+and moving from the debug-key preview.
+
 ## Native platform roadmap
 
 [#7](https://github.com/CarsonBurke/cagents/issues/7) tracks Windows and macOS
@@ -320,16 +433,28 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    - a private user with its own headless desktop installs the published
      release;
    - it opens three windows, one holding nothing, and seeds chats, agents, a
-     channel, terminals with a long-lived child and a chat whose provider has
-     already stopped;
+     channel and terminals with a long-lived child;
+   - it also seeds a chat whose provider has already stopped when the
+     **published source tag** lists `ended-provider` in
+     `scripts/release-rehearsal-capabilities.txt`. That capability requires
+     both the stopped-provider lifecycle fix (#4832) and the checkpoint
+     verification fix (#3860). Before declaring the capability, verify
+     that the source reports the chat as exited or omits it from its live
+     inventory before the update begins, including when the provider
+     outlives the worker. Published 0.2.3 and 0.2.4 run the standard matrix
+     without that seed;
    - the published build's own updater finds the cut in a file feed made
      from the cut bundle, checks its signature against the release keys, and
      updates;
    - it requires every pane, chat, agent and terminal to survive, NEW to
      serve, the windows to reopen on NEW, and no reopened window to show
      "Update failed" or "Update not installed";
-   - then, as after a reboot, it closes the windows, stops NEW's daemon and
-     reopens them, and requires the same again.
+   - then, as after a reboot, it closes the windows, deliberately stops
+     NEW's daemon and reopens the windows. The update must still read
+     `Complete` with NEW serving. A note that saved panes could not
+     reconnect is expected for the seeded terminal and console panes after
+     this stop. The harness verifies that they survived the update before
+     it stops their daemon.
 
    It takes about 12 minutes, plus the published release's download the
    first time. Interrupting it stops the run on the host too. The options
@@ -459,6 +584,8 @@ releases published on GitHub, read from their tags in the checkout;
 - A release that begins a generation must verify with the keys of every
   release of the generation before. When that generation is 1, it must hold
   exactly one signature.
+- If the preceding generation shipped Apple Silicon builds, the bridge must
+  carry an Apple Silicon build. Publication checks the published release assets.
 - A generation follows the one before it, never skipping one or going back.
 - The metadata it carries for older generations must be the one their
   generation's successor published, signed as those builds read it. For

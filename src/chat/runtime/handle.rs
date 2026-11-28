@@ -1,7 +1,10 @@
 //! One handle for a daemon-local actor or its authenticated retained owner.
 use super::retained_actor::journal::OutboxEntry;
 use super::retained_actor::transport::{ActorIdentity, RemoteActor, WeakRemote};
-use super::{LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness};
+use super::{
+    LocalHandle, Rejection, Store, TitleUnavailable, Update, UpdateReadiness,
+    UpgradeRestoreQueueBudget,
+};
 use crate::chat::{
     self, Command, Snapshot,
     protocol::{Adapter, ProcessSpec, Step},
@@ -162,6 +165,7 @@ impl Handle {
         store: Store,
         source: chat::Session,
         recovery_environment: BTreeMap<String, String>,
+        upgrade_queue_budget: Option<UpgradeRestoreQueueBudget>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
         LocalHandle::start_owned(
@@ -171,6 +175,7 @@ impl Handle {
             store,
             source,
             recovery_environment,
+            upgrade_queue_budget,
             notify,
         )
         .map(|local| Self(Owner::Local(local)))
@@ -784,6 +789,27 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.is_completed(),
             Owner::Remote(remote) => remote.state().completed,
+        }
+    }
+    /// Whether this worker stopped acknowledging commands. Cleanup can still
+    /// be outstanding after the local worker has stopped consuming them.
+    pub fn worker_stopped(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => {
+                local.is_completed() || local.0.draining.load(std::sync::atomic::Ordering::Acquire)
+            }
+            Owner::Remote(remote) => remote.state().completed,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn native_exit_pending(&self) -> bool {
+        matches!(&self.0, Owner::Local(local) if local.native_exit_pending())
+    }
+    #[cfg(target_os = "linux")]
+    pub fn settle_lost_native_owner(&self) -> super::NativeExit {
+        match &self.0 {
+            Owner::Local(local) => local.settle_lost_native_owner(),
+            Owner::Remote(_) => super::NativeExit::Unobservable,
         }
     }
     /// Provider-owned input observed at verified exit. The live snapshot

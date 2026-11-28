@@ -192,7 +192,7 @@ fn accept_client(
     capacity: &ClientCapacity,
     clients: &mut Vec<JoinHandle<()>>,
 ) -> io::Result<()> {
-    let (stream, _) = crate::descriptor::accept(listener)?;
+    let (stream, _peer_address) = crate::descriptor::accept(listener)?;
     match daemon::peer_uid(&stream) {
         Ok(uid) if uid == daemon::current_uid() => {}
         Ok(uid) => {
@@ -212,10 +212,17 @@ fn accept_client(
     };
     let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
     let client_host = Arc::clone(host);
+    let serve = client::serve;
+    #[cfg(all(test, target_os = "linux"))]
+    let serve = if exit_drain_tests::take_fixture_client(&_peer_address) {
+        client::serve_fixture_user
+    } else {
+        serve
+    };
     match thread::Builder::new()
         .name(format!("cagentsd-client-{client_id}"))
         .spawn(move || {
-            client::serve(stream, client_id, client_host);
+            serve(stream, client_id, client_host);
             // Free the slot before the wake, so its next peer can be admitted.
             drop(permit);
             daemon::wake();
@@ -1027,7 +1034,9 @@ fn initialize_serving_host(
         }
     };
     if let Some(broker) = &notification_broker {
-        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.notifications = Some(broker.handle());
+        state.mobile_relay = broker.mobile_relay();
     }
     // Cache sweeps preserve unretired helper journals and live Store leases.
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {

@@ -629,6 +629,90 @@ fn remote_status_reports_a_stopped_daemon_without_starting_it() {
 }
 
 #[test]
+fn remote_status_reports_a_daemon_lease_without_starting_another_daemon() {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    let runtime = fixture
+        .root
+        .path()
+        .join("run")
+        .join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let lease = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(runtime.join("cagentsd.lock"))
+        .unwrap();
+    let _lease = cagents::instance::owned_file_lock(lease, libc::LOCK_EX).unwrap();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    let output = fixture.run(
+        fixture
+            .command(&["--device", "fixture", "daemon", "status"])
+            .env("PATH", path),
+    );
+    assert!(output.success, "{output:?}");
+    let reply: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(reply["data"]["device"], "fixture", "{reply}");
+    assert_eq!(reply["data"]["daemon_present"], true, "{reply}");
+    assert_eq!(reply["data"]["running"], false, "{reply}");
+    assert!(!fixture.root.path().join("spawned").exists());
+}
+
+#[test]
+fn remote_status_explains_an_old_cli_that_rejects_the_no_start_flag() {
+    if !user_fixture::enter() {
+        return;
+    }
+    let fixture = Fixture::new();
+    configure_remote_fixture(&fixture, false);
+    fs::write(
+        fixture.root.path().join("bin/ssh"),
+        r#"#!/bin/sh
+set -eu
+last=''
+for arg do last=$arg; done
+case "$last" in
+    *' --no-start daemon bridge')
+        printf "%s\n" "error: unexpected argument '--no-start' found" "Usage: cagents [COMMAND]" >&2
+        exit 2 ;;
+    *) exit 99 ;;
+esac
+"#,
+    )
+    .unwrap();
+    let path = format!(
+        "{}:/usr/bin:/bin",
+        fixture.root.path().join("bin").display()
+    );
+    let output = fixture.run(
+        fixture
+            .command(&["--device", "fixture", "daemon", "status"])
+            .env("PATH", path),
+    );
+    assert_eq!(output.exit_code, Some(1), "{output:?}");
+    let reply: Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(reply["error"]["kind"], "device_cli_too_old", "{reply}");
+    assert!(
+        reply["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cagents device update fixture"),
+        "{reply}"
+    );
+    assert!(!fixture.root.path().join("spawned").exists());
+}
+
+#[test]
 fn a_genuine_ssh_failure_is_not_an_already_stopped_remote_daemon() {
     if !user_fixture::enter() {
         return;

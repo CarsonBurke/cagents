@@ -36,6 +36,7 @@ mod channels;
 mod chat;
 #[cfg(test)]
 mod device_peer_tests;
+mod mobile_notify;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
@@ -98,7 +99,10 @@ use crate::{
             ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
             ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
             TerminalDescriptor, TerminalSnapshot, TerminalVisibility,
-            client_session::{HandshakeError, validate_handshake},
+            client_session::{
+                DeadlineReader, DeadlineWriter, HandshakeError, ReplyError, connect_until,
+                validate_handshake,
+            },
             daemon_socket_path, read_frame, write_frame,
         },
     },
@@ -326,6 +330,11 @@ pub enum TopCommand {
     Device {
         #[command(subcommand)]
         command: devices::DeviceCommand,
+    },
+    /// Set up optional phone notifications for agent attention.
+    Mobile {
+        #[command(subcommand)]
+        command: mobile_notify::MobileCommand,
     },
     /// Read GitHub status through a shared local cache.
     Gh {
@@ -1141,64 +1150,8 @@ impl std::fmt::Debug for ControlClient {
     }
 }
 
-/// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
-/// fresh nonblocking sockets within the same establishment deadline, rather
-/// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-/// Darwin answers that pressure with a refusal, which callers take to mean no
-/// daemon runs; see [`crate::descriptor::retry_refusal`].
 pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as _;
-    let bytes = path.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid daemon Unix socket path",
-        ));
-    }
-    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *byte as _;
-    }
-    let deadline = Instant::now() + timeout;
-    let refusing_since = Instant::now();
-    let mut delay = Duration::from_millis(1);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon socket connection deadline elapsed",
-            ));
-        }
-        let stream = UnixStream::from(crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?);
-        let fd = stream.as_raw_fd();
-        // SAFETY: address is initialized with its valid length and the
-        // descriptor belongs exclusively to this connection attempt.
-        let result = unsafe {
-            libc::connect(
-                fd,
-                (&address as *const libc::sockaddr_un).cast(),
-                (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _,
-            )
-        };
-        if result == 0 {
-            stream.set_nonblocking(false)?;
-            return Ok(stream);
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
-        {
-            return Err(error);
-        }
-        // EAGAIN has not queued a connection. Close this attempt before
-        // retrying, preserving bounded descriptor use and the selected endpoint.
-        drop(stream);
-        thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
-        delay = (delay * 2).min(Duration::from_millis(20));
-    }
+    connect_until(path, Instant::now() + timeout, || false)
 }
 
 /// How long a window waits for the device to answer one device operation.
@@ -1226,9 +1179,10 @@ impl ControlClient {
         let health_request = crate::daemon_health::begin();
         let deadline = Instant::now() + Self::handshake_timeout();
         let result = (|| {
-            let stream = connect_control_socket(
+            let stream = connect_until(
                 socket_path,
-                io_timeout().min(deadline.saturating_duration_since(Instant::now())),
+                deadline.min(Instant::now() + io_timeout()),
+                || false,
             )
             .map_err(ControlError::Connect)?;
             connected(&stream).map_err(ControlError::Configure)?;
@@ -1268,7 +1222,19 @@ impl ControlClient {
         deadline: Instant,
     ) -> Result<Self, ControlError> {
         let deadline = deadline.max(Instant::now() + Self::handshake_timeout());
-        Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
+        Self::from_stream_with_startup_budget(stream, deadline)
+    }
+
+    /// Complete hello within the remaining startup budget, including the write.
+    pub(crate) fn from_stream_with_startup_budget(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
+        Self::from_stream_inner(
+            stream,
+            deadline,
+            deadline.min(Instant::now() + io_timeout()),
+        )
     }
 
     /// Consult the restoration deadline only if the ordinary hello budget runs out.
@@ -1847,6 +1813,21 @@ impl ControlClient {
             ServerResponse::NotificationTest { outcome } => Ok(outcome),
             response => Err(unexpected_response(
                 "a test notification outcome",
+                &response,
+            )),
+        }
+    }
+
+    fn send_test_mobile_notification(
+        &mut self,
+    ) -> Result<crate::notifications::TestOutcome, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::SendTestMobileNotification,
+            Instant::now() + crate::notifications::TEST_TIMEOUT + io_timeout(),
+        )? {
+            ServerResponse::NotificationTest { outcome } => Ok(outcome),
+            response => Err(unexpected_response(
+                "a mobile test notification outcome",
                 &response,
             )),
         }
@@ -3300,10 +3281,7 @@ impl ControlClient {
             };
             write_frame_for(
                 self.protocol,
-                &mut DeadlineWriter {
-                    stream: &mut self.stream,
-                    deadline: write_deadline,
-                },
+                &mut DeadlineWriter::new(&mut self.stream, write_deadline),
                 &envelope,
             )?;
         } else {
@@ -3314,10 +3292,7 @@ impl ControlClient {
             let envelope = match deadline {
                 Some(deadline) => read_frame_from(
                     self.protocol,
-                    &mut DeadlineReader {
-                        stream: &mut self.stream,
-                        deadline,
-                    },
+                    &mut DeadlineReader::new(&mut self.stream, deadline),
                 )
                 .map_err(|error| reply_error(error, Some(reply_timeout)))?
                 .ok_or(ControlError::ConnectionClosed)?,
@@ -3509,27 +3484,6 @@ fn read_frame_from<T: serde::de::DeserializeOwned>(
     crate::terminal_ipc::decoding_from(protocol, || read_frame(reader))
 }
 
-/// Bound the complete response, including unsolicited notifications and every
-/// partial frame read. A socket timeout alone restarts on each successful read.
-struct DeadlineReader<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl Read for DeadlineReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon response deadline expired",
-            ));
-        }
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(buffer)
-    }
-}
-
 /// Extend a timed-out hello read inside the frame reader, which still holds
 /// any prefix or payload bytes already received on this connection.
 struct HandshakeReplyReader<'a, F> {
@@ -3554,30 +3508,6 @@ impl<F: FnOnce() -> Instant> Read for HandshakeReplyReader<'_, F> {
             }
         }
         result
-    }
-}
-
-/// Bound every partial write of a request against the same overall deadline.
-struct DeadlineWriter<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl Write for DeadlineWriter<'_> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon request deadline expired",
-            ));
-        }
-        self.stream.set_write_timeout(Some(remaining))?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
     }
 }
 
@@ -3609,18 +3539,12 @@ impl HandshakeClient {
         // remote handshakes allow longer reads. Explicit callers retain their
         // own complete operation deadline for both directions.
         write_frame(
-            &mut DeadlineWriter {
-                stream: &mut self.stream,
-                deadline: write_deadline,
-            },
+            &mut DeadlineWriter::new(&mut self.stream, write_deadline),
             &request,
         )?;
         let started = Instant::now();
         let mut reader = HandshakeReplyReader {
-            reader: DeadlineReader {
-                stream: &mut self.stream,
-                deadline,
-            },
+            reader: DeadlineReader::new(&mut self.stream, deadline),
             extend,
         };
         let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
@@ -3634,14 +3558,19 @@ impl HandshakeClient {
         validate_handshake(&envelope, self.protocol, request_id)
             .cloned()
             .map_err(|error| match error {
-                HandshakeError::UnsupportedVersion { actual } => {
+                HandshakeError::InvalidReply(ReplyError::UnsupportedVersion { actual }) => {
                     ControlError::UnsupportedVersion { actual }
                 }
-                HandshakeError::RequestIdMismatch { expected, actual } => {
-                    ControlError::RequestIdMismatch { expected, actual }
+                HandshakeError::InvalidReply(ReplyError::RequestIdMismatch {
+                    expected,
+                    actual,
+                }) => ControlError::RequestIdMismatch { expected, actual },
+                HandshakeError::InvalidReply(ReplyError::IncompleteProof) => {
+                    ControlError::IncompleteProof
                 }
-                HandshakeError::IncompleteProof => ControlError::IncompleteProof,
-                HandshakeError::ProofMismatch => ControlError::ProofMismatch,
+                HandshakeError::InvalidReply(ReplyError::ProofMismatch) => {
+                    ControlError::ProofMismatch
+                }
                 HandshakeError::Remote(error) => ControlError::Remote {
                     code: error.code,
                     message: error.message.clone(),
@@ -4041,23 +3970,27 @@ fn already_stopped() -> CommandOutput {
     }
 }
 
-/// `daemon status` for a selected device whose bridge confirmed that no
-/// daemon is running or holding its inventory lease there.
-fn remote_daemon_stopped() -> CommandOutput {
+/// `daemon status` after the read-only bridge checked the device's lease.
+fn remote_daemon_not_serving(daemon_present: bool) -> CommandOutput {
     let device = crate::device::selected().map(|device| device.name.as_str());
+    let state = if daemon_present {
+        "is starting or stopping"
+    } else {
+        "stopped"
+    };
     CommandOutput {
         command: "daemon.status",
         data: json!({
             "instance": instance::NAME,
             "device": device,
             "running": false,
-            "daemon_present": false,
+            "daemon_present": daemon_present,
             "socket": null,
             "daemon_version": null,
             "cli_version": crate::version()
         }),
         human: format!(
-            "{} daemon on {} stopped; cli {}",
+            "{} daemon on {} {state}; cli {}",
             instance::NAME,
             device.unwrap_or("the selected device"),
             crate::version()
@@ -4198,13 +4131,22 @@ where
         | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
+        TopCommand::Mobile { .. } => {
+            Some("Mobile notification settings require your own terminal".into())
+        }
         // An agent must never link a device or grant itself access to one.
         TopCommand::Device { command } if command.changes_access() => {
             Some("Device links, grants and updates require your own terminal".into())
         }
         _ => None,
     };
-    if hosted && let Some(message) = user_only_message {
+    let legacy_mobile_caller = matches!(&cli.command, TopCommand::Mobile { .. })
+        && ["CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some());
+    if (hosted || legacy_mobile_caller)
+        && let Some(message) = user_only_message
+    {
         emit_error(
             cli.global.json,
             &AppError::new(
@@ -4241,7 +4183,8 @@ where
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::StoreSchema
                     | DaemonCommand::DowngradeStore { .. },
-            } | TopCommand::CoordinateInstall { .. }
+            } | TopCommand::Mobile { .. }
+                | TopCommand::CoordinateInstall { .. }
                 | TopCommand::SelectInstall { .. }
                 | TopCommand::SettleEditorInstall { .. }
                 | TopCommand::RestartWindows { .. }
@@ -4362,6 +4305,19 @@ where
                 let code = output.exit_code();
                 emit_success(cli.global.json, output);
                 code
+            }
+            Err(error) => {
+                emit_error(cli.global.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if matches!(&cli.command, TopCommand::Mobile { command } if !command.uses_daemon()) {
+        return match execute(cli.command) {
+            Ok(output) => {
+                emit_success(cli.global.json, output);
+                ExitCode::SUCCESS
             }
             Err(error) => {
                 emit_error(cli.global.json, &error);
@@ -4509,6 +4465,11 @@ where
                 crate::device::report_absent_bridge();
                 ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
             }
+            Err(error) if crate::device::daemon_transitioning(&error) => {
+                eprintln!("cagents daemon bridge: {error}");
+                crate::device::report_transitioning_bridge();
+                ExitCode::from(crate::device::BRIDGE_TRANSITION_EXIT)
+            }
             Err(error) => {
                 eprintln!("cagents daemon bridge: {error}");
                 ExitCode::FAILURE
@@ -4525,11 +4486,36 @@ where
                 return ExitCode::SUCCESS;
             }
             if reading_daemon_status {
-                emit_success(cli.global.json, remote_daemon_stopped());
+                emit_success(cli.global.json, remote_daemon_not_serving(false));
                 return ExitCode::SUCCESS;
             }
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
+        }
+        if reading_daemon_status {
+            use crate::device::RemoteStatusRefusal;
+            match crate::device::remote_status_refusal() {
+                Some(RemoteStatusRefusal::Transitioning) => {
+                    emit_success(cli.global.json, remote_daemon_not_serving(true));
+                    return ExitCode::SUCCESS;
+                }
+                Some(RemoteStatusRefusal::OldCli) => {
+                    let name = &crate::device::selected()
+                        .expect("selected remote device")
+                        .name;
+                    emit_error(
+                        cli.global.json,
+                        &AppError::new(
+                            "device_cli_too_old",
+                            format!(
+                                "{name} runs a cagents CLI too old to check daemon status over SSH. Run `cagents device update {name}` to update the device."
+                            ),
+                        ),
+                    );
+                    return ExitCode::FAILURE;
+                }
+                None => {}
+            }
         }
         emit_error(cli.global.json, &device_app_error(error));
         return ExitCode::FAILURE;
@@ -4549,6 +4535,7 @@ where
 
 fn staged_command_requires_daemon(command: &TopCommand) -> bool {
     match command {
+        TopCommand::Mobile { command } => command.uses_daemon(),
         TopCommand::Daemon {
             command: DaemonCommand::Start,
         }
@@ -4850,6 +4837,7 @@ fn execute_with_model_context(
             source.as_deref(),
             caller_reports_startup_failure,
         ),
+        TopCommand::Mobile { command } => mobile_notify::execute(command, !human_output()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => match project_channel_context {
             Some(context) => execute_terminal_as(command, &context),
@@ -5729,7 +5717,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
             });
-            let mut human = if running {
+            let mut human = if let Some(device) = crate::device::selected().filter(|_| running) {
+                format!(
+                    "{} daemon {} running on {}; cli {}",
+                    instance::NAME,
+                    daemon_version.as_deref().unwrap_or("starting"),
+                    device.name,
+                    crate::version()
+                )
+            } else if running {
                 format!(
                     "{} daemon {} running ({}); cli {}",
                     instance::NAME,
@@ -12695,10 +12691,7 @@ mod tests {
         client_stream.set_nonblocking(false).unwrap();
         let started = Instant::now();
         let error = write_frame(
-            &mut DeadlineWriter {
-                stream: &mut client_stream,
-                deadline: started + Duration::from_millis(20),
-            },
+            &mut DeadlineWriter::new(&mut client_stream, started + Duration::from_millis(20)),
             &ClientRequest::Agent {
                 authority: crate::agent_execution::Authority::default(),
                 operation: crate::agent_execution::Operation::PeekInbox(
@@ -12729,10 +12722,10 @@ mod tests {
             }
         });
         let started = Instant::now();
-        let error = read_frame::<ServerEnvelope>(&mut DeadlineReader {
-            stream: &mut client_stream,
-            deadline: started + Duration::from_millis(100),
-        })
+        let error = read_frame::<ServerEnvelope>(&mut DeadlineReader::new(
+            &mut client_stream,
+            started + Duration::from_millis(100),
+        ))
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));

@@ -53,6 +53,8 @@ pub(super) struct State {
     /// What this window's report said, so a failed update's notice that only
     /// repeats it is not shown twice.
     reported_notice: Option<String>,
+    /// A durable current window proof awaiting the coordinator's completion.
+    rechecked_job: Option<uuid::Uuid>,
     /// Terminals the gate is waiting on without anything settling them.
     pub(super) retries: retries::Retries,
     /// Since when a view this window shows has not been admitted.
@@ -1245,8 +1247,86 @@ impl Cagents {
         self.startup_gate.reported = true;
         instance::finish_window_restore();
         self.startup_gate.reported_notice = Some(notice.message.clone());
-        self.status = Some(notice);
+        self.status = Some(if result.is_err() {
+            notice.with_key(NoticeKey::StartupRecovery)
+        } else {
+            notice
+        });
         report(result)
+    }
+
+    pub(super) fn resolve_startup_recheck(&mut self, job: &str) -> bool {
+        if !self
+            .startup_gate
+            .rechecked_job
+            .is_some_and(|id| uuid::Uuid::parse_str(job) == Ok(id))
+        {
+            return false;
+        }
+        self.startup_gate.rechecked_job = None;
+        self.startup_gate.retained = false;
+        self.startup_gate.reported_notice = None;
+        self.resolve_notice(NoticeKey::StartupRecovery);
+        true
+    }
+
+    // An earlier failure belongs to the first launch. Check the panes this
+    // window holds now and flush the workspace without reenacting startup.
+    #[cfg(target_os = "linux")]
+    pub(super) fn recheck_startup(&mut self, request: instance::UiUpdateRequest) -> Task<Message> {
+        if let Err(reason) = self.current_startup_verdict() {
+            request.answer_recheck(Err(&reason));
+            return Task::none();
+        }
+        self.persist();
+        let save = self.capture_workspace_save();
+        cosmic::task::future(async move {
+            let (settings, saved) = flush_workspace(save).await;
+            Message::UiUpdateRechecked(request, settings, saved)
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn finish_startup_recheck(
+        &mut self,
+        request: instance::UiUpdateRequest,
+        settings: Result<SettingsSaved, String>,
+        saved: Result<(), String>,
+    ) {
+        let result = settings
+            .map(|settings| self.acknowledge_settings_save(settings))
+            .and(saved)
+            .map_err(bounded_report)
+            .and_then(|()| self.current_startup_verdict());
+        if result.is_ok()
+            && let instance::UiUpdateAction::Recheck(job) = request.action
+        {
+            self.startup_gate.rechecked_job = Some(job);
+            if let Ok(Some(notes)) = &result {
+                self.status = Some(incomplete_notice(notes));
+            }
+        }
+        request.answer_recheck(
+            result
+                .as_ref()
+                .map(|notes| notes.as_deref())
+                .map_err(String::as_str),
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn current_startup_verdict(&self) -> Result<Option<String>, String> {
+        if self.update_prepared || self.exit.is_some() || !self.startup_gate.reported {
+            return Err("the window is still changing its update state".into());
+        }
+        match self.inspect_startup_panes() {
+            Ok(None) => Ok(None),
+            Err(StartupReport::PaneNotes(notes)) => Ok(Some(bounded_report(notes))),
+            Err(StartupReport::Incomplete(reason)) => Err(bounded_report(reason)),
+            Ok(Some(pending)) => Err(bounded_report(
+                self.reconnecting_report(&pending).message().to_owned(),
+            )),
+        }
     }
 
     pub(super) fn startup_report_failed(&mut self) {

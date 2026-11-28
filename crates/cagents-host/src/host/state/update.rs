@@ -16,6 +16,21 @@ pub(in crate::host) fn inspect(
     // Reinstall its actual running owner before previewing checkpointability;
     // never waive a pending handoff or pretend a failed close completed.
     let cleanup_failures = super::super::chat::retained_actor::recover_cleanup_attachments(host);
+    #[cfg(target_os = "linux")]
+    {
+        let stopped = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .values()
+            .filter(|record| record.handle.native_exit_pending())
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        // Exit proofs and the resulting notification must run without HostState.
+        for handle in stopped {
+            handle.settle_lost_native_owner();
+        }
+    }
     let (registry, handles, migrations) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         (
@@ -24,14 +39,14 @@ pub(in crate::host) fn inspect(
                 .chats
                 .iter()
                 // An actor that already stopped admits nothing left to fence.
-                .filter(|(_, record)| record.handle.owns_work() && !record.handle.is_completed())
+                .filter(|(_, record)| record.handle.owns_work() && !record.handle.worker_stopped())
                 .map(|(&id, record)| (id, record.handle.clone()))
                 .collect::<Vec<_>>(),
             state
                 .chats
                 .iter()
                 .filter_map(|(id, record)| {
-                    if !record.handle.owns_work() || record.handle.is_completed() {
+                    if !record.handle.owns_work() || record.handle.worker_stopped() {
                         return None;
                     }
                     let mut source = record.session.clone();
@@ -95,7 +110,7 @@ pub(in crate::host) fn inspect(
                 Ok(readiness) => readiness,
                 // It stopped after being collected; the impact below reports
                 // what is left of it.
-                Err(_) if handle.is_completed() => continue,
+                Err(_) if handle.worker_stopped() => continue,
                 Err(error) => return Err(upgrade_error(error)),
             };
             match readiness {
@@ -161,9 +176,10 @@ impl HostState {
             matches!(continuity, crate::chat::NativeContinuity::ReconnectOnly)
         };
         record.handle.is_completed()
+            && !record.handle.is_read_only_history()
             && !record.returning_terminal
             && !self.native_closing.contains_key(&id)
-            && reconnects(&record.session.native_continuity)
+            && (reconnects(&record.session.native_continuity) || record.session.owns_codex_listener())
             && reconnects(&record.handle.native_continuity())
             // A terminal still running under this conversation is checkpointed
             // from the chat's confirmed identity, which a stopped actor no
@@ -274,7 +290,12 @@ impl HostState {
             });
         }
         for (&id, record) in &self.chats {
-            if !record.handle.owns_work() {
+            let provider_ended = self.provider_ended(id, record);
+            if !(record.handle.owns_work()
+                || (provider_ended
+                    && record.session.owns_codex_listener()
+                    && record.handle.confirmed_session_id().is_some()))
+            {
                 continue;
             }
             let (busy, ready) = record.handle.update_activity();
@@ -330,9 +351,9 @@ impl HostState {
             };
             let (disposition, reason) = if record.returning_terminal {
                 (Disposition::Blocked, SessionCause::ReturningToTerminal)
-            } else if self.provider_ended(id, record) {
+            } else if provider_ended {
                 (Disposition::Resumes, SessionCause::ProviderEnded)
-            } else if record.handle.is_completed() {
+            } else if record.handle.worker_stopped() {
                 (Disposition::Blocked, SessionCause::UnsettledProvider)
             } else if let Err(reason) = migration {
                 (Disposition::Blocked, SessionCause::Detail(reason))

@@ -54,7 +54,20 @@ class UpdateSourceDecisions(unittest.TestCase):
         (problem,) = checker.problems(self.tree(175, [156], [160, 174], [156, 160, 173, 174, 175]))
         self.assertIn("main served protocol 173", problem)
 
-    def test_protocols_older_than_every_pinned_source_need_no_decision(self):
+    def test_removing_the_oldest_pin_and_its_wire_fixture_requires_retirement(self):
+        snapshot = Path("tests/fixtures/protocol-contract/156.json")
+        root = self.tree(175, [173], [], [173, 175])
+        (root / snapshot).parent.mkdir()
+        (root / snapshot).write_text("{}\n")
+        (problem,) = checker.problems(root)
+        self.assertIn("main served protocol 156", problem)
+
+        retired = self.tree(175, [173], [156], [173, 175])
+        (retired / snapshot).parent.mkdir()
+        (retired / snapshot).write_text("{}\n")
+        self.assertEqual(checker.problems(retired), [])
+
+    def test_protocols_before_qualification_began_need_no_decision(self):
         self.assertEqual(checker.problems(self.tree(175, [156], [], [128, 129, 151, 156, 175])), [])
 
     def test_a_pinned_current_or_newer_protocol_fails(self):

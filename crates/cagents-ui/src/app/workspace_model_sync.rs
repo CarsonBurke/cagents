@@ -2405,7 +2405,7 @@ impl Cagents {
     /// registry request failed or a local conversation still waiting to
     /// publish; every edge until it settles then reconciles, as before edges
     /// could skip, and the trace gives the reason.
-    fn reconciliation_owed(&self) -> Option<&'static str> {
+    fn reconciliation_owed(&mut self) -> Option<&'static str> {
         if !self.pending_repository_reconciliation.is_empty() {
             Some("a repository reconciliation is deferred")
         } else if self.holds_unpublished_local_chat() {
@@ -2416,8 +2416,8 @@ impl Cagents {
             Some("a channel name suggestion is waiting")
         } else if self.channel_ui.deletion_unsettled() {
             Some("a channel deletion is unsettled")
-        } else if self.shared_views.reconciled_roots != self.worktree_roots_digest() {
-            Some("the worktree roots changed")
+        } else if self.shared_views.reconciled_topology != self.view_topology_revision() {
+            Some("the worktree topology changed")
         } else {
             None
         }
@@ -2696,25 +2696,43 @@ impl Cagents {
                 None => {}
             }
         }
-        for (scope, revision) in changes.removed {
-            self.shared_views
-                .view_sequences
-                .entry(scope.clone())
-                .and_modify(|held| *held = (*held).max(changes.sequence))
-                .or_insert(changes.sequence);
-            let newer_incarnation = views
-                .iter()
-                .any(|view| view.scope == scope && view.revision > revision);
-            if !newer_incarnation {
+        if !changes.removed.is_empty() {
+            // Registry maintenance can retire a batch of empty views at
+            // once. Compact the window's views in order, using the newest
+            // removal per scope as its revision fence.
+            let mut removed = HashMap::with_capacity(changes.removed.len());
+            for (scope, revision) in changes.removed {
+                removed
+                    .entry(scope)
+                    .and_modify(|(held, _)| *held = u64::max(*held, revision))
+                    .or_insert((revision, false));
+            }
+            let held = views.len();
+            views.retain(|view| {
+                let Some((revision, recreated)) = removed.get_mut(&view.scope) else {
+                    return true;
+                };
+                if view.revision <= *revision {
+                    return false;
+                }
+                *recreated = true;
+                true
+            });
+            changed |= views.len() != held;
+            for (scope, (_, recreated)) in removed {
                 self.shared_views
-                    .scope_absences
+                    .view_sequences
                     .entry(scope.clone())
                     .and_modify(|held| *held = (*held).max(changes.sequence))
                     .or_insert(changes.sequence);
+                if !recreated {
+                    self.shared_views
+                        .scope_absences
+                        .entry(scope)
+                        .and_modify(|held| *held = (*held).max(changes.sequence))
+                        .or_insert(changes.sequence);
+                }
             }
-            let held = views.len();
-            views.retain(|view| view.scope != scope || view.revision > revision);
-            changed |= views.len() != held;
         }
         for (scope, sequence) in changes.absent {
             self.shared_views
@@ -3103,10 +3121,8 @@ impl Cagents {
         }
         phase.mark("reconcile_naming");
         if repositories.is_none() {
-            // Which worktree a card belongs to reads these roots, so a change
-            // to them owes the next edge a reconciliation. Read after the
-            // pass, which can adopt projects and their worktrees.
-            self.shared_views.reconciled_roots = self.worktree_roots_digest();
+            // Read after the pass, which can adopt projects and worktrees.
+            self.shared_views.reconciled_topology = self.view_topology_revision();
         }
         Task::batch(tasks)
     }

@@ -250,6 +250,47 @@ fn a_focus_shortcut_owes_the_focus_moves_row_reconciliation() {
     assert!(owed.reconcile_row_selection);
 }
 
+#[test]
+fn a_dispatched_notice_survives_notices_raised_by_its_caller() {
+    let (mut app, _, _) = two_pane_app();
+    let before = projections();
+    app.dispatching = 1;
+    app.status = Some(TransientNotice::warning("An earlier worktree notice"));
+    let task = app.dispatch(Message::WorktreeCreated {
+        project_id: ProjectId::new(),
+        repository: "/repo/.git".into(),
+        result: Err("The checkout could not be created".into()),
+    });
+    app.status = Some(TransientNotice::warning("A later worktree notice"));
+    app.dispatching = 0;
+    assert_eq!(projections(), before);
+    drop(app.finish_update(
+        task,
+        UpdateEntry {
+            notice_control: None,
+            timed: false,
+            settled_projection: Task::none(),
+            oracle_message: None,
+        },
+    ));
+    assert_eq!(projections() - before, 1);
+    let notices: Vec<_> = app
+        .notices
+        .entries
+        .iter()
+        .map(|entry| entry.notice.message.as_str())
+        .collect();
+    assert_eq!(
+        notices,
+        [
+            "An earlier worktree notice",
+            "The checkout could not be created",
+            "A later worktree notice",
+        ]
+    );
+    projection_oracle::assert_projected(&mut app);
+}
+
 /// A shortcut is held to the gates of the message it stands for, which its
 /// own key event or command does not pass through: a focus move waits out
 /// a save in the focused editor and an update being prepared.

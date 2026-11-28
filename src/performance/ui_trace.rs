@@ -127,6 +127,17 @@ pub fn update(message: &dyn Debug) -> Scope {
     Scope(Some(Entry::new(Phase::Update, label, true)))
 }
 
+/// Attributes a dispatched handler within the outer update's measured time.
+pub fn dispatch(message: &dyn Debug) -> Scope {
+    Scope(enabled().then(|| {
+        Entry::new(
+            Phase::Update,
+            format!("dispatch {}", label(message)).into(),
+            false,
+        )
+    }))
+}
+
 /// Times the projection an update ends with, named by its kind and the
 /// outermost update's message, such as `Full KeyEvent`.
 pub fn projection(kind: &'static str) -> Scope {

@@ -10,8 +10,10 @@ mod host;
 
 use super::*;
 use cagents::mobile::pairing::{self, Added, AuthorizedKeys, Outcome, Progress};
+use cosmic::iced::futures::{Stream, StreamExt, stream};
 use std::{
-    sync::Arc,
+    future::Future,
+    sync::{Arc, Once},
     time::{Instant, SystemTime},
 };
 
@@ -42,6 +44,10 @@ pub enum Action {
     /// popover opened by itself and never had the keyboard.
     Dismiss(widget::Id),
     Tick,
+    ConnectionsObserved {
+        generation: u64,
+        count: usize,
+    },
     Probed(Box<host::Status>),
     Pair,
     Started(Result<Arc<Started>, String>),
@@ -78,6 +84,8 @@ pub(super) struct State {
     /// Whether the popover opened by itself, for a pairing that arrived,
     /// and so never took the keyboard from anywhere.
     opened_itself: bool,
+    connected: usize,
+    connection_generation: u64,
     status: Option<host::Status>,
     probing: bool,
     probed_at: Option<Instant>,
@@ -90,19 +98,52 @@ pub(super) struct State {
     notice: Option<Result<String, String>>,
     /// The phone just allowed, until it connects with its own key.
     joining: Option<String>,
-    /// Whether leftover pairings were cleaned up.
-    swept: bool,
     /// Whether the connection details are shown, once the person chose;
     /// until then they show only while something keeps a phone out.
     details: Option<bool>,
 }
 
-impl State {
-    fn connected(&self) -> usize {
-        self.status
-            .as_ref()
-            .map_or(0, |status| status.connections.len())
-    }
+fn sweep_stale_pairings() {
+    static SWEPT: Once = Once::new();
+    SWEPT.call_once(|| {
+        if let (Ok(keys), Ok(runtime)) = (
+            AuthorizedKeys::of_user(),
+            crate::instance::runtime_directory(),
+        ) && let Err(error) = pairing::remove_stale_pairings(&keys, &runtime, SystemTime::now())
+        {
+            tracing::warn!("couldn't remove leftover phone pairings: {error}");
+        }
+    });
+}
+
+fn watch_closed_connections(
+    &(generation, shown): &(u64, usize),
+) -> impl Stream<Item = Action> + use<> {
+    connection_count_changes(shown, || async {
+        tokio::time::sleep(CLOSED_PROBE).await;
+        tokio::task::spawn_blocking(|| {
+            sweep_stale_pairings();
+            host::connected_count()
+        })
+        .await
+        .ok()
+    })
+    .map(move |count| Action::ConnectionsObserved { generation, count })
+}
+
+fn connection_count_changes<F: Future<Output = Option<usize>> + Send>(
+    shown: usize,
+    probe: impl FnMut() -> F + Send,
+) -> impl Stream<Item = usize> {
+    stream::unfold((probe, shown), |(mut probe, previous)| async move {
+        loop {
+            if let Some(count) = probe().await
+                && count != previous
+            {
+                return Some((count, (probe, count)));
+            }
+        }
+    })
 }
 
 fn blocking<T: Send + 'static>(
@@ -121,46 +162,46 @@ fn blocking<T: Send + 'static>(
 }
 
 impl Cagents {
+    fn watches_closed_phone_connections(&self) -> bool {
+        self.settings.show_status_bar && !self.phone_ui.open && !self.phone_ui.probing
+    }
+
     pub(super) fn phone_subscription(&self) -> Subscription<Message> {
         let state = &self.phone_ui;
-        if !self.settings.show_status_bar && state.pairing.is_none() {
-            return Subscription::none();
-        }
-        let period = if state.open || state.pairing.is_some() {
-            Duration::from_secs(1)
+        // The closed control needs only the connection count. A sample that
+        // didn't change it stays in the worker and never wakes the window.
+        let connections = if self.watches_closed_phone_connections() {
+            Subscription::run_with(
+                (state.connection_generation, state.connected),
+                watch_closed_connections,
+            )
+            .map(Message::Phone)
         } else {
-            CLOSED_PROBE
+            Subscription::none()
         };
-        iced::time::every(period).map(|_| Message::Phone(Action::Tick))
+        let tick = if state.open || state.pairing.is_some() {
+            iced::time::every(Duration::from_secs(1)).map(|_| Message::Phone(Action::Tick))
+        } else {
+            Subscription::none()
+        };
+        Subscription::batch([connections, tick])
     }
 
     fn phone_probe(&mut self, force: bool) -> Task<Message> {
         let state = &mut self.phone_ui;
         let due = |at: Option<Instant>, every: Duration| at.is_none_or(|at| at.elapsed() >= every);
-        if state.probing
-            || !(force
-                || due(
-                    state.probed_at,
-                    if state.open { OPEN_PROBE } else { CLOSED_PROBE },
-                ))
-        {
+        if state.probing || !(force || (state.open && due(state.probed_at, OPEN_PROBE))) {
             return Task::none();
         }
         let network = state.open && (force || due(state.network_at, NETWORK_PROBE));
         state.probing = true;
-        let sweep = !std::mem::replace(&mut state.swept, true);
+        // The tracker may already have queued a reading from the closed
+        // watch. Fence it even if the popover closes and this probe completes
+        // before that reading arrives.
+        state.connection_generation = state.connection_generation.wrapping_add(1);
         blocking(
             move || {
-                if sweep
-                    && let (Ok(keys), Ok(runtime)) = (
-                        AuthorizedKeys::of_user(),
-                        crate::instance::runtime_directory(),
-                    )
-                    && let Err(error) =
-                        pairing::remove_stale_pairings(&keys, &runtime, SystemTime::now())
-                {
-                    tracing::warn!("couldn't remove leftover phone pairings: {error}");
-                }
+                sweep_stale_pairings();
                 host::probe(network)
             },
             |status| Action::Probed(Box::new(status)),
@@ -227,10 +268,21 @@ impl Cagents {
                 }
                 Task::batch(tasks)
             }
+            Action::ConnectionsObserved { generation, count } => {
+                // A detailed probe keeps reporting the badge until it
+                // finishes, even if the user has already closed the popover.
+                if self.watches_closed_phone_connections()
+                    && self.phone_ui.connection_generation == generation
+                {
+                    self.phone_ui.connected = count;
+                }
+                Task::none()
+            }
             Action::Probed(status) => {
                 let state = &mut self.phone_ui;
                 state.probing = false;
                 state.probed_at = Some(Instant::now());
+                state.connected = status.connections.len();
                 let previous = state.status.take();
                 let network = status
                     .network
@@ -486,7 +538,7 @@ impl Cagents {
     pub(super) fn phone_status_control(&self) -> Element<'_, Message> {
         let state = &self.phone_ui;
         let open = state.open && !self.modal_is_open();
-        let connected = state.connected();
+        let connected = state.connected;
         let (label, tone) = if state.pairing.is_some() {
             (
                 "Pairing a phone".to_owned(),
@@ -1074,6 +1126,53 @@ fn connect_section(network: &host::Network) -> Element<'_, Message> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn closed_connection_watch_only_emits_changed_counts() {
+        use cosmic::iced::futures::pin_mut;
+
+        let mut counts = [Some(0), Some(0), None, Some(2), Some(2), Some(0)].into_iter();
+        let updates =
+            connection_count_changes(0, move || std::future::ready(counts.next().unwrap()));
+        pin_mut!(updates);
+        for expected in [2, 0] {
+            assert_eq!(updates.next().await, Some(expected));
+        }
+    }
+
+    #[test]
+    fn a_detailed_probe_owns_the_badge_until_it_finishes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        assert_eq!(app.phone_subscription().units(), 1);
+        let generation = app.phone_ui.connection_generation;
+        let observed =
+            |generation, count| Message::Phone(Action::ConnectionsObserved { generation, count });
+        drop(app.update(observed(generation, 2)));
+        assert_eq!(app.phone_ui.connected, 2);
+
+        drop(app.update_phone(Action::Menu(true)));
+        drop(app.update(observed(generation, 0)));
+        assert_eq!(app.phone_ui.connected, 2);
+        assert!(app.phone_ui.probing);
+
+        drop(app.update_phone(Action::Menu(false)));
+        assert_eq!(app.phone_subscription().units(), 0);
+        drop(app.update(observed(generation, 0)));
+        assert_eq!(app.phone_ui.connected, 2);
+        let status = host::Status {
+            phones: Ok(Vec::new()),
+            unwritable: None,
+            connections: Vec::new(),
+            network: None,
+        };
+        drop(app.update(Message::Phone(Action::Probed(Box::new(status)))));
+        assert_eq!(app.phone_ui.connected, 0);
+        assert_eq!(app.phone_subscription().units(), 1);
+        drop(app.update(observed(generation, 2)));
+        assert_eq!(app.phone_ui.connected, 0);
+        drop(app.update(observed(app.phone_ui.connection_generation, 2)));
+        assert_eq!(app.phone_ui.connected, 2);
+    }
 
     fn network() -> host::Network {
         host::Network {

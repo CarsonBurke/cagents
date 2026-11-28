@@ -1162,6 +1162,16 @@ impl Handle {
             } => self
                 .pin(host, &scope, &item, column)
                 .map(|item| Response::Pinned(Box::new(item))),
+            Request::PinCard {
+                repository,
+                key,
+                column,
+            } => {
+                let board = self.board(host, &Scope::Project(repository.clone()), false)?;
+                let item = Self::exact_card(&board, &repository, &key)?;
+                self.save_pin(item, column, board.stale_after_days)
+                    .map(|(_, through_revision)| Response::PinSaved { through_revision })
+            }
             Request::RemovalPlan { scope, item, fetch } => self
                 .removal_plan(host, &scope, &item, fetch)
                 .map(|plan| Response::RemovalPlan(Box::new(plan))),
@@ -1574,7 +1584,33 @@ impl Handle {
         column: Option<Column>,
     ) -> Result<Item, String> {
         let board = self.board(host, scope, false)?;
-        let mut item = Self::card(&board, name)?;
+        let item = Self::card(&board, name)?;
+        self.save_pin(item, column, board.stale_after_days)
+            .map(|(item, _)| item)
+    }
+
+    fn exact_card(
+        board: &Board,
+        repository: &Path,
+        key: &crate::work::ItemKey,
+    ) -> Result<Item, String> {
+        board
+            .items
+            .iter()
+            .find(|item| item.project == repository && item.key == *key)
+            .cloned()
+            .ok_or_else(|| "This card is no longer on the Work board".into())
+    }
+
+    fn save_pin(
+        &self,
+        mut item: Item,
+        column: Option<Column>,
+        stale_after_days: u16,
+    ) -> Result<(Item, u64), String> {
+        // Watch assembly takes the same lock before reading pins. A board
+        // with a later revision must have read this write or a later one.
+        let publication = self.publication();
         let key = item.key.storage_key();
         self.store(|store| store.set_pin(&item.project, &key, column))
             .ok_or("The Work board store is unavailable, so pins cannot be saved")?;
@@ -1586,9 +1622,11 @@ impl Handle {
                 None => shared.pins.remove(&entry),
             };
         }
+        let through_revision = publication.revision;
+        drop(publication);
         self.0.publisher.notify();
-        crate::work::place(&mut item, column, now_unix_ms(), board.stale_after_days);
-        Ok(item)
+        crate::work::place(&mut item, column, now_unix_ms(), stale_after_days);
+        Ok((item, through_revision))
     }
 
     fn scan_worker(&self) {
@@ -2350,6 +2388,28 @@ mod tests {
             ],
             linear_unavailable: None,
         };
+        let missing = crate::work::ItemKey::Worktree("/missing".into());
+        let mut replaced = board.clone();
+        replaced.items[0].key = crate::work::ItemKey::Worktree("/replacement".into());
+        replaced.items[0].branch = Some(missing.storage_key());
+        assert!(
+            Handle::card(&replaced, &missing.storage_key()).is_ok(),
+            "the CLI still resolves aliases"
+        );
+        assert!(
+            Handle::exact_card(&replaced, Path::new("/app/.git"), &missing).is_err(),
+            "a board intent cannot fall through to a branch alias"
+        );
+        assert_eq!(
+            Handle::exact_card(
+                &board,
+                Path::new("/docs/.git"),
+                &crate::work::ItemKey::Branch("fix".into())
+            )
+            .unwrap()
+            .project,
+            Path::new("/docs/.git")
+        );
         let named = |name: &str| Handle::card(&board, name).map(|item| item.worktree.unwrap().path);
         assert_eq!(
             named(".worktrees/fix").unwrap_err(),

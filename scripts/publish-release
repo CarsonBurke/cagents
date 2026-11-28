@@ -17,6 +17,8 @@ PROMOTE=
 SMOKE_ROOTFS=
 BRIDGE_DIR=
 export LC_ALL=C
+# Archive validation parses a fixed listing format.
+unset TAR_OPTIONS
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2
@@ -137,6 +139,8 @@ PAYLOADS=(
     "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     "$EDITOR_ARCHIVE" SHA256SUMS-browserless SHA256SUMS-ceditor install.sh
 )
+APPIMAGE_PAYLOADS=("cagents-$VERSION-x86_64.AppImage" cagents-x86_64.AppImage)
+APPIMAGE=false
 # A release may also carry the Apple Silicon macOS build (scripts/package-macos):
 # its archive, installer and their own checksums, all three or none.
 # SHA256SUMS covers only the Linux payloads, so a release without macOS is
@@ -144,6 +148,9 @@ PAYLOADS=(
 MACOS_ARCHIVE=cagents-$VERSION-aarch64-apple-darwin.tar.gz
 MACOS_PAYLOADS=("$MACOS_ARCHIVE" install-macos.sh SHA256SUMS-macos)
 MACOS=false
+ANDROID_APK=cagents-android-$VERSION.apk
+ANDROID_PAYLOADS=("$ANDROID_APK" cagents-android.apk SHA256SUMS-android)
+ANDROID=false
 # The signed metadata names every other asset with its size and digest. A
 # bundle holds it as release-metadata.json. Published, each trust generation
 # has its own name (src/update/feed.rs): a release carries its own metadata
@@ -165,11 +172,14 @@ generation_at() {
 
 GENERATION=$(generation_at "$SOURCE_COMMIT")
 OWN_METADATA=$(metadata_name "$GENERATION")
-# The files a bundle holds and a release publishes, with or without macOS.
+# The files a bundle holds and a release publishes.
 define_assets() {
     local generation name
-    SHIPPED=("${PAYLOADS[@]}" SHA256SUMS)
+    LINUX_PAYLOADS=("${PAYLOADS[@]}")
+    if "$APPIMAGE"; then LINUX_PAYLOADS+=("${APPIMAGE_PAYLOADS[@]}"); fi
+    SHIPPED=("${LINUX_PAYLOADS[@]}" SHA256SUMS)
     if "$MACOS"; then SHIPPED+=("${MACOS_PAYLOADS[@]}"); fi
+    if "$ANDROID"; then SHIPPED+=("${ANDROID_PAYLOADS[@]}"); fi
     BUNDLE_ASSETS=("${SHIPPED[@]}" release-metadata.json release-metadata.json.sig)
     ASSETS=("${SHIPPED[@]}")
     for ((generation = 1; generation <= GENERATION; generation++)); do
@@ -179,16 +189,16 @@ define_assets() {
     EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
     EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
 }
-define_assets
 
-# Whether DIRECTORY, or with --names the listed names, includes any macOS file.
-# The asset set then requires all three, and the signed metadata its target.
-carries_macos() {
-    local name
-    for name in "${MACOS_PAYLOADS[@]}"; do
-        if [[ $1 == --names ]]; then
-            grep -qxF -- "$name" <<< "$2" && return 0
-        elif [[ -e $1/$name || -L $1/$name ]]; then
+# One recognized file requires the whole platform asset set. For promotion,
+# detect it from the draft's names before downloading the files.
+carries_platform_assets() {
+    local directory=$1 names=$2 name
+    shift 2
+    for name; do
+        if [[ -z $directory ]]; then
+            grep -qxF -- "$name" <<< "$names" && return 0
+        elif [[ -e $directory/$name || -L $directory/$name ]]; then
             return 0
         fi
     done
@@ -199,27 +209,38 @@ version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
 }
 
+published_candidates() {
+    jq -rs '
+        .[][] | select(.draft == false) | .tag_name as $tag |
+        ($tag | ltrimstr("v")) as $version |
+        [$tag, any(.assets[]?; .name == "cagents-\($version)-aarch64-apple-darwin.tar.gz")] | @tsv
+    ' | sort -uV
+}
+
 # The releases before this one whose builds check for updates, oldest first,
 # as `TAG GENERATION` lines. Publication takes them from GitHub: a tag pushed
 # but never published is no one's build, and no bridge. Every one must be in
 # this checkout, where its keys and generation are read. --verify-only, which
 # works offline, takes every release tag in the tagged history.
 EARLIER=()
+declare -A MACOS_READERS=()
 if "$VERIFY_ONLY"; then
     candidates=$(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*') || fail 'cannot list the release tags here'
 else
     command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
     candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
-        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '.[][] | select(.draft == false) | .tag_name') \
+        "repos/$REPOSITORY/releases?per_page=100" | published_candidates) \
         || fail 'cannot list the published releases'
 fi
-while IFS= read -r earlier; do
+while IFS=$'\t' read -r earlier apple_silicon; do
     [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
     version_after "$VERSION" "${earlier#v}" || continue
     checkout_git merge-base --is-ancestor "refs/tags/$earlier" "$SOURCE_COMMIT" 2>/dev/null \
         || fail "the published $earlier is not in $TAG's history here; fetch the release tags"
     checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
-    EARLIER+=("$earlier $(generation_at "$earlier")")
+    earlier_generation=$(generation_at "$earlier")
+    EARLIER+=("$earlier $earlier_generation")
+    if [[ $apple_silicon == true ]]; then MACOS_READERS[$earlier_generation]=$earlier; fi
 done < <(sort -uV <<< "$candidates")
 PREVIOUS_GENERATION=1
 if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
@@ -277,7 +298,7 @@ check_manifest() {
 }
 
 check_checksums() {
-    check_manifest "$1" SHA256SUMS "${PAYLOADS[@]}"
+    check_manifest "$1" SHA256SUMS "${LINUX_PAYLOADS[@]}"
     check_manifest "$1" SHA256SUMS-browserless "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
     if "$MACOS"; then check_manifest "$1" SHA256SUMS-macos "$MACOS_ARCHIVE" install-macos.sh; fi
@@ -533,7 +554,10 @@ check_macos_archive() {
 # A bundle is checked before anything is made for it; promotion makes it
 # from the draft.
 if [[ -z $PROMOTE ]]; then
-    if carries_macos "$DIST_DIR"; then MACOS=true; define_assets; fi
+    if carries_platform_assets "$DIST_DIR" '' "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
+    if carries_platform_assets "$DIST_DIR" '' "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
+    if carries_platform_assets "$DIST_DIR" '' "${APPIMAGE_PAYLOADS[@]}"; then APPIMAGE=true; fi
+    define_assets
     check_asset_set "$DIST_DIR"
 fi
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
@@ -558,7 +582,11 @@ if [[ -n $PROMOTE ]]; then
         || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
     jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
     DRAFT_ASSETS=$(draft_assets "$draft")
-    if carries_macos --names "$(jq -r '.assets[].name' <<< "$draft")"; then MACOS=true; define_assets; fi
+    draft_names=$(jq -r '.assets[].name' <<< "$draft")
+    if carries_platform_assets '' "$draft_names" "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
+    if carries_platform_assets '' "$draft_names" "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
+    if carries_platform_assets '' "$draft_names" "${APPIMAGE_PAYLOADS[@]}"; then APPIMAGE=true; fi
+    define_assets
     mkdir "$WORK_DIR/draft"
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
         || fail "cannot download the draft of $TAG"
@@ -576,6 +604,13 @@ if [[ -n $PROMOTE ]]; then
     DIST_DIR=$WORK_DIR/from-draft
 fi
 
+# The bridge must serve every platform already using the preceding generation.
+# That generation will keep seeing this release even after later ones ship.
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    macos_reader=${MACOS_READERS[$PREVIOUS_GENERATION]:-}
+    [[ -z $macos_reader ]] || fail "$TAG needs the Apple Silicon build to bridge trust generation $PREVIOUS_GENERATION, which shipped it in $macos_reader"
+fi
+
 # A private snapshot keeps uploads and comparisons bound to the bytes validated here.
 mkdir "$WORK_DIR/bundle"
 for asset in "${BUNDLE_ASSETS[@]}"; do
@@ -589,6 +624,9 @@ check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
 if "$MACOS"; then check_macos_archive "$DIST_DIR"; fi
+if "$ANDROID"; then
+    "$ROOT_DIR/scripts/package-android" verify --dir "$DIST_DIR" --version "$VERSION"
+fi
 if [[ -z $PROMOTE ]]; then
     smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
     if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
@@ -721,13 +759,25 @@ Linux x86_64 with glibc 2.35 or newer and Wayland. Repository features need
 Git 2.36 or newer. $PLATFORMS
 
 An installed cagents offers this release under Update and installs it itself
-after checking its signature. To install by hand:
+after checking its signature.
+
+EOF
+    if "$APPIMAGE"; then
+        cat <<EOF
+Download [${APPIMAGE_PAYLOADS[0]}](https://github.com/$REPOSITORY/releases/download/$TAG/${APPIMAGE_PAYLOADS[0]}).
+Allow it to execute in your file manager, then open it to install cagents.
+
+EOF
+    fi
+    cat <<EOF
+To install from a terminal:
 
 \`\`\`sh
 base=https://github.com/$REPOSITORY/releases/download/$TAG
-mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
-curl --fail --location --remote-name-all "\$base/$FULL_ARCHIVE" "\$base/SHA256SUMS" "\$base/install.sh"
-sha256sum --check --strict --ignore-missing SHA256SUMS
+mkdir "cagents-$VERSION" &&
+cd "cagents-$VERSION" &&
+curl --disable --fail --location --remote-name-all "\$base/$FULL_ARCHIVE" "\$base/SHA256SUMS" "\$base/install.sh" &&
+sha256sum --check --strict --ignore-missing SHA256SUMS &&
 CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --version $VERSION --restart-daemon
 \`\`\`
 
@@ -753,9 +803,10 @@ release the same way; the installer says what to stop first.
 
 \`\`\`sh
 base=https://github.com/$REPOSITORY/releases/download/$TAG
-mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
-curl --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh"
-shasum -a 256 --check SHA256SUMS-macos
+mkdir "cagents-$VERSION" &&
+cd "cagents-$VERSION" &&
+curl --disable --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh" &&
+shasum -a 256 --check SHA256SUMS-macos &&
 CAGENTS_ARCHIVE="\$PWD/$MACOS_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS-macos" sh ./install-macos.sh --version $VERSION
 \`\`\`
 
@@ -807,21 +858,22 @@ while IFS= read -r asset; do
     "$found" || fail "owned draft contains an unexpected asset: $asset"
 done <<< "$existing_assets"
 
-assert_current_draft() {
+read_owned_draft() {
     local current
-    current=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
+    current=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID") || return
     assert_owned_draft "$current"
+    printf '%s\n' "$current"
 }
-assert_current_draft
+release=$(read_owned_draft)
 if [[ -z $PROMOTE ]]; then
     upload_assets=()
     for asset in "${ASSETS[@]}"; do upload_assets+=("$WORK_DIR/upload/$asset"); done
     gh release upload "$TAG" "${upload_assets[@]}" --repo "$REPOSITORY" --clobber
 
-    release=$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")
-    assert_owned_draft "$release"
+    release=$(read_owned_draft)
     actual_assets=$(jq -r '.assets[].name' <<< "$release" | sort)
     [[ $actual_assets == "$EXPECTED_ASSETS" ]] || fail 'refusing to publish: uploaded assets do not match the exact expected set'
+    DRAFT_ASSETS=$(draft_assets "$release")
     mkdir "$WORK_DIR/downloaded"
     # gh uses authentication for private repositories and draft asset downloads.
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/downloaded"
@@ -847,23 +899,27 @@ cp -- "$WORK_DIR/downloaded/$OWN_METADATA.sig" "$WORK_DIR/served/release-metadat
 check_checksums "$WORK_DIR/served"
 check_metadata "$WORK_DIR/served"
 check_remote_tag
-assert_current_draft
 # Publishing makes this the latest release; never above a newer one, nor a
 # second release of a version.
-newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
-    jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' |
+published_now=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100")
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    # A predecessor may have published the first Mac build during verification.
+    current_candidates=$(published_candidates <<< "$published_now")
+    [[ $current_candidates == "$candidates" ]] \
+        || fail "the published release inventory changed while $TAG was verified; run this again"
+fi
+newer=$(jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' <<< "$published_now" |
     sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
     while IFS= read -r published; do
         version_after "$VERSION" "$published" || printf '%s\n' "$published"
     done)
 [[ -z $newer ]] || fail "refusing to publish $TAG: $(head -n1 <<< "$newer") is published already"
+release=$(read_owned_draft)
+[[ $(draft_assets "$release") == "$DRAFT_ASSETS" ]] \
+    || fail "the draft of $TAG changed while it was verified; run this again"
 if "$DRAFT"; then
     printf 'Verified %s as a draft; rehearse its update, then publish it.\n' "$TAG"
     exit 0
-fi
-if [[ -n $PROMOTE ]]; then
-    [[ $(draft_assets "$(gh api --hostname github.com "repos/$REPOSITORY/releases/$RELEASE_ID")") == "$DRAFT_ASSETS" ]] \
-        || fail "the draft of $TAG changed while it was verified; run this again"
 fi
 gh api --hostname github.com --method PATCH "repos/$REPOSITORY/releases/$RELEASE_ID" \
     -F draft=false --jq .html_url

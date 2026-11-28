@@ -60,7 +60,7 @@ fn viewing(app: &mut Cagents) -> (CardId, Target, Vec<(String, iced::advanced::i
     let images = show_images(runtime, 2);
     drop(app.update(Message::ChatUi(Action::OpenImage(
         target,
-        images[0].0.clone(),
+        images[0].0.clone().into(),
     ))));
     (card, target, images)
 }
@@ -459,14 +459,13 @@ fn the_viewer_keeps_its_image_and_borrows_the_rest() {
     assert_eq!(app.image_viewer(host).unwrap().position(), (1, 2));
 }
 
-/// Pixels the transcript sheds, under memory pressure, once its pane is
-/// hidden or as it syncs, leave the viewer at once, not with the next snapshot: it keeps
-/// only the image it shows.
+/// When a visible transcript sheds its previews, the viewer keeps the
+/// picture it shows and lets the other pixels go in the same update.
 #[test]
 fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
     // Each shed, and the gallery the viewer steps through after it, with
     // the place it steps to.
-    let shed: [(fn(&mut Runtime), (usize, usize)); 3] = [
+    let shed: [(fn(&mut Runtime), (usize, usize)); 2] = [
         (
             |runtime| assert_eq!(images::evict_ready(runtime, usize::MAX), usize::MAX - 8),
             (2, 2),
@@ -474,14 +473,6 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
         // Released caches hold no grouping either, so until the pane shows
         // again the viewer holds just the picture it shows.
         (Runtime::release_transcript_caches, (1, 1)),
-        // A hidden pane's transcript wants no images.
-        (
-            |runtime| {
-                runtime.visible.store(false, Ordering::Relaxed);
-                images::sync(runtime);
-            },
-            (2, 2),
-        ),
     ];
     for (shed, place) in shed {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -501,6 +492,61 @@ fn the_viewer_lets_go_of_the_pixels_the_transcript_sheds() {
         let expected = (place.1 == 1).then(|| images::ImageRef::Viewer(host, images[0].1));
         assert_eq!(stepped, expected);
     }
+}
+
+#[test]
+fn a_hidden_pane_keeps_the_image_selection_and_reloads_its_pixels_on_reveal() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (_, target, gallery_images) = viewing(&mut app);
+    let host = ViewerHost::Pane(target);
+    assert_eq!(
+        step(&mut app, target, 1),
+        Some(images::ImageRef::Viewer(host, gallery_images[1].1))
+    );
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.visible.store(false, Ordering::Relaxed);
+    images::sync(runtime);
+    assert_eq!(shown(&app, target), None);
+    let gallery = app.image_viewer(host).unwrap();
+    assert_eq!(gallery.position(), (2, 2));
+    let (resume, item) = gallery.awaiting();
+    assert_eq!(item, gallery_images[1].0);
+
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    runtime.visible.store(true, Ordering::Relaxed);
+    images::sync(runtime);
+    let read = app.handle_chat_ui(Action::ResumeImageViewer(target, resume));
+    assert!(iced::runtime::task::into_stream(read).is_some());
+    assert_eq!(shown(&app, target), None);
+    let (serial, shown_item) = app.image_viewer(host).unwrap().awaiting();
+    assert_ne!(serial, resume);
+    assert_eq!(shown_item, item);
+
+    drop(app.handle_chat_ui(Action::ViewerLoaded(
+        host,
+        resume,
+        item.clone(),
+        images::Loaded::Ready(iced::widget::image::Handle::from_rgba(
+            1,
+            1,
+            vec![255, 0, 0, 255],
+        )),
+    )));
+    assert_eq!(shown(&app, target), None);
+
+    let handle = iced::widget::image::Handle::from_rgba(1, 1, vec![32, 128, 0, 255]);
+    let decoded = handle.id();
+    drop(app.handle_chat_ui(Action::ViewerLoaded(
+        host,
+        serial,
+        item,
+        images::Loaded::Ready(handle),
+    )));
+    assert_eq!(
+        shown(&app, target),
+        Some(images::ImageRef::Viewer(host, decoded))
+    );
+    assert_eq!(app.image_viewer(host).unwrap().position(), (2, 2));
 }
 
 /// A whole picture the reader opened outranks the previews transcripts read

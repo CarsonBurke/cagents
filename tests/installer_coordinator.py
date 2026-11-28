@@ -37,7 +37,7 @@ EDITOR_MEMBERS = (
 INSTALL_TIMEOUT_SECONDS = 60
 
 COORDINATOR = r'''
-import json, os, pathlib, subprocess, sys
+import hashlib, json, os, pathlib, subprocess, sys
 args = sys.argv[1:]
 log = pathlib.Path(os.environ['FIXTURE_CALLS'])
 def record(event, **fields):
@@ -55,13 +55,16 @@ commands = ('coordinate-install', 'verify-install-guard', 'record-deferred-insta
 if len(args) == 2 and args[0] in commands and args[1] == '--help':
     print('Options:\n  --stage-only  Preserve the running application')
 elif args[0] == 'coordinate-install':
-    helper = pathlib.Path(sys.argv[0]).resolve().with_name('cagentsd')
+    executable = pathlib.Path(sys.argv[0]).resolve()
+    helper = executable.with_name('cagentsd')
     # The real coordinator resolves this exact sibling, never a PATH fallback.
     inspected = subprocess.run([str(helper), '--inspect-upgrade-source', 'fixture'],
                                check=True, capture_output=True, text=True)
     assert json.loads(inspected.stdout) == {'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}
-    record('coordinate', executable=str(pathlib.Path(sys.argv[0]).resolve()),
-           helper=str(helper), mode=helper.stat().st_mode & 0o777)
+    record('coordinate', executable=str(executable), helper=str(helper),
+           mode=helper.stat().st_mode & 0o777,
+           executable_sha256=hashlib.sha256(executable.read_bytes()).hexdigest(),
+           helper_sha256=hashlib.sha256(helper.read_bytes()).hexdigest())
     installer = args[args.index('--installer') + 1]
     child_args = args[args.index('--') + 1:]
     environment = dict(os.environ, CAGENTS_UI_UPDATE_GUARD_FD='fixture-only')
@@ -303,13 +306,15 @@ class InstallerCoordinator(unittest.TestCase):
         self.checksums = self.directory / "SHA256SUMS"
         self.package()
 
-    def package(self, *, exclude=(), version=VERSION):
+    def package(self, *, exclude=(), version=VERSION, extra_members=()):
         top = f"cagents-{version}"
         self.archive = self.directory / f"{top}-x86_64-unknown-linux-gnu.tar.gz"
         excluded = {f"{top}/{member}" for member in ((exclude,) if isinstance(exclude, str) else exclude)}
         with tarfile.open(self.archive, "w:gz") as archive:
             archive.add(self.payload, arcname=top,
                         filter=lambda entry: None if entry.name in excluded else entry)
+            for entry in extra_members:
+                archive.addfile(entry)
         self.checksums.write_text(f"{hashlib.sha256(self.archive.read_bytes()).hexdigest()}  {self.archive.name}\n")
         self.environment.update(CAGENTS_ARCHIVE=str(self.archive), CAGENTS_CHECKSUMS=str(self.checksums))
 
@@ -326,8 +331,10 @@ class InstallerCoordinator(unittest.TestCase):
         self.executable(path, f"#!{sys.executable}\n" + body)
 
     def install(self, *options, version=VERSION):
-        command = ["/bin/sh", str(ROOT / "install.sh"), "--version", version, "--prefix", str(self.prefix),
-                   *options]
+        command = ["/bin/sh", str(ROOT / "install.sh"), "--prefix", str(self.prefix)]
+        if version is not None:
+            command.extend(("--version", version))
+        command.extend(options)
         with subprocess.Popen(command, env=self.environment, cwd=self.directory,
                               stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                               text=True, start_new_session=True) as process:
@@ -560,11 +567,72 @@ exec /usr/bin/awk "$@"
         self.assertTrue(rollback.is_dir())
 
     def test_fresh_prefix_uses_the_verified_candidate_pair(self):
+        real_tar = shutil.which("tar")
+        version = subprocess.run([real_tar, "--version"], env={"LC_ALL": "C"}, capture_output=True)
+        listings = ["-tvzf"] if version.stdout.startswith(b"tar (GNU tar) ") else ["-tzf", "-tvzf"]
+        members = (f"{TOP}/bin/cagents", f"{TOP}/bin/cagentsd")
+        self.python(self.tools / "tar", f'''
+import json, os, sys
+
+args = sys.argv[1:]
+requested = [arg for arg in args if arg in {members!r}]
+if requested:
+    with open(os.environ["FIXTURE_CALLS"], "a") as calls:
+        calls.write(json.dumps(dict(event="bootstrap-extract", members=requested)) + "\\n")
+elif args[0] in ("-tzf", "-tvzf"):
+    with open(os.environ["FIXTURE_CALLS"], "a") as calls:
+        calls.write(json.dumps(dict(event="inventory", mode=args[0])) + "\\n")
+os.execv({real_tar!r}, [{real_tar!r}, *args])
+''')
         self.assertFalse(self.prefix.exists())
         coordinator = self.assert_installed(self.install(), 'candidate')
-        self.assertEqual(Path(coordinator['executable']).parent, Path(coordinator['helper']).parent)
-        self.assertEqual(Path(coordinator['helper']).name, 'cagentsd')
+        executable = Path(coordinator['executable'])
+        self.assertEqual(executable.name, 'cagents-install-coordinator')
+        self.assertEqual(Path(coordinator['helper']), executable.with_name('cagentsd'))
         self.assertEqual(coordinator['mode'], 0o700)
+        for role, name in (("executable", "cagents"), ("helper", "cagentsd")):
+            digest = hashlib.sha256((self.payload / "bin" / name).read_bytes()).hexdigest()
+            self.assertEqual(coordinator[f'{role}_sha256'], digest)
+        events = self.events()
+        self.assertEqual([event["members"] for event in events
+                          if event["event"] == "bootstrap-extract"], [list(members)] * 2)
+        # The outer installer validates before invoking the coordinator,
+        # then the guarded installer re-entry validates its own archive copy.
+        self.assertEqual([event["mode"] if event["event"] == "inventory" else event["event"] for event in events
+                          if event["event"] in ("inventory", "coordinate", "verify")],
+                         [*listings, "coordinate", *listings, "verify"])
+
+    def test_public_downloads_disable_curl_configuration(self):
+        self.environment.update(
+            CAGENTS_REPOSITORY="CarsonBurke/cagents",
+            FIXTURE_ARCHIVE=self.environment.pop("CAGENTS_ARCHIVE"),
+            FIXTURE_CHECKSUMS=self.environment.pop("CAGENTS_CHECKSUMS"),
+        )
+        self.python(self.tools / "curl", fr'''
+import json
+import os
+import shutil
+import sys
+
+args = sys.argv[1:]
+url = args[-1]
+with open(os.environ["FIXTURE_CALLS"], "a") as calls:
+    calls.write(json.dumps(dict(event="curl", option=args[0], url=url)) + "\n")
+if url.endswith("/latest"):
+    print(url.removesuffix("/latest") + "/tag/v{VERSION}", end="")
+else:
+    key = "FIXTURE_CHECKSUMS" if url.endswith("/SHA256SUMS") else "FIXTURE_ARCHIVE"
+    shutil.copyfile(os.environ[key], args[args.index("-o") + 1])
+''')
+        self.assert_installed(self.install(version=None), 'candidate')
+        requests = [(event['option'], event['url']) for event in self.events()
+                    if event['event'] == 'curl']
+        base = "https://github.com/CarsonBurke/cagents/releases"
+        self.assertEqual(requests, [
+            ("--disable", f"{base}/latest"),
+            ("--disable", f"{base}/download/v{VERSION}/{self.archive.name}"),
+            ("--disable", f"{base}/download/v{VERSION}/SHA256SUMS"),
+        ])
 
     def test_old_cli_without_install_guard_uses_the_verified_candidate_pair(self):
         previous = self.installed_cli(guarded=False)
@@ -580,16 +648,19 @@ exec /usr/bin/awk "$@"
 
     def test_source_inspector_extraction_failure_stops_before_publication(self):
         real_tar = shutil.which("tar")
+        members = [f"{TOP}/bin/cagents", f"{TOP}/bin/cagentsd"]
         self.python(self.tools / "tar", f'''
-import os, sys
+import os, subprocess, sys
 args = sys.argv[1:]
-if args[0] == '-xOzf' and args[-1] == '{TOP}/bin/cagentsd':
+if args[-2:] == {members!r}:
+    # Leave only the coordinator extracted, as a mid-extraction error would.
+    subprocess.run([{real_tar!r}, *args[:-1]], check=True)
     sys.exit(23)
 os.execv({real_tar!r}, [{real_tar!r}, *args])
 ''')
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('could not extract the verified source inspector', result.stderr)
+        self.assertIn('could not extract the verified update coordinator and source inspector', result.stderr)
         self.assertFalse(self.prefix.exists())
         self.assertFalse(self.calls.exists())
         self.assertEqual(list(self.downloads.iterdir()), [])
@@ -607,15 +678,70 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
     def assert_missing_member_rejected(self, member):
         # Recompute the checksum so this reaches the archive completeness gate.
         self.package(exclude=member)
+        self.assert_archive_refused('archive has an unexpected or incomplete entry structure')
+
+    def assert_archive_refused(self, reason):
         result = self.install()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn('archive has an unexpected or incomplete entry structure', result.stderr)
+        self.assertRegex(result.stderr, reason)
         self.assertFalse(self.prefix.exists())
         self.assertFalse(self.calls.exists(), 'an incomplete archive executed its coordinator')
         self.assertEqual(list(self.downloads.iterdir()), [])
 
     def test_archive_requires_the_ui_lease_marker_independently_of_autostart(self):
         self.assert_missing_member_rejected('bin/.cagents-ui-lease-v1')
+
+    def test_archive_validation_ignores_user_tar_options(self):
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        self.assert_installed(self.install(), 'candidate')
+
+    def test_archive_validation_keeps_the_legacy_listing_for_other_tar_implementations(self):
+        real_tar = shutil.which("tar")
+        self.python(self.tools / "tar", f'''
+import os, sys
+
+args = sys.argv[1:]
+if args == ["--version"]:
+    print("compatible fixture tar")
+    sys.exit(0)
+if any(arg.startswith("--quoting-style=") or arg == "--numeric-owner" for arg in args):
+    sys.exit(97)
+os.execv({real_tar!r}, [{real_tar!r}, *args])
+''')
+        self.assert_installed(self.install(), 'candidate')
+
+    def test_archive_refuses_duplicate_members_and_ambiguous_names(self):
+        member = f"{TOP}/bin/cagents"
+        bad_structure = 'unexpected or incomplete entry structure'
+        bad_name = bad_structure + '|archive contains links, special files, or invalid entry types'
+        self.package(extra_members=(tarfile.TarInfo(member),))
+        self.assert_archive_refused(bad_structure)
+        for name in (f" {member}", f"{member} ", f"{member}\n{member}", f'{member}"'):
+            with self.subTest(name=name):
+                self.package(exclude="bin/cagents", extra_members=(tarfile.TarInfo(name),))
+                self.assert_archive_refused(bad_name)
+
+    def test_archive_refuses_links_and_special_files_before_bootstrap(self):
+        for kind in (tarfile.SYMTYPE, tarfile.LNKTYPE, tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE):
+            with self.subTest(kind=kind):
+                entry = tarfile.TarInfo(f"{TOP}/bin/cagents")
+                entry.type = kind
+                entry.linkname = f"{TOP}/bin/cagentsd"
+                self.package(exclude="bin/cagents", extra_members=(entry,))
+                self.assert_archive_refused('archive contains links, special files, or invalid entry types')
+
+    def test_archive_refuses_a_failed_listing_even_if_it_printed_the_inventory(self):
+        real_tar = shutil.which("tar")
+        self.python(self.tools / "tar", f'''
+import os, subprocess, sys
+
+args = sys.argv[1:]
+if args[0] == "-tvzf":
+    subprocess.run([{real_tar!r}, *args], check=True)
+    sys.exit(23)
+os.execv({real_tar!r}, [{real_tar!r}, *args])
+''')
+        self.assert_archive_refused('archive metadata cannot be listed')
 
     def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
         self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')

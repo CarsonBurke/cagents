@@ -19,6 +19,18 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+pub enum NativeExit {
+    /// Nothing eligible for this observer, including owners without a known peer.
+    Unobservable,
+    /// Recheck the whole ownership proof when this exact live process exits.
+    Waiting(crate::daemon::PinnedProcess),
+    /// Cleanup is unproved and has no process descriptor to watch yet.
+    Pending,
+    /// The exact owner and its process groups have stopped executing.
+    Exited,
+}
+
 /// Kept only in the holder's memory. Discovery files contain process identity,
 /// never the launch recipe or its environment.
 #[derive(Clone, Serialize, Deserialize)]
@@ -289,7 +301,8 @@ impl Recovery {
 /// `crates/cagents-host/tests/codex_continuity_qualification.rs` is that verification, run against
 /// the real executable through a killed daemon. A version belongs here only
 /// after it passes; a server of any other version ends with its daemon.
-pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] = &["0.157.1", "0.160.1", "0.161.0", "0.162.0"];
+pub(crate) const VERIFIED_CODEX_VERSIONS: &[&str] =
+    &["0.157.1", "0.160.1", "0.161.0", "0.162.0", "0.172.0"];
 
 /// Codex's initialize response includes its own version in a user agent whose
 /// prefix is the client name supplied by this application. Use that response

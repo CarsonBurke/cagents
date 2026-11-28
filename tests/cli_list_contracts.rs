@@ -1029,7 +1029,7 @@ fn standalone_lists_show_headers_or_explicit_empty_states_without_debug_values()
 fn agent_list_names_its_project_and_the_next_step() {
     let human = output(Listing::Agents, true, false);
     // The daemon's project name labels the one checkout the agents share,
-    // and the waiting agent's handle is its shortest unique prefix.
+    // and the next steps keep the selected device and shortest agent handle.
     assert!(
         human.contains("\n(project Fixture at /fixture)\n"),
         "{human}"
@@ -1037,8 +1037,8 @@ fn agent_list_names_its_project_and_the_next_step() {
     assert!(!human.contains("PROJECT"), "{human}");
     assert!(
         human.trim_end().ends_with(
-            "hint: `cagents agent status abcdef00` shows its latest result; \
-             `cagents agent requests abcdef00` lists what it asks"
+            "hint: `cagents --device local agent status abcdef00` shows its latest result; \
+             `cagents --device local agent requests abcdef00` lists what it asks"
         ),
         "{human}"
     );

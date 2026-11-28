@@ -3,7 +3,7 @@ use super::{
     UnreadableProcess, process_error, settle,
 };
 use crate::process::{inspect, table};
-use std::{collections::BTreeMap, io};
+use std::{collections::BTreeMap, ffi::OsStr, io, os::unix::ffi::OsStrExt, path::Path};
 
 pub(super) fn scan(
     session: &TerminalSession,
@@ -135,7 +135,9 @@ struct Invocation {
 fn read_invocation(record: &[u8], evidence: &SurvivorEvidence) -> Option<Invocation> {
     // The ordinary parser ends the environment at the first empty entry.
     // Search the returned bytes for exact markers even when argv is empty.
-    let marked = evidence.carries_marker(record.get(4..)?.split(|byte| *byte == 0));
+    let mut entries = record.get(4..)?.split(|byte| *byte == 0);
+    let executable = Path::new(OsStr::from_bytes(entries.next()?));
+    let marked = evidence.carries_marker(entries);
     let Some(arguments) = inspect::parse_arguments(record).filter(|arguments| {
         arguments
             .arguments
@@ -149,7 +151,8 @@ fn read_invocation(record: &[u8], evidence: &SurvivorEvidence) -> Option<Invocat
         });
     };
     Some(Invocation {
-        conversation: evidence.names_conversation(arguments.arguments.iter().map(Vec::as_slice)),
+        conversation: evidence
+            .owns_conversation(executable, arguments.arguments.iter().map(Vec::as_slice)),
         marked,
         environment_visible: !arguments.environment.is_empty(),
     })
@@ -268,7 +271,7 @@ fn process_name(record: &table::Record) -> Option<String> {
 mod tests {
     use super::*;
     use crate::model::{BootId, LaunchRecipe, TerminalContinuity, TerminalId};
-    use std::{path::Path, process::Stdio};
+    use std::process::Stdio;
 
     fn source() -> TerminalSession {
         let launch = LaunchRecipe::shell(std::env::current_dir().unwrap()).unwrap();
@@ -364,20 +367,22 @@ mod tests {
     }
 
     #[test]
-    fn exact_writer_still_blocks_when_argv_is_visible_and_environment_is_hidden() {
+    fn exact_writer_still_blocks_for_an_unborn_lineage() {
         let mut source = source();
         let conversation = uuid::Uuid::new_v4().to_string();
         source.launch.program = "codex".into();
         source.launch.arguments = vec!["resume".into(), conversation.clone()];
         assert!(SurvivorEvidence::new(&source).exact_identity.is_some());
-        // XNU reports the Apple platform shell's invocation even when it
-        // hides the initial environment. Stdin keeps this lifetime live.
-        let child = Child::start(std::process::Command::new("/bin/sh").args([
-            "-c",
-            "IFS= read -r barrier",
-            "fixture",
-            &conversation,
-        ]));
+        // The fixture holds the recognized executable image open on stdin.
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("codex");
+        std::fs::copy("/bin/bash", &executable).unwrap();
+        std::fs::write(directory.path().join("resume"), b"IFS= read -r barrier\n").unwrap();
+        let child = Child::start(
+            std::process::Command::new(executable)
+                .current_dir(directory.path())
+                .args(["resume", "--model", "MODEL", &conversation]),
+        );
         let survivor = super::scan(&source, u32::MAX, &[]).unwrap().unwrap();
         assert_eq!(survivor.pid, child.pid());
         assert_eq!(survivor.link, SurvivorLink::Conversation);
@@ -388,6 +393,40 @@ mod tests {
                 .link,
             SurvivorLink::Conversation
         );
+    }
+
+    #[test]
+    fn transcript_readers_do_not_own_the_conversation_in_a_darwin_argument_record() {
+        let mut source = source();
+        let conversation = uuid::Uuid::new_v4().to_string();
+        source.launch.program = "claude".into();
+        source.launch.arguments = vec!["--resume".into(), conversation.clone()];
+        let evidence = SurvivorEvidence::new(&source);
+        let file = format!("/tmp/{conversation}.jsonl");
+        for (executable, arguments, writer) in [
+            ("/usr/bin/tail", vec!["tail", "-f", &file], false),
+            (
+                "/usr/bin/watch",
+                vec!["watch", "--exec", "cat", &file],
+                false,
+            ),
+            ("/bin/sh", vec!["claude", "--resume", &conversation], false),
+            (
+                "/bin/claude",
+                vec!["claude", "--resume", &conversation],
+                true,
+            ),
+        ] {
+            let count = i32::try_from(arguments.len()).unwrap();
+            let mut record = count.to_ne_bytes().to_vec();
+            for entry in std::iter::once(executable).chain(arguments) {
+                record.extend_from_slice(entry.as_bytes());
+                record.push(0);
+            }
+            let invocation = read_invocation(&record, &evidence).unwrap();
+            assert_eq!(invocation.conversation, writer, "{executable}");
+            assert!(!invocation.environment_visible);
+        }
     }
 
     #[test]

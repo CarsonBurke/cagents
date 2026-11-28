@@ -702,6 +702,12 @@ fn items(runtime: &Runtime) -> &[Arc<chat::Item>] {
         })
         .unwrap_or(&runtime.snapshot.items)
 }
+fn image_item<'a>(runtime: &'a Runtime, key: &str) -> Option<&'a Arc<chat::Item>> {
+    items(runtime).iter().find(|item| {
+        matches!(item.content, ItemContent::Image { .. }) && runtime.cache_key(item) == key
+    })
+}
+
 fn recent(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
     items(runtime)
         .iter()
@@ -719,18 +725,19 @@ fn interest(runtime: &Runtime) -> Vec<&Arc<chat::Item>> {
     }
     let requested = runtime
         .preview_request
-        .as_deref()
-        .and_then(|id| items(runtime).iter().find(|item| item.id == id));
+        .as_ref()
+        .and_then(|row| runtime.action_item(row));
     // The requested picture's gallery comes next, in its own order.
     let gallery = requested.into_iter().flat_map(|_| {
-        items(runtime)
+        runtime
+            .preview_gallery
             .iter()
-            .filter(|item| runtime.preview_gallery.contains(&item.id))
+            .filter_map(|row| runtime.action_item(row))
     });
     let explicit: Vec<_> = requested.into_iter().chain(gallery).collect();
     let recent = recent(runtime)
         .into_iter()
-        .filter(|item| !explicit.iter().any(|chosen| chosen.id == item.id));
+        .filter(|item| !explicit.iter().any(|chosen| Arc::ptr_eq(chosen, item)));
     explicit.iter().copied().chain(recent).collect()
 }
 fn retire(cached: &mut CachedItem, evicted: bool) {
@@ -746,8 +753,11 @@ impl Runtime {
     /// Opens `gallery` in this pane's viewer. It is what the reader asked
     /// for last, so a draft image still loading from an earlier press on
     /// its tile stays closed when it arrives.
-    pub(super) fn show_image(&mut self, gallery: Gallery) {
+    pub(super) fn show_image(&mut self, mut gallery: Gallery) {
         self.opening_attachment = None;
+        if !self.is_visible() {
+            gallery.suspend();
+        }
         self.image_viewer = Some(gallery);
     }
 }
@@ -763,7 +773,11 @@ pub(super) fn sync_viewer(runtime: &mut Runtime) {
     if let Some(mut gallery) = runtime.image_viewer.take()
         && gallery.transcript == runtime.selected_subagent
     {
-        gallery.refresh(runtime);
+        if !runtime.is_visible() {
+            gallery.suspend();
+        } else if !gallery.suspended {
+            gallery.refresh(runtime);
+        }
         runtime.image_viewer = Some(gallery);
     }
 }
@@ -772,8 +786,8 @@ pub(super) fn sync(runtime: &mut Runtime) {
     if !runtime.visible.load(Ordering::Relaxed)
         || runtime
             .preview_request
-            .as_deref()
-            .is_some_and(|id| !items(runtime).iter().any(|item| item.id == id))
+            .as_ref()
+            .is_some_and(|row| runtime.action_item(row).is_none())
     {
         runtime.preview_request = None;
     }
@@ -782,7 +796,10 @@ pub(super) fn sync(runtime: &mut Runtime) {
     }
     let fits: HashMap<_, _> = interest(runtime)
         .into_iter()
-        .map(|item| (item.id.clone(), runtime.image_fit(&item.id)))
+        .map(|item| {
+            let key = runtime.cache_key(item);
+            (key.to_owned(), runtime.image_fit(key))
+        })
         .collect();
     let parent = runtime.selected_subagent.is_none();
     for (active, id, cached) in runtime
@@ -838,21 +855,20 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
     if !runtime.visible.load(Ordering::Relaxed) {
         return;
     }
-    let Some(item) = items(runtime)
-        .iter()
-        .find(|item| item.id == id && matches!(item.content, ItemContent::Image { .. }))
-        .cloned()
-    else {
+    let Some(item) = image_item(runtime, id).cloned() else {
         return;
     };
     if !runtime.presentation_cache().contains_key(id) {
         return;
     }
-    runtime.preview_request = Some(id.to_owned());
+    runtime.preview_request = Some(runtime.row_target(&item));
     // At most as many beside it as the newest pictures, nearest first.
-    let gallery: Vec<String> = {
+    let gallery: Vec<_> = {
         let run = runtime.image_run(id);
-        let at = run.iter().position(|item| item.id == id).unwrap_or(0);
+        let at = run
+            .iter()
+            .position(|item| runtime.cache_key(item) == id)
+            .unwrap_or(0);
         let mut nearest: Vec<_> = run
             .iter()
             .enumerate()
@@ -862,10 +878,10 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
         nearest
             .into_iter()
             .take(RECENT_IMAGES)
-            .map(|(_, item)| item.id.clone())
+            .map(|(_, item)| (runtime.cache_key(item).to_owned(), runtime.row_target(item)))
             .collect()
     };
-    for member in &gallery {
+    for (member, _) in &gallery {
         // Pictures set aside for newer ones are wanted again.
         if let Some(cached) = runtime.presentation_cache_mut().get_mut(member)
             && cached.image.is_none()
@@ -873,7 +889,7 @@ pub(super) fn request(runtime: &mut Runtime, id: &str) {
             cached.image_evicted = false;
         }
     }
-    runtime.preview_gallery = gallery;
+    runtime.preview_gallery = gallery.into_iter().map(|(_, row)| row).collect();
     if let Some(cached) = runtime.presentation_cache_mut().get_mut(id) {
         cached.image_item = Some(item.clone());
         if cached.image.is_none() {
@@ -899,7 +915,7 @@ fn pixel_bytes(cached: &CachedItem) -> usize {
 pub(super) fn evict_ready(runtime: &mut Runtime, mut missing: usize) -> usize {
     let order: Vec<_> = interest(runtime)
         .into_iter()
-        .map(|item| item.id.clone())
+        .map(|item| runtime.cache_key(item).to_owned())
         .collect();
     let mut evicted = false;
     for id in order.iter().rev() {
@@ -932,9 +948,25 @@ pub(super) fn complete(
     {
         return None;
     }
-    let order: Vec<_> = interested.into_iter().map(|item| item.id.clone()).collect();
-    let priority = order.iter().position(|id| *id == item.id)?;
-    let cached = runtime.presentation_cache().get(&item.id)?;
+    let order: Vec<_> = interested
+        .into_iter()
+        .map(|item| runtime.cache_key(item).to_owned())
+        .collect();
+    // The cache may retain an equivalent new publication of the image.
+    // Resolve its exact admitted decoder source before applying a result.
+    let key = order.iter().find(|key| {
+        runtime
+            .presentation_cache()
+            .get(*key)
+            .is_some_and(|cached| {
+                cached
+                    .image_source
+                    .as_ref()
+                    .is_some_and(|source| Arc::ptr_eq(source, item))
+            })
+    })?;
+    let priority = order.iter().position(|id| id == key)?;
+    let cached = runtime.presentation_cache().get(key)?;
     if cached.image_attempt != attempt
         || cached
             .image_source
@@ -947,13 +979,17 @@ pub(super) fn complete(
     {
         return None;
     }
-    let explicit = runtime.preview_request.as_deref() == Some(item.id.as_str());
+    let explicit = runtime
+        .preview_request
+        .as_ref()
+        .and_then(|row| runtime.action_item(row))
+        .is_some_and(|item| runtime.cache_key(item) == key);
     if let Loaded::Deferred(pressure) = loaded {
         if cached.image.is_some() {
             // Reading a shown picture again at another size waits for the
             // memory without displacing anything; the pixels it has are
             // still the right picture meanwhile.
-            let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
+            let cached = runtime.presentation_cache_mut().get_mut(key).unwrap();
             cached.image_wait = Some(pressure);
             cached.image_attempt = cached.image_attempt.wrapping_add(1);
             return None;
@@ -974,7 +1010,7 @@ pub(super) fn complete(
                 }
             }
         }
-        let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
+        let cached = runtime.presentation_cache_mut().get_mut(key).unwrap();
         if !pressure.retained || explicit || evicted || cached.image_wait.is_some() {
             cached.image_wait = Some(pressure);
             cached.image_attempt = cached.image_attempt.wrapping_add(1);
@@ -990,7 +1026,7 @@ pub(super) fn complete(
         }
         return waiting.then_some(missing);
     }
-    let cached = runtime.presentation_cache_mut().get_mut(&item.id).unwrap();
+    let cached = runtime.presentation_cache_mut().get_mut(key).unwrap();
     cached.image_source = None;
     cached.image_wait = None;
     cached.image_unavailable = matches!(loaded, Loaded::Unavailable | Loaded::Failed(_));
@@ -1015,10 +1051,15 @@ fn pixel_size(handle: &iced::widget::image::Handle) -> Option<(u32, u32)> {
     }
 }
 pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
+    let resume = runtime
+        .image_viewer
+        .as_ref()
+        .filter(|gallery| runtime.is_visible() && gallery.suspended)
+        .map(|gallery| Subscription::run_with((runtime.target, gallery.serial), resume_viewer));
     interest(runtime)
         .into_iter()
         .find_map(|item| {
-            let cached = runtime.presentation_cache().get(&item.id)?;
+            let cached = runtime.presentation_cache().get(runtime.cache_key(item))?;
             let source = cached.image_source.as_ref()?;
             Some(Subscription::run_with(
                 Source {
@@ -1033,11 +1074,22 @@ pub(super) fn subscriptions(runtime: &Runtime) -> Vec<Subscription<Message>> {
             ))
         })
         .into_iter()
+        .chain(resume)
         .collect()
+}
+
+fn resume_viewer(
+    (target, serial): &(Target, u64),
+) -> iced::futures::stream::Once<std::future::Ready<Message>> {
+    iced::futures::stream::once(std::future::ready(action(Action::ResumeImageViewer(
+        *target, *serial,
+    ))))
 }
 
 struct Entry {
     id: String,
+    /// The mounted image this entry may borrow previews from.
+    row: Option<RowTarget>,
     managed: bool,
     path: String,
     label: String,
@@ -1062,11 +1114,12 @@ impl Entry {
         else {
             return None;
         };
-        let cached = runtime.presentation_cache().get(&item.id);
+        let cached = runtime.presentation_cache().get(runtime.cache_key(item));
         let preview = cached.and_then(|cached| cached.image.clone());
         let whole = preview.is_some() && cached.is_some_and(|cached| cached.image_whole);
         Some(Self {
-            id: item.id.clone(),
+            id: runtime.cache_key(item).to_owned(),
+            row: Some(runtime.row_target(item)),
             managed: reference.is_some(),
             path: if Path::new(path).is_absolute() || path.starts_with("data:image/") {
                 path.clone()
@@ -1084,7 +1137,7 @@ impl Entry {
             full: preview.clone().filter(|_| whole),
             preview,
             error: None,
-            source: (!whole).then(|| item.clone()),
+            source: Some(item.clone()),
         })
     }
     /// The entry's literal file path, for Copy image path. Managed snapshot
@@ -1100,11 +1153,36 @@ impl Entry {
         self.full.as_ref().or(self.preview.as_ref())
     }
 }
+#[derive(Clone)]
+enum ViewerSource {
+    Transcript(Arc<chat::Item>, Origin),
+    Attachment(chat::Attachment),
+    File(PathBuf, Origin),
+}
+
+impl ViewerSource {
+    fn read(&self) -> Loaded {
+        match self {
+            Self::Transcript(item, origin) => load(item, origin, Fit::Full),
+            Self::Attachment(attachment) => attachment_preview(attachment),
+            Self::File(path, origin) => {
+                load_file_with_request(path, origin, Fit::Full, crate::device_service::request)
+            }
+        }
+    }
+}
+
+fn next_viewer_serial() -> u64 {
+    static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    SERIAL.fetch_add(1, Ordering::Relaxed)
+}
+
 pub(in crate::app) struct Gallery {
     entries: Vec<Entry>,
     selected: usize,
     remote: bool,
     pub(super) reset: u64,
+    geometry: canvas::Geometry,
     /// The subagent whose transcript the images came from, `None` for the
     /// conversation's own. A pane viewer belongs to that transcript and
     /// closes when the pane shows another ([`sync`]).
@@ -1114,10 +1192,12 @@ pub(in crate::app) struct Gallery {
     from_transcript: bool,
     /// Where the conversation's pictures are read from.
     origin: Option<Origin>,
-    /// Tells this gallery's reads from those of one opened before it.
+    /// The pending read or reveal ticket. Zero accepts no completion.
     serial: u64,
     /// The read of the shown entry's whole picture, stopped with the gallery.
     reading: Option<iced::task::Handle>,
+    reload: Option<ViewerSource>,
+    suspended: bool,
 }
 impl Gallery {
     pub(in crate::app) fn file(
@@ -1128,6 +1208,7 @@ impl Gallery {
         Self {
             entries: vec![Entry {
                 id: "file".into(),
+                row: None,
                 managed: false,
                 // Keep non-UTF8 filenames and literal URL characters exact.
                 path: Url::from_file_path(&path)
@@ -1142,27 +1223,45 @@ impl Gallery {
             selected: 0,
             remote: device.is_some(),
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
             origin: None,
             serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         }
     }
+    /// A decoded figure opened from this transcript, with its resolved read
+    /// source kept for a reveal after the pane releases its pixels.
+    fn figure(
+        transcript: Option<String>,
+        path: PathBuf,
+        origin: Origin,
+        handle: iced::widget::image::Handle,
+    ) -> Self {
+        let mut gallery = Self::file(path.clone(), origin.device.as_deref(), handle);
+        gallery.transcript = transcript;
+        gallery.reload = Some(ViewerSource::File(path, origin));
+        gallery
+    }
+
     /// An image the draft holds, opened from the composer's tray over the
     /// transcript the pane shows (`transcript`, as [`Self::new`] records it).
     /// Its path is the draft's, never handed to another application.
     pub(in crate::app) fn attachment(
         transcript: Option<String>,
-        label: String,
+        attachment: chat::Attachment,
         handle: iced::widget::image::Handle,
     ) -> Self {
         Self {
             entries: vec![Entry {
                 id: "attachment".into(),
+                row: None,
                 managed: true,
                 path: String::new(),
-                label,
+                label: attachment.label(),
                 preview: None,
                 full: Some(handle),
                 error: None,
@@ -1171,11 +1270,14 @@ impl Gallery {
             selected: 0,
             remote: crate::device::is_remote(),
             reset: 0,
+            geometry: Default::default(),
             transcript,
             from_transcript: false,
             origin: None,
             serial: 0,
             reading: None,
+            reload: Some(ViewerSource::Attachment(attachment)),
+            suspended: false,
         }
     }
     /// The gallery the picture `id` names is drawn in, opened at it. Its
@@ -1183,7 +1285,9 @@ impl Gallery {
     /// reader means by "the next one".
     pub(super) fn new(runtime: &Runtime, id: &str) -> Option<Self> {
         let pictures = runtime.image_run(id);
-        let selected = pictures.iter().position(|item| item.id == id)?;
+        let selected = pictures
+            .iter()
+            .position(|item| runtime.cache_key(item) == id)?;
         Self::of(runtime, &pictures, selected)
     }
     /// The viewer over `pictures`, a gallery of the transcript, opened at the
@@ -1193,24 +1297,26 @@ impl Gallery {
         pictures: &[&Arc<chat::Item>],
         selected: usize,
     ) -> Option<Self> {
-        static SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-        let id = &pictures.get(selected)?.id;
+        let id = runtime.cache_key(pictures.get(selected)?);
         let entries: Vec<_> = pictures
             .iter()
             .enumerate()
             .filter_map(|(position, item)| Entry::of(runtime, item, position))
             .collect();
-        let selected = entries.iter().position(|entry| entry.id == *id)?;
+        let selected = entries.iter().position(|entry| entry.id == id)?;
         Some(Self {
             entries,
             selected,
             remote: crate::device::is_remote(),
             reset: 0,
+            geometry: Default::default(),
             transcript: runtime.selected_subagent.clone(),
             from_transcript: true,
             origin: Some(Origin::of(runtime)),
-            serial: SERIAL.fetch_add(1, Ordering::Relaxed),
+            serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         })
     }
     /// The items of the transcript `runtime` shows, `None` when the selected
@@ -1241,7 +1347,7 @@ impl Gallery {
         if !self.from_transcript {
             return;
         }
-        if Self::transcript(runtime).is_none() {
+        if Self::transcript(runtime).is_none_or(<[_]>::is_empty) {
             return;
         }
         let mut old: Vec<_> = std::mem::take(&mut self.entries)
@@ -1249,12 +1355,15 @@ impl Gallery {
             .map(Some)
             .collect();
         let mut shown = old[self.selected].take();
-        let id = shown
-            .as_ref()
-            .map(|entry| entry.id.clone())
-            .unwrap_or_default();
+        let run_for = |entry: &Entry| {
+            entry
+                .row
+                .as_ref()
+                .and_then(|row| runtime.action_item(row))
+                .map_or_else(Vec::new, |item| runtime.image_run(runtime.cache_key(item)))
+        };
         let mut entries = Vec::with_capacity(old.len());
-        let run = runtime.image_run(&id);
+        let run = shown.as_ref().map_or_else(Vec::new, run_for);
         if run.is_empty() {
             // The shown picture was paged out of the transcript. It keeps its
             // place among what remains of its gallery, which still takes the
@@ -1262,18 +1371,19 @@ impl Gallery {
             let rest = old
                 .iter()
                 .flatten()
-                .map(|entry| runtime.image_run(&entry.id))
+                .map(run_for)
                 .find(|run| !run.is_empty())
                 .unwrap_or_default();
-            let before = rest
-                .iter()
-                .filter(|item| {
-                    old[..self.selected]
-                        .iter()
-                        .flatten()
-                        .any(|entry| entry.id == item.id)
-                })
-                .count();
+            let before =
+                rest.iter()
+                    .filter(|item| {
+                        old[..self.selected].iter().flatten().any(|entry| {
+                            entry.row.as_ref().is_some_and(|row| {
+                                row.is(item, runtime.selected_subagent.as_deref())
+                            })
+                        })
+                    })
+                    .count();
             for (index, item) in rest.into_iter().enumerate() {
                 if index == before {
                     self.selected = entries.len();
@@ -1287,7 +1397,11 @@ impl Gallery {
             }
         } else {
             for (position, item) in run.into_iter().enumerate() {
-                if item.id == id {
+                if shown
+                    .as_ref()
+                    .and_then(|entry| entry.row.as_ref())
+                    .is_some_and(|row| row.is(item, runtime.selected_subagent.as_deref()))
+                {
                     self.selected = entries.len();
                     let mut entry = shown.take();
                     // A picture shown while it was still decoding takes the
@@ -1307,6 +1421,37 @@ impl Gallery {
         }
         self.entries = entries;
     }
+    /// Keep the source and selection while returning the pane's pixel budget.
+    fn suspend(&mut self) {
+        if self.suspended {
+            return;
+        }
+        self.suspended = true;
+        self.serial = next_viewer_serial();
+        self.reading = None;
+        for entry in &mut self.entries {
+            entry.preview = None;
+            entry.full = None;
+            entry.error = None;
+        }
+    }
+
+    fn resume(&mut self, serial: u64, visible: bool) -> bool {
+        if !self.suspended || self.serial != serial {
+            return false;
+        }
+        if !visible {
+            // A reveal can be followed by a hide in the same update batch.
+            // The one-shot subscription has answered, so the next reveal
+            // needs a fresh subscription identity.
+            self.serial = next_viewer_serial();
+            return false;
+        }
+        self.suspended = false;
+        self.serial = 0;
+        true
+    }
+
     /// Read the whole of the shown picture, unless it is already. The viewer
     /// `host` shows is told when it is, or, the first time, that the read
     /// waits for memory, so previews can make room for it.
@@ -1315,17 +1460,23 @@ impl Gallery {
     }
     fn read_whole(&mut self, host: ViewerHost, patient: bool) -> Task<Message> {
         let entry = &self.entries[self.selected];
-        let (Some(item), Some(origin), None, None) =
-            (&entry.source, &self.origin, &entry.full, &entry.error)
-        else {
+        if self.suspended || entry.full.is_some() || entry.error.is_some() {
+            return Task::none();
+        }
+        let source = if let Some(source) = &self.reload {
+            source.clone()
+        } else if let (Some(item), Some(origin)) = (&entry.source, &self.origin) {
+            ViewerSource::Transcript(item.clone(), origin.clone())
+        } else {
             return Task::none();
         };
-        let (item, origin, serial, id) =
-            (item.clone(), origin.clone(), self.serial, entry.id.clone());
+        let serial = next_viewer_serial();
+        self.serial = serial;
+        let id = entry.id.clone();
         let (task, handle) = cosmic::task::future(async move {
             let loaded = loop {
-                let (item, origin) = (item.clone(), origin.clone());
-                match worker(move || load(&item, &origin, Fit::Full)).await {
+                let source = source.clone();
+                match worker(move || source.read()).await {
                     // Once previews have made what room they can, the reader
                     // asked for it, so it waits for the rest.
                     Loaded::Deferred(pressure) if patient => pressure.available().await,
@@ -1346,7 +1497,10 @@ impl Gallery {
     /// Whether the read of the entry `id`, as this gallery opened `serial`,
     /// is for the picture it shows now: one it has moved on from is not kept.
     fn awaits(&self, serial: u64, id: &str) -> bool {
-        serial == self.serial && self.entries[self.selected].id == id
+        !self.suspended
+            && serial != 0
+            && serial == self.serial
+            && self.entries[self.selected].id == id
     }
     /// The whole picture of the entry `id`, read for this gallery.
     pub(in crate::app) fn loaded(&mut self, serial: u64, id: &str, loaded: Loaded) {
@@ -1371,7 +1525,7 @@ impl Gallery {
     pub(in crate::app) fn next(&mut self, host: ViewerHost, forward: bool) -> Task<Message> {
         // A lone picture has nowhere to go; moving "to" it again would drop
         // its pixels and the reader's zoom only to read it back.
-        if self.entries.len() < 2 {
+        if self.suspended || self.entries.len() < 2 {
             return Task::none();
         }
         // Only the shown picture is held whole, unless it is all there is.
@@ -1380,16 +1534,22 @@ impl Gallery {
             entry.full = None;
         }
         self.reading = None;
+        self.serial = 0;
         self.selected = if forward {
             (self.selected + 1) % self.entries.len()
         } else {
             (self.selected + self.entries.len() - 1) % self.entries.len()
         };
-        self.reset = self.reset.wrapping_add(1);
+        self.reset_view();
         // A picture that could not be read is tried again on return.
         self.entries[self.selected].error = None;
         self.read(host)
     }
+    fn reset_view(&mut self) {
+        self.reset = self.reset.wrapping_add(1);
+        self.geometry.set(Default::default());
+    }
+
     pub(super) fn url(&self) -> Option<Url> {
         self.entry_url(&self.entries[self.selected])
     }
@@ -1601,7 +1761,7 @@ impl Gallery {
                     .max_scale(20.0)
                     .into();
                 crate::interaction::context_menu(
-                    canvas::resettable(self.reset, viewer),
+                    canvas::resettable(self.reset, self.geometry.clone(), viewer),
                     clipboard::menu(
                         image,
                         entry.file_path().is_some(),
@@ -1692,9 +1852,10 @@ impl Cagents {
     /// Answers a viewer control or key: `None` for an action that isn't one.
     pub(super) fn image_viewer_action(&mut self, action: &Action) -> Option<Task<Message>> {
         match *action {
-            Action::OpenImage(target, ref id) => {
+            Action::OpenImage(target, ref row) => {
                 let runtime = self.chat_runtime_mut(target)?;
-                let Some(mut gallery) = Gallery::new(runtime, id) else {
+                let item = runtime.action_item(row)?;
+                let Some(mut gallery) = Gallery::new(runtime, runtime.cache_key(item)) else {
                     return Some(Task::none());
                 };
                 let read = gallery.read(ViewerHost::Pane(target));
@@ -1702,6 +1863,18 @@ impl Cagents {
                 // The keyboard moves to the viewer, as a press on the image
                 // would leave it, unless the pane doesn't hold it.
                 Some(Task::batch([read, self.focus_image_viewer(target)]))
+            }
+            Action::ResumeImageViewer(target, serial) => {
+                let runtime = self.chat_card_runtime_mut(target)?;
+                let mut gallery = runtime.image_viewer.take()?;
+                let read = if gallery.resume(serial, runtime.is_visible()) {
+                    gallery.refresh(runtime);
+                    gallery.read(ViewerHost::Pane(target))
+                } else {
+                    Task::none()
+                };
+                runtime.image_viewer = Some(gallery);
+                Some(read)
             }
             Action::FocusImage(target) => Some(self.focus_image_viewer(target)),
             Action::CloseImage(host) => {
@@ -1782,7 +1955,7 @@ impl Cagents {
             }
             Action::ImageFit(host) => {
                 if let Some(gallery) = self.image_viewer_mut(host) {
-                    gallery.reset = gallery.reset.wrapping_add(1);
+                    gallery.reset_view();
                 }
                 Some(Task::none())
             }
@@ -1931,15 +2104,18 @@ impl Runtime {
             } else if cached.image_source.is_some()
                 && interest(self)
                     .iter()
-                    .any(|candidate| candidate.id == item.id)
+                    .any(|candidate| std::ptr::eq(candidate.as_ref(), item))
             {
                 room("Loading preview…")
             } else {
                 widget::column::with_children(vec![
                     design::caption(label).into(),
-                    crate::ui_controls::button::secondary("Load preview")
-                        .on_press(action(Action::LoadImage(self.target, item.id.clone())))
-                        .into(),
+                    crate::ui_controls::owned(
+                        self.row_target(item),
+                        crate::ui_controls::button::secondary("Load preview").on_press(action(
+                            Action::LoadImage(self.target, self.row_target(item)),
+                        )),
+                    ),
                 ])
                 .spacing(step::GAP_XS)
                 .into()
@@ -1955,11 +2131,17 @@ impl Runtime {
                 .name(label.clone())
                 .class(crate::ui_controls::control_style(false, None))
                 .padding(tiles::INSET)
-                .on_press(action(Action::OpenImage(self.target, item.id.clone()))),
+                .on_press(action(Action::OpenImage(
+                    self.target,
+                    self.row_target(item),
+                ))),
         );
-        crate::interaction::context_menu_lazy(
-            crate::interaction::tooltip(button, label),
-            move || clipboard::menu(image, path, false),
+        crate::ui_controls::owned(
+            self.row_target(item),
+            crate::interaction::context_menu_lazy(
+                crate::interaction::tooltip(button, label),
+                move || clipboard::menu(image, path, false),
+            ),
         )
     }
 }
@@ -2323,6 +2505,61 @@ mod tests {
     }
 
     #[test]
+    fn opening_a_picture_with_a_shared_id_keeps_the_clicked_occurrence() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/fixture"))));
+        let card = app.workspace.focused().unwrap();
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+            panic!("draft chat")
+        };
+        let target = runtime.target;
+        let first = Arc::new(image_item("/fixture/first.png".into()));
+        let second = Arc::new(image_item("/fixture/second.png".into()));
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.items = vec![first.clone()];
+        let snapshot = Arc::new(snapshot);
+        runtime.prepare_transcript_cache(&snapshot);
+        runtime.snapshot = snapshot;
+        runtime.visible.store(true, Ordering::Relaxed);
+        let row = runtime.row_target(&first);
+        request(runtime, &first.id);
+        drop(app.image_viewer_action(&Action::OpenImage(target, row.clone())));
+        let path = |app: &Cagents| {
+            let gallery = app.image_viewer(ViewerHost::Pane(target)).unwrap();
+            gallery.entries[gallery.selected].path.clone()
+        };
+        assert_eq!(path(&app), "/fixture/first.png");
+
+        // A later publication gives the second picture the old cache key.
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let mut snapshot = (*runtime.snapshot).clone();
+        snapshot.items.push(second.clone());
+        let snapshot = Arc::new(snapshot);
+        runtime.prepare_transcript_cache(&snapshot);
+        runtime.snapshot = snapshot;
+        let second_key = runtime.cache_key(&second).to_owned();
+        let replacement = bytes_handle(png()).unwrap();
+        let cached = runtime.cache.get_mut(&second_key).unwrap();
+        cached.image = Some(replacement);
+        cached.image_whole = true;
+        sync(runtime);
+        assert!(runtime.preview_requested(&first));
+        assert!(!runtime.preview_requested(&second));
+        let gallery = runtime.image_viewer.as_ref().unwrap();
+        assert!(gallery.entries[gallery.selected].preview.is_none());
+        assert_eq!(path(&app), "/fixture/first.png");
+        drop(app.image_viewer_action(&Action::OpenImage(target, row.clone())));
+        assert_eq!(path(&app), "/fixture/first.png");
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        Arc::make_mut(&mut runtime.snapshot).items.remove(0);
+        assert!(
+            app.image_viewer_action(&Action::OpenImage(target, row))
+                .is_none()
+        );
+        assert_eq!(path(&app), "/fixture/first.png");
+    }
+
+    #[test]
     fn inline_image_gallery_never_offers_a_filesystem_external_link() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         drop(app.new_native_chat(Provider::Codex, Some(PathBuf::from("/tmp/gallery"))));
@@ -2610,6 +2847,7 @@ mod tests {
     fn gallery_navigation_wraps_and_resets_pan_and_zoom() {
         let entry = |id: &str| Entry {
             id: id.into(),
+            row: None,
             managed: false,
             path: format!("/fixture/{id}.png"),
             label: id.into(),
@@ -2627,15 +2865,21 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
             origin: None,
             serial: 1,
             reading: None,
+            reload: None,
+            suspended: false,
         };
+        gallery.entries[1].id = gallery.entries[0].id.clone();
         drop(gallery.next(ViewerHost::Dialog, false));
         assert_eq!(gallery.selected, 1);
         assert_eq!(gallery.reset, 1);
+        gallery.loaded(1, "a", Loaded::Failed("old decode".into()));
+        assert!(gallery.entries[1].error.is_none());
         drop(gallery.next(ViewerHost::Dialog, true));
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
@@ -2651,10 +2895,84 @@ mod tests {
         );
     }
     #[test]
+    fn a_suspended_attachment_returns_pixels_and_rejects_an_older_read() {
+        let bytes = png();
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(pixels) = bounded_handle(bytes.clone(), &budget) else {
+            panic!("the fixture fits the pixel budget");
+        };
+        let attachment = chat::Attachment::file("/fixture/picture.png");
+        let mut gallery = Gallery::attachment(None, attachment.clone(), pixels);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        gallery.suspend();
+        assert_eq!(budget.pixels.available_permits(), 4);
+        assert!(
+            matches!(&gallery.reload, Some(ViewerSource::Attachment(source)) if source == &attachment)
+        );
+        assert_eq!(gallery.position(), (1, 1));
+
+        let (resume, _) = gallery.awaiting();
+        assert!(
+            !gallery.resume(resume, false),
+            "the pane hid before the reply"
+        );
+        let (next_resume, _) = gallery.awaiting();
+        assert_ne!(resume, next_resume);
+        assert!(!gallery.resume(resume, true));
+        assert!(gallery.resume(next_resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (previous_read, id) = gallery.awaiting();
+
+        gallery.suspend();
+        let (resume, _) = gallery.awaiting();
+        assert!(gallery.resume(resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        assert_ne!(gallery.awaiting().0, previous_read);
+        gallery.loaded(previous_read, &id, bounded_handle(bytes.clone(), &budget));
+        assert!(gallery.selected_image(ViewerHost::Dialog).is_none());
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let (serial, id) = gallery.awaiting();
+        gallery.loaded(serial, &id, bounded_handle(bytes, &budget));
+        assert!(gallery.selected_image(ViewerHost::Dialog).is_some());
+    }
+
+    #[test]
+    fn a_figure_viewer_reloads_its_file_after_suspension() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("figure.png");
+        let bytes = png();
+        std::fs::write(&path, &bytes).unwrap();
+        let budget = Budget::new(bytes.len(), 4);
+        let Loaded::Ready(handle) = bounded_handle(bytes, &budget) else {
+            panic!("the fixture fits the pixel budget");
+        };
+        let origin = Origin {
+            root: directory.path().to_owned(),
+            child: false,
+            device: None,
+        };
+        let mut gallery = Gallery::figure(None, path, origin, handle);
+        assert_eq!(budget.pixels.available_permits(), 0);
+        gallery.suspend();
+        assert_eq!(budget.pixels.available_permits(), 4);
+        let (resume, _) = gallery.awaiting();
+        assert!(gallery.resume(resume, true));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (serial, id) = gallery.awaiting();
+        let result = gallery.reload.as_ref().unwrap().read();
+        gallery.loaded(serial, &id, result);
+        assert_eq!(
+            pixel_size(gallery.entries[0].shown().unwrap()),
+            Some((1, 1))
+        );
+    }
+
+    #[test]
     fn the_viewer_keeps_only_the_shown_pictures_whole_read() {
         let pixels = || iced::widget::image::Handle::from_rgba(1, 1, vec![0, 0, 0, 255]);
         let entry = |id: &str| Entry {
             id: id.into(),
+            row: None,
             managed: false,
             path: format!("/fixture/{id}.png"),
             label: id.into(),
@@ -2678,24 +2996,36 @@ mod tests {
             selected: 0,
             remote: false,
             reset: 0,
+            geometry: Default::default(),
             transcript: None,
             from_transcript: false,
-            origin: None,
-            serial: 7,
+            origin: Some(Origin {
+                root: "/fixture".into(),
+                child: false,
+                device: None,
+            }),
+            serial: 0,
             reading: None,
+            reload: None,
+            suspended: false,
         };
         // A read the viewer has moved on from, or one for an earlier viewer,
         // is not kept.
-        gallery.loaded(7, "b", Loaded::Ready(pixels()));
-        gallery.loaded(6, "a", Loaded::Ready(pixels()));
+        drop(gallery.read(ViewerHost::Dialog));
+        let (serial, first) = gallery.awaiting();
+        gallery.loaded(serial, "b", Loaded::Ready(pixels()));
+        gallery.loaded(serial + 1, &first, Loaded::Ready(pixels()));
         assert!(gallery.entries.iter().all(|entry| entry.full.is_none()));
-        gallery.loaded(7, "a", Loaded::Failed("gone".into()));
+        gallery.loaded(serial, &first, Loaded::Failed("gone".into()));
         assert_eq!(gallery.entries[0].error.as_deref(), Some("gone"));
         // Browsing away and back tries a failed picture again.
         drop(gallery.next(ViewerHost::Dialog, true));
         drop(gallery.next(ViewerHost::Dialog, false));
         assert_eq!(gallery.entries[0].error, None);
-        gallery.loaded(7, "a", Loaded::Ready(pixels()));
+        gallery.loaded(serial, &first, Loaded::Ready(pixels()));
+        assert!(gallery.entries[0].full.is_none());
+        let (current, shown) = gallery.awaiting();
+        gallery.loaded(current, &shown, Loaded::Ready(pixels()));
         assert!(gallery.entries[0].full.is_some());
         // Only the shown picture is held whole.
         drop(gallery.next(ViewerHost::Dialog, true));

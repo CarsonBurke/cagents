@@ -335,6 +335,23 @@ class Provider(unittest.TestCase):
         # Subagents keep running: none is stopped.
         self.assertFalse(any(frame.get("subtype") == "task_notification" for frame in after))
 
+    def test_stop_without_record_saves_only_the_conversation_messages(self):
+        (self.config / "fixture-stop-without-record").touch()
+        (self.config / "fixture-session-idle").touch()
+        interrupt = {"type": "control_request", "request_id": "stop",
+                     "request": {"subtype": "interrupt"}}
+        result, output, _ = self.run_provider(frames=(prompt(1), interrupt))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        response, settled, idle = output[-3:]
+        self.assertEqual(response["response"]["request_id"], "stop")
+        self.assertEqual(response["response"]["subtype"], "success")
+        self.assertEqual((settled["type"], settled["subtype"], settled["is_error"]),
+                         ("result", "success", False))
+        self.assertEqual(idle["state"], "idle")
+        history = next((self.config / "projects").glob("*/*.jsonl"))
+        self.assertEqual([json.loads(line)["type"] for line in history.read_text().splitlines()],
+                         ["user", "assistant"])
+
     def test_send_now_stopped_records_a_stop_then_starts_the_queue(self):
         _, answer, after = self.send_now("stopped")
         self.assertEqual(answer["send_now"], "stopped")

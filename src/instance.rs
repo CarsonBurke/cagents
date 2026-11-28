@@ -2525,25 +2525,65 @@ impl UiUpdateGuard {
     }
 
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        self.verify_cutover_window_slots(slots, image, None)
+            .map(|_| ())
+    }
+
+    pub(crate) fn recheck_cutover_windows(
+        &self,
+        slots: &[String],
+        image: &Path,
+        job: &str,
+    ) -> io::Result<Option<String>> {
+        self.verify_cutover_window_slots(slots, image, Some(job))
+    }
+
+    fn verify_cutover_window_slots(
+        &self,
+        slots: &[String],
+        image: &Path,
+        recheck_job: Option<&str>,
+    ) -> io::Result<Option<String>> {
         require_owned_runtime_directory(&self.runtime)?;
         #[cfg(target_os = "macos")]
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
+        let mut notes = Vec::new();
         let mut errors = Vec::new();
         for slot in slots {
             #[cfg(target_os = "linux")]
             let deadline = Instant::now() + crate::control::ui_launch_timeout(true)?;
-            if let Err(error) = self.verify_cutover_window(slot, image, deadline) {
-                errors.push((slot.as_str(), error.to_string()));
+            match self.verify_cutover_window(slot, image, deadline, recheck_job) {
+                Ok(Some(note)) => notes.push((slot.as_str(), note)),
+                Ok(None) => {}
+                Err(error) => errors.push((slot.as_str(), error)),
             }
         }
+        let notes = (!notes.is_empty()).then(|| relaunch_failure(slots.len(), &notes));
         if errors.is_empty() {
-            Ok(())
-        } else {
-            Err(io::Error::other(window_failures(&errors, None)))
+            return Ok(notes);
         }
+        if slots.len() == 1 {
+            return Err(errors.remove(0).1);
+        }
+        let errors: Vec<_> = errors
+            .into_iter()
+            .map(|(slot, error)| (slot, error.to_string()))
+            .collect();
+        let mut error = window_failures(&errors, None);
+        if let Some(notes) = notes {
+            error.push('\n');
+            error.push_str(&notes);
+        }
+        Err(io::Error::other(error))
     }
 
-    fn verify_cutover_window(&self, slot: &str, image: &Path, deadline: Instant) -> io::Result<()> {
+    fn verify_cutover_window(
+        &self,
+        slot: &str,
+        image: &Path,
+        deadline: Instant,
+        recheck_job: Option<&str>,
+    ) -> io::Result<Option<String>> {
         let owner = match self.saved_window_lease(slot)? {
             Some(lease) => verified_window_lease_owner(&lease, Path::new("/proc"), slot)?,
             None => None,
@@ -2551,7 +2591,7 @@ impl UiUpdateGuard {
         let Some(owner) = owner else {
             #[cfg(target_os = "linux")]
             if self.reconnecting_slot(slot, image)? {
-                return Ok(());
+                return Ok(None);
             }
             return Err(io::Error::other(
                 "A saved window has no matching restored owner",
@@ -2562,32 +2602,32 @@ impl UiUpdateGuard {
                 "A saved window has no matching restored owner",
             ));
         }
-        let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
-        let peer = crate::pinned_process::peer_credentials(&stream)?;
-        if peer.uid != current_uid() || peer.pid != owner.pid {
-            return Err(io::Error::other(
-                "A saved window changed its restored owner",
-            ));
-        }
-        stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-        let remaining = deadline
-            .checked_duration_since(Instant::now())
-            .filter(|remaining| !remaining.is_zero())
-            .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
-        writeln!(&mut stream, "update-ready")?;
-        #[cfg(target_os = "linux")]
-        crate::control::read_ui_launch_handshake(&mut stream, remaining)?;
+        let ready = request_cutover_window(&self.runtime, slot, &owner, deadline, "update-ready");
         #[cfg(target_os = "macos")]
+        let _ = recheck_job;
+        #[cfg(target_os = "linux")]
+        if let (Some(job), Err(first)) = (recheck_job, &ready)
+            && first.kind() == io::ErrorKind::Other
+            && first
+                .to_string()
+                .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
         {
-            stream.set_read_timeout(Some(remaining))?;
-            if read_capped_line(&stream)? != "ready" {
+            if !owner.still_owns_lease()? {
                 return Err(io::Error::other("A saved window is still reopening"));
             }
+            let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
+            let request = format!("update-recheck {job}");
+            return match request_cutover_window(&self.runtime, slot, &owner, deadline, &request) {
+                // An older activation listener replies with a bare "error".
+                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                    Err(io::Error::other(format!(
+                        "Window {slot}: {first}. Save your work and reopen this same window after resolving the reported problem, then retry verification."
+                    )))
+                }
+                result => result,
+            };
         }
-        if !owner.still_owns_lease()? {
-            return Err(io::Error::other("A saved window is still reopening"));
-        }
-        Ok(())
+        ready.map(|_| None)
     }
 
     fn relaunch_windows_with_notes(
@@ -2668,6 +2708,42 @@ impl UiUpdateGuard {
         self.lock.take();
         Ok(())
     }
+}
+
+fn request_cutover_window(
+    runtime: &Path,
+    slot: &str,
+    owner: &VerifiedWindow,
+    deadline: Instant,
+    action: &str,
+) -> io::Result<Option<String>> {
+    let mut stream = connect_cutover_window(runtime, slot, deadline)?;
+    let peer = crate::pinned_process::peer_credentials(&stream)?;
+    if peer.uid != current_uid() || peer.pid != owner.pid {
+        return Err(io::Error::other(
+            "A saved window changed its restored owner",
+        ));
+    }
+    stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+    let remaining = deadline
+        .checked_duration_since(Instant::now())
+        .filter(|remaining| !remaining.is_zero())
+        .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
+    writeln!(stream, "{action}")?;
+    #[cfg(target_os = "linux")]
+    let result = crate::control::read_ui_launch_handshake(&mut stream, remaining)?;
+    #[cfg(target_os = "macos")]
+    let result = {
+        stream.set_read_timeout(Some(remaining))?;
+        if read_capped_line(&stream)? != UI_LAUNCH_READY {
+            return Err(io::Error::other("A saved window is still reopening"));
+        }
+        None
+    };
+    if !owner.still_owns_lease()? {
+        return Err(io::Error::other("A saved window is still reopening"));
+    }
+    Ok(result)
 }
 
 /// A naturally opened window can take its lease before binding activation.
@@ -3148,8 +3224,17 @@ pub struct UiUpdateRequest {
     pub response: std::sync::mpsc::SyncSender<String>,
 }
 
+#[cfg(all(feature = "ui", target_os = "linux"))]
+impl UiUpdateRequest {
+    pub fn answer_recheck(self, result: Result<Option<&str>, &str>) {
+        let _ = self.response.try_send(ui_startup_message(result, true));
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UiUpdateAction {
+    #[cfg(target_os = "linux")]
+    Recheck(uuid::Uuid),
     Prepare,
     Cancel,
     Commit,
@@ -3655,6 +3740,10 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
         match read_activation_request(&stream) {
             Ok(ActivationRequest::Shutdown) => break,
             Ok(ActivationRequest::UpdateReady) => report_cutover_ready(stream),
+            #[cfg(target_os = "linux")]
+            Ok(ActivationRequest::Update(UiUpdateAction::Recheck(job))) => {
+                recheck_cutover_ready(stream, &events, job);
+            }
             Ok(ActivationRequest::Activate(token)) => {
                 // The acknowledgement is the launcher's proof that a window
                 // will be raised: `cagents ui` reports "already running" and
@@ -3709,6 +3798,46 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
                 let _ = writeln!(&stream, "error");
             }
         }
+    }
+}
+
+#[cfg(all(feature = "ui", target_os = "linux"))]
+fn recheck_cutover_ready(
+    mut stream: UnixStream,
+    events: &async_channel::Sender<UiActivation>,
+    job: uuid::Uuid,
+) {
+    static VERIFYING: AtomicBool = AtomicBool::new(false);
+    if VERIFYING.swap(true, Ordering::AcqRel) {
+        let _ = writeln!(stream, "error: this window is already being verified");
+        return;
+    }
+    let events = events.clone();
+    if thread::Builder::new()
+        .name("cutover-window-recheck".into())
+        .spawn(move || {
+            let (response, receiver) = std::sync::mpsc::sync_channel(1);
+            if events
+                .try_send(UiActivation {
+                    token: None,
+                    session: None,
+                    update: Some(UiUpdateRequest {
+                        action: UiUpdateAction::Recheck(job),
+                        response,
+                    }),
+                })
+                .is_ok()
+            {
+                let response = receiver
+                    .recv_timeout(CUTOVER_READY_TIMEOUT)
+                    .unwrap_or_else(|_| "error: window did not respond".into());
+                let _ = writeln!(stream, "{response}");
+            }
+            VERIFYING.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        VERIFYING.store(false, Ordering::Release);
     }
 }
 
@@ -3858,6 +3987,10 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
         None if line == "update-ready" => Ok(ActivationRequest::UpdateReady),
+        #[cfg(target_os = "linux")]
+        Some(("update-recheck", job)) => uuid::Uuid::parse_str(job)
+            .map(|job| ActivationRequest::Update(UiUpdateAction::Recheck(job)))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
         None if line == "update-commit" => Ok(ActivationRequest::Update(UiUpdateAction::Commit)),
@@ -4810,12 +4943,60 @@ mod tests {
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let stream = stream.unwrap();
-                    let _request = read_capped_line(&stream).unwrap();
-                    writeln!(&stream, "ok").unwrap();
+                    let request = read_capped_line(&stream).unwrap();
+                    let response = match request.as_str() {
+                        "update-ready" => {
+                            "error: recovery-incomplete: shared workspace unavailable"
+                        }
+                        request if request.starts_with("update-recheck ") => {
+                            "ready-with-pane-notes: One saved pane needs attention"
+                        }
+                        _ => "ok",
+                    };
+                    writeln!(&stream, "{response}").unwrap();
                 }
             });
         }
         std::thread::sleep(Duration::from_secs(60));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn verification_retry_asks_the_same_live_window_for_a_current_verdict() {
+        let runtime = tempdir().unwrap();
+        let guard = guard_in(runtime.path());
+        let mut window = LingeringWindow::spawn_answering(runtime.path(), "second");
+        let executable = env::current_exe().unwrap().canonicalize().unwrap();
+        let slots = ["second".to_owned()];
+
+        let first = guard
+            .verify_cutover_windows(&slots, &executable)
+            .unwrap_err();
+        assert!(
+            first
+                .to_string()
+                .starts_with(UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+        );
+        let job = uuid::Uuid::new_v4().to_string();
+        let notes = guard
+            .recheck_cutover_windows(&slots, &executable, &job)
+            .unwrap();
+        assert_eq!(notes.as_deref(), Some("One saved pane needs attention"));
+        assert!(window.0.try_wait().unwrap().is_none());
+        assert_eq!(guard.verified_windows().unwrap()[0].pid(), window.0.id());
+
+        fs::create_dir(runtime.path().join(slot_lock_name("broken-lease"))).unwrap();
+        let slots = ["broken-lease".to_owned(), "second".to_owned()];
+        let failure = guard
+            .recheck_cutover_windows(&slots, &executable, &job)
+            .unwrap_err()
+            .to_string();
+        assert!(failure.contains("broken-lease"), "{failure}");
+        assert!(
+            failure.contains("second: One saved pane needs attention"),
+            "{failure}"
+        );
+        assert!(window.0.try_wait().unwrap().is_none());
     }
 
     fn pin_committed(guard: &mut UiUpdateGuard, slot: &str) {
@@ -6504,6 +6685,38 @@ mod tests {
             ));
             assert!(parse_activation_request("update-ready extra").is_err());
         }
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn activation_socket_rechecks_the_window_without_blocking_focus() {
+        let runtime = tempdir().unwrap();
+        let (sender, events) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        let socket = runtime.path().join(ACTIVATION_SOCKET_FILE);
+        let mut stream = UnixStream::connect(&socket).unwrap();
+        let job = uuid::Uuid::new_v4();
+        writeln!(stream, "update-recheck {job}").unwrap();
+
+        let activation = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(3), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap()
+            });
+        let request = activation.update.unwrap();
+        // The app's save can take time. Another invocation can still focus it.
+        assert!(activate_running_ui_in(runtime.path()).unwrap());
+        assert!(events.try_recv().unwrap().update.is_none());
+        assert_eq!(request.action, UiUpdateAction::Recheck(job));
+        request.answer_recheck(Ok(Some("one saved pane needs attention")));
+        let notes =
+            crate::control::read_ui_launch_handshake(&mut stream, Duration::from_secs(3)).unwrap();
+        assert_eq!(notes.as_deref(), Some("one saved pane needs attention"));
     }
 
     #[cfg(feature = "ui")]

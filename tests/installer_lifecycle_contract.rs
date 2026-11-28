@@ -754,7 +754,12 @@ esac
             .replace("CLI=old", "CLI=new")
             .replacen("#!/bin/sh", "#!/bin/bash", 1);
     executable(&candidate.join("bin/cagents"), &candidate_cli);
-    for binary in ["cagents-ui", "cagentsd", "cagents-uninstall"] {
+    for binary in [
+        "cagents-ui",
+        "cagentsd",
+        "cagents-dictate",
+        "cagents-uninstall",
+    ] {
         executable(&candidate.join("bin").join(binary), "#!/bin/sh\nexit 0\n");
     }
     fs::write(candidate.join("bin/.cagents-ui-lease-v1"), "").unwrap();
@@ -765,6 +770,7 @@ esac
         "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
         "share/metainfo/dev.cagents.Cagents.metainfo.xml",
         "share/doc/cagents/LICENSE",
+        "share/doc/cagents/THIRD-PARTY-NOTICES",
     ] {
         let file = candidate.join(relative);
         fs::create_dir_all(file.parent().unwrap()).unwrap();
@@ -876,6 +882,9 @@ esac
         r#"#!/bin/sh
 set -eu
 [ "$FIXTURE_DOWNLOAD" = public ] || [ "$FIXTURE_DOWNLOAD" = auth-failure ] || exit 98
+# curl ignores its default configuration only when this is argument one.
+[ "${1-}" = --disable ] || exit 98
+shift
 destination=
 url=
 while [ "$#" -gt 0 ]; do

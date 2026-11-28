@@ -643,6 +643,7 @@ mod startup_read_tests {
             session,
             1024,
             16,
+            Vec::new(),
         )
         .unwrap();
         assert!(history.result_calls.is_empty());

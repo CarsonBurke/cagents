@@ -10,8 +10,8 @@ use std::{
 
 const EXITED_RETENTION: Duration = Duration::from_secs(10 * 60);
 // Match the existing five-second durable-notification retry cadence. Only an
-// uncertain or deferred expired pin census, or suspended child custody, arms
-// this deadline; it grants no cleanup.
+// uncertain or deferred pin census, lost native owner without a process
+// to watch, or suspended child custody arms this deadline.
 const RETENTION_RETRY: Duration = Duration::from_secs(5);
 
 pub(super) struct Lifecycle {
@@ -64,6 +64,8 @@ impl Lifecycle {
     pub(super) fn maintain(&mut self, host: &SharedHost, connected: bool) -> Option<Instant> {
         self.settlement_retry = None;
         self.settle_retirements(host);
+        #[cfg(target_os = "linux")]
+        self.settle_lost_native_owners(host);
         let retention = earliest(self.maintain_retention(host), self.settlement_retry);
         let retention = earliest(retention, self.retry_suspended_custody(Instant::now()));
         if !self.idle.enabled {
@@ -118,6 +120,31 @@ impl Lifecycle {
         };
         let idle = self.idle.update(now, idle);
         earliest(retention, idle)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn settle_lost_native_owners(&mut self, host: &SharedHost) {
+        use crate::chat::native_holder::NativeExit;
+
+        let pending = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .values()
+            .filter(|record| record.handle.native_exit_pending())
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        // Process inspection and completion callbacks must run outside HostState.
+        for handle in pending {
+            match handle.settle_lost_native_owner() {
+                NativeExit::Waiting(process) => self.waiting.push(Arc::new(process)),
+                NativeExit::Pending => {
+                    self.settlement_retry
+                        .get_or_insert_with(|| Instant::now() + RETENTION_RETRY);
+                }
+                NativeExit::Exited | NativeExit::Unobservable => {}
+            }
+        }
     }
 
     fn retry_suspended_custody(&mut self, now: Instant) -> Option<Instant> {
