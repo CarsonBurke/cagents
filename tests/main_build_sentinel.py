@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -195,6 +196,19 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
                                       SENTINEL_TEST_LANES=json.dumps(sentinel.TEST_LANES))
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        # Records each start of the build directory's pruner; none of the
+        # host's own build output is ever searched.
+        self.prunes = self.root / "prunes"
+        pruner = self.bin / "prune-build-dirs"
+        pruner.write_text(f'''#!/usr/bin/python3
+import json, os, sys
+with open({str(self.prunes)!r}, 'a') as out:
+    out.write(json.dumps([sys.argv[1:], os.environ.get('CAGENTS_BUILD_PRUNE_ROOTS')]) + '\\n')
+''')
+        pruner.chmod(0o755)
+        self.pruner = patch.object(sentinel, "PRUNER", pruner)
+        self.pruner.start()
+        self.addCleanup(self.pruner.stop)
         self.now = 2000
 
     def command(self, *args):
@@ -584,6 +598,29 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         start = ["--user", "start", "--no-block", sentinel.PREBUILD_SERVICE]
         # Before the first lane's tests, after them, and on a tick with nothing to do.
         self.assertEqual(calls, [[start, 0], [start, len(self.tested())], [start, len(self.tested())]])
+
+    def prunes_started(self):
+        return [json.loads(line) for line in self.prunes.read_text().splitlines()] \
+            if self.prunes.exists() else []
+
+    def test_the_sentinels_build_directory_is_trimmed_hourly_after_its_builds(self):
+        self.tick()
+        (arguments, roots), = self.prunes_started()
+        checkout = self.repo / ".worktrees/main-build-sentinel"
+        self.assertEqual(roots.split(":"), [str(checkout),
+                                            f"/var/tmp/cargo-build{checkout.resolve()}"])
+        self.assertIn("--apply", arguments)
+        # A lock of its own: the host's pruner runs, which builds wait for, go on.
+        self.assertEqual(arguments[arguments.index("--lock") + 1], str(self.state / "build-trim.lock"))
+        # After the commit's lanes, which a trim at their start would find
+        # holding every lock.
+        self.assertTrue(self.tested())
+        self.now += sentinel.BUILD_TRIM_SECONDS - 1
+        self.tick()
+        self.assertEqual(len(self.prunes_started()), 1)
+        self.now += 1
+        self.tick()
+        self.assertEqual(len(self.prunes_started()), 2)
 
     def test_a_host_without_the_prebuild_service_still_tests(self):
         (self.bin / "systemctl").write_text("#!/bin/sh\nexit 5\n")
