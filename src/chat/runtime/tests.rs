@@ -5048,9 +5048,32 @@ fn claude_clean_pipe_eof_requires_initialization_but_requested_close_does_not() 
     assert!(handle.failure().is_none());
 }
 
-// Claude's answer to initialize prompts the adapter's own request for the
-// context figure. A provider that exits cleanly before reading it lost none
-// of the reader's input, while one that leaves a prompt unread did (#3888).
+#[test]
+fn claude_automatically_refreshes_context_only_when_shown() {
+    let (_directory, handle) = claude_initialization_pipe(
+        r#"def reply(request, body):
+    print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': body}}), flush=True)
+reply(request, {})
+explicit = json.loads(sys.stdin.readline())
+assert explicit['request'] == {'subtype': 'get_context_usage'}
+reply(explicit, {'totalTokens': 10, 'maxTokens': 100})
+automatic = json.loads(sys.stdin.readline())
+assert automatic['request'] == {'subtype': 'get_context_usage', 'detail': 'summary'}
+reply(automatic, {'totalTokens': 20, 'maxTokens': 100, 'autoCompactThreshold': 80, 'isAutoCompactEnabled': True})
+sys.stdin.read()
+"#,
+    );
+    until(&handle, |snapshot| snapshot.ready);
+    handle.command(Command::Refresh).unwrap();
+    until(&handle, |snapshot| snapshot.usage.context_tokens == 10);
+    handle.set_visible(true);
+    let shown = until(&handle, |snapshot| snapshot.usage.context_tokens == 20);
+    assert_eq!(shown.usage.context_budget(), 80);
+    handle.close().unwrap();
+}
+
+// A visible conversation's automatic context request is expendable. A
+// provider that exits leaving a prompt unread has lost input (#3888).
 #[test]
 fn claude_clean_exit_reports_only_lost_reader_input() {
     // Closing its stdin before answering fails that request's write with
@@ -5059,6 +5082,7 @@ fn claude_clean_exit_reports_only_lost_reader_input() {
         "import os\nos.close(0)\n\
              print(json.dumps({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': request['request_id'], 'response': {}}}), flush=True)\n",
     );
+    handle.set_visible(true);
     let snapshot = finish_initialization_pipe(&handle);
     assert!(snapshot.error.is_none(), "{snapshot:?}");
     assert!(handle.failure().is_none());
@@ -5073,6 +5097,7 @@ fn claude_clean_exit_reports_only_lost_reader_input() {
              open('stopped-reading', 'w').close()\n\
              while not os.path.exists('prompt-sent'):\n    time.sleep(0.01)\n",
     );
+    handle.set_visible(true);
     crate::test_timing::eventually("the provider to stop reading", || {
         directory.path().join("stopped-reading").exists()
     });
@@ -6927,13 +6952,11 @@ fn provider_exit_stops_pending_claude_file_edits_in_cached_and_fresh_queries() {
                 }]
             }
         });
-        // Claude Code is asked where it compacts once connected, then the
-        // test's refresh ends it.
+        // The test's explicit refresh ends this hidden provider.
         let (_directory, handle) = claude_initialization_pipe(&format!(
             "print(json.dumps({{'type': 'control_response', 'response': {{'subtype': 'success', 'request_id': request['request_id'], 'response': {{}}}}}}), flush=True)\n\
              print({call:?}, flush=True)\n\
              assert json.loads(sys.stdin.readline())['request']['subtype'] == 'get_context_usage'\n\
-             json.loads(sys.stdin.readline())\n\
              sys.exit(7)\n",
             call = call.to_string(),
         ));

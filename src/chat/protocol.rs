@@ -507,6 +507,10 @@ pub trait Adapter: Send {
         Err("This provider transport does not support correlated agent runs".into())
     }
     fn receive(&mut self, frame: Value) -> Result<Step, String>;
+    /// Optional provider work that may start when a conversation is shown.
+    fn refresh_visible_context(&mut self) -> Option<Step> {
+        None
+    }
     fn metadata_wake(&self) -> Option<MetadataWake<'_>> {
         None
     }

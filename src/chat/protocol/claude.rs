@@ -1106,6 +1106,12 @@ struct Claude {
     /// alias of the first.
     aliases: HashMap<String, String>,
     usage: Usage,
+    /// The last observed root model and the last window from a turn result.
+    /// Context reports can give a different window, so compare results with
+    /// one another even across a conversation reset.
+    context_model: Option<String>,
+    context_result_window: Option<u64>,
+    context_usage_stale: bool,
     history: Option<History>,
     /// Why a resumed conversation's saved history could not be read. The
     /// provider still resumes it; the transcript says what is missing.
@@ -1198,16 +1204,19 @@ impl Claude {
             events: vec![],
         })
     }
-    /// Asks Claude Code where it auto-compacts, for the context meter. The
-    /// answer is display data, so a request that cannot be made now is
-    /// skipped rather than failing what prompted it.
-    fn ask_context_usage(&mut self, step: &mut Step) {
-        if let Ok(usage) =
-            self.control(json!({"subtype":"get_context_usage","_cagents_automatic":true}))
-        {
-            step.writes.extend(usage.writes);
+    fn observe_context_model(&mut self, model: &str) {
+        if model.is_empty() || model == "<synthetic>" {
+            return;
+        }
+        let model = self.resolved.get(model).map_or(model, String::as_str);
+        if self.context_model.as_deref() != Some(model) {
+            if self.context_model.is_some() {
+                self.context_usage_stale = true;
+            }
+            self.context_model = Some(model.to_owned());
         }
     }
+
     /// Claude's own account of the context: `get_context_usage`'s answer, or
     /// the structured twin of a `/context` report.
     ///
@@ -2188,6 +2197,7 @@ impl Claude {
                 })
         });
         if let Some(model) = data["model"].as_str() {
+            self.observe_context_model(model);
             self.selected = Some(self.listed(model).to_owned());
             self.running = Some(
                 self.resolved
@@ -3041,6 +3051,9 @@ impl Claude {
                 });
             }
             if child.is_none() {
+                if !history && let Some(model) = message["model"].as_str() {
+                    self.observe_context_model(model);
+                }
                 self.update_usage(&message["usage"], step);
             }
         }
@@ -4133,6 +4146,28 @@ impl Adapter for Claude {
         (!proved.is_empty() || (self.queued.is_empty() && self.submissions.is_empty()))
             .then_some(proved)
     }
+    fn refresh_visible_context(&mut self) -> Option<Step> {
+        if !self.ready
+            || self.busy
+            || !self.context_usage_stale
+            || self
+                .controls
+                .values()
+                .any(|request| request["subtype"] == "get_context_usage")
+        {
+            return None;
+        }
+        // Summary avoids per-category token-counting calls on CLI versions
+        // that support it. Older CLIs only see this request when shown.
+        let step = self
+            .control(json!({
+                "subtype": "get_context_usage", "detail": "summary", "_cagents_automatic": true,
+            }))
+            .ok()?;
+        self.context_usage_stale = false;
+        Some(step)
+    }
+
     fn metadata_wake(&self) -> Option<super::MetadataWake<'_>> {
         // Result frames account for ordinary writes during a turn. While
         // idle a title can change without any provider frame to wake us.
@@ -4822,6 +4857,7 @@ impl Claude {
                     compact_limit: self.usage.compact_limit,
                     ..Usage::default()
                 };
+                self.context_usage_stale = true;
                 self.cache_read_tokens = 0;
                 self.cache_write_tokens = 0;
                 step.events.push(Event::Reset {
@@ -4946,12 +4982,7 @@ impl Claude {
                                 )));
                             }
                             self.status(self.busy, "Claude connected", &mut step);
-                            // Where auto-compaction falls is Claude Code's to
-                            // resolve, from settings at every level, its
-                            // environment and the model; asking once it is
-                            // connected gives the context budget from the
-                            // start rather than after the first compaction.
-                            self.ask_context_usage(&mut step);
+                            self.context_usage_stale = true;
                             for key in [
                                 "pending_permission_requests",
                                 "pending_user_dialog_requests",
@@ -4968,6 +4999,9 @@ impl Claude {
                         "set_model" => {
                             self.selected = request["model"].as_str().map(str::to_owned);
                             if !self.busy {
+                                if let Some(model) = request["model"].as_str() {
+                                    self.observe_context_model(model);
+                                }
                                 self.running = self
                                     .selected
                                     .as_ref()
@@ -4976,9 +5010,7 @@ impl Claude {
                             self.metadata(&Value::Null, &mut step);
                             let next = self.control(json!({"subtype":"apply_flag_settings", "settings":{"effortLevel":request["_cagents_reasoning"]}}))?;
                             step.writes.extend(next.writes);
-                            // Another model has its own window, and so its own
-                            // auto-compaction point.
-                            self.ask_context_usage(&mut step);
+                            self.context_usage_stale = true;
                         }
                         "get_settings" => {
                             let snapshot =
@@ -5076,8 +5108,12 @@ impl Claude {
                             });
                         }
                         "get_context_usage" => {
-                            self.context_report(&response["response"]);
-                            step.events.push(Event::Usage(self.usage.clone()));
+                            // A model change, reset or compaction after an
+                            // automatic request makes its answer stale.
+                            if request["_cagents_automatic"] != true || !self.context_usage_stale {
+                                self.context_report(&response["response"]);
+                                step.events.push(Event::Usage(self.usage.clone()));
+                            }
                         }
                         _ => {}
                     }
@@ -5370,8 +5406,9 @@ impl Claude {
                 }
                 if let Some(models) = frame["modelUsage"].as_object() {
                     let data = self
-                        .running
+                        .context_model
                         .as_ref()
+                        .or(self.running.as_ref())
                         .and_then(|m| models.get(m))
                         .or_else(|| {
                             if models.len() == 1 {
@@ -5380,15 +5417,16 @@ impl Claude {
                                 None
                             }
                         });
-                    if let Some(window) = data.and_then(|data| data["contextWindow"].as_u64()) {
-                        // A model changed another way than `set_model`, such
-                        // as a typed /model or Claude Code's fallback, has
-                        // its own auto-compaction point.
-                        let changed =
-                            self.usage.context_limit != 0 && self.usage.context_limit != window;
-                        self.usage.context_limit = window;
-                        if changed {
-                            self.ask_context_usage(&mut step);
+                    if let Some(window) = data
+                        .and_then(|data| data["contextWindow"].as_u64())
+                        .filter(|window| *window > 0)
+                    {
+                        let previous = self.context_result_window.replace(window);
+                        if previous != Some(window) || self.usage.context_limit == 0 {
+                            self.usage.context_limit = window;
+                        }
+                        if previous.is_some_and(|previous| previous != window) {
+                            self.context_usage_stale = true;
                         }
                     }
                 }
@@ -8743,18 +8781,16 @@ impl Claude {
                     }
                 }
             }
-            // Compaction is the one frame here a reader acts on, and its only
-            // visible effect is the context figure. Nothing else on the wire
-            // announces that the figure has moved, so the boundary asks for
-            // the usage again exactly as a refresh does, rather than
-            // narrating itself into the transcript. The summary that follows
-            // marks the boundary there, as the reopened transcript does.
+            // The summary that follows marks the boundary in the transcript.
+            // Only a root compaction changes this conversation's usage.
             "compact_boundary" => {
-                // A subagent compacts its own context, not the conversation.
-                self.compaction_summary_due |= frame["parent_tool_use_id"]
+                if frame["parent_tool_use_id"]
                     .as_str()
-                    .is_none_or(str::is_empty);
-                self.ask_context_usage(step);
+                    .is_none_or(str::is_empty)
+                {
+                    self.compaction_summary_due = true;
+                    self.context_usage_stale = true;
+                }
             }
             // Auxiliary session frames are not transcript data. Each one used
             // to reach the transcript as a system item holding the raw JSON of

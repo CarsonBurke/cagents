@@ -3344,6 +3344,16 @@ impl Actor {
                     stdin_closed.unwrap_or_else(|| "Provider stdin stalled for 30 seconds".into())
                 );
             }
+            if !self.stop.load(Ordering::Acquire)
+                && stdin_closed.is_none()
+                && !stdout_eof
+                && !frames_ready
+                && self.pending.is_empty()
+                && self.visible.load(Ordering::Acquire)
+                && let Some(step) = self.adapter.refresh_visible_context()
+            {
+                self.step(step)?;
+            }
             if self.dirty
                 && self.visible.load(Ordering::Acquire)
                 && self.last_present.elapsed() >= PRESENT_INTERVAL
