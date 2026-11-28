@@ -92,6 +92,10 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
 - `SHA256SUMS-browserless`
 - `ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz`
 - `SHA256SUMS-ceditor`
+- with a Linux AppImage build, `cagents-${VERSION}-x86_64.AppImage` and its
+  byte-identical `cagents-x86_64.AppImage` alias. Both are covered by
+  `SHA256SUMS` and the signed metadata. The alias provides the
+  [latest download](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-x86_64.AppImage).
 - with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
   `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
 - with an [Android build](#android), `cagents-android-${VERSION}.apk`,
