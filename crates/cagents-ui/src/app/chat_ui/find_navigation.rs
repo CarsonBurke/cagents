@@ -1096,7 +1096,9 @@ impl Runtime {
                             .insert((row.clone(), part.to_owned()));
                     }
                 }
-                plan.expand && !self.row_expanded(&item) && self.find_expanded_rows.insert(row)
+                plan.expand
+                    && !self.row_expanded(&item)
+                    && self.find_expanded_rows.edit().insert(row)
             } else if let Some(child) = &child {
                 let disclosure = self.child_find_disclosure.entry(child.clone()).or_default();
                 for part in &plan.parts {

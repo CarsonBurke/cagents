@@ -484,7 +484,7 @@ struct HistoryKey {
     target: Target,
     presentation: u64,
     turns: revised::Stamp,
-    expanded: revised::Stamp,
+    expanded: (revised::Stamp, revised::Stamp, revised::Stamp),
     failures: (u64, revised::Stamp, revised::Stamp),
     cards: Vec<Option<bool>>,
     width: u32,
@@ -500,13 +500,10 @@ pub(super) struct HistoryRows {
     parts: std::rc::Rc<[HistoryPart]>,
     last: Option<Rhythm>,
     footer: f32,
-    // Message deliveries can resolve names through the current publication.
-    // Weak references fence those reads without retaining the publication or
-    // conflating reused allocation addresses.
-    delivery_source: Option<(
-        std::sync::Weak<Snapshot>,
-        std::sync::Weak<std::collections::BTreeMap<String, String>>,
-    )>,
+    // Delivery labels and exact row disclosures can depend on the current
+    // publication. A weak fence preserves its identity without keeping it.
+    snapshot_source: Option<std::sync::Weak<Snapshot>>,
+    delivery_addresses: Option<std::sync::Weak<std::collections::BTreeMap<String, String>>>,
 }
 
 #[cfg(test)]
@@ -6508,7 +6505,11 @@ impl Runtime {
             target: self.target,
             presentation: self.presentation_revision,
             turns: self.turns.stamp(),
-            expanded: self.expanded.stamp(),
+            expanded: (
+                self.expanded.stamp(),
+                self.row_expansions.stamp(),
+                self.find_expanded_rows.stamp(),
+            ),
             failures: self.failure_ui.exposure(),
             cards,
             width: content_width.to_bits(),
@@ -6519,12 +6520,12 @@ impl Runtime {
         if cache.as_ref().is_none_or(|cached| {
             cached.key != key
                 || cached
-                    .delivery_source
+                    .snapshot_source
                     .as_ref()
-                    .is_some_and(|(snapshot, addresses)| {
-                        !snapshot.ptr_eq(&Arc::downgrade(&self.snapshot))
-                            || !addresses.ptr_eq(&Arc::downgrade(&self.agent_addresses))
-                    })
+                    .is_some_and(|snapshot| snapshot.as_ptr() != Arc::as_ptr(&self.snapshot))
+                || cached.delivery_addresses.as_ref().is_some_and(|addresses| {
+                    addresses.as_ptr() != Arc::as_ptr(&self.agent_addresses)
+                })
         }) {
             let mut descriptors = Vec::<virtualized::Descriptor>::new();
             let mut parts = Vec::new();
@@ -6597,12 +6598,11 @@ impl Runtime {
                 parts: parts.into(),
                 last,
                 footer: trailing_footer,
-                delivery_source: deliveries.then(|| {
-                    (
-                        Arc::downgrade(&self.snapshot),
-                        Arc::downgrade(&self.agent_addresses),
-                    )
-                }),
+                snapshot_source: (deliveries
+                    || !self.row_expansions.is_empty()
+                    || !self.find_expanded_rows.is_empty())
+                .then(|| Arc::downgrade(&self.snapshot)),
+                delivery_addresses: deliveries.then(|| Arc::downgrade(&self.agent_addresses)),
             });
         }
         let rows = cache.as_ref().unwrap();
@@ -6657,10 +6657,13 @@ impl Runtime {
         use std::hash::Hash;
         let items = &self.snapshot.items;
         let cached = match part {
-            TurnPart::Prompt(index) => self.cache.get(&items[index].id),
-            TurnPart::Card(prose) | TurnPart::Prose(prose) => {
-                self.cache.get(&items[turn.prose[prose].index].id)
-            }
+            TurnPart::Prompt(index) => self
+                .cache
+                .get(row_cache_key(&self.parent_cache_keys, &items[index])),
+            TurnPart::Card(prose) | TurnPart::Prose(prose) => self.cache.get(row_cache_key(
+                &self.parent_cache_keys,
+                &items[turn.prose[prose].index],
+            )),
             _ => None,
         };
         let mut common = self.turn_common_hasher(turn, dark);

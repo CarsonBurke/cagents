@@ -3971,9 +3971,9 @@ pub(super) struct Runtime {
     colliding_row_ids: HashSet<String>,
     parent_cache_keys: HashMap<usize, String>,
     child_cache_keys: HashMap<usize, String>,
-    row_expansions: Vec<(RowTarget, bool)>,
+    row_expansions: Revised<Vec<(RowTarget, bool)>>,
     row_unfolded: HashSet<(RowTarget, String)>,
-    find_expanded_rows: HashSet<RowTarget>,
+    find_expanded_rows: Revised<HashSet<RowTarget>>,
     find_unfolded_rows: HashSet<(RowTarget, String)>,
     /// Each child's own disclosures, stamped separately so pruning departed
     /// children never disturbs the selected child's.
@@ -5724,9 +5724,9 @@ impl Runtime {
             colliding_row_ids: HashSet::new(),
             parent_cache_keys: HashMap::new(),
             child_cache_keys: HashMap::new(),
-            row_expansions: Vec::new(),
+            row_expansions: Revised::default(),
             row_unfolded: HashSet::new(),
-            find_expanded_rows: HashSet::new(),
+            find_expanded_rows: Revised::default(),
             find_unfolded_rows: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
@@ -5815,9 +5815,9 @@ impl Runtime {
         self.colliding_row_ids.clear();
         self.parent_cache_keys.clear();
         self.child_cache_keys.clear();
-        self.row_expansions.clear();
+        self.row_expansions = Revised::default();
         self.row_unfolded.clear();
-        self.find_expanded_rows.clear();
+        self.find_expanded_rows = Revised::default();
         self.find_unfolded_rows.clear();
         self.child_expanded.clear();
         self.child_unfolded.clear();
@@ -6744,12 +6744,26 @@ impl Runtime {
                     aliases.insert(address, alias);
                 }
             }
-            self.row_expansions
-                .retain(|(row, _)| row.item.strong_count() != 0);
+            if self
+                .row_expansions
+                .iter()
+                .any(|(row, _)| row.item.strong_count() == 0)
+            {
+                self.row_expansions
+                    .edit()
+                    .retain(|(row, _)| row.item.strong_count() != 0);
+            }
             self.row_unfolded
                 .retain(|(row, _)| row.item.strong_count() != 0);
-            self.find_expanded_rows
-                .retain(|row| row.item.strong_count() != 0);
+            if self
+                .find_expanded_rows
+                .iter()
+                .any(|row| row.item.strong_count() == 0)
+            {
+                self.find_expanded_rows
+                    .edit()
+                    .retain(|row| row.item.strong_count() != 0);
+            }
             self.find_unfolded_rows
                 .retain(|(row, _)| row.item.strong_count() != 0);
         }
@@ -6801,6 +6815,9 @@ impl Runtime {
                                 .any(|current| std::ptr::eq(current.as_ref(), item)))
                 })
             });
+            // An exact row can change its cache key without changing the IDs
+            // in the publication, for example when a duplicate moves in.
+            self.history_rows.get_mut().take();
         }
         let newest = items.len().wrapping_sub(1);
         let start = resume.unwrap_or(0).min(items.len());
@@ -7850,7 +7867,12 @@ impl Runtime {
             }
         }
         self.find_unfolded_rows.clear();
-        for row in self.find_expanded_rows.drain() {
+        let expanded_rows = if self.find_expanded_rows.is_empty() {
+            None
+        } else {
+            Some(self.find_expanded_rows.edit().drain())
+        };
+        for row in expanded_rows.into_iter().flatten() {
             let Some(item) = row.item.upgrade() else {
                 continue;
             };
@@ -18368,11 +18390,12 @@ impl Cagents {
                     runtime.find_navigation.cancel();
                     if requires_row_identity(&runtime.colliding_row_ids, &id) {
                         let row = runtime.row_target(&item);
-                        runtime.find_expanded_rows.remove(&row);
-                        runtime
-                            .row_expansions
-                            .retain(|(current, _)| current != &row);
-                        runtime.row_expansions.push((row, open));
+                        if runtime.find_expanded_rows.contains(&row) {
+                            runtime.find_expanded_rows.edit().remove(&row);
+                        }
+                        let expansions = runtime.row_expansions.edit();
+                        expansions.retain(|(current, _)| current != &row);
+                        expansions.push((row, open));
                     } else {
                         let expanded = if let Some(child) = &runtime.selected_subagent {
                             if let Some(disclosure) = runtime.child_find_disclosure.get_mut(child) {

@@ -14303,18 +14303,21 @@ fn send_now_is_offered_only_while_the_running_turn_can_take_the_queue() {
 
 #[test]
 fn unchanged_history_reuses_row_descriptors_and_preserves_spacing() {
-    let (runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(3));
+    let (mut runtime, _handle) = frame_cost::live_runtime(&frame_cost::transcript(3));
     let settings = design::markdown_settings(&cosmic::theme::active(), design::TEXT_TRANSCRIPT);
     let width = super::super::layout::READING_COLUMN;
-    let build = |width, dark| {
+    let build = |runtime: &Runtime, width, dark| {
         let mut rows = VirtualRows::new();
         rows.push(widget::Space::new().into());
         runtime.push_history_rows(&mut rows, width, settings, dark, None);
         rows.body.unwrap().rows
     };
 
-    let history = build(width, true);
-    assert!(std::rc::Rc::ptr_eq(&history, &build(width, false)));
+    let history = build(&runtime, width, true);
+    assert!(std::rc::Rc::ptr_eq(
+        &history,
+        &build(&runtime, width, false)
+    ));
     let mut ordinary = VirtualRows::new();
     ordinary.push(widget::Space::new().into());
     for turn in &runtime.turns {
@@ -14326,7 +14329,32 @@ fn unchanged_history_reuses_row_descriptors_and_preserves_spacing() {
         assert_eq!(expected.estimate, actual.estimate);
         assert_eq!(expected.aliases, actual.aliases);
     }
-    assert!(!std::rc::Rc::ptr_eq(&history, &build(width - 100.0, true)));
+    let narrower = build(&runtime, width - 100.0, true);
+    assert!(!std::rc::Rc::ptr_eq(&history, &narrower));
+    drop(ordinary);
+
+    // Exact reader disclosures have their own state and do not change the
+    // persisted ID set. A thinking row can need a different action footer.
+    let row = runtime.row_target(&runtime.snapshot.items[1]);
+    runtime.row_expansions.edit().push((row.clone(), true));
+    let expanded = build(&runtime, width - 100.0, true);
+    assert!(!std::rc::Rc::ptr_eq(&narrower, &expanded));
+    runtime.row_expansions.edit().clear();
+    let collapsed = build(&runtime, width - 100.0, true);
+    runtime.find_expanded_rows.edit().insert(row);
+    let found = build(&runtime, width - 100.0, true);
+    assert!(!std::rc::Rc::ptr_eq(&collapsed, &found));
+    assert!(std::rc::Rc::ptr_eq(
+        &found,
+        &build(&runtime, width - 100.0, false)
+    ));
+    let replacement = Arc::new((*runtime.snapshot.items[1]).clone());
+    Arc::make_mut(&mut runtime.snapshot).items[1] = replacement.clone();
+    assert!(!runtime.row_expanded(&replacement));
+    assert!(!std::rc::Rc::ptr_eq(
+        &found,
+        &build(&runtime, width - 100.0, true)
+    ));
 }
 
 /// A transcript row is kept for as long as its fingerprint holds, and it is
