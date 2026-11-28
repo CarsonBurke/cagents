@@ -7,14 +7,20 @@ from pathlib import Path
 import sys
 
 sys.dont_write_bytecode = True
-root = Path(__file__).resolve().parent
-sys.path.insert(0, str(root / "scripts"))
+for parent in Path(__file__).resolve().parents:
+    if (parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(parent / "scripts"))
+        break
 from fixture_home import require_fixture_home
 
-require_fixture_home("HOME")
-provider = Path(__file__).name
-if provider == "codex":
-    require_fixture_home("CODEX_HOME")
+if sys.argv[1:] == ["app-server"]:
+    provider = "codex"
+elif sys.argv[1:] == ["--mode", "rpc-ui"]:
+    provider = "omp"
+else:
+    sys.exit("Expected app-server or --mode rpc-ui")
+
+require_fixture_home("CODEX_HOME" if provider == "codex" else "HOME")
 
 SESSION = "c81f5f74-4385-4dbb-b4e6-36b0d177ac9b"
 ANSWER = "The provider answered despite wrapper output."
@@ -25,7 +31,7 @@ def send(frame, prefix=""):
 
 
 def complete(frame):
-    send(frame, os.environ["FIXTURE_GLUE_PREFIX"])
+    send(frame, os.environ.get("FIXTURE_GLUE_PREFIX", ""))
 
 
 def codex(request):
