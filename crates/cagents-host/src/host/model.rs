@@ -43,7 +43,7 @@ mod execution_deltas;
 #[cfg(any(debug_assertions, feature = "development"))]
 pub(crate) mod fixture_seed;
 pub(super) mod floor;
-pub(super) use execution::{AuthorityError, ResidentRelease, confirmed_identity_update};
+pub(super) use execution::{AuthorityError, ResidentRelease};
 mod lineage;
 mod mailbox;
 pub(super) use execution::{
