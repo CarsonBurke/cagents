@@ -347,6 +347,14 @@ impl SurvivorEvidence {
                 .next()
                 .and_then(|script| std::str::from_utf8(script).ok())
                 .and_then(|script| Provider::from_script(Path::new(script)))
+        } else if matches!(
+            name,
+            "codex-aarch64-apple-darwin"
+                | "codex-x86_64-apple-darwin"
+                | "codex-aarch64-unknown-linux-musl"
+                | "codex-x86_64-unknown-linux-musl"
+        ) {
+            Some(Provider::Codex)
         } else if executable
             .parent()
             .is_some_and(|directory| directory.ends_with("claude/versions"))
@@ -439,6 +447,7 @@ impl SurvivorEvidence {
 fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid::Uuid) -> bool {
     use crate::agent::Provider::Codex;
 
+    let is_option = |argument: &[u8]| argument.len() > 1 && argument.starts_with(b"-");
     let matches_id = |argument: &[u8]| {
         std::str::from_utf8(argument)
             .ok()
@@ -455,7 +464,7 @@ fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid:
             // cannot introduce a subcommand or change how resume selects it.
             return resuming && (matched_id || arguments.next().is_some_and(matches_id));
         }
-        if argument.len() > 1 && argument.starts_with(b"-") {
+        if is_option(argument) {
             let flag = argument
                 .split(|byte| *byte == b'=')
                 .next()
@@ -466,12 +475,11 @@ fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid:
                 }
                 // These observed CLI options are distinct from the subset
                 // supported in a replayable cagents launch recipe.
+                let image = matches!(flag, "--image" | "-i");
                 let takes_value = Codex.is_value_option(flag)
                     || Codex.is_cwd_option(flag)
-                    || matches!(
-                        flag,
-                        "--image" | "-i" | "--local-provider" | "--enable" | "--disable"
-                    )
+                    || image
+                    || matches!(flag, "--local-provider" | "--enable" | "--disable")
                     || (exec
                         && matches!(
                             flag,
@@ -483,7 +491,11 @@ fn codex_resume_matches<'a>(arguments: impl Iterator<Item = &'a [u8]>, id: uuid:
                                 | "--cyber-access-program"
                         ));
                 if takes_value && !argument.contains(&b'=') {
-                    arguments.next_if(|value| *value != b"--");
+                    arguments.next_if(|value| !is_option(value));
+                    // Only exec's resume subcommand uses a single image operand.
+                    if image && !(exec && resuming) {
+                        while arguments.next_if(|value| !is_option(value)).is_some() {}
+                    }
                 }
             }
             continue;
@@ -4336,7 +4348,23 @@ mod tests {
                 ],
                 true,
             ),
-            ("/usr/bin/codex", vec!["resume", "--model=MODEL", id], true),
+            (
+                "/usr/bin/codex-x86_64-unknown-linux-musl",
+                vec!["resume", "--model=MODEL", id],
+                true,
+            ),
+            (
+                "/usr/bin/codex",
+                vec![
+                    "resume", "--image", "one.png", "two.png", "--model", "MODEL", id,
+                ],
+                true,
+            ),
+            (
+                "/usr/bin/codex",
+                vec!["resume", "--image=one.png", id],
+                true,
+            ),
             ("/usr/bin/codex", vec!["resume", "--", id], true),
             ("/usr/bin/codex", vec!["resume", id, "--", "--last"], true),
             (
@@ -4344,10 +4372,10 @@ mod tests {
                 vec![
                     "e",
                     "resume",
-                    "--image",
-                    "prompt.png",
                     "--model",
                     "MODEL",
+                    "--image",
+                    "prompt.png",
                     id,
                 ],
                 true,
@@ -4358,11 +4386,17 @@ mod tests {
                 true,
             ),
             ("/usr/bin/cat", vec!["resume", id], false),
+            ("/usr/bin/codex-app-server", vec!["resume", id], false),
             ("/usr/bin/codex", vec!["app-server", "resume", id], false),
             ("/usr/bin/codex", vec!["--", "resume", id], false),
             ("/usr/bin/codex", vec!["exec", "--", "resume", id], false),
             ("/usr/bin/codex", vec!["--model", "resume", id], false),
             ("/usr/bin/codex", vec!["resume", "--model", id], false),
+            (
+                "/usr/bin/codex",
+                vec!["resume", "--image", "one.png", id, "--model", "MODEL"],
+                false,
+            ),
             ("/usr/bin/codex", vec!["resume", other, id], false),
             ("/usr/bin/codex", vec!["resume", "--last", id], false),
             ("/usr/bin/codex", vec!["resume", id, "--last"], false),
