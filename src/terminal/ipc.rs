@@ -2763,6 +2763,22 @@ impl FrameCodec {
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(())
     }
+
+    /// Writes a frame prepared by a daemon publication writer.
+    #[cfg(feature = "host")]
+    pub fn write_preframed(
+        &mut self,
+        writer: &mut impl Write,
+        frame: &EncodedFrame,
+    ) -> Result<(), FrameError> {
+        let length = frame.0.len() - LENGTH_PREFIX_BYTES;
+        validate_frame_length(length, self.maximum)?;
+        writer.write_all(&frame.0)?;
+        writer.flush()?;
+        recycle_frame_buffer(&mut self.write_buffer, length, &mut self.small_writes);
+        tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
+        Ok(())
+    }
 }
 
 impl Drop for FrameCodec {
@@ -2773,6 +2789,27 @@ impl Drop for FrameCodec {
 }
 
 const LENGTH_PREFIX_BYTES: usize = 4;
+
+/// An immutable postcard frame, including its validated length prefix.
+#[cfg(feature = "host")]
+#[derive(Debug)]
+pub struct EncodedFrame(Vec<u8>);
+
+#[cfg(feature = "host")]
+impl EncodedFrame {
+    pub fn new(value: &impl Serialize) -> Result<Self, FrameError> {
+        let started =
+            tracing::enabled!(target: "cagents::terminal_pipeline", tracing::Level::TRACE)
+                .then(std::time::Instant::now);
+        let mut bytes = Vec::new();
+        let length = encode_frame(&mut bytes, MAX_FRAME_BYTES, value)?;
+        bytes[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_be_bytes());
+        if let Some(started) = started {
+            tracing::trace!(target: "cagents::terminal_pipeline", stage = "ipc_encode", elapsed_ns = started.elapsed().as_nanos() as u64, bytes = length);
+        }
+        Ok(Self(bytes))
+    }
+}
 
 pub fn read_frame<T: DeserializeOwned>(reader: &mut impl Read) -> Result<Option<T>, FrameError> {
     read_frame_with_limit(reader, MAX_FRAME_BYTES)

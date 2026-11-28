@@ -913,7 +913,7 @@ fn notification_activation_prefers_the_focused_owner_and_restores_closed_window_
         "primary"
     );
     assert!(
-        matches!(focused.pop().unwrap().message, ServerMessage::NotificationActivated { target: found } if found == crate::notifications::Target::Session(session))
+        matches!(focused.pop().unwrap().into_message(), ServerMessage::NotificationActivated { target: found } if found == crate::notifications::Target::Session(session))
     );
     drop(host.unregister_client(1));
     drop(host.unregister_client(2));
@@ -974,7 +974,7 @@ fn mobile_watches_are_scoped_coalesced_and_do_not_register_window_presence() {
     ] {
         delivery.close_after_drain();
         assert!(matches!(
-            delivery.pop().unwrap().message,
+            delivery.pop().unwrap().into_message(),
             ServerMessage::MobileChanged { topic: actual } if actual == topic
         ));
         assert!(delivery.pop().is_none());
@@ -1010,7 +1010,7 @@ fn run_notification_routes_only_to_a_cagents_window_without_a_provider_pane() {
     );
     delivery.close_after_drain();
     editor.close_after_drain();
-    assert!(matches!(delivery.pop().unwrap().message,
+    assert!(matches!(delivery.pop().unwrap().into_message(),
         ServerMessage::NotificationActivated { target: actual } if actual == target));
     assert!(editor.pop().is_none());
 }
@@ -1041,7 +1041,7 @@ fn automation_notification_routes_to_cagents_without_a_provider_and_reconnects_o
     let destination = host.activate_notification_destination(first.clone(), None, None, None);
     assert_eq!(destination.application, Application::Cagents);
     assert_eq!(destination.window, "primary");
-    assert!(matches!(agents.pop().unwrap().message,
+    assert!(matches!(agents.pop().unwrap().into_message(),
         ServerMessage::NotificationActivated { target } if target == first));
     drop(host.unregister_client(1));
     let replacement = Target::Automation { id, sequence: 42 };
@@ -2724,7 +2724,8 @@ fn hidden_output_is_per_subscriber_and_rearms_without_revealing() {
         delivery.close_after_drain();
         let mut epochs = Vec::new();
         while let Some(envelope) = delivery.pop() {
-            if let ServerMessage::TerminalObserved { terminal_id, epoch } = envelope.message {
+            if let ServerMessage::TerminalObserved { terminal_id, epoch } = envelope.into_message()
+            {
                 assert_eq!(terminal_id, id);
                 epochs.push(epoch);
             }
@@ -2865,12 +2866,12 @@ fn redraw_delivery_excludes_hidden_and_hibernated_subscribers() {
     }
     // The spawning client first learns which worker it started.
     assert!(matches!(
-        deliveries[0].pop().unwrap().message,
+        deliveries[0].pop().unwrap().into_message(),
         ServerMessage::TerminalWorker { terminal_id: id, instance }
             if id == terminal_id && instance == stream.handle.execution_instance()
     ));
     assert!(matches!(
-        deliveries[0].pop().unwrap().message,
+        deliveries[0].pop().unwrap().into_message(),
         ServerMessage::Snapshot { snapshot, .. } if snapshot.generation == 7
     ));
     assert!(deliveries[0].pop().is_none());
@@ -2944,7 +2945,7 @@ fn a_recorded_base_turns_a_redraw_edge_into_a_pushed_repaint() {
         if let ServerMessage::Snapshot {
             terminal_id,
             snapshot,
-        } = message.message
+        } = message.into_message()
             && terminal_id == id
         {
             pushed = Some(snapshot);
@@ -3081,7 +3082,7 @@ fn completed_terminal_history_routes_queries_after_the_event_forwarder_finishes(
                         ..
                     },
                 ..
-            } = envelope.message
+            } = envelope.into_message()
             {
                 assert_eq!(matches.len(), 1);
                 results += 1;
@@ -3159,7 +3160,7 @@ fn terminal_search_results_are_delivered_only_to_the_requesting_window_and_never
         let mut count = 0;
         while let Some(envelope) = delivery.pop() {
             if matches!(
-                envelope.message,
+                envelope.into_message(),
                 ServerMessage::Event {
                     event: WireTerminalEvent::SearchResults { request: 1, .. },
                     ..

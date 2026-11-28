@@ -1872,7 +1872,7 @@ mod tests {
         let told = |delivery: &crate::host::delivery::DeliveryQueue| {
             delivery.close_after_drain();
             std::iter::from_fn(|| delivery.pop())
-                .filter_map(|envelope| match envelope.message {
+                .filter_map(|envelope| match envelope.into_message() {
                     crate::terminal_ipc::ServerMessage::AutomationProposalsChanged {
                         repository,
                     } => Some(repository),

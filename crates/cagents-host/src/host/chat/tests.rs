@@ -407,7 +407,7 @@ fn mobile_inventory_and_conversation_watches_see_provider_completion() {
     ] {
         queue.close_after_drain();
         assert!(std::iter::from_fn(|| queue.pop()).any(|frame|
-            matches!(frame.message, ServerMessage::MobileChanged { topic: actual } if actual == topic)));
+            matches!(frame.into_message(), ServerMessage::MobileChanged { topic: actual } if actual == topic)));
     }
 }
 
@@ -3440,7 +3440,7 @@ fn a_codex_chat_on_a_known_conversation_returns_to_its_terminal() {
 fn terminal_frames(delivery: &crate::host::delivery::DeliveryQueue) -> Vec<ServerMessage> {
     delivery.close_after_drain();
     std::iter::from_fn(|| delivery.pop())
-        .map(|outbound| outbound.message)
+        .map(|outbound| outbound.into_message())
         .filter(|message| {
             matches!(
                 message,
@@ -3779,7 +3779,9 @@ fn agent_addresses_reach_every_subscriber_and_each_new_one() {
         let queue = queue.clone();
         move || {
             while let Some(outbound) = queue.pop() {
-                if let ServerMessage::ChatAgentAddresses { chat_id, addresses } = outbound.message {
+                if let ServerMessage::ChatAgentAddresses { chat_id, addresses } =
+                    outbound.into_message()
+                {
                     let _ = heard.send((chat_id, addresses));
                 }
             }
@@ -3939,7 +3941,7 @@ fn acknowledgement_race(before_rearm: bool) {
     let drain = |queue: &super::super::delivery::DeliveryQueue| {
         let mut epochs = Vec::new();
         while let Some(envelope) = queue.pop() {
-            match envelope.message {
+            match envelope.into_message() {
                 ServerMessage::ChatObserved { epoch, .. } => epochs.push(epoch),
                 ServerMessage::ChatActivity { .. } => {}
                 other => panic!("hidden acknowledgement requested presentation: {other:?}"),

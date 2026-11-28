@@ -36,7 +36,7 @@ use crate::{
     workspace_model::ModelEdit,
 };
 
-use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound};
+use super::delivery::{DEFAULT_CLIENT_QUEUE_CAPACITY, DeliveryQueue, Outbound, publish};
 pub(super) mod update;
 
 const EVENT_REPLAY_CAPACITY: usize = 256;
@@ -1230,21 +1230,18 @@ impl HostState {
     ) {
         self.mobile_sessions_changed();
         let edit = edit.committed();
-        for client_id in &self.model_watchers {
-            if *client_id == origin {
-                continue;
+        let deliveries = self
+            .model_watchers
+            .iter()
+            .filter(|&&client| client != origin)
+            .filter_map(|client| self.clients.get(client).map(Arc::as_ref));
+        publish(&self.proof, deliveries, || {
+            ServerMessage::WorkspaceModelEdited {
+                sequence,
+                edit: edit.as_ref().clone(),
+                effects: effects.clone(),
             }
-            if let Some(delivery) = self.clients.get(client_id) {
-                let _ = delivery.push(Outbound::broadcast(
-                    &self.proof,
-                    ServerMessage::WorkspaceModelEdited {
-                        sequence,
-                        edit: edit.as_ref().clone(),
-                        effects: effects.clone(),
-                    },
-                ));
-            }
-        }
+        });
         if let Some(titles) = &self.channel_titles {
             for view in &effects.views {
                 if let crate::workspace_model::views::Scope::Channel(id) = view.scope
@@ -7129,14 +7126,13 @@ fn record_event_from(
     if wake_exit {
         crate::daemon::wake();
     }
-    let message = ServerMessage::Event {
-        terminal_id,
-        sequence,
-        event: wire_event,
-    };
-    for delivery in deliveries {
-        let _ = delivery.push(Outbound::broadcast(&proof, message.clone()));
-    }
+    publish(&proof, deliveries.iter().map(Arc::as_ref), || {
+        ServerMessage::Event {
+            terminal_id,
+            sequence,
+            event: wire_event,
+        }
+    });
 }
 
 fn transcript_metadata(

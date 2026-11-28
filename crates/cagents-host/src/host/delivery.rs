@@ -1,13 +1,14 @@
 use std::{
     collections::{BTreeMap, VecDeque},
+    io,
     sync::{Arc, Condvar, Mutex, OnceLock},
 };
 
 use crate::{
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
-        OlderClient, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
-        ServerEnvelopeRef, ServerMessage, ServerResponse,
+        EncodedFrame, FrameCodec, FrameError, OlderClient, PROTOCOL_VERSION, ProtocolError,
+        ProtocolErrorCode, ServerEnvelope, ServerEnvelopeRef, ServerMessage, ServerResponse,
     },
 };
 
@@ -25,31 +26,90 @@ pub(crate) enum DeliveryError {
     Full,
 }
 
-/// One queued frame, with the session proof shared rather than copied.
-///
-/// A redraw edge fans out to every visible subscriber of a terminal, and the
-/// proof is three `String`s; cloning the owned [`ServerEnvelope`] per
-/// subscriber made the per-frame allocation scale with the subscriber count.
-/// The writer serializes this through [`ServerEnvelopeRef`], which encodes
-/// byte-identically to the owned envelope.
-#[derive(Clone, Debug)]
+/// One publication shared by the queues that receive the same unsolicited message.
+#[derive(Debug)]
+struct Publication {
+    message: ServerMessage,
+    // Encode only once a current client dequeues this publication. A dropped or
+    // coalesced edge needs no bytes, and encoding never holds a delivery lock.
+    frame: OnceLock<Result<EncodedFrame, FrameError>>,
+}
+
+#[allow(clippy::large_enum_variant)] // Direct messages need no extra allocation.
+#[derive(Debug)]
+enum Payload {
+    Direct(ServerMessage),
+    Shared(Arc<Publication>),
+}
+
+/// One queued reply or notification, using a borrowed envelope on the wire.
+#[derive(Debug)]
 pub(crate) struct Outbound {
     version: u16,
     request_id: Option<u64>,
     proof: Arc<HostSessionProof>,
-    pub(crate) message: ServerMessage,
+    payload: Payload,
     encoded_response: Option<Vec<u8>>,
+}
+
+/// Delivers one identical notification to its recipients. Only a fan-out
+/// needs shared storage; the single-writer path can reuse its codec buffer.
+pub(super) fn publish<'a>(
+    proof: &Arc<HostSessionProof>,
+    mut deliveries: impl Iterator<Item = &'a DeliveryQueue>,
+    message: impl FnOnce() -> ServerMessage,
+) {
+    let Some(first) = deliveries.next() else {
+        return;
+    };
+    let message = message();
+    let Some(second) = deliveries.next() else {
+        let _ = first.push(Outbound::broadcast(proof, message));
+        return;
+    };
+    let publication = Arc::new(Publication {
+        message,
+        frame: OnceLock::new(),
+    });
+    for delivery in [first, second].into_iter().chain(deliveries) {
+        let _ = delivery.push(Outbound::notification(
+            proof,
+            Payload::Shared(Arc::clone(&publication)),
+        ));
+    }
 }
 
 impl Outbound {
     /// An unsolicited daemon-to-client message that shares `proof`.
     pub(crate) fn broadcast(proof: &Arc<HostSessionProof>, message: ServerMessage) -> Self {
+        Self::notification(proof, Payload::Direct(message))
+    }
+
+    fn notification(proof: &Arc<HostSessionProof>, payload: Payload) -> Self {
         Self {
             version: PROTOCOL_VERSION,
             request_id: None,
             proof: Arc::clone(proof),
-            message,
+            payload,
             encoded_response: None,
+        }
+    }
+
+    fn message(&self) -> &ServerMessage {
+        match &self.payload {
+            Payload::Direct(message) => message,
+            Payload::Shared(publication) => &publication.message,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn into_message(self) -> ServerMessage {
+        match self.payload {
+            Payload::Direct(message) => message,
+            Payload::Shared(publication) => match Arc::try_unwrap(publication) {
+                Ok(publication) => publication.message,
+                Err(shared) => shared.message.clone(),
+            },
         }
     }
 
@@ -60,18 +120,18 @@ impl Outbound {
         // Older peers must be checked against the actual response variant.
         // Only this upgrade compatibility path needs to decode a relay payload.
         if let Some(bytes) = self.encoded_response.take() {
-            self.message = match postcard::from_bytes(&bytes) {
+            self.payload = Payload::Direct(match postcard::from_bytes(&bytes) {
                 Ok(response) => ServerMessage::Response { response },
                 Err(_) => ServerMessage::Error(client.refusal()),
-            };
+            });
         }
-        if !client.admits_message(&self.message) {
+        if !client.admits_message(self.message()) {
             self.request_id?;
             tracing::debug!(
                 protocol = client.protocol,
                 "refusing a reply an older protocol client cannot decode"
             );
-            self.message = ServerMessage::Error(client.refusal());
+            self.payload = Payload::Direct(ServerMessage::Error(client.refusal()));
             self.encoded_response = None;
         }
         self.version = client.protocol;
@@ -97,15 +157,27 @@ impl Outbound {
             version: PROTOCOL_VERSION,
             request_id: Some(request_id),
             proof: Arc::new(proof.clone()),
-            message: ServerMessage::Response { response },
+            payload: Payload::Direct(ServerMessage::Response { response }),
             encoded_response,
         }
     }
     pub(crate) fn write(
         &self,
-        codec: &mut crate::terminal_ipc::FrameCodec,
-        writer: &mut impl std::io::Write,
-    ) -> Result<(), crate::terminal_ipc::FrameError> {
+        codec: &mut FrameCodec,
+        writer: &mut impl io::Write,
+    ) -> Result<(), String> {
+        if let Payload::Shared(publication) = &self.payload
+            && self.version == PROTOCOL_VERSION
+        {
+            let frame = publication
+                .frame
+                .get_or_init(|| EncodedFrame::new(&self.wire()))
+                .as_ref()
+                .map_err(write_failure)?;
+            return codec
+                .write_preframed(writer, frame)
+                .map_err(|error| write_failure(&error));
+        }
         match &self.encoded_response {
             Some(response) => codec.write_encoded_response(
                 writer,
@@ -116,13 +188,15 @@ impl Outbound {
             ),
             None => codec.write(writer, &self.wire()),
         }
+        .map_err(|error| write_failure(&error))
     }
+
     pub(crate) fn wire(&self) -> ServerEnvelopeRef<'_> {
         ServerEnvelopeRef {
             version: self.version,
             request_id: self.request_id,
             proof: &self.proof,
-            message: &self.message,
+            message: self.message(),
         }
     }
 }
@@ -133,9 +207,32 @@ impl From<ServerEnvelope> for Outbound {
             version: value.version,
             request_id: value.request_id,
             proof: Arc::new(value.proof),
-            message: value.message,
+            payload: Payload::Direct(value.message),
             encoded_response: None,
         }
+    }
+}
+
+/// Why a frame never reached the client, in the words the daemon log uses.
+fn write_failure(error: &FrameError) -> String {
+    match error {
+        FrameError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+            ) =>
+        {
+            "the client socket could not be written within its send timeout".to_owned()
+        }
+        FrameError::Io(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::BrokenPipe | io::ErrorKind::ConnectionReset
+            ) =>
+        {
+            "the client closed its connection".to_owned()
+        }
+        error => format!("a frame could not be written to the client: {error}"),
     }
 }
 
@@ -234,11 +331,11 @@ impl QueueState {
     }
 
     fn enqueue(&mut self, message: Outbound) {
-        if let Some(key) = coalescible(&message.message) {
+        if let Some(key) = coalescible(message.message()) {
             let position = self.popped + self.messages.len() as u64;
             self.slots.insert(key, position);
         }
-        if bulk_page(&message.message) {
+        if bulk_page(message.message()) {
             self.queued_bulk_pages += 1;
         }
         self.messages.push_back(message);
@@ -246,12 +343,12 @@ impl QueueState {
 
     fn dequeue(&mut self) -> Option<Outbound> {
         let message = self.messages.pop_front()?;
-        if let Some(key) = coalescible(&message.message)
+        if let Some(key) = coalescible(message.message())
             && self.slots.get(&key) == Some(&self.popped)
         {
             self.slots.remove(&key);
         }
-        if bulk_page(&message.message) {
+        if bulk_page(message.message()) {
             self.queued_bulk_pages -= 1;
         }
         self.popped += 1;
@@ -412,10 +509,10 @@ impl DeliveryQueue {
     /// when its backlog is full.
     fn admit(&self, state: &mut QueueState, message: Outbound) -> Result<(), DeliveryError> {
         // Coalesce through the indexed slot instead of scanning the queue.
-        if let Some(key) = coalescible(&message.message)
+        if let Some(key) = coalescible(message.message())
             && let Some(index) = state.slot(key)
         {
-            match &message.message {
+            match message.message() {
                 ServerMessage::Event {
                     event: crate::terminal_ipc::WireTerminalEvent::Bell,
                     ..
@@ -425,18 +522,26 @@ impl DeliveryQueue {
                     // metadata events, which clients would then reject as old.
                     return Ok(());
                 }
-                ServerMessage::Redraw { generation, .. } => {
-                    let generation = *generation;
+                ServerMessage::Redraw {
+                    terminal_id,
+                    generation,
+                } => {
+                    let existing = &mut state.messages[index];
                     if let ServerMessage::Redraw {
                         generation: queued, ..
-                    } = &mut state.messages[index].message
+                    } = existing.message()
                     {
-                        *queued = (*queued).max(generation);
+                        if generation > queued {
+                            existing.payload = Payload::Direct(ServerMessage::Redraw {
+                                terminal_id: *terminal_id,
+                                generation: *generation,
+                            });
+                        }
                         return Ok(());
                     }
                 }
                 ServerMessage::ChatChanged { .. } | ServerMessage::MobileChanged { .. }
-                    if state.messages[index].message == message.message =>
+                    if state.messages[index].message() == message.message() =>
                 {
                     return Ok(());
                 }
@@ -444,7 +549,7 @@ impl DeliveryQueue {
                     let generation = *generation;
                     let existing = &state.messages[index];
                     let same_proof = existing.proof == message.proof;
-                    let queued = match &existing.message {
+                    let queued = match existing.message() {
                         ServerMessage::ChatActivity {
                             generation: queued, ..
                         } => Some(*queued),
@@ -464,7 +569,7 @@ impl DeliveryQueue {
                     if existing.proof == message.proof
                         && let ServerMessage::WorkBoard {
                             revision: queued, ..
-                        } = &existing.message
+                        } = existing.message()
                     {
                         // These are complete snapshots. A later board may
                         // replace an earlier publication in place, but never
@@ -481,7 +586,7 @@ impl DeliveryQueue {
                     if existing.proof == message.proof
                         && let ServerMessage::DeviceStats {
                             revision: queued, ..
-                        } = &existing.message
+                        } = existing.message()
                     {
                         if revision >= queued {
                             state.messages[index] = message;
@@ -494,7 +599,7 @@ impl DeliveryQueue {
         }
 
         let bulk_backlog =
-            bulk_page(&message.message) && state.queued_bulk_pages >= MAX_QUEUED_BULK_PAGES;
+            bulk_page(message.message()) && state.queued_bulk_pages >= MAX_QUEUED_BULK_PAGES;
         if state.backlog() >= self.capacity || bulk_backlog {
             return Err(self.overflow(state, message));
         }
@@ -528,14 +633,14 @@ impl DeliveryQueue {
             version: PROTOCOL_VERSION,
             request_id: None,
             proof,
-            message: ServerMessage::Error(ProtocolError::new(
+            payload: Payload::Direct(ServerMessage::Error(ProtocolError::new(
                 ProtocolErrorCode::QueueFull,
                 format!(
                     "the cagents daemon dropped this connection: {queued} undelivered messages \
                      reached the per-client queue limit. Reconnect to resynchronize."
                 ),
                 true,
-            )),
+            ))),
         });
         state.close_after_drain = true;
         self.available.notify_all();
@@ -656,6 +761,116 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn current_writers_share_one_frame_and_older_writers_encode_their_version() {
+        use crate::terminal_ipc::{MAX_FRAME_BYTES, read_frame, write_frame};
+        let current = [DeliveryQueue::new(1, 8), DeliveryQueue::new(2, 8)];
+        let older = DeliveryQueue::new(3, 8);
+        older.speak_older(OlderClient::knowing(7, 7, 2));
+        let id = TerminalId::new();
+        let proof = Arc::new(redraw(id, 0).proof);
+        let notification = ServerMessage::Event {
+            terminal_id: id,
+            sequence: 9,
+            event: crate::terminal_ipc::WireTerminalEvent::TitleChanged {
+                title: "build output".into(),
+            },
+        };
+        publish(&proof, current.iter().chain([&older]), || {
+            notification.clone()
+        });
+        for queue in current.iter().chain([&older]) {
+            queue.close_after_drain();
+        }
+        let first = current[0].pop().unwrap();
+        let second = current[1].pop().unwrap();
+        let Payload::Shared(publication) = &first.payload else {
+            panic!("current watcher did not receive the shared publication");
+        };
+        assert!(std::ptr::eq(first.message(), second.message()));
+        assert!(publication.frame.get().is_none(), "queuing must not encode");
+
+        let write = |outbound: &Outbound| {
+            let mut bytes = Vec::new();
+            outbound
+                .write(&mut FrameCodec::new(MAX_FRAME_BYTES), &mut bytes)
+                .unwrap();
+            bytes
+        };
+        let old_wire = write(&older.pop().unwrap());
+        assert!(
+            publication.frame.get().is_none(),
+            "an older write must not populate the cache"
+        );
+        assert_eq!(
+            read_frame::<ServerEnvelope>(&mut old_wire.as_slice()).unwrap(),
+            Some(ServerEnvelope {
+                version: 7,
+                request_id: None,
+                proof: (*proof).clone(),
+                message: notification.clone(),
+            })
+        );
+
+        let first_wire = write(&first);
+        assert!(matches!(publication.frame.get(), Some(Ok(_))));
+        assert_eq!(write(&second), first_wire);
+        let mut expected_wire = Vec::new();
+        write_frame(
+            &mut expected_wire,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: None,
+                proof: (*proof).clone(),
+                message: notification,
+            },
+        )
+        .unwrap();
+        assert_eq!(first_wire, expected_wire);
+    }
+
+    #[test]
+    fn coalescing_replaces_one_watchers_edge_after_another_has_written_it() {
+        use crate::{
+            agent::ActivityState,
+            terminal_ipc::{MAX_FRAME_BYTES, read_frame},
+        };
+        let queues = [DeliveryQueue::new(1, 8), DeliveryQueue::new(2, 8)];
+        let chat_id = TerminalId::new();
+        let proof = Arc::new(redraw(chat_id, 0).proof);
+        let activity = |generation| ServerMessage::ChatActivity {
+            chat_id,
+            state: ActivityState::Working,
+            generation,
+        };
+        publish(&proof, queues.iter(), || activity(1));
+        assert_eq!(queues[0].queued(), 1);
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        let first = queues[0].pop().unwrap();
+        first.write(&mut codec, &mut std::io::sink()).unwrap();
+
+        let ordered = ServerMessage::HostShuttingDown;
+        queues[1]
+            .push(Outbound::broadcast(&proof, ordered.clone()))
+            .unwrap();
+        publish(&proof, queues.iter(), || activity(3));
+        publish(&proof, queues.iter(), || activity(2));
+
+        let mut bytes = Vec::new();
+        for queue in &queues {
+            queue.close_after_drain();
+            while let Some(outbound) = queue.pop() {
+                outbound.write(&mut codec, &mut bytes).unwrap();
+            }
+        }
+        let mut bytes = bytes.as_slice();
+        let messages: Vec<_> =
+            std::iter::from_fn(|| read_frame::<ServerEnvelope>(&mut bytes).unwrap())
+                .map(|envelope| envelope.message)
+                .collect();
+        assert_eq!(messages, [activity(3), activity(3), ordered]);
+    }
 
     #[test]
     fn encoded_transcripts_keep_wire_bytes_and_bulk_page_credits() {
@@ -825,18 +1040,18 @@ mod tests {
             "the undecodable notification is withheld"
         );
         assert!(matches!(
-            delivered[0].message,
+            delivered[0].message(),
             ServerMessage::Response {
                 response: ServerResponse::Listed { .. }
             }
         ));
         assert_eq!(delivered[1].request_id, Some(2));
         assert!(matches!(
-            &delivered[1].message,
+            delivered[1].message(),
             ServerMessage::Error(error) if error.code == ProtocolErrorCode::UnsupportedVersion
         ));
         assert!(matches!(
-            delivered[2].message,
+            delivered[2].message(),
             ServerMessage::Redraw { generation: 9, .. }
         ));
     }
@@ -884,7 +1099,7 @@ mod tests {
             if let Some(client) = client {
                 outbound = outbound.for_older(client).unwrap();
             }
-            assert!(matches!(outbound.message, ServerMessage::Response { .. }));
+            assert!(matches!(outbound.message(), ServerMessage::Response { .. }));
             let mut bytes = Vec::new();
             crate::terminal_ipc::write_frame(&mut bytes, &outbound.wire()).unwrap();
             bytes
@@ -927,7 +1142,7 @@ mod tests {
         assert_eq!(queue.pop().unwrap().request_id, Some(1));
         let published = queue.pop().unwrap();
         assert_eq!(published.request_id, None);
-        assert!(matches!(published.message,
+        assert!(matches!(published.into_message(),
             ServerMessage::WorkBoard { revision: 128, board }
                 if board.generated_at_unix_ms == 128
                     && board.linear_unavailable.as_ref().unwrap().len() == 64 * 1024
@@ -936,7 +1151,7 @@ mod tests {
         // A drained slot cannot swallow the next publication.
         queue.push(work_board(129)).unwrap();
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::WorkBoard { revision: 129, .. }
         ));
     }
@@ -949,7 +1164,7 @@ mod tests {
         replacement.proof.host_incarnation = HostIncarnation::new("replacement");
         queue.push(replacement.clone()).unwrap();
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::WorkBoard { revision: 5, .. }
         ));
         assert_eq!(queue.pop().unwrap().wire().proof, &replacement.proof);
@@ -979,7 +1194,7 @@ mod tests {
             assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
             let first = queue.pop().unwrap();
             assert_eq!(first.request_id, Some(1));
-            assert!(matches!(first.message,
+            assert!(matches!(first.into_message(),
                 ServerMessage::Response { response } if response == page
             ));
             assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
@@ -989,7 +1204,7 @@ mod tests {
             assert_eq!(queue.pop().unwrap().request_id, Some(2));
             assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
             assert!(matches!(
-                queue.pop().unwrap().message,
+                queue.pop().unwrap().into_message(),
                 ServerMessage::WorkBoard { revision: 4, .. }
             ));
             queue.push(reply(4, page.clone())).unwrap();
@@ -999,7 +1214,7 @@ mod tests {
                 assert_eq!(state.queued_bulk_pages, 0);
                 assert!(state.slots.is_empty());
             }
-            let ServerMessage::Error(error) = queue.pop().unwrap().message else {
+            let ServerMessage::Error(error) = queue.pop().unwrap().into_message() else {
                 panic!("bulk overflow must explain why the connection closed")
             };
             assert_eq!(error.code, ProtocolErrorCode::QueueFull);
@@ -1019,7 +1234,7 @@ mod tests {
 
         let delivered = queue.pop().unwrap();
         assert!(matches!(
-            delivered.message,
+            delivered.into_message(),
             ServerMessage::Redraw { generation: 11, .. }
         ));
     }
@@ -1054,7 +1269,7 @@ mod tests {
             queue.push(envelope.clone()).unwrap();
         }
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::Event {
                 sequence: 1,
                 event: crate::terminal_ipc::WireTerminalEvent::Bell,
@@ -1062,7 +1277,7 @@ mod tests {
             }
         ));
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::Event {
                 sequence: 2,
                 event: crate::terminal_ipc::WireTerminalEvent::Completed { .. },
@@ -1072,7 +1287,7 @@ mod tests {
         // A new attention edge after the old slot drains must remain visible.
         queue.push(envelope).unwrap();
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::Event {
                 sequence: 9999,
                 event: crate::terminal_ipc::WireTerminalEvent::Bell,
@@ -1091,7 +1306,7 @@ mod tests {
         queue.push(redraw(first, 1)).unwrap();
         queue.push(redraw(second, 1)).unwrap();
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::Redraw { generation: 1, .. }
         ));
         queue.push(redraw(first, 2)).unwrap();
@@ -1101,7 +1316,7 @@ mod tests {
             let ServerMessage::Redraw {
                 terminal_id,
                 generation,
-            } = message.message
+            } = message.into_message()
             else {
                 panic!("queue delivered an unexpected message kind");
             };
@@ -1134,11 +1349,11 @@ mod tests {
             queue.push(envelope.clone()).unwrap();
         }
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::ChatObserved { .. }
         ));
         assert!(matches!(
-            queue.pop().unwrap().message,
+            queue.pop().unwrap().into_message(),
             ServerMessage::ChatActivity {
                 state: ActivityState::Waiting,
                 generation: 5,
@@ -1180,7 +1395,7 @@ mod tests {
         queue.push(page(2)).unwrap();
         let first = queue.pop().unwrap();
         assert_eq!(first.request_id, Some(1));
-        assert!(matches!(first.message, ServerMessage::Response {
+        assert!(matches!(first.into_message(), ServerMessage::Response {
             response: ServerResponse::ChatTextCopy { page, .. }
         } if page.offset == 0 && page.text.len() == crate::chat::TEXT_COPY_PAGE_BYTES));
         // Draining one page admits the next; a third retained page must still
@@ -1189,7 +1404,7 @@ mod tests {
         assert_eq!(queue.push(page(4)), Err(DeliveryError::Full));
         assert_eq!(queue.push(page(4)), Err(DeliveryError::Closed));
         let delivered = queue.pop().unwrap();
-        let ServerMessage::Error(error) = delivered.message else {
+        let ServerMessage::Error(error) = delivered.into_message() else {
             panic!("a stalled text-copy peer was not told why");
         };
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
@@ -1219,7 +1434,7 @@ mod tests {
         let order = |queue: &DeliveryQueue| {
             queue.close_after_drain();
             std::iter::from_fn(|| queue.pop())
-                .map(|queued| match queued.message {
+                .map(|queued| match queued.into_message() {
                     ServerMessage::Event { sequence, .. } => format!("event {sequence}"),
                     ServerMessage::Response { .. } => "reply".into(),
                     ServerMessage::Error(error) => format!("{:?}", error.code),
@@ -1290,7 +1505,7 @@ mod tests {
                 continue;
             }
             let notice = queue.pop().unwrap();
-            assert!(matches!(notice.message, ServerMessage::Error(_)));
+            assert!(matches!(notice.message(), ServerMessage::Error(_)));
             assert_eq!(Arc::strong_count(&proof), 1 + 1);
             drop(notice);
             assert!(queue.pop().is_none());
@@ -1311,7 +1526,7 @@ mod tests {
         assert_eq!(queue.push(envelope), Err(DeliveryError::Closed));
 
         let delivered = queue.pop().unwrap();
-        let ServerMessage::Error(error) = delivered.message else {
+        let ServerMessage::Error(error) = delivered.into_message() else {
             panic!("a severed client was not told why");
         };
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
