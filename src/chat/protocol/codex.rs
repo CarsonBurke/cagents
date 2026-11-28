@@ -3082,6 +3082,7 @@ impl Codex {
                 }
                 Pending::Config => {
                     let config = &result["config"];
+                    let token_budget = &config["features"]["token_budget"];
                     self.context_config = ContextConfig {
                         // A limit scoped to what grows after the carried
                         // prefix doesn't bound the whole context the reading
@@ -3100,6 +3101,10 @@ impl Codex {
                         post_turn_percent: config["model_post_turn_compact_threshold_percent"]
                             .as_u64()
                             .filter(|percent| (1..=100).contains(percent))
+                            // Token-budget mode uses its own rollover policy.
+                            // Model and account activation are resolved
+                            // internally by Codex.
+                            .filter(|_| token_budget != true && token_budget["enabled"] != true)
                             .and_then(|percent| u8::try_from(percent).ok()),
                     };
                     if let Some(usage) = &mut self.usage {

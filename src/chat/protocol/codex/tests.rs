@@ -7789,8 +7789,16 @@ fn codex_compacts_where_its_effective_configuration_says() {
             155_040,
         ),
         (
-            json!({"model_post_turn_compact_threshold_percent":57}),
-            147_288,
+            json!({"model_post_turn_compact_threshold_percent":60,"features":{"token_budget":true}}),
+            244_800,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":60,"features":{"token_budget":{"enabled":true}}}),
+            244_800,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":60,"features":{"token_budget":false}}),
+            155_040,
         ),
         (
             json!({"model_context_window":400000,"model_post_turn_compact_threshold_percent":50}),
