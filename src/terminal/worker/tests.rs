@@ -4309,7 +4309,27 @@ fn transcript_writer_caps_output_and_pruning_keeps_the_marked_file() {
 }
 
 #[test]
-fn transcript_writer_recognizes_a_marker_below_the_cap_on_reopen() {
+fn transcript_writer_continues_after_a_literal_marker_below_the_cap() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("terminal.log");
+    let terminal = TerminalId::new();
+    let writer = TranscriptWriter::start(path.clone(), terminal, 8, 128).unwrap();
+    writer.send(b"before\n".to_vec()).unwrap();
+    writer.send(TRANSCRIPT_TRUNCATED_MARKER.to_vec()).unwrap();
+    writer.finish();
+
+    let reopened = TranscriptWriter::start(path.clone(), terminal, 8, 128).unwrap();
+    assert!(reopened.accepts());
+    reopened.send(b"after\n".to_vec()).unwrap();
+    reopened.finish();
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        [b"before\n", TRANSCRIPT_TRUNCATED_MARKER, b"after\n"].concat()
+    );
+}
+
+#[test]
+fn transcript_writer_persists_an_early_cap_on_reopen() {
     let root = tempdir().unwrap();
     let path = root.path().join("terminal.log");
     let terminal = TerminalId::new();
@@ -4326,6 +4346,77 @@ fn transcript_writer_recognizes_a_marker_below_the_cap_on_reopen() {
     reopened.send(b"must stay discarded".to_vec()).unwrap();
     reopened.finish();
     assert_eq!(fs::read(&path).unwrap(), capped);
+}
+
+#[test]
+fn transcript_writer_migrates_an_early_legacy_cap() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("terminal.log");
+    let capped = [b"before\n", TRANSCRIPT_TRUNCATED_MARKER].concat();
+    fs::write(&path, &capped).unwrap();
+
+    let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 8, 128).unwrap();
+    assert!(!writer.accepts());
+    writer.send(b"discarded".to_vec()).unwrap();
+    writer.finish();
+    assert_eq!(fs::read(&path).unwrap(), capped);
+    assert_eq!(
+        crate::fs_safety::read_attribute_with_limit(
+            &File::open(path).unwrap(),
+            TRANSCRIPT_CAP_ATTRIBUTE,
+            1
+        )
+        .unwrap()
+        .as_deref(),
+        Some(TRANSCRIPT_CAPPED)
+    );
+}
+
+#[test]
+fn transcript_writer_keeps_a_persisted_cap_without_a_marker() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("terminal.log");
+    fs::write(&path, b"saved before the cap\n").unwrap();
+    let file = open_private_read_append_file(&path).unwrap();
+    // The host stopped after committing the metadata but before the marker.
+    assert!(set_transcript_cap(&file, true));
+    drop(file);
+
+    let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 8, 128).unwrap();
+    assert!(!writer.accepts());
+    writer.send(b"discarded".to_vec()).unwrap();
+    writer.finish();
+    assert_eq!(fs::read(&path).unwrap(), b"saved before the cap\n");
+}
+
+#[test]
+fn transcript_writer_cap_follows_the_inherited_file_across_terminal_owners() {
+    let root = tempdir().unwrap();
+    let original = TerminalId::new();
+    let resumed = TerminalId::new();
+    let path = root.path().join(format!("{original}.log"));
+    let writer = TranscriptWriter::start(path.clone(), original, 8, 128).unwrap();
+    writer.send(b"before\n".to_vec()).unwrap();
+    writer.send(vec![b'x'; 128]).unwrap();
+    writer.finish();
+
+    let saved = [b"before\n", TRANSCRIPT_TRUNCATED_MARKER].concat();
+    let inherited = TranscriptWriter::start(path.clone(), resumed, 8, 128).unwrap();
+    assert!(!inherited.accepts());
+    inherited.send(b"discarded".to_vec()).unwrap();
+    inherited.finish();
+    assert_eq!(fs::read(&path).unwrap(), saved);
+
+    // Pruning or replacement ends the old file's lifetime. A fresh inode at
+    // the same path is writable even when the resumed terminal ID is reused.
+    let old = root.path().join("old.log");
+    fs::rename(&path, &old).unwrap();
+    let fresh = TranscriptWriter::start(path.clone(), resumed, 8, 128).unwrap();
+    assert!(fresh.accepts());
+    fresh.send(b"new file\n".to_vec()).unwrap();
+    fresh.finish();
+    assert_eq!(fs::read(&path).unwrap(), b"new file\n");
+    assert_eq!(fs::read(&old).unwrap(), saved);
 }
 
 #[test]
