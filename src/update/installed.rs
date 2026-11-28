@@ -2349,12 +2349,9 @@ exit 1"#,
                             job.phase == UpdatePhase::Installing
                                 && job.message == WAITING_FOR_STARTUP
                         }),
-                    "write-error" => fs::read_dir(root.path().join("state")).unwrap().any(|row| {
-                        row.unwrap()
-                            .file_name()
-                            .to_string_lossy()
-                            .starts_with("status-")
-                    }),
+                    "write-error" => fs::read_to_string(&stderr)
+                        .unwrap()
+                        .contains(WAITING_FOR_STARTUP),
                     "panic" => root.path().join("reporter-entered").exists(),
                     _ => unreachable!(),
                 };
