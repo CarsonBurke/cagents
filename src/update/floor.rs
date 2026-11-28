@@ -407,11 +407,17 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         let chats = client.list_chats()?;
         let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
         let mut in_flight = Vec::new();
+        let mut resume_points = BTreeMap::new();
         for chat in &chats {
             let snapshot = client.capture_chat_snapshot(chat.clone())?;
             // Read before the page keeps only what a reader shows.
             let work = self.survivors.observe_in_flight(chat, &snapshot);
             if !work.is_empty() {
+                if let Some(point) =
+                    super::in_flight::ResumePoint::capture(chat.launch.provider, &snapshot)
+                {
+                    resume_points.insert(chat.id, point);
+                }
                 in_flight.push(work);
             }
             snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
@@ -442,6 +448,7 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             .fit_pages(&self.proof, daemon, self.guard.prepared_window_slots())
             .map_err(invalid)?;
         self.survivors.record_census(self.reviewed, daemon, &census);
+        self.survivors.resume_points = resume_points;
         let census = self.original_census.insert(census);
         crate::upgrade::recovery::capture_before_floor(
             &self.proof,
@@ -566,7 +573,15 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         daemon: &impact::DaemonImpact,
         chat: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, UpdateError> {
-        source_client_for(daemon)?.close_chat(chat)
+        let snapshot = source_client_for(daemon)?.close_chat(chat.clone())?;
+        // Review can stay open across new turns. Use the transcript the
+        // actual close acknowledged for this conversation.
+        self.survivors.resume_points.remove(&chat.id);
+        if let Some(point) = super::in_flight::ResumePoint::capture(chat.launch.provider, &snapshot)
+        {
+            self.survivors.resume_points.insert(chat.id, point);
+        }
+        Ok(snapshot)
     }
     fn capture_record(
         &mut self,
@@ -665,6 +680,11 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             self.survivors
                 .ended
                 .insert((item.kind, item.id), item.clone());
+        }
+        if service {
+            // Service shutdown fences inventory, not the turns running while
+            // its separate consent prompt is open. It returns no final pages.
+            self.survivors.resume_points.clear();
         }
         self.survivors.service_stopped |= service;
         self.survivors.background_tasks = background_tasks;
@@ -1332,6 +1352,7 @@ pub(super) struct Survivors {
     /// The census's work in flight, and what the reviewed source said would
     /// become of each conversation, captured together before preparation.
     in_flight: Vec<super::in_flight::InFlight>,
+    resume_points: BTreeMap<TerminalId, super::in_flight::ResumePoint>,
     capture_dispositions: BTreeMap<TerminalId, impact::Disposition>,
     /// The confirmed successor serves and has finished its restore.
     successor_serving: bool,
@@ -1825,6 +1846,7 @@ impl Survivors {
                         .or_else(|| self.interrupted.get(&key).map(|turn| &turn.label))
                         .cloned()
                         .unwrap_or_default(),
+                    resume_point: self.resume_points.get(&work.id).cloned(),
                     work,
                     fate,
                 }

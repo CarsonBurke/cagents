@@ -5,6 +5,7 @@
 use super::{Adapter, ProcessSpec, QueuedInput, Step};
 use crate::account::{self, LiveReport};
 use crate::agent::Provider;
+use crate::agent::claude::{element, model_only_note, stop_record, without_preface};
 use crate::chat;
 use crate::chat::{
     AgentAddress, Answer, Attachment, AttachmentRules, Capabilities, Choice, Command,
@@ -6368,31 +6369,6 @@ fn injected(content: &Value) -> Injected<'_> {
     }
 }
 
-/// Whether `text` is wholly one of the notes Claude Code writes for the
-/// model alone; see [`Injected::ModelOnly`].
-pub(crate) fn model_only_note(text: &str) -> bool {
-    let text = text.trim();
-    let wrapped = |tag: &str| {
-        let mut rest = text;
-        let (open, close) = (format!("<{tag}>"), format!("</{tag}>"));
-        while let Some(inner) = rest.strip_prefix(open.as_str()) {
-            let Some((_, after)) = inner.split_once(close.as_str()) else {
-                return false;
-            };
-            rest = after.trim_start();
-            if rest.is_empty() {
-                return true;
-            }
-        }
-        false
-    };
-    image_note(text)
-        || wrapped("system-reminder")
-        || wrapped("local-command-caveat")
-        || wrapped("fork-boilerplate")
-        || (text.starts_with("(Re-invocation of /") && text.ends_with(')'))
-}
-
 /// What a reader is told when the model refused and Claude Code withdrew its
 /// reply to answer with another model. The frame is the harness's record of
 /// the switch, not words for a reader.
@@ -6411,31 +6387,6 @@ fn local_command_output(text: &str) -> Option<String> {
                 .strip_suffix(&format!("</{tag}>"))
         })?;
     Some(clean_permission_text(inner).trim().to_owned())
-}
-
-/// Claude Code's notes on an image: how it scaled one a tool returned, such
-/// as `[Image: original 2600x1800, displayed at 2306x1596. Multiply
-/// coordinates by 1.13 to map to original image.]`, or where it saved one the
-/// reader attached, as `[Image: source: /path/1.png]`. Every line must be one
-/// whole note, so a note followed by anything else still shows, even when
-/// that ends in a bracket of its own. A saved path may hold brackets, but a
-/// closing one before more words ends its note.
-fn image_note(text: &str) -> bool {
-    let note = |line: &str| {
-        line.strip_prefix("[Image: ")
-            .and_then(|rest| rest.strip_suffix(']'))
-            .is_some_and(|rest| match rest.strip_prefix("source: ") {
-                Some(path) => !path.contains("] "),
-                None => {
-                    !rest.contains(['[', ']'])
-                        && rest
-                            .strip_prefix("original ")
-                            .is_some_and(|rest| rest.contains(", displayed at "))
-                }
-            })
-    };
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    lines.next().is_some_and(note) && lines.all(note)
 }
 
 /// The name Claude Code's context steps carry, as a call to no tool of the
@@ -6670,40 +6621,6 @@ impl Peer {
             body: body.trim().into(),
         }
     }
-}
-
-/// `content` after the `Another Claude session sent a message:` line the
-/// harness introduces a peer's envelope with, where there is one.
-fn without_preface(content: &str) -> &str {
-    match content.split_once('\n') {
-        Some((preface, rest))
-            if preface.starts_with("Another Claude session sent a message")
-                && preface.ends_with(':') =>
-        {
-            rest
-        }
-        _ => content,
-    }
-}
-
-/// Splits an element whose opening tag is a line of its own into its
-/// attributes, its body and whatever follows its closing tag, which must
-/// also stand on a line of its own. `content` starts at the opening tag.
-fn element<'a>(content: &'a str, tag: &str) -> Option<(&'a str, &'a str, &'a str)> {
-    let (open, rest) = content.split_once('\n')?;
-    let attributes = open
-        .strip_prefix('<')?
-        .strip_prefix(tag)?
-        .strip_suffix('>')?;
-    if !(attributes.is_empty() || attributes.starts_with(' ')) {
-        return None;
-    }
-    let close = format!("</{tag}>");
-    if let Some(after) = rest.strip_prefix(&close) {
-        return Some((attributes, "", after));
-    }
-    let end = rest.find(&format!("\n{close}"))?;
-    Some((attributes, &rest[..end], &rest[end + 1 + close.len()..]))
 }
 
 /// The value of attribute `name` among an element's `attributes`, with the
@@ -7873,23 +7790,6 @@ fn harness_error(text: String) -> String {
     } else {
         format!("{said}\n{hint}")
     }
-}
-
-/// Whether a user message is Claude Code's record that the person stopped
-/// the turn, which it adds as though the person had written it.
-fn stop_record(message: &Value) -> bool {
-    let text = match &message["content"] {
-        Value::String(text) => text.as_str(),
-        Value::Array(blocks) => match blocks.as_slice() {
-            [block] if string(block, "type") == "text" => string(block, "text"),
-            _ => return false,
-        },
-        _ => return false,
-    };
-    matches!(
-        text.trim(),
-        "[Request interrupted by user]" | "[Request interrupted by user for tool use]"
-    )
 }
 
 fn interrupt_generation(request: &Value) -> Option<u64> {

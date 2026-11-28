@@ -20,6 +20,9 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+mod resume_point;
+pub use resume_point::ResumePoint;
+
 /// Tasks kept for one conversation; the rest are only counted.
 pub(crate) const MAX_TASKS: usize = 32;
 /// Queued messages kept for one conversation; the rest are only counted.
@@ -191,6 +194,10 @@ impl InFlight {
 pub struct Outcome {
     #[serde(flatten)]
     pub work: InFlight,
+    /// The newest provider turn seen before the update stopped work. Stored
+    /// only in the terminal job so the legacy rollback census keeps its bytes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resume_point: Option<ResumePoint>,
     /// What the update review called the conversation.
     #[serde(default)]
     pub label: String,
@@ -483,6 +490,7 @@ mod tests {
             serde_json::json!({ "id": id })
         );
         let round_trip = Outcome {
+            resume_point: None,
             work: InFlight {
                 id,
                 turn: true,

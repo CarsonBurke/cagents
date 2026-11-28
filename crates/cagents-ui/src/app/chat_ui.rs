@@ -8,6 +8,7 @@ use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
 use crate::model::{ChatDraftModel, ExitedQueueKey, RestoredQueue, SavedQueue, SentAfter};
 use crate::performance::chat_stage::{self, Stage};
+use crate::update::in_flight::ResumePoint;
 use base64::Engine as _;
 use cosmic::widget::text_editor;
 use std::sync::{
@@ -1655,7 +1656,7 @@ pub(super) struct State {
     blocked_starts: HashMap<CardId, blocked_recovery::BlockedStart>,
     /// A message to resume a conversation's stopped work, held for a card
     /// reopening without a chat runtime until its conversation attaches.
-    held_for_start: HashMap<CardId, String>,
+    held_for_start: HashMap<CardId, HeldUpdateResume>,
     /// Cards given a message to resume stopped work that are on their way
     /// to taking it, with how many more of their pane's ways back they may
     /// still take for it. Once attached, one whose provider is still stopped
@@ -3473,6 +3474,18 @@ struct Followup {
     attachments: Vec<Attachment>,
 }
 
+struct HeldUpdateResume {
+    text: String,
+    point: Option<ResumePoint>,
+}
+
+struct ResumeGuard {
+    id: u64,
+    point: ResumePoint,
+    /// The connection and turn that asked, and whether its read has returned.
+    checked: Option<(Target, u64, bool)>,
+}
+
 /// A provider's queued message on its way back to the composer.
 ///
 /// Removing a message races the agent starting on it, and the provider alone
@@ -3758,6 +3771,7 @@ pub(super) struct Runtime {
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
     followups: Vec<Followup>,
+    resume_guards: Vec<ResumeGuard>,
     /// The place of the next thing the reader writes: a held follow-up's ID,
     /// or a message's, so that what comes back to the composer from both
     /// comes back in the order written.
@@ -5068,7 +5082,7 @@ impl Runtime {
 
     /// Holds `text` for the turn after the running one, as a message written
     /// in the composer and queued would be.
-    fn hold_followup(&mut self, text: String) {
+    fn hold_followup(&mut self, text: String) -> u64 {
         let id = self.next_written;
         self.next_written += 1;
         self.followups.push(Followup {
@@ -5078,6 +5092,44 @@ impl Runtime {
             attachments: Vec::new(),
         });
         let _ = self.present();
+        id
+    }
+
+    fn hold_update_resume(&mut self, held: HeldUpdateResume) {
+        let id = self.hold_followup(held.text);
+        if let Some(point) = held.point {
+            self.resume_guards.push(ResumeGuard {
+                id,
+                point,
+                checked: None,
+            });
+        }
+    }
+
+    fn discard_superseded_resumes(&mut self) -> bool {
+        if self.resume_guards.is_empty() || !self.commands.is_idle() {
+            return false;
+        }
+        let snapshot = self.latest_snapshot();
+        let provider = self.session.launch.provider;
+        let before = self.followups.len();
+        self.followups.retain(|followup| {
+            !self.resume_guards.iter().any(|guard| {
+                guard.id == followup.id
+                    && (!guard.point.matches_launch(&self.session.launch)
+                        || guard.point.advanced_in(provider, &snapshot))
+            })
+        });
+        self.resume_guards.retain(|guard| {
+            self.followups
+                .iter()
+                .any(|followup| followup.id == guard.id)
+        });
+        if before == self.followups.len() {
+            return false;
+        }
+        let _ = self.present();
+        true
     }
 
     /// Returns every held follow-up to the composer, in the order written.
@@ -5569,6 +5621,7 @@ impl Runtime {
             agent_addresses: Default::default(),
             queued: None,
             followups: Vec::new(),
+            resume_guards: Vec::new(),
             next_written: 0,
             recalling: Vec::new(),
             taken_back: Vec::new(),
@@ -10661,9 +10714,9 @@ impl Cagents {
             if open_cards.contains(card) {
                 let draft = chat_drafts.entry(*card).or_default();
                 *draft = if draft.is_empty() {
-                    held.clone()
+                    held.text.clone()
                 } else {
-                    format!("{held}\n{draft}")
+                    format!("{}\n{draft}", held.text)
                 };
             }
         }
@@ -13518,22 +13571,39 @@ impl Cagents {
         )
     }
 
+    pub(super) fn chat_update_resume_advanced(&self, card: CardId, point: &ResumePoint) -> bool {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime),
+            _ => self.chat_ui.parked.get(&card),
+        };
+        runtime.is_some_and(|runtime| {
+            runtime.connected()
+                && point.advanced_in(runtime.session.launch.provider, &runtime.latest_snapshot())
+        })
+    }
+
     /// Asks the conversation in `card` to pick up the work an update stopped,
     /// with `text`. The message is held like a queued follow-up, which the
     /// reader can see, change or take back, and goes out once the provider
     /// is ready and idle. A conversation whose provider stopped first takes
     /// the way back its pane offers, as pressing it would. `None` when the
     /// card cannot take a message.
-    pub(super) fn resume_lost_work(&mut self, card: CardId, text: String) -> Option<Task<Message>> {
+    pub(super) fn resume_lost_work(
+        &mut self,
+        card: CardId,
+        text: String,
+        point: Option<ResumePoint>,
+    ) -> Option<Task<Message>> {
         if !self.chat_takes_resume(card) {
             return None;
         }
+        let held = HeldUpdateResume { text, point };
         let starting = self.chat_start_pending(card);
         let fresh = self.chat_offers_fresh_conversation(card);
         match self.cards.get_mut(&card) {
             Some(CardRuntime::Chat(runtime)) if starting => {
                 // What it attaches to says whether it takes the message.
-                runtime.hold_followup(text);
+                runtime.hold_update_resume(held);
                 self.chat_ui
                     .resuming_on_attach
                     .insert(card, RESUME_RECOVERIES);
@@ -13542,7 +13612,7 @@ impl Cagents {
             }
             Some(CardRuntime::Chat(runtime)) => {
                 let readiness = runtime.readiness(false, fresh);
-                runtime.hold_followup(text);
+                runtime.hold_update_resume(held);
                 let target = runtime.target;
                 self.persist();
                 Some(match readiness {
@@ -13556,7 +13626,7 @@ impl Cagents {
                 })
             }
             _ => {
-                self.chat_ui.held_for_start.insert(card, text);
+                self.chat_ui.held_for_start.insert(card, held);
                 self.chat_ui
                     .resuming_on_attach
                     .insert(card, RESUME_RECOVERIES);
@@ -13607,6 +13677,40 @@ impl Cagents {
         }
     }
 
+    /// A recovered conversation may attach with a frozen page or have its
+    /// history off screen. Recheck the provider's saved history at dispatch.
+    pub(super) fn update_resume_dispatch_checked(
+        &mut self,
+        target: Target,
+        turn: u64,
+        checked: Vec<(u64, bool)>,
+    ) -> Task<Message> {
+        let Some(runtime) = self.chat_card_runtime_mut(target) else {
+            return Task::none();
+        };
+        let mut advanced = Vec::new();
+        for (id, continued) in checked {
+            if let Some(guard) = runtime
+                .resume_guards
+                .iter_mut()
+                .find(|guard| guard.id == id && guard.checked == Some((target, turn, false)))
+            {
+                guard.checked = Some((target, turn, true));
+                if continued {
+                    advanced.push(id);
+                }
+            }
+        }
+        if !advanced.is_empty() {
+            runtime
+                .followups
+                .retain(|followup| !advanced.contains(&followup.id));
+            let _ = runtime.present();
+            self.persist();
+        }
+        self.dispatch_queued(target)
+    }
+
     /// Takes the next step of sending a started draft's first message: its
     /// model, where one was chosen, and then the message.
     ///
@@ -13619,13 +13723,19 @@ impl Cagents {
     fn dispatch_queued(&mut self, target: Target) -> Task<Message> {
         let held = self.chat_ui.held_for_start.remove(&target.card);
         let Some(runtime) = self.chat_card_runtime_mut(target) else {
-            if let Some(text) = held {
-                self.chat_ui.held_for_start.insert(target.card, text);
+            if let Some(held) = held {
+                self.chat_ui.held_for_start.insert(target.card, held);
             }
             return Task::none();
         };
-        if let Some(text) = held {
-            runtime.hold_followup(text);
+        if let Some(held) = held {
+            runtime.hold_update_resume(held);
+        }
+        if runtime.discard_superseded_resumes() {
+            if runtime.resume_guards.is_empty() {
+                self.chat_ui.resuming_on_attach.remove(&target.card);
+            }
+            self.persist();
         }
         // A message to resume stopped work, held while its conversation
         // reopened, may find it reopened stopped: saved history read without
@@ -13673,9 +13783,39 @@ impl Cagents {
         if latest.ready
             && !latest.busy
             && !latest.exited
+            && !(latest.history_loading && !runtime.resume_guards.is_empty())
             && !runtime.followups.is_empty()
             && runtime.commands.outgoing().next().is_none()
         {
+            if !runtime.resume_guards.is_empty() && !crate::device::is_remote() {
+                let turn = latest.turn_generation;
+                let checks: Vec<_> = runtime
+                    .resume_guards
+                    .iter_mut()
+                    .filter_map(|guard| {
+                        if guard.checked.is_some_and(|(checked, generation, _)| {
+                            checked == target && generation == turn
+                        }) {
+                            return None;
+                        }
+                        guard.checked = Some((target, turn, false));
+                        Some((guard.id, guard.point.clone()))
+                    })
+                    .collect();
+                if !checks.is_empty() {
+                    let launch = runtime.session.launch.clone();
+                    return super::update_resume::check_resume_dispatch(
+                        target, turn, launch, checks,
+                    );
+                }
+                if runtime
+                    .resume_guards
+                    .iter()
+                    .any(|guard| guard.checked == Some((target, turn, false)))
+                {
+                    return Task::none();
+                }
+            }
             let (text, attachments) = runtime.combined_followups();
             // A queued message remains a prompt. Resolving it as an idle
             // slash command could discard everything combined after /compact.
@@ -15814,6 +15954,8 @@ impl Cagents {
                         }
                         let restored_queue = self.check_saved_reopened_queue_scope(target.card);
                         return Task::batch([
+                            self.observe_update_resume_advance(target.card),
+                            self.check_update_resume_history(),
                             submitted,
                             disconnect_task,
                             usage,
@@ -16307,7 +16449,7 @@ impl Cagents {
                     if queue_changed {
                         self.persist();
                     }
-                    return Task::none();
+                    return self.observe_update_resume_advance(target.card);
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -16416,6 +16558,7 @@ impl Cagents {
                             "wake tasks",
                         );
                         return Task::batch([
+                            self.observe_update_resume_advance(target.card),
                             settled,
                             refresh_limits,
                             self.list_chat_models(target.card),

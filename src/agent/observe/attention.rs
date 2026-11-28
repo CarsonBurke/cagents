@@ -240,7 +240,7 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
             // distinguishes repeated provider turn IDs in imported history.
             Some(Boundary::Outcome(kind, None))
         }
-        Format::Claude if value["type"] == "user" && claude_root_input(&value) => {
+        Format::Claude if value["type"] == "user" && crate::agent::claude::root_input(&value) => {
             Some(Boundary::ClaudeInput)
         }
         Format::Claude if value["type"] == "assistant" && value["isSidechain"] != true => {
@@ -256,79 +256,6 @@ fn boundary(line: &[u8], format: Format) -> Option<Boundary> {
         }
         _ => None,
     }
-}
-
-fn claude_root_input(value: &serde_json::Value) -> bool {
-    let origin = value.get("origin").filter(|origin| !origin.is_null());
-    if value["message"]["role"] != "user"
-        || value["uuid"].as_str().is_none_or(str::is_empty)
-        || !value["parent_tool_use_id"].is_null()
-        || !value["sourceToolUseID"].is_null()
-        || value["teamName"]
-            .as_str()
-            .is_some_and(|name| !name.is_empty())
-        || origin.is_some_and(|origin| origin["kind"] != "human")
-        || [
-            "isMeta",
-            "isSidechain",
-            "isSynthetic",
-            "isReplay",
-            "isCompactSummary",
-            "isVisibleInTranscriptOnly",
-        ]
-        .iter()
-        .any(|key| value[*key] == true)
-    {
-        return false;
-    }
-    let input_text = |text: &str| {
-        let text = text.trim();
-        !text.is_empty() && (origin.is_some() || !claude_context_only(text))
-    };
-    let content = &value["message"]["content"];
-    if let Some(text) = content.as_str() {
-        return input_text(text);
-    }
-    let Some(blocks) = content.as_array() else {
-        return false;
-    };
-    let mut has_input = false;
-    for block in blocks {
-        match block["type"].as_str() {
-            Some("text") => {
-                let Some(text) = block["text"].as_str() else {
-                    return false;
-                };
-                has_input |= input_text(text);
-            }
-            Some("image" | "document") if block["source"].is_object() => has_input = true,
-            _ => return false,
-        }
-    }
-    has_input
-}
-
-fn claude_context_only(mut text: &str) -> bool {
-    // Only a whole context envelope is a note. Preserve human text after
-    // the envelope, including when Claude puts both in one text block.
-    const WRAPPERS: &[(&str, &str)] = &[
-        ("<system-reminder>", "</system-reminder>"),
-        ("<task-notification>", "</task-notification>"),
-        ("<fork-boilerplate>", "</fork-boilerplate>"),
-        ("<local-command-caveat>", "</local-command-caveat>"),
-        ("<local-command-stdout>", "</local-command-stdout>"),
-        ("<local-command-stderr>", "</local-command-stderr>"),
-    ];
-    while let Some((rest, close)) = WRAPPERS
-        .iter()
-        .find_map(|&(open, close)| text.strip_prefix(open).map(|rest| (rest, close)))
-    {
-        let Some((_, trailing)) = rest.split_once(close) else {
-            return false;
-        };
-        text = trailing.trim_start();
-    }
-    text.is_empty() || crate::chat::protocol::claude::model_only_note(text)
 }
 
 #[cfg(test)]
