@@ -118,6 +118,45 @@ fn preserves_errno_when_flushing_to_a_closed_peer() {
     );
 }
 
+#[test]
+fn preserves_errno_when_the_peer_closes_during_dispatch() {
+    let (connection, _client, peer) = socket_pair();
+    let mut event_loop = EventLoop::try_new().unwrap();
+    let queue = connection.new_event_queue::<State>();
+    WaylandSource::new(connection.clone(), queue)
+        .insert(event_loop.handle())
+        .unwrap();
+
+    let error = WaylandFlush::default()
+        .dispatch(&connection, &event_loop.handle(), || {
+            // The flush preflight succeeded. The read source discovers EOF
+            // inside calloop, which wraps its error before returning it.
+            drop(peer);
+            let error = event_loop
+                .dispatch(Some(Duration::ZERO), &mut State::default())
+                .unwrap_err();
+            assert!(matches!(error, calloop::Error::OtherError(_)));
+            Err(error)
+        })
+        .unwrap_err();
+    assert_eq!(
+        std::io::Error::from(error).raw_os_error(),
+        Some(rustix::io::Errno::PIPE.raw_os_error())
+    );
+}
+
+#[test]
+fn preserves_dispatch_errors_on_a_healthy_connection() {
+    let (connection, _client, _peer) = socket_pair();
+    let event_loop = EventLoop::<()>::try_new().unwrap();
+    let error = WaylandFlush::default()
+        .dispatch(&connection, &event_loop.handle(), || {
+            Err(calloop::Error::InvalidToken)
+        })
+        .unwrap_err();
+    assert!(matches!(error, calloop::Error::InvalidToken));
+}
+
 struct DrainBeforePoll(Option<(UnixStream, usize)>);
 
 impl EventSource for DrainBeforePoll {

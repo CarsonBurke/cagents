@@ -12,8 +12,9 @@ GPU, browser surface, LSP, and persistence cleanup are unchanged.
 Both the Winit and iced SCTK dispatch loops watch for a writable socket after
 `flush()` returns `WouldBlock`. They retry when the compositor drains the socket
 and remove write interest when pending requests have been sent. The external
-pump notifier also watches for writes while requests are pending. Fatal flushes
-still exit the Winit loop with the I/O errno or `EPROTO` for a protocol error.
+pump notifier also watches for writes while requests are pending. A fatal
+connection error exits the Winit loop with the I/O errno or `EPROTO` for a
+protocol error, including when calloop discovers the failure during dispatch.
 `mise run test:contracts -- --test wayland_flush` exercises the shared dispatch
 against a private socket pair.
 
