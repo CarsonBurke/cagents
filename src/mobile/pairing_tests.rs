@@ -685,6 +685,7 @@ fn pairing_topics_stay_private_and_rotate_after_revocation() {
             .notification_topic(&fingerprint, &server)
             .is_err()
     );
+    record_request(&scene.pairing.directory, &key, &request.name).unwrap();
     assert_eq!(scene.pairing.allow(&request, command), Ok(Added::Added));
     let topic = scene
         .keys
@@ -704,10 +705,9 @@ fn pairing_topics_stay_private_and_rotate_after_revocation() {
         0o700
     );
     assert!(!scene.keys.read().unwrap().contains(&topic));
-    assert!(
-        !fs::read_to_string(scene.pairing.directory.join(DECISION))
-            .unwrap()
-            .contains(&topic)
+    assert_eq!(
+        fs::read_to_string(scene.pairing.directory.join(DECISION)).unwrap(),
+        Outcome::Allowed.word()
     );
 
     assert_eq!(
