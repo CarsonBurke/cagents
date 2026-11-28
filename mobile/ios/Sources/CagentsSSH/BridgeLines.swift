@@ -9,7 +9,7 @@ final class BridgeLines: ChannelInboundHandler, @unchecked Sendable {
     static let maxLineBytes = 16 * 1024 * 1024
 
     private let command: BridgeCommand
-    private var ready: EventLoopPromise<Void>?
+    private var ready: ((BridgeLines, Result<Void, Error>) -> Void)?
     private var buffer: ByteBuffer
     private var scanned = 0
     private var channel: Channel?
@@ -18,7 +18,10 @@ final class BridgeLines: ChannelInboundHandler, @unchecked Sendable {
     private var ended = false
     private var failure: Error?
 
-    init(command: BridgeCommand, ready: EventLoopPromise<Void>, allocator: ByteBufferAllocator) {
+    init(
+        command: BridgeCommand, allocator: ByteBufferAllocator,
+        ready: @escaping (BridgeLines, Result<Void, Error>) -> Void
+    ) {
         self.command = command
         self.ready = ready
         self.buffer = allocator.buffer(capacity: 0)
@@ -37,8 +40,7 @@ final class BridgeLines: ChannelInboundHandler, @unchecked Sendable {
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         switch event {
         case is ChannelSuccessEvent:
-            ready?.succeed(())
-            ready = nil
+            finishOpening(.success(()))
         case is ChannelFailureEvent:
             end(SSHFailure.commandRefused)
             context.close(promise: nil)
@@ -137,8 +139,13 @@ final class BridgeLines: ChannelInboundHandler, @unchecked Sendable {
         guard !ended else { return }
         ended = true
         failure = error
-        ready?.fail(error ?? SSHFailure.closed)
-        ready = nil
+        finishOpening(.failure(error ?? SSHFailure.closed))
         deliverLine()
+    }
+
+    private func finishOpening(_ result: Result<Void, Error>) {
+        let complete = ready
+        ready = nil
+        complete?(self, result)
     }
 }

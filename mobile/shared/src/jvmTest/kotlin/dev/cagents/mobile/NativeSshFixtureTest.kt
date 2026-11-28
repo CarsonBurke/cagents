@@ -7,10 +7,10 @@ import dev.cagents.mobile.protocol.Event
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withContext
-import kotlinx.coroutines.withTimeout
 import org.junit.Assume.assumeTrue
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -24,7 +24,12 @@ class NativeSshFixtureTest {
         val process = ProcessBuilder(args!!.split('\n')).redirectError(ProcessBuilder.Redirect.INHERIT).start()
         try {
             runBlocking {
-                withTimeout(15_000) {
+                // Destroying the process unblocks a pipe read even if the peer stops responding.
+                val watchdog = launch {
+                    delay(15_000)
+                    process.destroyForcibly()
+                }
+                try {
                     val session = BridgeSession(ProcessLines(process), "cagents-ios-fixture", "1")
                     assertEquals(1, session.handshake().api)
                     val sessions = CompletableDeferred<Event.Sessions>()
@@ -39,6 +44,8 @@ class NativeSshFixtureTest {
                         session.close()
                         reader.cancelAndJoin()
                     }
+                } finally {
+                    watchdog.cancelAndJoin()
                 }
             }
         } finally {

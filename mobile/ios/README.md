@@ -22,7 +22,7 @@ connections per key after a warmup.
 
 | Candidate | Ed25519 successes, median | P-256 successes, median | Stripped Linux payload |
 | --- | ---: | ---: | ---: |
-| SwiftNIO SSH 0.15.0 | 10/10, 211 ms | 10/10, 212 ms | 7.07 MB including the linked SSH and crypto code |
+| SwiftNIO SSH 0.15.0 | 10/10, 190 ms | 10/10, 172 ms | 7.06 MB including the linked SSH and crypto code |
 | libssh2 1.11.1 with OpenSSL | 10/10, 243 ms | 10/10, 229 ms | 6.38 MB including libssh2, OpenSSL and zlib shared libraries |
 
 These Linux measurements exclude each platform's system and language

@@ -114,8 +114,6 @@ public final class SSHConnection: Sendable {
         result: EventLoopFuture<SSHConnection>
     ) async throws -> SSHConnection {
         let loop = parent.eventLoop
-        let ready = loop.makePromise(of: Void.self)
-        let lines = BridgeLines(command: command, ready: ready, allocator: parent.allocator)
         let timeout = loop.scheduleTask(in: .seconds(8)) {
             startup.finish(.failure(SSHFailure.timedOut))
             parent.close(promise: nil)
@@ -127,16 +125,15 @@ public final class SSHConnection: Sendable {
                 let ssh = try parent.pipeline.syncOperations.handler(type: NIOSSHHandler.self)
                 let child = loop.makePromise(of: Channel.self)
                 ssh.createChannel(child, channelType: .session) { channel, _ in
-                    channel.setOption(ChannelOptions.autoRead, value: false).flatMap {
+                    let lines = BridgeLines(command: command, allocator: channel.allocator) { lines, ready in
+                        startup.finish(ready.map { SSHConnection(parent: parent, channel: channel, lines: lines) })
+                    }
+                    channel.closeFuture.whenComplete { _ in parent.close(promise: nil) }
+                    return channel.setOption(ChannelOptions.autoRead, value: false).flatMap {
                         channel.pipeline.addHandler(lines)
                     }
                 }
-                child.futureResult.flatMap { channel in
-                    channel.closeFuture.whenComplete { _ in parent.close(promise: nil) }
-                    return ready.futureResult.map {
-                        SSHConnection(parent: parent, channel: channel, lines: lines)
-                    }
-                }.whenComplete { startup.finish($0) }
+                child.futureResult.whenFailure { startup.finish(.failure($0)) }
             } catch {
                 startup.finish(.failure(error))
             }
