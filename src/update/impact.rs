@@ -177,6 +177,13 @@ pub enum Disposition {
     Blocked,
 }
 
+/// The activity that must settle before an update can continue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WaitReason {
+    FinishingTurn,
+    PendingDelivery,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionImpact {
     pub id: TerminalId,
@@ -200,11 +207,22 @@ pub struct SessionReview {
     pub kind: SessionKind,
     pub title: String,
     pub disposition: Disposition,
+    pub wait_reason: Option<WaitReason>,
     pub reason: String,
     pub warns_about_agent_run: bool,
 }
 
 impl SessionImpact {
+    pub fn wait_reason(&self) -> Option<WaitReason> {
+        match self.disposition {
+            Disposition::WaitsForIdle if self.reason == SessionCause::PendingDelivery => {
+                Some(WaitReason::PendingDelivery)
+            }
+            Disposition::WaitsForIdle => Some(WaitReason::FinishingTurn),
+            _ => None,
+        }
+    }
+
     fn permits_agent_run_warning(&self, observed: &Self, policy: Policy) -> bool {
         match (policy, self.disposition, observed.disposition) {
             // This risk is disclosed as a consequence of updating sooner.
@@ -226,6 +244,7 @@ impl SessionImpact {
     }
 
     pub fn review(&self) -> SessionReview {
+        let wait_reason = self.wait_reason();
         let warns_about_agent_run = self.kind == SessionKind::NativeChat
             && matches!(
                 self.disposition,
@@ -244,7 +263,7 @@ impl SessionImpact {
             Disposition::Resumes => "Restarts on its recorded conversation.".into(),
             Disposition::WaitsForIdle => {
                 let tasks = self.interrupted_subagents.len();
-                if self.reason == SessionCause::PendingDelivery {
+                if wait_reason == Some(WaitReason::PendingDelivery) {
                     "Messages sent to it are still being delivered; the update waits for them.".into()
                 } else if tasks == 0 {
                     "Finishing its turn; the update waits.".into()
@@ -296,6 +315,7 @@ impl SessionImpact {
             kind: self.kind,
             title: self.title.clone(),
             disposition: self.disposition,
+            wait_reason,
             reason,
             warns_about_agent_run,
         }

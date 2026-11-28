@@ -1,7 +1,7 @@
 //! The terminal and its tests render the same reviewed outcome record.
 
 use super::{
-    impact::{Disposition, Preview, SessionKind, SessionReview},
+    impact::{Disposition, Preview, SessionKind, SessionReview, WaitReason},
     source_inspection::SavedOutcome,
 };
 use std::{
@@ -352,9 +352,7 @@ pub(super) fn interruption_review(preview: &Preview) -> Preview {
     if let Some(daemon) = &mut selected.daemon {
         daemon.policy = super::impact::Policy::Interrupt;
         for session in &mut daemon.sessions {
-            if session.disposition == Disposition::WaitsForIdle
-                && session.reason != super::impact::SessionCause::PendingDelivery
-            {
+            if session.wait_reason() == Some(WaitReason::FinishingTurn) {
                 session.disposition = Disposition::Interrupted;
             }
         }
@@ -704,6 +702,37 @@ mod tests {
             recovery: "Its saved file stays as it is".into(),
         });
         preview
+    }
+
+    #[test]
+    fn a_mixed_review_distinguishes_a_delivery_from_an_interruptible_turn() {
+        let mut preview = preview();
+        let mut delivery = session("Delivery", Disposition::WaitsForIdle, "");
+        delivery.reason = crate::update::impact::SessionCause::PendingDelivery;
+        let turn = session("Working", Disposition::WaitsForIdle, "Finishing its turn");
+        preview.daemon.as_mut().unwrap().sessions = vec![delivery, turn];
+
+        let activity = |preview: &Preview| {
+            Review::from(preview)
+                .sessions
+                .into_iter()
+                .map(|session| (session.disposition, session.wait_reason))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            activity(&preview),
+            [
+                (Disposition::WaitsForIdle, Some(WaitReason::PendingDelivery)),
+                (Disposition::WaitsForIdle, Some(WaitReason::FinishingTurn)),
+            ]
+        );
+        assert_eq!(
+            activity(&interruption_review(&preview)),
+            [
+                (Disposition::WaitsForIdle, Some(WaitReason::PendingDelivery)),
+                (Disposition::Interrupted, None),
+            ]
+        );
     }
 
     #[test]

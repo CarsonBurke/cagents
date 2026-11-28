@@ -348,7 +348,7 @@ struct Interruptions {
 fn interruptions_available(
     confirmation: &crate::update::UpdateConfirmation,
 ) -> Option<Interruptions> {
-    use crate::update::impact::{Disposition, Policy, SessionCause, SessionKind};
+    use crate::update::impact::{Policy, SessionKind, WaitReason};
 
     if confirmation.stop.is_some() {
         return None;
@@ -361,12 +361,18 @@ fn interruptions_available(
     let mut subagents = 0;
     let mut delivery_waits = false;
     let mut recovery_needed = false;
-    for session in daemon.sessions.iter().filter(|session| {
-        session.kind == SessionKind::NativeChat && session.disposition == Disposition::WaitsForIdle
-    }) {
-        if session.reason == SessionCause::PendingDelivery {
-            delivery_waits = true;
-            continue;
+    for session in daemon
+        .sessions
+        .iter()
+        .filter(|session| session.kind == SessionKind::NativeChat)
+    {
+        match session.wait_reason() {
+            Some(WaitReason::PendingDelivery) => {
+                delivery_waits = true;
+                continue;
+            }
+            Some(WaitReason::FinishingTurn) => {}
+            None => continue,
         }
         recovery_needed |= confirmation
             .preview
