@@ -1204,15 +1204,23 @@ impl Claude {
             events: vec![],
         })
     }
-    fn observe_context_model(&mut self, model: &str) {
+    fn observe_context_model(&mut self, model: &str, step: &mut Step) {
         if model.is_empty() || model == "<synthetic>" {
             return;
         }
         let model = self.resolved.get(model).map_or(model, String::as_str);
+        let previous = self.context_model.as_deref().or(self.running.as_deref());
+        if previous.map_or(
+            self.usage.context_limit != 0 || self.usage.compact_limit.is_some(),
+            |previous| previous != model,
+        ) {
+            self.context_usage_stale = true;
+            self.context_result_window = None;
+            self.usage.context_limit = 0;
+            self.usage.compact_limit = None;
+            step.events.push(Event::ContextBudgetInvalidated);
+        }
         if self.context_model.as_deref() != Some(model) {
-            if self.context_model.is_some() {
-                self.context_usage_stale = true;
-            }
             self.context_model = Some(model.to_owned());
         }
     }
@@ -1229,6 +1237,16 @@ impl Claude {
     /// whole window itself comes from each turn's result, which names the
     /// model's.
     fn context_report(&mut self, report: &Value) {
+        if self.context_model.is_none()
+            && let Some(model) = report["model"].as_str().filter(|model| !model.is_empty())
+        {
+            self.context_model = Some(
+                self.resolved
+                    .get(model)
+                    .map_or(model, String::as_str)
+                    .into(),
+            );
+        }
         if let Some(tokens) = report["totalTokens"].as_u64() {
             self.usage.context_tokens = tokens;
         }
@@ -2197,7 +2215,7 @@ impl Claude {
                 })
         });
         if let Some(model) = data["model"].as_str() {
-            self.observe_context_model(model);
+            self.observe_context_model(model, step);
             self.selected = Some(self.listed(model).to_owned());
             self.running = Some(
                 self.resolved
@@ -3052,7 +3070,7 @@ impl Claude {
             }
             if child.is_none() {
                 if !history && let Some(model) = message["model"].as_str() {
-                    self.observe_context_model(model);
+                    self.observe_context_model(model, step);
                 }
                 self.update_usage(&message["usage"], step);
             }
@@ -4146,7 +4164,7 @@ impl Adapter for Claude {
         (!proved.is_empty() || (self.queued.is_empty() && self.submissions.is_empty()))
             .then_some(proved)
     }
-    fn refresh_visible_context(&mut self) -> Option<Step> {
+    fn refresh_visible_context(&mut self, observed: &dyn Fn() -> bool) -> Option<Step> {
         if !self.ready
             || self.busy
             || !self.context_usage_stale
@@ -4154,6 +4172,7 @@ impl Adapter for Claude {
                 .controls
                 .values()
                 .any(|request| request["subtype"] == "get_context_usage")
+            || !observed()
         {
             return None;
         }
@@ -5000,7 +5019,7 @@ impl Claude {
                             self.selected = request["model"].as_str().map(str::to_owned);
                             if !self.busy {
                                 if let Some(model) = request["model"].as_str() {
-                                    self.observe_context_model(model);
+                                    self.observe_context_model(model, &mut step);
                                 }
                                 self.running = self
                                     .selected
@@ -5405,18 +5424,23 @@ impl Claude {
                     self.usage.cost_microusd = Some((cost * 1_000_000.0).round() as u64);
                 }
                 if let Some(models) = frame["modelUsage"].as_object() {
-                    let data = self
-                        .context_model
-                        .as_ref()
-                        .or(self.running.as_ref())
-                        .and_then(|m| models.get(m))
-                        .or_else(|| {
-                            if models.len() == 1 {
-                                models.values().next()
-                            } else {
-                                None
-                            }
-                        });
+                    let model = self.context_model.as_deref().or(self.running.as_deref());
+                    let data = model.and_then(|model| models.get(model)).or_else(|| {
+                        // Local turns can repeat cumulative usage for a prior
+                        // model. Only fall back for unidentified or alias models.
+                        if models.len() == 1
+                            && model.is_none_or(|model| {
+                                matches!(
+                                    model,
+                                    "default" | "opus" | "sonnet" | "haiku" | "opusplan"
+                                )
+                            })
+                        {
+                            models.values().next()
+                        } else {
+                            None
+                        }
+                    });
                     if let Some(window) = data
                         .and_then(|data| data["contextWindow"].as_u64())
                         .filter(|window| *window > 0)
@@ -5426,6 +5450,7 @@ impl Claude {
                             self.usage.context_limit = window;
                         }
                         if previous.is_some_and(|previous| previous != window) {
+                            self.usage.compact_limit = None;
                             self.context_usage_stale = true;
                         }
                     }

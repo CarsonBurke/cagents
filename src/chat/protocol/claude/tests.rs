@@ -13453,14 +13453,14 @@ fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
         )
         .unwrap();
     assert!(child.writes.is_empty());
-    assert!(adapter.refresh_visible_context().is_none());
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
     let step = adapter
         .receive(
             json!({"type":"system","subtype":"compact_boundary","uuid":"c1","compact_metadata":{"trigger":"manual"}}),
         )
         .unwrap();
     assert!(step.writes.is_empty());
-    let refresh = adapter.refresh_visible_context().unwrap();
+    let refresh = adapter.refresh_visible_context(&|| true).unwrap();
     assert_eq!(refresh.writes[0]["request"]["subtype"], "get_context_usage");
     assert_eq!(refresh.writes[0]["request"]["detail"], "summary");
     assert!(
@@ -15613,10 +15613,11 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         .receive(reply(request, json!({"models":[]})))
         .unwrap();
     assert!(connected.writes.is_empty());
-    let report = adapter.refresh_visible_context().unwrap();
+    assert!(adapter.refresh_visible_context(&|| false).is_none());
+    let report = adapter.refresh_visible_context(&|| true).unwrap();
     let asked = report.writes[0]["request_id"].as_str().unwrap().to_owned();
     assert_eq!(report.writes[0]["request"]["detail"], "summary");
-    assert!(adapter.refresh_visible_context().is_none());
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
     let usage_of = |step: &Step| {
         step.events.iter().rev().find_map(|event| match event {
             Event::Usage(usage) => Some(usage.clone()),
@@ -15626,7 +15627,7 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     let report = adapter
         .receive(reply(
             &asked,
-            json!({"totalTokens":14000,"maxTokens":300000,"rawMaxTokens":300000,
+            json!({"model":"claude-opus-5-5","totalTokens":14000,"maxTokens":300000,"rawMaxTokens":300000,
                 "autocompactSource":"settings","autoCompactThreshold":267000,
                 "isAutoCompactEnabled":true}),
         ))
@@ -15654,24 +15655,36 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
             "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000},"claude-sonnet":{"contextWindow":200000}}})
     };
     adapter.receive(result_in()).unwrap();
-    assert!(adapter.refresh_visible_context().is_none());
-    adapter
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
+    let model_switch = adapter
         .receive(json!({"type":"assistant","uuid":"model-switch","message":{
         "role":"assistant","model":"claude-sonnet","content":[]}}))
         .unwrap();
+    assert!(
+        model_switch
+            .events
+            .contains(&Event::ContextBudgetInvalidated)
+    );
+    assert_eq!(adapter.usage.context_budget(), 0);
+    let local_turn = adapter
+        .receive(json!({"type":"result","subtype":"success","is_error":false,
+        "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}))
+        .unwrap();
+    assert_eq!(usage_of(&local_turn).unwrap().context_budget(), 0);
     let switched = adapter.receive(result_in()).unwrap();
     assert!(switched.writes.is_empty());
-    let automatic = adapter.refresh_visible_context().unwrap();
-    assert_eq!(usage_of(&switched).unwrap().context_budget(), 200_000);
+    let usage = usage_of(&switched).unwrap();
+    assert_eq!(usage.compact_limit, None);
+    assert_eq!(usage.context_budget(), 200_000);
+    let automatic = adapter.refresh_visible_context(&|| true).unwrap();
 
-    // Clearing the conversation clears its figures, not where the session
-    // compacts.
+    // Clearing the conversation discards an outstanding report's occupancy.
     adapter
         .receive(json!({"type":"conversation_reset"}))
         .unwrap();
     assert_eq!(adapter.usage.context_tokens, 0);
-    assert_eq!(adapter.usage.compact_limit, Some(267_000));
-    assert!(adapter.refresh_visible_context().is_none());
+    assert_eq!(adapter.usage.compact_limit, None);
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
     let obsolete = adapter
         .receive(reply(
             automatic.writes[0]["request_id"].as_str().unwrap(),
@@ -15680,7 +15693,7 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         .unwrap();
     assert!(usage_of(&obsolete).is_none());
     assert_eq!(adapter.usage.context_tokens, 0);
-    let refresh = adapter.refresh_visible_context().unwrap();
+    let refresh = adapter.refresh_visible_context(&|| true).unwrap();
     let off = adapter
         .receive(reply(
             refresh.writes[0]["request_id"].as_str().unwrap(),
@@ -15690,7 +15703,7 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     assert_eq!(usage_of(&off).unwrap().context_limit, 180_000);
     let unchanged = adapter.receive(result_in()).unwrap();
     assert_eq!(usage_of(&unchanged).unwrap().context_limit, 180_000);
-    assert!(adapter.refresh_visible_context().is_none());
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
 
     // With auto-compaction off the reported window is the model's whole
     // window, and nothing compacts early.
@@ -15716,6 +15729,10 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         ))
         .unwrap();
     assert_eq!(usage_of(&windowed).unwrap().compact_limit, Some(300_000));
+    adapter
+        .receive(json!({"type":"conversation_reset"}))
+        .unwrap();
+    assert_eq!(adapter.usage.compact_limit, Some(300_000));
 
     // A refresh the reader asked for says why it got nothing.
     let refresh = adapter.command(Command::Refresh).unwrap();
@@ -15743,7 +15760,7 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     adapter
         .receive(reply(request, json!({"models":[]})))
         .unwrap();
-    let automatic = adapter.refresh_visible_context().unwrap();
+    let automatic = adapter.refresh_visible_context(&|| true).unwrap();
     let asked = &automatic.writes[0];
     assert_eq!(asked["request"].get("_cagents_automatic"), None);
     // A provider that exits before reading this one lost no input (#3888).

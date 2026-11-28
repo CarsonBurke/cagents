@@ -23,6 +23,14 @@ impl Watcher {
         self.notify();
         Ok(reader)
     }
+    /// Checks the readiness socket of the current authenticated attachment.
+    pub(super) fn connected(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .is_some_and(|writer| disconnected(writer).is_ok_and(|closed| !closed))
+    }
     pub(super) fn clear(&self) {
         if let Some(previous) = self.0.lock().unwrap_or_else(|p| p.into_inner()).take() {
             let _ = previous.shutdown(std::net::Shutdown::Both);
@@ -108,6 +116,20 @@ pub(super) fn drain(reader: &UnixStream) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn watcher_requires_a_live_current_attachment() {
+        let watcher = Watcher::default();
+        assert!(!watcher.connected());
+        let reader = watcher.subscribe().unwrap();
+        assert!(watcher.connected());
+        drop(reader);
+        assert!(!watcher.connected());
+        let _replacement = watcher.subscribe().unwrap();
+        assert!(watcher.connected());
+        watcher.clear();
+        assert!(!watcher.connected());
+    }
 
     #[test]
     fn retiring_a_watcher_disconnects_even_while_a_descriptor_copy_lives() {

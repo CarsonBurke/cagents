@@ -529,12 +529,15 @@ fn semantic_metadata_wakes_after_confirmation_without_hidden_body_ticks() {
         None,
         None,
         None,
-        Some(Arc::new(move || {
-            if let Some(inner) = target.get().and_then(std::sync::Weak::upgrade) {
-                let id = inner.confirmed_session.lock().unwrap().clone();
-                sent.send(id).unwrap();
-            }
-        })),
+        Some(RetainedObserver {
+            changed: Box::new(move || {
+                if let Some(inner) = target.get().and_then(std::sync::Weak::upgrade) {
+                    let id = inner.confirmed_session.lock().unwrap().clone();
+                    sent.send(id).unwrap();
+                }
+            }),
+            connected: Box::new(|| true),
+        }),
         Default::default(),
         |_| {},
     )

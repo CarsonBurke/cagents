@@ -4243,6 +4243,10 @@ pub enum Event {
     ProviderTitleCleared {
         id: String,
     },
+    /// The model changed and its context window and compaction limit are unknown.
+    #[cfg(feature = "host")]
+    #[serde(skip)]
+    ContextBudgetInvalidated,
 }
 
 #[cfg(feature = "host")]

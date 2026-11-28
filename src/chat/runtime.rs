@@ -397,6 +397,13 @@ impl AgentAddresses {
     }
 }
 
+/// Retained helpers publish resident metadata even without a reader. Optional
+/// provider work also needs a live attachment to the daemon showing the chat.
+struct RetainedObserver {
+    changed: Box<dyn Fn() + Send + Sync>,
+    connected: Box<dyn Fn() -> bool + Send + Sync>,
+}
+
 struct Inner {
     commands: crossbeam_channel::Sender<CommandRequest>,
     wake: Mutex<UnixStream>,
@@ -578,7 +585,7 @@ impl LocalHandle {
         store: Store,
         source: super::Session,
         notify: impl Fn(Update, Option<String>) + Send + Sync + 'static,
-        resident_changed: impl Fn() + Send + Sync + 'static,
+        observer: RetainedObserver,
     ) -> Result<Self, String> {
         if source.launch.provider != crate::agent::Provider::Claude {
             return Err("Retained stream actors require Claude".into());
@@ -599,7 +606,7 @@ impl LocalHandle {
             source.launch.session_id,
             None,
             Some(scope),
-            Some(Arc::new(resident_changed)),
+            Some(observer),
             confirmed_session,
             move |update| {
                 let confirmed = followed.lock().unwrap_or_else(|p| p.into_inner()).clone();
@@ -616,7 +623,7 @@ impl LocalHandle {
         session_id: Option<String>,
         ownership: Option<NativeOwnership>,
         launch_account_scope: Option<crate::account::scope::LaunchAccountScope>,
-        resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
+        retained_observer: Option<RetainedObserver>,
         confirmed_session: Arc<Mutex<Option<String>>>,
         notify: impl Fn(Update) + Send + Sync + 'static,
     ) -> Result<Self, String> {
@@ -801,7 +808,7 @@ impl LocalHandle {
                     incoming,
                     wake: reader,
                     notify,
-                    resident_changed,
+                    retained_observer,
                     resident_dirty: false,
                     followed_generation: spec.followed.then_some(0),
                     output: Vec::new(),
@@ -2727,9 +2734,7 @@ struct Actor {
     incoming: crossbeam_channel::Receiver<CommandRequest>,
     wake: UnixStream,
     notify: Arc<dyn Fn(Update) + Send + Sync>,
-    /// Retained helpers observe semantic metadata independently of visible
-    /// presentation and the once-per-unread-epoch output observation.
-    resident_changed: Option<Arc<dyn Fn() + Send + Sync>>,
+    retained_observer: Option<RetainedObserver>,
     resident_dirty: bool,
     followed_generation: Option<u64>,
     output: Vec<u8>,
@@ -3350,7 +3355,12 @@ impl Actor {
                 && !frames_ready
                 && self.pending.is_empty()
                 && self.visible.load(Ordering::Acquire)
-                && let Some(step) = self.adapter.refresh_visible_context()
+                && let Some(step) = self.adapter.refresh_visible_context(&|| {
+                    self.retained_observer
+                        .as_ref()
+                        .is_none_or(|observer| (observer.connected)())
+                        && self.visible.load(Ordering::Acquire)
+                })
             {
                 self.step(step)?;
             }
@@ -4242,6 +4252,7 @@ impl Actor {
                     | Event::TurnSettled
                     | Event::TurnFinished { .. }
                     | Event::Usage(_)
+                    | Event::ContextBudgetInvalidated
                     | Event::Session { .. }
             )
             .then(|| event.clone());
@@ -4274,6 +4285,7 @@ impl Actor {
                             &event,
                             Event::Error { .. }
                                 | Event::Usage(_)
+                                | Event::ContextBudgetInvalidated
                                 | Event::Plan { .. }
                                 | Event::Status { .. }
                                 | Event::Waiting(_)
@@ -4367,7 +4379,7 @@ impl Actor {
         // The Store consumes parent bodies. Child bodies still project here,
         // and Claude repeats the same identity on ordinary body frames.
         // Neither should turn hidden streaming into metadata RPCs.
-        if self.resident_changed.is_some() {
+        if self.retained_observer.is_some() {
             self.resident_dirty |= match &event {
                 Event::Item(_)
                 | Event::TextDelta { .. }
@@ -4557,9 +4569,9 @@ impl Actor {
     }
     fn publish_resident_metadata(&mut self) {
         if std::mem::take(&mut self.resident_dirty)
-            && let Some(changed) = &self.resident_changed
+            && let Some(observer) = &self.retained_observer
         {
-            changed();
+            (observer.changed)();
         }
     }
     fn touch(&mut self) {
@@ -5153,6 +5165,10 @@ fn apply_projected_event(
             }
             state.busy = busy;
             state.detail = detail;
+        }
+        Event::ContextBudgetInvalidated => {
+            state.usage.context_limit = 0;
+            state.usage.compact_limit = None;
         }
         Event::Usage(value) => {
             if value.input_tokens != 0 {

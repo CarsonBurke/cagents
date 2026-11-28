@@ -922,6 +922,12 @@ fn usage_keeps_the_compaction_point_each_reading_states() {
     apply_event(&mut state, &mut indices, reading(20_000, None));
     assert_eq!(state.usage.compact_limit, None);
     assert_eq!(state.usage.context_budget(), 1_000_000);
+
+    apply_event(&mut state, &mut indices, reading(20_000, Some(267_000)));
+    apply_event(&mut state, &mut indices, Event::ContextBudgetInvalidated);
+    assert_eq!(state.usage.context_tokens, 20_000);
+    assert_eq!(state.usage.context_budget(), 0);
+    assert_eq!(state.usage.compact_limit, None);
 }
 
 /// A request to send what is queued now is the provider's to report, and

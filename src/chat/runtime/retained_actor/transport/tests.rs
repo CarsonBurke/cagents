@@ -2373,6 +2373,41 @@ fn commit_seals_exact_pre_id_capability_before_confirmation_race() {
     );
 }
 #[test]
+fn visibility_does_not_survive_preserve_or_reattachment() {
+    let mut fixture = resident_fixture();
+    let server = &mut fixture.server;
+    let action = |server: &Server, method: &str, args: Value| Invocation {
+        proof: server.proof.clone(),
+        epoch: Some(server.epoch),
+        method: method.into(),
+        args,
+    };
+    server
+        .invoke(action(server, "visible", json!([true])))
+        .unwrap();
+    assert!(server.actor.0.visible.load(Ordering::Acquire));
+    server
+        .invoke(action(server, "preserve", json!([])))
+        .unwrap();
+    server
+        .invoke(action(server, "visible", json!([true])))
+        .unwrap();
+    assert!(!server.actor.0.visible.load(Ordering::Acquire));
+
+    // An unexpected disconnect can leave the old visibility bit set. The
+    // next attached daemon has to publish its own subscriber visibility.
+    server.actor.set_visible(true);
+    let attach = Invocation {
+        proof: server.proof.clone(),
+        epoch: None,
+        method: "attach_close".into(),
+        args: json!([server.source, server.identity.record]),
+    };
+    server.invoke(attach).unwrap();
+    assert!(!server.actor.0.visible.load(Ordering::Acquire));
+}
+
+#[test]
 fn conditional_idle_close_refuses_stale_or_preserved_attachment_without_stopping_provider() {
     for refusal in ["epoch", "proof", "preserved"] {
         let mut fixture = resident_fixture();
