@@ -236,6 +236,18 @@ approves only by choosing an action.
 | `terminal_ended` | `session`, `message` describe why a terminal watch ended. |
 | `closing` | `message`: the bridge is about to exit, such as when the daemon stops. |
 
+### Notifications
+
+Start `notifications.watch` after reconnecting to get the daemon's current
+unacknowledged attention. A pending question or approval has kind `waiting`.
+`failed` and `succeeded` describe run outcomes. Use `kind` to include those
+outcomes alongside requests. The `asks` flag identifies notices that ask the
+person to act. The `request` detail, when present, distinguishes a question,
+approval or consent request.
+
+Acknowledgement uses the exact notice ID. A newer notice for the same
+conversation has its own ID.
+
 ### Sessions
 
 Each session has an `id`, its `lineage` (the conversation it continues),
