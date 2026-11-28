@@ -4,7 +4,6 @@
 use super::{model::Registry, state::SharedHost};
 use crate::{
     account::{Account, home::Homes, registry::Store},
-    agent::Provider,
     agent_execution::{
         Accepted, Agent, Authority, Destination, HostedSession, Origin, Run, Spec, Start, State,
         Submit, Surface, Update,
@@ -785,6 +784,7 @@ fn dispatch_accepted_with_directory(
 /// spelling its native chat adapter translates. Each is applied before the
 /// provider can receive a prompt, so the first turn already runs with it.
 fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
+    use crate::agent::Provider;
     let mut arguments = Vec::new();
     if let Some(model) = &spec.model {
         arguments.extend(["--model".into(), model.clone()]);
@@ -1411,7 +1411,9 @@ pub(super) fn persist_confirmed_identity(
     };
     if !matches!(
         hosted.launch.provider,
-        Provider::Codex | Provider::Antigravity | Provider::Muse
+        crate::agent::Provider::Codex
+            | crate::agent::Provider::Antigravity
+            | crate::agent::Provider::Muse
     ) {
         return Ok(false);
     }

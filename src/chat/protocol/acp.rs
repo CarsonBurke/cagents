@@ -212,7 +212,7 @@ fn prepare(profile: &'static Profile, launch: &Launch) -> Result<(ProcessSpec, A
         })?
         .to_owned();
     if let Some(id) = &launch.session_id
-        && (!chat::valid_acp_session_id(id))
+        && !chat::valid_acp_session_id(id)
     {
         return Err(format!(
             "{} cannot resume a conversation without its exact session ID.",
