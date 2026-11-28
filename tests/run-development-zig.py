@@ -1369,6 +1369,19 @@ exit 1
         process = subprocess.Popen(["sleep", "infinity"], env={"XDG_RUNTIME_DIR": str(runtime),
                                                           "PATH": "/usr/bin:/bin"})
         self.addCleanup(lambda: (process.kill(), process.wait()))
+        # The runner finds this process by its exact entry in procfs. Wait for
+        # that entry before letting a sweep decide the runtime is already empty.
+        environ = Path(f"/proc/{process.pid}/environ")
+        runtime_entry = b"XDG_RUNTIME_DIR=" + os.fsencode(runtime)
+
+        def runtime_visible():
+            self.assertIsNone(process.poll(), "mock exited before publishing its runtime")
+            try:
+                return runtime_entry in environ.read_bytes().split(b"\0")
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                return False
+
+        wait_until(runtime_visible, f"mock {process.pid} never published runtime {runtime}")
         return runtime, process
 
     def ended_owner(self):
@@ -1388,6 +1401,23 @@ exit 1
         self.assertEqual(process.wait(timeout=HANG_GUARD), -signal.SIGTERM)
         # A watcher sweeps once the processes it signalled have gone.
         wait_until(lambda: not runtime.exists(), "the runtime was not swept")
+
+    def test_session_waits_for_its_runtime_to_be_visible_in_procfs(self):
+        read_bytes = Path.read_bytes
+        scans = []
+
+        def read_during_startup(path):
+            if path.name == "environ" and path.parent.parent == Path("/proc"):
+                scans.append(path)
+                if len(scans) == 1:
+                    return b"XDG_RUNTIME_DIR=/unrelated\0"
+            return read_bytes(path)
+
+        with patch.object(Path, "read_bytes", read_during_startup):
+            _, process = self.session("starting-mock")
+
+        self.assertGreaterEqual(len(scans), 2)
+        self.assertEqual(scans[0], Path(f"/proc/{process.pid}/environ"))
 
     def test_gc_stops_an_instance_whose_starter_ended_past_its_grace(self):
         old = int(time.time()) - 100

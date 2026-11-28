@@ -6170,7 +6170,7 @@ fn copy_and_disclosures_stay_with_their_row_across_separate_history_windows() {
 #[test]
 fn find_reveals_and_restores_only_the_matching_report_continuation() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target, handle) = history_fixture(&mut app);
+    let (_, target, handle) = history_fixture(&mut app);
     let report = |body: &str| {
         Arc::new(chat::Item {
             id: "report:native-part:1:delivery:131072-140000:0-0".into(),

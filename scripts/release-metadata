@@ -175,8 +175,15 @@ def build(directory: Path, version: str, source_commit: str, protocol: int, note
     darwin = darwin_target(version, names)
     if darwin is not None:
         targets.append(darwin)
+    appimage = f"cagents-{version}-x86_64.AppImage"
+    appimage_alias = "cagents-x86_64.AppImage"
+    image_names = {appimage, appimage_alias}
+    if names & image_names and not image_names <= names:
+        raise Refused(f"a Linux AppImage release needs {appimage} and {appimage_alias}")
     assets = {path.name: {"size": path.stat().st_size, "sha256": digest(path)} for path in files}
     check_android(directory, version, assets)
+    if appimage in assets and assets[appimage] != assets[appimage_alias]:
+        raise Refused(f"{appimage_alias} differs from the versioned AppImage")
     return {
         "schema_version": SCHEMA,
         "repository": REPOSITORY,

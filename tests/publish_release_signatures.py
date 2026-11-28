@@ -4,6 +4,7 @@
 nothing reaches the network."""
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -263,10 +264,10 @@ class PublisherSignatures(unittest.TestCase):
         self.git("tag", "-a", f"v{version}", "-m", f"v{version}")
 
     def bundle(self, version: str, signers: list[str], variant: str = "", macos: bool = False,
-               android: bool = False) -> Path:
+               android: bool = False, appimage: bool = False) -> Path:
         """A complete bundle of VERSION, its metadata signed by SIGNERS in
-        order; another VARIANT is another build of it. MACOS and ANDROID add
-        their platform assets."""
+        order; another VARIANT is another build of it. MACOS, ANDROID and
+        APPIMAGE add their platform assets."""
         dist = Path(tempfile.mkdtemp(prefix=f"dist-{version}-", dir=self.directory))
         cagents_archive(dist / f"cagents-{version}-{TARGET}.tar.gz", "cagents", version, "dev.cagents.Cagents")
         cagents_archive(dist / f"cagents-browserless-{version}-{TARGET}.tar.gz", "cagents-browserless", version,
@@ -277,6 +278,9 @@ class PublisherSignatures(unittest.TestCase):
                      f"cagents-browserless-{version}-sizes.txt"):
             (dist / name).write_text(name + variant)
         (dist / "install.sh").write_text("#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n")
+        if appimage:
+            for name in (f"cagents-{version}-x86_64.AppImage", "cagents-x86_64.AppImage"):
+                (dist / name).write_bytes(b"offline AppImage fixture")
 
         def sums(manifest: str, names: list[str]):
             lines = subprocess.run(["sha256sum", "--", *names], cwd=dist, check=True, text=True,
@@ -361,14 +365,14 @@ class PublisherSignatures(unittest.TestCase):
                                "--promote", digest], cwd=self.checkout, text=True, capture_output=True,
                               env=environment, timeout=HANG_GUARD)
 
-    def drafted(self, macos: bool = False, android: bool = False) -> Path:
+    def drafted(self, macos: bool = False, android: bool = False, appimage: bool = False) -> Path:
         """0.2.5 left as a verified draft after 0.2.3 and 0.2.4, as the
         release workflow leaves it; its bundle."""
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         self.bridge = self.bundle("0.2.4", ["old"])
         self.published("0.2.4", self.bridge, {"release-metadata.json": "release-metadata.json",
                                               "release-metadata.json.sig": "release-metadata.json.sig"})
-        release = self.bundle("0.2.5", ["new"], macos=macos, android=android)
+        release = self.bundle("0.2.5", ["new"], macos=macos, android=android, appimage=appimage)
         result = self.publish("0.2.5", release, "--draft")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Verified v0.2.5 as a draft", result.stdout)
@@ -688,6 +692,53 @@ class PublisherSignatures(unittest.TestCase):
         self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
         result = self.verify("0.2.5", candidate, "--bridge", str(bridge))
         self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_the_appimage_release_includes_both_names_in_linux_checksums(self):
+        dist = self.bundle("0.2.4", ["old"], appimage=True)
+        accepted = self.verify("0.2.4", dist)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertIn("Validated v0.2.4: 18 assets", accepted.stdout)
+
+        manifest = dist / "SHA256SUMS"
+        original = manifest.read_text()
+        alias = "cagents-x86_64.AppImage"
+        manifest.write_text("".join(line for line in original.splitlines(keepends=True)
+                                    if not line.rstrip().endswith(f"  {alias}")))
+        self.assertRefused(self.verify("0.2.4", dist), "SHA256SUMS has missing")
+
+        manifest.write_text(original)
+        (dist / alias).unlink()
+        self.assertRefused(self.verify("0.2.4", dist), "expected assets")
+
+    def test_the_appimage_draft_retains_both_names_on_promotion(self):
+        bundle = self.drafted(appimage=True)
+        draft = self.directory / "github/releases/v0.2.5"
+        image = "cagents-0.2.5-x86_64.AppImage"
+        alias = "cagents-x86_64.AppImage"
+        self.assertIn(f"/releases/download/v0.2.5/{image}", (draft / "release.json").read_text())
+        digest = hashlib.sha256((bundle / "release-metadata.json").read_bytes()).hexdigest()
+        result = self.promote("0.2.5", digest)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in (image, alias, "SHA256SUMS"):
+            self.assertEqual((draft / "assets" / name).read_bytes(), (bundle / name).read_bytes())
+
+    def test_terminal_install_notes_stop_when_checksums_fail(self):
+        self.drafted(appimage=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "terminal-install-commands"
+        tools.mkdir()
+        for name, command in (("curl", "exit 0"), ("sha256sum", "exit 1"),
+                              ("sh", "echo 'installer was invoked'")):
+            path = tools / name
+            path.write_text(f"#!/bin/sh\n{command}\n")
+            path.chmod(0o755)
+        result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                env={"PATH": f"{tools}:{os.defpath}"}, text=True,
+                                capture_output=True, timeout=HANG_GUARD)
+        self.assertNotIn("installer was invoked", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])
