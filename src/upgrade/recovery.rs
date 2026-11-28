@@ -1358,9 +1358,8 @@ impl PendingRecovery {
             self.census.terminals = original.terminals;
             self.census.chats = original.chats;
         }
-        if let Cow::Owned(census) = self.census.with_historical_pages() {
-            self.census = census.into();
-        }
+        // A matching Proposed capture already carries the original bytes.
+        // Derive its historical pages only for recovery.
         self.census.freeze().map_err(|error| error.to_string())?;
         self.producer = Some(CaptureProducer::ExplicitCensus {
             transaction: original.transaction,
@@ -1378,16 +1377,7 @@ impl PendingRecovery {
             return Ok(None);
         };
         let pending = pending.with_original_census(path)?;
-        persist_bound_capture(
-            &pending.checkpoint_path,
-            &CapturedCensus {
-                producer: pending.producer.clone(),
-                source: pending.source.clone(),
-                checkpoint_hash: Some(pending.checkpoint_hash.clone()),
-                census: pending.census.clone(),
-                windows: pending.windows.clone(),
-            },
-        )?;
+        pending.bind_manual_census()?;
         let bytes =
             read_checkpoint(&pending.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         pending.validate(&bytes)?;

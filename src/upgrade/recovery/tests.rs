@@ -787,6 +787,60 @@ fn pending_original_census_rejects_foreign_source_and_preserves_prepared_bytes()
 }
 
 #[test]
+fn installer_binding_keeps_proposed_census_bytes_without_a_captured_page() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let preparation = preparation(root.path());
+    let path = &preparation.authority.checkpoint_path;
+    let bytes = checkpoint(&preparation, "Prepared");
+    save(path, &bytes);
+    let pending = PendingRecovery::inspect_at(path).unwrap().unwrap();
+    assert!(!pending.original_census_complete);
+
+    let (chat, _, _, _) = scale_chat(&preparation, 0, 0, 0);
+    let census = Census {
+        terminals: pending.census.terminals.clone(),
+        chats: vec![chat],
+        ..Default::default()
+    };
+    let encoded = serde_json::to_string(&census).unwrap();
+    let raw = format!(r#"{{"future_field": {{"counter": 1}}, {}"#, &encoded[1..]);
+    let job = uuid::Uuid::new_v4().to_string();
+    let request = b"private installer request";
+    let windows = vec!["primary".into()];
+    save(&root.path().join(format!("{job}.request")), request);
+    persist_capture(
+        path,
+        &CapturedCensus {
+            producer: Some(CaptureProducer::Proposed {
+                job: job.clone(),
+                request_hash: digest(request),
+            }),
+            source: pending.source.clone(),
+            checkpoint_hash: None,
+            census: serde_json::from_str(&raw).unwrap(),
+            windows: windows.clone(),
+        },
+    )
+    .unwrap();
+    let original_path = root.path().join("original.json");
+    let original = serde_json::json!({
+        "version":1, "transaction":job, "source":pending.source,
+        "terminals":census.terminals, "chats":census.chats, "checkpoint_before":null,
+    });
+    save(&original_path, &serde_json::to_vec(&original).unwrap());
+
+    let bound = pending.with_original_census(&original_path).unwrap();
+    assert!(bound.original_census_complete);
+    assert_eq!(bound.windows, windows);
+    assert_eq!(bound.census.hash().unwrap(), digest(raw.as_bytes()));
+    assert!(bound.census.snapshots.is_empty());
+    bound.bind_manual_census().unwrap();
+    let reloaded = PendingRecovery::inspect_at(path).unwrap().unwrap();
+    assert_eq!(serde_json::to_string(&reloaded.census).unwrap(), raw);
+    assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
 fn exact_adopted_terminal_proof_ignores_output_but_not_allocation_changes() {
     let root = crate::test_fixture::tempdir().unwrap();
     let preparation = preparation(root.path());
