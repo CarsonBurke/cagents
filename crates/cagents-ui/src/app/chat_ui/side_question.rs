@@ -16,6 +16,11 @@ pub(super) const COMMAND: &str = "btw";
 /// What the slash menu says `/btw` does.
 pub(super) const DESCRIPTION: &str = "Ask a quick question that stays out of the conversation";
 
+/// How long a question waits for its answer before the card says none is
+/// coming. Claude Code gives up on one after ten minutes; this is the bound
+/// for a provider that never says.
+const ANSWER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(12 * 60);
+
 /// The tallest an answer grows before it scrolls, so a long one leaves the
 /// transcript in view.
 const ANSWER_HEIGHT: f32 = 280.0;
@@ -54,13 +59,15 @@ enum State {
 
 impl Thread {
     /// Asks `question` after what `open` already answered, if anything.
-    fn ask(open: Option<Self>, question: String) -> (Self, chat::SideQuestion) {
+    /// `open` stays as it is, so a question that can't be asked leaves the
+    /// card showing what it did.
+    fn ask(open: Option<&Self>, question: String) -> (Self, chat::SideQuestion) {
         let mut earlier = Vec::new();
         if let Some(open) = open {
-            earlier = open.earlier;
-            if let State::Answered { text, .. } = open.current.state {
+            earlier.clone_from(&open.earlier);
+            if let State::Answered { text, .. } = &open.current.state {
                 earlier.push(chat::SideExchange {
-                    question: open.current.question,
+                    question: open.current.question.clone(),
                     answer: text.to_string(),
                 });
             }
@@ -158,12 +165,12 @@ impl Cagents {
             return Task::none();
         }
         let Some(handle) = runtime.handle().cloned() else {
+            runtime.composer_note =
+                Some("This conversation isn't connected. Ask again once it reconnects.".into());
             return Task::none();
         };
-        let question = question.to_owned();
-        let (thread, request) = Thread::ask(runtime.side_question.take(), question);
+        let (thread, request) = Thread::ask(runtime.side_question.as_ref(), question.to_owned());
         if let Err(refusal) = request.validate() {
-            runtime.side_question = None;
             runtime.composer_note = Some(refusal.into());
             return Task::none();
         }
@@ -182,19 +189,46 @@ impl Cagents {
     }
 
     /// The provider took the question, or said why not. Taken, its answer
-    /// arrives on its own.
+    /// arrives on its own, or the card stops waiting at the deadline.
     pub(super) fn side_question_sent(
         &mut self,
         target: Target,
-        id: &str,
+        id: String,
         result: Result<(), String>,
-    ) {
-        if let Err(reason) = result
-            && let Some(thread) = self
-                .chat_runtime_mut(target)
-                .and_then(|runtime| runtime.side_question.as_mut())
+    ) -> Task<Message> {
+        let Some(thread) = self
+            .chat_runtime_mut(target)
+            .and_then(|runtime| runtime.side_question.as_mut())
+        else {
+            return Task::none();
+        };
+        match result {
+            Err(reason) => {
+                thread.fail(Some(&id), reason);
+                Task::none()
+            }
+            Ok(()) => cosmic::task::future(async move {
+                tokio::time::sleep(ANSWER_DEADLINE).await;
+                Message::ChatUi(Action::SideQuestionExpired(target, id))
+            }),
+        }
+    }
+
+    /// The deadline for question `id` passed; if it is still waiting, the
+    /// card says no answer is coming.
+    pub(super) fn side_question_expired(&mut self, target: Target, id: &str) {
+        let provider = match self.chat_runtime_mut(target) {
+            Some(runtime) => runtime.session.launch.provider.label(),
+            None => return,
+        };
+        if let Some(thread) = self
+            .chat_runtime_mut(target)
+            .and_then(|runtime| runtime.side_question.as_mut())
         {
-            thread.fail(Some(id), reason);
+            thread.fail(
+                Some(id),
+                format!("{provider} didn't answer in time. Try again."),
+            );
         }
     }
 
@@ -245,6 +279,14 @@ impl Runtime {
                 None,
                 "The conversation disconnected before the answer arrived. Ask again once it reconnects.",
             );
+        }
+    }
+
+    /// A question that will get no answer because the provider stopped.
+    pub(super) fn side_question_stopped(&mut self) {
+        let provider = self.session.launch.provider.label();
+        if let Some(thread) = &mut self.side_question {
+            thread.fail(None, format!("{provider} stopped before it answered."));
         }
     }
 
@@ -364,7 +406,7 @@ mod tests {
         let (mut thread, first) = Thread::ask(None, "first".into());
         assert!(first.history.is_empty());
         answered(&mut thread, "one");
-        let (mut thread, second) = Thread::ask(Some(thread), "second".into());
+        let (mut thread, second) = Thread::ask(Some(&thread), "second".into());
         assert_eq!(
             second.history,
             vec![chat::SideExchange {
@@ -374,20 +416,29 @@ mod tests {
         );
         // A question with no answer is not context for the next one.
         thread.fail(None, "lost");
-        let (_, third) = Thread::ask(Some(thread), "third".into());
+        let (_, third) = Thread::ask(Some(&thread), "third".into());
         assert_eq!(third.history.len(), 1);
         assert!(third.validate().is_ok());
+        // Asking leaves the open card as it was, for a question that can't
+        // be asked.
+        let (_, oversized) = Thread::ask(
+            Some(&thread),
+            "x".repeat(chat::SideQuestion::MAX_QUESTION + 1),
+        );
+        assert!(oversized.validate().is_err());
+        assert!(matches!(thread.current.state, State::Failed(_)));
+        assert_eq!(thread.earlier.len(), 1);
     }
 
     #[test]
     fn a_follow_up_keeps_the_newest_exchanges_within_the_bounds() {
         let mut thread = None;
         for index in 0..chat::SideQuestion::MAX_HISTORY + 3 {
-            let (mut next, _) = Thread::ask(thread, format!("question {index}"));
+            let (mut next, _) = Thread::ask(thread.as_ref(), format!("question {index}"));
             answered(&mut next, &"a".repeat(64 * 1024));
             thread = Some(next);
         }
-        let (_, request) = Thread::ask(thread, "last".into());
+        let (_, request) = Thread::ask(thread.as_ref(), "last".into());
         assert!(request.validate().is_ok());
         assert!(request.history.len() <= chat::SideQuestion::MAX_HISTORY);
         let newest = chat::SideQuestion::MAX_HISTORY + 2;

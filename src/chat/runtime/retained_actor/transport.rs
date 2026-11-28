@@ -3145,7 +3145,7 @@ struct Server {
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
-    side_answers: Arc<Mutex<Vec<chat::SideAnswer>>>,
+    side_answers: Arc<Mutex<SideAnswers>>,
     environment: crate::terminal_ipc::ChatExecutionEnvironment,
     recovery_environment: BTreeMap<String, String>,
     listener: UnixListener,
@@ -3255,7 +3255,7 @@ impl Server {
         let outcomes = journal.clone();
         let account_reports = Arc::new(Mutex::new(Vec::<Update>::new()));
         let reported = account_reports.clone();
-        let side_answers = Arc::new(Mutex::new(Vec::<chat::SideAnswer>::new()));
+        let side_answers = Arc::new(Mutex::new(SideAnswers::new()));
         let answered = side_answers.clone();
         if disconnected(control)? {
             return Err("Retained actor launch cancelled before process creation".into());
@@ -3536,11 +3536,7 @@ impl Server {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .clone();
-        let side_answers = self
-            .side_answers
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .clone();
+        let side_answers = pending_side_answers(&self.side_answers);
         // Metadata can become a public descriptor through ChatList without
         // hydrating a snapshot. Retain the exact sampled IDs before sending
         // them, even if the reducer concurrently advances to another thread.
@@ -5160,16 +5156,32 @@ fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
 /// builds and names. A daemon built with `test-support` takes that name too
 /// when it is given, and is itself otherwise, as when an integration test runs
 /// it with a cleared environment.
+/// Answers to side questions waiting for the daemon's next poll, each with
+/// when it arrived.
+type SideAnswers = Vec<(Instant, chat::SideAnswer)>;
+
+/// How long an answer stays in what the helper reports. The daemon polls on
+/// every change, an answer's arrival included, and hands each on once, so an
+/// answer is only repeated until it ages out rather than in every later poll.
+const SIDE_ANSWER_KEPT_FOR: Duration = Duration::from_secs(30);
+
 /// Keep the latest few answers for the daemon's next poll. A window that is
-/// still waiting needs only its own, and the daemon hands each on once.
-fn remember_side_answer(answers: &Mutex<Vec<chat::SideAnswer>>, answer: chat::SideAnswer) {
+/// still waiting needs only its own.
+fn remember_side_answer(answers: &Mutex<SideAnswers>, answer: chat::SideAnswer) {
     const KEPT: usize = 8;
     let mut answers = answers.lock().unwrap_or_else(|p| p.into_inner());
-    answers.retain(|previous| previous.id != answer.id);
+    answers.retain(|(_, previous)| previous.id != answer.id);
     if answers.len() >= KEPT {
         answers.remove(0);
     }
-    answers.push(answer);
+    answers.push((Instant::now(), answer));
+}
+
+/// The answers a poll reports, after forgetting those it has had long enough.
+fn pending_side_answers(answers: &Mutex<SideAnswers>) -> Vec<chat::SideAnswer> {
+    let mut answers = answers.lock().unwrap_or_else(|p| p.into_inner());
+    answers.retain(|(arrived, _)| arrived.elapsed() < SIDE_ANSWER_KEPT_FOR);
+    answers.iter().map(|(_, answer)| answer.clone()).collect()
 }
 
 fn helper_executable() -> Result<PathBuf, String> {

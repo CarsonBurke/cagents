@@ -2363,6 +2363,7 @@ fn adapter() -> Codex {
         prediction_turn: None,
         predictions_unsupported: false,
         latest_turn: None,
+        latest_turn_live: false,
         samples_unsupported: false,
         subagent_status: None,
         subagent_waiting: false,
@@ -8356,5 +8357,73 @@ fn a_refused_sample_says_why_without_its_payload() {
     assert_eq!(
         side_failure("rate limited"),
         "Codex couldn't answer: rate limited"
+    );
+}
+
+/// A side question names the thread's newest turn even when turns ran
+/// elsewhere while this adapter wasn't watching: the next latest page
+/// replaces the turn it remembered, unless a live start since its request
+/// already named a newer one.
+#[test]
+fn a_side_question_names_the_newest_turn_after_a_reattach() {
+    let page =
+        |id: &str| json!({"data":[{"id":id,"status":"completed","items":[]}],"nextCursor":null});
+    let mut current = adapter();
+    current
+        .page(&page("turn-1"), &mut Step::default(), false)
+        .unwrap();
+    assert_eq!(current.latest_turn.as_deref(), Some("turn-1"));
+    // Reattached after another client ran a turn.
+    current.latest_turn_live = false;
+    current
+        .page(&page("turn-2"), &mut Step::default(), false)
+        .unwrap();
+    assert_eq!(current.latest_turn.as_deref(), Some("turn-2"));
+    // A page requested before a live start arrives after it.
+    current
+        .receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn-3","status":"inProgress","items":[]}}}))
+        .unwrap();
+    current
+        .page(&page("turn-2"), &mut Step::default(), false)
+        .unwrap();
+    assert_eq!(current.latest_turn.as_deref(), Some("turn-3"));
+    // An earlier page never names the newest turn.
+    current.latest_turn_live = false;
+    current
+        .page(&page("turn-0"), &mut Step::default(), true)
+        .unwrap();
+    assert_eq!(current.latest_turn.as_deref(), Some("turn-3"));
+}
+
+/// Codex's refusals of a sample are said in plain words, and one that names
+/// a turn that is no longer the newest rereads the thread for the next ask.
+#[test]
+fn a_sample_refused_for_a_stale_turn_says_so_and_rereads_the_thread() {
+    assert_eq!(
+        side_failure("sample turn requires client interaction"),
+        "Codex wanted to use a tool or ask for approval instead of answering. Try asking another way."
+    );
+    let mut current = adapter();
+    current
+        .receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn-old","status":"inProgress","items":[]}}}))
+        .unwrap();
+    let request = current
+        .command(Command::SideQuestion(side_question("stale", "why?")))
+        .unwrap()
+        .writes
+        .remove(0);
+    let step = current
+        .receive(json!({"id":request["id"],"error":{"code":-32600,"message":"sample source turn must be the latest turn"}}))
+        .unwrap();
+    assert_eq!(
+        side_answers(&step),
+        vec![&chat::SideAnswer::failed("stale", SIDE_TURN_MOVED)]
+    );
+    assert!(
+        step.writes
+            .iter()
+            .any(|write| write["method"] == "thread/turns/list"),
+        "{:?}",
+        step.writes
     );
 }

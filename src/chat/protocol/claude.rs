@@ -888,16 +888,46 @@ fn side_answer(id: &str, response: &Value) -> chat::SideAnswer {
         Some(text) if !text.is_empty() && response["synthetic"] != true => {
             chat::SideAnswer::answered(id, text)
         }
-        Some(text) if !text.is_empty() => chat::SideAnswer::failed(id, text),
+        // Claude Code's own "no answer" note is a parenthesised sentence;
+        // anything else synthetic is an API error.
+        Some(text) if text.starts_with('(') && text.ends_with(')') => {
+            chat::SideAnswer::failed(id, text[1..text.len() - 1].trim())
+        }
+        Some(text) if !text.is_empty() => chat::SideAnswer::failed(
+            id,
+            format!(
+                "Claude couldn't answer: {}",
+                chat::failure::summary(Provider::Claude, text)
+            ),
+        ),
         _ => chat::SideAnswer::failed(id, "Claude didn't answer. Try asking another way."),
     }
 }
 
-fn side_failure(error: &str) -> String {
-    match error.trim() {
-        "" => "Claude couldn't answer this side question.".into(),
-        error => format!("Claude couldn't answer: {error}"),
+/// Why Claude refused a side question, in words for the person who asked.
+/// The CLI's own refusals name its request plumbing, so the known ones are
+/// said plainly and anything else is reduced to its one-line summary.
+fn side_failure(response: &Value) -> String {
+    let error = response["error"].as_str().unwrap_or_default().trim();
+    if response["code"] == "side_question_busy" || error.contains("side_question_busy") {
+        return "Claude is already answering as many side questions as it can. Ask again when one finishes.".into();
     }
+    if error.contains("timed out") {
+        return "Claude took too long to answer. Try again.".into();
+    }
+    if error.contains("not supported in this context") {
+        return "Claude Code can't answer side questions in this session.".into();
+    }
+    if error.is_empty() || error.starts_with("side_question") {
+        if !error.is_empty() {
+            tracing::debug!(error, "Claude refused a side question");
+        }
+        return "Claude couldn't answer this side question.".into();
+    }
+    format!(
+        "Claude couldn't answer: {}",
+        chat::failure::summary(Provider::Claude, error)
+    )
 }
 
 #[derive(Default)]
@@ -5050,7 +5080,7 @@ impl Claude {
                     if let Some(side) = request["_cagents_side"].as_str() {
                         step.events.push(Event::SideAnswer(chat::SideAnswer::failed(
                             side,
-                            side_failure(string(response, "error")),
+                            side_failure(response),
                         )));
                     } else if request["_cagents_automatic"] != true {
                         let what = if request["send_now"] == true {

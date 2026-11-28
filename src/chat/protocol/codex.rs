@@ -540,6 +540,7 @@ fn create_inner(
             prediction_turn: None,
             predictions_unsupported: false,
             latest_turn: None,
+            latest_turn_live: false,
             samples_unsupported: false,
             subagent_status: None,
             subagent_waiting: false,
@@ -577,6 +578,9 @@ fn create_inner(
     ))
 }
 
+/// A side question named a turn that is no longer the thread's newest.
+const SIDE_TURN_MOVED: &str = "The conversation moved on before Codex could answer. Ask again.";
+
 const CODEX_SAMPLES_UNSUPPORTED: &str =
     "This version of Codex can't answer side questions. Update Codex to ask one.";
 
@@ -586,6 +590,30 @@ const CODEX_SAMPLES_UNSUPPORTED: &str =
 /// before it, never the escaped payload itself.
 fn side_failure(message: &str) -> String {
     let message = message.trim();
+    // Codex's own refusals of a sample, said for the person who asked.
+    for (refusal, said) in [
+        ("sample source turn must be the latest", SIDE_TURN_MOVED),
+        ("sample source changed", SIDE_TURN_MOVED),
+        ("expectedTurnId", SIDE_TURN_MOVED),
+        ("sample canceled", "The side question was canceled."),
+        (
+            "sample turn stopped",
+            "Codex stopped before it answered. Try again.",
+        ),
+        (
+            "sample turn requires client interaction",
+            "Codex wanted to use a tool or ask for approval instead of answering. Try asking another way.",
+        ),
+        (
+            "sample turn was not admitted",
+            "Codex couldn't start answering. Try again in a moment.",
+        ),
+    ] {
+        if message.contains(refusal) {
+            tracing::debug!(message, "Codex refused a side question");
+            return said.to_owned();
+        }
+    }
     let message = message
         .strip_prefix("sample failed:")
         .map_or(message, str::trim_start);
@@ -897,6 +925,9 @@ struct Codex {
     /// The thread's newest turn, finished or not, which `thread/sample`
     /// requires its caller to name.
     latest_turn: Option<String>,
+    /// A live `turn/started` named `latest_turn` after the latest page was
+    /// last requested, so that page, when it arrives, is older than it.
+    latest_turn_live: bool,
     /// The server answered `thread/sample` as an unknown method.
     samples_unsupported: bool,
     subagent_status: Option<ToolStatus>,
@@ -2061,6 +2092,9 @@ impl Codex {
         .then_some((self.lifecycle_revision, self.notification_revision));
         let adoption_binding =
             (!earlier).then_some((self.lifecycle_revision, self.notification_revision));
+        if !earlier {
+            self.latest_turn_live = false;
+        }
         self.call(step, "thread/turns/list", json!({"threadId":self.thread,"cursor":cursor,"limit":20,"sortDirection":"desc","itemsView":"full"}), Pending::History { earlier, initial_notification_binding, adoption_binding })?;
         self.history_loading = true;
         step.events.push(if earlier {
@@ -2176,9 +2210,11 @@ impl Codex {
         let mut items = Vec::new();
         let turns = array(page, "data")?;
         // The page lists newest first; a latest page names the thread's
-        // newest turn, unless a live start already named a newer one.
+        // newest turn, unless a live start since it was requested named a
+        // newer one. Turns may have run elsewhere since the last page, so
+        // an older name never stands against it.
         if !earlier
-            && self.latest_turn.is_none()
+            && !self.latest_turn_live
             && let Some(newest) = turns.first()
         {
             self.latest_turn = Some(string(newest, "id")?.to_owned());
@@ -3131,6 +3167,11 @@ impl Codex {
                             _ => "Codex couldn't answer this side question.".to_owned(),
                         }
                     };
+                    // Turns ran that this adapter never saw, so the next
+                    // question needs the thread's own newest turn.
+                    if reason == SIDE_TURN_MOVED {
+                        self.reread(&mut step)?;
+                    }
                     step.events.push(Event::SideAnswer(chat::SideAnswer::failed(
                         id.clone(),
                         reason,
@@ -3289,6 +3330,7 @@ impl Codex {
                         .push(json!({"method":"initialized","params":{}}));
                     let pending = Pending::Attach { renamed: None };
                     if self.thread.is_some() {
+                        self.latest_turn_live = false;
                         self.call(&mut step, "thread/resume", json!({"threadId":self.thread,"excludeTurns":true,"initialTurnsPage":{"limit":20,"sortDirection":"desc","itemsView":"full"}}), pending)?;
                     } else {
                         self.call(&mut step, "thread/start", self.start.clone(), pending)?;
@@ -4398,6 +4440,7 @@ impl Codex {
                     self.remember_turn_pricing(turn_id, model, tier);
                     self.prediction_turn = Some(turn_id.into());
                     self.latest_turn = Some(turn_id.into());
+                    self.latest_turn_live = true;
                 }
                 let prediction_turn =
                     method == "turn/completed" && self.prediction_turn.as_deref() == Some(turn_id);

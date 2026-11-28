@@ -571,6 +571,7 @@ pub enum Action {
     DismissComposerNote(Target),
     /// The provider took a side question, by its identifier, or refused it.
     SideQuestionSent(Target, String, Result<(), String>),
+    SideQuestionExpired(Target, String),
     DismissSideQuestion(Target),
     CopySideAnswer(Target),
     /// Moves a draft just opened on a provider Accounts finds missing, if it
@@ -1095,6 +1096,7 @@ impl Action {
             Self::DismissRestoredWaiting(..) => "DismissRestoredWaiting",
             Self::DismissComposerNote(..) => "DismissComposerNote",
             Self::SideQuestionSent(..) => "SideQuestionSent",
+            Self::SideQuestionExpired(..) => "SideQuestionExpired",
             Self::DismissSideQuestion(..) => "DismissSideQuestion",
             Self::CopySideAnswer(..) => "CopySideAnswer",
             Self::MoveDraftOffMissingProvider(..) => "MoveDraftOffMissingProvider",
@@ -16107,6 +16109,9 @@ impl Cagents {
                         {
                             runtime.error = None;
                         }
+                        if runtime.snapshot.exited {
+                            runtime.side_question_stopped();
+                        }
                         let settled = runtime.settle_streaming_answer();
                         // First hydration can load historical provider errors
                         // never classified in this window. Current Snapshot/
@@ -18254,8 +18259,9 @@ impl Cagents {
                 }
             }
             Action::SideQuestionSent(target, id, result) => {
-                self.side_question_sent(target, &id, result);
+                return self.side_question_sent(target, id, result);
             }
+            Action::SideQuestionExpired(target, id) => self.side_question_expired(target, &id),
             Action::DismissSideQuestion(target) => return self.dismiss_side_question(target),
             Action::CopySideAnswer(target) => return self.copy_side_answer(target),
             Action::MoveDraftOffMissingProvider(target) => {

@@ -4386,6 +4386,13 @@ impl Actor {
                 }
                 continue;
             }
+            // An answer beside the conversation is not part of it: the
+            // surfaces get it, and the store, snapshot and any automation run
+            // never do.
+            if let Event::SideAnswer(answer) = event {
+                (self.notify)(Update::SideAnswer(answer));
+                continue;
+            }
             if let Some(run) = execution_scope {
                 self.execution.observe(run, &event);
             }
@@ -4394,12 +4401,6 @@ impl Actor {
                     report,
                     observed_at: observed_at().unwrap_or_default(),
                 });
-                continue;
-            }
-            // An answer beside the conversation is not part of it: the
-            // surfaces get it, and the store and snapshot never do.
-            if let Event::SideAnswer(answer) = event {
-                (self.notify)(Update::SideAnswer(answer));
                 continue;
             }
             if let Event::ActiveModel(model) = event {

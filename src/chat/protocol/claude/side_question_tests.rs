@@ -159,10 +159,48 @@ fn a_side_question_that_fails_tells_its_asker_not_the_conversation() {
         &request,
         json!({"subtype":"success","response":{"response":"API Error: 529","synthetic":true}}),
     );
+    assert!(matches!(
+        &answers(&step)[0].outcome,
+        chat::SideOutcome::Failed(reason)
+            if reason.starts_with("Claude couldn't answer") && !reason.contains("API Error")
+    ));
+    // Its own "no answer" note is said as the sentence it is.
+    let request = ask(&mut adapter, "empty");
+    let step = respond(
+        &mut adapter,
+        &request,
+        json!({"subtype":"success","response":{"response":"(No answer available for this side question. Try again, or ask in the main conversation.)","synthetic":true}}),
+    );
     assert_eq!(
         answers(&step),
-        vec![&chat::SideAnswer::failed("synthetic", "API Error: 529")]
+        vec![&chat::SideAnswer::failed(
+            "empty",
+            "No answer available for this side question. Try again, or ask in the main conversation."
+        )]
     );
+
+    // Its plumbing refusals are said plainly.
+    for (error, said) in [
+        (
+            json!({"subtype":"error","error":"too many side questions","code":"side_question_busy"}),
+            "Claude is already answering as many side questions as it can. Ask again when one finishes.",
+        ),
+        (
+            json!({"subtype":"error","error":"side_question timed out: the host did not answer in time"}),
+            "Claude took too long to answer. Try again.",
+        ),
+        (
+            json!({"subtype":"error","error":"side_question: question must be a string and history an array of {question, response} strings"}),
+            "Claude couldn't answer this side question.",
+        ),
+    ] {
+        let request = ask(&mut adapter, "plumbing");
+        let step = respond(&mut adapter, &request, error);
+        assert_eq!(
+            answers(&step),
+            vec![&chat::SideAnswer::failed("plumbing", said)]
+        );
+    }
 }
 
 #[test]
