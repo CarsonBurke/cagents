@@ -20,3 +20,9 @@ __pycache__/
 /mobile/build/
 /mobile/*/build/
 /mobile/local.properties
+
+# SwiftPM build artifacts for the native mobile transport.
+/mobile/.build/
+/mobile/ios/.build/
+/mobile/.swiftpm/
+/mobile/ios/.swiftpm/
