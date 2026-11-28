@@ -2615,6 +2615,37 @@ fn failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved() {
     );
 }
 
+fn fixture_with_codex_listener() -> (tempfile::TempDir, SharedHost, Submit, std::path::PathBuf) {
+    // Keep the Unix address short even when fixture data lives under a long TMPDIR.
+    let socket_root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let (host, request, path) = fixture();
+    host.lock().unwrap().codex_listeners =
+        crate::host::chat::CodexListenerRoots::at(socket_root.path().to_owned());
+    (socket_root, host, request, path)
+}
+
+#[test]
+fn fresh_codex_execution_survives_a_long_caller_tmpdir() {
+    let caller = tempfile::tempdir().unwrap();
+    let long_tmpdir = caller
+        .path()
+        .join("a".repeat(crate::chat::protocol::codex::OWNED_LISTENER_PATH_CAPACITY));
+    std::fs::create_dir(&long_tmpdir).unwrap();
+    let status = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "host::agent_execution::tests::fresh_codex_execution_uses_owned_listener_and_correlated_provider_result",
+            "--nocapture",
+        ])
+        .env("TMPDIR", long_tmpdir)
+        .status()
+        .unwrap();
+    assert!(
+        status.success(),
+        "Codex execution failed under a long TMPDIR"
+    );
+}
+
 #[test]
 fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     if isolated("fresh_codex_execution_uses_owned_listener_and_correlated_provider_result")
@@ -2623,7 +2654,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
         return;
     }
     use serde_json::{Value, json};
-    let (host, mut request, path) = fixture();
+    let (socket_root, host, mut request, path) = fixture_with_codex_listener();
     let root = path.parent().unwrap().to_owned();
     let program = root.join("bin/codex");
     std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
@@ -2741,7 +2772,8 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     let Some(HostedSession::Chat(session)) = agent.session else {
         panic!()
     };
-    assert!(session.owned_codex_listener.is_some());
+    let listener = session.owned_codex_listener.as_ref().unwrap();
+    assert!(listener.socket.starts_with(socket_root.path()));
     assert!(session.owns_codex_listener());
     assert!(
         session
@@ -2789,7 +2821,7 @@ fn undisplayed_codex_agent_saves_confirmed_thread_before_restart() {
     }
     use serde_json::{Value, json};
     const THREAD: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
-    let (host, mut request, path) = fixture();
+    let (_socket_root, host, mut request, path) = fixture_with_codex_listener();
     let root = path.parent().unwrap().to_owned();
     let program = root.join("bin/codex");
     std::fs::write(&program, "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments.partial\"\nmv \"$HOME/../codex-arguments.partial\" \"$HOME/../codex-arguments\"\nexec /bin/sleep 60\n").unwrap();
