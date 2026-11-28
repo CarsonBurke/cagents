@@ -1048,6 +1048,25 @@ mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
 
+    #[derive(Default)]
+    struct Placeholders(HashMap<Id, Rectangle>);
+
+    impl Operation for Placeholders {
+        fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+            visit(self);
+        }
+        fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+            if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
+                policy.visit = true;
+            }
+        }
+        fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+            if let Some(id) = id {
+                self.0.insert(id.clone(), bounds);
+            }
+        }
+    }
+
     #[test]
     fn only_explicit_navigation_reads_offscreen_alias_bounds() {
         struct Probe {
@@ -1089,6 +1108,11 @@ mod tests {
         let mut tree = Tree::new(&column);
         let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
         let node = column.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let mut full = Placeholders::default();
+        column
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut full);
+        assert_eq!(full.0.len(), 1_000);
         let run = |column: &mut Element<'_, Message>, tree: &mut Tree, wanted: Option<Id>| {
             let mut probe = Probe {
                 wanted,
@@ -1389,18 +1413,6 @@ mod tests {
     /// placeholder sits where the rows above it end.
     #[test]
     fn a_column_rebuilt_each_frame_keeps_offsets_exact() {
-        #[derive(Default)]
-        struct Placeholders(HashMap<Id, Rectangle>);
-        impl Operation for Placeholders {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-                if let Some(id) = id {
-                    self.0.insert(id.clone(), bounds);
-                }
-            }
-        }
         let renderer = crate::app::tests::headless_renderer();
         let window = Rc::new(Cell::new(Some(Viewport {
             top: 0.0,
@@ -1472,18 +1484,6 @@ mod tests {
     /// reindex would place it.
     #[test]
     fn a_measured_row_changed_offscreen_keeps_its_measured_height() {
-        #[derive(Default)]
-        struct Placeholders(HashMap<Id, Rectangle>);
-        impl Operation for Placeholders {
-            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
-                visit(self);
-            }
-            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
-                if let Some(id) = id {
-                    self.0.insert(id.clone(), bounds);
-                }
-            }
-        }
         let renderer = crate::app::tests::headless_renderer();
         let window = Rc::new(Cell::new(Some(Viewport {
             top: 0.0,
