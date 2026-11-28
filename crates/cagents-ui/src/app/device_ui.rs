@@ -63,6 +63,7 @@ pub(super) fn sidebar_route(action: &SidebarAction) -> Option<SidebarRoute> {
         | SidebarAction::SetFilter(_)
         | SidebarAction::HideReadAttention
         | SidebarAction::ToggleInProgress
+        | SidebarAction::ListHover(_)
         | SidebarAction::ToggleControls
         | SidebarAction::OpenFirstSearchResult
         | SidebarAction::FocusFirstSearchResult

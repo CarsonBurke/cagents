@@ -44,6 +44,12 @@ impl Cagents {
         ) {
             self.device_source_activity(false);
         }
+        if let SidebarAction::ListHover(over) = action {
+            let compact = self.projects_sidebar_mode() == SidebarMode::Compact;
+            self.sidebar_state
+                .hover_list(&self.sidebar_model, compact, over);
+            return ControlFlow::Break(Task::none());
+        }
         // Folding takes the rows, and any keyboard focus on one, out
         // of the tree; ask the tree drawn now before it does.
         if action == SidebarAction::ToggleInProgress {
@@ -717,6 +723,7 @@ impl Cagents {
             | SidebarAction::ToggleProject(_)
             | SidebarAction::ToggleWorktrees(_)
             | SidebarAction::ToggleInProgress
+            | SidebarAction::ListHover(_)
             => Task::none(),
             // The settings page edits the same default, so this goes
             // through its path: the page's draft, the save and the

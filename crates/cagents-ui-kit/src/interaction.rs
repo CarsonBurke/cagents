@@ -19,6 +19,8 @@ mod composer_popover;
 pub use composer_popover::composer_popover;
 mod footed;
 pub use footed::footed;
+pub mod hover_hold;
+pub use hover_hold::hover_region;
 mod context_menu;
 mod keyed_list;
 mod list_navigation;

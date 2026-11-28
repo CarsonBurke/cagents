@@ -67,13 +67,15 @@ fn tab_row<'a, Message: Clone + 'a>(
     compact: bool,
     returns: bool,
 ) -> Element<'a, Message> {
-    let row = widget::row::with_children(
+    // A tab's count comes, grows and goes with what its view holds; while
+    // the pointer is on the row, the tabs keep their widths so none slides
+    // under it.
+    let row = crate::interaction::hover_hold::held_row(
         tabs.into_iter()
             .map(|tab| tab_button(tab, compact, returns))
-            .collect::<Vec<_>>(),
-    )
-    .spacing(space::XS)
-    .align_y(iced::Alignment::Center);
+            .collect(),
+        space::XS,
+    );
     widget::container(row).width(Length::Fill).clip(true).into()
 }
 

@@ -14406,3 +14406,156 @@ fn a_rebase_with_nothing_staged_continues_without_a_message() {
         "{texts:?}"
     );
 }
+
+/// While the pointer rests on the Attention list, rows stay where they were
+/// as their agents change state, and settle once it leaves.
+#[test]
+fn attention_rows_hold_still_under_the_pointer() {
+    use crate::agent::{Activity, ActivityState, Provider};
+    let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+    let project = project_id(1);
+    let main = model.projects[0].worktrees[0].clone();
+    let feature = model.projects[0].worktrees[1].clone();
+    let working = CardId::from_uuid(Uuid::from_u128(81));
+    let waiting = CardId::from_uuid(Uuid::from_u128(82));
+    let durable = pane_workspace(&[(working, &feature.path), (waiting, &main.path)]);
+    let activity = |state| Activity {
+        provider: Provider::Codex,
+        state,
+    };
+    let mut state = expanded_worktree_state();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+    state.set_agent_activity(
+        working,
+        project,
+        feature.id,
+        activity(ActivityState::Working),
+    );
+    state.set_agent_activity(waiting, project, main.id, activity(ActivityState::Waiting));
+    refresh_attention(&mut state, &mut model, &durable);
+    let before = vec![
+        SelectionRow::Project(project),
+        SelectionRow::Card(waiting),
+        SelectionRow::Card(working),
+    ];
+    assert_eq!(visible_selection_rows(&model, &state, false), before);
+
+    let cache = NavigationCache::default();
+    let settled = cache.generation(&model, &state);
+    state.hover_list(&model, false, true);
+    assert!(state.list_held());
+    assert_ne!(settled, cache.generation(&model, &state), "holding redraws");
+    // The working agent comes to need the user, and the waiting one carries
+    // on: neither row moves between the sections while the pointer stays.
+    state.set_agent_activity(
+        working,
+        project,
+        feature.id,
+        activity(ActivityState::Waiting),
+    );
+    state.set_agent_activity(waiting, project, main.id, activity(ActivityState::Working));
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(visible_selection_rows(&model, &state, false), before);
+    // Once the agents are idle the rows still keep their places.
+    state.set_agent_activity(working, project, feature.id, activity(ActivityState::Idle));
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(visible_selection_rows(&model, &state, false), before);
+
+    // A second report while held keeps the hold the pointer arrived to.
+    state.hover_list(&model, false, true);
+    assert_eq!(visible_selection_rows(&model, &state, false), before);
+    state.hover_list(&model, false, false);
+    assert!(!state.list_held());
+    // Settled: the waiting card now works, under In progress, last.
+    assert_eq!(
+        visible_selection_rows(&model, &state, false).last(),
+        Some(&SelectionRow::Card(waiting))
+    );
+
+    // Typing a search lists its matches as they are.
+    state.hover_list(&model, false, true);
+    state.apply(&SidebarAction::SearchChanged("agent".into()));
+    assert!(!state.list_held());
+}
+
+/// Work that starts while the pointer is on the list joins In progress after
+/// the rows held there.
+#[test]
+fn work_starting_under_the_pointer_joins_in_progress_after_held_rows() {
+    use crate::agent::{Activity, ActivityState, Provider};
+    let mut model = SidebarModel::ready(SidebarMode::Expanded, vec![project()]);
+    let project = project_id(1);
+    let main = model.projects[0].worktrees[0].clone();
+    let feature = model.projects[0].worktrees[1].clone();
+    let first = CardId::from_uuid(Uuid::from_u128(91));
+    let second = CardId::from_uuid(Uuid::from_u128(92));
+    // Settled, the second pane, in the feature checkout, sorts first.
+    let durable = pane_workspace(&[(first, &main.path), (second, &feature.path)]);
+    let activity = |state| Activity {
+        provider: Provider::Codex,
+        state,
+    };
+    let mut state = expanded_worktree_state();
+    state.apply(&SidebarAction::SetFilter(SidebarFilter::Attention));
+    state.set_agent_activity(first, project, main.id, activity(ActivityState::Working));
+    refresh_attention(&mut state, &mut model, &durable);
+    let rows = |model: &SidebarModel, state: &SidebarState| {
+        in_progress_rows(model, state, false)
+            .iter()
+            .map(|row| row.row())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(rows(&model, &state), [SelectionRow::Card(first)]);
+    state.hover_list(&model, false, true);
+    state.set_agent_activity(
+        second,
+        project,
+        feature.id,
+        activity(ActivityState::Working),
+    );
+    refresh_attention(&mut state, &mut model, &durable);
+    assert_eq!(
+        rows(&model, &state),
+        [SelectionRow::Card(first), SelectionRow::Card(second)],
+        "the newcomer follows the held row"
+    );
+    state.hover_list(&model, false, false);
+    assert_eq!(
+        rows(&model, &state),
+        [SelectionRow::Card(second), SelectionRow::Card(first)],
+        "and takes its own place once the pointer leaves"
+    );
+}
+
+/// The compact rail keeps the rows it drew while the pointer is on it.
+#[test]
+fn compact_rail_rows_hold_still_under_the_pointer() {
+    let mut model = SidebarModel::ready(SidebarMode::Compact, vec![project()]);
+    let channel_id = ChannelId::from_uuid(Uuid::from_u128(95));
+    model.projects[0].channels.push(SidebarChannel::new(
+        channel_id,
+        "Investigate".into(),
+        false,
+        Some(crate::agent::ActivityState::Working),
+        false,
+        1,
+        true,
+        1,
+    ));
+    let mut state = SidebarState::default();
+    let shows = |model: &SidebarModel, state: &SidebarState| {
+        compact_rail_shows_channel(state, &model.projects[0].channels[0])
+    };
+    assert!(shows(&model, &state));
+    state.hover_list(&model, true, true);
+    model.projects[0].channels[0].activity = None;
+    assert!(shows(&model, &state), "a row whose work ended stays drawn");
+    state.release_list_hold();
+    assert!(!shows(&model, &state), "and goes once released");
+    // Work starting under the pointer waits for it to leave.
+    state.hover_list(&model, true, true);
+    model.projects[0].channels[0].activity = Some(crate::agent::ActivityState::Working);
+    assert!(!shows(&model, &state));
+    state.hover_list(&model, true, false);
+    assert!(shows(&model, &state));
+}

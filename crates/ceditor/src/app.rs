@@ -3291,6 +3291,8 @@ fn tab_strip(editor: &Editor) -> Element<'_, Message> {
             select: Box::new(Message::Select),
             dropped: Box::new(|card, before| Message::ReorderTab { card, before }),
         },
+        // Its tabs have one fixed width, which a close never changes.
+        None,
     )
 }
 
