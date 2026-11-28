@@ -4140,6 +4140,106 @@ fn fresh_launch_preserves_path_order_and_adds_missing_login_search_directories()
 
 #[cfg(target_os = "linux")]
 #[test]
+fn linux_native_chat_uses_the_local_windows_shell_profile() {
+    use crate::repository::{
+        CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor,
+    };
+
+    const FIXTURE: &str = "CAGENTS_CHAT_SHELL_PROFILE_FIXTURE";
+    const BASE_PATH: &str = "/usr/bin:/bin";
+    let current = thread::current();
+    let name = current.name().unwrap();
+    if std::env::var(FIXTURE).as_deref() != Ok(name) {
+        // Fish uses XDG_CONFIG_HOME to select its interactive startup file.
+        // The shared shell resolver tests also cover this with a portable
+        // fixture when a developer uses another login shell.
+        let shell = LaunchRecipe::shell("/".into()).unwrap().program;
+        if std::path::Path::new(&shell).file_name() != Some(std::ffi::OsStr::new("fish")) {
+            eprintln!("Native profile fixture requires fish as the login shell");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        for child in ["home", "daemon-config", "data", "state", "cache", "run"] {
+            crate::secure_file::prepare_private_directory(&root.path().join(child)).unwrap();
+        }
+        let command = CommandSpec::new(std::env::current_exe().unwrap())
+            .args(["--exact", name, "--nocapture"])
+            .env(FIXTURE, name)
+            .env("HOME", root.path().join("home"))
+            .env("XDG_CONFIG_HOME", root.path().join("daemon-config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_STATE_HOME", root.path().join("state"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", root.path().join("run"))
+            .env("PATH", BASE_PATH)
+            .timeout(Duration::from_secs(60));
+        let result = SystemProcessExecutor
+            .execute(&command, &CancellationToken::new())
+            .unwrap();
+        result.require_success(&command.program).unwrap();
+        return;
+    }
+
+    let (directory, host, saved) = upgrade_fixture();
+    let window_profile = directory.path().join("window-config");
+    let tools = window_profile.join("tools");
+    std::fs::create_dir_all(window_profile.join("fish")).unwrap();
+    std::fs::create_dir(&tools).unwrap();
+    std::fs::write(
+        window_profile.join("fish/config.fish"),
+        "if status is-interactive
+    set -gx PATH $XDG_CONFIG_HOME/tools $PATH
+end
+",
+    )
+    .unwrap();
+    std::fs::rename(directory.path().join("omp"), tools.join("omp")).unwrap();
+    let daemon_path = daemon_shell_search_path(None, false).unwrap();
+    assert!(!std::env::split_paths(&daemon_path).any(|path| path == tools));
+
+    let mut session = saved.source;
+    session.proof = None;
+    session.launch.recipe.program = "omp".into();
+    session.launch.recipe.environment.insert(
+        "XDG_CONFIG_HOME".into(),
+        directory
+            .path()
+            .join("recorded-profile")
+            .to_str()
+            .unwrap()
+            .into(),
+    );
+    let response = process(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session: session.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                ("PATH".into(), BASE_PATH.into()),
+                (
+                    "XDG_CONFIG_HOME".into(),
+                    window_profile.to_str().unwrap().into(),
+                ),
+            ])),
+        },
+    )
+    .unwrap();
+    assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+    let handle = host.lock().unwrap().chats[&session.id].handle.clone();
+    let environment = handle.execution_environment();
+    let path = &environment.0["PATH"];
+    assert_eq!(
+        crate::account::probe::find_executable("omp", Some(std::ffi::OsStr::new(path))),
+        Some(tools.join("omp")),
+    );
+    handle.close().unwrap();
+    assert_eq!(daemon_shell_search_path(None, false), Some(daemon_path));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn linux_provider_path_preserves_recorded_and_relative_order() {
     let mut recipe = crate::model::LaunchRecipe {
         program: "codex".into(),
