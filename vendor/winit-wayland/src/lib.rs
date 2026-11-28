@@ -39,6 +39,8 @@ macro_rules! os_error {
 }
 
 mod event_loop;
+#[doc(hidden)]
+pub mod flush;
 mod output;
 mod seat;
 mod state;

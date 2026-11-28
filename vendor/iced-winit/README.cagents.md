@@ -121,12 +121,11 @@ requests from a surface configure are broadcast as before. The vendored
 `iced_futures` makes those queues keep every event; see
 `vendor/iced-futures/README.cagents.md`.
 
-The SCTK thread stops once its Wayland connection is lost. A failed connection
-fails every later dispatch at once, so the upstream loop spun at full speed and
-logged a flush error and a dispatch error on each pass (about 60,000 pairs in
-the two seconds an application took to shut down after its compositor exited).
-After a dispatch error the thread flushes the connection; anything but
-`WouldBlock` means the connection is gone, and the thread logs one line and
-returns. Surfaces dropped after that no longer panic on the closed action
-channel. Remove this backport when the pinned dependency stops on a lost
-connection.
+## SCTK dispatch and socket backpressure (#3732, #3753)
+
+The SCTK thread uses Winit's shared flush helper to retry buffered requests
+when the Wayland socket becomes writable. On a fatal dispatch error the thread
+logs the error and stops. A failed Wayland connection fails every later
+dispatch immediately, so retrying would spin and flood the log while the app
+shuts down. A queue error on a healthy connection still allows dispatch to
+continue. Surfaces can still be dropped after the action channel closes.
