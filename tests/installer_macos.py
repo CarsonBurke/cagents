@@ -102,6 +102,17 @@ esac''')
         self.reinstall()
         self.assertEqual([tree.stat().st_ino for tree in trees], before)
 
+    def test_disk_image_bootstrap_leaves_a_different_selected_release_in_place(self):
+        current = self.prefix / "current"
+        current.unlink()
+        current.symlink_to("versions/10.0.0")
+        (self.prefix / ".previous").touch()
+        result = self.run_installer("--no-start", "--version", VERSION, "--publish-tree", str(self.stage),
+                                    "--publisher", str(self.stage / "bin/cagents"), "--bootstrap", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the disk image cannot replace the selected release 10.0.0", result.stderr)
+        self.assertEqual(current.readlink(), Path("versions/10.0.0"))
+
     def test_uninstall_can_reinstall_in_a_prefix_with_user_files(self):
         notes = self.prefix / "notes.txt"
         notes.write_text("user file\n")

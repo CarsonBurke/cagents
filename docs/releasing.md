@@ -104,7 +104,8 @@ Before publishing integrated artifacts, follow [the Wayland capability qualifica
   `SHA256SUMS` and the signed metadata. The alias provides the
   [latest download](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-x86_64.AppImage).
 - with a macOS build ([macOS](#macos)): `cagents-${VERSION}-aarch64-apple-darwin.tar.gz`,
-  `install-macos.sh`, and `SHA256SUMS-macos`, which covers those two
+  `install-macos.sh`, `Cagents-${VERSION}-arm64.dmg`, and its byte-identical
+  `Cagents-arm64.dmg` alias. `SHA256SUMS-macos` covers all four.
 - with an [Android build](#android), `cagents-android-${VERSION}.apk`,
   `cagents-android.apk`, and `SHA256SUMS-android`, which covers both names
 - `release-metadata-2.json`: the version, source commit, daemon protocol,
@@ -137,6 +138,27 @@ the production identity `dev.cagents.Cagents` and without the integrated
 browser, and the dictation helper, linked against the pinned sherpa-onnx static
 libraries. The UI and the helper carry an embedded `Info.plist` section, so the
 microphone permission prompt names cagents and its purpose.
+
+Pass `--dmg` to build the drag-to-Applications installer alongside the
+archive. The release build enables that flag for sources that support it.
+The disk image bundles the archive and terminal installer, so first launch
+can install offline. Both disk image names go in the signed release metadata,
+and the stable name is available when
+[the latest release includes macOS](https://github.com/CarsonBurke/cagents/releases/latest/download/Cagents-arm64.dmg).
+
+1. Open the disk image and drag Cagents to `/Applications` or
+   `~/Applications`.
+2. Open the copy in Applications. If Gatekeeper blocks it, open **System
+   Settings → Privacy & Security**, then select **Open Anyway** for Cagents
+   and confirm. On macOS 11 and 12, open **System Preferences → Security &
+   Privacy → General**.
+3. Open Cagents normally from then on. The first launch installs the CLI and
+   the LaunchAgent. The UI starts the daemon and uses the managed
+   installation for future updates.
+
+The app and bundled executables use ad hoc signatures. The daemon uses the
+per-user LaunchAgent installed by the terminal installer. When uninstalling,
+remove the dragged copy as well if you want to remove Cagents completely.
 
 The archive holds one version tree laid out as on Linux, so the install guard
 reads it the same way, as companion lookup and the updater will once they
@@ -220,11 +242,11 @@ To cut a release with the macOS build, give `cut` or `build` the Mac with
 commit to a private staging directory on the Mac and runs that commit's
 `scripts/package-macos`. The packager builds, signs and installs the package in
 a private home and prefix to check the commands, bundle and login item. Cut
-brings the three files into the bundle before writing and signing the metadata.
+brings the macOS assets into the bundle before writing and signing the metadata.
 The Mac removes the staged source and keeps the shared Cargo target in
 `~/Library/Caches/cagents-release/target` for later builds. The publisher
-then requires all three files, checks `SHA256SUMS-macos` and the archive's
-members, and adds a macOS section to the release notes. GitHub Actions builds
+then checks the asset set, `SHA256SUMS-macos`, and the archive's members. It
+adds a macOS section to the release notes. GitHub Actions builds
 no macOS release yet.
 
 To build and smoke-test macOS while fw16 prepares Linux, run

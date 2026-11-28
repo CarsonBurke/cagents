@@ -240,7 +240,13 @@ if [[ -f $root/macos-source-marker ]]; then
     cat "$root/macos-source-marker" >> "cagents-$version-aarch64-apple-darwin.tar.gz"
 fi
 printf "#!/bin/sh\nDEFAULT_REPOSITORY='CarsonBurke/cagents'\n" > install-macos.sh
-sha256sum "cagents-$version-aarch64-apple-darwin.tar.gz" install-macos.sh > SHA256SUMS-macos
+payloads=("cagents-$version-aarch64-apple-darwin.tar.gz" install-macos.sh)
+if [[ ${3:-} == --dmg ]]; then
+    printf 'disk image fixture\n' > "Cagents-$version-arm64.dmg"
+    cp "Cagents-$version-arm64.dmg" Cagents-arm64.dmg
+    payloads+=("Cagents-$version-arm64.dmg" Cagents-arm64.dmg)
+fi
+sha256sum "${payloads[@]}" > SHA256SUMS-macos
 [[ ! -e $FIXTURE/macos-damaged ]] || echo damaged >> install-macos.sh
 """
 
@@ -1182,6 +1188,35 @@ printf '%s\n' '{pinned / "zig"}'
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(receipt.read_text(), expected)
         self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 2)
+
+    def test_prepare_macos_copies_disk_images_from_a_source_that_builds_them(self):
+        self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)
+        (self.repo / "packaging/macos").mkdir(parents=True)
+        self.tool(self.repo / "packaging/macos/first-launch", "#!/bin/sh\n")
+        commit = self.commit("feat(release): build the macOS disk image")
+        self.git("push", "-q", "origin", "main")
+        bundles = self.root / "disk image & bundles"
+        self.env["CAGENTS_RELEASE_BUNDLES"] = str(bundles)
+        args = ("prepare-macos", "--commit", commit, "--macos-host", "mac")
+
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        cache = bundles / f".prepared-macos/mac/0.2.4/{commit}"
+        image = cache / "Cagents-0.2.4-arm64.dmg"
+        alias = cache / "Cagents-arm64.dmg"
+        self.assertEqual(alias.read_bytes(), image.read_bytes())
+        self.assertIn(alias.name, (cache / "SHA256SUMS-macos").read_text())
+
+        alias.write_bytes(b"damaged alias")
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(alias.read_bytes(), image.read_bytes())
+        self.assertEqual(sum(line.startswith("package-macos ") for line in self.log("calls.log")), 2)
+
+        self.bundle(commit)
+        preview = self.release("cut", "--commit", commit, "--macos-host", "mac", "--dry-run")
+        self.assertEqual(preview.returncode, 0, preview.stderr)
+        self.assertIn(f"Using the prepared macOS release of {commit}", preview.stdout)
 
     def test_cut_reuses_only_the_prepared_mac_bundle_for_the_selected_commit(self):
         self.tool(self.repo / "scripts/package-macos", PACKAGE_MACOS)

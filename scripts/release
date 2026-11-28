@@ -423,30 +423,48 @@ esac
 # Rehearsal keys are compiled into private test builds only.
 unset CAGENTS_UPDATE_REHEARSAL_KEYS
 # rustup and Cargo find the checkout's toolchain and config from cwd.
-(cd build-source && scripts/package-macos --output "$1/dist" </dev/null 9>&-)
+(
+    output=$1/dist
+    cd build-source
+    args=(--output "$output")
+    if [[ -f packaging/macos/first-launch ]]; then args+=(--dmg); fi
+    scripts/package-macos "${args[@]}" </dev/null 9>&-
+)
 BUILD
 MAC
-    for name in "$(macos_archive)" install-macos.sh SHA256SUMS-macos; do
+    while IFS= read -r name; do
         scp -q -- "$MACOS_HOST:$remote/dist/$name" "$directory/$name" \
             || fail "cannot copy $name from $MACOS_HOST"
-    done
-    macos_checksums_match "$directory" \
+    done < <(macos_assets "$commit")
+    macos_checksums_match "$directory" "$commit" \
         || fail "the macOS release copied from $MACOS_HOST does not match its checksums"
 )
 
-macos_archive() {
-    printf 'cagents-%s-aarch64-apple-darwin.tar.gz' "$VERSION"
+macos_payloads() {
+    printf '%s\n' "cagents-$VERSION-aarch64-apple-darwin.tar.gz" install-macos.sh
+    # A release built from an older tag uses that tag's own packager.
+    if repository_git cat-file -e "$1:packaging/macos/first-launch" 2>/dev/null; then
+        printf '%s\n' "Cagents-$VERSION-arm64.dmg" Cagents-arm64.dmg
+    fi
+}
+
+macos_assets() {
+    macos_payloads "$1"
+    printf '%s\n' SHA256SUMS-macos
 }
 
 macos_checksums_match() (
     cd -- "$1" || exit 1
-    local archive
-    archive=$(macos_archive)
+    local -a payloads
+    mapfile -t payloads < <(macos_payloads "$2")
     local name
-    for name in "$archive" install-macos.sh SHA256SUMS-macos; do
+    for name in "${payloads[@]}" SHA256SUMS-macos; do
         [[ -f $name && ! -L $name ]] || exit 1
     done
-    sha256sum -- "$archive" install-macos.sh | cmp -s -- - SHA256SUMS-macos
+    if (( ${#payloads[@]} == 4 )); then
+        cmp -s -- "${payloads[2]}" "${payloads[3]}" || exit 1
+    fi
+    sha256sum -- "${payloads[@]}" | cmp -s -- - SHA256SUMS-macos
 )
 
 macos_cache_dir() {
@@ -464,7 +482,7 @@ macos_receipt() {
 prepared_macos_matches() {
     local bundle=$1 commit=$2
     [[ -f $bundle/receipt && ! -L $bundle/receipt ]] \
-        && macos_checksums_match "$bundle" \
+        && macos_checksums_match "$bundle" "$commit" \
         && macos_receipt "$bundle" "$commit" | cmp -s -- - "$bundle/receipt"
 }
 
@@ -476,8 +494,10 @@ add_macos() (
     exec 8>"$cache/.lock"
     flock 8
     if prepared_macos_matches "$bundle" "$commit"; then
-        cp -- "$bundle/$(macos_archive)" "$bundle/install-macos.sh" "$bundle/SHA256SUMS-macos" "$directory/"
-        if ! macos_checksums_match "$directory" \
+        local -a assets
+        mapfile -t assets < <(macos_assets "$commit")
+        cp -- "${assets[@]/#/"$bundle"/}" "$directory/"
+        if ! macos_checksums_match "$directory" "$commit" \
             || ! macos_receipt "$directory" "$commit" | cmp -s -- - "$bundle/receipt"; then
             fail "the staged macOS assets do not match the prepared release"
         fi

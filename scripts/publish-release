@@ -142,12 +142,15 @@ PAYLOADS=(
 APPIMAGE_PAYLOADS=("cagents-$VERSION-x86_64.AppImage" cagents-x86_64.AppImage)
 APPIMAGE=false
 # A release may also carry the Apple Silicon macOS build (scripts/package-macos):
-# its archive, installer and their own checksums, all three or none.
+# its archive, installer and their own checksums. Newer sources also build a
+# disk image and its identical stable download alias.
 # SHA256SUMS covers only the Linux payloads, so a release without macOS is
 # what it was before macOS builds existed.
 MACOS_ARCHIVE=cagents-$VERSION-aarch64-apple-darwin.tar.gz
 MACOS_PAYLOADS=("$MACOS_ARCHIVE" install-macos.sh SHA256SUMS-macos)
+MACOS_IMAGES=("Cagents-$VERSION-arm64.dmg" Cagents-arm64.dmg)
 MACOS=false
+MACOS_IMAGE=false
 ANDROID_APK=cagents-android-$VERSION.apk
 ANDROID_PAYLOADS=("$ANDROID_APK" cagents-android.apk SHA256SUMS-android)
 ANDROID=false
@@ -179,6 +182,7 @@ define_assets() {
     if "$APPIMAGE"; then LINUX_PAYLOADS+=("${APPIMAGE_PAYLOADS[@]}"); fi
     SHIPPED=("${LINUX_PAYLOADS[@]}" SHA256SUMS)
     if "$MACOS"; then SHIPPED+=("${MACOS_PAYLOADS[@]}"); fi
+    if "$MACOS_IMAGE"; then SHIPPED+=("${MACOS_IMAGES[@]}"); fi
     if "$ANDROID"; then SHIPPED+=("${ANDROID_PAYLOADS[@]}"); fi
     BUNDLE_ASSETS=("${SHIPPED[@]}" release-metadata.json release-metadata.json.sig)
     ASSETS=("${SHIPPED[@]}")
@@ -203,6 +207,22 @@ carries_platform_assets() {
         fi
     done
     return 1
+}
+
+select_platform_assets() {
+    local directory=$1 names=$2
+    if carries_platform_assets "$directory" "$names" "${MACOS_IMAGES[@]}"; then
+        MACOS_IMAGE=true
+        MACOS=true
+    elif carries_platform_assets "$directory" "$names" "${MACOS_PAYLOADS[@]}"; then
+        MACOS=true
+        if checkout_git cat-file -e "$SOURCE_COMMIT:packaging/macos/first-launch" 2>/dev/null; then
+            MACOS_IMAGE=true
+        fi
+    fi
+    if carries_platform_assets "$directory" "$names" "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
+    if carries_platform_assets "$directory" "$names" "${APPIMAGE_PAYLOADS[@]}"; then APPIMAGE=true; fi
+    define_assets
 }
 
 version_after() {
@@ -301,7 +321,13 @@ check_checksums() {
     check_manifest "$1" SHA256SUMS "${LINUX_PAYLOADS[@]}"
     check_manifest "$1" SHA256SUMS-browserless "$BROWSERLESS_ARCHIVE" "$BROWSERLESS_DEB" "$BROWSERLESS_SIZES"
     check_manifest "$1" SHA256SUMS-ceditor "$EDITOR_ARCHIVE"
-    if "$MACOS"; then check_manifest "$1" SHA256SUMS-macos "$MACOS_ARCHIVE" install-macos.sh; fi
+    if "$MACOS_IMAGE"; then
+        check_manifest "$1" SHA256SUMS-macos "$MACOS_ARCHIVE" install-macos.sh "${MACOS_IMAGES[@]}"
+        cmp -s -- "$1/${MACOS_IMAGES[0]}" "$1/${MACOS_IMAGES[1]}" \
+            || fail 'the stable macOS disk image differs from the versioned image'
+    elif "$MACOS"; then
+        check_manifest "$1" SHA256SUMS-macos "$MACOS_ARCHIVE" install-macos.sh
+    fi
 }
 
 # An allowed-signers file for the trusted key lines of a release-keys.pub.
@@ -554,10 +580,7 @@ check_macos_archive() {
 # A bundle is checked before anything is made for it; promotion makes it
 # from the draft.
 if [[ -z $PROMOTE ]]; then
-    if carries_platform_assets "$DIST_DIR" '' "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
-    if carries_platform_assets "$DIST_DIR" '' "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
-    if carries_platform_assets "$DIST_DIR" '' "${APPIMAGE_PAYLOADS[@]}"; then APPIMAGE=true; fi
-    define_assets
+    select_platform_assets "$DIST_DIR" ''
     check_asset_set "$DIST_DIR"
 fi
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
@@ -582,11 +605,7 @@ if [[ -n $PROMOTE ]]; then
         || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
     jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
     DRAFT_ASSETS=$(draft_assets "$draft")
-    draft_names=$(jq -r '.assets[].name' <<< "$draft")
-    if carries_platform_assets '' "$draft_names" "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
-    if carries_platform_assets '' "$draft_names" "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
-    if carries_platform_assets '' "$draft_names" "${APPIMAGE_PAYLOADS[@]}"; then APPIMAGE=true; fi
-    define_assets
+    select_platform_assets '' "$(jq -r '.assets[].name' <<< "$draft")"
     mkdir "$WORK_DIR/draft"
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
         || fail "cannot download the draft of $TAG"
@@ -795,17 +814,35 @@ EOF
         cat <<EOF
 ## macOS
 
-Apple Silicon Macs with macOS 11 or newer. The build is signed ad hoc, not
-notarized; installing it from a terminal as below is what macOS allows
-without a warning. It links Cagents into ~/Applications and the \`cagents\`
-command into ~/.local/bin, and starts the daemon at login. To update, install a newer
-release the same way; the installer says what to stop first.
+Apple Silicon Macs with macOS 11 or newer. The ad hoc signed build links the
+\`cagents\` command into ~/.local/bin and starts the daemon at login.
+
+EOF
+        if "$MACOS_IMAGE"; then
+            cat <<EOF
+Open [${MACOS_IMAGES[0]}](https://github.com/$REPOSITORY/releases/download/$TAG/${MACOS_IMAGES[0]})
+and drag Cagents to Applications. Open it from Applications. If macOS blocks
+the first launch, open System Settings → Privacy & Security, select Open
+Anyway for Cagents and confirm. On macOS 11 and 12, look in System
+Preferences → Security & Privacy → General. Cagents installs on first
+launch and offers later versions through its updater.
+
+EOF
+        fi
+        cat <<EOF
+To install from a terminal:
 
 \`\`\`sh
 base=https://github.com/$REPOSITORY/releases/download/$TAG
 mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
-curl --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh"
-shasum -a 256 --check SHA256SUMS-macos
+curl --fail --location --remote-name-all "\$base/$MACOS_ARCHIVE" "\$base/SHA256SUMS-macos" "\$base/install-macos.sh" &&
+expected=\$(shasum -a 256 "$MACOS_ARCHIVE" install-macos.sh) &&
+recorded=\$(awk -v archive="$MACOS_ARCHIVE" '
+    \$2 == archive { a = \$0; archives++ }
+    \$2 == "install-macos.sh" { i = \$0; installers++ }
+    END { if (archives != 1 || installers != 1) exit 1; print a; print i }
+' SHA256SUMS-macos) &&
+[ "\$expected" = "\$recorded" ] &&
 CAGENTS_ARCHIVE="\$PWD/$MACOS_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS-macos" sh ./install-macos.sh --version $VERSION
 \`\`\`
 

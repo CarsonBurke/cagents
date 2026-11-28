@@ -21,6 +21,12 @@
 #include <string.h>
 #include <unistd.h>
 
+#ifdef CAGENTS_DISK_IMAGE
+#include <spawn.h>
+#include <sys/wait.h>
+extern char **environ;
+#endif
+
 static void report(const char *message)
 {
     /* Finder shows nothing a launcher writes to stderr, so say it in a
@@ -56,13 +62,37 @@ int main(int argc, char **argv)
     char launcher[PATH_MAX];
     if (realpath(raw, launcher) == NULL)
         report("The launcher cannot find its own location.");
+
+    char wanted[PATH_MAX];
+    char ui[PATH_MAX];
+#ifdef CAGENTS_DISK_IMAGE
+    if (strip_components(launcher, 3) != 0)
+        report("The launcher is not inside an installed Cagents.app.");
+    char bootstrap[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (home == NULL || home[0] != '/'
+        || snprintf(bootstrap, sizeof bootstrap, "%s/Contents/Resources/first-launch", launcher) >= (int)sizeof bootstrap
+        || snprintf(wanted, sizeof wanted,
+                    "%s/Library/Application Support/cagents-install/current/bin/cagents-ui", home) >= (int)sizeof wanted)
+        report("The installation path is too long.");
+
+    char *const command[] = { "/bin/sh", bootstrap, NULL };
+    pid_t child;
+    if (posix_spawn(&child, "/bin/sh", NULL, NULL, command, environ) != 0)
+        report("The installed version of cagents is missing. Reinstall cagents.");
+    int status;
+    pid_t waited;
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        report("The installed version of cagents is missing. Reinstall cagents.");
+#else
     /* PREFIX/Cagents.app/Contents/MacOS/Cagents */
     if (strip_components(launcher, 4) != 0)
         report("The launcher is not inside an installed Cagents.app.");
 
     char marker[PATH_MAX];
-    char wanted[PATH_MAX];
-    char ui[PATH_MAX];
     if (snprintf(marker, sizeof marker, "%s/.cagents-install-root", launcher) >= (int)sizeof marker
         || snprintf(wanted, sizeof wanted, "%s/current/bin/cagents-ui", launcher) >= (int)sizeof wanted)
         report("The installation path is too long.");
@@ -75,6 +105,7 @@ int main(int argc, char **argv)
         if (access(marker, F_OK) != 0)
             report("This Cagents.app is not part of a cagents installation. Reinstall cagents.");
     }
+#endif
     if (realpath(wanted, ui) == NULL)
         report("The installed version of cagents is missing. Reinstall cagents.");
 

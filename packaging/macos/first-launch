@@ -1,0 +1,40 @@
+#!/bin/sh
+# The disk image app follows the same managed installation as the terminal
+# installer. This helper only prepares that installation for the launcher.
+set -eu
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+: "${HOME:?HOME is not set}"
+case $HOME in /*) ;; *) exit 1 ;; esac
+resources=${0%/*}
+bundle=${resources%/Contents/Resources}
+[ "$bundle" != "$resources" ] || exit 1
+applications=${bundle%/*}
+[ "$applications" -ef /Applications ] || [ "$applications" -ef "$HOME/Applications" ] || exit 1
+
+prefix=$HOME/Library/Application\ Support/cagents-install
+marker=$prefix/.cagents-install-root
+installed() {
+    [ ! -L "$prefix" ] && [ ! -L "$marker" ] && [ -f "$marker" ] \
+        && [ "$(cat "$marker")" = 'cagents install root' ] \
+        && [ ! -L "$prefix/.previous" ] && [ -f "$prefix/.previous" ] \
+        && [ -x "$prefix/current/bin/cagents-ui" ]
+}
+installed && exit 0
+
+IFS= read -r version < "$resources/release-version"
+case $version in ''|[!0-9]*|*..*|*[!0-9A-Za-z.+~-]*) exit 1 ;; esac
+archive=$resources/cagents-$version-aarch64-apple-darwin.tar.gz
+checksums=$resources/SHA256SUMS-macos
+[ -f "$archive" ] && [ -f "$checksums" ] || exit 1
+
+# Check the bundled installer before running it. It verifies the archive and
+# the staged program signatures before acquiring the publication fence.
+cd "$resources"
+installer_checksum=$(shasum -a 256 install-macos.sh)
+grep -Fqx -- "$installer_checksum" "$checksums" || exit 1
+export CAGENTS_ARCHIVE="$archive" CAGENTS_CHECKSUMS="$checksums"
+# The window starts or adopts the daemon after acquiring its window lease.
+# Another first launch may have finished while this installer was waiting.
+/bin/sh "$resources/install-macos.sh" --version "$version" --prefix "$prefix" --no-start --bootstrap || installed
