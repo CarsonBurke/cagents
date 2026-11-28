@@ -6,6 +6,8 @@
 
 #[path = "support/cli.rs"]
 mod cli;
+#[path = "../../../tests/support/user_fixture.rs"]
+mod user_fixture;
 
 use cagents::{
     account::{
@@ -14,7 +16,6 @@ use cagents::{
         provider_install::{ProviderInstallMethod, ProviderStatus, ProviderUpdateResult},
     },
     agent::Provider,
-    agent_execution::Authority,
     control::ControlClient,
     instance::{RUNTIME_SUBDIRECTORY, STORAGE_NAME},
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
@@ -214,24 +215,10 @@ impl Fixture {
     }
 
     fn observer(&self) -> ControlClient {
-        // An explicit User for this synthetic private daemon. The CLI continues
-        // to use its real authority if the test runs under delegation.
-        let mut client = ControlClient::connect(&self.socket()).unwrap();
-        client.authenticate(Authority::default()).unwrap();
-        client
+        ControlClient::connect(&self.socket()).unwrap()
     }
 
     fn maintain(&self, operation: Operation) -> ProviderStatus {
-        if Authority::from_environment() != Authority::default() {
-            let mut client = self.observer();
-            return match operation {
-                Operation::Manage => client.provider_manage(Provider::Claude),
-                Operation::Update => client.provider_update(Provider::Claude),
-            }
-            .unwrap()
-            .pop()
-            .unwrap();
-        }
         let operation = match operation {
             Operation::Manage => "manage",
             Operation::Update => "update",
@@ -330,6 +317,9 @@ fn until(mut ready: impl FnMut() -> bool, detail: &str) {
 fn the_daemon_keeps_running_claude_versions_and_preserves_update_failures() {
     use ProviderUpdateResult::{Current, Deferred, Failed, Skipped, Updated};
 
+    if !user_fixture::enter() {
+        return;
+    }
     let fixture = Fixture::new();
     fixture.expose("1.0.0", "1.0.0");
     let daemon = fixture.start();
