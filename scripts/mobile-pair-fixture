@@ -244,9 +244,48 @@ stop)
     if [ -s "$base/sshd.pid" ]; then kill "$(cat "$base/sshd.pid")" 2>/dev/null || true; fi
     pkill -f "$base/run" 2>/dev/null || true
     # The fixture's daemon, started by a bridge, runs under the fixture's HOME.
-    for pid in $(pgrep -u "$USER" cagentsd 2>/dev/null); do
-        if tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null | grep -qx "HOME=$base/home"; then kill "$pid" || true; fi
-    done
+    /usr/bin/python3 -I - "$base" <<'PYTHON'
+import os
+from pathlib import Path
+import selectors
+import signal
+import sys
+
+fixture_home = os.fsencode(f"HOME={sys.argv[1]}/home")
+with selectors.DefaultSelector() as stopped:
+    for process in Path("/proc").iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            pid = os.pidfd_open(int(process.name))
+        except (OSError, ValueError):
+            continue
+        try:
+            if (process / "comm").read_bytes().strip() == b"cagentsd" and fixture_home in (
+                (process / "environ").read_bytes().split(b"\0")
+            ):
+                signal.pidfd_send_signal(pid, signal.SIGTERM)
+                stopped.register(pid, selectors.EVENT_READ)
+                continue
+        except OSError:
+            pass
+        os.close(pid)
+    # Wait for the daemon's last writes before removing its state directory.
+    while stopped.get_map():
+        ready = stopped.select(timeout=3)
+        if not ready:
+            for pid in list(stopped.get_map()):
+                try:
+                    signal.pidfd_send_signal(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+            ready = stopped.select(timeout=3)
+            if not ready:
+                raise SystemExit("fixture daemon did not exit")
+        for key, _ in ready:
+            stopped.unregister(key.fd)
+            os.close(key.fd)
+PYTHON
     rm -rf "$base"
     echo "stopped and removed $base"
     ;;

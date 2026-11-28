@@ -29,7 +29,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -49,9 +48,7 @@ class RecordedMessagesTest {
     private data class Recording(val name: String, val direction: String, val message: JsonObject)
 
     private val recordings: List<Recording> by lazy {
-        val path = System.getProperty("cagents.mobileApiFixture")
-            ?: fail("Run through Gradle, which points cagents.mobileApiFixture at the recording")
-        File(path).readLines().filter { it.isNotBlank() }.map { line ->
+        mobileApiRecording.filter { it.isNotBlank() }.map { line ->
             val obj = Json.parseToJsonElement(line).jsonObject
             Recording(
                 name = obj["name"]!!.jsonPrimitive.content,

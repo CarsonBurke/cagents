@@ -1,7 +1,6 @@
 package dev.cagents.mobile
 
 import dev.cagents.mobile.pairing.PairingCode
-import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
@@ -12,7 +11,7 @@ import kotlin.test.assertIs
  * (`the_code_is_the_one_recorded_for_the_app` in `src/mobile/pairing_tests.rs`).
  */
 class RecordedPairingCodeTest {
-    private val recorded = File(System.getProperty("cagents.pairingCodeFixture")).readText().trim()
+    private val recorded = pairingCodeRecording.single().trim()
 
     @Test
     fun readsTheCodeTheComputerWrites() {
