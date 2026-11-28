@@ -5,6 +5,118 @@ use std::{collections::BTreeSet, ffi::OsStr, time::SystemTime};
 
 const KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const COMPLETE: &str = ".complete";
+#[cfg(any(target_os = "macos", test))]
+pub(super) const RELEASE_STAGE_PREFIX: &str = ".release-stage-";
+#[cfg(any(target_os = "macos", test))]
+pub(super) const RELEASE_STAGE_RANDOM_BYTES: usize = 6;
+
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn extraction_lease_path(stage: &Path) -> PathBuf {
+    stage.with_extension("lock")
+}
+
+/// The installer receives an empty directory. Keep its lease beside the
+/// stage and bind it to that exact directory before any data is extracted.
+#[cfg(any(target_os = "macos", test))]
+pub(super) fn lease_extraction(stage: &Path) -> Result<File, UpdateError> {
+    let identity = directory_identity(&fs::symlink_metadata(stage)?);
+    let mut lease = lock_file(private_create(&extraction_lease_path(stage))?)?.into_file();
+    lease.write_all(&identity)?;
+    lease.sync_all()?;
+    let state = stage
+        .parent()
+        .ok_or_else(|| invalid("release stage has no parent"))?;
+    File::open(state)?.sync_all()?;
+    Ok(lease)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn directory_identity(metadata: &fs::Metadata) -> [u8; 16] {
+    let mut bytes = [0; 16];
+    bytes[..8].copy_from_slice(&metadata.dev().to_le_bytes());
+    bytes[8..].copy_from_slice(&metadata.ino().to_le_bytes());
+    bytes
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn extraction_stage_name(lease: &str) -> Option<&str> {
+    let stage = lease.strip_suffix(".lock")?;
+    let suffix = stage.strip_prefix(RELEASE_STAGE_PREFIX)?;
+    (suffix.len() == RELEASE_STAGE_RANDOM_BYTES
+        && suffix.bytes().all(|byte| byte.is_ascii_alphanumeric()))
+    .then_some(stage)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn collect_extraction(root: &Root, name: &str, lease: &str) -> Result<(), UpdateError> {
+    let mut file = match fs_safety::open_beneath_writable(root, Path::new(lease)) {
+        Ok(Some(file)) => file,
+        Ok(None) => return Ok(()),
+        Err(error) if error.is_not_found() => return Ok(()),
+        Err(error) => return Err(io::Error::other(error).into()),
+    };
+    let metadata = file.metadata()?;
+    if !private_file(&metadata) || metadata.len() != 16 {
+        return Ok(());
+    }
+    file = match lock_file(file) {
+        Ok(lock) => lock.into_file(),
+        Err(UpdateError::Busy) => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let mut identity = [0; 16];
+    file.read_exact(&mut identity)?;
+
+    let path = Path::new(name);
+    match fs_safety::metadata_beneath(root, path) {
+        Ok(metadata) => {
+            let device = root.metadata()?.dev();
+            if !metadata.is_dir()
+                || metadata.uid() != crate::daemon::current_uid()
+                || metadata.mode() & 0o077 != 0
+                || metadata.dev() != device
+                || directory_identity(&metadata) != identity
+            {
+                return Ok(());
+            }
+            let stage = fs_safety::open_directory_beneath(root, path).map_err(io::Error::other)?;
+            if directory_identity(&stage.metadata()?) != identity {
+                return Ok(());
+            }
+            clear_extraction(&stage, device)?;
+            fs_safety::remove_directory_within(root, OsStr::new(name)).map_err(io::Error::other)?;
+            fs_safety::sync_directory(root)?;
+        }
+        Err(error) if error.is_not_found() => {}
+        Err(error) => return Err(io::Error::other(error).into()),
+    }
+    // Leave the identity and lock available until the tree's removal is durable.
+    fs_safety::unlink_within(root, OsStr::new(lease)).map_err(io::Error::other)?;
+    Ok(())
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn clear_extraction(directory: &Root, device: u64) -> Result<(), UpdateError> {
+    let names = fs_safety::directory_entries_beneath(directory, Path::new(""), usize::MAX)
+        .map_err(io::Error::other)?;
+    for name in names {
+        let path = Path::new(&name);
+        let metadata = fs_safety::metadata_beneath(directory, path).map_err(io::Error::other)?;
+        if metadata.is_dir() {
+            let child =
+                fs_safety::open_directory_beneath(directory, path).map_err(io::Error::other)?;
+            let held = child.metadata()?;
+            if held.dev() != device || directory_identity(&held) != directory_identity(&metadata) {
+                return Err(invalid("release staging directory changed during cleanup"));
+            }
+            clear_extraction(&child, device)?;
+            fs_safety::remove_directory_within(directory, &name).map_err(io::Error::other)?;
+        } else {
+            fs_safety::unlink_within(directory, &name).map_err(io::Error::other)?;
+        }
+    }
+    Ok(())
+}
 
 pub(super) fn canonical_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
@@ -141,6 +253,12 @@ fn collect(root: &Root, current: Option<&str>, now: SystemTime) -> Result<(), Up
     let names: Vec<_> = names.iter().filter_map(|name| name.to_str()).collect();
     let mut expired = BTreeSet::new();
     for name in &names {
+        #[cfg(any(target_os = "macos", test))]
+        if let Some(stage) = extraction_stage_name(name)
+            && let Err(error) = collect_extraction(root, stage, name)
+        {
+            tracing::warn!(name = *name, %error, "could not collect abandoned release extraction");
+        }
         if let Some(job) = name.strip_suffix(COMPLETE)
             && Some(job) != current
             && canonical_id(job)
@@ -188,6 +306,74 @@ fn private_metadata(root: &Root, name: &str) -> Result<Option<fs::Metadata>, Upd
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn collects_abandoned_release_extractions_and_keeps_other_entries() {
+        use std::{
+            os::fd::AsRawFd,
+            process::{Command, Stdio},
+        };
+
+        let directory = crate::test_fixture::tempdir().unwrap();
+        let state = directory.path();
+        let neighboring = crate::test_fixture::tempdir().unwrap();
+        let kept_file = neighboring.path().join("note");
+        fs::write(&kept_file, b"support data").unwrap();
+        let link = state.join(".release-stage-A1b2C3");
+        std::os::unix::fs::symlink(neighboring.path(), &link).unwrap();
+        let diagnostic = state.join(".release-stage-saved-diagnostics");
+        fs::create_dir(&diagnostic).unwrap();
+
+        let staging = || {
+            tempfile::Builder::new()
+                .prefix(RELEASE_STAGE_PREFIX)
+                .rand_bytes(RELEASE_STAGE_RANDOM_BYTES)
+                .permissions(fs::Permissions::from_mode(0o700))
+                .tempdir_in(state)
+                .unwrap()
+                .keep()
+        };
+        let legacy = staging();
+        let active = staging();
+        let active_lease = lease_extraction(&active).unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r released || :"])
+            .stdin(Stdio::piped());
+        super::super::candidate::inherit(&mut command, active_lease.as_raw_fd());
+        let mut extractor = command.spawn().unwrap();
+        drop(active_lease);
+        let abandoned = staging();
+        drop(lease_extraction(&abandoned).unwrap());
+        let abandoned_lease = extraction_lease_path(&abandoned);
+        let unpacking = abandoned.join(".unpacking-A");
+        fs::create_dir(&unpacking).unwrap();
+        fs::write(unpacking.join("download"), b"partial extraction").unwrap();
+        std::os::unix::fs::symlink(neighboring.path(), unpacking.join("neighbor")).unwrap();
+        let replaced = staging();
+        drop(lease_extraction(&replaced).unwrap());
+        fs::rename(&replaced, state.join("saved-extraction")).unwrap();
+        fs::DirBuilder::new().mode(0o700).create(&replaced).unwrap();
+
+        let root = Root::open(state).unwrap();
+        let collected = collect(&root, None, SystemTime::now());
+        let kept_active = active.is_dir();
+        drop(extractor.stdin.take());
+        assert!(extractor.wait().unwrap().success());
+        collected.unwrap();
+        assert!(!abandoned.exists());
+        assert!(!abandoned_lease.exists());
+        assert!(legacy.is_dir());
+        assert!(kept_active);
+        assert!(replaced.is_dir());
+        assert!(diagnostic.is_dir());
+        assert!(fs::symlink_metadata(link).unwrap().is_symlink());
+        assert_eq!(fs::read(kept_file).unwrap(), b"support data");
+
+        collect(&root, None, SystemTime::now()).unwrap();
+        assert!(!active.exists());
+    }
 
     #[test]
     fn collects_only_expired_verified_jobs_that_are_no_longer_current() {
