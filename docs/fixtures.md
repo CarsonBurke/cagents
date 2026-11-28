@@ -1479,7 +1479,7 @@ The first of these words a prompt contains chooses what it does:
 | `permission` | asks to edit `config.toml` with allow once, allow always and reject options, then acts on the answer |
 | `hold` | runs a long step and thinks until stopped |
 | `background` | starts a build in the background, says it is waiting, and stays silent until the build ends after `FAKE_ACP_BACKGROUND_SECONDS` (default 20); Stop fails the build |
-| `subagent` | starts a Release Checker subagent as Antigravity 1.5.17 does, whose `make check` asks for approval under its own session ID; once allowed, it runs for two seconds and reports. Deny leaves the checks unrun; Stop fails them. A loaded conversation replays only the call that started it |
+| `subagent` | starts a Release Checker subagent as Antigravity 1.5.17 does, whose `make check` asks for approval under its own session ID; once allowed, it runs for two seconds and reports. Deny leaves the checks unrun; Stop fails them. A loaded conversation replays only the call that started it. Add `parallel` to start two roles and have the one whose prompt gives no command ask first |
 | `garbage` | writes a line that is not JSON between two parts of its answer |
 | `files` | asks the client to read a file and reports the error it got |
 | `mode` | moves to the next mode and reports it |

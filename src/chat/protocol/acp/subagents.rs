@@ -13,8 +13,8 @@
 //! they were started. A child is therefore matched to a call only on
 //! evidence: the one call of the turn not yet matched, or the one whose
 //! prompt names what the child asks to do. A child that cannot be matched
-//! is listed under its own session ID, rather than under another subagent's
-//! role or among the parent's own steps.
+//! is provisionally listed under its own session ID. If matching another
+//! child leaves one possible pair, the entries merge when the turn ends.
 use super::tool_item;
 use super::tools::{self, Calls};
 use crate::chat::{Event, ToolStatus};
@@ -67,10 +67,33 @@ struct Child {
 }
 
 #[derive(Default)]
+enum UnmatchedChildren {
+    #[default]
+    None,
+    One {
+        id: String,
+        candidates: Vec<String>,
+    },
+    /// More than one child to place, or a call forgotten at the retention limit.
+    Ambiguous,
+}
+
+impl UnmatchedChildren {
+    fn could_belong_to(&self, invocation: &str) -> bool {
+        match self {
+            Self::None => false,
+            Self::One { candidates, .. } => candidates.iter().any(|id| id == invocation),
+            Self::Ambiguous => true,
+        }
+    }
+}
+
+#[derive(Default)]
 pub(super) struct Subagents {
     /// Subagents started this turn that no child has been matched to, with
     /// their prompts, in the order they were started.
     unmatched: Vec<(String, String)>,
+    unmatched_children: UnmatchedChildren,
     /// The subagents of this turn, which end with it.
     live: Vec<String>,
     /// This turn's calls still pending, such as one awaiting the reader's
@@ -166,6 +189,8 @@ impl Subagents {
     fn begin(&mut self, listing: Listing) -> Event {
         if self.unmatched.len() == MAX_INVOCATIONS {
             self.unmatched.remove(0);
+            // Retention dropping a call is no evidence of who started a child.
+            self.unmatched_children = UnmatchedChildren::Ambiguous;
         }
         self.unmatched
             .push((listing.subagent.clone(), listing.prompt.clone()));
@@ -211,7 +236,13 @@ impl Subagents {
                     events.push(self.begin(listing));
                 }
             }
-            let subagent = known.unwrap_or_else(|| self.matched(&child, update));
+            let subagent = known.unwrap_or_else(|| {
+                if live {
+                    self.matched(update).unwrap_or_else(|| child.clone())
+                } else {
+                    child.clone()
+                }
+            });
             if new && subagent == child {
                 events.push(Event::Subagent {
                     id: child.clone(),
@@ -229,6 +260,13 @@ impl Subagents {
                 });
                 if live {
                     self.keep_live(child.clone());
+                    self.unmatched_children = match self.unmatched_children {
+                        UnmatchedChildren::None => UnmatchedChildren::One {
+                            id: child.clone(),
+                            candidates: self.unmatched.iter().map(|(id, _)| id.clone()).collect(),
+                        },
+                        _ => UnmatchedChildren::Ambiguous,
+                    };
                 }
             }
             if self.order.len() == MAX_CHILDREN
@@ -259,12 +297,11 @@ impl Subagents {
         Some(events)
     }
 
-    /// The call that started `child`, where the evidence names one, or else
-    /// `child` itself.
-    fn matched(&mut self, child: &str, update: &Value) -> String {
-        let index = match self.unmatched.len() {
-            0 => None,
-            1 => Some(0),
+    /// The call that started this child, when the evidence names one.
+    fn matched(&mut self, update: &Value) -> Option<String> {
+        let index = match self.unmatched.as_slice() {
+            [] => None,
+            [(id, _)] if !self.unmatched_children.could_belong_to(id) => Some(0),
             _ => {
                 let evidence: Vec<_> = tools::evidence(update)
                     .into_iter()
@@ -283,7 +320,37 @@ impl Subagents {
                 }
             }
         };
-        index.map_or_else(|| child.to_owned(), |index| self.unmatched.remove(index).0)
+        index.map(|index| self.unmatched.remove(index).0)
+    }
+
+    /// A single child and call left at the end of this turn can be paired
+    /// if the call was a candidate when the child first appeared. Waiting
+    /// until settlement keeps more calls from invalidating that inference.
+    fn reconcile(&mut self) -> Option<Event> {
+        let UnmatchedChildren::One { id, candidates } =
+            std::mem::take(&mut self.unmatched_children)
+        else {
+            return None;
+        };
+        let [(target, _)] = self.unmatched.as_slice() else {
+            return None;
+        };
+        if !candidates.contains(target) {
+            return None;
+        }
+        if let Some(child) = self.children.get_mut(&id) {
+            child.subagent.clone_from(target);
+        } else if let Some((_, subagent)) = self.evicted.iter_mut().find(|(child, _)| *child == id)
+        {
+            subagent.clone_from(target);
+        } else {
+            return None;
+        }
+        self.live.retain(|live| *live != id);
+        Some(Event::SubagentMerged {
+            from: id,
+            into: target.clone(),
+        })
     }
 
     /// The subagent that made the call `id`, if a subagent made it.
@@ -322,6 +389,7 @@ impl Subagents {
     /// says why. Whatever they still ran stopped with the turn.
     pub fn settle(&mut self, outcome: Kind) -> Vec<Event> {
         let mut events = Vec::new();
+        events.extend(self.reconcile());
         for child in self.children.values_mut() {
             for (item, content) in child.calls.stop_running() {
                 events.push(Event::SubagentItem {
