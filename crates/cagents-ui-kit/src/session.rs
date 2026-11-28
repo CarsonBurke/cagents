@@ -707,8 +707,8 @@ pub struct SessionRuntime {
 /// transcript each writes, which covers a terminal no window has saved yet, and
 /// the window databases name the rest. Owners claim files by name, because a
 /// terminal returned from a conversation appends to its predecessor's. If the
-/// daemon cannot answer, nothing is removed; if a window database cannot be
-/// read, no transcript is removed as orphaned.
+/// daemon cannot answer, nothing is removed; if any window's claims are
+/// incomplete, no transcript is removed as orphaned.
 pub struct TranscriptPruner {
     store: Arc<StateStore>,
     database_path: PathBuf,
@@ -762,7 +762,7 @@ impl TranscriptPruner {
                         continue;
                     }
                     match crate::persistence::read_claimed_transcript_names(&path) {
-                        Ok(ids) => owners.saved.extend(ids),
+                        Ok(claims) => owners.add_window(claims),
                         Err(error) => {
                             tracing::warn!(
                                 database = %path.display(),

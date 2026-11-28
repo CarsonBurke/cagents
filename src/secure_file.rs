@@ -232,6 +232,16 @@ pub fn open_existing_private_file_readonly(path: &Path) -> io::Result<File> {
 
 #[cfg(feature = "host")]
 pub fn open_private_append_file(path: &Path) -> io::Result<File> {
+    open_private_append(path, false)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn open_private_read_append_file(path: &Path) -> io::Result<File> {
+    open_private_append(path, true)
+}
+
+#[cfg(feature = "host")]
+fn open_private_append(path: &Path, read: bool) -> io::Result<File> {
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -241,6 +251,7 @@ pub fn open_private_append_file(path: &Path) -> io::Result<File> {
     let file = OpenOptions::new()
         .create(true)
         .append(true)
+        .read(read)
         .mode(PRIVATE_FILE_MODE)
         .custom_flags(O_NOFOLLOW | O_NONBLOCK)
         .open(path)?;

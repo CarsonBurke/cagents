@@ -4270,42 +4270,85 @@ fn transcript_writer_creates_private_storage() {
 }
 
 #[test]
-fn transcript_writer_stops_at_size_cap_with_marker() {
+fn transcript_writer_caps_output_and_pruning_keeps_the_marked_file() {
+    use crate::persistence::{
+        StateStore, TranscriptListing, TranscriptOwners, TranscriptRetention,
+    };
+    use crate::{model::BootId, terminal::DEFAULT_TRANSCRIPT_MAX_BYTES};
+    use std::collections::HashSet;
+
     let root = tempdir().unwrap();
-    let path = root.path().join("terminal.log");
+    let directory = root.path().join("transcripts");
+    let terminal = TerminalId::new();
+    let path = directory.join(format!("{terminal}.log"));
+    let limit = DEFAULT_TRANSCRIPT_MAX_BYTES;
 
-    let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 64, 16).unwrap();
-    writer.send(vec![b'x'; 64]).unwrap();
-    writer.send(b"discarded\n".to_vec()).unwrap();
-    writer.finish();
-
-    let content = fs::read(&path).unwrap();
-    assert!(
-        content.ends_with(TRANSCRIPT_TRUNCATED_MARKER),
-        "capped transcript should end with the truncation marker"
-    );
-    assert!(
-        content.len() <= 16 + TRANSCRIPT_TRUNCATED_MARKER.len(),
-        "capped transcript should not grow past the cap plus marker"
-    );
-}
-
-#[test]
-fn transcript_writer_caps_preexisting_oversized_file() {
-    let root = tempdir().unwrap();
-    let path = root.path().join("terminal.log");
-    fs::write(&path, vec![b'y'; 32]).unwrap();
-
-    let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 64, 16).unwrap();
-    writer.send(b"new output\n".to_vec()).unwrap();
+    let writer = TranscriptWriter::start(path.clone(), terminal, 8, limit).unwrap();
+    writer.send(vec![b'x'; limit as usize]).unwrap();
+    writer.send(b"overflow".to_vec()).unwrap();
+    writer.send(b"discarded".to_vec()).unwrap();
     writer.finish();
 
     let content = fs::read(&path).unwrap();
     assert_eq!(
-        content,
-        [vec![b'y'; 32], TRANSCRIPT_TRUNCATED_MARKER.to_vec()].concat(),
-        "oversized transcript should keep existing bytes and record nothing more"
+        content.len(),
+        limit as usize + TRANSCRIPT_TRUNCATED_MARKER.len()
     );
+    assert!(content[..limit as usize].iter().all(|&byte| byte == b'x'));
+    assert!(content.ends_with(TRANSCRIPT_TRUNCATED_MARKER));
+
+    let reopened = TranscriptWriter::start(path.clone(), terminal, 8, limit).unwrap();
+    assert!(!reopened.accepts());
+    reopened.finish();
+
+    let store = StateStore::open(root.path().join("window.sqlite3"), BootId::new("boot")).unwrap();
+    let report = store
+        .prune_transcripts(
+            TranscriptListing::scan(&directory).unwrap(),
+            TranscriptOwners {
+                saved: HashSet::from([terminal.to_string()]),
+                every_window_read: true,
+                ..TranscriptOwners::default()
+            },
+            TranscriptRetention::default(),
+        )
+        .unwrap();
+    assert_eq!(report.removed(), 0);
+    assert_eq!(fs::read(&path).unwrap(), content);
+}
+
+#[test]
+fn transcript_writer_recognizes_a_marker_below_the_cap_on_reopen() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("terminal.log");
+    let terminal = TerminalId::new();
+    let writer = TranscriptWriter::start(path.clone(), terminal, 8, 128).unwrap();
+    writer.send(vec![b'x'; 64]).unwrap();
+    writer.send(vec![b'y'; 128]).unwrap();
+    writer.finish();
+    let capped = [vec![b'x'; 64], TRANSCRIPT_TRUNCATED_MARKER.to_vec()].concat();
+    assert_eq!(fs::read(&path).unwrap(), capped);
+    assert!(capped.len() < 128);
+
+    let reopened = TranscriptWriter::start(path.clone(), terminal, 8, 128).unwrap();
+    assert!(!reopened.accepts());
+    reopened.send(b"must stay discarded".to_vec()).unwrap();
+    reopened.finish();
+    assert_eq!(fs::read(&path).unwrap(), capped);
+}
+
+#[test]
+fn transcript_writer_leaves_preexisting_oversized_files_untouched() {
+    let root = tempdir().unwrap();
+    let path = root.path().join("terminal.log");
+    fs::write(&path, vec![b'y'; 32]).unwrap();
+
+    let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 8, 16).unwrap();
+    assert!(!writer.accepts());
+    writer.send(b"new output\n".to_vec()).unwrap();
+    writer.finish();
+
+    assert_eq!(fs::read(&path).unwrap(), vec![b'y'; 32]);
 }
 
 #[test]

@@ -21,6 +21,16 @@ pub use widget::{drop_faces_without_advances, monospace_font};
 #[cfg(feature = "host")]
 mod worker;
 
+/// Raw PTY bytes retained per terminal transcript. Full-screen apps repaint
+/// constantly, so an unbounded log turns one animated pane into endless writes.
+pub(crate) const DEFAULT_TRANSCRIPT_MAX_BYTES: u64 = 1 << 20;
+
+/// Appended once when a writer drops output at the cap. Pruning allows room
+/// for this marker in addition to the PTY bytes.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) const TRANSCRIPT_TRUNCATED_MARKER: &[u8] =
+    b"\n[cagents transcript truncated: size cap reached]\n";
+
 /// The holder may take this long to report a newly spawned process. Keep the
 /// CLI reply and window attachment waits longer than this bound.
 pub const SPAWN_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
