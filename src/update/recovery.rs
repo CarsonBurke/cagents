@@ -1284,7 +1284,10 @@ pub(super) fn require_prepared_scope(
     target: &Path,
 ) -> Result<(), UpdateError> {
     if settled.source != pending.source
-        || settled.census != *pending.census
+        || !settled
+            .census
+            .same_bytes(&pending.census)
+            .map_err(|error| invalid(error.to_string()))?
         || settled.witness.checkpoint_hash != pending.checkpoint_hash
         || settled.witness.target != target
     {

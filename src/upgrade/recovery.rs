@@ -113,6 +113,13 @@ impl StoredCensus {
         }
     }
 
+    pub(crate) fn same_bytes(&self, other: &Self) -> Result<bool, serde_json::Error> {
+        match (&self.original, &other.original) {
+            (Some(left), Some(right)) => Ok(left.get() == right.get()),
+            _ => Ok(self.hash()? == other.hash()?),
+        }
+    }
+
     fn freeze(&mut self) -> Result<(), serde_json::Error> {
         if self.original.is_none() {
             self.original = Some(serde_json::value::to_raw_value(&self.value)?.into());
@@ -551,6 +558,13 @@ pub(crate) struct Authority {
     daemon_path: PathBuf,
     target: PathBuf,
     target_hash: String,
+}
+
+#[cfg(any(all(target_os = "macos", feature = "host"), test))]
+impl Authority {
+    fn same_evidence(&self, other: &Self) -> bool {
+        self == other && self.census.same_bytes(&other.census).unwrap_or(false)
+    }
 }
 
 /// Disk evidence alone never grants the automatic prepare/ACK authority.
@@ -1820,7 +1834,7 @@ impl ReadyPlanEvidence<'_> {
 
     #[cfg(feature = "host")]
     pub(crate) fn same_authority(&self, authority: &Authority) -> bool {
-        self.authority.as_ref() == authority
+        self.authority.same_evidence(authority)
     }
 
     pub(crate) fn claim_exists(&self) -> Result<bool, String> {
@@ -2447,7 +2461,7 @@ fn read_verified_record_identity(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -2474,7 +2488,10 @@ fn read_verified_record_identity(
         || target_hash.is_some_and(|hash| record.target_hash != hash)
         || record.target.as_deref() != Some(target)
         || executable_hash(target)? != record.target_hash
-        || &*record.census != census
+        || !record
+            .census
+            .same_bytes(census)
+            .map_err(|error| error.to_string())?
         || record.successor.as_ref() != Some(serving)
         || !serving.is_complete()
     {
@@ -2483,7 +2500,7 @@ fn read_verified_record_identity(
     let evidence = PendingRecovery {
         source: source.clone(),
         checkpoint_hash: checkpoint_hash.into(),
-        census: census.clone().into(),
+        census: census.clone(),
         windows: Vec::new(),
         original_census_complete: true,
         producer: None,
@@ -2498,7 +2515,7 @@ fn read_verified_record(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -3352,7 +3369,7 @@ pub struct AlreadyRecovered {
     pub(crate) job: String,
     pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
-    pub census: Census,
+    pub census: StoredCensus,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
@@ -3870,7 +3887,7 @@ fn recovered_data(
         job: record.job,
         windows: record.windows,
         source: record.source,
-        census: record.census.value,
+        census: record.census,
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
         adopted_chat_descriptors: descriptors,
@@ -4965,7 +4982,7 @@ impl Inherited {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
     if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
         return Ok(None);
@@ -4980,7 +4997,10 @@ fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>
         || capture.source != authority.source
         || capture.checkpoint_hash.as_deref() != Some(authority.checkpoint_hash.as_str())
         || capture.windows != authority.windows
-        || capture.census != authority.census
+        || !capture
+            .census
+            .same_bytes(&authority.census)
+            .map_err(|error| error.to_string())?
     {
         return Err(
             "Prepared authority changed its acknowledged inventory or saved windows".into(),
