@@ -578,7 +578,7 @@ pub(super) fn restore(host: &SharedHost) -> Result<Option<recovery::RecoveryReco
     // a pane reattachment may launch its provider behind the user's back.
     let mut paused = paused_record(
         record.source.clone(),
-        &record.recovery_census()?,
+        record.recovery_census()?.as_ref(),
         &record.paused_chats,
         record.paused_terminals.clone(),
     )?;
