@@ -487,6 +487,24 @@ impl Client {
             .map_err(|error| invalid(error.to_string()))
     }
 
+    /// The roster saved before floor preparation may span several pages.
+    /// Fence those reads even when the source speaks an older protocol.
+    pub(crate) fn list_for_floor(
+        &mut self,
+    ) -> Result<Vec<crate::terminal_ipc::TerminalDescriptor>, UpdateError> {
+        if self.protocol() < crate::terminal_ipc::LIST_PAGES_PROTOCOL {
+            return self.list();
+        }
+        let before = self.inventory_generation()?;
+        let terminals = self.list()?;
+        if self.inventory_generation()? != before {
+            return Err(invalid(
+                "The source terminal inventory changed during census capture",
+            ));
+        }
+        Ok(terminals)
+    }
+
     /// The capability a service stop confirms. Preflight only issues an
     /// expiring capability, and a busy source refuses it before issuing
     /// anything, so it is asked again while busy.
@@ -1376,6 +1394,14 @@ mod prepare_receipt_tests {
         replies: Vec<ServerMessage>,
         before_reply: Option<(usize, fn(&File))>,
     ) -> LeasedSource {
+        leased_source_at(PROTOCOL_VERSION, replies, before_reply)
+    }
+
+    fn leased_source_at(
+        protocol: u16,
+        replies: Vec<ServerMessage>,
+        before_reply: Option<(usize, fn(&File))>,
+    ) -> LeasedSource {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let directory = tempfile::tempdir().unwrap();
         fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
@@ -1403,7 +1429,7 @@ mod prepare_receipt_tests {
                 write_frame(
                     peer,
                     &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
+                        version: protocol,
                         request_id: Some(request_id),
                         proof: served.clone(),
                         message,
@@ -1438,7 +1464,12 @@ mod prepare_receipt_tests {
         let socket = directory.path().join("cagentsd.sock");
         let observed = Peer::observe(&stream, &socket).unwrap();
         let client = Client {
-            client: ControlClient::from_stream(stream).unwrap(),
+            client: ControlClient::from_stream_at_source_protocol(
+                stream,
+                Instant::now() + Duration::from_secs(5),
+                protocol,
+            )
+            .unwrap(),
             peer: observed,
             busy: BusyPatience::PER_REQUEST,
             busy_pause: Duration::from_millis(1),
@@ -1499,6 +1530,92 @@ mod prepare_receipt_tests {
         let mut source = leased_source(vec![busy(), busy(), preflight(7)], None);
         assert_eq!(source.client.inventory_generation().unwrap(), 7);
         assert_eq!(source.finish().len(), 3);
+    }
+
+    #[test]
+    fn a_floor_list_requires_one_inventory_generation_across_pages() {
+        use crate::{
+            model::{LaunchRecipe, TerminalId},
+            terminal_ipc::{ShutdownOperation, TerminalDescriptor},
+        };
+
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: Vec::new(),
+            working_directory: "/".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut ids = [TerminalId::new(), TerminalId::new()];
+        ids.sort_unstable();
+        let first = TerminalDescriptor::relaunchable(ids[0], recipe.clone(), None);
+        let second = TerminalDescriptor::relaunchable(ids[1], recipe, None);
+        let page = |terminals, complete| ServerMessage::Response {
+            response: ServerResponse::ListedPage {
+                terminals,
+                complete,
+            },
+        };
+
+        for final_generation in [7, 8] {
+            // The second terminal could move behind the first page's cursor.
+            let rest = if final_generation == 7 {
+                vec![second.clone()]
+            } else {
+                Vec::new()
+            };
+            let mut source = leased_source(
+                vec![
+                    preflight(7),
+                    page(vec![first.clone()], false),
+                    page(rest, true),
+                    preflight(final_generation),
+                ],
+                None,
+            );
+            let listed = source.client.list_for_floor();
+            if final_generation == 7 {
+                assert_eq!(listed.unwrap(), [first.clone(), second.clone()]);
+            } else {
+                assert!(
+                    listed
+                        .unwrap_err()
+                        .to_string()
+                        .contains("inventory changed during census capture")
+                );
+            }
+
+            let requests = source.finish();
+            let preflight = |request: &ClientRequest| {
+                matches!(
+                    request,
+                    ClientRequest::ShutdownV1 {
+                        operation: ShutdownOperation::Preflight,
+                        ..
+                    }
+                )
+            };
+            assert!(
+                matches!(&requests[..], [before, ClientRequest::ListPage { after: None }, ClientRequest::ListPage { after: Some(id) }, after]
+                    if preflight(before) && *id == ids[0] && preflight(after)),
+                "{requests:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_floor_uses_the_single_reply_of_an_older_source() {
+        let mut source = leased_source_at(
+            156,
+            vec![ServerMessage::Response {
+                response: ServerResponse::Listed {
+                    terminals: Vec::new(),
+                },
+            }],
+            None,
+        );
+        assert!(source.client.list_for_floor().unwrap().is_empty());
+        assert_eq!(source.finish(), [ClientRequest::List]);
     }
 
     /// A confirmed stop refused as busy was refused before its capability was
