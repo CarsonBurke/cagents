@@ -580,6 +580,63 @@ fn create_inner(
 const CODEX_SAMPLES_UNSUPPORTED: &str =
     "This version of Codex can't answer side questions. Update Codex to ask one.";
 
+/// Why a side question failed, from a `thread/sample` error. Codex reports an
+/// upstream refusal as `sample failed: http 400 Bad Request: Some("{...}")`,
+/// so this prefers that payload's own message and otherwise keeps the text
+/// before it, never the escaped payload itself.
+fn side_failure(message: &str) -> String {
+    let message = message.trim();
+    let message = message
+        .strip_prefix("sample failed:")
+        .map_or(message, str::trim_start);
+    let Some(start) = message.find('{') else {
+        return format!("Codex couldn't answer: {message}");
+    };
+    let payload = message[start..].trim_end_matches([')', '"', ' ']);
+    let reason = [payload.to_owned(), unescape_debug(payload)]
+        .iter()
+        .filter_map(|candidate| serde_json::from_str::<Value>(candidate).ok())
+        .find_map(|value| {
+            [&value["error"]["message"], &value["message"]]
+                .into_iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .find(|reason| !reason.is_empty())
+                .map(str::to_owned)
+        });
+    match reason {
+        Some(reason) => format!("Codex couldn't answer: {reason}"),
+        None => {
+            let before = message[..start].trim_end_matches(['"', '(', ':', ' ']);
+            let before = before.strip_suffix("Some").unwrap_or(before);
+            match before.trim_end_matches([':', ' ']) {
+                "" => "Codex couldn't answer this side question.".to_owned(),
+                before => format!("Codex couldn't answer: {before}"),
+            }
+        }
+    }
+}
+
+/// Undo Rust's `Debug` quoting of a string, which is how Codex embeds an
+/// upstream response body in its error text.
+fn unescape_debug(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('n') => out.push('\n'),
+            Some('t') => out.push('\t'),
+            Some(other) => out.push(other),
+            None => {}
+        }
+    }
+    out
+}
+
 /// What Codex samples for a side question. A sample that reaches for a tool
 /// answers nothing, so the prompt asks for an answer from what the thread
 /// already holds.
@@ -3070,9 +3127,7 @@ impl Codex {
                         CODEX_SAMPLES_UNSUPPORTED.to_owned()
                     } else {
                         match error["message"].as_str().map(str::trim) {
-                            Some(message) if !message.is_empty() => {
-                                format!("Codex couldn't answer: {message}")
-                            }
+                            Some(message) if !message.is_empty() => side_failure(message),
                             _ => "Codex couldn't answer this side question.".to_owned(),
                         }
                     };

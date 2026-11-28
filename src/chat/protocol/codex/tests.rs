@@ -8339,3 +8339,22 @@ fn a_sample_that_reached_for_a_tool_or_failed_says_so_to_its_asker() {
             .is_err()
     );
 }
+
+/// An upstream refusal reaches the asker as its own sentence, not as the
+/// escaped response body Codex wraps it in.
+#[test]
+fn a_refused_sample_says_why_without_its_payload() {
+    let refusal = r#"sample failed: http 400 Bad Request: Some("{\"type\":\"error\",\"status\":400,\"error\":{\"type\":\"invalid_request_error\",\"message\":\"The 'gpt-x' model is not supported when using Codex with a ChatGPT account.\",\"code\":\"model_not_found\"}}")"#;
+    assert_eq!(
+        side_failure(refusal),
+        "Codex couldn't answer: The 'gpt-x' model is not supported when using Codex with a ChatGPT account."
+    );
+    assert_eq!(
+        side_failure(r#"sample failed: http 502 Bad Gateway: Some("{oops")"#),
+        "Codex couldn't answer: http 502 Bad Gateway"
+    );
+    assert_eq!(
+        side_failure("rate limited"),
+        "Codex couldn't answer: rate limited"
+    );
+}
