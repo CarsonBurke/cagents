@@ -665,6 +665,12 @@ pub struct ConversationWorktree {
     /// the list shows once.
     #[serde(default)]
     pub pull_request: Option<u64>,
+    /// When its files or commits last changed, as the Work board dates a
+    /// card (see [`last_activity`]), without its sessions' activity: an
+    /// agent at work there changes files, while one reading or waiting
+    /// changes nothing. `None` until the worktree's status has been read.
+    #[serde(default)]
+    pub last_activity_unix_ms: Option<u64>,
 }
 
 /// Lines a change adds and removes.
