@@ -3101,7 +3101,7 @@ fn serve_connection(
                         "refused"
                     });
                 }
-                if is_committed_daemon_shutdown(&error) {
+                if error.failure_class().reason == ProtocolErrorCode::DaemonShutdownCommitted {
                     // In-flight controls can reach the old daemon after its
                     // checkpoint commits. Keep the runtime alive until the
                     // reconnect handshake observes the replacement proof and
@@ -3135,23 +3135,25 @@ fn serve_connection(
                     continue;
                 }
                 if let Some(PendingRequest::Input(operation)) = &request {
-                    let refusal = match (error.code, error.retryable, error.message.as_str()) {
-                        (ProtocolErrorCode::QueueFull, true, _) => {
+                    let class = error.failure_class();
+                    let refusal = match class.reason {
+                        ProtocolErrorCode::QueueFull
+                            if class.retry_advice() == crate::terminal_ipc::RetryAdvice::Retry =>
+                        {
                             Some(InputRejectionReason::QueueFull)
                         }
-                        // These exact host admission errors precede any input
-                        // effect. Completion can race its response; keep the
+                        // Completion can race its response; keep the
                         // attachment to receive the actual Completed event.
-                        (
-                            ProtocolErrorCode::TerminalUnavailable,
-                            true,
-                            "the terminal worker has closed",
-                        )
-                        | (
-                            ProtocolErrorCode::TerminalUnavailable,
-                            false,
-                            "terminal output has completed",
-                        ) => Some(InputRejectionReason::WorkerClosed),
+                        ProtocolErrorCode::TerminalInputWorkerClosed
+                            if class.retry_advice() == crate::terminal_ipc::RetryAdvice::Retry =>
+                        {
+                            Some(InputRejectionReason::WorkerClosed)
+                        }
+                        ProtocolErrorCode::TerminalOutputCompleted
+                            if class.retry_advice() == crate::terminal_ipc::RetryAdvice::None =>
+                        {
+                            Some(InputRejectionReason::WorkerClosed)
+                        }
                         _ => None,
                     };
                     if let Some(reason) = refusal {
@@ -3386,23 +3388,13 @@ fn accept_server_event(
     Ok(())
 }
 
-fn is_committed_daemon_shutdown(error: &ProtocolError) -> bool {
-    // Installed daemons report this with retryable=false: that incarnation
-    // will never accept controls again. It is nevertheless transient for the
-    // UI. Match only this specific refusal, not other unavailable terminals,
-    // and retain compatibility without changing the wire protocol mid-upgrade.
-    error.code == ProtocolErrorCode::TerminalUnavailable
-        && error.message
-            == "Daemon upgrade/shutdown is committed; no further control mutations are accepted"
-}
-
 fn reject_handshake(
     events: &Sender<TerminalEvent>,
     published: &HostedPublishedState,
     stop: &WorkerStop,
     error: ProtocolError,
 ) -> ConnectionEnd {
-    if is_committed_daemon_shutdown(&error) {
+    if error.failure_class().reason == ProtocolErrorCode::DaemonShutdownCommitted {
         return ConnectionEnd::Retry;
     }
     // A reconnect can recover transport failures, but this handle may never
@@ -5403,13 +5395,7 @@ mod tests {
                 )
                 .unwrap();
             };
-            let shutdown = || {
-                ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    "Daemon upgrade/shutdown is committed; no further control mutations are accepted",
-                    false,
-                ))
-            };
+            let shutdown = || ServerMessage::Error(ProtocolError::daemon_shutdown_committed());
             let mut stream = accept_connection(&listener);
             let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
             send(
@@ -5522,15 +5508,6 @@ mod tests {
                 None
             );
         }
-    }
-
-    #[test]
-    fn unavailable_terminal_is_not_a_committed_daemon_shutdown() {
-        assert!(!is_committed_daemon_shutdown(&ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            "terminal process is unavailable",
-            false,
-        )));
     }
 
     #[test]

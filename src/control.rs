@@ -950,13 +950,16 @@ pub enum ControlError {
 }
 
 fn remote_display(code: ProtocolErrorCode, message: &str, retryable: bool) -> String {
-    if Refusal::recognize(message, retryable).is_some()
+    if Refusal::from_class(crate::terminal_ipc::FailureClass::new(code, retryable)).is_some()
         || crate::agent_execution::concurrency::LimitReached::recognize(message, retryable)
             .is_some()
     {
         message.to_owned()
     } else {
-        format!("daemon rejected the request ({code:?}): {message}")
+        format!(
+            "daemon rejected the request ({:?}): {message}",
+            code.legacy_code()
+        )
     }
 }
 
@@ -968,14 +971,18 @@ impl ControlError {
         self.refusal() == Some(Refusal::Busy)
     }
 
-    /// The daemon's refusal before it did anything, if this is one.
-    pub fn refusal(&self) -> Option<Refusal> {
+    pub fn failure_class(&self) -> Option<crate::terminal_ipc::FailureClass> {
         match self {
             Self::Remote {
-                retryable, message, ..
-            } => Refusal::recognize(message, *retryable),
+                code, retryable, ..
+            } => Some(crate::terminal_ipc::FailureClass::new(*code, *retryable)),
             _ => None,
         }
+    }
+
+    /// The daemon's refusal before it did anything, if this is one.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.failure_class().and_then(Refusal::from_class)
     }
 
     /// The daemon's own sentence for a person; every other failure as it stands.
@@ -1021,12 +1028,19 @@ pub enum Refusal {
 }
 
 impl Refusal {
-    /// The refusal a daemon's sentence and retryability carry, if it is one.
-    pub(crate) fn recognize(message: &str, retryable: bool) -> Option<Self> {
-        if crate::terminal_ipc::is_daemon_busy(message, retryable) {
-            Some(Self::Busy)
-        } else {
-            crate::account::remote::ListHeld::recognize(message, retryable).map(Self::AccountList)
+    fn from_class(class: crate::terminal_ipc::FailureClass) -> Option<Self> {
+        use crate::{
+            account::remote::ListHeld,
+            terminal_ipc::{Admission, RetryAdvice},
+        };
+        if class.admission() != Admission::Refused || class.retry_advice() != RetryAdvice::Retry {
+            return None;
+        }
+        match class.reason {
+            ProtocolErrorCode::DaemonBusy => Some(Self::Busy),
+            ProtocolErrorCode::AccountRegistryBusy => Some(Self::AccountList(ListHeld::Registry)),
+            ProtocolErrorCode::AccountLifecycleBusy => Some(Self::AccountList(ListHeld::Lifecycle)),
+            _ => None,
         }
     }
 
@@ -2514,7 +2528,7 @@ impl ControlClient {
                     retryable: false,
                     ..
                 } => ControlError::Remote {
-                    code: ProtocolErrorCode::TerminalNotFound,
+                    code: ProtocolErrorCode::TerminalCloseSourceAbsent,
                     message: terminal::ipc::TERMINAL_CLOSE_SOURCE_ABSENT.into(),
                     retryable: false,
                 },
@@ -3269,7 +3283,7 @@ impl ControlClient {
 
         loop {
             let envelope = match deadline {
-                Some(deadline) => read_frame_from(
+                Some(deadline) => read_server_frame_from(
                     self.protocol,
                     &mut DeadlineReader::new(&mut self.stream, deadline),
                 )
@@ -3408,7 +3422,7 @@ impl ControlClient {
 
     fn read_envelope(&mut self) -> Result<ServerEnvelope, ControlError> {
         let timeout = self.stream.read_timeout().ok().flatten();
-        read_frame_from(self.protocol, &mut self.stream)
+        read_server_frame_from(self.protocol, &mut self.stream)
             .map_err(|error| reply_error(error, timeout))?
             .ok_or(ControlError::ConnectionClosed)
     }
@@ -3461,6 +3475,20 @@ fn read_frame_from<T: serde::de::DeserializeOwned>(
     reader: &mut impl std::io::Read,
 ) -> Result<Option<T>, crate::terminal_ipc::FrameError> {
     crate::terminal_ipc::decoding_from(protocol, || read_frame(reader))
+}
+
+fn read_server_frame_from(
+    protocol: u16,
+    reader: &mut impl std::io::Read,
+) -> Result<Option<ServerEnvelope>, FrameError> {
+    let mut envelope: Option<ServerEnvelope> = read_frame_from(protocol, reader)?;
+    if let Some(envelope) = &mut envelope
+        && envelope.version == protocol
+        && let ServerMessage::Error(error) = &mut envelope.message
+    {
+        error.adapt_legacy_refusal(protocol);
+    }
+    Ok(envelope)
 }
 
 /// Extend a timed-out hello read inside the frame reader, which still holds
@@ -3526,7 +3554,7 @@ impl HandshakeClient {
             reader: DeadlineReader::new(&mut self.stream, deadline),
             extend,
         };
-        let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
+        let envelope: ServerEnvelope = read_server_frame_from(self.protocol, &mut reader)
             .map_err(|error| {
                 reply_error(
                     error,
@@ -7613,12 +7641,12 @@ mod tests {
     #[test]
     fn a_busy_refusal_displays_as_the_daemons_wait_and_retry_sentence() {
         use crate::terminal_ipc::{DAEMON_BUSY, ProtocolErrorCode};
-        let remote = |message: &str, retryable| ControlError::Remote {
-            code: ProtocolErrorCode::Internal,
+        let remote = |code, message: &str, retryable| ControlError::Remote {
+            code,
             message: message.into(),
             retryable,
         };
-        let busy = remote(DAEMON_BUSY, true);
+        let busy = remote(ProtocolErrorCode::DaemonBusy, DAEMON_BUSY, true);
         assert!(busy.is_daemon_busy());
         assert_eq!(busy.to_string(), DAEMON_BUSY);
         assert_eq!(
@@ -7626,8 +7654,9 @@ mod tests {
             RequestError::Refused(Refusal::Busy)
         );
         for other in [
-            remote(DAEMON_BUSY, false),
-            remote("registry is unavailable", true),
+            remote(ProtocolErrorCode::Internal, DAEMON_BUSY, false),
+            remote(ProtocolErrorCode::Internal, DAEMON_BUSY, true),
+            remote(ProtocolErrorCode::Internal, "registry is unavailable", true),
         ] {
             assert!(!other.is_daemon_busy());
 
@@ -7648,13 +7677,16 @@ mod tests {
     #[test]
     fn a_held_account_list_is_a_refusal_in_its_own_words() {
         use crate::{account::remote::ListHeld, terminal_ipc::ProtocolErrorCode};
-        let remote = |message: String, retryable| ControlError::Remote {
-            code: ProtocolErrorCode::InvalidRequest,
+        let remote = |code, message: String, retryable| ControlError::Remote {
+            code,
             message,
             retryable,
         };
-        for held in [ListHeld::Registry, ListHeld::Lifecycle] {
-            let refusal = remote(held.to_string(), true);
+        for (held, code) in [
+            (ListHeld::Registry, ProtocolErrorCode::AccountRegistryBusy),
+            (ListHeld::Lifecycle, ProtocolErrorCode::AccountLifecycleBusy),
+        ] {
+            let refusal = remote(code, held.to_string(), true);
             assert!(!refusal.is_daemon_busy());
             assert_eq!(refusal.refusal(), Some(Refusal::AccountList(held)));
             assert_eq!(refusal.to_string(), held.to_string());
@@ -7662,7 +7694,7 @@ mod tests {
             assert_eq!(error, RequestError::Refused(Refusal::AccountList(held)));
             assert_eq!(error.to_string(), held.to_string());
             // Only a retryable refusal says nothing was done.
-            let final_answer = remote(held.to_string(), false);
+            let final_answer = remote(code, held.to_string(), false);
             assert_eq!(final_answer.refusal(), None);
             assert!(matches!(
                 RequestError::from(final_answer),
@@ -11810,7 +11842,7 @@ mod tests {
         }
         assert!(
             matches!(public_terminal_close_exchange_source(true, "attach-missing", true),
-            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalNotFound, message, retryable: false })
+            Err(ControlError::Remote { code: ProtocolErrorCode::TerminalCloseSourceAbsent, message, retryable: false })
                 if message == crate::terminal_ipc::TERMINAL_CLOSE_SOURCE_ABSENT)
         );
     }

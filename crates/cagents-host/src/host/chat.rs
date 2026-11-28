@@ -466,6 +466,7 @@ fn setup_error(failure: chat::protocol::SetupError) -> ProtocolError {
     match failure {
         chat::protocol::SetupError::Invalid(message) => error(message),
         chat::protocol::SetupError::Unavailable(message) => retryable_unavailable(message),
+        chat::protocol::SetupError::Refused(error) => error,
     }
 }
 fn retryable_unavailable(message: impl Into<String>) -> ProtocolError {
@@ -1902,15 +1903,6 @@ enum SharedCodexService {
     Unknown,
 }
 
-fn shared_codex_failure(failure: chat::protocol::SetupError) -> ProtocolError {
-    match failure {
-        chat::protocol::SetupError::Invalid(message) => error(message),
-        chat::protocol::SetupError::Unavailable(message) => {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        }
-    }
-}
-
 /// Probe the exact shared transport both preparation and fallback would use.
 /// The adapter owns any verified short alias until the probe has completed.
 /// Only an absent entry or ConnectionRefused proves this endpoint unserved;
@@ -1941,7 +1933,7 @@ fn shared_codex_service(
             }) {
                 return Ok(SharedCodexService::Unknown);
             }
-            return Err(shared_codex_failure(failure));
+            return Err(setup_error(failure));
         }
     };
     let service = match &spec.transport {

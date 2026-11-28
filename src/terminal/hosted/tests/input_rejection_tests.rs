@@ -519,9 +519,9 @@ fn proof_auth_and_wire_errors_cannot_be_reclassified_as_input_refusals() {
 
 #[test]
 fn closed_input_admission_keeps_the_same_connection_for_actual_completion() {
-    for (message, retryable) in [
-        ("the terminal worker has closed", true),
-        ("terminal output has completed", false),
+    for refusal in [
+        ProtocolError::terminal_input_worker_closed(),
+        ProtocolError::terminal_output_completed(),
     ] {
         let mut mock = MockHost::begin(false);
         mock.attach();
@@ -538,14 +538,7 @@ fn closed_input_admission_keeps_the_same_connection_for_actual_completion() {
             matches!(request.request, ClientRequest::Key { terminal_id, input }
             if terminal_id == mock.session.id && input == key)
         );
-        mock.send(
-            Some(request.request_id),
-            ServerMessage::Error(ProtocolError::new(
-                ProtocolErrorCode::TerminalUnavailable,
-                message,
-                retryable,
-            )),
-        );
+        mock.send(Some(request.request_id), ServerMessage::Error(refusal));
         assert!(matches!(
             mock.handle.events().recv_timeout(Duration::from_secs(2)).unwrap(),
             TerminalEvent::InputRejected { operation: "send terminal key", message }
@@ -590,16 +583,70 @@ fn closed_input_admission_keeps_the_same_connection_for_actual_completion() {
 
 #[test]
 fn unavailable_refusals_require_the_exact_pre_effect_input_contract() {
-    for (kind, message, retryable) in [
-        ("input", "unknown partial input delivery", true),
-        ("input", "the terminal worker has closed", false),
-        ("input", "terminal output has completed", true),
-        ("attach", "the terminal worker has closed", true),
-        ("control", "the terminal worker has closed", true),
-        ("unsolicited", "the terminal worker has closed", true),
-        ("unknown", "the terminal worker has closed", true),
-        ("wrong-proof", "the terminal worker has closed", true),
-        ("wrong-version", "the terminal worker has closed", true),
+    use ProtocolErrorCode::{
+        TerminalInputWorkerClosed, TerminalOutputCompleted, TerminalUnavailable,
+    };
+    for (kind, code, message, retryable) in [
+        (
+            "input",
+            TerminalUnavailable,
+            "unknown partial input delivery",
+            true,
+        ),
+        (
+            "input",
+            TerminalUnavailable,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "input",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            false,
+        ),
+        (
+            "input",
+            TerminalOutputCompleted,
+            "terminal output has completed",
+            true,
+        ),
+        (
+            "attach",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "control",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "unsolicited",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "unknown",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "wrong-proof",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
+        (
+            "wrong-version",
+            TerminalInputWorkerClosed,
+            "the terminal worker has closed",
+            true,
+        ),
     ] {
         let mut mock = MockHost::begin(false);
         let request_id = if kind == "attach" {
@@ -634,11 +681,7 @@ fn unavailable_refusals_require_the_exact_pre_effect_input_contract() {
                 } else {
                     mock.proof.clone()
                 },
-                message: ServerMessage::Error(ProtocolError::new(
-                    ProtocolErrorCode::TerminalUnavailable,
-                    message,
-                    retryable,
-                )),
+                message: ServerMessage::Error(ProtocolError::new(code, message, retryable)),
             },
         )
         .unwrap();
@@ -678,11 +721,7 @@ fn full_event_inbox_preserves_mixed_pre_effect_refusals_and_completion() {
     let input = mock.request();
     mock.send(
         Some(input.request_id),
-        ServerMessage::Error(ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            "the terminal worker has closed",
-            true,
-        )),
+        ServerMessage::Error(ProtocolError::terminal_input_worker_closed()),
     );
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {

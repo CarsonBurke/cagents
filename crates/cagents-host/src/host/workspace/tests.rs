@@ -772,3 +772,31 @@ fn a_confirmed_project_close_cannot_take_a_channel_created_after_confirmation() 
     assert_eq!(last.0, ModelEdit::CloseProject { repository });
     assert_eq!(last.1.removed_channels, [late]);
 }
+
+#[test]
+fn an_edit_rebases_only_a_typed_precondition_refusal() {
+    let (directory, host, _) = fixture();
+    let writer = writer(&host).unwrap();
+    let mut registry = writer.lock().unwrap();
+    let edit = open_project(directory.path());
+
+    for (failure, code, retryable) in [
+        (
+            EditError::SourceConflict,
+            ProtocolErrorCode::ViewConflict,
+            true,
+        ),
+        (
+            EditError::Store(Registry::VIEW_SOURCE_CONFLICT.to_owned()),
+            ProtocolErrorCode::Internal,
+            false,
+        ),
+    ] {
+        let result = apply_delta_guarded::<()>(&mut registry, &edit, None, |_, _| Err(failure));
+        let refusal = result.err().expect("the edit was refused");
+        assert_eq!(refusal.code, code);
+        assert_eq!(refusal.message, Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(refusal.retryable, retryable);
+        assert!(registry.model().unwrap().projects.is_empty());
+    }
+}

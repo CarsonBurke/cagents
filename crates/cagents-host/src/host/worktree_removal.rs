@@ -121,7 +121,7 @@ impl Reservation {
         };
         let writer = gate
             .exclusive_when_free_until(std::time::Instant::now() + patience)
-            .ok_or_else(super::control_gate::busy)?;
+            .ok_or_else(ProtocolError::daemon_busy)?;
         super::client::ensure_control_open(host)?;
         let mut entries = map.lock().unwrap_or_else(|p| p.into_inner());
         if entries.values().any(|other| other.overlaps(&scope)) {

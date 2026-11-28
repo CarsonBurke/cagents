@@ -303,3 +303,81 @@ fn observed_metadata_uses_the_worker_receipt_after_the_host_descriptor_advances(
     let model = edit(&host, 1, change).unwrap();
     assert_eq!(model.views[0].panes[0].kind, pane.kind);
 }
+
+#[test]
+fn same_revision_with_a_stale_source_keeps_the_removal_refusal() {
+    let (directory, host, _) = fixture();
+    let root = directory.path().canonicalize().unwrap();
+    edit(&host, 1, open_project(&root)).unwrap();
+    let browser = crate::model::BrowserId::new();
+    let kind = |address: &str| {
+        let url: url::Url = address.parse().unwrap();
+        CardKind::Browser(crate::model::BrowserSession {
+            id: browser,
+            current_url: url.clone(),
+            history: vec![url],
+            history_index: 0,
+            scroll_x: 0.0,
+            scroll_y: 0.0,
+            fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+        })
+    };
+    let pane = Pane {
+        id: CardId::new(),
+        title: "Saved page".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        scope: None,
+        kind: kind("https://example.invalid/current"),
+    };
+    let scope = Scope::Worktree {
+        repository: root.clone(),
+        path: root.clone(),
+    };
+    let model = edit(
+        &host,
+        1,
+        ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: Vec::new(),
+        },
+    )
+    .unwrap();
+    let operation = uuid::Uuid::new_v4();
+    let removal = ModelEdit::ChangeView {
+        scope,
+        expected_revision: model.views[0].revision,
+        operation,
+        change: Change::RemoveSource {
+            registry: model.identity,
+            repository: root,
+            before: Pane {
+                kind: kind("https://example.invalid/earlier"),
+                ..pane
+            },
+            terminal: None,
+            capture: None,
+        },
+    };
+
+    let refusal = process_request(
+        &host,
+        1,
+        ClientRequest::EditWorkspaceModel { edit: removal },
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!refusal.retryable);
+    assert_eq!(refusal.message, Registry::VIEW_REMOVAL_CONFLICT);
+    assert_eq!(snapshot(&host, None).unwrap(), model);
+    assert!(
+        !writer(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .view_operation_seen(operation)
+            .unwrap()
+    );
+}

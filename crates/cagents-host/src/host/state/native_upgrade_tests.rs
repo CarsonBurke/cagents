@@ -2119,7 +2119,6 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
                 crate::terminal::ipc::ClientRequest::ResolveUpgradeChat { source },
             )
             .unwrap_err()
-            .message
         };
         // The descriptor was issued before its thread was named; the pane
         // saved the confirmed alias once it was. Both learn why it stopped.
@@ -2130,20 +2129,18 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         assert_eq!(confirmed.launch.session_id.as_deref(), Some(thread));
         for source in [issued.source.clone(), confirmed.clone()] {
             let refusal = resolve(source);
-            assert!(
-                refusal.starts_with(crate::chat::UPDATE_RESTART_STOPPED)
-                    && refusal.contains(reason),
-                "{refusal:?}"
+            assert_eq!(refusal.code, ProtocolErrorCode::UpdateRestartStopped);
+            assert!(refusal.retryable);
+            assert_eq!(
+                refusal.message,
+                crate::chat::update_restart_stopped(&entry.reason)
             );
         }
         // Another thread under the same pane is not the one that stopped.
         let mut other = confirmed;
         other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
         let refusal = resolve(other);
-        assert!(
-            !refusal.starts_with(crate::chat::UPDATE_RESTART_STOPPED),
-            "{refusal:?}"
-        );
+        assert_ne!(refusal.code, ProtocolErrorCode::UpdateRestartStopped);
     }
 
     // Use the framed client that the pane uses. Its ordinary restore only

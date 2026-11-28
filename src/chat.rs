@@ -932,14 +932,12 @@ impl Recovery {
 
 /// The daemon's refusal of a retained Claude conversation whose earlier
 /// process ended without recording its close. Only a later boot proves that
-/// process gone, so a client reads this exact sentence as
-/// [`Recovery::AfterRestart`]. The protocol has no code of its own for it.
+/// process gone.
 pub const UNPROVEN_OWNER_REFUSAL: &str = "This conversation's earlier Claude process ended without recording its close, and cagents cannot prove that nothing else still holds the conversation, so nothing was started in its place. It can be reopened after you restart this computer.";
 
 /// How the daemon's refusal begins for a conversation whose restart after an
 /// update failed and was stopped again. Nothing of it runs and nothing was
-/// resent, so an ordinary start of its saved conversation reopens it; a client
-/// may read this prefix to offer that instead of treating the card as blocked.
+/// resent, so an ordinary start of its saved conversation reopens it.
 pub const UPDATE_RESTART_STOPPED: &str =
     "This conversation could not be restarted after the update";
 
@@ -951,9 +949,7 @@ pub fn update_restart_stopped(reason: &str) -> String {
 }
 
 /// How the daemon's refusal under startup recovery's hold on original
-/// ownership begins. The protocol has no code of its own for it, so a client
-/// recognises a non-retryable `TerminalUnavailable` that starts with this
-/// sentence, and can confirm the hold by asking for the startup state.
+/// ownership begins.
 pub const STARTUP_RECOVERY_REFUSAL: &str = "Startup recovery retained original ownership";
 
 impl StartFailure {

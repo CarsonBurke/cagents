@@ -52,11 +52,14 @@ pub(crate) fn blank_form_answer(values: &[String]) -> bool {
 pub enum SetupError {
     Invalid(String),
     Unavailable(String),
+    /// A recovery decision with a specific daemon refusal code.
+    Refused(crate::terminal_ipc::ProtocolError),
 }
 impl std::fmt::Display for SetupError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+            Self::Refused(error) => error.message.fmt(f),
         }
     }
 }

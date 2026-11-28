@@ -1,5 +1,7 @@
 //! Source-checked shared removal; resident serialization spans the SQL commit.
+use super::super::model::EditError;
 use super::*;
+
 use crate::workspace_model::views::{Change, TerminalRemovalBasis};
 
 const CAPACITY: usize = 8192;
@@ -274,7 +276,16 @@ impl HostState {
         &self,
         source: &TerminalSession,
     ) -> Result<TerminalRemovalBasis, ProtocolError> {
-        let refused = || ProtocolError::new(ProtocolErrorCode::InvalidRequest, conflict(), false);
+        self.terminal_removal_basis_for(source, || {
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, conflict(), false)
+        })
+    }
+
+    pub(in crate::host) fn terminal_removal_basis_for(
+        &self,
+        source: &TerminalSession,
+        refused: impl Fn() -> ProtocolError,
+    ) -> Result<TerminalRemovalBasis, ProtocolError> {
         if self.removal_in_transition(source.id) {
             return Err(refused());
         }
@@ -323,7 +334,7 @@ impl HostState {
                 && self.terminals.get(&id).is_some_and(|record| record.handle.execution_instance() == *instance))
     }
 
-    pub(in crate::host) fn validate_view_removal(&self, edit: &ModelEdit) -> Result<(), String> {
+    pub(in crate::host) fn validate_view_removal(&self, edit: &ModelEdit) -> Result<(), EditError> {
         if let ModelEdit::ChangeView {
             change:
                 Change::UpdateTerminalSource {
@@ -339,7 +350,7 @@ impl HostState {
                 crate::model::CardKind::Terminal(observed),
             ) = (&before.kind, &pane.kind)
             else {
-                return Err(conflict());
+                return Err(EditError::RemovalConflict);
             };
             if source.id != observed.id
                 || source.launch != observed.launch
@@ -347,7 +358,7 @@ impl HostState {
                 || (self.terminals.contains_key(&source.id)
                     && !self.current_metadata_worker(source.id, worker))
             {
-                return Err(conflict());
+                return Err(EditError::RemovalConflict);
             }
             return Ok(());
         }
@@ -365,25 +376,25 @@ impl HostState {
                 if self.spawning.contains(&source.id)
                     || super::super::chat::shared_removal_in_transition(self, before)
                 {
-                    return Err(conflict());
+                    return Err(EditError::RemovalConflict);
                 }
                 if let Some(record) = self.chats.get(&source.id)
                     && !removes_resident_chat(before, record)
                 {
-                    return Err(conflict());
+                    return Err(EditError::RemovalConflict);
                 }
             }
             return if terminal.is_none() {
                 Ok(())
             } else {
-                Err(conflict())
+                Err(EditError::RemovalConflict)
             };
         };
         if self.removal_in_transition(source.id)
             || self.terminal_retirements.contains_key(&source.id)
             || self.removal_chat_owner(source.id)
         {
-            return Err(conflict());
+            return Err(EditError::RemovalConflict);
         }
         let latest = self
             .published_terminal_workers
@@ -415,7 +426,7 @@ impl HostState {
             {
                 Ok(())
             }
-            _ => Err(conflict()),
+            _ => Err(EditError::RemovalConflict),
         }
     }
 

@@ -1028,7 +1028,7 @@ fn codex_constructor_io_is_retryable_but_recipe_conflicts_remain_blocked() {
     let failure = chat::protocol::codex::create_for_start(&source.launch)
         .err()
         .expect("the actual home is absent");
-    let failure = shared_codex_failure(failure);
+    let failure = setup_error(failure);
     assert_eq!(failure.code, ProtocolErrorCode::TerminalUnavailable);
     assert!(failure.retryable, "{failure:?}");
     assert!(
@@ -1047,7 +1047,7 @@ fn codex_constructor_io_is_retryable_but_recipe_conflicts_remain_blocked() {
     let conflict = chat::protocol::codex::create_for_start(&source.launch)
         .err()
         .expect("the exact recipe no longer matches");
-    let conflict = shared_codex_failure(conflict);
+    let conflict = setup_error(conflict);
     assert_eq!(conflict.code, ProtocolErrorCode::InvalidRequest);
     assert!(!conflict.retryable, "{conflict:?}");
     assert_eq!(

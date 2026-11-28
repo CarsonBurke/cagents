@@ -154,7 +154,7 @@ pub(in crate::host::model) fn captured(
     db: &Connection,
     capture: &CapturedTerminalSource,
     expected: Option<u64>,
-) -> Result<Binding, String> {
+) -> Result<Binding, EditError> {
     let identity: String = db
         .query_row("SELECT identity FROM metadata WHERE key=0", [], |r| {
             r.get(0)
@@ -164,25 +164,25 @@ pub(in crate::host::model) fn captured(
         || project(db, &capture.scope)? != capture.repository
         || owner(db, capture.before.id)?.as_ref() != Some(&capture.scope)
     {
-        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+        return Err(EditError::RemovalConflict);
     }
     let view = super::read(db, &capture.scope)?;
     let current = view
         .panes
         .iter()
         .find(|p| p.id == capture.before.id)
-        .ok_or(Registry::VIEW_REMOVAL_CONFLICT)?;
+        .ok_or(EditError::RemovalConflict)?;
     if !crate::workspace_model::views::same_removal_source(&capture.before, current)
         || current.pending_terminal_start
     {
-        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+        return Err(EditError::RemovalConflict);
     }
-    let binding = read(db, capture.before.id)?.ok_or(Registry::VIEW_REMOVAL_CONFLICT)?;
+    let binding = read(db, capture.before.id)?.ok_or(EditError::RemovalConflict)?;
     if binding.birth_sequence > capture.model_sequence
         || binding.birth_revision > capture.view_revision
         || expected.is_some_and(|token| token != binding.birth_sequence)
     {
-        return Err(Registry::VIEW_REMOVAL_CONFLICT.into());
+        return Err(EditError::RemovalConflict);
     }
     Ok(binding)
 }

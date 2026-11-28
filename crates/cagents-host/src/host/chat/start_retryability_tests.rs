@@ -660,6 +660,7 @@ fn an_unmatched_ended_actor_waits_for_a_restart_rather_than_a_retry() {
         },
     )
     .expect_err("a daemon restart within the boot proves nothing");
+    assert_eq!(refusal.code, ProtocolErrorCode::UnprovenChatOwner);
     assert_eq!(refusal.message, chat::UNPROVEN_OWNER_REFUSAL);
     drop(lease);
     drop(host);

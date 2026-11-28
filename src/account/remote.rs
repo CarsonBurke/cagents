@@ -227,14 +227,6 @@ impl ListHeld {
     pub fn of(error: &std::io::Error) -> Option<Self> {
         error.get_ref()?.downcast_ref().copied()
     }
-
-    /// The refusal a daemon's reply carries, if it is this one: retryable,
-    /// in this refusal's own words.
-    pub(crate) fn recognize(message: &str, retryable: bool) -> Option<Self> {
-        [Self::Registry, Self::Lifecycle]
-            .into_iter()
-            .find(|held| retryable && message == held.to_string())
-    }
 }
 
 #[cfg(feature = "host")]

@@ -387,17 +387,15 @@ use crate::{
 /// snapshots without the count, and an older update source is read without it.
 ///
 /// Version 226 adds exact Work card pins and a publication watermark for replies.
-pub const PROTOCOL_VERSION: u16 = 226;
+///
+/// Version 228 appends codes for daemon and account-lock contention, chat
+/// recovery holds, terminal input and source-checked close refusals, and
+/// shutdown admission.
+pub const PROTOCOL_VERSION: u16 = 228;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
-/// The retryable refusal of an exclusive request the daemon could not admit
-/// before its deadline. It admitted nothing, so the same request may be sent
-/// again. Clients recognise it by this exact sentence
-/// (`ControlError::is_daemon_busy`), and the update retries a busy source's
-/// preparation only when it matches; rewording it here or in a daemon still in
-/// service turns that retry off for every client that compares against the
-/// other wording.
+/// The message for daemon contention before request admission.
 pub const DAEMON_BUSY: &str = "The daemon is finishing another operation. Wait for it and retry.";
 /// A correlated refusal issued before source-checked cleanup has any effect.
 pub const TERMINAL_CLOSE_SOURCE_CONFLICT: &str =
@@ -414,6 +412,8 @@ pub const TERMINAL_CLOSE_SOURCE_ABSENT: &str =
 /// that CLI cannot send.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
+mod failure;
+pub use failure::{Admission, FailureClass, RetryAdvice};
 mod older_clients;
 pub use older_clients::{
     ACP_REASONING_OBSERVATIONS, ANTIGRAVITY_AND_MUSE, CHANNEL_CHECKOUT, DRAFT_MODEL_IN_LAUNCH,
@@ -1789,6 +1789,7 @@ impl Serialize for ProtocolError {
             {
                 ProtocolErrorCode::InvalidRequest
             }
+            code if older_clients::encoding_before(failure::TYPED_REFUSALS) => code.legacy_code(),
             code => code,
         };
         let mut error = serializer.serialize_struct("ProtocolError", 3)?;
@@ -1818,18 +1819,18 @@ impl ProtocolError {
         }
     }
 
-    /// Whether this is the daemon's [`DAEMON_BUSY`] refusal of an exclusive
-    /// request it could not admit before its deadline. Nothing was admitted,
-    /// so the same request may be sent again once the other operation ends.
-    pub fn is_daemon_busy(&self) -> bool {
-        is_daemon_busy(&self.message, self.retryable)
+    pub fn failure_class(&self) -> FailureClass {
+        FailureClass::new(self.code, self.retryable)
     }
-}
 
-/// The one recognition of [`DAEMON_BUSY`] for every client type that carries
-/// a daemon refusal's sentence and retryability.
-pub(crate) fn is_daemon_busy(message: &str, retryable: bool) -> bool {
-    retryable && message == DAEMON_BUSY
+    /// The exclusive request timed out before admission and can be sent again.
+    pub fn is_daemon_busy(&self) -> bool {
+        self.failure_class().is_daemon_busy()
+    }
+
+    pub fn daemon_busy() -> Self {
+        Self::new(ProtocolErrorCode::DaemonBusy, DAEMON_BUSY, true)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1853,8 +1854,19 @@ pub enum ProtocolErrorCode {
     /// The request was refused before it changed anything, for the reason
     /// its message gives. Only an automatic account switch is refused this
     /// way, so the conversation it would have moved is still where it was.
-    /// Postcard encodes the variant's position, so it stays last.
+    /// Postcard encodes variant positions, so append new codes below.
     NotAdmitted,
+    DaemonBusy,
+    AccountRegistryBusy,
+    AccountLifecycleBusy,
+    StartupRecoveryHeld,
+    UpdateRestartStopped,
+    UnprovenChatOwner,
+    TerminalInputWorkerClosed,
+    TerminalOutputCompleted,
+    TerminalCloseSourceConflict,
+    TerminalCloseSourceAbsent,
+    DaemonShutdownCommitted,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

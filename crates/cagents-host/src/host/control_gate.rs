@@ -54,8 +54,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::terminal_ipc::{DAEMON_BUSY, ProtocolError, ProtocolErrorCode};
-
 #[derive(Debug, Default)]
 struct Counts {
     shared: usize,
@@ -281,11 +279,6 @@ impl Drop for Exclusive<'_> {
         self.0.counts().exclusive = false;
         self.0.changed.notify_all();
     }
-}
-
-/// The retryable refusal for an exclusive request the gate did not admit.
-pub(super) fn busy() -> ProtocolError {
-    ProtocolError::new(ProtocolErrorCode::Internal, DAEMON_BUSY, true)
 }
 
 #[cfg(test)]
