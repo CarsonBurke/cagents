@@ -25,6 +25,7 @@ pub enum ProviderInstallMethod {
     },
     Standalone,
     Unknown,
+    CagentsManaged,
 }
 
 impl ProviderInstallMethod {
@@ -37,6 +38,7 @@ impl ProviderInstallMethod {
             Self::Npm { .. } => "npm global package",
             Self::Standalone => "standalone binary",
             Self::Unknown => "unknown install method",
+            Self::CagentsManaged => "managed by Cagents",
         }
     }
 }

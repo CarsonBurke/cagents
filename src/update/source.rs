@@ -952,6 +952,10 @@ pub(crate) const RETIRED_SOURCES: &[(u16, &str)] = &[
         222,
         "the intermediate protocol from #4690 has no release qualified for live update",
     ),
+    (
+        223,
+        "the intermediate protocol from #4736 has no release qualified for live update",
+    ),
 ];
 
 #[cfg(any(test, feature = "test-support"))]

@@ -377,7 +377,8 @@ use crate::{
 /// Version 222 appends tracked compaction requests and outcome replies.
 ///
 /// Version 223 adds managed account removal planning, transcript transfer and archival.
-pub const PROTOCOL_VERSION: u16 = 223;
+/// Version 224 adds manual provider CLI installation and update requests.
+pub const PROTOCOL_VERSION: u16 = 224;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
@@ -965,6 +966,14 @@ pub enum ClientRequest {
     /// figure a window shows moves. The device is read only while some
     /// connection watches.
     WatchDeviceStats,
+    /// Check and, if eligible, update the selected provider CLI on the daemon's computer.
+    ProviderUpdate {
+        provider: crate::agent::Provider,
+    },
+    /// Provision a daemon-managed installation of the selected provider CLI.
+    ProviderManage {
+        provider: crate::agent::Provider,
+    },
 }
 
 /// Read-only invalidations for the SSH bridge. They do not confer window

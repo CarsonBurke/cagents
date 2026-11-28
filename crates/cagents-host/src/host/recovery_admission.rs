@@ -186,6 +186,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::PrepareUpgrade { .. }
+        | R::ProviderUpdate { .. }
+        | R::ProviderManage { .. }
         | R::PrepareConfirmedUpgrade { .. }
         | R::ChatCapacitySet { .. }
         | R::Work(crate::work::Request::Remove(_))

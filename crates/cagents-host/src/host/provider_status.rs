@@ -40,6 +40,9 @@ pub(super) fn snapshot() -> Result<Vec<ProviderStatus>, ProtocolError> {
 
 pub(super) async fn inspect(provider: Provider, search_path: Option<&OsStr>) -> ProviderStatus {
     let mut status = ProviderStatus::detect(provider, search_path);
+    if let Some(managed) = super::provider_update::inspect_managed(&status, search_path).await {
+        return managed;
+    }
     if let Some(executable) = &status.executable {
         match read_version(provider, executable, search_path).await {
             Ok(version) => status.version = Some(version),
