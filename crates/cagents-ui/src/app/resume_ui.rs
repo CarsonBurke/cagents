@@ -1108,10 +1108,10 @@ impl Cagents {
         ]))
     }
 
-    /// Opens the picker, or answers `None` while another dialog holds the
-    /// window.
+    /// Opens the picker once no resume or other dialog is pending.
     fn open_resume(&mut self, scope: Option<Scope>) -> Option<Task<Message>> {
-        if !self.resume_history_is_available() || self.modal_is_open() {
+        if !self.resume_history_is_available() || self.modal_is_open() || self.refuse_busy_resume()
+        {
             return None;
         }
         self.chrome_ui.close();
@@ -1143,8 +1143,6 @@ impl Cagents {
         state.replace = None;
         state.asked_from = None;
         state.error = None;
-        state.loading = false;
-        state.queued_draft_check = None;
         state.indexing = Some((0, 0));
         state.limit = PAGE;
         state.selected = 0;
@@ -1340,7 +1338,7 @@ impl Cagents {
             }
             Action::Listed(listened) => self.resume_listed(*listened),
             Action::Resume(card) => {
-                if !self.resume_ui.open || self.resume_ui.loading {
+                if !self.resume_ui.open {
                     return Task::none();
                 }
                 let Some(row) = self.resume_ui.rows.iter().find(|row| row.card == card) else {
@@ -1853,8 +1851,21 @@ impl Cagents {
         .then_some(proof)
     }
 
+    fn refuse_busy_resume(&mut self) -> bool {
+        if !self.resume_ui.loading {
+            return false;
+        }
+        let error = "A conversation is already opening. Wait for it to open, then try again.";
+        self.resume_error(error);
+        if self.resume_ui.open {
+            // The first request can close the picker before its error is drawn.
+            self.status = Some(TransientNotice::error(error));
+        }
+        true
+    }
+
     pub(super) fn resume_saved_conversation(&mut self, entry: SavedConversation) -> Task<Message> {
-        if self.resume_ui.loading {
+        if self.refuse_busy_resume() {
             return Task::none();
         }
         if let Some(key) = self
@@ -1865,6 +1876,7 @@ impl Cagents {
             self.resume_ui.attempts = self.resume_ui.attempts.wrapping_add(1);
             let attempt = self.resume_ui.attempts;
             self.resume_ui.queued_draft_check = Some(attempt);
+            self.resume_ui.error = None;
             self.resume_ui.loading = true;
             let origin = entry.card;
             let release = self.direct_queue_release(origin);
@@ -2844,12 +2856,12 @@ impl Cagents {
             }
             column.height(Length::Fill).into()
         });
-        let status: Element<'_, Message> = if state.loading {
-            design::caption("Opening the conversation…").into()
-        } else if let Some(error) = &state.error {
+        let status: Element<'_, Message> = if let Some(error) = &state.error {
             design::caption(error.as_str())
                 .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into()
+        } else if state.loading {
+            design::caption("Opening the conversation…").into()
         } else {
             design::caption("↑↓ choose · Enter resume · Tab where to look · Esc close").into()
         };
@@ -2918,10 +2930,7 @@ impl Cagents {
                 .height(Length::Fixed(ROW_HEIGHT))
                 .class(cosmic::theme::Button::ListItem([8.0; 4]))
                 .selected(index == state.selected)
-                .on_press_maybe(
-                    (!state.loading)
-                        .then_some(Message::ResumeConversation(Action::Resume(row.card))),
-                );
+                .on_press(Message::ResumeConversation(Action::Resume(row.card)));
             // Pointing at a row selects it, so the preview always describes
             // the highlighted row. A row does not hear the pointer leave the
             // list, so a pointer-only preview could outlive the pointer.
@@ -3433,6 +3442,49 @@ mod tests {
     fn reopening(app: &Cagents) -> (CardId, u64) {
         let card = app.workspace.focused().expect("the reopened pane");
         (card, app.resume_ui.reopening[&card].attempt)
+    }
+
+    #[test]
+    fn a_busy_picker_reports_refusals_from_a_row_and_enter() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = retained(directory.path());
+        let mut second = saved(directory.path());
+        second.session.launch.session_id = Some("5aec1039-41d2-4f85-88e8-8240e123811a".into());
+        app.resume_ui.open = true;
+        list(&mut app, 0, vec![second.clone()]);
+        app.resume_ui.loading = true;
+        app.resume_ui.queued_draft_check = Some(1);
+
+        for action in [Action::Resume(second.card), Action::Submit] {
+            app.resume_ui.error = None;
+            drop(app.update(Message::ResumeConversation(action)));
+            assert_eq!(
+                app.resume_ui.error.as_deref(),
+                Some("A conversation is already opening. Wait for it to open, then try again.")
+            );
+            assert!(app.resume_ui.open && app.resume_ui.loading);
+            assert_eq!(app.resume_ui.queued_draft_check, Some(1));
+            assert!(app.resume_ui.reopening.is_empty());
+        }
+
+        drop(
+            app.update(Message::ResumeConversation(Action::QueuedDraftChecked(
+                1,
+                Box::new(first.clone()),
+                None,
+            ))),
+        );
+        let (card, _) = reopening(&app);
+        assert_eq!(app.resume_ui.reopening[&card].entry.card, first.card);
+        assert!(!app.resume_ui.open && !app.resume_ui.loading);
+        assert!(app.notices.recent().any(|entry| {
+            entry.notice
+                == TransientNotice::error(
+                    "A conversation is already opening. Wait for it to open, then try again.",
+                )
+                && entry.repeats == 2
+        }));
     }
 
     #[test]

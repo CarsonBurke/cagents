@@ -854,6 +854,62 @@ fn a_resume_picker_selection_waits_for_either_retirement_answer() {
 }
 
 #[test]
+fn a_deferred_reopen_refuses_another_request_and_remains_pending() {
+    let mut fixture = fixture();
+    fixture.close_card();
+    let _published = fixture.send_retirement();
+    fixture.reopen_pane();
+    assert!(fixture.app.resume_ui.loading);
+
+    let mut second = fixture.saved();
+    second.card = CardId::new();
+    second.title = "Second conversation".into();
+    second.session.launch.session_id = Some("5aec1039-41d2-4f85-88e8-8240e123811a".into());
+    let mut closed = fixture.app.card_state(fixture.card).unwrap().clone();
+    closed.id = second.card;
+    closed.title.clone_from(&second.title);
+    closed.kind = CardKind::Chat(second.session.clone());
+    fixture
+        .app
+        .recently_closed
+        .push((closed, Some(WorkspaceDestination::Channel(fixture.channel))));
+
+    let refusal = TransientNotice::error(
+        "A conversation is already opening. Wait for it to open, then try again.",
+    );
+    fixture.reopen_pane();
+    assert_eq!(fixture.app.status.take(), Some(refusal.clone()));
+    assert_eq!(fixture.app.recently_closed.len(), 2);
+
+    // Opening the picker must not invalidate the pending retirement reply.
+    drop(
+        fixture
+            .app
+            .update_resume(super::super::resume_ui::Action::Open),
+    );
+    assert_eq!(fixture.app.status.take(), Some(refusal));
+    assert!(!fixture.app.resume_ui.open);
+    assert!(fixture.app.resume_ui.loading);
+
+    fixture.answer_retirement(false);
+    assert_eq!(fixture.resumed().title, TITLE);
+    assert!(!fixture.app.resume_ui.loading);
+    assert_eq!(fixture.app.recently_closed.len(), 1);
+    assert_eq!(fixture.app.recently_closed[0].0.id, second.card);
+
+    fixture.reopen_pane();
+    assert!(fixture.app.recently_closed.is_empty());
+    assert_eq!(
+        fixture
+            .app
+            .card_state(fixture.app.workspace.focused().unwrap())
+            .unwrap()
+            .title,
+        second.title
+    );
+}
+
+#[test]
 fn a_non_chat_reopen_waits_for_either_retirement_answer() {
     for retired in [false, true] {
         let mut fixture = fixture();
