@@ -489,3 +489,174 @@ fn a_held_account_list_refuses_retryably_in_its_own_words() {
         );
     }
 }
+
+// A private child gives the real shell resolver its own home and cache.
+#[cfg(target_os = "linux")]
+#[test]
+fn accounts_refresh_rediscovers_a_provider_while_shutdown_preflight_can_run() {
+    use crate::{
+        agent::Provider,
+        device_service::{AccountSnapshot, Operation, Reply},
+        process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
+    };
+    use std::{fs, io::Write, os::unix::fs::PermissionsExt, path::Path};
+
+    const ROOT: &str = "CAGENTS_TEST_ACCOUNTS_REFRESH_ROOT";
+    let Some(root) = std::env::var_os(ROOT) else {
+        let root = tempfile::tempdir().unwrap();
+        let root = root.path();
+        for path in ["home", "config", "data", "state", "cache", "r"] {
+            fs::create_dir(root.join(path)).unwrap();
+        }
+        let executable = std::env::current_exe().unwrap();
+        let spec = CommandSpec::new(&executable)
+            .args([
+                "--exact",
+                "host::client::control_admission_tests::accounts_refresh_rediscovers_a_provider_while_shutdown_preflight_can_run",
+                "--nocapture",
+            ])
+            .env(ROOT, root)
+            .env("HOME", root.join("home"))
+            .env("ENV", root.join("home/.profile"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("ZDOTDIR", root.join("home"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_STATE_HOME", root.join("state"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env("XDG_RUNTIME_DIR", root.join("r"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("CODEX_HOME", root.join("home/.codex"))
+            .env("PATH", "/usr/bin:/bin")
+            .timeout(Duration::from_secs(25));
+        let output = SystemProcessExecutor
+            .execute(&spec, &CancellationToken::new())
+            .unwrap();
+        assert!(
+            output.success && String::from_utf8_lossy(&output.stdout).contains("1 passed"),
+            "private account discovery failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    };
+
+    let root = Path::new(&root);
+    let shell = LaunchRecipe::shell(root.to_owned()).unwrap().program;
+    let shell_name = Path::new(&shell).file_name().and_then(|name| name.to_str());
+    let (profile, startup) = match shell_name {
+        Some("fish") => (
+            "config/fish/config.fish",
+            r#"
+            set -gx PATH $HOME/base
+            if test -d "$HOME/new-bin"
+                if not test -f "$HOME/entered"
+                    printf '' > "$HOME/entered"
+                    read -l resume < "$HOME/release"
+                end
+                set -gx PATH $HOME/new-bin $PATH
+            end
+        "#,
+        ),
+        Some("bash" | "zsh" | "sh" | "dash" | "ksh") => {
+            let profile = match shell_name {
+                Some("bash") => "home/.bashrc",
+                Some("zsh") => "home/.zshrc",
+                _ => "home/.profile",
+            };
+            (
+                profile,
+                r#"
+                export PATH="$HOME/base"
+                if [ -d "$HOME/new-bin" ]; then
+                    if [ ! -f "$HOME/entered" ]; then
+                        : > "$HOME/entered"
+                        read -r resume < "$HOME/release"
+                    fi
+                    export PATH="$HOME/new-bin:$PATH"
+                fi
+            "#,
+            )
+        }
+        _ => {
+            eprintln!("private startup fixture has no profile for {shell}");
+            return;
+        }
+    };
+
+    let mut state = HostState::new(HostSessionProof {
+        host_session_id: HostSessionId::new("accounts-refresh"),
+        boot_id: BootId::new("accounts-refresh"),
+        host_incarnation: HostIncarnation::new("accounts-refresh"),
+    });
+    state.register_client(TYPIST);
+    state.register_client(OPERATOR);
+    let host = Arc::new(HostLock::new(state));
+    let snapshot = |response| {
+        let ServerResponse::DeviceOperation {
+            reply: Reply::Accounts(value),
+        } = response
+        else {
+            panic!("expected the device accounts snapshot, received {response:?}");
+        };
+        serde_json::from_value::<AccountSnapshot>(value).unwrap()
+    };
+    let cached = || {
+        let request = ClientRequest::DeviceOperation {
+            operation: Operation::AccountsRead,
+        };
+        snapshot(process_request(&host, TYPIST, request).unwrap().0)
+    };
+
+    let profile = root.join(profile);
+    fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    fs::write(profile, startup).unwrap();
+    let initial = cached();
+    let provider = Provider::Antigravity;
+    assert_eq!(initial.installed.get(&provider), Some(&false));
+
+    let bin = root.join("home/new-bin");
+    fs::create_dir(&bin).unwrap();
+    let executable = bin.join(provider.executable());
+    fs::write(&executable, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&executable, fs::Permissions::from_mode(0o700)).unwrap();
+    assert_eq!(cached().installed.get(&provider), Some(&false));
+
+    let release = root.join("home/release");
+    let fifo = std::ffi::CString::new(release.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: the terminated path lives for the call and is in the private home.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let mut release = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(release)
+        .unwrap();
+    let refresh = submit(
+        &host,
+        TYPIST,
+        ClientRequest::DeviceOperation {
+            operation: Operation::AccountsRefresh,
+        },
+    );
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let entered = root.join("home/entered");
+    while !entered.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let preflight = entered
+        .exists()
+        .then(|| process_request(&host, OPERATOR, preflight()));
+    release.write_all(b"continue\n").unwrap();
+    let refreshed = snapshot(
+        refresh
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .unwrap(),
+    );
+    assert!(matches!(
+        preflight.expect("refresh did not enter shell startup"),
+        Ok((ServerResponse::ShutdownPreflight(_), _, _))
+    ));
+    assert_eq!(refreshed.installed.get(&provider), Some(&true));
+    assert_eq!(refreshed.registry, initial.registry);
+    assert_eq!(cached().installed.get(&provider), Some(&true));
+}

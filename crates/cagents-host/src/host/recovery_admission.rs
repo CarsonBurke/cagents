@@ -290,6 +290,7 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
         O::Home
         | O::ProjectNavigation { .. }
         | O::AccountsRead
+        | O::AccountsRefresh
         | O::AccountsCache { .. }
         | O::Skills { .. }
         | O::AccountLogin { .. }

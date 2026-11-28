@@ -747,6 +747,50 @@ impl State {
             .any(|account| &account.id != except && account.schedule.in_flight(now))
     }
 
+    /// The discovery owns CLI presence even when a row has cached usage.
+    fn apply_discovered_presence(
+        &mut self,
+        restored: &[Restored],
+        installed: &BTreeMap<Provider, bool>,
+        from_device: bool,
+    ) {
+        for restored in restored {
+            let Some(state) = self
+                .accounts
+                .iter_mut()
+                .find(|state| state.id == restored.id)
+            else {
+                continue;
+            };
+            let provider = state.account.provider;
+            // A device snapshot confirms CLI presence. A usage answer still
+            // owns account presence while that CLI stays installed.
+            if from_device
+                && restored.present
+                && state.snapshot.is_some()
+                && self.installed.get(&provider) == Some(&true)
+            {
+                continue;
+            }
+            if !state.present && restored.present {
+                state.invalidate_usage();
+            }
+            state.present = restored.present;
+            let absent = format!(
+                "{} is not installed",
+                probe::cli_name(state.account.provider)
+            );
+            if installed.get(&state.account.provider) == Some(&false) {
+                state.failure = Some(absent);
+            } else if state.failure.as_ref() == Some(&absent) {
+                state.failure = None;
+            }
+            if !restored.present && self.popover.as_ref() == Some(&restored.id) {
+                self.popover = None;
+            }
+        }
+    }
+
     /// Takes what a load found for each account: whether it has a CLI to ask,
     /// and what the cache had for it.
     fn restore(&mut self, restored: Vec<Restored>) {
@@ -1631,20 +1675,6 @@ fn restore(
             present: account.resolved_home().is_some_and(|home| home.is_dir())
                 && installed.get(&account.provider) == Some(&true),
             entry: account.cache_key().and_then(|key| entries.remove(&key)),
-        })
-        .collect()
-}
-
-fn provider_installations(search_path: Option<&std::ffi::OsStr>) -> BTreeMap<Provider, bool> {
-    Provider::ALL
-        .into_iter()
-        .map(|provider| {
-            (
-                provider,
-                provider
-                    .programs()
-                    .any(|program| probe::find_executable(program, search_path).is_some()),
-            )
         })
         .collect()
 }
@@ -3044,27 +3074,11 @@ impl Cagents {
     /// Omp's usage record is read beside it, on its own: a read that waits
     /// on Omp writing holds back no other account.
     pub(super) fn load_accounts(&mut self) -> Task<Message> {
+        if crate::device::is_remote() {
+            return self.load_device_accounts(crate::device_service::Operation::AccountsRead);
+        }
         self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
         let generation = self.account_ui.discovery_generation;
-        if crate::device::is_remote() {
-            return cosmic::task::future(async move {
-                let result =
-                    tokio::task::spawn_blocking(|| {
-                        match crate::device_service::request(
-                            crate::device_service::Operation::AccountsRead,
-                        )? {
-                            crate::device_service::Reply::Accounts(value) => {
-                                serde_json::from_value(value).map_err(|error| error.to_string())
-                            }
-                            _ => Err("The device did not return its accounts".into()),
-                        }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
-            });
-        }
         let store = self.account_ui.store.clone();
         let homes = self.account_ui.homes.clone();
         let cache = self.account_ui.cache.clone();
@@ -3084,7 +3098,7 @@ impl Cagents {
                     .map(|registry| registry.accounts(homes.as_ref()))
                     .unwrap_or_else(|_| Account::system_accounts().into());
                 let now = now_ms();
-                let installed = provider_installations(search_path.as_deref());
+                let installed = probe::provider_installations(search_path.as_deref());
                 let restored = restore(&accounts, cache.as_ref(), now, &installed);
                 let catalogs = cache
                     .as_ref()
@@ -3134,12 +3148,11 @@ impl Cagents {
     fn locate_accounts_for(&mut self, manual: Option<(AccountId, u64)>) -> Task<Message> {
         // A device window learns which CLIs exist from its device's accounts
         // snapshot; this computer's PATH would describe the wrong machine.
-        // What follows a discovery, checking the accounts, still does.
-        if crate::device::is_remote() {
-            return self.probe_accounts(Trigger::Focus);
-        }
         if let Some((id, owner)) = manual {
             self.account_ui.discovery_manual.insert(id, owner);
+        }
+        if crate::device::is_remote() {
+            return self.load_device_accounts(crate::device_service::Operation::AccountsRefresh);
         }
         self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
         let generation = self.account_ui.discovery_generation;
@@ -3156,7 +3169,7 @@ impl Cagents {
         cosmic::task::future(async move {
             let search_path = probe::refresh_search_path().await;
             let (restored, installed) = tokio::task::spawn_blocking(move || {
-                let installed = provider_installations(search_path.as_deref());
+                let installed = probe::provider_installations(search_path.as_deref());
                 (
                     restore(&accounts, cache.as_ref(), now_ms(), &installed),
                     installed,
@@ -3173,29 +3186,33 @@ impl Cagents {
         })
     }
 
+    fn load_device_accounts(
+        &mut self,
+        operation: crate::device_service::Operation,
+    ) -> Task<Message> {
+        self.account_ui.discovery_generation = self.account_ui.discovery_generation.wrapping_add(1);
+        let generation = self.account_ui.discovery_generation;
+        cosmic::task::future(async move {
+            let result =
+                tokio::task::spawn_blocking(move || {
+                    match crate::device_service::request(operation)? {
+                        crate::device_service::Reply::Accounts(value) => {
+                            serde_json::from_value(value).map_err(|error| error.to_string())
+                        }
+                        _ => Err("The device did not return its accounts".into()),
+                    }
+                })
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            Message::AccountUi(Action::RemoteLoaded(generation, result))
+        })
+    }
+
     /// Reads the registry again, for what another window changed.
     pub(super) fn reload_registry(&mut self) -> Task<Message> {
         if crate::device::is_remote() {
-            self.account_ui.discovery_generation =
-                self.account_ui.discovery_generation.wrapping_add(1);
-            let generation = self.account_ui.discovery_generation;
-            return cosmic::task::future(async move {
-                let result =
-                    tokio::task::spawn_blocking(|| {
-                        match crate::device_service::request(
-                            crate::device_service::Operation::AccountsRead,
-                        )? {
-                            crate::device_service::Reply::Accounts(value) => {
-                                serde_json::from_value(value).map_err(|error| error.to_string())
-                            }
-                            _ => Err("The device did not return its accounts".into()),
-                        }
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                Message::AccountUi(Action::RemoteLoaded(generation, result))
-            });
+            return self.load_device_accounts(crate::device_service::Operation::AccountsRefresh);
         }
         let Some(store) = self.account_ui.store.clone() else {
             return Task::none();
@@ -3271,11 +3288,7 @@ impl Cagents {
         if !self.settings.show_status_bar {
             self.account_ui.popover = None;
         }
-        if crate::device::is_remote() {
-            self.reload_registry()
-        } else {
-            self.locate_accounts()
-        }
+        self.locate_accounts()
     }
 
     /// Called with the main window's focus changes, after `refresh_ui` has
@@ -3295,7 +3308,7 @@ impl Cagents {
             return Task::none();
         }
         let discovery = if crate::device::is_remote() {
-            Task::none() // reload_registry already reads remote CLI presence.
+            Task::none() // reload_registry already refreshes remote CLI presence.
         } else {
             self.locate_accounts()
         };
@@ -4017,6 +4030,22 @@ impl Cagents {
         Task::batch(tasks)
     }
 
+    /// A current discovery releases queued Check now requests for the same homes.
+    fn probe_after_discovery(&mut self) -> Task<Message> {
+        let manual = std::mem::take(&mut self.account_ui.discovery_manual);
+        if manual.is_empty() {
+            return self.probe_accounts(Trigger::Focus);
+        }
+        let now = now_ms();
+        self.account_ui.now_ms = now;
+        Task::batch(manual.into_iter().filter_map(|(id, owner)| {
+            if self.account_ui.account(&id)?.owner != owner {
+                return None;
+            }
+            self.probe_account(&id, Trigger::Manual, now)
+        }))
+    }
+
     pub(super) fn update_account_ui(&mut self, action: Action) -> Task<Message> {
         match action {
             Action::ResetStart(id, reset, surface, choose_scope) => {
@@ -4080,6 +4109,7 @@ impl Cagents {
                 let snapshot = match result {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
+                        self.account_ui.discovery_manual.clear();
                         self.status = Some(TransientNotice::error(format!(
                             "The device accounts could not be read: {error}"
                         )));
@@ -4090,10 +4120,11 @@ impl Cagents {
                 self.account_ui.remote_system_homes = snapshot.system_homes;
                 self.account_ui.set_registry(snapshot.registry.clone());
                 self.account_ui.sync_accounts();
-                let restored = self
+                let restored: Vec<_> = self
                     .account_ui
                     .accounts
                     .iter()
+                    .filter(|state| !state.account.is_brokered())
                     .map(|state| Restored {
                         id: state.id.clone(),
                         present: snapshot
@@ -4107,6 +4138,8 @@ impl Cagents {
                             .and_then(|key| snapshot.entries.get(key).cloned()),
                     })
                     .collect();
+                self.account_ui
+                    .apply_discovered_presence(&restored, &snapshot.installed, true);
                 self.update_account_ui(Action::Loaded(Loaded {
                     generation,
                     registry: Ok(snapshot.registry),
@@ -4192,7 +4225,9 @@ impl Cagents {
                 let changed = owners_before != self.account_ui.discovery_owners();
                 let follow_up = if (current_discovery && loaded.provisional) || changed {
                     self.locate_accounts()
-                } else if current_discovery || !was_ready {
+                } else if current_discovery {
+                    self.probe_after_discovery()
+                } else if !was_ready {
                     // A newer discovery may already have answered while
                     // policy was unknown, so first readiness releases probes.
                     self.probe_accounts(Trigger::Focus)
@@ -4217,58 +4252,15 @@ impl Cagents {
                     // dropping a Check now still waiting on this discovery.
                     return self.locate_accounts();
                 }
+                self.account_ui
+                    .apply_discovered_presence(&restored, &installed, false);
                 self.account_ui.installed = installed;
                 self.account_ui.installed_provisional = false;
-                // Fresh detection owns current presence, independently of an
-                // older usage snapshot which remains useful history.
-                let installed = self.account_ui.installed.clone();
-                for restored in &restored {
-                    let Some(state) = self.account_ui.account_mut(&restored.id) else {
-                        continue;
-                    };
-                    if !state.present && restored.present {
-                        state.invalidate_usage();
-                    }
-                    state.present = restored.present;
-                    let absent = format!(
-                        "{} is not installed",
-                        probe::cli_name(state.account.provider)
-                    );
-                    if installed.get(&state.account.provider) == Some(&false) {
-                        state.failure = Some(absent);
-                    } else if state.failure.as_ref() == Some(&absent) {
-                        state.failure = None;
-                    }
-                    if !restored.present && self.account_ui.popover.as_ref() == Some(&restored.id) {
-                        self.account_ui.popover = None;
-                    }
-                }
                 self.account_ui.restore(restored);
                 // With presence settled, so a moved draft picks its account
                 // as a new one would.
                 let drafts = self.move_drafts_off_missing_providers();
-                let manual = std::mem::take(&mut self.account_ui.discovery_manual);
-                let probes = if manual.is_empty() {
-                    self.probe_accounts(Trigger::Focus)
-                } else {
-                    let now = now_ms();
-                    self.account_ui.now_ms = now;
-                    let current: Vec<_> = manual
-                        .into_iter()
-                        .filter_map(|(id, owner)| {
-                            self.account_ui
-                                .account(&id)
-                                .is_some_and(|state| state.owner == owner)
-                                .then_some(id)
-                        })
-                        .collect();
-                    Task::batch(
-                        current
-                            .iter()
-                            .filter_map(|id| self.probe_account(id, Trigger::Manual, now)),
-                    )
-                };
-                Task::batch([probes, drafts])
+                Task::batch([self.probe_after_discovery(), drafts])
             }
             Action::Probed {
                 owner,
@@ -4286,22 +4278,13 @@ impl Cagents {
                 let Some(state) = self.account_ui.account(&id) else {
                     return Task::none();
                 };
-                if !crate::device::is_remote() && !state.account.is_brokered() {
-                    let owner = state.owner;
-                    return self.locate_accounts_for(Some((id, owner)));
+                if !state.account.is_brokered() || crate::device::is_remote() {
+                    return self.locate_accounts_for(Some((id, state.owner)));
                 }
-                let discovery = if crate::device::is_remote() {
-                    self.reload_registry()
-                } else {
-                    Task::none()
-                };
                 let now = now_ms();
                 self.account_ui.now_ms = now;
-                Task::batch([
-                    discovery,
-                    self.probe_account(&id, Trigger::Manual, now)
-                        .unwrap_or_else(Task::none),
-                ])
+                self.probe_account(&id, Trigger::Manual, now)
+                    .unwrap_or_else(Task::none)
             }
             Action::LimitReady {
                 id,
@@ -8255,7 +8238,7 @@ mod tests {
         let path = directory.path().join(Provider::Omp.executable());
         std::fs::write(&path, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let installations = provider_installations(Some(directory.path().as_os_str()));
+        let installations = probe::provider_installations(Some(directory.path().as_os_str()));
         assert_eq!(installations.len(), Provider::ALL.len());
         assert_eq!(installations.get(&Provider::Omp), Some(&true));
         assert_eq!(installations.get(&Provider::Claude), Some(&false));
@@ -8264,7 +8247,7 @@ mod tests {
         let upstream = directory.path().join("muse-upstream");
         std::fs::write(&upstream, b"#!/bin/sh\nexit 0\n").unwrap();
         std::fs::set_permissions(&upstream, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let installations = provider_installations(Some(directory.path().as_os_str()));
+        let installations = probe::provider_installations(Some(directory.path().as_os_str()));
         assert_eq!(installations.get(&Provider::Muse), Some(&true));
     }
 
@@ -15116,6 +15099,77 @@ mod app_tests {
                 Some("history")
             );
         }
+    }
+
+    #[test]
+    fn device_discovery_updates_cached_presence_before_releasing_manual_usage() {
+        use crate::device_service::{AccountSnapshot, Operation};
+
+        let mut app = context_inspector_test_app(false);
+        app.refresh_ui.focused = true;
+        let provider = Provider::Codex;
+        let id = Account::system(provider).id();
+        let state = app.account_ui.account_mut(&id).unwrap();
+        state.present = false;
+        state.failure = Some(format!("{} is not installed", probe::cli_name(provider)));
+        state.snapshot = Some(UsageSnapshot::state(UsageStatus::Ok, "cached", now_ms()));
+        let owner = state.owner;
+        app.account_ui.installed.insert(provider, false);
+        app.account_ui.discovery_manual.insert(id.clone(), owner);
+        let unavailable = Account::system(Provider::Claude).id();
+        let state = app.account_ui.account_mut(&unavailable).unwrap();
+        state.present = false;
+        state.snapshot = Some(UsageSnapshot::state(
+            UsageStatus::Unavailable,
+            "no account home",
+            now_ms(),
+        ));
+        app.account_ui.installed.insert(Provider::Claude, true);
+
+        drop(app.load_device_accounts(Operation::AccountsRefresh));
+        let generation = app.account_ui.discovery_generation;
+        let snapshot = |installed| AccountSnapshot {
+            registry: Registry::default(),
+            homes: None,
+            system_homes: BTreeMap::new(),
+            entries: BTreeMap::new(),
+            cache_keys: BTreeMap::new(),
+            catalogs: BTreeMap::new(),
+            installed: BTreeMap::from([(provider, installed), (Provider::Claude, true)]),
+        };
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            generation.wrapping_sub(1),
+            Ok(snapshot(false)),
+        ))));
+        assert_eq!(app.account_ui.discovery_manual.get(&id), Some(&owner));
+        assert_eq!(app.account_ui.installed.get(&provider), Some(&false));
+
+        drop(app.update(Message::AccountUi(Action::RemoteLoaded(
+            generation,
+            Ok(snapshot(true)),
+        ))));
+        let state = app.account_ui.account(&id).unwrap();
+        assert!(state.present);
+        assert!(state.failure.is_none());
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().detail.as_deref(),
+            Some("cached")
+        );
+        assert_eq!(app.account_ui.installed.get(&provider), Some(&true));
+        assert!(app.account_ui.discovery_manual.is_empty());
+        assert!(!state.schedule.manual_ready(app.account_ui.now_ms));
+
+        let state = app.account_ui.account(&unavailable).unwrap();
+        assert!(
+            !state.present,
+            "installed CLI does not establish account presence"
+        );
+        assert!(!state.usage_invalidated);
+        assert!(state.absent_since.is_none());
+        assert_eq!(
+            state.snapshot.as_ref().unwrap().status,
+            UsageStatus::Unavailable
+        );
     }
 
     #[test]

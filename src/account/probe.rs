@@ -799,6 +799,23 @@ pub fn find_executable(name: &str, search_path: Option<&OsStr>) -> Option<PathBu
         .find(|candidate| is_executable(candidate))
 }
 
+/// CLI availability from the search path on the machine that will launch it.
+pub fn provider_installations(
+    search_path: Option<&OsStr>,
+) -> std::collections::BTreeMap<Provider, bool> {
+    Provider::ALL
+        .into_iter()
+        .map(|provider| {
+            (
+                provider,
+                provider
+                    .programs()
+                    .any(|program| find_executable(program, search_path).is_some()),
+            )
+        })
+        .collect()
+}
+
 fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
