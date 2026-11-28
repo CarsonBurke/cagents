@@ -519,14 +519,24 @@ impl Cagents {
         revision
     }
 
+    pub(in crate::app) fn view_topology_revision(&mut self) -> u64 {
+        let mut discovery = std::mem::take(&mut self.shared_views.discovery);
+        let revision = self.refresh_view_topology(&mut discovery);
+        self.shared_views.discovery = discovery;
+        revision
+    }
+
     /// The kept topology, built again first if the projects or the known
     /// roots changed, for a structural pass to share with the save after it.
     pub(super) fn kept_view_topology(&mut self) -> Arc<Topology> {
-        let mut discovery = std::mem::take(&mut self.shared_views.discovery);
-        self.refresh_view_topology(&mut discovery);
-        let topology = Arc::clone(discovery.topology.as_ref().expect("refreshed above"));
-        self.shared_views.discovery = discovery;
-        topology
+        self.view_topology_revision();
+        Arc::clone(
+            self.shared_views
+                .discovery
+                .topology
+                .as_ref()
+                .expect("refreshed above"),
+        )
     }
 
     /// Resolves again each card whose directory, owner, filing or channel

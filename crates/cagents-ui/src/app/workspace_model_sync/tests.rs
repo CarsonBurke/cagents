@@ -7486,6 +7486,29 @@ fn reconciles(app: &mut Cagents, update: ModelUpdate) -> bool {
     complete_reconciliations() != before
 }
 
+#[test]
+fn unchanged_edges_reconcile_only_when_the_worktree_topology_changes() {
+    let (mut app, baseline, repository) = window_with_registry();
+    let edge = |offset| {
+        changed_edge(
+            baseline.identity,
+            baseline.sequence + offset,
+            ModelEdit::AgentsChanged,
+            EditEffects::default(),
+            vec![],
+        )
+    };
+    let revision = app.shared_views.reconciled_topology;
+    app.sidebar_model.projects[0].name = "Renamed project".into();
+    assert!(!reconciles(&mut app, edge(1)));
+    assert_eq!(app.shared_views.reconciled_topology, revision);
+
+    // The roots themselves did not change, but their scope authority did.
+    app.sidebar_model.projects[0].repository = repository.with_extension("other");
+    assert!(reconciles(&mut app, edge(2)));
+    assert_ne!(app.shared_views.reconciled_topology, revision);
+}
+
 /// A copy of an edge this window already installed, such as the observer's
 /// echo of its own receipt, changes no row and no view, so it skips the
 /// complete reconciliation. Each kind an agent start produces is covered, and
