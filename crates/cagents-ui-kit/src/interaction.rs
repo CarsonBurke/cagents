@@ -25,8 +25,10 @@ mod list_navigation;
 pub use list_navigation::{reveal_list_selection, selection_offset};
 mod reveal_focus;
 pub use reveal_focus::{focus_group, reveal_focus};
+mod keycap;
+pub use keycap::{CHORD_GAP, KeyChord, chords_caps, key_caps, key_hints};
 mod rich_tip;
-pub use rich_tip::{RichTip, TipBody, TipRow, TipTone, chord_keys, find as find_tips};
+pub use rich_tip::{RichTip, TipBody, TipRow, TipTone, find as find_tips};
 
 use crate::design::space;
 
@@ -3627,6 +3629,29 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// A menu's hint is the text form of the key caps a tooltip draws for
+    /// the same chord, so the two read as one shortcut.
+    #[test]
+    fn menu_hints_name_keys_as_their_key_caps_do() {
+        let primary = cagents::settings::ModifierNames::CURRENT.primary;
+        for chord in [
+            format!("{primary}+Shift+T"),
+            format!("{primary}+Comma"),
+            "Ctrl+Alt+F5".to_owned(),
+            "Alt+Shift+Left".to_owned(),
+            format!("{primary}+PageDown"),
+            "Ctrl+Tab".to_owned(),
+            format!("{primary}+Shift+Space"),
+        ] {
+            let bind = crate::workspace_widget::menu_keybind(&chord).expect("a menu chord");
+            assert_eq!(
+                bind.to_string(),
+                KeyChord::new(chord.as_str()).label(),
+                "{chord}"
+            );
+        }
     }
 
     #[test]

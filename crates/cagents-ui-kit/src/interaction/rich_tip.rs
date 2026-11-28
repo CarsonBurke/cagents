@@ -13,7 +13,6 @@
 
 use std::borrow::Cow;
 
-use cosmic::iced::advanced::Renderer as _;
 use cosmic::iced::advanced::{
     Layout, Widget, layout, renderer,
     widget::{Operation, Tree},
@@ -21,6 +20,7 @@ use cosmic::iced::advanced::{
 use cosmic::iced::{Alignment, Color, Length, Point, Rectangle, Size, mouse};
 use cosmic::{Element, Renderer, Theme, widget};
 
+use super::keycap::{KeyChord, key_caps, scaled};
 use crate::design::{self, space};
 
 /// What a tooltip says: a label, or a [`RichTip`].
@@ -59,7 +59,7 @@ impl TipBody<'_> {
         let lines: Vec<String> = tip
             .shortcut
             .iter()
-            .map(|chord| format!("Shortcut: {chord}"))
+            .map(|chord| format!("Shortcut: {}", chord.label()))
             .chain(tip.rows.iter().map(TipRow::plain))
             .chain(tip.notes.iter().map(|(text, _)| text.to_string()))
             .collect();
@@ -102,7 +102,7 @@ impl<'a> From<RichTip<'a>> for TipBody<'a> {
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct RichTip<'a> {
     title: Cow<'a, str>,
-    shortcut: Option<Cow<'a, str>>,
+    shortcut: Option<KeyChord<'a>>,
     rows: Vec<TipRow<'a>>,
     notes: Vec<(Cow<'a, str>, TipTone)>,
 }
@@ -117,13 +117,13 @@ impl<'a> RichTip<'a> {
 
     /// The chord that runs the control, such as `Ctrl+M`, shown as key caps
     /// after the title.
-    pub fn shortcut(mut self, chord: impl Into<Cow<'a, str>>) -> Self {
+    pub fn shortcut(mut self, chord: impl Into<KeyChord<'a>>) -> Self {
         self.shortcut = Some(chord.into());
         self
     }
 
     /// [`Self::shortcut`] when there is one.
-    pub fn shortcut_maybe(mut self, chord: Option<impl Into<Cow<'a, str>>>) -> Self {
+    pub fn shortcut_maybe(mut self, chord: Option<impl Into<KeyChord<'a>>>) -> Self {
         self.shortcut = chord.map(Into::into);
         self
     }
@@ -185,8 +185,8 @@ impl<'a> RichTip<'a> {
         &self.title
     }
 
-    pub fn shortcut_chord(&self) -> Option<&str> {
-        self.shortcut.as_deref()
+    pub fn shortcut_chord(&self) -> Option<&KeyChord<'a>> {
+        self.shortcut.as_ref()
     }
 
     pub fn detail_rows(&self) -> &[TipRow<'a>] {
@@ -201,7 +201,7 @@ impl<'a> RichTip<'a> {
     /// `Label: value, detail` for each row, then each note.
     pub fn plain(&self) -> String {
         let mut lines = vec![match &self.shortcut {
-            Some(chord) => format!("{} ({chord})", self.title),
+            Some(chord) => format!("{} ({})", self.title, chord.label()),
             None => self.title.to_string(),
         }];
         lines.extend(self.rows.iter().map(TipRow::plain));
@@ -224,7 +224,7 @@ pub struct TipRow<'a> {
 enum TipValue<'a> {
     Text(Cow<'a, str>),
     /// A chord, drawn as key caps.
-    Shortcut(Cow<'a, str>),
+    Shortcut(KeyChord<'a>),
 }
 
 /// How strongly a tip's text reads against the rest.
@@ -252,7 +252,7 @@ impl<'a> TipRow<'a> {
 
     /// A row whose value is the chord that runs `label`, such as one of a
     /// control's several commands.
-    pub fn shortcut(label: impl Into<Cow<'a, str>>, chord: impl Into<Cow<'a, str>>) -> Self {
+    pub fn shortcut(label: impl Into<Cow<'a, str>>, chord: impl Into<KeyChord<'a>>) -> Self {
         Self {
             label: label.into(),
             value: TipValue::Shortcut(chord.into()),
@@ -288,9 +288,11 @@ impl<'a> TipRow<'a> {
         &self.label
     }
 
-    pub fn value(&self) -> &str {
+    /// The value as text: a chord as one line, as a menu prints it.
+    pub fn value(&self) -> Cow<'_, str> {
         match &self.value {
-            TipValue::Text(text) | TipValue::Shortcut(text) => text,
+            TipValue::Text(text) => Cow::Borrowed(text),
+            TipValue::Shortcut(chord) => chord.label(),
         }
     }
 
@@ -304,7 +306,7 @@ impl<'a> TipRow<'a> {
 
     fn plain(&self) -> String {
         let mut line = if self.label.is_empty() {
-            self.value().to_owned()
+            self.value().into_owned()
         } else {
             format!("{}: {}", self.label, self.value())
         };
@@ -332,30 +334,6 @@ pub mod find {
     pub fn close() -> RichTip<'static> {
         RichTip::new("Close find").shortcut("Escape")
     }
-}
-
-/// The keys of `chord` as they are printed on a keyboard, such as `Ctrl`,
-/// `,` for `Comma`, or `+` for the plus key in `Ctrl++`.
-pub fn chord_keys(chord: &str) -> Vec<Cow<'_, str>> {
-    let mut keys: Vec<Cow<'_, str>> = chord
-        .split('+')
-        .filter(|key| !key.is_empty())
-        .map(|key| match key {
-            "Comma" => Cow::Borrowed(","),
-            "Period" => Cow::Borrowed("."),
-            "Plus" => Cow::Borrowed("+"),
-            "Minus" => Cow::Borrowed("-"),
-            "PageUp" => Cow::Borrowed("Page Up"),
-            "PageDown" => Cow::Borrowed("Page Down"),
-            "Escape" => Cow::Borrowed("Esc"),
-            key if key.chars().count() == 1 => Cow::Owned(key.to_uppercase()),
-            key => Cow::Borrowed(key),
-        })
-        .collect();
-    if chord.ends_with('+') {
-        keys.push(Cow::Borrowed("+"));
-    }
-    keys
 }
 
 /// Secondary text's share of the surface's ink: close to the app's faint
@@ -421,34 +399,6 @@ pub(super) fn surface<'a, Message: 'a>(tip: RichTip<'a>) -> Element<'a, Message>
     .into()
 }
 
-/// `chord` as a row of key caps.
-fn key_caps<'a, Message: 'a>(chord: &str) -> Element<'a, Message> {
-    widget::row::with_children(
-        chord_keys(chord)
-            .into_iter()
-            .map(|key| {
-                Element::new(Ink {
-                    content: widget::container(
-                        cosmic::widget::text::caption(key.into_owned())
-                            .size(design::TEXT_CAPTION)
-                            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-                                design::LINE_CAPTION.into(),
-                            )),
-                    )
-                    .class(design::transparent())
-                    .padding([0.0, space::XS + 1.0])
-                    .into(),
-                    tone: TipTone::Secondary,
-                    cap: true,
-                })
-            })
-            .collect::<Vec<_>>(),
-    )
-    .spacing(space::XXS)
-    .align_y(Alignment::Center)
-    .into()
-}
-
 fn ink<'a, Message: 'a>(
     content: impl Into<Element<'a, Message>>,
     tone: TipTone,
@@ -459,7 +409,6 @@ fn ink<'a, Message: 'a>(
     Element::new(Ink {
         content: content.into(),
         tone,
-        cap: false,
     })
 }
 
@@ -480,12 +429,11 @@ fn table<'a, Message: 'a>(rows: Vec<TipRow<'a>>) -> Element<'a, Message> {
 }
 
 /// Draws its content in a share of the ink it is given, or in a tone at that
-/// ink's strength, and a key cap's outline around it when `cap` is set. The
-/// colors follow the given ink, so they fade in with the tip.
+/// ink's strength. The colors follow the given ink, so they fade in with the
+/// tip.
 struct Ink<'a, Message> {
     content: Element<'a, Message>,
     tone: TipTone,
-    cap: bool,
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Ink<'_, Message> {
@@ -555,20 +503,6 @@ impl<Message> Widget<Message, Theme, Renderer> for Ink<'_, Message> {
                 scaled(tone, strength)
             }
         };
-        if self.cap {
-            renderer.fill_quad(
-                renderer::Quad {
-                    bounds: layout.bounds(),
-                    border: cosmic::iced::Border {
-                        color: scaled(given, 0.28),
-                        width: design::BORDER_WIDTH,
-                        radius: design::RADIUS_XS.into(),
-                    },
-                    ..Default::default()
-                },
-                scaled(given, 0.06),
-            );
-        }
         self.content.as_widget().draw(
             &tree.children[0],
             renderer,
@@ -578,13 +512,6 @@ impl<Message> Widget<Message, Theme, Renderer> for Ink<'_, Message> {
             cursor,
             viewport,
         );
-    }
-}
-
-fn scaled(color: Color, share: f32) -> Color {
-    Color {
-        a: color.a * share,
-        ..color
     }
 }
 
@@ -691,6 +618,27 @@ impl<Message> Widget<Message, Theme, Renderer> for Table<'_, Message> {
         )
     }
 
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        renderer: &Renderer,
+        operation: &mut dyn Operation,
+    ) {
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            for ((cell, tree), cell_layout) in self
+                .cells
+                .iter_mut()
+                .zip(&mut tree.children)
+                .zip(layout.children())
+            {
+                cell.as_widget_mut()
+                    .operate(tree, cell_layout, renderer, operation);
+            }
+        });
+    }
+
     fn draw(
         &self,
         tree: &Tree,
@@ -722,22 +670,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn chords_split_into_the_keys_printed_on_a_keyboard() {
-        let keys = |chord| {
-            chord_keys(chord)
-                .into_iter()
-                .map(Cow::into_owned)
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(keys("Ctrl+M"), ["Ctrl", "M"]);
-        assert_eq!(keys("Ctrl+Shift+Space"), ["Ctrl", "Shift", "Space"]);
-        assert_eq!(keys("Ctrl+Comma"), ["Ctrl", ","]);
-        assert_eq!(keys("Ctrl++"), ["Ctrl", "+"]);
-        assert_eq!(keys("Alt+q"), ["Alt", "Q"]);
-        assert_eq!(keys("F2"), ["F2"]);
-    }
-
-    #[test]
     fn a_rich_tip_reads_as_plain_text_one_part_to_a_line() {
         let tip = RichTip::new("Choose an account")
             .shortcut("Ctrl+U")
@@ -765,6 +697,90 @@ mod tests {
         );
         assert_eq!(TipBody::from(RichTip::new("Settings")).description(), None);
         assert_eq!(TipBody::from("Settings").description(), None);
+    }
+
+    /// Labels, values and qualifiers each start at one edge, whatever their
+    /// lengths; a row without a qualifier leaves its column empty; a key-cap
+    /// value sits level with its label; and the table hands an operation to
+    /// every cell, so a screen reader or a test reaches the words in it.
+    #[test]
+    fn a_tip_table_lines_up_its_columns_and_reaches_every_cell() {
+        let renderer = crate::workspace_widget::forwarding_test::renderer();
+        let mut element: Element<'_, ()> = table(vec![
+            TipRow::new("Weekly", "4% left").detail("resets in 3d"),
+            TipRow::new("Session window", "100% left").detail("resets in 5h"),
+            TipRow::new("Fable", "0% left").warning(),
+            TipRow::shortcut("Terminal", "Ctrl+Shift+T"),
+        ]);
+        let mut tree = Tree::new(&element);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(DETAILED_MAX_WIDTH, 400.0)),
+        );
+        let cells: Vec<Rectangle> = node.children().iter().map(|cell| cell.bounds()).collect();
+        assert_eq!(cells.len(), 4 * COLUMNS);
+        let column = |index: usize| -> Vec<Rectangle> {
+            cells.iter().skip(index).step_by(COLUMNS).copied().collect()
+        };
+        let (labels, values, details) = (column(0), column(1), column(2));
+        assert!(labels.iter().all(|label| label.x == 0.0));
+        let widest_label = labels.iter().map(|label| label.width).fold(0.0, f32::max);
+        assert!(
+            values
+                .iter()
+                .all(|value| value.x == widest_label + COLUMN_GAP),
+            "{values:?}"
+        );
+        let widest_value = values.iter().map(|value| value.width).fold(0.0, f32::max);
+        assert_eq!(details[0].x, details[1].x);
+        assert_eq!(details[0].x, values[0].x + widest_value + COLUMN_GAP);
+        assert_eq!(details[2].width, 0.0, "no qualifier, no text");
+        // Rows stack in order without overlapping.
+        for pair in labels.windows(2) {
+            assert!(pair[1].y >= pair[0].y + pair[0].height, "{labels:?}");
+        }
+        // The key caps are centered on their label's line.
+        let caps = values[3];
+        let label = labels[3];
+        assert!(
+            ((caps.y + caps.height / 2.0) - (label.y + label.height / 2.0)).abs() < 1.0,
+            "{caps:?} beside {label:?}"
+        );
+        assert_eq!(
+            node.bounds().width,
+            details[0].x + details[0].width.max(details[1].width)
+        );
+
+        #[derive(Default)]
+        struct Texts(Vec<String>);
+        impl Operation for Texts {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn text(&mut self, _: Option<&widget::Id>, _: Rectangle, text: &str) {
+                self.0.push(text.to_owned());
+            }
+        }
+        let mut texts = Texts::default();
+        element
+            .as_widget_mut()
+            .operate(&mut tree, Layout::new(&node), &renderer, &mut texts);
+        for text in [
+            "Weekly",
+            "4% left",
+            "resets in 3d",
+            "Fable",
+            "0% left",
+            "Terminal",
+            "T",
+        ] {
+            assert!(
+                texts.0.iter().any(|seen| seen == text),
+                "{text}: {:?}",
+                texts.0
+            );
+        }
     }
 
     /// Previews of one account share its notes; the tip says each once.

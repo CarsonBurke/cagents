@@ -1737,9 +1737,14 @@ fn keyboard_groups<'a>(
                 design::body(fixed.label)
                     .width(Length::FillPortion(3))
                     .into(),
-                design::caption(keys.clone())
-                    .width(Length::FillPortion(4))
-                    .into(),
+                widget::container(crate::interaction::chords_caps(
+                    fixed
+                        .chords
+                        .iter()
+                        .map(|chord| crate::interaction::KeyChord::new(*chord)),
+                ))
+                .width(Length::FillPortion(4))
+                .into(),
                 design::caption("Fixed").width(64).into(),
             ])
             .spacing(space::S)
@@ -1786,13 +1791,24 @@ fn shortcut_input<'a>(
         .map(|(index, chord)| {
             let mut remaining = chords.clone();
             remaining.remove(index);
-            crate::ui_controls::button::quiet(format!("{chord} ×"))
-                .name(format!("Remove {chord} shortcut for {label}"))
-                .on_press(Message::SettingsDraftChanged {
-                    field,
-                    value: settings::format_chords(&remaining),
-                })
-                .into()
+            let keys = crate::interaction::KeyChord::new(chord.as_str());
+            widget::button::custom(
+                widget::row::with_children(vec![
+                    crate::interaction::key_caps(&keys),
+                    design::body("×").into(),
+                ])
+                .spacing(space::XS)
+                .align_y(Alignment::Center),
+            )
+            .name(format!("Remove {keys} shortcut for {label}"))
+            .class(crate::ui_controls::button::quiet_class())
+            .padding([0.0, space::S])
+            .height(design::DENSE_ROW_HEIGHT)
+            .on_press(Message::SettingsDraftChanged {
+                field,
+                value: settings::format_chords(&remaining),
+            })
+            .into()
         })
         .collect();
     // Record, Reset and Source end the row as one unit: they never part

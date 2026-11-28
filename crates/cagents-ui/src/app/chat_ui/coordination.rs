@@ -515,7 +515,7 @@ pub(super) struct MessageRun {
     shared: bool,
     state: RowStatus,
     /// Whom each message went to and how it stands, for the tooltip.
-    each: Vec<String>,
+    each: Vec<(String, RowStatus)>,
     /// The whole of the words they share, for the tooltip and to copy.
     full: Option<String>,
     /// The first message, whose words copying takes when they share them.
@@ -607,11 +607,7 @@ impl MessageRun {
             first.get_or_insert_with(|| item.id.clone());
             let (status, output) = reported(item, coordinated);
             let state = message_state(reading, message, status, output);
-            each.push(tip_line(&format!(
-                "{}: {}",
-                recipient(message, reading, listed).plain(),
-                state.reason()
-            )));
+            each.push((recipient(message, reading, listed).plain(), state.clone()));
             states.push(state);
             // Compared whole, as the agent wrote them: messages that open
             // alike and differ further on are not one message.
@@ -701,16 +697,22 @@ impl MessageRun {
 
     /// The tooltip: whom each message went to and how it stands, then the
     /// words they share.
-    pub(super) fn tip(&self) -> String {
+    pub(super) fn tip(&self) -> crate::interaction::RichTip<'static> {
         const LISTED: usize = 12;
-        let mut tip = vec![format!("{} {}", self.verb, self.count)];
-        let mut each = self.each.iter().take(LISTED).cloned().collect::<Vec<_>>();
+        let mut tip = crate::interaction::RichTip::new(format!("{} {}", self.verb, self.count))
+            .rows(
+                self.each
+                    .iter()
+                    .take(LISTED)
+                    .map(|(to, state)| state.tip_row(tip_label(to))),
+            );
         if self.each.len() > LISTED {
-            each.push(format!("and {} more", self.each.len() - LISTED));
+            tip = tip.note(format!("and {} more", self.each.len() - LISTED));
         }
-        tip.push(each.join("\n"));
-        tip.extend(self.full.as_deref().map(bounded));
-        tip.join("\n\n")
+        if let Some(full) = &self.full {
+            tip = tip.note_in(bounded(full), crate::interaction::TipTone::Primary);
+        }
+        tip
     }
 
     /// The row as one line of plain text.
@@ -1049,15 +1051,16 @@ fn plain(markdown: &str) -> String {
     text.trim().to_owned()
 }
 
-/// `text` as one line of a tooltip's list, cut where it runs long.
-fn tip_line(text: &str) -> String {
-    const CHARS: usize = 160;
-    let mut line = one_line_of(text);
-    if let Some((end, _)) = line.char_indices().nth(CHARS) {
-        line.truncate(end);
-        line = format!("{}…", line.trim_end());
+/// `text` as a tooltip row's label, which keeps to one line: cut shorter
+/// than a line of a list, so the value beside it stays in the tip.
+fn tip_label(text: &str) -> String {
+    const CHARS: usize = 40;
+    let mut label = one_line_of(text);
+    if let Some((end, _)) = label.char_indices().nth(CHARS) {
+        label.truncate(end);
+        label = format!("{}…", label.trim_end());
     }
-    line
+    label
 }
 
 /// `text` bounded for a tooltip, which wraps at its own width.
@@ -1213,7 +1216,7 @@ impl Row {
     /// What the tooltip and a screen reader give whole: the agent's whole
     /// name where the row cut it, the outcome's reason, what pressing does
     /// where it opens no agent, and then the message or prompt.
-    fn described(&self) -> (String, String) {
+    fn described(&self) -> (crate::interaction::RichTip<'static>, String) {
         // A warning or a failure names itself, as a narrow row keeps only
         // its mark; a plain state is either drawn or the working dot.
         let reason = match (self.state.tone, self.state.detail.as_deref()) {
@@ -1232,17 +1235,20 @@ impl Row {
         };
         // The row fades its name where the pane runs short, so the tooltip
         // names it whole.
-        let mut tip = vec![if matches!(&self.open, Some(Action::OpenAgent(_))) {
-            format!("Open {}", self.label)
-        } else {
-            format!("{} {}", self.verb, self.label)
-        }];
-        tip.extend(reason);
+        let mut tip =
+            crate::interaction::RichTip::new(if matches!(&self.open, Some(Action::OpenAgent(_))) {
+                format!("Open {}", self.label)
+            } else {
+                format!("{} {}", self.verb, self.label)
+            });
+        if let Some(reason) = reason {
+            tip = tip.note_in(reason, self.state.tip_tone());
+        }
         if self.open.is_none() {
-            tip.push(pressing.to_owned());
+            tip = tip.note(pressing);
         }
         if !self.full.is_empty() {
-            tip.push(bounded(&self.full));
+            tip = tip.note_in(bounded(&self.full), crate::interaction::TipTone::Primary);
         }
         let name = [
             format!("{} {}", self.verb, self.label),
@@ -1263,7 +1269,7 @@ impl Row {
         .filter(|part| !part.trim().is_empty())
         .collect::<Vec<_>>()
         .join(" · ");
-        (tip.join("\n\n"), name)
+        (tip, name)
     }
 }
 
@@ -1343,17 +1349,36 @@ impl RowStatus {
     fn error(text: impl Into<Cow<'static, str>>) -> Self {
         Self::with(text, Tone::Error, false)
     }
-    /// The state in words with its reason, as a tooltip lists it.
-    fn reason(&self) -> String {
-        match self
+    /// The state as a tooltip row under `label`: its words as the value, in
+    /// its tone, and its reason after them.
+    fn tip_row(&self, label: String) -> crate::interaction::TipRow<'static> {
+        let detail = self
             .detail
             .as_deref()
-            .filter(|detail| !detail.trim().is_empty())
-        {
-            // "Queued for its next step" says "Queued" already.
-            Some(detail) if detail.contains(&*self.text) => detail.to_owned(),
-            Some(detail) => format!("{}: {detail}", self.text),
-            None => self.text.to_string(),
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            // "Queued for its next step" goes on from "Queued".
+            .map(|detail| {
+                detail
+                    .strip_prefix(&*self.text)
+                    .map_or(detail, str::trim_start)
+                    .to_owned()
+            })
+            .filter(|detail| !detail.is_empty());
+        let row =
+            crate::interaction::TipRow::new(label, self.text.to_string()).detail_maybe(detail);
+        match self.tone {
+            Tone::Plain => row,
+            Tone::Warning | Tone::Error => row.warning(),
+        }
+    }
+
+    /// The state's tone in a tooltip's note.
+    fn tip_tone(&self) -> crate::interaction::TipTone {
+        match self.tone {
+            Tone::Plain => crate::interaction::TipTone::Secondary,
+            Tone::Warning => crate::interaction::TipTone::Warning,
+            Tone::Error => crate::interaction::TipTone::Error,
         }
     }
 }
@@ -1994,13 +2019,8 @@ impl Runtime {
                 ],
             )
         };
-        let tipped = |content: Element<'static, Message>| {
-            if tip.is_empty() {
-                content
-            } else {
-                crate::interaction::tooltip(content, tip.clone())
-            }
-        };
+        let tipped =
+            |content: Element<'static, Message>| crate::interaction::tooltip(content, tip.clone());
         // Every row keeps room for the open arrow at its trailing edge, so
         // the statuses end in line whether or not a row opens.
         let padding = iced::Padding {
@@ -2471,6 +2491,7 @@ mod identity_tests {
             assert_eq!(default.preview, "");
             assert_eq!(default.agent_type.as_ref().unwrap().drawn(), None);
             let (tip, name) = default.described();
+            let tip = tip.plain();
             assert!(tip.contains("general-purpose"), "{tip}");
             assert!(name.contains("general-purpose"), "{name}");
         }
@@ -2570,6 +2591,7 @@ mod identity_tests {
             assert_eq!(row.preview, expected);
             assert_eq!(row.state.text, "Launch accepted");
             let (tip, accessible) = row.described();
+            let tip = tip.plain();
             assert!(accessible.contains(expected));
             if placed {
                 let destination = title.map_or_else(
@@ -2648,6 +2670,7 @@ mod identity_tests {
         assert_eq!(kind.name, "general-purpose");
         assert_eq!(kind.drawn(), None);
         let (tip, name) = started.described();
+        let tip = tip.plain();
         assert!(tip.contains("general-purpose"), "{tip}");
         assert!(name.ends_with(" · general-purpose"), "{name}");
         assert_eq!(started.state.text, "Waiting on scripts/restart-check");
@@ -2848,6 +2871,7 @@ mod identity_tests {
             }];
             let row = runtime.spawn_row(&step, spawn, ToolStatus::Failed, refusal);
             let (tip, accessible) = row.described();
+            let tip = tip.plain();
             assert!(tip.contains(refusal), "{worked}: {tip}");
             assert!(accessible.contains(refusal), "{worked}: {accessible}");
             if worked {
@@ -2857,7 +2881,7 @@ mod identity_tests {
                 assert_eq!(row.state.trailing(None), disclosure::Trailing::default());
                 // The tooltip names the agent whole, then how it stands.
                 assert!(
-                    tip.starts_with(&format!("Started {}\n\nFailed: {refusal}", row.label)),
+                    tip.starts_with(&format!("Started {}\nFailed: {refusal}", row.label)),
                     "{tip}"
                 );
                 assert!(row.open.is_some(), "its transcript opens");
@@ -2871,7 +2895,7 @@ mod identity_tests {
                 // A state with no words gives its bare reason, not ": reason",
                 // after what could not start.
                 assert!(
-                    tip.starts_with(&format!("Couldn't start {}\n\n{refusal}", row.label)),
+                    tip.starts_with(&format!("Couldn't start {}\n{refusal}", row.label)),
                     "{tip}"
                 );
             }
@@ -3269,9 +3293,10 @@ mod identity_tests {
             RowStatus::plain("Queued"),
         );
         let (tip, name) = opens.described();
+        let tip = tip.plain();
         assert_eq!(
             tip,
-            format!("Message to {long}\n\nThe repo is now at /srv/repos/t3code.")
+            format!("Message to {long}\nThe repo is now at /srv/repos/t3code.")
         );
         assert_eq!(
             name,
@@ -3286,9 +3311,10 @@ mod identity_tests {
             RowStatus::plain("Queued"),
         )
         .described();
+        let tip = tip.plain();
         assert_eq!(
             tip,
-            "Message to reviewer\n\nThe repo is now at /srv/repos/t3code."
+            "Message to reviewer\nThe repo is now at /srv/repos/t3code."
         );
 
         // A row with no agent to open says so, after the outcome's reason.
@@ -3297,11 +3323,12 @@ mod identity_tests {
             ..RowStatus::error("Not sent")
         };
         let (tip, name) = row("release-notes", "release-notes", None, refused()).described();
+        let tip = tip.plain();
         assert_eq!(
             tip,
             format!(
-                "Message to release-notes\n\n\
-                 Not sent: No agent named 'release-notes' is reachable.\n\n{OPENS_DETAIL}\n\n\
+                "Message to release-notes\n\
+                 Not sent: No agent named 'release-notes' is reachable.\n{OPENS_DETAIL}\n\
                  The repo is now at /srv/repos/t3code."
             )
         );
@@ -3322,7 +3349,13 @@ mod identity_tests {
                 RowStatus::plain("Delivered"),
             )
         };
-        assert!(several.described().0.contains(OPENS_DETAIL_OF_SEVERAL));
+        assert!(
+            several
+                .described()
+                .0
+                .plain()
+                .contains(OPENS_DETAIL_OF_SEVERAL)
+        );
     }
 
     /// A row names an agent as its tab does, so two whose tasks a tab cuts

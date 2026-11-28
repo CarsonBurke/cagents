@@ -2851,7 +2851,12 @@ impl Cagents {
                 .class(cosmic::theme::Text::Custom(design::destructive_text))
                 .into()
         } else {
-            design::caption("↑↓ choose · Enter resume · Tab where to look · Esc close").into()
+            crate::interaction::key_hints([
+                (&["Up", "Down"][..], "choose"),
+                (&["Enter"][..], "resume"),
+                (&["Tab"][..], "where to look"),
+                (&["Escape"][..], "close"),
+            ])
         };
         content
             .push(

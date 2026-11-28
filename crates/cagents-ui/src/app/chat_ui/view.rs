@@ -794,15 +794,15 @@ fn composer_hint(
 /// allows, and `enter_sends` decides which chord the first of them answers to,
 /// so the tooltip names the key the composer is actually bound to rather than
 /// a fixed one.
-/// A submit control's icon and its name, which is also its tooltip. The name
-/// ends with the chord that presses it, or with `unsendable`, why it can't be
-/// pressed in a refused conversation, where no chord sends either.
+/// A submit control's icon and its tooltip, whose title is also its name.
+/// The tooltip shows the chord that presses it, or `unsendable`, why it can't
+/// be pressed in a refused conversation, where no chord sends either.
 fn submit_control(
     mode: PromptMode,
     slot: usize,
     enter_sends: bool,
     unsendable: Option<blocked_recovery::Unsendable>,
-) -> (Icon, String) {
+) -> (Icon, crate::interaction::RichTip<'static>) {
     let command = crate::settings::ModifierNames::CURRENT.primary;
     let primary = if enter_sends {
         "Enter".to_owned()
@@ -817,8 +817,19 @@ fn submit_control(
         (PromptMode::Queue, 0) => (Icon::Alarm, "Queue for the next turn", primary),
         (PromptMode::Queue, _) => (Icon::Alarm, "Queue for the next turn", alternate),
     };
-    let tail = unsendable.map_or(chord.as_str(), |unsendable| unsendable.reason);
-    (name, format!("{verb} — {tail}"))
+    let tip = crate::interaction::RichTip::new(verb);
+    let tip = match unsendable {
+        // The reason ends the title's sentence in a name; beneath the
+        // title it is a sentence of its own.
+        Some(unsendable) => {
+            let mut reason = unsendable.reason.chars();
+            tip.note(reason.next().map_or_else(String::new, |first| {
+                format!("{}{}.", first.to_uppercase(), reason.as_str())
+            }))
+        }
+        None => tip.shortcut(chord),
+    };
+    (name, tip)
 }
 /// The submit mode a composer key press asks for, or `None` when the press is
 /// ordinary editing.
@@ -9453,6 +9464,7 @@ fn picker_section_header<'a>(content: Element<'a, Message>, top: f32) -> Element
 fn picker_choice_row<'a>(
     title: Cow<'a, str>,
     detail: Option<Cow<'a, str>>,
+    submits: bool,
     name: Cow<'a, str>,
     id: widget::Id,
     selected: bool,
@@ -9491,6 +9503,10 @@ fn picker_choice_row<'a>(
                 .width(Length::Fill)
                 .into(),
         ])
+        .push_maybe(
+            submits
+                .then(|| crate::interaction::key_caps(&crate::interaction::KeyChord::new("Enter"))),
+        )
         .spacing(step::GAP_S)
         .align_y(Alignment::Center)
         .height(Length::Fill),
@@ -9840,17 +9856,12 @@ fn model_list<'a>(
                 None if listed => Some(Cow::Borrowed("Whichever its settings choose")),
                 None => Some(Cow::Borrowed("Its models are listed once it has run")),
             };
-            // The row Enter takes says so, as the search's answer.
-            let detail = if std::mem::take(&mut enter) {
-                Some(detail.map_or(Cow::Borrowed("Enter"), |detail| {
-                    Cow::Owned(format!("{detail} · Enter"))
-                }))
-            } else {
-                detail
-            };
+            // The row Enter takes shows its key, as the search's answer.
+            let submits = std::mem::take(&mut enter);
             rows.push(picker_choice_row(
                 title,
                 detail,
+                submits,
                 name,
                 card_control_id(
                     target.card,

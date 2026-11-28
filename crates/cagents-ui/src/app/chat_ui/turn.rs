@@ -3395,10 +3395,25 @@ mod tests {
         )
         .expect("a run of messages");
         let tip = run.tip();
-        assert!(tip.starts_with("Messaged 3 agents\n\n"), "{tip}");
-        assert!(tip.contains("\ntriage: Not sent"), "{tip}");
+        assert_eq!(tip.title(), "Messaged 3 agents");
+        let row = |label: &str| {
+            tip.detail_rows()
+                .iter()
+                .find(|row| row.label() == label)
+                .unwrap_or_else(|| panic!("{label}: {}", tip.plain()))
+        };
+        assert_eq!(row("triage").value(), "Not sent");
+        assert_eq!(row("triage").tone(), crate::interaction::TipTone::Warning);
         // A reason that opens with its state says it once.
-        assert!(tip.contains("\nui-tests, packaging: Queued for"), "{tip}");
-        assert!(tip.ends_with("\n\nRebase."), "{tip}");
+        let queued = row("ui-tests, packaging");
+        assert_eq!(queued.value(), "Queued");
+        assert!(
+            queued
+                .detail_text()
+                .is_some_and(|detail| detail.starts_with("for ")),
+            "{}",
+            tip.plain()
+        );
+        assert_eq!(tip.notes().last(), Some("Rebase."));
     }
 }

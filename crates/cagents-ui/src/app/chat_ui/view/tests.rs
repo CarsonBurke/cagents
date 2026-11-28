@@ -6126,6 +6126,7 @@ fn footer_picker_rows_center_single_lines_and_subtitled_blocks() {
         let mut row = picker_choice_row(
             "High".into(),
             detail.map(Cow::Borrowed),
+            false,
             "High".into(),
             widget::Id::unique(),
             true,
@@ -11230,10 +11231,12 @@ fn submit_tooltips_name_the_chord_the_preference_bound() {
             format!("{primary}+Shift+Enter"),
         ),
     ] {
-        let (_, label) = submit_control(mode, slot, enter_sends, None);
-        assert!(
-            label.ends_with(&chord),
-            "{mode:?} in slot {slot} is bound to {chord} but reads {label:?}"
+        let (_, tip) = submit_control(mode, slot, enter_sends, None);
+        assert_eq!(
+            tip.shortcut_chord(),
+            Some(&crate::interaction::KeyChord::new(chord.as_str())),
+            "{mode:?} in slot {slot} is bound to {chord} but reads {:?}",
+            tip.plain()
         );
     }
 }

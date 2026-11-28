@@ -1049,9 +1049,12 @@ impl Runtime {
         let header = widget::column::with_children(vec![
             widget::row::with_children(vec![
                 design::heading("Subagents").width(Length::Fill).into(),
-                crate::ui_controls::icon_button(Icon::Close, "Close subagents (Esc)")
-                    .on_press(action(Action::SubagentPicker(target, false)))
-                    .into(),
+                crate::ui_controls::icon_button(
+                    Icon::Close,
+                    crate::interaction::RichTip::new("Close subagents").shortcut("Escape"),
+                )
+                .on_press(action(Action::SubagentPicker(target, false)))
+                .into(),
             ])
             .align_y(Alignment::Center)
             .into(),

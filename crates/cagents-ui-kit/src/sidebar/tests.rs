@@ -13586,7 +13586,7 @@ fn a_clean_worktree_draws_no_commit_box() {
     let mut state = panel_state(&model);
     state.changes_tab = ChangesTab::Changes;
     let names = accessible_names(&renderer, git_panel(&model, &state, 380.0, false));
-    for absent in ["Commit subject", "Commit (Ctrl+Enter)", "Amend"] {
+    for absent in ["Commit subject", "Commit", "Amend"] {
         assert!(
             !names.iter().any(|name| name == absent),
             "{absent} drawn over a clean worktree: {names:?}"
