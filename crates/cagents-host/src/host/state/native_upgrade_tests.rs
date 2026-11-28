@@ -1954,11 +1954,12 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
     assert_eq!(recorded.terminal.unwrap().source, terminal.source);
     fs::remove_file(refused).unwrap();
 
-    let connect = |client, refuse_publication| {
+    let connect = |client, refuse_publication, refuse_rebind| {
         let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
         let host = reopened_host.clone();
         let serving = thread::spawn(move || {
             REFUSE_NEXT_TERMINAL_PUBLICATION.set(refuse_publication);
+            REFUSE_NEXT_AGENT_REBIND.set(refuse_rebind);
             super::super::client::serve_fixture_user(peer, client, host)
         });
         let reopened = crate::chat::client::ClientHandle::fixture_connect(
@@ -1972,27 +1973,57 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
 
     let refuse_thread = root.join(format!("refuse-resume-{THREAD}"));
     fs::write(&refuse_thread, "").unwrap();
-    let (failed, serving) = connect(1, false);
+    let (failed, serving) = connect(1, false, false);
     assert!(failed.is_err(), "provider rejected the saved thread");
     serving.join().unwrap();
     assert!(reopened_host.lock().unwrap().chats.is_empty());
     assert!(store.stopped_chat(&source).unwrap().is_some());
     fs::remove_file(refuse_thread).unwrap();
 
-    let (failed, serving) = connect(2, true);
+    let (failed, serving) = connect(2, true, false);
     assert!(
         failed.is_err(),
         "publication failed after creating the paired PTY"
     );
     serving.join().unwrap();
-    let original_worker = {
+    let pending_owners = || {
         let state = reopened_host.lock().unwrap();
-        assert!(state.paired_restart(source.id).is_some());
-        state.terminals[&source.id].handle.clone()
+        let actor = state.paired_restart(source.id).unwrap();
+        (
+            actor.handle.clone(),
+            state.terminals[&source.id].handle.clone(),
+        )
     };
+    let (first_owner, first_worker) = pending_owners();
     assert!(store.stopped_chat(&source).unwrap().is_some());
 
-    let (reopened, serving) = connect(3, false);
+    first_worker.shutdown().unwrap();
+    let (failed, serving) = connect(3, true, false);
+    assert!(failed.is_err(), "terminal publication failed again");
+    serving.join().unwrap();
+    let (next_owner, next_worker) = pending_owners();
+    assert!(next_owner.same_attachment(&first_owner));
+    assert!(!next_worker.same_worker(&first_worker));
+
+    next_owner.close().unwrap();
+    assert!(next_owner.is_completed());
+    let (failed, serving) = connect(4, true, false);
+    assert!(
+        failed.is_err(),
+        "terminal publication failed after restarting the ended provider"
+    );
+    serving.join().unwrap();
+    let (current_owner, original_worker) = pending_owners();
+    assert!(!current_owner.same_attachment(&next_owner));
+    assert!(!original_worker.same_worker(&next_worker));
+
+    let (failed, serving) = connect(5, false, true);
+    assert!(failed.is_err(), "the agent registry refused rebinding");
+    serving.join().unwrap();
+    assert!(store.stopped_chat(&source).unwrap().is_some());
+    assert!(pending_owners().1.same_worker(&original_worker));
+
+    let (reopened, serving) = connect(6, false, false);
     let reopened = reopened.unwrap();
     let session = reopened.session();
     assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));

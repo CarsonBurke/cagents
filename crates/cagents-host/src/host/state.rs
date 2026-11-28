@@ -74,6 +74,8 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static REFUSE_NEXT_TERMINAL_PUBLICATION: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+    static REFUSE_NEXT_AGENT_REBIND: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 pub(crate) struct TerminalRecord {
@@ -1051,7 +1053,6 @@ impl HostState {
                     && pending.paired_instance == Some(instance)
                     && self.terminals.get(&source.id).is_some_and(|record| {
                         pending.handle.same_worker(&record.handle)
-                            && !record.handle.is_completed()
                             && record.execution_launch() == recipe
                             && record.options == *options
                     })
@@ -4027,6 +4028,16 @@ fn restore_terminal_execution_authority(
 /// restore: the conversation itself was relaunched and confirmed, and windows
 /// still resolve it through the upgrade aliases.
 pub(super) fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    if let Err(reason) = rebind_relaunched_execution_authority(host, id) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+pub(super) fn rebind_relaunched_execution_authority(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<(), String> {
     let (registry, successor, sources) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let (Some(registry), Some(record), Some(sources)) = (
@@ -4034,15 +4045,20 @@ pub(super) fn restore_relaunched_execution_authority(host: &SharedHost, id: Term
             state.chats.get(&id),
             state.upgrade_chats.get(&id),
         ) else {
-            return;
+            return Err(
+                "The relaunched conversation's agent registry or exact lineage is unavailable"
+                    .into(),
+            );
         };
         (registry, record.session.clone(), sources.clone())
     };
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
-        tracing::warn!(session = %id, %reason,
-            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    #[cfg(test)]
+    if REFUSE_NEXT_AGENT_REBIND.replace(false) {
+        return Err("fixture refused agent rebinding".into());
     }
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    adopt_relaunched_agent(&mut registry, &sources, successor)?;
+    Ok(())
 }
 
 fn adopt_relaunched_agent(
