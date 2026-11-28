@@ -4,6 +4,7 @@
 nothing reaches the network."""
 import hashlib
 import io
+import json
 import os
 from pathlib import Path
 import shutil
@@ -720,6 +721,24 @@ class PublisherSignatures(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         for name in (image, alias, "SHA256SUMS"):
             self.assertEqual((draft / "assets" / name).read_bytes(), (bundle / name).read_bytes())
+
+    def test_terminal_install_notes_stop_when_checksums_fail(self):
+        self.drafted(appimage=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "terminal-install-commands"
+        tools.mkdir()
+        for name, command in (("curl", "exit 0"), ("sha256sum", "exit 1"),
+                              ("sh", "echo 'installer was invoked'")):
+            path = tools / name
+            path.write_text(f"#!/bin/sh\n{command}\n")
+            path.chmod(0o755)
+        result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                env={"PATH": f"{tools}:{os.defpath}"}, text=True,
+                                capture_output=True, timeout=HANG_GUARD)
+        self.assertNotIn("installer was invoked", result.stdout)
+        self.assertEqual(result.returncode, 1, result.stderr)
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])

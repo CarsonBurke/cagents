@@ -774,9 +774,10 @@ To install from a terminal:
 
 \`\`\`sh
 base=https://github.com/$REPOSITORY/releases/download/$TAG
-mkdir "cagents-$VERSION" && cd "cagents-$VERSION"
-curl --fail --location --remote-name-all "\$base/$FULL_ARCHIVE" "\$base/SHA256SUMS" "\$base/install.sh"
-sha256sum --check --strict --ignore-missing SHA256SUMS
+mkdir "cagents-$VERSION" &&
+cd "cagents-$VERSION" &&
+curl --disable --fail --location --remote-name-all "\$base/$FULL_ARCHIVE" "\$base/SHA256SUMS" "\$base/install.sh" &&
+sha256sum --check --strict --ignore-missing SHA256SUMS &&
 CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --version $VERSION --restart-daemon
 \`\`\`
 
