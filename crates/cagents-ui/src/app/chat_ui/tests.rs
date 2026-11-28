@@ -503,6 +503,7 @@ fn image_actions_follow_the_displayed_pixels_into_the_clipboard() {
         CardRuntime::Chat(runtime) => runtime,
         _ => unreachable!(),
     };
+    runtime.set_visible(true).unwrap();
     let content = ItemContent::Image {
         path: "shots/result.png".into(),
         description: "Generated image".into(),
