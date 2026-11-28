@@ -6,6 +6,23 @@
 use super::*;
 use crate::model::WorkspaceDestination;
 
+impl super::State {
+    pub(in crate::app) fn with_saved_worktrees(worktrees: &[crate::model::WorktreeState]) -> Self {
+        let mut state = Self::default();
+        for worktree in worktrees.iter().filter(|row| !row.existence.is_open()) {
+            state
+                .retired_worktree_projects
+                .insert(worktree.path.clone(), worktree.project_id);
+            if let Some(branch) = &worktree.branch {
+                state
+                    .known_branches
+                    .insert(worktree.path.clone(), branch.clone());
+            }
+        }
+        state
+    }
+}
+
 impl Cagents {
     /// The channel that opening `checkout` of project `project_id` enters,
     /// where `None` is the project's main checkout.
@@ -157,6 +174,17 @@ impl Cagents {
         Some((project.id, checkout))
     }
 
+    /// Resolves a legacy strip whose worktree row disappeared before startup.
+    /// Only a saved worktree record supplies ownership of an unlisted path.
+    fn retired_strip_checkout(&self, root: &Path) -> Option<(ProjectId, Option<PathBuf>)> {
+        let id = *self.channel_ui.retired_worktree_projects.get(root)?;
+        let project = self.sidebar_model.project(id)?;
+        let repository = crate::workspace_model::canonical_repository(&project.repository).ok()?;
+        let checkout =
+            crate::workspace_model::canonical_channel_checkout(&repository, root).ok()?;
+        Some((id, checkout))
+    }
+
     /// Moves the panes this window alone kept in a worktree strip into their
     /// checkout's channel, once it holds the daemon's model.
     ///
@@ -201,7 +229,10 @@ impl Cagents {
         }
         let mut adopted = false;
         for (root, cards) in strips {
-            let Some((project_id, checkout)) = self.checkout_at(&root) else {
+            let Some((project_id, checkout)) = self
+                .retired_strip_checkout(&root)
+                .or_else(|| self.checkout_at(&root))
+            else {
                 // A project whose rows have not loaded yet is tried again when
                 // they do.
                 self.channel_ui.strip_adoption_pending = true;
@@ -222,7 +253,10 @@ impl Cagents {
                         checkout,
                     ) {
                         Some(id) => id,
-                        None => continue,
+                        None => {
+                            self.channel_ui.strip_adoption_pending = true;
+                            continue;
+                        }
                     }
                 }
             };
@@ -277,6 +311,7 @@ impl Cagents {
                     .find(|worktree| worktree.path == root)
             })
             .and_then(|worktree| worktree.branch.clone())
+            .or_else(|| self.channel_ui.known_branches.get(root).cloned())
             .or_else(|| {
                 root.file_name()
                     .map(|name| name.to_string_lossy().into_owned())
@@ -715,6 +750,61 @@ mod tests {
         assert_eq!(channel.title, "feature");
         assert_eq!(channel.cards, vec![pane.id]);
         assert!(channel.checkout.is_some());
+    }
+
+    #[test]
+    fn a_window_only_pane_keeps_its_removed_worktrees_channel() {
+        for repaired in [false, true] {
+            let mut fixture = fixture();
+            let project = fixture.project;
+            let linked = fixture.linked.path().to_path_buf();
+            let pane = strip_pane(&linked);
+            Arc::make_mut(&mut fixture.app.durable).cards = vec![pane.clone()].into();
+            let main = fixture.channel(1, None);
+            Arc::make_mut(&mut fixture.app.durable).channels[0].title = "feature".into();
+            let repaired = repaired.then(|| fixture.channel(2, Some(&linked)));
+
+            let mut worktrees = [crate::model::WorktreeState {
+                id: fixture.linked_id,
+                project_id: project,
+                generation: 0,
+                path: linked.clone(),
+                branch: Some("feature".into()),
+                existence: Existence::Open,
+            }];
+            std::fs::remove_dir(&linked).unwrap();
+            super::super::super::worktree_ui::retire_missing_worktrees(&mut worktrees);
+            fixture.app.channel_ui = super::super::State::with_saved_worktrees(&worktrees);
+            fixture.app.sidebar_model.projects[0]
+                .worktrees
+                .retain(|row| row.id != fixture.linked_id);
+            let protections = tempfile::tempdir().unwrap();
+            fixture
+                .app
+                .worktree_protections
+                .use_fixture_runtime(protections.path().into());
+            fixture.connect();
+
+            fixture.app.adopt_strip_cards();
+
+            let missing = fixture
+                .app
+                .channel_for_checkout(project, Some(&linked))
+                .unwrap();
+            if let Some(repaired) = repaired {
+                assert_eq!(missing, repaired, "join the daemon's repair");
+            }
+            assert_eq!(fixture.app.durable.channels.len(), 2);
+            assert_eq!(fixture.cards(missing), vec![pane.id]);
+            assert!(fixture.cards(main).is_empty());
+            assert_eq!(
+                fixture.app.channel_directory(missing).as_deref(),
+                Some(fixture.main.path())
+            );
+            let recovery = fixture.app.missing_checkout(missing).unwrap();
+            assert_eq!(recovery.path, linked);
+            assert_eq!(recovery.branch.as_deref(), Some("feature"));
+        }
     }
 
     /// A main-checkout strip pane only this window had joins the channel the

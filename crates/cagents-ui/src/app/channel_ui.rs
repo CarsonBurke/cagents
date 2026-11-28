@@ -500,6 +500,9 @@ pub struct State {
     /// Whether a complete model or a worktree listing arrived since this
     /// window last moved its strip-only panes into channels.
     pub(in crate::app) strip_adoption_pending: bool,
+    /// Projects of worktrees already retired when the window loaded. Their
+    /// rows are gone, but older window-only panes can still be filed there.
+    pub(in crate::app) retired_worktree_projects: HashMap<PathBuf, ProjectId>,
     /// The branch each worktree this window has listed was on, by folder, so
     /// a channel whose worktree is removed can recreate it on that branch:
     /// once Git forgets the worktree, nothing else records it.
@@ -1048,8 +1051,10 @@ impl Cagents {
         // Its new panes start in this directory, so it must not be removed
         // while the channel is being made.
         let directory = match &checkout {
-            Some(checkout) => checkout.clone(),
-            None => self.project_primary_worktree(project_id)?,
+            Some(checkout) if super::worktree_ui::worktree_directory_available(checkout) => {
+                checkout.clone()
+            }
+            _ => super::worktree_ui::project_main_checkout(project),
         };
         if let Err(error) = self.worktree_protections.protect_next(&directory) {
             self.status = Some(TransientNotice::warning(format!(

@@ -3958,16 +3958,13 @@ impl Cagents {
             return;
         };
         let repository = project.repository.clone();
-        // A worktree removed or broken while the channel was unshared would
-        // have the registry refuse the channel every time it is offered, so
-        // the checkout is checked as the registry checks it, and a channel
-        // whose worktree fails is offered in the main checkout instead.
-        let checkout = checkout.filter(|checkout| {
-            crate::device::is_remote()
-                || std::fs::canonicalize(&repository).is_ok_and(|repository| {
-                    crate::workspace_model::canonical_checkout(&repository, checkout)
-                        .is_ok_and(|checkout| checkout.is_some())
-                })
+        // Keep removed worktrees recorded when introducing a saved channel.
+        // A checkout that now belongs to another repository cannot be used.
+        let checkout = checkout.and_then(|checkout| {
+            let repository = crate::workspace_model::canonical_repository(&repository).ok()?;
+            crate::workspace_model::canonical_channel_checkout(&repository, &checkout)
+                .ok()
+                .flatten()
         });
         if self.project_ui.closed.contains(&repository) {
             return;
