@@ -136,6 +136,8 @@ JOBS = (
         Suite("Linux installer platform", "tests/installer_platform.py", sources=("install.sh",),
               syntax=(("sh", "install.sh"),)),
         Suite("installer coordinator extraction", "tests/installer_coordinator.py", isolated=False),
+        Suite("AppImage launch", "tests/appimage.py", sources=("packaging/appimage/AppRun",),
+              syntax=(("bash", "packaging/appimage/AppRun"),)),
         Suite("macOS installer publication", "tests/installer_macos.py", sources=("install-macos.sh",),
               syntax=(("sh", "install-macos.sh"),)),
         Suite("pinned sherpa-onnx libraries", "tests/sherpa_onnx_libs.py", sources=("scripts/sherpa-onnx-libs",)),
@@ -191,7 +193,7 @@ JOBS = (
         Suite("release artifact smoke", "tests/release_artifact_smoke.py",
               sources=("scripts/build-release-linux", "scripts/release-build-cache", "scripts/cargo-gate-command.py",
                        "tests/fixture_custody.py", "scripts/prepare-release-smoke-rootfs", "scripts/smoke-release-artifacts",
-                       "packaging/smoke-release-artifact"),
+                       "packaging/smoke-release-artifact", "packaging/appimage/prepare-runtime"),
               syntax=(("bash", "scripts/release-build-cache"), ("bash", "scripts/prepare-release-smoke-rootfs"),
                       ("bash", "scripts/smoke-release-artifacts"), ("bash", "packaging/smoke-release-artifact"))),
         Suite("release cut", "tests/release_cut.py",
@@ -264,6 +266,7 @@ UNSCHEDULED = (
 # Shell entry points that do not run in a scheduled suite.
 SHELL_SYNTAX = (("sh", "scripts/run-development"), ("sh", "scripts/refuse-compile"), ("sh", "scripts/check-format"),
                 ("bash", "packaging/release-build"), ("bash", "scripts/package-release-linux"),
+                ("bash", "scripts/package-appimage"), ("bash", "packaging/appimage/prepare-runtime"),
                 ("sh", "scripts/package-linux.sh"), ("sh", "scripts/package-ceditor-linux.sh"),
                 ("sh", "scripts/check-macos"), ("sh", "scripts/darwin-cc"), ("sh", "scripts/darwin-ar"),
                 # The macOS packaging runs only on a Mac.

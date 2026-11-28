@@ -427,6 +427,19 @@ class InstallerCoordinator(unittest.TestCase):
         self.assertTrue((self.prefix / 'versions/old').is_dir())
         self.assertFalse(obsolete.exists())
 
+    def test_appimage_stages_only_over_the_selection_it_opened(self):
+        self.installed_cli(guarded=True, version='9.9.8')
+        for source in ('-', 'versions/9.9.7'):
+            failed = self.install('--stage-only', '--appimage-current', source)
+            self.assertNotEqual(failed.returncode, 0, failed.stdout + failed.stderr)
+            self.assertIn('the installed version changed', failed.stderr)
+            self.assertEqual((self.prefix / 'current').readlink(), Path('versions/9.9.8'))
+            self.assertFalse((self.prefix / 'versions' / VERSION).exists())
+        staged = self.install('--stage-only', '--appimage-current', 'versions/9.9.8')
+        self.assertEqual(staged.returncode, 0, staged.stdout + staged.stderr)
+        self.assertEqual((self.prefix / 'current').readlink(), Path(f'versions/{VERSION}'))
+        self.assertFalse(any(event['event'] == 'daemon-start-fixture' for event in self.events()))
+
     def test_staging_for_upgrade_keeps_the_public_cli_on_the_source(self):
         previous = self.installed_cli(guarded=True, version='9.9.8')
         public_cli = self.home / '.local/bin/cagents'

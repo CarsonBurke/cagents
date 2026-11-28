@@ -53,7 +53,7 @@ SENTINEL_STATE = Path.home() / ".local/state/cagents-main-sentinel"
 # Apart from the cache `scripts/release build` uses, which allows one build at a time.
 CACHE = Path.home() / ".cache/cagents-prebuild/ubuntu-22.04-amd64"
 # And apart from the smoke checks' runtime image, whose preparation allows one at a time.
-SMOKE_CACHE = Path.home() / ".cache/cagents-prebuild/smoke-ubuntu-24.04-amd64"
+SMOKE_CACHE = Path.home() / ".cache/cagents-prebuild/smoke-ubuntu-24.04-amd64-v5"
 CHECKOUT = ".worktrees/.prebuild"
 # Bundles kept, newest first; a pinned one is kept besides.
 KEEP = 3

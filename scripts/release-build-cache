@@ -49,7 +49,7 @@ reclaim_release_runs() (
             case ${entry##*/} in
                 build-tmp|build-var-tmp|dist|provision-tmp|rootfs)
                     [[ -d $entry ]] || continue 2 ;;
-                group|notes.md|passwd|release-build|resolv.conf|ubuntu-base.tar.gz)
+                group|notes.md|passwd|prepare-appimage-runtime|release-build|resolv.conf|ubuntu-base.tar.gz)
                     [[ -f $entry ]] || continue 2 ;;
                 *) continue 2 ;;
             esac

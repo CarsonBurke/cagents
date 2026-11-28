@@ -1,0 +1,21 @@
+#!/bin/bash
+set -euo pipefail
+[[ $# == 1 ]] || { printf 'usage: prepare-runtime OUTPUT\n' >&2; exit 2; }
+output=$1
+work=$(mktemp -d)
+trap 'rm -rf -- "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+
+# Extract the official static type-2 runtime from a pinned upstream release.
+# The standalone runtime upstream publishes at "continuous" is replaced.
+tool=$work/appimagetool
+curl --disable --proto '=https' --tlsv1.2 --fail --location --connect-timeout 20 --max-time 180 \
+    https://github.com/AppImage/appimagetool/releases/download/1.9.1/appimagetool-x86_64.AppImage \
+    --output "$tool"
+printf '%s  %s\n' ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0 "$tool" \
+    | sha256sum --check --strict
+chmod 0700 "$tool"
+offset=$("$tool" --appimage-offset)
+[[ $offset =~ ^[1-9][0-9]{0,6}$ && $offset -lt $(stat -c %s "$tool") ]]
+head -c "$offset" -- "$tool" > "$work/runtime"
+install -m 0644 -- "$work/runtime" "$output"

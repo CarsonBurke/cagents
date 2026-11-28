@@ -1,0 +1,48 @@
+#!/bin/bash
+# Build a type-2 AppImage from the same full archive the user installer reads.
+set -euo pipefail
+fail() { printf 'package-appimage: %s\n' "$*" >&2; exit 1; }
+[[ $# == 4 ]] || fail 'expected VERSION, DIST, INSTALLER and TYPE2_RUNTIME'
+version=$1 dist=$2 installer=$3 runtime=$4
+[[ $version =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] ||
+    fail 'expected a stable version'
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)
+dist=$(realpath -- "$dist")
+archive=cagents-$version-x86_64-unknown-linux-gnu.tar.gz
+output=$dist/cagents-$version-x86_64.AppImage
+for input in "$dist/$archive" "$installer" "$runtime"; do
+    [[ -s $input && -f $input && ! -L $input ]] || fail "missing regular input: $input"
+done
+[[ ! -e $output && ! -L $output ]] || fail 'output already exists'
+printf '%s  %s\n' d30a3ba1388ef57be73faabf606e0d326682f48c87f666106a3c8d6b35b58b4f "$runtime" \
+    | sha256sum --check --strict --status || fail 'runtime does not match the pinned AppImage executable'
+[[ $(od -An -t x1 -j 8 -N 3 "$runtime" | tr -d '[:space:]') == 414902 ]] ||
+    fail 'runtime must be a type-2 AppImage executable'
+headers=$(LC_ALL=C readelf --file-header --program-headers "$runtime")
+[[ $headers == *'Advanced Micro Devices X86-64'* && $headers != *INTERP* ]] ||
+    fail 'runtime must be static and x86_64'
+
+work=$(mktemp -d "$dist/.appimage.XXXXXX")
+trap 'rm -rf -- "$work"' EXIT
+trap 'exit 1' HUP INT TERM
+appdir=$work/AppDir
+mkdir "$appdir"
+desktop=dev.cagents.Cagents
+install -m 0755 "$root/packaging/appimage/AppRun" "$appdir/AppRun"
+install -m 0644 "$installer" "$appdir/install.sh"
+install -m 0644 "$root/packaging/appimage/RUNTIME-LICENSE" "$appdir/RUNTIME-LICENSE"
+install -m 0644 "$root/packaging/$desktop.png" "$appdir/$desktop.png"
+ln -s "$desktop.png" "$appdir/.DirIcon"
+sed -e '/^TryExec=/d' -e 's/^Exec=.*/Exec=AppRun/' \
+    "$root/packaging/$desktop.desktop" > "$appdir/$desktop.desktop"
+cp --reflink=auto -- "$dist/$archive" "$appdir/$archive"
+printf '%s\n' "$version" > "$appdir/VERSION"
+(cd "$appdir" && sha256sum -- "$archive" > SHA256SUMS)
+
+# The portable payload is already compressed. Avoid compressing it twice.
+mksquashfs "$appdir" "$work/payload.squashfs" -noappend -all-root -no-xattrs \
+    -noD -no-progress -processors 1 -quiet
+cat -- "$runtime" "$work/payload.squashfs" > "$work/image"
+chmod 0755 "$work/image"
+ln -T -- "$work/image" "$output"
+printf 'Created %s\n' "$output"

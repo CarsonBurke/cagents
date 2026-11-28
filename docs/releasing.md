@@ -50,10 +50,22 @@ Before compiling, the builder validates the runtime cache or provisions it with
 network access using `scripts/prepare-release-smoke-rootfs`. Every artifact
 execution uses a separate networkless namespace with private user state. The
 runtime cache defaults to
-`$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64` (or under `~/.cache`),
+`$XDG_CACHE_HOME/cagents-release-smoke/ubuntu-24.04-amd64-v5` (or under `~/.cache`),
 and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it. Each cache keeps one pinned base
 archive and one provisioned runtime image. The next preparation reclaims scratch
 directories left by interrupted preparations while it holds the cache lock.
+
+The versioned Linux AppImage embeds the full portable archive, installer
+and static [type-2 runtime source](https://github.com/AppImage/type2-runtime/tree/caf24f9f712084686bfc24a70b75e50df0aefb9c).
+The build extracts the runtime from the checksum-pinned appimagetool 1.9.1
+distribution and includes its license notice. To relink the runtime with a
+different libfuse, follow the linked source tree's `BUILD.md`. The running
+image's `--appimage-offset` prints the size of the original runtime prefix.
+Copy the bytes after that offset and append them to the rebuilt runtime to use
+the same filesystem payload.
+
+The AppImage smoke uses the extraction fallback and opens the app
+twice in an offline, nonroot headless Wayland session before uninstalling it.
 
 Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally.
 The build and verification tools use the selected source revision to determine
