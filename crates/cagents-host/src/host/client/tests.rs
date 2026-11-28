@@ -4150,19 +4150,15 @@ pub(in crate::host) fn terminal_with_transcript(
     }
 }
 
-/// A writer creates its transcript before the inventory lists the terminal.
-/// The resident census covers the reserved path until the spawn settles.
+/// An inherited transcript is named for an earlier terminal. The resident
+/// census must report its exact path while the new writer is still reserved.
 #[test]
-fn the_resident_census_tracks_spawning_and_inherited_transcripts() {
+fn the_resident_census_names_the_inherited_transcript_during_spawn() {
+    use super::super::state::AFTER_SPAWN_RESERVATION;
+
     let directory = tempfile::tempdir().unwrap();
     let (_, host) = panic_test_host("resident-census");
     host.lock().unwrap().register_client(1);
-    let spawning = TerminalId::new();
-    let opening = directory.path().join("opening.log");
-    host.lock()
-        .unwrap()
-        .reserve_spawn_writing(spawning, &opening)
-        .unwrap();
 
     // A root that waits for hangup and starts no other jobs.
     let recipe = crate::model::LaunchRecipe {
@@ -4174,6 +4170,19 @@ fn the_resident_census_tracks_spawning_and_inherited_transcripts() {
     };
     let inherited = directory.path().join("predecessor.log");
     let returned = terminal_with_transcript(recipe.clone(), inherited.clone());
+    let reserved_host = Arc::clone(&host);
+    let terminal_id = returned.id;
+    let reserved_path = inherited.clone();
+    AFTER_SPAWN_RESERVATION.with(|slot| {
+        slot.replace(Some(Box::new(move || {
+            with_resident_census_client(&reserved_host, |client| {
+                assert!(client.list().unwrap().is_empty());
+                let resident = client.resident_terminals().unwrap();
+                assert_eq!(resident.terminals, [terminal_id]);
+                assert_eq!(resident.transcripts, [reserved_path]);
+            });
+        })));
+    });
     let spawn = |session| {
         process_request(
             &host,
@@ -4187,23 +4196,9 @@ fn the_resident_census_tracks_spawning_and_inherited_transcripts() {
     let (response, _, _) = spawn(returned.clone()).unwrap();
     assert!(matches!(response, ServerResponse::Spawned { .. }));
     let terminal = host.lock().unwrap().handle(1, returned.id).unwrap();
-    let listed: Vec<_> = host
-        .lock()
-        .unwrap()
-        .list(1)
-        .into_iter()
-        .map(|terminal| terminal.session.id)
-        .collect();
-    assert_eq!(listed, [returned.id], "the inventory omits the spawn");
+    assert!(AFTER_SPAWN_RESERVATION.with(|slot| slot.take().is_none()));
 
     with_resident_census_client(&host, |client| {
-        let mut terminals = vec![spawning, returned.id];
-        terminals.sort();
-        let resident = client.resident_terminals().unwrap();
-        assert_eq!(resident.terminals, terminals);
-        assert_eq!(resident.transcripts, [opening, inherited.clone()]);
-
-        host.lock().unwrap().cancel_spawn(spawning);
         let resident = client.resident_terminals().unwrap();
         assert_eq!(resident.terminals, [returned.id]);
         assert_eq!(resident.transcripts, std::slice::from_ref(&inherited));

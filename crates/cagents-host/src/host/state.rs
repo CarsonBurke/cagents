@@ -68,6 +68,12 @@ pub(crate) type ClientId = u64;
 pub(crate) type HostLock = super::lock::HostMutex<HostState>;
 pub(crate) type SharedHost = Arc<HostLock>;
 
+#[cfg(test)]
+thread_local! {
+    pub(super) static AFTER_SPAWN_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 pub(crate) struct TerminalRecord {
     screen_lost_after_crash: bool,
     /// Finite presentation revisions outlive disconnected viewports. Hidden
@@ -1891,16 +1897,6 @@ impl HostState {
         paired: Option<&TerminalSession>,
     ) -> Result<(), ProtocolError> {
         self.reserve_spawn_for_view_reserved(terminal_id, paired, None, None, None, false)
-    }
-
-    /// A reservation for a spawn whose worker will open `transcript`.
-    #[cfg(test)]
-    pub(crate) fn reserve_spawn_writing(
-        &mut self,
-        terminal_id: TerminalId,
-        transcript: &std::path::Path,
-    ) -> Result<(), ProtocolError> {
-        self.reserve_spawn_for_view_reserved(terminal_id, None, None, Some(transcript), None, false)
     }
 
     /// A reservation for a spawn of `terminal`, checked as a real one is.
@@ -6062,6 +6058,13 @@ fn start_terminal_view_owned_reserved(
         });
         (holder, publication_source, reservation)
     };
+    // The reservation is visible to a census on another connection before
+    // the worker starts. Neither the registry nor HostState is locked here.
+    #[cfg(test)]
+    if let Some(hook) = AFTER_SPAWN_RESERVATION.with(|slot| slot.borrow_mut().take()) {
+        hook();
+    }
+
     // Fresh holders receive this exact daemon-issued source. Retain it after
     // successful startup instead of the caller's proofless relaunch projection.
     // Adoption keeps its independently installed previous source above.
