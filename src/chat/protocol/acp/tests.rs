@@ -340,6 +340,82 @@ fn agy_settings_apply_in_order_before_the_conversation_is_ready() {
     assert!(!acp.initialization_pending());
 }
 
+#[test]
+fn startup_requires_a_fresh_mode_confirmation_from_the_requested_option() {
+    for response in [
+        json!({}),
+        json!({"configOptions": []}),
+        json!({"configOptions": [{
+            "id": "other", "category": "mode", "type": "select",
+            "currentValue": "default", "options": [{"value": "default"}]
+        }]}),
+    ] {
+        let mut acp = adapter(&["--mode", "default"], None);
+        let initialize = acp.initialize().unwrap();
+        let opened = acp
+            .receive(reply(only_write(&initialize), agy_initialize()))
+            .unwrap();
+        let step = acp.receive(reply(only_write(&opened), agy_new())).unwrap();
+        let step = acp.receive(reply(only_write(&step), response)).unwrap();
+        assert!(matches!(acp.stage, Stage::Failed));
+        assert!(step.writes.is_empty());
+        assert!(step.events.iter().any(|event| matches!(event,
+            Event::Error { message, fatal: true } if message.contains("did not confirm permission mode"))));
+        assert!(
+            !step
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Ready(true)))
+        );
+    }
+}
+
+#[test]
+fn a_mode_update_before_dispatch_cannot_change_the_first_correlated_prompt() {
+    for changed in [
+        json!({"sessionUpdate": "current_mode_update", "currentModeId": "auto"}),
+        // The older mode state still lists the startup default. Once the
+        // preferred option is gone, that stale value cannot confirm it.
+        json!({"sessionUpdate": "config_option_update", "configOptions": []}),
+    ] {
+        let mut acp = adapter(&["--mode", "default"], None);
+        let session = ready(&mut acp);
+        acp.receive(update(&session, changed)).unwrap();
+        let command = Command::Prompt {
+            text: "Read the fixture".into(),
+            attachments: Vec::new(),
+            mode: PromptMode::Send,
+        };
+        assert!(
+            acp.command_for_run(crate::model::RunId::new(), command)
+                .unwrap_err()
+                .contains("has not confirmed permission mode")
+        );
+    }
+}
+
+#[test]
+fn startup_can_use_the_legacy_mode_acknowledgment() {
+    let mut acp = adapter(&["--mode", "plan"], None);
+    let initialize = acp.initialize().unwrap();
+    let opened = acp
+        .receive(reply(only_write(&initialize), agy_initialize()))
+        .unwrap();
+    let mut new = agy_new();
+    new.as_object_mut().unwrap().remove("configOptions");
+    let step = acp.receive(reply(only_write(&opened), new)).unwrap();
+    let setting = only_write(&step);
+    assert_eq!(setting["method"], "session/set_mode");
+    assert_eq!(setting["params"]["modeId"], "plan");
+    let step = acp.receive(reply(setting, json!({}))).unwrap();
+    assert!(
+        step.events
+            .iter()
+            .any(|event| matches!(event, Event::Ready(true)))
+    );
+    assert_eq!(acp.config.current_mode(), Some("plan"));
+}
+
 /// agy's thinking option lists Extra for every model, but Flash's combined
 /// identifiers say it has none: a launch asking for it is not sent it.
 #[test]

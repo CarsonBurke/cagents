@@ -262,13 +262,23 @@ enum Setting {
     Mode(String),
 }
 
+struct ConfirmedMode {
+    mode: String,
+    setter: config::Setter,
+}
+
 /// What a request cagents sent is waiting to hear.
 #[derive(Debug)]
 enum Pending {
     Initialize,
     Open,
-    ListTitle { pages_left: u8 },
-    Setting(Setting),
+    ListTitle {
+        pages_left: u8,
+    },
+    Setting {
+        setting: Setting,
+        setter: config::Setter,
+    },
     Prompt,
 }
 
@@ -343,6 +353,9 @@ struct Acp {
     /// choosing a model can change the reasoning levels it offers.
     settings: VecDeque<Setting>,
     setting_in_flight: bool,
+    /// A mode update can arrive after readiness and before dispatch reaches
+    /// this actor. Check the launch's mode again at the first correlated turn.
+    first_run_mode: Option<ConfirmedMode>,
     commands: Vec<SlashCommand>,
     replay: Option<history::Replay>,
     calls: tools::Calls,
@@ -381,6 +394,7 @@ impl Acp {
             config: config::Config::default(),
             settings: VecDeque::new(),
             setting_in_flight: false,
+            first_run_mode: None,
             commands: Vec::new(),
             replay: None,
             calls: tools::Calls::default(),
@@ -566,12 +580,14 @@ impl Acp {
         }
     }
 
-    /// Sends the next queued setting, if none is in flight. Returns whether
-    /// one is now outstanding.
-    fn send_setting(&mut self, step: &mut Step) -> bool {
-        while !self.setting_in_flight {
+    /// Sends the next setting, or finishes startup once they are all applied.
+    fn advance_settings(&mut self, step: &mut Step) {
+        while !self.setting_in_flight && self.stage != Stage::Failed {
             let Some(mut setting) = self.settings.pop_front() else {
-                return false;
+                if self.stage == Stage::Configuring {
+                    self.become_ready(step);
+                }
+                return;
             };
             // A terminal's model can name a reasoning level too, as agy's
             // `gemini-3.8-flash-low` does, where the session offers the model
@@ -612,17 +628,18 @@ impl Acp {
                 ),
             };
             let Some(setter) = setter.filter(|_| offered) else {
-                step.events.push(Event::Error {
-                    message: format!(
+                self.setting_failed(
+                    &setting,
+                    format!(
                         "{} does not offer the {what} {value:?} in this conversation.",
                         self.profile.label
                     ),
-                    fatal: false,
-                });
+                    step,
+                );
                 continue;
             };
             let session = self.session_id().to_owned();
-            let (method, params) = match setter {
+            let (method, params) = match &setter {
                 config::Setter::Option(id) => (
                     "session/set_config_option",
                     json!({"sessionId": session, "configId": id, "value": value}),
@@ -636,11 +653,21 @@ impl Acp {
                     json!({"sessionId": session, "modeId": value}),
                 ),
             };
-            let (_, frame) = self.request(method, params, Pending::Setting(setting));
+            let (_, frame) = self.request(method, params, Pending::Setting { setting, setter });
             step.writes.push(frame);
             self.setting_in_flight = true;
         }
-        true
+    }
+
+    fn setting_failed(&mut self, setting: &Setting, message: String, step: &mut Step) {
+        if self.stage == Stage::Configuring && matches!(setting, Setting::Mode(_)) {
+            self.fail(message, step);
+        } else {
+            step.events.push(Event::Error {
+                message,
+                fatal: false,
+            });
+        }
     }
 
     fn become_ready(&mut self, step: &mut Step) {
@@ -682,6 +709,7 @@ impl Acp {
         let params = json!({"sessionId": self.session_id(), "prompt": blocks});
         let (id, frame) = self.request("session/prompt", params, Pending::Prompt);
         step.writes.push(frame);
+        self.first_run_mode = None;
         self.segment = None;
         self.turn = Some(Turn {
             requests: vec![id],
@@ -1044,7 +1072,7 @@ impl Acp {
                 }
             },
             Pending::ListTitle { pages_left } => self.listed_title(outcome, pages_left, step),
-            Pending::Setting(setting) => {
+            Pending::Setting { setting, setter } => {
                 self.setting_in_flight = false;
                 match outcome {
                     Ok(result) => {
@@ -1067,7 +1095,41 @@ impl Acp {
                                     self.settings.pop_front();
                                 }
                             }
-                            Setting::Mode(mode) => self.config.mode_changed(mode),
+                            Setting::Mode(mode) => {
+                                let replied = match setter {
+                                    config::Setter::Option(_) => options.is_some(),
+                                    // The dedicated method acknowledges the change
+                                    // with an empty result. It has no mode field.
+                                    config::Setter::Mode => {
+                                        let accepted = result.is_null()
+                                            || result
+                                                .as_object()
+                                                .is_some_and(|object| object.is_empty());
+                                        if accepted {
+                                            self.config.mode_changed(mode);
+                                        }
+                                        accepted
+                                    }
+                                    config::Setter::Model => false,
+                                };
+                                if replied && self.config.confirms_mode(&setter, mode) {
+                                    if self.stage == Stage::Configuring {
+                                        self.first_run_mode = Some(ConfirmedMode {
+                                            mode: mode.clone(),
+                                            setter,
+                                        });
+                                    }
+                                } else {
+                                    self.setting_failed(
+                                        &setting,
+                                        format!(
+                                            "{} did not confirm permission mode {mode:?}.",
+                                            self.profile.label
+                                        ),
+                                        step,
+                                    );
+                                }
+                            }
                             Setting::Reasoning(_) => {}
                         }
                         self.configuration_changed(step);
@@ -1078,19 +1140,18 @@ impl Acp {
                             Setting::Reasoning(level) => ("reasoning level", level),
                             Setting::Mode(mode) => ("mode", mode),
                         };
-                        step.events.push(Event::Error {
-                            message: format!(
+                        self.setting_failed(
+                            &setting,
+                            format!(
                                 "{} did not change its {what} to {value:?}: {}",
                                 self.profile.label,
                                 self.failure(error)
                             ),
-                            fatal: false,
-                        });
+                            step,
+                        );
                     }
                 }
-                if !self.send_setting(step) && self.stage == Stage::Configuring {
-                    self.become_ready(step);
-                }
+                self.advance_settings(step);
             }
             Pending::Prompt => self.answered(id, outcome, step),
         }
@@ -1190,12 +1251,10 @@ impl Acp {
         self.config.retain_models(self.profile.offers_model);
         self.configuration_changed(step);
         self.stage = Stage::Configuring;
-        if !self.send_setting(step) {
-            self.become_ready(step);
-        }
+        self.advance_settings(step);
         // Session load replays messages, but an agent may only publish a
         // saved conversation's title in session/list.
-        if self.resume.is_some() {
+        if self.stage != Stage::Failed && self.resume.is_some() {
             self.refresh_title(MAX_SAVED_TITLE_LIST_PAGES, step);
         }
     }
@@ -1791,6 +1850,14 @@ impl Adapter for Acp {
                 self.profile.label
             ));
         }
+        if let Some(ConfirmedMode { mode, setter }) = &self.first_run_mode
+            && (self.setting_in_flight || !self.config.confirms_mode(setter, mode))
+        {
+            return Err(format!(
+                "{} has not confirmed permission mode {mode:?} for the first prompt.",
+                self.profile.label
+            ));
+        }
         let mut step = self.command(command)?;
         let turn = self
             .turn
@@ -1989,7 +2056,7 @@ impl Adapter for Acp {
                     self.settings.push_back(Setting::Reasoning(level));
                 }
                 let mut step = Step::default();
-                self.send_setting(&mut step);
+                self.advance_settings(&mut step);
                 Ok(step)
             }
             Command::SetPermissionMode { mode } => {
@@ -2002,7 +2069,7 @@ impl Adapter for Acp {
                 }
                 self.settings.push_back(Setting::Mode(own));
                 let mut step = Step::default();
-                self.send_setting(&mut step);
+                self.advance_settings(&mut step);
                 Ok(step)
             }
             Command::Refresh => Ok(Step::default()),

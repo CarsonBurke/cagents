@@ -265,6 +265,29 @@ mod acp_permission_tests {
         assert!(!launch.resumes_in_terminal(&recipe(&["--model", "m"])));
     }
     #[test]
+    fn a_terminal_resume_strips_the_native_antigravity_default_mode() {
+        let launch = Launch {
+            provider: Provider::Antigravity,
+            recipe: recipe(&["--mode", "default", "--model", "m"]),
+            session_id: Some("98608bab-5eb6-4cf5-8f9b-46019bf29df7".into()),
+            draft_model: None,
+        };
+        for mode in [None, Some("provider-specific"), Some("default")] {
+            let terminal = launch.terminal_recipe_with_permission_mode(mode).unwrap();
+            assert_eq!(
+                terminal.arguments,
+                [
+                    "--model",
+                    "m",
+                    "--conversation",
+                    launch.session_id.as_deref().unwrap()
+                ]
+            );
+            assert!(launch.resumes_in_terminal(&terminal));
+        }
+    }
+
+    #[test]
     fn muse_terminal_handoff_requires_a_representable_approval_mode() {
         let id = "98608bab-5eb6-4cf5-8f9b-46019bf29df7";
         let mut launch = Launch {
@@ -684,11 +707,18 @@ pub fn apply_terminal_permission_mode(
         if confirmed || !named_acp_permission_modes(recipe, acp).eq([terminal]) {
             write_acp_permission_mode(recipe, provider, acp, Some(terminal));
         }
-    } else if let Some(mode) = mode {
-        if provider == Provider::Claude {
+    } else if provider == Provider::Claude {
+        if let Some(mode) = mode {
             apply_claude_permission_mode(recipe, mode);
-        } else {
-            apply_acp_permission_mode(recipe, provider, mode);
+        }
+    } else if let Some(acp) = provider.acp() {
+        if mode.is_some_and(|mode| apply_acp_permission_mode(recipe, provider, mode)) {
+            return Ok(());
+        }
+        if named_acp_permission_modes(recipe, acp).last() == Some(acp.default_mode) {
+            // The native launch can name Antigravity's default for ACP. Its
+            // terminal CLI only accepts non-default mode values.
+            write_acp_permission_mode(recipe, provider, acp, None);
         }
     }
     Ok(())

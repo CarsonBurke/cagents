@@ -407,10 +407,10 @@ impl Handle {
         &self,
         run: crate::model::RunId,
         command: Command,
-    ) -> Result<(), String> {
+    ) -> Result<(), Rejection> {
         match &self.0 {
             Owner::Local(local) => local.command_for_run(run, command),
-            Owner::Remote(remote) => remote.submit(Some(run), command).map_err(String::from),
+            Owner::Remote(remote) => remote.submit(Some(run), command),
         }
     }
     pub fn close_if_idle_for_resume(&self, generation: u64) -> Result<(), String> {
