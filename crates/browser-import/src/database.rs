@@ -311,18 +311,8 @@ pub(super) fn extract(
         } else {
             Some(expiry)
         };
-        // Pinned Servo does not enforce SameSite at request dispatch. Import
-        // only explicitly unrestricted cookies; retaining Lax/Strict/default
-        // attributes alone would silently broaden their credential scope.
         let secure: bool = row.get(5).map_err(sql)?;
-        // None without Secure is not unrestricted in modern source browsers:
-        // Firefox can repair such persisted records to SameSite=Unset on load.
-        // Servo lacks that repair and would send them cross-site and over HTTP.
-        if partition
-            || site != 0
-            || !secure
-            || expires_unix.is_some_and(|expiry| expiry <= now_unix)
-        {
+        if partition || expires_unix.is_some_and(|expiry| expiry <= now_unix) {
             batch.skipped += 1;
             continue;
         }
@@ -363,12 +353,7 @@ pub(super) fn extract(
         if imported_bytes > 16 * 1024 * 1024 || batch.cookies.len() >= 20_000 {
             return Err(Error::TooManySelected);
         }
-        let same_site = match site {
-            0 => SameSite::None,
-            1 => SameSite::Lax,
-            2 => SameSite::Strict,
-            _ => SameSite::Unspecified,
-        };
+        let same_site = same_site_scope(site, secure);
         batch.cookies.push(Cookie {
             host,
             domain: raw_host.starts_with('.'),
@@ -391,6 +376,21 @@ pub(super) fn extract(
         });
     }
     Ok(batch)
+}
+
+/// The engine's `SameSite` for a source record, never broader than the
+/// source browser's. The engine enforces `Lax` and `Strict`, but it treats a
+/// cookie with no attribute as unrestricted, while Chromium treats one as `Lax`
+/// (`-1`, unspecified) and Firefox repairs `None` without `Secure` to unset on
+/// load (and stores unset as `256`). Those, and values this importer doesn't
+/// know, import as `Lax`. Only `None` with `Secure` imports as `None`; the
+/// engine rejects `None` without it.
+fn same_site_scope(source: i64, secure: bool) -> SameSite {
+    match source {
+        0 if secure => SameSite::None,
+        2 => SameSite::Strict,
+        _ => SameSite::Lax,
+    }
 }
 
 fn valid_host(raw: &str) -> Option<String> {
@@ -481,10 +481,31 @@ mod tests {
                 source.execute("INSERT INTO moz_cookies VALUES('example.test','/',?1,'fixture',1,1,?2,?3,'',?4)", rusqlite::params![name, same_site, expiry, partition]).unwrap();
             }
             let batch = extract(&profile, &selected, &mut NoKeys, &cancel, now).unwrap();
-            assert_eq!(batch.cookies.len(), 1, "schema {version}");
-            assert_eq!(batch.cookies[0].name, "allowed");
-            assert_eq!(batch.cookies[0].expires_unix, Some(now + 60));
-            assert_eq!(batch.skipped, 7);
+            let imported: Vec<_> = batch
+                .cookies
+                .iter()
+                .map(|cookie| (cookie.name.as_str(), cookie.same_site))
+                .collect();
+            // Restricted cookies keep their scope, and unknown or unset
+            // values never import broader than Lax.
+            assert_eq!(
+                imported,
+                [
+                    ("allowed", SameSite::None),
+                    ("lax", SameSite::Lax),
+                    ("strict", SameSite::Strict),
+                    ("unspecified", SameSite::Lax),
+                    ("firefox-unset", SameSite::Lax),
+                ],
+                "schema {version}"
+            );
+            assert!(
+                batch
+                    .cookies
+                    .iter()
+                    .all(|cookie| cookie.expires_unix == Some(now + 60))
+            );
+            assert_eq!(batch.skipped, 3);
         }
         for unknown in [-1, 0, 18] {
             source.pragma_update(None, "user_version", unknown).unwrap();
@@ -500,7 +521,7 @@ mod tests {
     }
 
     #[test]
-    fn insecure_none_cookies_are_not_broadened_into_the_engine() {
+    fn insecure_none_cookies_import_as_lax() {
         let directory = tempfile::tempdir().unwrap();
         let cancel = AtomicBool::new(false);
         let selected = BTreeSet::from(["example.test".into()]);
@@ -518,11 +539,26 @@ mod tests {
                 source.execute_batch("PRAGMA user_version=17; CREATE TABLE moz_cookies(host TEXT,path TEXT,name TEXT,value TEXT,isSecure INTEGER,isHttpOnly INTEGER,sameSite INTEGER,expiry INTEGER); INSERT INTO moz_cookies VALUES('example.test','/','insecure','fixture',0,1,0,2000000000000),('example.test','/','secure','fixture',1,1,0,2000000000000);").unwrap();
             }
             let batch = extract(&profile, &selected, &mut NoKeys, &cancel, 1_700_000_000).unwrap();
-            assert_eq!(batch.cookies.len(), 1);
-            assert!(batch.cookies[0].secure);
-            assert_eq!(batch.skipped, 1);
+            // SameSite=None without Secure imports as Lax, which the engine
+            // enforces, instead of being sent cross-site.
+            let imported: Vec<_> = batch
+                .cookies
+                .iter()
+                .map(|cookie| (cookie.secure, cookie.same_site))
+                .collect();
+            assert_eq!(
+                imported,
+                [(false, SameSite::Lax), (true, SameSite::None)],
+                "{browser:?}"
+            );
+            assert_eq!(batch.skipped, 0);
             if browser.chromium() {
-                assert_eq!(batch.cookies[0].expires_unix, None);
+                assert!(
+                    batch
+                        .cookies
+                        .iter()
+                        .all(|cookie| cookie.expires_unix.is_none())
+                );
             }
         }
     }

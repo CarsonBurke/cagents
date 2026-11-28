@@ -249,9 +249,10 @@ pub struct Cookie {
     pub expires_unix: Option<i64>,
 }
 
+/// Always explicit: the engine would treat a cookie without the attribute as
+/// unrestricted, which is broader than Chromium's default.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SameSite {
-    Unspecified,
     None,
     Lax,
     Strict,

@@ -361,3 +361,9 @@ cryoglyph = { path = "vendor/cryoglyph" }
 # Keep the clipboard worker alive when an input device is removed (#1464).
 [patch."https://github.com/pop-os/smithay-clipboard"]
 smithay-clipboard = { path = "vendor/smithay-clipboard" }
+
+# Enforce SameSite cookies in the embedded browser; see vendor/servo-net/README.cagents.md.
+[patch."https://github.com/servo/servo.git"]
+servo-net = { path = "vendor/servo-net" }
+servo-net-traits = { path = "vendor/servo-net-traits" }
+servo-script = { path = "vendor/servo-script" }

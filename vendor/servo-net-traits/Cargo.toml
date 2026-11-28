@@ -1,0 +1,56 @@
+[package]
+name = "servo-net-traits"
+version = "0.1.3"
+authors = ["The Servo Project Developers"]
+license = "MPL-2.0"
+edition = "2024"
+publish = true
+rust-version = "1.86.0"
+repository = "https://github.com/servo/servo"
+description = "A component of the servo web-engine."
+
+[lib]
+name = "net_traits"
+path = "lib.rs"
+test = false
+doctest = false
+
+[dependencies]
+content-security-policy = { version = "0.8.0", features = ["serde"] }
+cookie = { version = "0.18" }
+crossbeam-channel = { version = "0.5" }
+data-url = { version = "0.3" }
+embedder_traits = { package = "servo-embedder-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+headers = { version = "0.4" }
+http = { version = "1.4" }
+hyper-util = { version = "0.1", features = ["client-legacy", "http2", "tokio", "client-proxy"] }
+hyper_serde = { package = "servo-hyper-serde", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+ipc-channel = { version = "0.21" }
+log = { version = "0.4.29" }
+malloc_size_of = { package = "servo-malloc-size-of", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+malloc_size_of_derive = { version = "0.1" }
+mime = { version = "0.3.13" }
+num-traits = { version = "0.2" }
+paint_api = { package = "servo-paint-api", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+parking_lot = { version = "0.12", features = ["serde"] }
+percent-encoding = { version = "2.3" }
+pixels = { package = "servo-pixels", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+profile_traits = { package = "servo-profile-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+rand = { version = "0.9.5" }
+rustc-hash = { version = "2.1.2" }
+rustls-pki-types = { version = "1.14" }
+serde = { version = "1.0.228" }
+servo-base = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+servo-config = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+servo-url = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+servo_arc = { version = "0.4.3" }
+sys-locale = "0.3"
+tokio = { version = "1" }
+url = { version = "2.5" }
+uuid = { version = "1.23.0", features = ["v4", "v5"] }
+webrender_api = { version = "0.68" }
+
+[dev-dependencies]
+servo-default-resources = { git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282" }
+
+[workspace]

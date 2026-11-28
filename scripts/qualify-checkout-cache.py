@@ -27,13 +27,14 @@ OLD_TIME = 946684800
 VENDOR_BUILD_HOOKS = (
     "vendor/iced-core", "vendor/iced-runtime", "vendor/iced-winit",
     "vendor/libcosmic", "vendor/libsqlite3-sys", "vendor/iced-wgpu",
-    "vendor/iced-widget",
+    "vendor/iced-widget", "vendor/servo-script",
 )
 VENDOR_SOURCE_HOOKS = (
     "vendor/winit-wayland", "vendor/iced-accessibility", "vendor/accesskit-unix",
     "vendor/accesskit-atspi-common", "vendor/harfrust", "vendor/cosmic-text",
     "vendor/smithay-clipboard",
     "vendor/iced-graphics", "vendor/cryoglyph", "vendor/iced-futures",
+    "vendor/servo-net", "vendor/servo-net-traits",
 )
 ENV_WATCH = f'println!("cargo:rerun-if-env-changed={IDENTITY}");'
 

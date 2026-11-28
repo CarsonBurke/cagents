@@ -74,12 +74,14 @@ Cookie values never enter daemon IPC, logs, or crash messages. The importer
 passes them directly from the local extraction worker to the UI process's
 browser engine. Normal browsing subsequently sends cookies to their destination
 sites according to browser policy. Host-only versus domain cookies, paths,
-secure and HTTP-only flags, and expiration are retained. The current browser
-engine does not enforce SameSite on requests, so only cookies explicitly marked
-`SameSite=None` with Secure are imported. Lax, Strict, unspecified, and insecure
-cookies are skipped; this can prevent some imported logins from working.
-Partitioned cookies and Firefox container cookies are also skipped because
-flattening them into an ordinary jar would broaden their scope. Unsupported and
+secure and HTTP-only flags, and expiration are retained, and so is SameSite,
+which the embedded engine enforces (see `vendor/servo-net/README.cagents.md`).
+A cookie the source browser stored without SameSite, or as `SameSite=None`
+without Secure, imports as `Lax`. Chromium treats such cookies the same way and
+Firefox more permissively, so no imported cookie reaches more requests than it
+did in its source browser. Partitioned cookies and Firefox container cookies
+are skipped because flattening them into an ordinary jar would broaden their
+scope. Unsupported and
 expired cookies are reported as skipped; unsupported encryption reports a profile
 error.
 
