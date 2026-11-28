@@ -578,12 +578,16 @@ impl Seals for SealShaped {
     }
 }
 
+#[cfg(feature = "host")]
+const BATCH_SEPARATOR: &str = "\n\n---\n\n";
+
 /// What a window shows for the frames of one prompt: a message as it was
 /// sent, or several as one delivery named by their senders, whose body gives
 /// each message under its sender's name.
 #[cfg(feature = "host")]
 fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
     use crate::chat::{DeliveryKind, ItemContent};
+    use std::fmt::Write as _;
     if opened.len() == 1 {
         let opened = opened.remove(0);
         return ItemContent::Delivery {
@@ -607,25 +611,26 @@ fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
         [first, second, rest @ ..] => format!("{first}, {second} and {} others", rest.len()),
         [] => unreachable!("a delivery holds at least one frame"),
     };
-    let body = opened
-        .iter()
-        .map(|frame| {
-            let mut heading = format!("**{}**", markdown_literal(&frame.from));
-            if !frame.sender.is_empty() {
-                heading.push_str(&format!(" ({})", frame.sender));
-            }
-            if !frame.summary.is_empty() {
-                heading.push_str(&format!(" · {}", frame.summary));
-            }
-            // A code block one message leaves open would swallow the rest.
-            let body = frame.body.trim_end();
-            match open_fence(body) {
-                Some(fence) => format!("{heading}\n\n{body}\n{fence}"),
-                None => format!("{heading}\n\n{body}"),
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n---\n\n");
+    let mut body = String::new();
+    for frame in &opened {
+        let start = body.len();
+        write!(body, "**{}**", markdown_literal(&frame.from)).unwrap();
+        if !frame.sender.is_empty() {
+            write!(body, " ({})", frame.sender).unwrap();
+        }
+        if !frame.summary.is_empty() {
+            write!(body, " · {}", frame.summary).unwrap();
+        }
+        body.push_str("\n\n");
+        body.push_str(frame.body.trim_end());
+        let end = body.len();
+        body.push_str(BATCH_SEPARATOR);
+        if let Some(fence) = open_fence(&body[start..]) {
+            let closer = format!("\n{fence}");
+            body.insert_str(end, &closer);
+        }
+    }
+    body.truncate(body.len() - BATCH_SEPARATOR.len());
     ItemContent::Delivery {
         kind: DeliveryKind::Message,
         from: String::new(),
@@ -646,37 +651,72 @@ fn delivery(mut opened: Vec<Opened>) -> crate::chat::ItemContent {
     }
 }
 
-/// The fence that closes the code block `markdown` leaves open, if it does,
-/// as CommonMark reads fences.
+/// Find the fence that consumes the batch separator. An unindented rule
+/// already ends a fence inside a list item or block quote.
 #[cfg(feature = "host")]
-fn open_fence(markdown: &str) -> Option<String> {
-    let mut open: Option<(char, usize)> = None;
-    for line in markdown.lines() {
-        let indented = line.trim_start_matches(' ');
-        if line.len() - indented.len() > 3 {
-            continue;
-        }
-        let line = indented;
-        let Some(mark @ ('`' | '~')) = line.chars().next() else {
-            continue;
-        };
-        let length = line.chars().take_while(|&c| c == mark).count();
-        if length < 3 {
-            continue;
-        }
-        let info = &line[length..];
-        open = match open {
-            None if mark == '`' && info.contains('`') => None,
-            None => Some((mark, length)),
-            Some((opened, at_least))
-                if mark == opened && length >= at_least && info.trim().is_empty() =>
+fn open_fence(section: &str) -> Option<&str> {
+    use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag};
+
+    if !section.contains(['`', '~']) {
+        return None;
+    }
+    let rule = section.len() - BATCH_SEPARATOR.trim_start().len();
+    let probe = without_html_blocks(section);
+    Parser::new_ext(&probe, Options::ENABLE_TABLES)
+        .into_offset_iter()
+        .find_map(|(event, range)| {
+            if range.start < rule
+                && rule < range.end
+                && matches!(
+                    event,
+                    Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(_)))
+                )
             {
+                let opening = &section[range.start..];
+                let mark = opening.as_bytes()[0];
+                let length = opening.bytes().take_while(|&byte| byte == mark).count();
+                Some(&opening[..length])
+            } else {
                 None
             }
-            still => still,
-        };
+        })
+}
+
+/// The native transcript reads HTML as literal text except for line breaks.
+/// Mask the other tags in the probe so they cannot hide a fence, while
+/// retaining offsets into the original text.
+#[cfg(feature = "host")]
+fn without_html_blocks(section: &str) -> std::borrow::Cow<'_, str> {
+    if !section.contains('<') {
+        return section.into();
     }
-    open.map(|(mark, length)| mark.to_string().repeat(length))
+    let mut probe = None;
+    let mut offset = 0;
+    for line in section.split_inclusive(['\r', '\n']) {
+        let unindented = line.trim_start_matches(' ');
+        let indent = line.len() - unindented.len();
+        if indent < 4 && unindented.starts_with('<') && !starts_html_line_break(unindented) {
+            let at = offset + indent;
+            probe
+                .get_or_insert_with(|| section.to_owned())
+                .replace_range(at..at + 1, "x");
+        }
+        offset += line.len();
+    }
+    match probe {
+        Some(probe) => probe.into(),
+        None => section.into(),
+    }
+}
+
+#[cfg(feature = "host")]
+fn starts_html_line_break(line: &str) -> bool {
+    line.get(..3)
+        .is_some_and(|tag| tag.eq_ignore_ascii_case("<br"))
+        && {
+            let tail = line[3..].trim_start_matches(' ');
+            tail.starts_with('>') || tail.starts_with("/>")
+        }
 }
 
 /// `text` escaped so that Markdown shows it as written.
@@ -1372,7 +1412,7 @@ mod tests {
             summary,
             "3 messages from Fix login bug, Review *auth* and you"
         );
-        let sections: Vec<&str> = body.split("\n\n---\n\n").collect();
+        let sections: Vec<&str> = body.split(BATCH_SEPARATOR).collect();
         assert_eq!(sections.len(), 3, "{body}");
         let session = short(first.from.session.unwrap());
         assert!(
@@ -1453,33 +1493,61 @@ mod tests {
 
     #[cfg(feature = "host")]
     #[test]
-    fn a_code_block_one_message_leaves_open_ends_with_it() {
+    fn markdown_blocks_end_before_the_next_delivery() {
         use crate::chat::ItemContent;
-        assert_eq!(open_fence("```rust\nfn main() {"), Some("```".into()));
-        assert_eq!(open_fence("~~~~\n~~~\nstill code"), Some("~~~~".into()));
-        assert_eq!(open_fence("  ```\ncode\n```"), None);
-        assert_eq!(open_fence("```sh\n``` not a close\n````"), None);
-        assert_eq!(open_fence("``` not `a` fence"), None);
-        assert_eq!(open_fence("    ```\nindented code"), None);
+        use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag};
 
+        let seal = Seal::new([8; 32]);
+        let recognizer = seal.recognizer();
         let mut first = message();
-        first.body = "Here is the failing part:\n```rust\nfn main() {".into();
         let mut second = message();
         second.body = "# Landed\n\nThe fix is on main.".into();
-        let seal = Seal::new([8; 32]);
-        let opened = seal
-            .recognizer()
-            .open_all(&seal.seal_all([&first, &second], 0))
-            .unwrap();
-        let ItemContent::Delivery { body, .. } = delivery(opened) else {
-            panic!("a delivery");
-        };
-        let sections: Vec<&str> = body.split("\n\n---\n\n").collect();
-        assert!(sections[0].ends_with("fn main() {\n```"), "{body}");
-        assert!(
-            sections[1].ends_with("# Landed\n\nThe fix is on main."),
-            "{body}"
-        );
+        for (source, closer) in [
+            ("Here is the failing part:\n```rust\nfn main() {", "\n```"),
+            ("  ~~~~\n~~~\nstill code", "\n~~~~"),
+            ("```sh\n``` not a close\n````", ""),
+            ("``` not `a` fence", ""),
+            ("    ```\nindented code", ""),
+            ("- List item\n  ```rust\n  fn main() {", ""),
+            ("- List item\n\t```rust\n\tfn main() {", ""),
+            ("> Quote\n> ```rust\n> fn main() {", ""),
+            ("<div>\nNormal HTML block", ""),
+            ("  <PRE class=example>\nUnclosed HTML", ""),
+            ("<!--\nUnclosed comment", ""),
+            ("Before\r<!--\rUnclosed comment", ""),
+            ("<!-- note\n```rust\nlet x = 1;", "\n```"),
+            ("<pre>\n```text\nA visible code block", "\n```"),
+            ("<br>\n```text\n```\t\n\nAfter the blank.", ""),
+            ("<BR />\n```text\ncode\n\n```", "\n```"),
+        ] {
+            first.body = source.into();
+            let opened = recognizer
+                .open_all(&seal.seal_all([&first, &second], 0))
+                .unwrap();
+            assert_eq!(opened[0].body, source);
+            let ItemContent::Delivery { body, .. } = delivery(opened) else {
+                panic!("a delivery");
+            };
+            let (first, second) = body.split_once(BATCH_SEPARATOR).unwrap();
+            assert!(first.ends_with(&format!("{source}{closer}")), "{body}");
+            assert!(
+                second.ends_with("# Landed\n\nThe fix is on main."),
+                "{body}"
+            );
+            let probe = without_html_blocks(&body);
+            let mut events = Parser::new_ext(&probe, Options::ENABLE_TABLES);
+            assert!(events.any(|event| event == Event::Rule), "{body}");
+            assert!(
+                events.any(|event| matches!(
+                    event,
+                    Event::Start(Tag::Heading {
+                        level: HeadingLevel::H1,
+                        ..
+                    })
+                )),
+                "{body}"
+            );
+        }
     }
 
     #[cfg(feature = "host")]
