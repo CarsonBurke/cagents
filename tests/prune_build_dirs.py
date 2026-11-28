@@ -157,6 +157,37 @@ class PruneBuildDirs(unittest.TestCase):
         self.assertEqual(self.log.read_bytes(), legacy)
         self.assertIn(f"removed {path}", output)
 
+    def test_managed_log_short_append_preserves_complete_rows(self):
+        # Leave less room than one removal row under the shell's 512-byte limit.
+        existing = b"previous record\n" * 31
+        self.log.write_bytes(existing)
+        first = self.target(self.roots / "first/target")
+        self.settle()
+
+        self.prune(managed_log=True, limit_writes=True)
+
+        self.assertFalse(first.exists())
+        self.assertEqual(self.log.read_bytes(), existing)
+
+        second = self.target(self.roots / "second/target")
+        self.settle()
+        self.prune(managed_log=True)
+        row, = self.log.read_bytes()[len(existing):].splitlines()
+        self.assertIn(os.fsencode(second), row)
+
+    def test_managed_log_repairs_an_incomplete_tail_before_appending(self):
+        existing = b"previous record\n"
+        self.log.write_bytes(existing + b"interrupted record")
+        target = self.target(self.roots / "lane/target")
+        self.settle()
+
+        self.prune(managed_log=True)
+
+        prior, removed = self.log.read_bytes().splitlines(keepends=True)
+        self.assertEqual(prior, existing)
+        self.assertNotIn(b"interrupted record", removed)
+        self.assertIn(os.fsencode(target), removed)
+
     def test_a_recent_write_anywhere_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")
         time.sleep(7)
