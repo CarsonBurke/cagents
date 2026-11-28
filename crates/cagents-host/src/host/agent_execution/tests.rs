@@ -183,6 +183,9 @@ done
 while IFS= read -r frame; do
   case "$frame" in
     *'"type":"control_request"'*)
+      case "$frame" in
+        *'"subtype":"interrupt"'*) printf 'interrupt\n' >> "$HOME/../interrupts" ;;
+      esac
       id=${frame#*'"request_id":"'}
       id=${id%%'"'*}
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":%s}}\n' "$id" "$confirmed"
@@ -7690,6 +7693,63 @@ fn a_prompt_for_a_busy_agent_waits_unsent_and_runs_when_the_run_settles() {
     assert_eq!(next.state, State::Succeeded, "{next:?}");
     assert_eq!(prompts(root), 2);
     drop(courier);
+}
+
+#[test]
+fn a_late_follow_up_interrupt_leaves_the_already_dispatched_prompt_running() {
+    if isolated("a_late_follow_up_interrupt_leaves_the_already_dispatched_prompt_running").is_some()
+    {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap();
+    let first = busy_agent(&host, request.clone(), root);
+    let agent = first.agent.id;
+    let (next, receipt) = prompt(
+        &host,
+        &Authority::default(),
+        Submit {
+            destination: Destination::Existing(agent),
+            prompt: "ASK_PERMISSION for the next run".into(),
+            idempotency_key: "late-interrupt-follow-up".into(),
+            ..request
+        },
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt,
+        Start::Queued {
+            behind: Some(first.run.id)
+        }
+    );
+    // The worker can finish the old turn and the courier can dispatch the
+    // queued prompt between its acceptance and admission of the interrupt.
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, first.run.id).state, State::Succeeded);
+    assert!(matches!(start(&host, &next).unwrap(), Start::Sent { .. }));
+    let asked = pending_requests(&host, agent);
+    let [asked] = asked.as_slice() else {
+        panic!("{asked:?}");
+    };
+
+    interrupt_ahead(&host, agent, next.run.id, Some(first.run.id)).unwrap();
+
+    process(
+        &host,
+        Authority::default(),
+        Operation::Control {
+            agent,
+            command: Control::Answer {
+                request_id: asked.id.clone(),
+                action: "allow".into(),
+                answers: Vec::new(),
+            },
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, next.run.id).state, State::Succeeded);
+    assert!(!root.join("interrupts").exists());
 }
 
 #[test]

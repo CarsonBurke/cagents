@@ -235,7 +235,7 @@ pub(super) fn prompt(
     let (accepted, start) = accept(host, authority, request)?;
     let start = start.map_err(|error| unstarted(host, &accepted, error))?;
     if interrupt && let Start::Queued { behind } = start {
-        interrupt_ahead(host, agent, behind).map_err(|error| {
+        interrupt_ahead(host, agent, accepted.run.id, behind).map_err(|error| {
             format!(
                 "Run {} waits behind the agent's current work, which could not be interrupted: {error}",
                 accepted.run.id
@@ -622,20 +622,36 @@ fn resume(
 
 /// Stops what the agent is doing so the prompt queued behind it goes next:
 /// the run ahead, or a turn no run started.
-fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> Result<(), String> {
+fn interrupt_ahead(
+    host: &SharedHost,
+    agent: AgentId,
+    follow_up: RunId,
+    behind: Option<RunId>,
+) -> Result<(), String> {
     let gate = agent_gate(host, agent);
     let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host)?;
-    let (record, head) = {
+    let (record, running) = {
         let store = registry.lock().unwrap_or_else(|p| p.into_inner());
-        let head = behind
-            .map(|run| store.agent_run(run))
-            .transpose()?
-            .filter(|run| !run.state.is_terminal());
-        (store.agent(agent)?, head)
+        // The courier may have dispatched this prompt before we took the
+        // gate. The observed predecessor may also have finished on its own.
+        if !store.agent_run_is_queued(follow_up)? {
+            return Ok(());
+        }
+        let running = if let Some(head) = behind {
+            if store.agent_run(head)?.state.is_terminal() {
+                return Ok(());
+            }
+            // A head that is itself waiting unsent stays first. Stop the
+            // interactive turn it waits on.
+            (!store.agent_run_is_queued(head)?).then_some(head)
+        } else {
+            None
+        };
+        (store.agent(agent)?, running)
     };
-    if let Some(head) = &head
-        && withdraw_undelivered(host, &mut dispatch, Some(head.id))?
+    if let Some(head) = behind
+        && withdraw_undelivered(host, &mut dispatch, Some(head))?
     {
         return Ok(());
     }
@@ -654,16 +670,7 @@ fn interrupt_ahead(host: &SharedHost, agent: AgentId, behind: Option<RunId>) -> 
     let Some(handle) = handle else {
         return Err(not_running());
     };
-    // A head that is itself waiting unsent stays first; the turn it waits on
-    // is what stops.
-    let running = head.filter(|head| {
-        !registry
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .agent_run_is_queued(head.id)
-            .unwrap_or(true)
-    });
-    handle.interrupt_owned(running.map(|run| run.id), false)
+    handle.interrupt_owned(running, false)
 }
 
 /// The usage limit that stops `agent`'s live conversation, if one does.
