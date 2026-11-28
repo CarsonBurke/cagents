@@ -69,6 +69,7 @@ def account_home() -> Path:
 # that holds none of it, and a user may keep builds under a HOME of their own.
 HOMES = list(dict.fromkeys((account_home(), Path.home())))
 MIRROR = Path("/var/tmp/cargo-build")
+MANAGED_LOG_BYTES = 1 << 20
 LOCK_NAMES = (".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock")
 PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
 # What scripts/native-evidence names a task's builds, beside this marker.
@@ -401,6 +402,49 @@ def nonnegative(value: str) -> float:
     return number
 
 
+def open_managed_log(path: Path, *, create: bool):
+    flags = os.O_RDWR | os.O_APPEND | os.O_NONBLOCK | os.O_NOFOLLOW
+    if create:
+        flags |= os.O_CREAT
+    log = os.fdopen(os.open(path, flags, 0o600), "a+b")
+    info = os.fstat(log.fileno())
+    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        log.close()
+        raise OSError(f"not an owned regular log file: {path}")
+    return log
+
+
+def write_managed_log(path: Path, record: bytes = b"") -> None:
+    """Keep up to 1 MiB of recent removals under the caller's pruner lock."""
+    if len(record) > MANAGED_LOG_BYTES:
+        return
+    with contextlib.suppress(OSError):
+        with open_managed_log(path, create=bool(record)) as log:
+            size = os.fstat(log.fileno()).st_size
+            if size + len(record) <= MANAGED_LOG_BYTES:
+                if record:
+                    log.write(record)
+                return
+
+            # Read only the recent tail, even if an older guard left gigabytes.
+            # Keep complete rows and leave room for more appends.
+            keep = min(MANAGED_LOG_BYTES // 2, MANAGED_LOG_BYTES - len(record))
+            log.seek(max(0, size - keep - 1))
+            tail = log.read(keep + 1)
+            if size > keep:
+                tail = tail.partition(b"\n")[2]
+            tail = tail[:tail.rfind(b"\n") + 1]
+
+        # Preserve the previous log until the replacement is complete. A
+        # killed writer can leave at most one staging file, reused next time.
+        staging = path.with_name(path.name + ".new")
+        with open_managed_log(staging, create=True) as replacement:
+            replacement.truncate(0)
+            replacement.write(tail)
+            replacement.write(record)
+        os.replace(staging, path)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
@@ -429,8 +473,11 @@ def main() -> int:
     parser.add_argument("--keep-checkout", action="append", type=Path, default=[], metavar="DIR",
                         help="never remove the build of the checkout at DIR, in its "
                              "target or the mirror; repeatable")
-    parser.add_argument("--log", type=Path, metavar="FILE",
-                        help="append a tab-separated line per removal to FILE")
+    logs = parser.add_mutually_exclusive_group()
+    logs.add_argument("--log", type=Path, metavar="FILE",
+                      help="append a tab-separated line per removal to FILE")
+    logs.add_argument("--managed-log", type=Path, metavar="FILE",
+                      help="keep up to 1 MiB of recent tab-separated removal rows in FILE")
     parser.add_argument("--budget", type=nonnegative, metavar="SECONDS",
                         help="start no search or removal after this long, finishing the "
                              "removal under way (default: no limit)")
@@ -497,6 +544,8 @@ def main() -> int:
             os.dup2(output, 2)
             os.close(output)
 
+    if arguments.apply and arguments.managed_log:
+        write_managed_log(arguments.managed_log)
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
     orphan_cutoff = now - arguments.orphan_hours * 3600
@@ -589,10 +638,14 @@ def main() -> int:
         freed += size
         removed += 1
         print(f"removed {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
-        if arguments.log:
-            with contextlib.suppress(OSError), open(arguments.log, "a") as log:
-                log.write(f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
-                          f"{size}\t{reason}\n")
+        if arguments.log or arguments.managed_log:
+            record = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
+                      f"{size}\t{reason}\n")
+            if arguments.managed_log:
+                write_managed_log(arguments.managed_log, os.fsencode(record))
+            else:
+                with contextlib.suppress(OSError), open(arguments.log, "a") as log:
+                    log.write(record)
     else:
         complete = True
     if not complete or deadline_passed():

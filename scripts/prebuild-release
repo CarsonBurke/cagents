@@ -538,20 +538,6 @@ class Failed(Exception):
     """The build failed."""
 
 
-def clear_cache_runs(cache):
-    """Removes the work directories of builds stopped before they could,
-    unless a build is using the cache."""
-    if not (cache / ".lock").is_file():
-        return
-    with (cache / ".lock").open("a") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return
-        for run_directory in cache.glob("run.*"):
-            shutil.rmtree(run_directory, ignore_errors=True)
-
-
 def build(repository, store, sentinel, cache, sha, priority, first_tried_at=None):
     """Builds `sha`'s bundle into the store. Returns True once it is bundled,
     False once its build failed, and raises Stopped if it was stopped.
@@ -563,7 +549,10 @@ def build(repository, store, sentinel, cache, sha, priority, first_tried_at=None
         checkout = prepare_checkout(repository, sha)
     except subprocess.CalledProcessError as error:
         raise Stopped(f"could not check out {sha}: {error.stderr.strip()}")
-    clear_cache_runs(cache)
+    # Current builders sweep while holding their build lock. A historical
+    # checkout keeps its own builder, so use our cache owner for that path.
+    if not (checkout / "scripts/release-build-cache").is_file():
+        subprocess.run([str(Path(__file__).resolve().with_name("release-build-cache")), str(cache)])
     partial = store.bundles / f".{sha}.partial"
     shutil.rmtree(partial, ignore_errors=True)
     partial.mkdir(mode=0o700)

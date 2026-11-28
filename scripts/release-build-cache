@@ -1,0 +1,70 @@
+#!/bin/bash
+# The Linux release builder sources this file. Prebuilds of older revisions
+# use its command form to recover the same cache before starting the old builder.
+
+BASE_SHA256=242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a
+CACHE_ID="cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 $BASE_SHA256"
+
+open_release_cache() {
+    umask 077
+    [[ ! -L $CACHE ]] || fail 'cache root must not be a symlink'
+    mkdir -p -- "$CACHE"
+    CACHE=$(realpath -- "$CACHE")
+    [[ $(stat -c %u "$CACHE") == "$CALLER_UID" && $(stat -c %a "$CACHE") == 700 ]] \
+        || fail 'cache root must be owned by the caller with mode 0700'
+    local entry marker=$CACHE/.cagents-release-cache
+    for entry in "$CACHE/.lock" "$marker"; do
+        [[ ! -L $entry && ( ! -e $entry || -f $entry ) ]] || fail "unsafe cache entry: $entry"
+    done
+    if [[ ! -e $marker ]]; then
+        # A builder may have died between creating the lock and marking an
+        # otherwise empty cache. Never add a lock to an unrelated directory.
+        (
+            shopt -s nullglob dotglob
+            for entry in "$CACHE"/*; do
+                [[ $entry == "$CACHE/.lock" ]] || fail 'refusing to adopt an unmarked nonempty cache'
+            done
+        ) || exit 1
+    fi
+    exec 9>>"$CACHE/.lock"
+    flock -n 9 || fail 'another release build is using this cache'
+    if [[ -e $marker ]]; then
+        [[ $(cat "$marker") == "$CACHE_ID" ]] \
+            || fail 'cache marker does not match this builder; use a different cache directory'
+    else
+        printf '%s\n' "$CACHE_ID" > "$marker"
+    fi
+}
+
+reclaim_release_runs() (
+    # Called only with the marked cache locked. Match even a run interrupted
+    # immediately after mktemp, but leave unfamiliar names and layouts alone.
+    shopt -s nullglob dotglob
+    for run in "$CACHE"/run.??????; do
+        [[ ${run##*.} =~ ^[a-zA-Z0-9]{6}$ && -d $run && ! -L $run &&
+            $(stat -c '%u:%a' -- "$run") == "$CALLER_UID:700" ]] || continue
+        [[ ${1:-} != "$run/"* ]] || continue
+        for entry in "$run"/*; do
+            [[ ! -L $entry ]] || continue 2
+            case ${entry##*/} in
+                build-tmp|build-var-tmp|dist|provision-tmp|rootfs)
+                    [[ -d $entry ]] || continue 2 ;;
+                group|notes.md|passwd|release-build|resolv.conf|ubuntu-base.tar.gz)
+                    [[ -f $entry ]] || continue 2 ;;
+                *) continue 2 ;;
+            esac
+        done
+        rm -rf --one-file-system -- "$run" || :
+    done
+)
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    set -euo pipefail
+    fail() { printf 'release-build-cache: %s\n' "$*" >&2; exit 1; }
+    (($# == 1)) || fail 'expected the path to an existing release builder cache'
+    CACHE=$1
+    [[ -f $CACHE/.cagents-release-cache ]] || exit 0
+    CALLER_UID=$(id -u)
+    open_release_cache
+    reclaim_release_runs
+fi

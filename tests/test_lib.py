@@ -389,7 +389,7 @@ class TestLib(unittest.TestCase):
                 pruner = str(self.root / "pruner")
                 self.assertEqual(self.events("prune")[0]["arguments"],
                                  ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
-                                  "--log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
+                                  "--managed-log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
                                   "--keep", str(self.root / "owned-build"),
                                   "--orphan-hours", "0", "--evidence-hours", "1", "--budget", "300", "--wait"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])

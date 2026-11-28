@@ -429,11 +429,20 @@ class Prebuild(unittest.TestCase):
         self.compiled(self.first)
         self.store.prepare()
         (self.store.bundle(self.first) / "dist").mkdir(parents=True)
-        (self.cache / "run.left").mkdir(parents=True)
-        (self.cache / ".lock").touch()
+        self.cache.mkdir(mode=0o700)
+        (self.cache / ".cagents-release-cache").write_text(
+            "cagents-local-release-v1 ubuntu-22.04.5 amd64 rust-1.93.0 zig-0.15.2 "
+            "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a\n"
+        )
+        stale = self.cache / "run.ABC123"
+        stale.mkdir(mode=0o700)
+        (stale / "dist").mkdir()
+        unrelated = self.cache / "run.left"
+        unrelated.mkdir()
         self.assertEqual(self.run_once(), 0)
         self.assertTrue(self.store.built(self.first))
-        self.assertFalse((self.cache / "run.left").exists())
+        self.assertFalse(stale.exists())
+        self.assertTrue(unrelated.is_dir())
 
     def test_it_does_not_start_while_memory_is_short_or_under_pressure_or_a_build_waits(self):
         self.compiled(self.first)
