@@ -1909,11 +1909,12 @@ class Evidence(unittest.TestCase):
         # A transcript keeps its file, which its location records.
         self.assertEqual((provider_home / "session.jsonl").stat().st_ino, session_file)
 
-        # A fixture removed meanwhile can't keep them, and every start says so
-        # until the seed is saved again.
-        shutil.rmtree(fixture)
+        # Keep the old directory alive so the replacement cannot reuse its
+        # inode. Every start warns until the seed is saved again.
+        fixture.rename(self.task / "previous-fixture")
         for _ in range(2):
             result = self.run_tool("start", "before")
+            self.assertFalse(os.path.samestat(recorded, provider_home.stat()))
             self.assertIn("the provider home is not the one the seed was saved from", result.stderr)
             self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
             self.run_tool("stop")
