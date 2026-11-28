@@ -963,7 +963,12 @@ impl Card {
         let Some(session) = &mut self.session else {
             return;
         };
-        if let Some(unrenderable) = session.unrenderable.take() {
+        // The answer can land in the same spin as a navigation away, whose
+        // URL change is already reported; a finding for the page left behind
+        // would cover the new one.
+        if let Some(unrenderable) = session.unrenderable.take()
+            && session.webview.url().as_ref() == Some(&unrenderable.url)
+        {
             self.events.semantic(BrowserEvent::Unrenderable(
                 unrenderable.into_document(servo),
             ));
@@ -2266,5 +2271,55 @@ mod tests {
             std::time::Instant::now() >= settle
         });
         assert_eq!(*unrenderable.borrow(), None);
+
+        // Over HTTP the window keeps the site's origin even for the
+        // stand-in, so the probe must tell it apart by the document alone.
+        let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let site = Url::parse(&format!("http://{}/", server.local_addr().unwrap())).unwrap();
+        std::thread::spawn(move || {
+            use std::io::{BufRead, Write};
+            for stream in server.incoming() {
+                let Ok(mut stream) = stream else { return };
+                let mut reader = std::io::BufReader::new(stream.try_clone().unwrap());
+                let mut request = String::new();
+                let _ = reader.read_line(&mut request);
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                    line.clear();
+                }
+                let (kind, body) = if request.contains("/paper.pdf") {
+                    ("application/pdf", "%PDF-1.4\n%%EOF\n")
+                } else {
+                    ("text/html", "<!DOCTYPE html>Page")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        let served_page = site.join("page.html").unwrap();
+        navigate_webview(&webview, &navigation, served_page.clone());
+        spin_for("the served page", &|| {
+            webview.url() == Some(served_page.clone())
+        });
+        let settle = std::time::Instant::now() + Duration::from_secs(2);
+        spin_for("the served page's probe", &|| {
+            std::time::Instant::now() >= settle
+        });
+        assert_eq!(*unrenderable.borrow(), None, "a served page is shown");
+        let served_paper = site.join("paper.pdf").unwrap();
+        navigate_webview(&webview, &navigation, served_paper.clone());
+        spin_for("the served PDF's probe", &|| {
+            unrenderable.borrow().is_some()
+        });
+        assert_eq!(
+            unrenderable.take(),
+            Some(super::super::content::Unrenderable {
+                url: served_paper,
+                content_type: "application/pdf".to_owned(),
+            })
+        );
     }
 }

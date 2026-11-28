@@ -7,12 +7,13 @@
 //! ordinary load that completes.
 //!
 //! So every completed load is asked two questions in the page: the response's
-//! content type, and the document's origin. Servo gives the replacement an
-//! opaque origin, which an HTTP or file document only otherwise has when its
-//! server sandboxed it, and a sandboxed document is still of a type Servo
-//! renders. Both answers together single out the replacement, and the content
-//! type is classified with Servo's own [`MimeClassifier`], so what counts as
-//! renderable here is exactly what Servo renders.
+//! content type, and the document's domain. Servo gives the replacement
+//! document an opaque origin, whose domain is empty, while the window keeps
+//! the response's origin, so `self.origin` would still name the site. Only a
+//! sandboxed or `file:` document otherwise has an empty domain, and those are
+//! of types Servo renders. Both answers together single out the replacement,
+//! and the content type is classified with Servo's own [`MimeClassifier`], so
+//! what counts as renderable here is exactly what Servo renders.
 //!
 //! A page can only lie about itself to its own disadvantage: the answer
 //! decides whether the application offers to fetch the page's own URL again
@@ -34,8 +35,8 @@ pub(crate) struct Unrenderable {
 pub(crate) type Slot = RefCell<Option<Unrenderable>>;
 
 /// The script the probe evaluates: the response's type and the document's
-/// origin, which is the string `"null"` for an opaque one.
-const PROBE: &str = "[document.contentType, self.origin]";
+/// domain, which is empty for an opaque origin.
+const PROBE: &str = "[document.contentType, document.domain]";
 
 /// Asks the page just loaded in `webview` whether Servo could render it.
 pub(crate) fn probe(webview: &servo::WebView, slot: &std::rc::Rc<Slot>) {
@@ -53,7 +54,7 @@ pub(crate) fn probe(webview: &servo::WebView, slot: &std::rc::Rc<Slot>) {
         };
         let [
             servo::JSValue::String(content_type),
-            servo::JSValue::String(origin),
+            servo::JSValue::String(domain),
         ] = values.as_slice()
         else {
             return;
@@ -63,7 +64,7 @@ pub(crate) fn probe(webview: &servo::WebView, slot: &std::rc::Rc<Slot>) {
         if probed.url().as_ref() != Some(&url) {
             return;
         }
-        if is_replacement(content_type, origin) {
+        if is_replacement(content_type, domain) {
             *slot.borrow_mut() = Some(Unrenderable {
                 url,
                 content_type: content_type.clone(),
@@ -72,10 +73,10 @@ pub(crate) fn probe(webview: &servo::WebView, slot: &std::rc::Rc<Slot>) {
     });
 }
 
-/// Whether a document with this content type and origin is Servo's stand-in
+/// Whether a document with this content type and domain is Servo's stand-in
 /// for a response it could not render.
-fn is_replacement(content_type: &str, origin: &str) -> bool {
-    origin == "null" && !renderable(content_type)
+fn is_replacement(content_type: &str, domain: &str) -> bool {
+    domain.is_empty() && !renderable(content_type)
 }
 
 /// Whether Servo renders a response of `content_type` inline.
@@ -167,21 +168,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_an_opaque_document_of_a_type_servo_cannot_show_is_a_replacement() {
-        assert!(is_replacement("application/pdf", "null"));
-        assert!(is_replacement("application/zip", "null"));
-        assert!(is_replacement("application/octet-stream", "null"));
-        assert!(
-            is_replacement("font/woff2", "null"),
-            "Servo replaces fonts too"
-        );
-        // A sandboxed page is opaque and still rendered.
-        assert!(!is_replacement("text/plain", "null"));
-        assert!(!is_replacement("text/html; charset=utf-8", "null"));
-        assert!(!is_replacement("image/png", "null"));
-        assert!(!is_replacement("application/json", "null"));
+    fn only_a_domainless_document_of_a_type_servo_cannot_show_is_a_replacement() {
+        assert!(is_replacement("application/pdf", ""));
+        assert!(is_replacement("application/zip", ""));
+        assert!(is_replacement("application/octet-stream", ""));
+        assert!(is_replacement("font/woff2", ""), "Servo replaces fonts too");
+        // A sandboxed or file page has no domain and is still rendered.
+        assert!(!is_replacement("text/plain", ""));
+        assert!(!is_replacement("text/html; charset=utf-8", ""));
+        assert!(!is_replacement("image/png", ""));
+        assert!(!is_replacement("application/json", ""));
         // A page with a real origin was rendered, whatever it says.
-        assert!(!is_replacement("application/pdf", "https://arxiv.org"));
+        assert!(!is_replacement("application/pdf", "arxiv.org"));
     }
 
     #[test]

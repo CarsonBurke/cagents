@@ -286,7 +286,10 @@ impl PdfDocument {
                                     raster.height,
                                     raster.rgba.to_vec(),
                                 ),
-                                pixels_per_point: raster.width as f32 / raster.points_wide,
+                                // What was asked for, not what came back:
+                                // the helper caps a huge page's raster, and
+                                // measuring that would ask again forever.
+                                pixels_per_point: render.pixels_per_point,
                                 tone: render.tone,
                             },
                         );
@@ -446,8 +449,10 @@ impl PdfDocument {
     }
 
     fn needs_render(&self, page: usize, wanted: f32) -> bool {
-        if let Some(render) = self.renders.get(&page) {
-            return !adequate(render.pixels_per_point, render.tone, wanted, self.tone);
+        // A page already rendering is looked at again when it lands, so a
+        // burst of zoom clicks never runs more helpers than MAX_RENDERS.
+        if self.renders.contains_key(&page) {
+            return false;
         }
         self.rasters
             .get(&page)

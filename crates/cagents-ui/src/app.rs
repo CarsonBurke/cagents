@@ -16571,10 +16571,16 @@ impl Cagents {
     /// outgoing theme would be no better than not rendering one at all.
     fn retone_documents(&mut self, theme: &cosmic::Theme) -> Task<Message> {
         Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-            if let CardRuntime::Repository(runtime) = runtime {
-                Some(repository_task(runtime.retone_document(card, theme)))
-            } else {
-                None
+            match runtime {
+                CardRuntime::Repository(runtime) => {
+                    Some(repository_task(runtime.retone_document(card, theme)))
+                }
+                #[cfg(feature = "integrated-browser")]
+                CardRuntime::Browser(browser) => browser
+                    .document
+                    .as_mut()
+                    .map(|document| document.retone(card, theme)),
+                _ => None,
             }
         }))
     }
@@ -20113,13 +20119,18 @@ impl Cagents {
                 {
                     self.window_scale_factor = scale_factor;
                     #[cfg(feature = "integrated-browser")]
-                    for runtime in self.cards.values() {
-                        if let CardRuntime::Browser(browser) = runtime {
-                            let _ = browser.handle.set_scale_factor(effective_surface_scale(
-                                scale_factor,
-                                self.settings.ui_scale,
-                            ));
+                    {
+                        let surface = effective_surface_scale(scale_factor, self.settings.ui_scale);
+                        let mut renders = Vec::new();
+                        for (&card, runtime) in &mut self.cards {
+                            if let CardRuntime::Browser(browser) = runtime {
+                                let _ = browser.handle.set_scale_factor(surface);
+                                if let Some(document) = &mut browser.document {
+                                    renders.push(document.rescale(card, surface));
+                                }
+                            }
                         }
+                        return Task::batch(renders);
                     }
                 }
                 Task::none()

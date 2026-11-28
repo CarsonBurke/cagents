@@ -2,11 +2,14 @@
 //!
 //! Servo has no downloads, and the document it shows in place of such a page
 //! has an opaque origin, so not even the page itself can read the response
-//! again. The application fetches the URL once more instead, through Servo's
-//! own HTTP client: its TLS verification, proxy settings and header casing,
-//! with the cookies and user agent Servo sent. The response goes to a fresh
-//! directory under the application's cache, named as the server or the URL
-//! names it, so a viewer or another application shows a recognizable name.
+//! again. The application fetches the URL once more instead, with a client
+//! built as Servo builds its own (hyper over rustls, verified by the
+//! platform's certificate store) and the cookies and user agent Servo sent.
+//! It is a plain GET with no proxy, so a page that only a POST or a proxy
+//! produced fails here and is left to the system browser. The response goes
+//! to a fresh directory under the application's cache, named as the server
+//! or the URL names it, so a viewer or another application shows a
+//! recognizable name.
 
 use std::{
     io,
@@ -28,6 +31,10 @@ use super::content::{UnrenderableDocument, is_pdf_type};
 
 /// A server may redirect this many times before the fetch stops following.
 const MAX_REDIRECTS: usize = 10;
+
+/// How long a server may take to answer, or to send the next part of the
+/// file, before the fetch gives up.
+const STALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How often a running fetch reports how far it has got.
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(100);
@@ -118,9 +125,9 @@ async fn fetch(
                     .boxed(),
             )
             .map_err(|_| "This address can't be fetched.".to_owned())?;
-        let response = client
-            .request(request)
+        let response = tokio::time::timeout(STALL_TIMEOUT, client.request(request))
             .await
+            .map_err(|_| "The server didn't answer.".to_owned())?
             .map_err(|error| format!("The connection failed: {}", root_cause(&error)))?;
         if !response.status().is_redirection() {
             break response;
@@ -171,6 +178,8 @@ async fn fetch(
     tokio::fs::create_dir_all(&directory)
         .await
         .map_err(|error| write_failure(&error))?;
+    // A fetch that fails or is stopped leaves nothing behind.
+    let mut unfinished = Unfinished(Some(directory.clone()));
     let partial = directory.join(".partial");
     let mut file = tokio::io::BufWriter::new(
         tokio::fs::File::create(&partial)
@@ -184,7 +193,10 @@ async fn fetch(
     let _ = output
         .send(FetchProgress::Receiving { received, total })
         .await;
-    while let Some(frame) = body.frame().await {
+    while let Some(frame) = tokio::time::timeout(STALL_TIMEOUT, body.frame())
+        .await
+        .map_err(|_| "The download stalled.".to_owned())?
+    {
         let frame =
             frame.map_err(|error| format!("The download stopped: {}", root_cause(&error)))?;
         let Ok(data) = frame.into_data() else {
@@ -214,6 +226,7 @@ async fn fetch(
     tokio::fs::rename(&partial, &path)
         .await
         .map_err(|error| write_failure(&error))?;
+    unfinished.0 = None;
     Ok(Fetched {
         path,
         bytes: received,
@@ -250,6 +263,17 @@ fn http_client() -> Result<
         hyper_util::client::legacy::Client::builder(hyper_util::rt::TokioExecutor::new())
             .build(connector),
     )
+}
+
+/// Removes a fetch's directory unless the fetch completed.
+struct Unfinished(Option<PathBuf>);
+
+impl Drop for Unfinished {
+    fn drop(&mut self) {
+        if let Some(directory) = self.0.take() {
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
 }
 
 /// A `file:` page is already a file, so it is used where it is.
@@ -293,11 +317,20 @@ pub fn save_into(fetched: &Fetched, directory: &Path, keep: bool) -> io::Result<
         if candidate.exists() {
             continue;
         }
-        if !fetched.original && !keep && std::fs::rename(&fetched.path, &candidate).is_ok() {
-            if let Some(parent) = fetched.path.parent() {
-                let _ = std::fs::remove_dir(parent);
+        // A hard link never replaces a file that appeared since the check,
+        // which a rename would.
+        if !fetched.original && !keep {
+            match std::fs::hard_link(&fetched.path, &candidate) {
+                Ok(()) => {
+                    let _ = std::fs::remove_file(&fetched.path);
+                    if let Some(parent) = fetched.path.parent() {
+                        let _ = std::fs::remove_dir(parent);
+                    }
+                    return Ok(candidate);
+                }
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {}
             }
-            return Ok(candidate);
         }
         // Another file system, or the reader's own file: copy without
         // replacing anything that appeared meanwhile.
@@ -454,6 +487,15 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&decoded).into_owned()
 }
 
+/// Whether `character` changes the order text is shown in, which would let a
+/// name such as `invoice\u{202E}fdp.exe` display as `invoiceexe.pdf`.
+fn reorders(character: char) -> bool {
+    matches!(
+        character,
+        '\u{061C}' | '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}'
+    )
+}
+
 /// Keeps a name to one path component a file system and a file manager both
 /// show plainly: no separators, control characters or leading dots, and no
 /// more than [`MAX_FILE_NAME`] bytes.
@@ -462,7 +504,7 @@ fn sanitize(name: &str) -> String {
         .chars()
         .map(|character| match character {
             '/' | '\\' | ':' => '_',
-            character if character.is_control() => '_',
+            character if character.is_control() || reorders(character) => '_',
             character => character,
         })
         .collect();
@@ -538,6 +580,11 @@ mod tests {
             "download",
             "a name with nothing left falls back to the URL"
         );
+    }
+
+    #[test]
+    fn a_name_cannot_reorder_how_it_reads() {
+        assert_eq!(sanitize("invoice\u{202E}fdp.exe"), "invoice_fdp.exe");
     }
 
     #[test]
@@ -732,6 +779,23 @@ mod tests {
             "{}",
             followed[0]
         );
+    }
+
+    #[tokio::test]
+    async fn a_cut_off_download_leaves_nothing_in_the_cache() {
+        let (base, served) = serve(vec![
+            "HTTP/1.1 200 OK\r\nContent-Type: application/pdf\r\nContent-Length: 100\r\nConnection: close\r\n\r\n%PDF-".into(),
+        ])
+        .await;
+        let cache = tempfile::tempdir().unwrap();
+        let result = finish(fetch_document(
+            document(base.join("paper.pdf").unwrap(), None),
+            cache.path().to_owned(),
+        ))
+        .await;
+        assert!(result.is_err(), "{result:?}");
+        served.await.unwrap();
+        assert_eq!(std::fs::read_dir(cache.path()).unwrap().count(), 0);
     }
 
     #[tokio::test]

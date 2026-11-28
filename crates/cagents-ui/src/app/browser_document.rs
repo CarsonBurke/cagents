@@ -25,6 +25,9 @@ pub(super) struct BrowserDocument {
     /// Where the reader saved the file, once they have.
     saved: Option<PathBuf>,
     saving: bool,
+    /// Whether another application was given the cached copy, which then
+    /// stays until the cache's own expiry rather than vanishing under it.
+    handed_out: bool,
     /// Dropping the document stops its fetch.
     _fetching: Option<iced::task::Handle>,
 }
@@ -51,6 +54,7 @@ pub enum Action {
     Download,
     OpenExternally,
     Retry,
+    Cancel,
     ShowSaved,
 }
 
@@ -64,6 +68,35 @@ impl BrowserDocument {
     pub(super) fn holds(&self, document: &UnrenderableDocument) -> bool {
         self.document.url == document.url && !matches!(self.fetch, Fetch::Failed(_))
     }
+
+    /// Renders the open PDF's pages again for a display of another density.
+    pub(super) fn rescale(&mut self, card: CardId, scale_factor: f32) -> Task<Message> {
+        let generation = self.generation;
+        self.viewer.as_mut().map_or_else(Task::none, |viewer| {
+            viewer.set_scale_factor(scale_factor).map(move |action| {
+                cosmic::Action::App(Message::BrowserDocument(
+                    card,
+                    Action::Viewer(generation, action),
+                ))
+            })
+        })
+    }
+
+    /// Renders the open PDF's pages again for `theme`, unless the reader
+    /// chose a tone themselves.
+    pub(super) fn retone(&mut self, card: CardId, theme: &cosmic::Theme) -> Task<Message> {
+        let generation = self.generation;
+        self.viewer.as_mut().map_or_else(Task::none, |viewer| {
+            viewer
+                .set_theme_tone(crate::pdf_viewer::theme_tone(theme))
+                .map(move |action| {
+                    cosmic::Action::App(Message::BrowserDocument(
+                        card,
+                        Action::Viewer(generation, action),
+                    ))
+                })
+        })
+    }
 }
 
 /// The cached copy is the application's, and nothing reads it once the
@@ -73,7 +106,7 @@ impl Drop for BrowserDocument {
         let Fetch::Done(fetched) = &self.fetch else {
             return;
         };
-        if fetched.original {
+        if fetched.original || self.handed_out {
             return;
         }
         if let Some(directory) = fetched.path.parent().map(Path::to_path_buf) {
@@ -137,6 +170,7 @@ impl Cagents {
             viewer: None,
             saved: None,
             saving: false,
+            handed_out: false,
             _fetching: None,
         }));
         if pdf {
@@ -147,12 +181,18 @@ impl Cagents {
     }
 
     /// The browser moved to `url`; a document for another page is put away.
+    /// A fragment, such as a PDF link's `#page=2`, is the same document.
     pub(super) fn browser_document_left(&mut self, card: CardId, url: &Url) {
+        let without_fragment = |url: &Url| {
+            let mut url = url.clone();
+            url.set_fragment(None);
+            url
+        };
         if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&card)
             && browser
                 .document
                 .as_ref()
-                .is_some_and(|document| document.url() != url)
+                .is_some_and(|document| without_fragment(document.url()) != without_fragment(url))
         {
             browser.document = None;
         }
@@ -270,11 +310,41 @@ impl Cagents {
             Action::Download => self.save_browser_document(card),
             Action::OpenExternally => self.open_browser_document(card),
             Action::Retry => {
+                let tone = crate::pdf_viewer::theme_tone(&cosmic::theme::active());
+                let scale =
+                    effective_surface_scale(self.window_scale_factor, self.settings.ui_scale);
                 let Some(document) = self.browser_document_mut(card, None) else {
                     return Task::none();
                 };
+                // A PDF that was fetched but failed to open is opened again;
+                // anything else is fetched again.
+                if let (Some(viewer), Fetch::Done(fetched)) = (&document.viewer, &document.fetch)
+                    && viewer.failure().is_some()
+                {
+                    let generation = document.generation;
+                    let (viewer, task) = PdfDocument::open(fetched.path.clone(), tone, scale);
+                    document.viewer = Some(viewer);
+                    return task.map(move |action| {
+                        cosmic::Action::App(Message::BrowserDocument(
+                            card,
+                            Action::Viewer(generation, action),
+                        ))
+                    });
+                }
                 let intent = document.intent;
                 self.start_browser_document_fetch(card, intent)
+            }
+            Action::Cancel => {
+                if let Some(document) = self.browser_document_mut(card, None)
+                    && matches!(document.fetch, Fetch::Running { .. })
+                {
+                    document._fetching = None;
+                    document.fetch = match document.intent {
+                        Intent::View => Fetch::Failed("Loading was stopped.".to_owned()),
+                        Intent::Save | Intent::Open => Fetch::Idle,
+                    };
+                }
+                Task::none()
             }
             Action::Saved(generation, result) => {
                 let Some(document) = self.browser_document_mut(card, Some(generation)) else {
@@ -383,6 +453,7 @@ impl Cagents {
         let Ok(url) = Url::from_file_path(&path) else {
             return Task::none();
         };
+        document.handed_out = true;
         let opened = self.system_url_opener.open(url);
         cosmic::task::future(async move { Message::BrowserDocumentOpened(opened.await) })
     }
@@ -396,6 +467,13 @@ impl Cagents {
     ) -> Element<'a, Message> {
         let generation = document.generation;
         let content: Element<'a, Message> = match (&document.viewer, &document.fetch) {
+            // The first page brings every page's size, so until it lands
+            // there is no column to lay out.
+            (Some(viewer), _) if viewer.page_count() == 0 && viewer.failure().is_none() => {
+                crate::ui_controls::placeholder("Loading PDF")
+                    .icon(Icon::Import)
+                    .into()
+            }
             (Some(viewer), _) if viewer.failure().is_none() => {
                 let mut controls: Vec<Element<'a, Message>> = viewer
                     .controls()
@@ -430,7 +508,16 @@ impl Cagents {
             (Some(viewer), _) => crate::ui_controls::placeholder("This PDF can't be shown")
                 .icon(Icon::Warning)
                 .detail(viewer.failure().unwrap_or_default())
-                .action(self.browser_document_fallbacks(card, document))
+                .action(
+                    widget::column::with_children(vec![
+                        self.browser_document_fallbacks(card, document),
+                        crate::ui_controls::button::secondary("Try again")
+                            .on_press(Message::BrowserDocument(card, Action::Retry))
+                            .into(),
+                    ])
+                    .spacing(space::S)
+                    .align_x(Alignment::Center),
+                )
                 .into(),
             (None, Fetch::Running { received, total }) => {
                 let progress = match total {
@@ -448,6 +535,10 @@ impl Cagents {
                 crate::ui_controls::placeholder(title)
                     .icon(Icon::Import)
                     .detail(progress)
+                    .action(
+                        crate::ui_controls::button::secondary("Cancel")
+                            .on_press(Message::BrowserDocument(card, Action::Cancel)),
+                    )
                     .into()
             }
             (None, Fetch::Failed(message)) if document.intent == Intent::View => {
