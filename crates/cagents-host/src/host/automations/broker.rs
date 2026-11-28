@@ -1123,9 +1123,12 @@ impl Handle {
         if worker.revision() != revision {
             return Err("Precheck retirement does not match its mapped worker".into());
         }
-        worker
-            .forget_retirement()
-            .map_err(|error| error.to_string())?;
+        if let Err(error) = worker.forget_retirement() {
+            // Only receipt reclamation remains. Keep the mapped worker so
+            // another tick can retry, including an unlink whose fsync failed.
+            tracing::warn!(%id, %error, "retired precheck receipt could not be reclaimed");
+            return Ok(());
+        }
         workers.remove(&id);
         Ok(())
     }
@@ -1633,6 +1636,86 @@ mod tests {
         let automation = registry.automation(automation.id).unwrap();
         assert!(!automation.enabled);
         assert!(automation.next.is_none());
+    }
+
+    #[test]
+    fn an_unremovable_retired_precheck_receipt_does_not_block_due_work() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_directory, host, handle, automation) = manual_precheck_fixture();
+        let now = service::now().unwrap();
+        let minute = (now / 60_000 + 12 * 60) % (24 * 60);
+        let mut definition = automation.definition;
+        definition.schedule.pattern = crate::automations::SchedulePattern::Daily {
+            hour: (minute / 60).try_into().unwrap(),
+            minute: (minute % 60).try_into().unwrap(),
+        };
+        let previous = Compiled::new(&definition.schedule)
+            .unwrap()
+            .next_after(now - 24 * 60 * 60 * 1000)
+            .unwrap();
+        assert!(previous.due_ms < now);
+        {
+            let mut registry = handle.0.registry.lock().unwrap();
+            let (_, identity) = registry.automation_for_start(automation.id).unwrap();
+            let automation = registry
+                .edit_automation(
+                    automation.id,
+                    automation.revision,
+                    definition,
+                    now,
+                    identity,
+                )
+                .unwrap();
+            registry
+                .set_automation_enabled(
+                    automation.id,
+                    automation.revision,
+                    Some(previous.clone()),
+                    true,
+                    now,
+                )
+                .unwrap();
+        }
+
+        // The firing row has already been pruned after its durable cleanup
+        // ACK. Its exact on-disk retirement receipt is all that remains.
+        let root = &handle.0.root;
+        std::fs::create_dir(root).unwrap();
+        let firing = Uuid::new_v4();
+        let receipt = root.join(format!("{firing}.retired"));
+        let bytes = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "firing": firing, "revision": 1, "device": 2, "inode": 3
+        }))
+        .unwrap();
+        std::fs::write(&receipt, &bytes).unwrap();
+        std::fs::set_permissions(&receipt, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        handle
+            .0
+            .workers
+            .lock()
+            .unwrap()
+            .insert(firing, Worker::recover(root, firing, 1));
+        let tick = handle.tick(&host);
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        tick.expect("receipt collection must not block other automations");
+        assert_eq!(std::fs::read(&receipt).unwrap(), bytes);
+        let next = handle
+            .0
+            .registry
+            .lock()
+            .unwrap()
+            .automation(automation.id)
+            .unwrap()
+            .next
+            .unwrap();
+        assert!(next.due_ms > now, "overdue schedule did not advance");
+        handle.tick(&host).unwrap();
+        assert!(
+            !receipt.exists(),
+            "the next tick should reclaim the receipt"
+        );
     }
 
     #[test]
