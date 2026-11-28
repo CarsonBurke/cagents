@@ -3968,6 +3968,8 @@ pub(super) struct Runtime {
     child_cache_keys: HashMap<usize, String>,
     row_expansions: Vec<(RowTarget, bool)>,
     row_unfolded: HashSet<(RowTarget, String)>,
+    find_expanded_rows: HashSet<RowTarget>,
+    find_unfolded_rows: HashSet<(RowTarget, String)>,
     /// Each child's own disclosures, stamped separately so pruning departed
     /// children never disturbs the selected child's.
     child_expanded: HashMap<String, Revised<HashSet<String>>>,
@@ -5710,6 +5712,8 @@ impl Runtime {
             child_cache_keys: HashMap::new(),
             row_expansions: Vec::new(),
             row_unfolded: HashSet::new(),
+            find_expanded_rows: HashSet::new(),
+            find_unfolded_rows: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
@@ -5798,6 +5802,8 @@ impl Runtime {
         self.child_cache_keys.clear();
         self.row_expansions.clear();
         self.row_unfolded.clear();
+        self.find_expanded_rows.clear();
+        self.find_unfolded_rows.clear();
         self.child_expanded.clear();
         self.child_unfolded.clear();
         self.answers.clear();
@@ -6455,6 +6461,13 @@ impl Runtime {
         }
     }
     fn row_expanded(&self, item: &chat::Item) -> bool {
+        if self
+            .find_expanded_rows
+            .iter()
+            .any(|row| row.is(item, self.selected_subagent.as_deref()))
+        {
+            return true;
+        }
         self.row_expansions
             .iter()
             .find_map(|(row, open)| {
@@ -6488,10 +6501,13 @@ impl Runtime {
     }
 
     fn row_unfolded_parts<'a>(&'a self, item: &'a chat::Item) -> impl Iterator<Item = &'a str> {
-        self.row_unfolded.iter().filter_map(|(row, part)| {
-            row.is(item, self.selected_subagent.as_deref())
-                .then_some(part.as_str())
-        })
+        self.row_unfolded
+            .iter()
+            .chain(&self.find_unfolded_rows)
+            .filter_map(|(row, part)| {
+                row.is(item, self.selected_subagent.as_deref())
+                    .then_some(part.as_str())
+            })
     }
     fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
         self.presentation_cache()
@@ -6724,8 +6740,19 @@ impl Runtime {
                 .retain(|(row, _)| row.item.strong_count() != 0);
             self.row_unfolded
                 .retain(|(row, _)| row.item.strong_count() != 0);
+            self.find_expanded_rows
+                .retain(|row| row.item.strong_count() != 0);
+            self.find_unfolded_rows
+                .retain(|(row, _)| row.item.strong_count() != 0);
         }
         let row_expanded = |item: &chat::Item| {
+            if self
+                .find_expanded_rows
+                .iter()
+                .any(|row| row.is(item, context.as_deref()))
+            {
+                return true;
+            }
             self.row_expansions
                 .iter()
                 .find_map(|(row, open)| row.is(item, context.as_deref()).then_some(*open))
@@ -7785,7 +7812,7 @@ impl Runtime {
 
     fn restore_find_disclosures(&mut self) {
         self.restore_failure_find();
-        let collapsed =
+        let mut collapsed =
             self.find_disclosure
                 .restore(&mut self.expanded, &mut self.unfolded, &mut self.opened);
         // Restoring reads a child's disclosures before it writes them; an
@@ -7800,6 +7827,29 @@ impl Runtime {
             );
             if self.selected_subagent.as_ref() == Some(&child) {
                 child_collapsed = restored;
+            }
+        }
+        self.find_unfolded_rows.clear();
+        for row in self.find_expanded_rows.drain() {
+            let Some(item) = row.item.upgrade() else {
+                continue;
+            };
+            let (keys, cache, collapsed) = match &row.child {
+                None => (&self.parent_cache_keys, &self.cache, &mut collapsed),
+                Some(child) if self.selected_subagent.as_ref() == Some(child) => (
+                    &self.child_cache_keys,
+                    &self.child_cache,
+                    &mut child_collapsed,
+                ),
+                Some(_) => continue,
+            };
+            let key = row_cache_key(keys, &item);
+            if cache
+                .get(key)
+                .and_then(|cached| cached.item.as_ref())
+                .is_some_and(|cached| Arc::ptr_eq(cached, &item))
+            {
+                collapsed.push(key.to_owned());
             }
         }
         // A temporary Find reveal owns the report's parsed body too. Drop it
@@ -18203,6 +18253,7 @@ impl Cagents {
                     runtime.find_navigation.cancel();
                     if requires_row_identity(&runtime.colliding_row_ids, &id) {
                         let row = runtime.row_target(&item);
+                        runtime.find_expanded_rows.remove(&row);
                         runtime
                             .row_expansions
                             .retain(|(current, _)| current != &row);
@@ -18516,7 +18567,9 @@ impl Cagents {
                     if requires_row_identity(&runtime.colliding_row_ids, &item.id) {
                         let choice = (runtime.row_target(item), part);
                         runtime.find_navigation.cancel();
-                        if !runtime.row_unfolded.remove(&choice) {
+                        if !runtime.find_unfolded_rows.remove(&choice)
+                            && !runtime.row_unfolded.remove(&choice)
+                        {
                             runtime.row_unfolded.insert(choice);
                         }
                         return Task::none();

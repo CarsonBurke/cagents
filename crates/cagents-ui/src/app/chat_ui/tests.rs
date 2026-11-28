@@ -6168,6 +6168,44 @@ fn copy_and_disclosures_stay_with_their_row_across_separate_history_windows() {
 }
 
 #[test]
+fn find_reveals_and_restores_only_the_matching_report_continuation() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let report = |body: &str| {
+        Arc::new(chat::Item {
+            id: "report:native-part:1:delivery:131072-140000:0-0".into(),
+            role: chat::Role::User,
+            content: ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: String::new(),
+                sender: "Fixture".into(),
+                summary: "Review report".into(),
+                body: body.into(),
+            },
+            at: None,
+            started_at: None,
+        })
+    };
+    let neighbor = report("Summary of the first review");
+    let matching = report("The second report includes an exact-find-needle");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![neighbor.clone(), matching.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    drop(find_navigation::find_for_test(
+        &mut app,
+        target,
+        "exact-find-needle".into(),
+    ));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.row_expanded(&matching));
+    assert!(!runtime.row_expanded(&neighbor));
+    runtime.restore_find_disclosures();
+    assert!(!runtime.row_expanded(&matching));
+}
+
+#[test]
 fn selected_presentation_same_item_id_keeps_parent_and_child_copy_independent() {
     use iced::futures::StreamExt;
     let mut app = crate::app::tests::context_inspector_test_app(false);
