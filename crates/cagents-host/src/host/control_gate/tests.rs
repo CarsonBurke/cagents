@@ -1,4 +1,4 @@
-use super::{ControlGate, Counts};
+use super::{ControlGate, Counts, WaitFailure};
 use std::{
     sync::{
         Arc,
@@ -433,4 +433,16 @@ fn queued_and_unqueued_writers_competing_are_each_admitted_alone() {
         ),
         (0, false, 0, 0)
     );
+}
+
+#[test]
+fn an_abandoned_request_cannot_enter_an_empty_gate() {
+    let gate = ControlGate::default();
+    assert_eq!(
+        gate.exclusive_until_while_connected(Instant::now() + Duration::from_secs(30), || true)
+            .unwrap_err(),
+        WaitFailure::Abandoned,
+    );
+    assert!(gate.try_shared().is_some());
+    assert!(gate.try_exclusive().is_some());
 }

@@ -1,7 +1,7 @@
 use std::{
     io::{self, Read},
     net::Shutdown,
-    os::unix::net::UnixStream,
+    os::{fd::AsRawFd, unix::net::UnixStream},
     sync::{Arc, TryLockError},
     thread,
     time::{Duration, Instant},
@@ -20,7 +20,7 @@ use crate::{
 };
 
 use super::{
-    control_gate::{self, ControlGate, Exclusive, Shared},
+    control_gate::{self, ControlGate, Exclusive, Shared, WaitFailure},
     delivery::DeliveryQueue,
     state::{ClientId, SharedHost, send_error, spawn_terminal},
 };
@@ -134,11 +134,34 @@ impl Drop for CheckedCloseReply {
     }
 }
 
-type RequestHandler<R> =
-    fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome<R>, ProtocolError>;
+enum WireFailure {
+    Refused(ProtocolError),
+    Abandoned,
+}
+
+impl From<ProtocolError> for WireFailure {
+    fn from(error: ProtocolError) -> Self {
+        Self::Refused(error)
+    }
+}
+
+impl WireFailure {
+    fn reply(self) -> ProtocolError {
+        match self {
+            Self::Refused(error) => error,
+            Self::Abandoned => ProtocolError::new(
+                ProtocolErrorCode::NotAdmitted,
+                "The client withdrew the request while it was waiting for the daemon",
+                false,
+            ),
+        }
+    }
+}
 
 pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
-    serve_with(stream, client_id, host, process_wire_request);
+    serve_connection(stream, client_id, host, |host, client, request, stream| {
+        process_wire_request(host, client, request, Some(stream))
+    });
 }
 
 /// Lifecycle parks without a timer, so a request that removes a retention
@@ -194,11 +217,28 @@ fn peer_runs_cli(pid: u32) -> bool {
         .is_ok_and(|(executable, command_line)| is_cli_peer(&executable, &command_line))
 }
 
+#[cfg(test)]
 fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
     stream: UnixStream,
     client_id: ClientId,
     host: SharedHost,
-    handle: RequestHandler<R>,
+    handle: fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome<R>, ProtocolError>,
+) {
+    serve_connection(stream, client_id, host, |host, client, request, _| {
+        handle(host, client, request).map_err(WireFailure::from)
+    });
+}
+
+fn serve_connection<R: Into<crate::terminal_ipc::PreparedResponse>>(
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    handle: impl Fn(
+        &SharedHost,
+        ClientId,
+        ClientRequest,
+        &UnixStream,
+    ) -> Result<RequestOutcome<R>, WireFailure>,
 ) {
     let registration = Registration::new(Arc::clone(&host), client_id);
     let delivery = Arc::clone(&registration.delivery);
@@ -424,14 +464,15 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
             None
         };
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            handle(&host, client_id, request)
+            handle(&host, client_id, request, &reader)
         }))
         .unwrap_or_else(|_| {
             Err(ProtocolError::new(
                 ProtocolErrorCode::Internal,
                 "the daemon failed while handling this request",
                 false,
-            ))
+            )
+            .into())
         });
         if releases_retention {
             crate::daemon::wake();
@@ -472,8 +513,12 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                     }
                 }
             }
-            Err(error) => {
-                if push_error(&delivery, &host, request_id, error).is_err() {
+            Err(failure) => {
+                let abandoned = matches!(failure, WireFailure::Abandoned);
+                let queued = push_error(&delivery, &host, request_id, failure.reply());
+                // A write-half close can still receive the refusal. Once
+                // abandoned, no more requests on this connection may run.
+                if abandoned || queued.is_err() {
                     break;
                 }
             }
@@ -1139,7 +1184,8 @@ pub(super) fn process_request(
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
-    let (response, extras, shutdown) = process_wire_request(host, client_id, request)?;
+    let (response, extras, shutdown) =
+        process_wire_request(host, client_id, request, None).map_err(WireFailure::reply)?;
     Ok((
         response
             .decode()
@@ -1155,8 +1201,8 @@ pub(super) fn process_request(
 const MERGED_WORKTREE_REMOVAL_PATIENCE: Duration = Duration::from_secs(10);
 
 /// The requests that hold the control gate exclusively, and how long each waits
-/// for it: half of what its client allows for the reply. The daemon then never
-/// runs one its client has given up on, and the admitted work has the other half.
+/// for it: half of what its client allows for the reply, leaving the other
+/// half for admitted work.
 fn exclusive_patience(request: &ClientRequest) -> Option<Duration> {
     match request {
         // `ControlClient::request_strict` waits five seconds for the reply.
@@ -1245,11 +1291,75 @@ fn admission(
     })
 }
 
+/// Inspect the connection without consuming a pipelined frame. A full
+/// hangup can accompany readable input. For an automatic switch only, EOF
+/// also withdraws the pending request: the device bridge forwards the caller's
+/// departure by closing its write half, and a caller can keep reading for the
+/// correlated refusal.
+fn request_abandoned(stream: &UnixStream, cancel_on_eof: bool) -> bool {
+    #[cfg(target_os = "linux")]
+    let eof_event = libc::POLLRDHUP;
+    #[cfg(not(target_os = "linux"))]
+    let eof_event = libc::POLLIN;
+    let read_events = if cancel_on_eof { eof_event } else { 0 };
+    let mut socket = libc::pollfd {
+        fd: stream.as_raw_fd(),
+        // Darwin needs a requested event to watch the descriptor for hangup.
+        events: libc::POLLOUT | read_events,
+        revents: 0,
+    };
+    loop {
+        // SAFETY: socket describes the borrowed stream and poll has no wait.
+        let ready = unsafe { libc::poll(&mut socket, 1, 0) };
+        if ready >= 0 {
+            break;
+        }
+        if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+            return true;
+        }
+    }
+    if socket.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+        return true;
+    }
+    if socket.revents & read_events == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        true
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let mut byte = 0_u8;
+        loop {
+            // SAFETY: the descriptor belongs to stream and byte is writable.
+            // MSG_PEEK leaves any queued data for the connection reader.
+            let read = unsafe {
+                libc::recv(
+                    socket.fd,
+                    (&mut byte as *mut u8).cast(),
+                    1,
+                    libc::MSG_PEEK | libc::MSG_DONTWAIT,
+                )
+            };
+            if read >= 0 {
+                return read == 0;
+            }
+            match io::Error::last_os_error().kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => return false,
+                _ => return true,
+            }
+        }
+    }
+}
+
 fn process_wire_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
-) -> Result<RequestOutcome<crate::terminal_ipc::PreparedResponse>, ProtocolError> {
+    stream: Option<&UnixStream>,
+) -> Result<RequestOutcome<crate::terminal_ipc::PreparedResponse>, WireFailure> {
     admission(&request, || {
         ensure_request_open(host, &request)?;
         ensure_startup_recovery_request(host, &request)
@@ -1375,13 +1485,29 @@ fn process_wire_request(
     // Inventory decisions and commit must wait for all previously admitted
     // effects, including provider closes that finish outside HostState.
     let (_exclusive, _shared) = match exclusive_patience(&request) {
-        Some(patience) => (
-            Some(
-                gate.exclusive_until(Instant::now() + patience)
-                    .ok_or_else(control_gate::busy)?,
-            ),
-            None,
-        ),
+        Some(patience) => {
+            let deadline = Instant::now() + patience;
+            let exclusive = if let Some(stream) = stream {
+                let automatic_switch = matches!(
+                    request,
+                    ClientRequest::ChatRecoverAccount {
+                        idle_generation: Some(_),
+                        ..
+                    }
+                );
+                gate.exclusive_until_while_connected(deadline, || {
+                    request_abandoned(stream, automatic_switch)
+                })
+                .map_err(|failure| match failure {
+                    WaitFailure::Busy => control_gate::busy().into(),
+                    WaitFailure::Abandoned => WireFailure::Abandoned,
+                })?
+            } else {
+                gate.exclusive_until(deadline)
+                    .ok_or_else(control_gate::busy)?
+            };
+            (Some(exclusive), None)
+        }
         // A snapshot waits for the worker's next frame, which can take
         // seconds. It is admitted as terminal I/O only while its read is
         // queued (`state::client_snapshot`), so it neither holds back the
@@ -1409,7 +1535,8 @@ fn process_wire_request(
             ProtocolErrorCode::TerminalUnavailable,
             super::state::RETAINED_CHILD_CLEANUP_MESSAGE,
             true,
-        ));
+        )
+        .into());
     }
     if shutdown_admission
         || matches!(
@@ -1433,7 +1560,8 @@ fn process_wire_request(
                     "Terminal retirement is pending; retry shutdown or upgrade after cleanup settles"
                 },
                 true,
-            ));
+            )
+            .into());
         }
     }
     if let ClientRequest::ChatRead {
@@ -1442,7 +1570,8 @@ fn process_wire_request(
     } = request
     {
         return super::chat::read_presentation(host, client_id, chat_id, after_generation)
-            .map(|response| (response, Vec::new(), false));
+            .map(|response| (response, Vec::new(), false))
+            .map_err(WireFailure::from);
     }
     let (response, extras, shutdown) =
         process_admitted_request(host, client_id, request, _shared, false)?;

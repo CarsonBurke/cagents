@@ -51,7 +51,7 @@
 
 use std::{
     sync::{Condvar, Mutex, MutexGuard},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use crate::terminal_ipc::{DAEMON_BUSY, ProtocolError, ProtocolErrorCode};
@@ -103,6 +103,18 @@ pub(super) struct ControlGate {
 #[derive(Debug)]
 #[must_use = "admission ends when the guard is dropped"]
 pub(super) struct Shared<'gate>(&'gate ControlGate);
+
+/// Why a client's request left the exclusive queue without admission.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WaitFailure {
+    Busy,
+    Abandoned,
+}
+
+// A condition variable wakes for gate changes, not socket changes. Sample
+// the peer while a request waits so a vanished writer stops holding back
+// ordinary requests even when the current holder is still inside.
+const PEER_CHECK_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Exclusive admission, released on drop.
 #[derive(Debug)]
@@ -164,25 +176,35 @@ impl ControlGate {
     /// Queued exclusive admission once the shared holders inside have left, or
     /// `None` at `deadline`. While it waits, new ordinary requests wait for it.
     pub(super) fn exclusive_until(&self, deadline: Instant) -> Option<Exclusive<'_>> {
-        self.enter_exclusive(Some(deadline), true)
+        self.enter_exclusive(Some(deadline), true, None).ok()
+    }
+
+    /// Queued admission for a wire request. The nonblocking peer check also
+    /// runs just before granting the gate, including when it is already free.
+    pub(super) fn exclusive_until_while_connected(
+        &self,
+        deadline: Instant,
+        abandoned: impl Fn() -> bool,
+    ) -> Result<Exclusive<'_>, WaitFailure> {
+        self.enter_exclusive(Some(deadline), true, Some(&abandoned))
     }
 
     /// Exclusive admission whenever the gate is next free, or `None` at
     /// `deadline`. It holds back no other request while it waits.
     pub(super) fn exclusive_when_free_until(&self, deadline: Instant) -> Option<Exclusive<'_>> {
-        self.enter_exclusive(Some(deadline), false)
+        self.enter_exclusive(Some(deadline), false, None).ok()
     }
 
     /// Background retirement waits for a gap without delaying new requests.
     pub(super) fn exclusive_when_free(&self) -> Exclusive<'_> {
-        self.enter_exclusive(None, false)
+        self.enter_exclusive(None, false, None)
             .expect("an exclusive wait without a deadline cannot expire")
     }
 
     /// Queued exclusive admission without a deadline. Only for daemon exit,
     /// which must win and has no client to ask to retry.
     pub(super) fn exclusive(&self) -> Exclusive<'_> {
-        self.enter_exclusive(None, true)
+        self.enter_exclusive(None, true, None)
             .expect("an exclusive wait without a deadline cannot expire")
     }
 
@@ -193,14 +215,22 @@ impl ControlGate {
         self.counts().unqueued
     }
 
-    fn enter_exclusive(&self, deadline: Option<Instant>, queue: bool) -> Option<Exclusive<'_>> {
+    fn enter_exclusive(
+        &self,
+        deadline: Option<Instant>,
+        queue: bool,
+        abandoned: Option<&dyn Fn() -> bool>,
+    ) -> Result<Exclusive<'_>, WaitFailure> {
         let mut counts = self.counts();
         *counts.waiters(queue) += 1;
-        loop {
+        let failure = loop {
+            if abandoned.is_some_and(|abandoned| abandoned()) {
+                break WaitFailure::Abandoned;
+            }
             if counts.admits_exclusive() && (queue || counts.queued == 0) {
                 *counts.waiters(queue) -= 1;
                 counts.exclusive = true;
-                return Some(Exclusive(self));
+                return Ok(Exclusive(self));
             }
             counts = match deadline {
                 None => self.wait(counts),
@@ -209,7 +239,12 @@ impl ControlGate {
                         .checked_duration_since(Instant::now())
                         .filter(|remaining| !remaining.is_zero())
                     else {
-                        break;
+                        break WaitFailure::Busy;
+                    };
+                    let remaining = if abandoned.is_some() {
+                        remaining.min(PEER_CHECK_INTERVAL)
+                    } else {
+                        remaining
                     };
                     self.changed
                         .wait_timeout(counts, remaining)
@@ -217,7 +252,7 @@ impl ControlGate {
                         .0
                 }
             };
-        }
+        };
         *counts.waiters(queue) -= 1;
         let released = queue && counts.queued == 0;
         drop(counts);
@@ -225,7 +260,7 @@ impl ControlGate {
             // Requests held back for this one may enter now.
             self.changed.notify_all();
         }
-        None
+        Err(failure)
     }
 }
 
