@@ -17,6 +17,8 @@ PROMOTE=
 SMOKE_ROOTFS=
 BRIDGE_DIR=
 export LC_ALL=C
+# Archive validation parses a fixed listing format.
+unset TAR_OPTIONS
 
 fail() {
     printf '%s: %s\n' "$PROGRAM" "$*" >&2

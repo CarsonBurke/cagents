@@ -651,6 +651,10 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
     def test_archive_requires_the_ui_lease_marker_independently_of_autostart(self):
         self.assert_missing_member_rejected('bin/.cagents-ui-lease-v1')
 
+    def test_archive_validation_ignores_user_tar_options(self):
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        self.assert_installed(self.install(), 'candidate')
+
     def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
         self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')
 

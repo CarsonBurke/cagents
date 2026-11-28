@@ -600,6 +600,13 @@ class PublisherSignatures(unittest.TestCase):
                        check=True, capture_output=True, timeout=HANG_GUARD)
         self.sign(dist, signers)
 
+    def test_archive_validation_ignores_user_tar_options(self):
+        bridge = self.bridges(release_metadata=self.bundle("0.2.4", ["old"]))
+        candidate = self.bundle("0.2.5", ["new"])
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        result = self.verify("0.2.5", candidate, "--bridge", str(bridge))
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])
         signature = (dist / "release-metadata.json.sig").read_text()
