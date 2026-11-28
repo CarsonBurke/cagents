@@ -8224,7 +8224,10 @@ fn live_codex_source(chat: TerminalId) -> Result<Option<TerminalSession>, String
 /// A conversation the provider named resumes in its CLI, exactly as the
 /// daemon's own return would start it. Before a conversation has an identity,
 /// open the selected provider's interactive CLI with its account and policy.
-fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> {
+fn local_return_launch(
+    session: &chat::Session,
+    mode: Option<&str>,
+) -> Result<LaunchRecipe, String> {
     if session.launch.session_id.is_none() {
         let mut fresh = session.clone();
         fresh.reset_owned_codex_listener();
@@ -8248,13 +8251,12 @@ fn local_return_launch(session: &chat::Session) -> Result<LaunchRecipe, String> 
             }
             recipe.arguments = interactive;
         }
-        return crate::model::agent_recovery::fresh_recipe(&recipe)
-            .ok_or_else(|| "Cannot form a safe provider CLI launch command.".to_owned());
+        let mut recipe = crate::model::agent_recovery::fresh_recipe(&recipe)
+            .ok_or_else(|| "Cannot form a safe provider CLI launch command.".to_owned())?;
+        chat::apply_terminal_permission_mode(&mut recipe, session.launch.provider, mode)?;
+        return Ok(recipe);
     }
-    session
-        .launch
-        .terminal_recipe()
-        .ok_or_else(|| "Cannot form a safe exact-session terminal resume command.".to_owned())
+    Ok(session.launch.terminal_recipe_with_permission_mode(mode)?)
 }
 
 /// A new conversation for `provider` on `account`.
@@ -12237,23 +12239,17 @@ impl Cagents {
         let Some(session) = self.chat_return_session(card) else {
             return Task::none();
         };
-        let mut launch = match local_return_launch(&session) {
+        let mode = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.snapshot.permission_mode.as_deref(),
+            _ => None,
+        };
+        let launch = match local_return_launch(&session, mode) {
             Ok(launch) => launch,
             Err(error) => {
                 self.status = Some(TransientNotice::error(error));
                 return Task::none();
             }
         };
-        if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card)
-            && let Some(mode) = runtime.snapshot.permission_mode.as_deref()
-        {
-            // The terminal resumes in the mode the conversation is in now.
-            if session.launch.provider == Provider::Claude {
-                chat::apply_claude_permission_mode(&mut launch, mode);
-            } else {
-                chat::apply_acp_permission_mode(&mut launch, session.launch.provider, mode);
-            }
-        }
         let resumes = session.launch.session_id.is_some();
         let handle = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) if runtime.connected() => runtime.handle().cloned(),

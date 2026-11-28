@@ -1929,6 +1929,149 @@ fn durable_terminal_commit_retires_evidence_after_terminal_retirement() {
 }
 
 #[test]
+fn muse_return_refuses_an_unrepresentable_live_mode_before_closing() {
+    let (host, chat_id, handle) = muse_return_actor(false);
+    let failure = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("no equivalent for Deny unmatched actions"),
+        "{failure:?}"
+    );
+    assert!(!handle.is_completed());
+    {
+        let state = host.lock().unwrap();
+        assert!(!state.chats[&chat_id].returning_terminal);
+        assert!(state.terminals.is_empty());
+    }
+    handle.close().unwrap();
+}
+
+#[test]
+fn muse_return_leaves_a_reopenable_chat_if_its_mode_changes_during_close() {
+    let (host, chat_id, handle) = muse_return_actor(true);
+    let failure = process(&host, 1, ClientRequest::ChatReturnTerminal { chat_id }).unwrap_err();
+    assert!(
+        failure.message.contains("Reopen it in chat to continue"),
+        "{failure:?}"
+    );
+    assert!(handle.is_completed());
+    let state = host.lock().unwrap();
+    assert!(!state.chats[&chat_id].returning_terminal);
+    assert!(state.terminals.is_empty());
+    assert!(state.handoff_terminals.is_empty());
+}
+
+fn muse_return_actor(changes_during_close: bool) -> (SharedHost, TerminalId, Handle) {
+    const SESSION_ID: &str = "12345678-1234-4234-8234-123456789abc";
+
+    struct ModeOnInterrupt {
+        mode: &'static str,
+        busy: bool,
+    }
+    impl Adapter for ModeOnInterrupt {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            assert_eq!(command, Command::Interrupt);
+            Ok(Step {
+                events: vec![
+                    Event::PermissionMode(Some("dontAsk".into())),
+                    Event::Status {
+                        busy: false,
+                        detail: "Interrupted".into(),
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+        fn receive(&mut self, _: Value) -> Result<Step, String> {
+            Ok(Step {
+                events: vec![
+                    Event::Session {
+                        id: SESSION_ID.into(),
+                        title: None,
+                    },
+                    Event::Ready(true),
+                    Event::PermissionMode(Some(self.mode.into())),
+                    Event::Status {
+                        busy: self.busy,
+                        detail: "Muse".into(),
+                    },
+                ],
+                ..Step::default()
+            })
+        }
+    }
+
+    let host = completion_wake_host();
+    let chat_id = TerminalId::new();
+    let recipe = LaunchRecipe {
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: std::env::temp_dir(),
+        environment: BTreeMap::new(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mode = if changes_during_close {
+        "auto"
+    } else {
+        "dontAsk"
+    };
+    // A provider frame confirms the ID. The initial projection alone carries
+    // no authority to start an exact terminal handoff.
+    let mut initial = Step {
+        writes: vec![json!({"ready": true})],
+        ..Step::default()
+    };
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle = Handle::start(
+        spec,
+        Box::new(ModeOnInterrupt {
+            mode,
+            busy: changes_during_close,
+        }),
+        initial,
+        store,
+        None,
+        |_| {},
+    )
+    .unwrap();
+    completion_wait_until(|| {
+        handle.confirmed_session_id().as_deref() == Some(SESSION_ID)
+            && handle
+                .snapshot(None)
+                .is_some_and(|snapshot| snapshot.permission_mode.as_deref() == Some(mode))
+    });
+    completion_wake_record(
+        &host,
+        chat_id,
+        uuid::Uuid::new_v4(),
+        handle.clone(),
+        chat::Launch {
+            provider: Provider::Muse,
+            recipe: LaunchRecipe {
+                program: "muse".into(),
+                arguments: vec!["--approval-mode".into(), "never".into()],
+                ..recipe
+            },
+            session_id: Some(SESSION_ID.into()),
+            draft_model: None,
+        },
+    );
+    host.lock()
+        .unwrap()
+        .chats
+        .get_mut(&chat_id)
+        .unwrap()
+        .subscribers
+        .insert(1, true);
+    (host, chat_id, handle)
+}
+
+#[test]
 pub(in crate::host) fn standalone_credentials_survive_failed_and_retried_terminal_handoff_without_persistence()
  {
     if !super::super::state::tests::upgrade_fixture_in_fresh_process() {
