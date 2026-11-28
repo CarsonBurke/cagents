@@ -37,12 +37,18 @@ are distinct from email addresses: two homes can report the same email without
 becoming the same configured account. A changed observed login is reported
 separately from the registered identity.
 
-Inside a live cagents session, the report also includes authenticated caller
-latest reported context occupancy, its reported context limit, and the account selected by the
-session's captured effective execution environment. It does not substitute the default for new chats. Missing execution metadata or
-API credential overrides leave subscription account selection unknown.
-Providers which do not report context occupancy or limits leave those fields
-null. Terminal callers also leave account binding unknown, because foreground
+Inside a live cagents session, the report includes the caller's latest reported
+context occupancy and the account selected by the session's captured execution
+environment. Missing execution metadata or API credential overrides leave the
+subscription account unknown.
+
+The JSON caller's `context_remaining` and `context_used_fraction` use the same
+budget as the context meter. The budget ends at automatic compaction when the
+provider reports an earlier threshold (`usage.compact_limit`). The caller's
+`context_limit` still reports the provider's full window. Missing occupancy or
+budget leaves the two derived figures null.
+
+Terminal callers also leave account binding unknown, because foreground
 provider activity does not prove the environment it currently uses. All cached
 account allowances remain available. Occupancy can lag while a turn is running; the daemon query time is not
 the time that occupancy was observed. A CLI outside a hosted session has no caller context. A running account

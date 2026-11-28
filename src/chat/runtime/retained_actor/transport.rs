@@ -1,5 +1,5 @@
 //! Authenticated retained Claude helper and bounded attachment transport.
-use super::super::{LocalHandle, QueueRefusal, Rejection, Update};
+use super::super::{LocalHandle, QueueRefusal, Rejection, RetainedObserver, Update};
 pub use super::final_snapshot::{RetirementInspection, VerifiedRetirement};
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState, OutboxEntry};
@@ -3162,6 +3162,7 @@ impl Server {
         let published_watcher = watcher.clone();
         let metadata_changed = changed.clone();
         let metadata_watcher = watcher.clone();
+        let context_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -3198,9 +3199,12 @@ impl Server {
                 published.fetch_add(1, Ordering::Release);
                 published_watcher.notify();
             },
-            move || {
-                metadata_changed.fetch_add(1, Ordering::Release);
-                metadata_watcher.notify();
+            RetainedObserver {
+                changed: Box::new(move || {
+                    metadata_changed.fetch_add(1, Ordering::Release);
+                    metadata_watcher.notify();
+                }),
+                connected: Box::new(move || context_watcher.connected()),
             },
         )?;
         #[cfg(target_os = "macos")]
@@ -3709,6 +3713,7 @@ impl Server {
                 );
             }
             self.watcher.clear();
+            self.actor.set_visible(false);
             self.epoch = uuid::Uuid::new_v4();
             self.close_only = close_only;
             self.attachment_preserved = false;
@@ -4140,7 +4145,8 @@ impl Server {
             }
             "visible" => {
                 let (visible,) = decode!((bool,));
-                self.actor.set_visible(visible);
+                self.actor
+                    .set_visible(visible && !self.attachment_preserved);
                 Ok(Value::Null)
             }
             "observe" => {
@@ -4183,6 +4189,7 @@ impl Server {
                     return Err("This actor lifetime is stopping; ownership cannot be preserved for a successor".into());
                 }
                 if !self.attachment_preserved {
+                    self.actor.set_visible(false);
                     self.attachment_preserved = true;
                     self.changed.fetch_add(1, Ordering::Release);
                 }
@@ -4763,7 +4770,7 @@ fn disconnected(control: &UnixStream) -> Result<bool, String> {
     if unsafe { libc::poll(&mut event, 1, 0) } < 0 {
         return Err(std::io::Error::last_os_error().to_string());
     }
-    Ok(event.revents & (libc::POLLHUP | libc::POLLERR) != 0)
+    Ok(event.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
 }
 /// This actor is a subreaper, so every orphaned tool descendant of its
 /// provider becomes its child. Reap the exited ones while it serves; the

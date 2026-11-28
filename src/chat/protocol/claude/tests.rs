@@ -13438,26 +13438,31 @@ fn typed_start_and_read_only_history_keep_damaged_message_markers() {
     }
 }
 
-/// Compaction rewrites what the session is carrying, and the context
-/// figure is the only place a reader sees that. The boundary frame
-/// therefore has to ask for the usage again - and must not spend a
-/// transcript row narrating itself, which is what every auxiliary session
-/// frame used to do with the raw JSON of the frame.
+/// A root compaction invalidates the context figure. Its summary marks the
+/// boundary in the transcript.
 #[test]
 fn a_compaction_boundary_asks_for_the_context_usage_and_says_nothing() {
-    let mut adapter = Claude::default();
+    let mut adapter = Claude {
+        ready: true,
+        ..Claude::default()
+    };
+    let child = adapter
+        .receive(
+            json!({"type":"system","subtype":"compact_boundary","uuid":"child",
+        "parent_tool_use_id":"agent","compact_metadata":{"trigger":"auto"}}),
+        )
+        .unwrap();
+    assert!(child.writes.is_empty());
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
     let step = adapter
         .receive(
             json!({"type":"system","subtype":"compact_boundary","uuid":"c1","compact_metadata":{"trigger":"manual"}}),
         )
         .unwrap();
-    assert!(
-        step.writes
-            .iter()
-            .any(|frame| frame["request"]["subtype"] == "get_context_usage"),
-        "the compacted usage is never asked for: {:?}",
-        step.writes
-    );
+    assert!(step.writes.is_empty());
+    let refresh = adapter.refresh_visible_context(&|| true).unwrap();
+    assert_eq!(refresh.writes[0]["request"]["subtype"], "get_context_usage");
+    assert_eq!(refresh.writes[0]["request"]["detail"], "summary");
     assert!(
         step.events.is_empty(),
         "compaction narrated itself into the conversation: {:?}",
@@ -15597,7 +15602,7 @@ fn user_frames_hide_model_notes_and_unwrap_local_command_output() {
 /// Claude Code resolves where auto-compaction falls - its settings at every
 /// level, CLAUDE_CODE_AUTO_COMPACT_WINDOW, /autocompact and the model - and
 /// reports it as `get_context_usage`'s window, which the adapter asks for once
-/// connected. That point is kept apart from the model's whole window, which a
+/// shown and connected. That point is kept apart from the model's whole window, which a
 /// turn's result names, so neither replaces the other.
 #[test]
 fn the_context_budget_follows_claude_codes_auto_compaction_window() {
@@ -15607,12 +15612,12 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     let connected = adapter
         .receive(reply(request, json!({"models":[]})))
         .unwrap();
-    let asked = connected
-        .writes
-        .iter()
-        .find(|frame| frame["request"]["subtype"] == "get_context_usage")
-        .expect("the context budget is asked for once connected");
-    let asked = asked["request_id"].as_str().unwrap().to_owned();
+    assert!(connected.writes.is_empty());
+    assert!(adapter.refresh_visible_context(&|| false).is_none());
+    let report = adapter.refresh_visible_context(&|| true).unwrap();
+    let asked = report.writes[0]["request_id"].as_str().unwrap().to_owned();
+    assert_eq!(report.writes[0]["request"]["detail"], "summary");
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
     let usage_of = |step: &Step| {
         step.events.iter().rev().find_map(|event| match event {
             Event::Usage(usage) => Some(usage.clone()),
@@ -15622,7 +15627,7 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     let report = adapter
         .receive(reply(
             &asked,
-            json!({"totalTokens":14000,"maxTokens":300000,"rawMaxTokens":300000,
+            json!({"model":"claude-opus-5-5","totalTokens":14000,"maxTokens":300000,"rawMaxTokens":300000,
                 "autocompactSource":"settings","autoCompactThreshold":267000,
                 "isAutoCompactEnabled":true}),
         ))
@@ -15642,30 +15647,68 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     assert_eq!(usage.compact_limit, Some(267_000));
     assert_eq!(usage.context_budget(), 267_000);
 
-    // A model changed outside `set_model`, such as by a typed /model, has its
-    // own window and so its own compaction point: it is asked again. The same
-    // window asks nothing.
-    let asks = |step: &Step| {
-        step.writes
-            .iter()
-            .any(|frame| frame["request"]["subtype"] == "get_context_usage")
-    };
-    let result_in = |window: u64| {
+    // Results keep cumulative readings for both models. The main assistant's
+    // actual model is fresh even while the advertised selection is still old.
+    adapter.running = Some("claude-opus-5-5".into());
+    let result_in = || {
         json!({"type":"result","subtype":"success","is_error":false,"session_id":"00000000-0000-4000-8000-000000000001",
-            "modelUsage":{"claude-model":{"contextWindow":window}}})
+            "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000},
+                "provider.sonnet":{"canonicalModel":"claude-sonnet","contextWindow":200000}}})
     };
-    assert!(!asks(&adapter.receive(result_in(1_000_000)).unwrap()));
-    let switched = adapter.receive(result_in(200_000)).unwrap();
-    assert!(asks(&switched), "{:?}", switched.writes);
-    assert_eq!(usage_of(&switched).unwrap().context_budget(), 200_000);
+    adapter.receive(result_in()).unwrap();
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
+    // An older SDK can report an unresolved alias before B's first call.
+    let model_switch = adapter
+        .receive(json!({"type":"system","subtype":"init","model":"sonnet"}))
+        .unwrap();
+    assert!(
+        model_switch
+            .events
+            .contains(&Event::ContextBudgetInvalidated)
+    );
+    assert_eq!(adapter.usage.context_budget(), 0);
+    let local_turn = adapter
+        .receive(json!({"type":"result","subtype":"success","is_error":false,
+        "modelUsage":{"claude-opus-5-5":{"contextWindow":1000000}}}))
+        .unwrap();
+    assert_eq!(usage_of(&local_turn).unwrap().context_budget(), 0);
+    adapter
+        .receive(json!({"type":"assistant","uuid":"model-switch","message":{
+        "role":"assistant","model":"claude-sonnet","content":[]}}))
+        .unwrap();
+    let switched = adapter.receive(result_in()).unwrap();
+    assert!(switched.writes.is_empty());
+    let usage = usage_of(&switched).unwrap();
+    assert_eq!(usage.compact_limit, None);
+    assert_eq!(usage.context_budget(), 200_000);
+    let automatic = adapter.refresh_visible_context(&|| true).unwrap();
 
-    // Clearing the conversation clears its figures, not where the session
-    // compacts.
+    // Clearing the conversation discards an outstanding report's occupancy.
     adapter
         .receive(json!({"type":"conversation_reset"}))
         .unwrap();
     assert_eq!(adapter.usage.context_tokens, 0);
-    assert_eq!(adapter.usage.compact_limit, Some(267_000));
+    assert_eq!(adapter.usage.compact_limit, None);
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
+    let obsolete = adapter
+        .receive(reply(
+            automatic.writes[0]["request_id"].as_str().unwrap(),
+            json!({"totalTokens":99000,"maxTokens":200000,"isAutoCompactEnabled":true}),
+        ))
+        .unwrap();
+    assert!(usage_of(&obsolete).is_none());
+    assert_eq!(adapter.usage.context_tokens, 0);
+    let refresh = adapter.refresh_visible_context(&|| true).unwrap();
+    let off = adapter
+        .receive(reply(
+            refresh.writes[0]["request_id"].as_str().unwrap(),
+            json!({"totalTokens":20000,"maxTokens":180000,"isAutoCompactEnabled":false}),
+        ))
+        .unwrap();
+    assert_eq!(usage_of(&off).unwrap().context_limit, 180_000);
+    let unchanged = adapter.receive(result_in()).unwrap();
+    assert_eq!(usage_of(&unchanged).unwrap().context_limit, 180_000);
+    assert!(adapter.refresh_visible_context(&|| true).is_none());
 
     // With auto-compaction off the reported window is the model's whole
     // window, and nothing compacts early.
@@ -15691,6 +15734,10 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
         ))
         .unwrap();
     assert_eq!(usage_of(&windowed).unwrap().compact_limit, Some(300_000));
+    adapter
+        .receive(json!({"type":"conversation_reset"}))
+        .unwrap();
+    assert_eq!(adapter.usage.compact_limit, Some(300_000));
 
     // A refresh the reader asked for says why it got nothing.
     let refresh = adapter.command(Command::Refresh).unwrap();
@@ -15715,14 +15762,11 @@ fn the_context_budget_follows_claude_codes_auto_compaction_window() {
     let mut adapter = Claude::default();
     let initialize = adapter.initialize().unwrap();
     let request = initialize.writes[0]["request_id"].as_str().unwrap();
-    let connected = adapter
+    adapter
         .receive(reply(request, json!({"models":[]})))
         .unwrap();
-    let asked = connected
-        .writes
-        .iter()
-        .find(|frame| frame["request"]["subtype"] == "get_context_usage")
-        .unwrap();
+    let automatic = adapter.refresh_visible_context(&|| true).unwrap();
+    let asked = &automatic.writes[0];
     assert_eq!(asked["request"].get("_cagents_automatic"), None);
     // A provider that exits before reading this one lost no input (#3888).
     assert!(adapter.expendable_write(asked));

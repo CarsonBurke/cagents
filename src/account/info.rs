@@ -110,8 +110,12 @@ pub struct Caller {
     /// Latest provider-reported context occupancy, distinct from cumulative
     /// usage. Zero is the underlying usage model's unknown sentinel.
     pub context_tokens: Option<u64>,
+    /// Full provider-reported context window.
     pub context_limit: Option<u64>,
+    /// Tokens left before automatic compaction, or before the window fills
+    /// when the provider does not report a compaction point.
     pub context_remaining: Option<u64>,
+    /// Occupancy as a fraction of the same budget as `context_remaining`.
     pub context_used_fraction: Option<f64>,
     pub usage: Option<crate::chat::Usage>,
 }
@@ -132,17 +136,19 @@ impl Caller {
             .as_ref()
             .filter(|u| u.context_tokens > 0)
             .map(|u| u.context_tokens);
+        let occupancy = context_tokens.zip(
+            usage
+                .as_ref()
+                .map(crate::chat::Usage::context_budget)
+                .filter(|budget| *budget > 0),
+        );
         Self {
             session,
             provider,
             account,
             account_detail,
-            context_remaining: context_tokens
-                .zip(context_limit)
-                .map(|(used, limit)| limit.saturating_sub(used)),
-            context_used_fraction: context_tokens
-                .zip(context_limit)
-                .map(|(used, limit)| used as f64 / limit as f64),
+            context_remaining: occupancy.map(|(used, budget)| budget.saturating_sub(used)),
+            context_used_fraction: occupancy.map(|(used, budget)| used as f64 / budget as f64),
             context_tokens,
             context_limit,
             usage,
@@ -289,6 +295,27 @@ mod tests {
         );
         assert_eq!(full.context_remaining, Some(0));
         assert_eq!(full.context_used_fraction, Some(1.2));
+    }
+    #[test]
+    fn caller_context_measures_against_the_effective_compaction_budget() {
+        for (window, compact, budget) in [(100, 80, 80), (0, 80, 80), (80, 100, 80)] {
+            let caller = Caller::new(
+                TerminalId::new(),
+                None,
+                None,
+                None,
+                Some(crate::chat::Usage {
+                    context_limit: window,
+                    context_tokens: 60,
+                    compact_limit: Some(compact),
+                    ..Default::default()
+                }),
+            );
+            assert_eq!(caller.context_limit, (window > 0).then_some(window));
+            assert_eq!(caller.context_remaining, Some(budget - 60));
+            assert_eq!(caller.context_used_fraction, Some(0.75));
+            assert_eq!(caller.usage.unwrap().compact_limit, Some(compact));
+        }
     }
     #[test]
     fn account_remaining_keeps_reset_and_freshness_evidence() {
