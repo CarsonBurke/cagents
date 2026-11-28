@@ -1980,48 +1980,48 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
     assert!(store.stopped_chat(&source).unwrap().is_some());
     fs::remove_file(refuse_thread).unwrap();
 
-    let (failed, serving) = connect(2, true, false);
-    assert!(
-        failed.is_err(),
-        "publication failed after creating the paired PTY"
-    );
-    serving.join().unwrap();
-    let pending_owners = || {
-        let state = reopened_host.lock().unwrap();
-        let actor = state.paired_restart(source.id).unwrap();
-        (
-            actor.handle.clone(),
-            state.terminals[&source.id].handle.clone(),
-        )
+    let assert_refused = |client, refuse_publication, reason: &str| {
+        let (result, serving) = connect(client, refuse_publication, !refuse_publication);
+        let Err(failure) = result else {
+            panic!("attempt {client} unexpectedly succeeded");
+        };
+        assert!(
+            failure.message.contains(reason),
+            "attempt {client}: {failure:?}"
+        );
+        serving.join().unwrap();
     };
-    let (first_owner, first_worker) = pending_owners();
+    let pending_owners = |stage: &str| {
+        let state = reopened_host.lock().unwrap();
+        let actor = state.paired_restart(source.id).expect(stage);
+        let terminal = state.terminals.get(&source.id).expect(stage);
+        (actor.handle.clone(), terminal.handle.clone())
+    };
+    let publication = "fixture refused terminal publication";
+    assert_refused(2, true, publication);
+    let (first_owner, first_worker) = pending_owners("the initial paired PTY");
     assert!(store.stopped_chat(&source).unwrap().is_some());
 
     first_worker.shutdown().unwrap();
-    let (failed, serving) = connect(3, true, false);
-    assert!(failed.is_err(), "terminal publication failed again");
-    serving.join().unwrap();
-    let (next_owner, next_worker) = pending_owners();
+    assert_refused(3, true, publication);
+    let (next_owner, next_worker) = pending_owners("the replacement for the ended PTY");
     assert!(next_owner.same_attachment(&first_owner));
     assert!(!next_worker.same_worker(&first_worker));
 
     next_owner.close().unwrap();
     assert!(next_owner.is_completed());
-    let (failed, serving) = connect(4, true, false);
-    assert!(
-        failed.is_err(),
-        "terminal publication failed after restarting the ended provider"
-    );
-    serving.join().unwrap();
-    let (current_owner, original_worker) = pending_owners();
+    assert_refused(4, true, publication);
+    let (current_owner, original_worker) = pending_owners("the pair after the provider ended");
     assert!(!current_owner.same_attachment(&next_owner));
     assert!(!original_worker.same_worker(&next_worker));
 
-    let (failed, serving) = connect(5, false, true);
-    assert!(failed.is_err(), "the agent registry refused rebinding");
-    serving.join().unwrap();
+    assert_refused(5, false, "fixture refused agent rebinding");
     assert!(store.stopped_chat(&source).unwrap().is_some());
-    assert!(pending_owners().1.same_worker(&original_worker));
+    assert!(
+        pending_owners("the pair awaiting registry rebinding")
+            .1
+            .same_worker(&original_worker)
+    );
 
     let (reopened, serving) = connect(6, false, false);
     let reopened = reopened.unwrap();

@@ -3992,6 +3992,7 @@ fn codex_terminal_view(
                     "The CLI owner changed while releasing its completed view.",
                 ));
             }
+            state.startup_closed(chat_id, &terminal);
             state.retire_terminal(chat_id);
             let record = state.chats.get_mut(&chat_id).expect("checked actor");
             record.session.terminal = None;
@@ -6893,7 +6894,8 @@ fn stop_failed_upgrade_restore_with(
                 notifications.retire(id);
             }
         }
-        if terminal.is_some() {
+        if let Some((_, terminal)) = &terminal {
+            state.startup_closed(id, terminal);
             state.retire_terminal(id);
         }
         record
