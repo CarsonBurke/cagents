@@ -1633,6 +1633,12 @@ impl Scroll {
     fn prefetch_reach(self) -> f32 {
         self.window * PREFETCH_SCREENS
     }
+
+    /// The page halves can affect prefetch only within reach of a loaded edge.
+    pub(super) fn within_prefetch_reach(self) -> bool {
+        let reach = self.prefetch_reach();
+        self.into_loaded() <= reach || self.short_of_loaded_end() <= reach
+    }
 }
 
 /// The height given to each unloaded item: the average of what the loaded
@@ -2321,6 +2327,13 @@ pub(super) struct SelectionKey {
     tool_groups_expanded: bool,
     failures: (u64, revised::Stamp, revised::Stamp),
     queued: Option<(u64, u64)>,
+}
+
+pub(super) struct ScrollAliases {
+    scope: Option<String>,
+    presentation: u64,
+    turns: revised::Stamp,
+    aliases: std::rc::Rc<scroll::Aliases>,
 }
 
 /// The selected scope's copy and selection catalog, built when something
@@ -3189,6 +3202,42 @@ impl Runtime {
                 .local_prompt()
                 .map(|local| (local.source.id, local.presentation.revision)),
         }
+    }
+
+    fn scroll_aliases(&self, child: Option<&chat::Subagent>) -> std::rc::Rc<scroll::Aliases> {
+        let scope = child.map(|agent| agent.id.as_str());
+        let turns = self.turns.stamp();
+        let mut memo = self.scroll_aliases.borrow_mut();
+        if let Some(memo) = memo.as_ref().filter(|memo| {
+            memo.scope.as_deref() == scope
+                && memo.presentation == self.presentation_revision
+                && memo.turns == turns
+        }) {
+            return memo.aliases.clone();
+        }
+        let items = &self.snapshot.items;
+        let aliases = std::rc::Rc::new(scroll::Aliases::new(
+            child
+                .map_or(items.as_slice(), |child| child.items.as_slice())
+                .iter()
+                .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
+                .chain(self.turns.iter().flat_map(|turn| {
+                    let key = turn.steps.first().and_then(|step| items.get(step.index));
+                    turn.steps.iter().filter_map(move |step| {
+                        Some((
+                            scroll::steps_id(&key?.id),
+                            items.get(step.index)?.id.as_str(),
+                        ))
+                    })
+                })),
+        ));
+        *memo = Some(ScrollAliases {
+            scope: scope.map(str::to_owned),
+            presentation: self.presentation_revision,
+            turns,
+            aliases: aliases.clone(),
+        });
+        aliases
     }
 
     /// Note the inputs the transcript presents now. When they changed, the
@@ -4223,29 +4272,13 @@ impl Runtime {
             self.observe_selection_document();
             let bookmark = self.selection_bookmark();
             crate::ui_memory::gate(selection::transcript_virtualized(
-                scroll::transcript_observed(
+                scroll::transcript_observed_with_aliases(
                     transcript,
                     target,
                     self.selected_subagent.as_deref(),
                     anchors,
                     selected.is_some() || (!snapshot.has_later && self.paging().is_none()),
-                    selected
-                        .map_or(snapshot.items.as_slice(), |agent| agent.items.as_slice())
-                        .iter()
-                        .map(|item| (scroll::item_id(&item.id), item.id.as_str()))
-                        .chain(self.turns.iter().flat_map(|turn| {
-                            let key = turn
-                                .steps
-                                .first()
-                                .and_then(|step| snapshot.items.get(step.index));
-                            turn.steps.iter().filter_map(move |step| {
-                                Some((
-                                    scroll::steps_id(&key?.id),
-                                    snapshot.items.get(step.index)?.id.as_str(),
-                                ))
-                            })
-                        }))
-                        .collect(),
+                    self.scroll_aliases(selected),
                     self.observed_scroll.clone(),
                     self.scroll_memory.clone(),
                     if let Some(edge) = self.scroll_memory.edge(self.selected_subagent.as_deref()) {

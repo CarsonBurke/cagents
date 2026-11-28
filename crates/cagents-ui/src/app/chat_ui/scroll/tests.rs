@@ -3540,11 +3540,31 @@ fn prefetch_waits_until_the_viewport_is_inside_the_half_a_slide_keeps() {
     // A tall older half keeps more of the window, so the page goes sooner.
     let tall_half = |top: f32| Scroll::new(top, 10_000.0, 800.0).with_kept(kept(8_400.0, 8_000.0));
     assert!(tall_half(1_500.0).prefetch_earlier());
+    let middle = tall_half(4_600.0);
+    assert!(!middle.within_prefetch_reach());
+    assert!(!middle.prefetch_earlier());
+    assert!(!middle.prefetch_later());
+    assert!(tall_half(1_600.0).within_prefetch_reach());
+    assert!(tall_half(7_600.0).within_prefetch_reach());
     assert!(!tall_half(7_700.0).prefetch_later());
     assert!(tall_half(8_000.0).prefetch_later());
     let unmeasured = Scroll::new(1_500.0, 10_000.0, 800.0);
     assert!(!unmeasured.prefetch_earlier());
     assert!(Scroll::new(0.0, 10_000.0, 800.0).prefetch_earlier());
+
+    let with_unloaded = |top| {
+        Scroll::new(top, 18_000.0, 800.0)
+            .with_unloaded(view::Unloaded {
+                before: 4_000.0,
+                after: 4_000.0,
+            })
+            .with_kept(kept(6_000.0, 12_000.0))
+    };
+    assert!(with_unloaded(4_200.0).within_prefetch_reach());
+    assert!(with_unloaded(4_200.0).prefetch_earlier());
+    assert!(with_unloaded(13_200.0).within_prefetch_reach());
+    assert!(with_unloaded(13_200.0).prefetch_later());
+    assert!(!with_unloaded(9_000.0).within_prefetch_reach());
 }
 
 /// An exchange draws its steps on one strip above its prose, whatever

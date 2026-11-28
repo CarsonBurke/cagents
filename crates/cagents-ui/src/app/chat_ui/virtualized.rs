@@ -30,8 +30,12 @@ pub(super) type Window = Rc<Cell<Option<Viewport>>>;
 
 /// Sparse input operations opt out of placeholder enumeration. Offscreen
 /// aliases exist for explicit navigation operations, never pointer hit tests.
+#[derive(Default)]
 pub(super) struct PlaceholderPolicy {
+    /// The reader's anchoring pass needs all aliases.
     pub visit: bool,
+    /// An explicit navigation request needs only its own alias.
+    pub wanted: Option<Id>,
 }
 
 #[derive(Clone, PartialEq)]
@@ -303,6 +307,7 @@ struct State {
     anchors: HashSet<u64>,
     logical: HashMap<u64, Vec<(std::ops::Range<usize>, usize, bool)>>,
     aliased: Vec<usize>,
+    aliases: HashMap<Id, Vec<usize>>,
 }
 
 /// Mutable measured heights with logarithmic corrections and prefix lookup.
@@ -339,6 +344,9 @@ impl PrefixSums {
         self.prefix(self.values.len())
     }
     fn set(&mut self, index: usize, value: f32) {
+        if self.values[index] == value {
+            return;
+        }
         let delta = value - self.values[index];
         self.values[index] = value;
         let mut at = index + 1;
@@ -462,12 +470,22 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 .filter(|row| row.anchor)
                 .map(|row| row.key)
                 .collect();
-            state.aliased = self
+            state.aliases.clear();
+            state.aliased.clear();
+            for (index, row) in self
                 .rows
                 .iter()
                 .enumerate()
-                .filter_map(|(index, row)| (!row.aliases.is_empty()).then_some(index))
-                .collect();
+                .filter(|(_, row)| !row.aliases.is_empty())
+            {
+                state.aliased.push(index);
+                for id in &row.aliases {
+                    let positions = state.aliases.entry(id.clone()).or_default();
+                    if positions.last() != Some(&index) {
+                        positions.push(index);
+                    }
+                }
+            }
             state.logical.clear();
             for (index, row) in self.rows.iter().enumerate() {
                 for logical in row.logical.iter().cloned().chain(row.descendants.iter()) {
@@ -633,28 +651,36 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
         operation.custom(None, layout.bounds(), state);
         // Placeholder bounds make unloaded items addressable by find/history
         // anchoring without constructing their text or widget trees.
-        let mut placeholders = PlaceholderPolicy { visit: true };
+        let mut placeholders = PlaceholderPolicy::default();
         operation.custom(None, layout.bounds(), &mut placeholders);
-        if placeholders.visit {
-            for &index in &state.aliased {
-                let row = &self.rows[index];
+        let (indexes, wanted) = match (placeholders.visit, placeholders.wanted.as_ref()) {
+            (true, _) => (state.aliased.as_slice(), None),
+            (false, Some(id)) => (
+                state.aliases.get(id).map(Vec::as_slice).unwrap_or_default(),
+                Some(id),
+            ),
+            (false, None) => (&[][..], None),
+        };
+        for &index in indexes {
+            let row = &self.rows[index];
+            let start = state.offsets.prefix(index);
+            let size = self.axis.size(
+                state.offsets.values[index],
+                self.axis.cross(layout.bounds().size()),
+            );
+            let bounds = Rectangle::new(
+                layout.bounds().position()
+                    + match self.axis {
+                        Axis::Vertical => Vector::new(0.0, start),
+                        Axis::Horizontal => Vector::new(start, 0.0),
+                    },
+                size,
+            );
+            if let Some(id) = wanted {
+                operation.container(Some(id), bounds);
+            } else {
                 for id in &row.aliases {
-                    let start = state.offsets.prefix(index);
-                    let size = self.axis.size(
-                        state.offsets.values[index],
-                        self.axis.cross(layout.bounds().size()),
-                    );
-                    operation.container(
-                        Some(id),
-                        Rectangle::new(
-                            layout.bounds().position()
-                                + match self.axis {
-                                    Axis::Vertical => Vector::new(0.0, start),
-                                    Axis::Horizontal => Vector::new(start, 0.0),
-                                },
-                            size,
-                        ),
-                    );
+                    operation.container(Some(id), bounds);
                 }
             }
         }
@@ -1021,6 +1047,64 @@ impl Operation for UpdateViewport {
 mod tests {
     use super::*;
     use std::{cell::Cell, rc::Rc};
+
+    #[test]
+    fn only_explicit_navigation_reads_offscreen_alias_bounds() {
+        struct Probe {
+            wanted: Option<Id>,
+            seen: Vec<(Id, Rectangle)>,
+        }
+        impl Operation for Probe {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
+                if let Some(policy) = state.downcast_mut::<PlaceholderPolicy>() {
+                    policy.wanted = self.wanted.clone();
+                }
+            }
+            fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
+                if let Some(id) = id {
+                    self.seen.push((id.clone(), bounds));
+                }
+            }
+        }
+        let ids: Vec<_> = (0..1000).map(|_| Id::unique()).collect();
+        let rows = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| {
+                Row::new(index as u64 + 1, 0, 20.0, Some(id.clone()), || {
+                    widget::Space::new().height(20.0).into()
+                })
+            })
+            .collect();
+        let viewport = Rc::new(Cell::new(Some(Viewport {
+            top: 0.0,
+            height: 400.0,
+            bottom: false,
+        })));
+        let mut column = column(rows, viewport);
+        let renderer = crate::app::tests::headless_renderer();
+        let mut tree = Tree::new(&column);
+        let limits = layout::Limits::new(Size::ZERO, Size::new(600.0, f32::INFINITY));
+        let node = column.as_widget_mut().layout(&mut tree, &renderer, &limits);
+        let run = |column: &mut Element<'_, Message>, tree: &mut Tree, wanted: Option<Id>| {
+            let mut probe = Probe {
+                wanted,
+                seen: Vec::new(),
+            };
+            column
+                .as_widget_mut()
+                .operate(tree, Layout::new(&node), &renderer, &mut probe);
+            probe.seen
+        };
+        assert!(run(&mut column, &mut tree, None).is_empty());
+        let result = run(&mut column, &mut tree, Some(ids[900].clone()));
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].0, ids[900]);
+        assert_eq!(result[0].1.y, 18_000.0);
+    }
 
     #[test]
     fn measured_shrink_keeps_mounted_flow_until_parent_refresh_and_offscreen_evicts() {

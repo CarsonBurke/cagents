@@ -3894,6 +3894,7 @@ pub(super) struct Runtime {
     /// the snapshot changes rather than once per frame.
     turns: Revised<Vec<turn::Turn>>,
     selected_subagent: Option<String>,
+    scroll_aliases: std::cell::RefCell<Option<view::ScrollAliases>>,
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
     /// The images answers' Markdown shows, decoded as they come into view.
@@ -5689,6 +5690,7 @@ impl Runtime {
             pull_request_labels_built_from: None,
             turns: Revised::default(),
             selected_subagent: None,
+            scroll_aliases: Default::default(),
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
             figures: Default::default(),
@@ -5802,6 +5804,7 @@ impl Runtime {
         self.observed_scroll.borrow_mut().clear();
         self.scroll_memory.clear();
         self.selection_document.get_mut().clear();
+        self.scroll_aliases.get_mut().take();
         self.selection_bookmarks.get_mut().clear();
         self.asked_after.clear();
         self.asked.clear();
@@ -8072,6 +8075,7 @@ impl Runtime {
         self.child_cache = HashMap::new();
         self.child_cache_context = None;
         self.selection_document.get_mut().clear();
+        self.scroll_aliases.get_mut().take();
         self.presentation_revision = self.presentation_revision.wrapping_add(1);
         self.find_navigation.changed_document();
         self.presentation_evicted = true;
