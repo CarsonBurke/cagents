@@ -6899,55 +6899,87 @@ fn send_appears_with_a_draft_left_of_a_stop_that_stays_put() {
 }
 
 /// A Codex conversation in the middle of a turn, such as an agent stopped on
-/// an approval, still lets the person change its permission mode, and says
-/// that the change applies from the next turn.
+/// an approval, still lets the person change its permission mode. The turn
+/// keeps the mode it started in, so the footer marks a change as waiting for
+/// the next turn and the picker says which mode this turn keeps.
 #[test]
 fn a_busy_codex_conversation_still_offers_its_permission_mode() {
     let (mut runtime, _handle) = furnished_runtime();
     runtime.session.launch.provider = Provider::Codex;
     let modes = ["readOnly", "workspaceWrite", "yolo"];
-    let snapshot = Arc::make_mut(&mut runtime.snapshot);
-    snapshot.capabilities.permission_modes = modes.map(String::from).to_vec();
-    snapshot.permission_mode = Some("workspaceWrite".into());
-    snapshot.busy = true;
-    let laid = lay_out(&runtime, 900.0, None, &["chat-permission-picker"]);
-    assert!(
-        laid.controls.contains_key("chat-permission-picker"),
-        "{:?}",
-        laid.footer_text
-    );
+    let mut started = (*runtime.snapshot).clone();
+    started.capabilities.permission_modes = modes.map(String::from).to_vec();
+    started.permission_mode = Some("workspaceWrite".into());
+    started.busy = true;
+    started.turn_generation = 3;
+    runtime.observe_turn_permission_mode(&started);
+    runtime.snapshot = Arc::new(started.clone());
+    let picker = |runtime: &Runtime| {
+        let laid = lay_out(runtime, 900.0, None, &["chat-permission-picker"]);
+        assert!(
+            laid.controls.contains_key("chat-permission-picker"),
+            "{:?}",
+            laid.footer_text
+        );
+        laid.footer_text.join(" | ")
+    };
+    assert!(picker(&runtime).contains("Workspace write"));
+    assert!(!picker(&runtime).contains("next turn"));
     let controls = runtime.permission_controls(true);
     for mode in modes {
         let id = card_control_id(runtime.target.card, &format!("chat-permission-mode-{mode}"));
         assert!(controls.contains(&id), "{mode}");
     }
     assert_eq!(
-        runtime.permission_change_note(),
+        runtime.permission_change_note().as_deref(),
         Some("A change applies from the next turn.")
     );
-    Arc::make_mut(&mut runtime.snapshot)
-        .requests
-        .push(chat::Request {
-            kind: crate::chat::RequestKind::Approval,
-            id: "approval".into(),
-            title: "Command approval".into(),
-            description: "gh issue view 4580".into(),
-            fields: Vec::new(),
-            actions: Vec::new(),
-        });
+
+    // The person chooses full access while the turn waits on an approval;
+    // Codex confirms it for the next turn.
+    let mut changed = started.clone();
+    changed.permission_mode = Some("yolo".into());
+    changed.requests.push(chat::Request {
+        kind: crate::chat::RequestKind::Approval,
+        id: "approval".into(),
+        title: "Command approval".into(),
+        description: "gh issue view 4580".into(),
+        fields: Vec::new(),
+        actions: Vec::new(),
+    });
+    runtime.observe_turn_permission_mode(&changed);
+    runtime.snapshot = Arc::new(changed.clone());
+    assert_eq!(runtime.next_turn_permission_mode(), Some("yolo"));
+    assert!(
+        picker(&runtime).contains("YOLO · next turn"),
+        "{}",
+        picker(&runtime)
+    );
     assert_eq!(
-        runtime.permission_change_note(),
+        runtime.permission_change_note().as_deref(),
         Some(
-            "A change applies from the next turn. This turn still needs your answer to its approval request."
+            "This turn keeps Workspace write. YOLO applies from the next turn. Its approval request still needs your answer."
         )
     );
-    // Between turns, and for a provider that applies a change at once, there
-    // is nothing to add.
-    Arc::make_mut(&mut runtime.snapshot).busy = false;
+
+    // The next turn runs in it, with nothing left to explain.
+    let mut next = changed.clone();
+    next.requests.clear();
+    next.turn_generation = 4;
+    runtime.observe_turn_permission_mode(&next);
+    runtime.snapshot = Arc::new(next.clone());
+    assert_eq!(runtime.next_turn_permission_mode(), None);
+    assert!(!picker(&runtime).contains("next turn"));
+    let mut idle = next;
+    idle.busy = false;
+    runtime.observe_turn_permission_mode(&idle);
+    runtime.snapshot = Arc::new(idle);
     assert_eq!(runtime.permission_change_note(), None);
+    // A provider that applies a change at once has nothing to add.
     Arc::make_mut(&mut runtime.snapshot).busy = true;
     runtime.session.launch.provider = Provider::Claude;
     assert_eq!(runtime.permission_change_note(), None);
+    assert_eq!(runtime.next_turn_permission_mode(), None);
 }
 
 #[test]

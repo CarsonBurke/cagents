@@ -350,23 +350,63 @@ impl Runtime {
         permissions_surface(content, width, target.card)
     }
 
-    /// What a person changing the mode now should know: a Codex turn keeps
-    /// the mode it started with, so a change applies from the next one, and
-    /// a request it is waiting on still needs an answer.
-    pub(super) fn permission_change_note(&self) -> Option<&'static str> {
+    /// Remembers the mode a turn starts in, from the publication `next` that
+    /// is about to replace the current one, for as long as the turn runs.
+    pub(super) fn observe_turn_permission_mode(&mut self, next: &Snapshot) {
+        let same_turn = self.snapshot.busy
+            && next.busy
+            && next.turn_generation == self.snapshot.turn_generation;
+        if !next.busy {
+            self.turn_permission_mode = None;
+        } else if !same_turn || self.turn_permission_mode.is_none() {
+            self.turn_permission_mode = Some(next.permission_mode.clone());
+        }
+    }
+
+    /// The mode a person chose for the next turn while a Codex turn keeps
+    /// the one it started in, when the two differ.
+    pub(super) fn next_turn_permission_mode(&self) -> Option<&str> {
         if self.session.launch.provider != Provider::Codex || !self.snapshot.busy {
             return None;
         }
-        let waiting = self
+        let turn = self.turn_permission_mode.as_ref()?.as_deref();
+        self.chosen_permission_mode()
+            .filter(|chosen| Some(*chosen) != turn)
+    }
+
+    /// What a person changing the mode now should know: a Codex turn keeps
+    /// the mode it started with, so a change applies from the next one, and
+    /// a request it is waiting on still needs an answer.
+    pub(super) fn permission_change_note(&self) -> Option<String> {
+        if self.session.launch.provider != Provider::Codex || !self.snapshot.busy {
+            return None;
+        }
+        let provider = self.session.launch.provider;
+        let mut note = match self.next_turn_permission_mode() {
+            Some(next) => {
+                let turn = self
+                    .turn_permission_mode
+                    .as_ref()
+                    .and_then(Option::as_deref)
+                    .map_or("its current permissions", |mode| {
+                        view::permission_mode_label(provider, mode)
+                    });
+                format!(
+                    "This turn keeps {turn}. {} applies from the next turn.",
+                    view::permission_mode_label(provider, next)
+                )
+            }
+            None => "A change applies from the next turn.".to_owned(),
+        };
+        if self
             .snapshot
             .requests
             .iter()
-            .any(|request| request.kind == chat::RequestKind::Approval);
-        Some(if waiting {
-            "A change applies from the next turn. This turn still needs your answer to its approval request."
-        } else {
-            "A change applies from the next turn."
-        })
+            .any(|request| request.kind == chat::RequestKind::Approval)
+        {
+            note.push_str(" Its approval request still needs your answer.");
+        }
+        Some(note)
     }
 
     /// The subagent a block stopped, as its tab names it. The provider

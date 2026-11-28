@@ -2256,16 +2256,20 @@ pub(super) fn answer_grants(provider: crate::agent::Provider, kind: chat::Reques
     }
 }
 
-/// Whether `command` answers one of the agent's pending requests that can
-/// grant it something: a person's answer the agent's owner may need, rather
-/// than a person taking the agent's controls.
-pub(super) fn answers_grant(
+/// Whether `command` decides what the agent may do for its owner rather than
+/// taking the agent's controls: an answer to one of its pending requests that
+/// can grant it something, which a limited owner may need a person to give,
+/// or a change of its permission mode, which only a person can make. Either
+/// leaves the agent with its owner.
+pub(super) fn sets_permission_for_owner(
     handle: &chat::runtime::Handle,
     provider: crate::agent::Provider,
     command: &Command,
 ) -> bool {
-    let Command::Answer { request_id, .. } = command else {
-        return false;
+    let request_id = match command {
+        Command::SetPermissionMode { .. } => return true,
+        Command::Answer { request_id, .. } => request_id,
+        _ => return false,
     };
     refresh_retained_requests(handle);
     handle
@@ -2757,7 +2761,7 @@ fn console(
             }
             let gate = agent_gate(host, id);
             let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            if !answers_grant(&handle, agent.spec.provider, &command) {
+            if !sets_permission_for_owner(&handle, agent.spec.provider, &command) {
                 registry
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

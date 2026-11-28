@@ -493,7 +493,8 @@ impl Ceiling {
     /// provider gets this session's mode, and any other its provider's
     /// equivalent of this session's tier, or of the nearest stricter tier it
     /// has. A Codex request without a sandbox takes this session's sandbox
-    /// when it is a Codex session too, and that equivalent's otherwise.
+    /// when it is a Codex session too, and otherwise that equivalent's, but
+    /// never more than the workspace's.
     pub fn child(&self, provider: Provider, requested: Option<&str>) -> Result<String, String> {
         let own = self.mode.filter(|_| self.provider == Some(provider));
         let Some(requested) = requested else {
@@ -511,7 +512,10 @@ impl Ceiling {
                 let sandbox = match (sandbox, own) {
                     (Some(sandbox), _) => sandbox,
                     (None, Some(Mode::Codex(_, own))) => own,
-                    (None, _) => match self.equivalent(provider)? {
+                    // A request that names only how the child asks keeps
+                    // Codex's usual workspace sandbox at most, rather than
+                    // going without one under a lead where nothing asks.
+                    (None, _) => match self.equivalent(provider, Tier::AutoEdit)? {
                         Mode::Codex(_, sandbox) => sandbox,
                         _ => unreachable!("a Codex equivalent is a Codex mode"),
                     },
@@ -574,16 +578,16 @@ impl Ceiling {
             self.provider == Some(provider) && provider.check_permission_mode(&own.name()).is_ok()
         }) {
             Some(own) => Ok(own),
-            None => self.equivalent(provider),
+            None => self.equivalent(provider, Tier::Full),
         }
     }
 
-    /// The mode of `provider` that matches this session's tier: its
-    /// equivalent of the highest tier it has that allows no more than this
-    /// session. A session of unknown mode counts as asking, so its child asks
+    /// The mode of `provider` that matches this session's tier, up to `cap`:
+    /// its equivalent of the highest tier it has that allows no more than
+    /// either. A session of unknown mode counts as asking, so its child asks
     /// too.
-    fn equivalent(&self, provider: Provider) -> Result<Mode, String> {
-        let tier = self.tier();
+    fn equivalent(&self, provider: Provider, cap: Tier) -> Result<Mode, String> {
+        let tier = self.tier().min(cap);
         let modes = Mode::equivalents(provider);
         modes
             .iter()
@@ -1168,12 +1172,20 @@ mod tests {
                 "{mode}"
             );
         }
-        assert_eq!(
-            claude("bypassPermissions")
-                .child(Provider::Codex, Some("never"))
-                .as_deref(),
-            Ok("never/danger-full-access")
-        );
+        // A request naming only how the child asks keeps the workspace
+        // sandbox; only one naming the sandbox goes without.
+        for (approval, mode) in [
+            ("never", "never/workspace-write"),
+            ("on-request", "on-request/workspace-write"),
+            ("untrusted", "untrusted/workspace-write"),
+        ] {
+            assert_eq!(
+                claude("bypassPermissions")
+                    .child(Provider::Codex, Some(approval))
+                    .as_deref(),
+                Ok(mode)
+            );
+        }
         assert_eq!(
             claude("default").child(Provider::Codex, Some("never")),
             Err("This agent runs in default mode, so it can't start a Codex child in never/workspace-write. Without --permission-mode it starts in untrusted/workspace-write, and a person approves in cagents what it asks beyond that. Only a person can start it in that mode.".into())

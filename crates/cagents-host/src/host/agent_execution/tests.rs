@@ -4398,8 +4398,9 @@ done
 }
 
 /// The ceiling bounds agents, not the person: a person loosens a limited
-/// agent's child's mode in its pane, which the agent itself can't, and the
-/// child's own children then follow the child's new mode.
+/// agent's child's mode in its pane, which the agent itself can't, the
+/// child's own children then follow the child's new mode, and the agent keeps
+/// its child.
 #[test]
 fn a_person_loosens_a_limited_agent_s_child_and_its_children_follow() {
     if isolated("a_person_loosens_a_limited_agent_s_child_and_its_children_follow").is_some() {
@@ -4492,13 +4493,34 @@ fn a_person_loosens_a_limited_agent_s_child_and_its_children_follow() {
         Some("never/danger-full-access")
     );
     settled(&host, grandchild.run.id);
-    // Its lead's own ceiling is unchanged by the person's choice.
+    // Its lead's own ceiling is unchanged by the person's choice, and the
+    // lead keeps its child: changing the mode is not taking the child over.
     assert_eq!(
         caller_ceiling(&host, &lead)
             .unwrap()
             .map(|ceiling| ceiling.tier()),
         Some(crate::agent_execution::permission::Tier::Ask)
     );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_is_interactive(child.agent.id)
+            .unwrap()
+    );
+    let followup = submit(
+        &host,
+        &lead,
+        Submit {
+            name: None,
+            destination: Destination::Existing(child.agent.id),
+            prompt: "more work".into(),
+            idempotency_key: "followup".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, followup.run.id).state, State::Succeeded);
 }
 
 /// A person answers the tool request a limited agent was refused in its

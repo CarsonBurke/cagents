@@ -605,18 +605,20 @@ fn spawn_after_help() -> String {
         channel its lineage last belonged to when that view is missing or ambiguous. An agent \
         for another project, or for a caller that never belonged to a channel, gets a new \
         channel.\n\n\
-        Without --permission-mode, your own spawn uses the provider's configured mode. An \
-        agent's spawn gives the child the agent's own level: the agent's mode for the same \
-        provider, and otherwise the child provider's mode at that level below, or the nearest \
-        stricter one where it has none. An agent whose mode cagents can't confirm counts as \
-        Ask. An agent never starts a child above its own level, even with --permission-mode; \
-        a person can change the child's mode in cagents afterwards.\n",
+        Without --permission-mode, your own spawn uses the provider's configured mode. A \
+        spawn by an agent gives the child the agent's own permission level: the agent's own \
+        mode when the child runs the same provider, and otherwise the child provider's mode \
+        for that level in the list below, or for the nearest stricter level it has. Every \
+        mode counts at one of these levels by what it lets an agent do without asking: \
+        dontAsk counts as Ask, for example, and so does a mode cagents can't confirm. An agent \
+        never starts a child above its own level, even with --permission-mode, but a person \
+        can change the child's mode in cagents at any time.\n",
     );
     for tier in Tier::ALL {
         let modes: Vec<String> = HELP_PROVIDERS
             .into_iter()
             .filter_map(|provider| {
-                equivalent(provider, tier).map(|mode| format!("{} {mode}", provider.label()))
+                equivalent(provider, tier).map(|mode| format!("{mode} ({})", provider.label()))
             })
             .collect();
         help.push_str(&format!("\n  {}: {}", tier.label(), modes.join(", ")));
@@ -2762,10 +2764,10 @@ mod tests {
             .render_long_help()
             .to_string();
         assert!(help.contains(
-            "\n  Nothing asks: Claude Code bypassPermissions, Codex never/danger-full-access, Muse bypassPermissions, Oh My Pi yolo"
+            "\n  Nothing asks: bypassPermissions (Claude Code), never/danger-full-access (Codex), bypassPermissions (Muse), yolo (Oh My Pi)"
         ), "{help}");
         assert!(help.contains(
-            "\n  Edits apply: Claude Code acceptEdits, Codex on-request/workspace-write, Antigravity acceptEdits"
+            "\n  Edits apply: acceptEdits (Claude Code), on-request/workspace-write (Codex), acceptEdits (Antigravity)"
         ), "{help}");
         for tier in Tier::ALL {
             let line = help
@@ -2775,7 +2777,7 @@ mod tests {
             for provider in Provider::ALL {
                 if let Some(mode) = equivalent(provider, tier) {
                     assert!(
-                        line.contains(&format!("{} {mode}", provider.label())),
+                        line.contains(&format!("{mode} ({})", provider.label())),
                         "{line}"
                     );
                 }
