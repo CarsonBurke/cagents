@@ -7784,6 +7784,40 @@ fn codex_compacts_where_its_effective_configuration_says() {
         // A limit past the default changes nothing: Codex takes the lesser.
         (json!({"model_auto_compact_token_limit":900000}), 244_800),
         (json!({"model_context_window":400000}), 360_000),
+        (
+            json!({"model_post_turn_compact_threshold_percent":60}),
+            155_040,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":57}),
+            147_288,
+        ),
+        (
+            json!({"model_context_window":400000,"model_post_turn_compact_threshold_percent":50}),
+            129_200,
+        ),
+        (
+            json!({"model_auto_compact_token_limit":150000,"model_post_turn_compact_threshold_percent":60}),
+            150_000,
+        ),
+        (
+            json!({"model_auto_compact_token_limit":150000,
+                "model_auto_compact_token_limit_scope":"body_after_prefix",
+                "model_post_turn_compact_threshold_percent":60}),
+            155_040,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":0}),
+            244_800,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":100}),
+            244_800,
+        ),
+        (
+            json!({"model_post_turn_compact_threshold_percent":101}),
+            244_800,
+        ),
         // A limit on what grows after the carried prefix doesn't bound the
         // whole context.
         (
@@ -7839,11 +7873,21 @@ fn codex_compacts_where_its_effective_configuration_says() {
     adapter.receive(reading).unwrap();
     let configured = adapter
         .receive(json!({"id":read.writes[0]["id"],
-            "result":{"config":{"model_auto_compact_token_limit":150000}}}))
+            "result":{"config":{"model_post_turn_compact_threshold_percent":50}}}))
         .unwrap();
     let usage = usage_of(&configured).unwrap();
     assert_eq!(
         (usage.context_tokens, usage.compact_limit),
-        (200_000, Some(150_000))
+        (200_000, Some(129_200))
     );
+}
+
+#[test]
+fn post_turn_compaction_rounds_up_to_the_first_token_at_the_threshold() {
+    let config = ContextConfig {
+        post_turn_percent: Some(51),
+        ..ContextConfig::default()
+    };
+    assert_eq!(config.compact_limit(101), Some(52));
+    assert_eq!(config.compact_limit(0), None);
 }

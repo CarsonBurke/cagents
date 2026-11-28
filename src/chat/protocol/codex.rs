@@ -682,6 +682,8 @@ struct ContextConfig {
     auto_compact: Option<u64>,
     /// `model_context_window`, which replaces the model's own window.
     window: Option<u64>,
+    /// `model_post_turn_compact_threshold_percent`, of the usable window.
+    post_turn_percent: Option<u8>,
 }
 
 impl ContextConfig {
@@ -702,10 +704,15 @@ impl ContextConfig {
             (usable > 0).then(|| usable.saturating_mul(100).div_ceil(Self::USABLE_PERCENT))
         })?;
         let default = window.saturating_mul(Self::COMPACT_NUMERATOR) / Self::COMPACT_DENOMINATOR;
-        Some(
-            self.auto_compact
-                .map_or(default, |limit| limit.min(default)),
-        )
+        let in_turn = self
+            .auto_compact
+            .map_or(default, |limit| limit.min(default));
+        // Codex compares used * 100 >= usable * percent after the final
+        // response. Round up to the first whole token satisfying that check.
+        let post_turn = self.post_turn_percent.and_then(|percent| {
+            (usable > 0).then(|| (u128::from(usable) * u128::from(percent)).div_ceil(100) as u64)
+        });
+        Some(post_turn.map_or(in_turn, |limit| limit.min(in_turn)))
     }
 }
 
@@ -3090,6 +3097,10 @@ impl Codex {
                         window: config["model_context_window"]
                             .as_u64()
                             .filter(|window| *window > 0),
+                        post_turn_percent: config["model_post_turn_compact_threshold_percent"]
+                            .as_u64()
+                            .filter(|percent| (1..=100).contains(percent))
+                            .and_then(|percent| u8::try_from(percent).ok()),
                     };
                     if let Some(usage) = &mut self.usage {
                         let compact_limit = self.context_config.compact_limit(usage.context_limit);
