@@ -32,6 +32,8 @@ use crate::file_manager;
 use crate::file_manager::open_system_url_with_opener;
 #[cfg(feature = "integrated-browser")]
 mod browser_backend;
+#[cfg(feature = "integrated-browser")]
+mod browser_document;
 mod browser_host;
 mod file_ui;
 #[cfg(any(debug_assertions, feature = "development"))]
@@ -5451,6 +5453,10 @@ pub enum Message {
     #[cfg(feature = "integrated-browser")]
     BrowserNavigate(CardId),
     #[cfg(feature = "integrated-browser")]
+    BrowserDocument(CardId, browser_document::Action),
+    #[cfg(feature = "integrated-browser")]
+    BrowserDocumentOpened(Result<(), String>),
+    #[cfg(feature = "integrated-browser")]
     BrowserAddressFocus {
         card: CardId,
         focused: bool,
@@ -5807,6 +5813,9 @@ struct BrowserRuntime {
     address_error: bool,
     progress_phase: f32,
     load_state: Option<String>,
+    /// A page the browser loaded and couldn't show, such as a PDF, which the
+    /// pane shows in its place.
+    document: Option<Box<browser_document::BrowserDocument>>,
 }
 
 enum CardRuntime {
@@ -12614,6 +12623,7 @@ impl Cagents {
         let mut durable_changed = false;
         match event {
             BrowserEvent::UrlChanged(url) => {
+                self.browser_document_left(id, &url);
                 if let Some(CardRuntime::Browser(browser)) = self.cards.get_mut(&id) {
                     browser.address.report_location(&url);
                 }
@@ -12734,7 +12744,8 @@ impl Cagents {
                     browser.lifecycle = lifecycle;
                 }
             }
-            BrowserEvent::Error(_) => {
+            BrowserEvent::Error(error) => {
+                tracing::warn!(card = ?id, %error, "browser operation failed");
                 self.status = Some(TransientNotice::error(
                     "A browser operation failed".to_owned(),
                 ));
@@ -12749,6 +12760,9 @@ impl Cagents {
             }
             BrowserEvent::ClosedByContent => {
                 tasks.push(cosmic::task::message(Message::CloseCard(id)));
+            }
+            BrowserEvent::Unrenderable(document) => {
+                tasks.push(self.browser_document_found(id, document));
             }
             BrowserEvent::Ready { .. } => {
                 if self.finish_initial_hydration(id, Ok(())) {
@@ -13193,8 +13207,11 @@ impl Cagents {
             #[cfg(feature = "integrated-browser")]
             // The page's native surface draws over the application, so an
             // inspector covering a narrow pane's content hides it.
-            Some(CardRuntime::Browser(browser)) => BrowserWidget::new(&browser.handle)
-                .obscured(self.pane_content_inputs_blocked(id))
+            Some(CardRuntime::Browser(browser)) => {
+                let page = BrowserWidget::new(&browser.handle)
+                // A document shown in the page's place covers it, so the
+                // page's native surface must not draw over the document.
+                .obscured(self.pane_content_inputs_blocked(id) || browser.document.is_some())
                 .on_shortcut(move |event| browser_shortcut(id, &event))
                 .model_focused(card_focused)
                 .on_focus(Message::PaneWidgetFocused(id))
@@ -13208,8 +13225,18 @@ impl Cagents {
                 .on_error(move |error| Message::BrowserError {
                     card: id,
                     message: error.to_string(),
-                })
-                .into(),
+                });
+                match &browser.document {
+                    Some(document) => iced::widget::stack![
+                        page,
+                        self.browser_document_view(id, document)
+                    ]
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .into(),
+                    None => page.into(),
+                }
+            }
             Some(CardRuntime::Repository(runtime)) => {
                 repository_widget::view(id, runtime).map(Message::Repository)
             }
@@ -16564,10 +16591,16 @@ impl Cagents {
     /// outgoing theme would be no better than not rendering one at all.
     fn retone_documents(&mut self, theme: &cosmic::Theme) -> Task<Message> {
         Task::batch(self.cards.iter_mut().filter_map(|(&card, runtime)| {
-            if let CardRuntime::Repository(runtime) = runtime {
-                Some(repository_task(runtime.retone_document(card, theme)))
-            } else {
-                None
+            match runtime {
+                CardRuntime::Repository(runtime) => {
+                    Some(repository_task(runtime.retone_document(card, theme)))
+                }
+                #[cfg(feature = "integrated-browser")]
+                CardRuntime::Browser(browser) => browser
+                    .document
+                    .as_mut()
+                    .map(|document| document.retone(card, theme)),
+                _ => None,
             }
         }))
     }
@@ -18900,7 +18933,8 @@ impl Cagents {
                 cosmic::task::message(Message::FocusCard(card))
             }
             #[cfg(feature = "integrated-browser")]
-            Message::BrowserError { .. } => {
+            Message::BrowserError { card, message } => {
+                tracing::warn!(?card, %message, "browser widget operation failed");
                 self.status = Some(TransientNotice::error("A browser operation failed".to_owned()));
                 Task::none()
             }
@@ -20106,13 +20140,18 @@ impl Cagents {
                 {
                     self.window_scale_factor = scale_factor;
                     #[cfg(feature = "integrated-browser")]
-                    for runtime in self.cards.values() {
-                        if let CardRuntime::Browser(browser) = runtime {
-                            let _ = browser.handle.set_scale_factor(effective_surface_scale(
-                                scale_factor,
-                                self.settings.ui_scale,
-                            ));
+                    {
+                        let surface = effective_surface_scale(scale_factor, self.settings.ui_scale);
+                        let mut renders = Vec::new();
+                        for (&card, runtime) in &mut self.cards {
+                            if let CardRuntime::Browser(browser) = runtime {
+                                let _ = browser.handle.set_scale_factor(surface);
+                                if let Some(document) = &mut browser.document {
+                                    renders.push(document.rescale(card, surface));
+                                }
+                            }
                         }
+                        return Task::batch(renders);
                     }
                 }
                 Task::none()
@@ -20289,6 +20328,15 @@ impl Cagents {
                     if let CardRuntime::Browser(browser) = runtime {
                         browser.progress_phase = (browser.progress_phase + 0.035) % 1.0;
                     }
+                }
+                Task::none()
+            }
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserDocument(card, action) => self.update_browser_document(card, action),
+            #[cfg(feature = "integrated-browser")]
+            Message::BrowserDocumentOpened(result) => {
+                if let Err(error) = result {
+                    self.status = Some(TransientNotice::error(error));
                 }
                 Task::none()
             }
@@ -21400,6 +21448,7 @@ fn spawn_browser(
             },
             address: BrowserAddress::location(&session.current_url),
             load_state: None,
+            document: None,
         })
         .map_err(|error| error.to_string())
 }
@@ -21412,8 +21461,9 @@ fn browser_command(
     status: &mut Option<TransientNotice>,
 ) -> Task<Message> {
     if let Some(CardRuntime::Browser(browser)) = cards.get(&card)
-        && command(&browser.handle).is_err()
+        && let Err(error) = command(&browser.handle)
     {
+        tracing::warn!(?card, %error, "browser command failed");
         *status = Some(TransientNotice::error(
             "A browser operation failed".to_owned(),
         ));

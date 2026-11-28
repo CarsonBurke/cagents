@@ -88,6 +88,7 @@ icons! {
     Delete => "delete",
     Diff => "diff",
     Display => "display",
+    Download => "download",
     DraftPullRequest => "draft-pull-request",
     Edit => "edit",
     Ended => "ended",

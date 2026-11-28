@@ -16,7 +16,9 @@ pub mod retained_save;
 /// Rasterizing a page happens in a child process, so the reader's document
 /// lives behind the same module boundary either way: `load_file` opens one on
 /// its first page, and the view asks for the pages after that.
-pub use crate::document_render::{DocumentPage, render_document_page};
+pub use crate::document_render::{
+    DocumentPage, PageSize, render_document_page, render_document_page_at,
+};
 
 /// Files above this size are never loaded into an editable buffer.
 pub const MAX_EDITABLE_FILE_BYTES: u64 = 8 * 1024 * 1024;
@@ -545,7 +547,7 @@ fn load_regular_file(
         // had a chance to ask for anything else yet.
         return Ok(
             match render_document_page(&path, 0, tone, PdfZoom::default()) {
-                Ok(DocumentPage { pages, page }) => FileContent::Pdf { pages, page },
+                Ok(DocumentPage { pages, page, .. }) => FileContent::Pdf { pages, page },
                 Err(reason) => FileContent::ReadOnly(ReadOnlyReason::Document(reason)),
             },
         );

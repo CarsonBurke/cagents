@@ -88,11 +88,15 @@ const FRAME_MAGIC: [u8; 8] = *b"CGDOCPAG";
 /// Bumped if the header's shape ever changes. Parent and helper are the same
 /// build in every supported case, so a mismatch means something other than
 /// this protocol is writing to the pipe.
-const FRAME_VERSION: u32 = 2;
+const FRAME_VERSION: u32 = 3;
 
 /// Magic, version, page count, page index, width, height, printed width, and
-/// RGBA length.
+/// RGBA length. Every page's printed size follows the header, ahead of the
+/// pixels.
 const FRAME_HEADER_BYTES: usize = 8 + 4 + 8 + 8 + 4 + 4 + 4 + 8;
+
+/// One page's printed width and height, as two `f32`s.
+const PAGE_SIZE_BYTES: usize = 8;
 
 /// The widest page the parent will believe, in PostScript points.
 ///
@@ -108,7 +112,8 @@ const MAX_PAGE_POINTS: f32 = 14_400.0;
 const MAX_RGBA_BYTES: u64 = MAX_IMAGE_DIMENSION as u64 * MAX_IMAGE_DIMENSION as u64 * 4;
 
 /// Everything the parent will read from the helper's stdout.
-const MAX_FRAME_BYTES: u64 = FRAME_HEADER_BYTES as u64 + MAX_RGBA_BYTES;
+const MAX_FRAME_BYTES: u64 =
+    FRAME_HEADER_BYTES as u64 + (MAX_PDF_PAGES * PAGE_SIZE_BYTES) as u64 + MAX_RGBA_BYTES;
 
 /// Enough of the helper's stderr for a sentence or a runtime's dying words,
 /// and not enough for a wedged helper to fill the parent's memory.
@@ -123,11 +128,24 @@ const REAP_GRACE: Duration = Duration::from_millis(500);
 /// How often the exit status is polled while waiting out `REAP_GRACE`.
 const REAP_POLL: Duration = Duration::from_millis(1);
 
-/// One page raster plus how many pages the document has.
+/// How large a page prints, in PostScript points, after its rotation.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PageSize {
+    pub width: f32,
+    pub height: f32,
+}
+
+/// One page raster plus how many pages the document has and how large each
+/// of them prints.
+///
+/// The sizes come with every page because a reader scrolling a whole document
+/// needs the length of the column before the pages in it are drawn, and the
+/// helper has already materialised the page tree they are read from.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DocumentPage {
     pub pages: usize,
     pub page: PdfPage,
+    pub sizes: std::sync::Arc<[PageSize]>,
 }
 
 /// Performs the render and exits, when this process was spawned as the
@@ -195,17 +213,50 @@ pub fn render_document_page(
     tone: PdfTone,
     zoom: PdfZoom,
 ) -> Result<DocumentPage, String> {
+    render_document_page_scaled(path, index, tone, zoom.factor())
+}
+
+/// Renders one page at `pixels_per_point` device pixels per PostScript point,
+/// for a viewer that sizes its own pages rather than stepping through
+/// [`PdfZoom`]'s steps.
+///
+/// The helper bounds the raster to the preview's limits either way, so a
+/// request for more than a page can hold comes back as sharp as it may be.
+pub fn render_document_page_at(
+    path: &Path,
+    index: usize,
+    tone: PdfTone,
+    pixels_per_point: f32,
+) -> Result<DocumentPage, String> {
+    let factor = if pixels_per_point.is_finite() {
+        (pixels_per_point / PDF_PAGE_SCALE).clamp(MIN_ZOOM_FACTOR, MAX_ZOOM_FACTOR)
+    } else {
+        1.0
+    };
+    render_document_page_scaled(path, index, tone, factor)
+}
+
+fn render_document_page_scaled(
+    path: &Path,
+    index: usize,
+    tone: PdfTone,
+    factor: f32,
+) -> Result<DocumentPage, String> {
     let helper = crate::process::current_executable()
         .map_err(|error| format!("This document could not be rendered: {error}."))?;
-    render_with_helper(&helper, path, index, tone, zoom, RENDER_TIMEOUT)
+    render_with_helper(&helper, path, index, tone, factor, RENDER_TIMEOUT)
 }
+
+/// The multipliers of `PDF_PAGE_SCALE` the helper accepts.
+const MIN_ZOOM_FACTOR: f32 = 0.05;
+const MAX_ZOOM_FACTOR: f32 = 8.0;
 
 fn render_with_helper(
     helper: &Path,
     path: &Path,
     index: usize,
     tone: PdfTone,
-    zoom: PdfZoom,
+    factor: f32,
     timeout: Duration,
 ) -> Result<DocumentPage, String> {
     let mut command = Command::new(helper);
@@ -214,7 +265,7 @@ fn render_with_helper(
         .arg(path)
         .arg(index.to_string())
         .arg(tone_argument(tone))
-        .arg(format!("{:.4}", zoom.factor()))
+        .arg(format!("{factor:.4}"))
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -284,7 +335,7 @@ fn parse_tone(argument: &str) -> Option<PdfTone> {
 /// infinity, or a page nothing can hold.
 fn parse_zoom(argument: &str) -> Option<f32> {
     let zoom = argument.parse::<f32>().ok()?;
-    (zoom.is_finite() && (0.05..=8.0).contains(&zoom)).then_some(zoom)
+    (zoom.is_finite() && (MIN_ZOOM_FACTOR..=MAX_ZOOM_FACTOR).contains(&zoom)).then_some(zoom)
 }
 
 struct HelperOutput {
@@ -543,6 +594,13 @@ fn render_page(
     if let PdfTone::Inverted { paper } = tone {
         invert_lightness(&mut rgba, paper);
     }
+    let sizes = pages
+        .iter()
+        .map(|page| {
+            let (width, height) = page.render_dimensions();
+            PageSize { width, height }
+        })
+        .collect();
     Ok(DocumentPage {
         pages: count,
         page: PdfPage {
@@ -552,6 +610,7 @@ fn render_page(
             points_wide,
             rgba: rgba.into(),
         },
+        sizes,
     })
 }
 
@@ -651,6 +710,7 @@ fn write_frame(page: &DocumentPage) -> Result<(), String> {
     let mut stdout = stdout.lock();
     stdout
         .write_all(&frame_header(page))
+        .and_then(|()| stdout.write_all(&frame_sizes(page)))
         .and_then(|()| stdout.write_all(&page.page.rgba))
         .and_then(|()| stdout.flush())
         .map_err(|error| format!("This document's page could not be returned: {error}."))
@@ -669,6 +729,20 @@ fn frame_header(page: &DocumentPage) -> Vec<u8> {
     header
 }
 
+fn frame_sizes(page: &DocumentPage) -> Vec<u8> {
+    let mut sizes = Vec::with_capacity(page.sizes.len() * PAGE_SIZE_BYTES);
+    for size in page.sizes.iter() {
+        sizes.extend_from_slice(&size.width.to_le_bytes());
+        sizes.extend_from_slice(&size.height.to_le_bytes());
+    }
+    sizes
+}
+
+/// Whether a printed extent is one the parent will lay a page out at.
+fn plausible_points(points: f32) -> bool {
+    points.is_finite() && points > 0.0 && points <= MAX_PAGE_POINTS
+}
+
 /// Turns a frame back into a page, or says why it is not one.
 ///
 /// Every field is checked against what the parent asked for and against the
@@ -681,7 +755,7 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
             frame.len()
         ));
     }
-    let (header, rgba) = frame.split_at(FRAME_HEADER_BYTES);
+    let (header, rest) = frame.split_at(FRAME_HEADER_BYTES);
     if header[..FRAME_MAGIC.len()] != FRAME_MAGIC {
         return Err("the reply was not a page".to_owned());
     }
@@ -695,7 +769,7 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
     let height = u32_at(header, 32);
     let points_wide = f32::from_le_bytes([header[36], header[37], header[38], header[39]]);
     let declared = u64_at(header, 40);
-    if !points_wide.is_finite() || points_wide <= 0.0 || points_wide > MAX_PAGE_POINTS {
+    if !plausible_points(points_wide) {
         return Err(format!(
             "the page declared a printed width of {points_wide}"
         ));
@@ -705,6 +779,27 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
             "the page declared {declared} bytes, past the {MAX_RGBA_BYTES} byte limit"
         ));
     }
+    if pages == 0 || pages > MAX_PDF_PAGES as u64 {
+        return Err(format!("the document claimed {pages} pages"));
+    }
+    let sizes_length = pages as usize * PAGE_SIZE_BYTES;
+    if rest.len() < sizes_length {
+        return Err(format!(
+            "the page sizes needed {sizes_length} bytes and {} arrived",
+            rest.len()
+        ));
+    }
+    let (sizes, rgba) = rest.split_at(sizes_length);
+    let sizes = sizes
+        .chunks_exact(PAGE_SIZE_BYTES)
+        .map(|size| {
+            let width = f32::from_le_bytes([size[0], size[1], size[2], size[3]]);
+            let height = f32::from_le_bytes([size[4], size[5], size[6], size[7]]);
+            (plausible_points(width) && plausible_points(height))
+                .then_some(PageSize { width, height })
+                .ok_or_else(|| format!("a page declared a printed size of {width} by {height}"))
+        })
+        .collect::<Result<std::sync::Arc<[PageSize]>, String>>()?;
     if declared != rgba.len() as u64 {
         return Err(format!(
             "the page declared {declared} bytes and sent {}",
@@ -718,9 +813,6 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
         return Err(format!(
             "a {width} by {height} page cannot be {declared} bytes"
         ));
-    }
-    if pages == 0 || pages > MAX_PDF_PAGES as u64 {
-        return Err(format!("the document claimed {pages} pages"));
     }
     if index != requested as u64 {
         return Err(format!(
@@ -736,6 +828,7 @@ fn decode_frame(frame: &[u8], requested: usize) -> Result<DocumentPage, String> 
             points_wide,
             rgba: rgba.into(),
         },
+        sizes,
     })
 }
 
@@ -810,6 +903,7 @@ mod tests {
 
     fn frame(page: &DocumentPage) -> Vec<u8> {
         let mut frame = frame_header(page);
+        frame.extend_from_slice(&frame_sizes(page));
         frame.extend_from_slice(&page.page.rgba);
         frame
     }
@@ -822,6 +916,13 @@ mod tests {
         let rendered = render_page(&path, 0, PdfTone::Original, 1.0).unwrap();
         assert_eq!(rendered.pages, 1);
         assert_eq!(rendered.page.index, 0);
+        assert_eq!(
+            &*rendered.sizes,
+            &[PageSize {
+                width: 21.0,
+                height: 11.0
+            }]
+        );
         let width = rendered.page.width as usize;
         assert_eq!(
             rendered.page.rgba.len(),
@@ -949,6 +1050,14 @@ mod tests {
                 points_wide: 612.0,
                 rgba: vec![1, 2, 3, 4, 5, 6, 7, 8].into(),
             },
+            sizes: vec![
+                PageSize {
+                    width: 612.0,
+                    height: 792.0
+                };
+                3
+            ]
+            .into(),
         };
         let whole = frame(&page);
         assert_eq!(decode_frame(&whole, 1).unwrap(), page);
@@ -998,6 +1107,25 @@ mod tests {
         uncountable[12..20].copy_from_slice(&0u64.to_le_bytes());
         assert!(decode_frame(&uncountable, 1).is_err());
 
+        // Every page's printed size lays out the column the reader scrolls,
+        // so a size nothing can be drawn at is refused like the page's own.
+        let sizes_at = FRAME_HEADER_BYTES;
+        for nonsense in [0.0, f32::NAN, MAX_PAGE_POINTS + 1.0] {
+            let mut absurd = whole.clone();
+            absurd[sizes_at + 12..sizes_at + 16].copy_from_slice(&nonsense.to_le_bytes());
+            assert!(
+                decode_frame(&absurd, 1)
+                    .unwrap_err()
+                    .contains("printed size"),
+                "a page height of {nonsense} has to be refused"
+            );
+        }
+        assert!(
+            decode_frame(&whole[..FRAME_HEADER_BYTES + 4], 1)
+                .unwrap_err()
+                .contains("page sizes")
+        );
+
         let mut foreign = whole.clone();
         foreign[8..12].copy_from_slice(&(FRAME_VERSION + 1).to_le_bytes());
         assert!(decode_frame(&foreign, 1).is_err());
@@ -1027,7 +1155,7 @@ mod tests {
                 &document,
                 0,
                 PdfTone::Original,
-                PdfZoom::default(),
+                PdfZoom::default().factor(),
                 patience
             ),
             Err("This PDF declares no pages.".to_owned())
@@ -1045,7 +1173,7 @@ mod tests {
             &document,
             0,
             PdfTone::Original,
-            PdfZoom::default(),
+            PdfZoom::default().factor(),
             patience,
         )
         .unwrap_err();
@@ -1071,7 +1199,7 @@ mod tests {
             &document,
             0,
             PdfTone::Original,
-            PdfZoom::default(),
+            PdfZoom::default().factor(),
             patience,
         )
         .unwrap_err();
@@ -1108,7 +1236,7 @@ mod tests {
                 &document,
                 0,
                 PdfTone::Original,
-                PdfZoom::default(),
+                PdfZoom::default().factor(),
                 Duration::from_millis(250)
             ),
             Err("This document could not be rendered in time.".to_owned())

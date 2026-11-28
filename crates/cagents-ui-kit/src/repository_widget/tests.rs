@@ -6626,6 +6626,14 @@ fn rendered_document_page(index: usize, pages: usize) -> crate::editor::Document
             points_wide: 612.0,
             rgba: vec![255; 16].into(),
         },
+        sizes: vec![
+            crate::editor::PageSize {
+                width: 612.0,
+                height: 792.0
+            };
+            pages
+        ]
+        .into(),
     }
 }
 

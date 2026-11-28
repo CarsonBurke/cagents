@@ -47,6 +47,7 @@ pub mod latency_fixture;
 pub mod lifecycle;
 pub mod lsp;
 pub mod operation_recovery;
+pub mod pdf_viewer;
 pub mod pull_request_review;
 pub mod question;
 pub mod reorder;

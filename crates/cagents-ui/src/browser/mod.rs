@@ -7,6 +7,8 @@
 //! iced widget supplies input, IME, visibility, and logical geometry but does
 //! not import or draw browser pixels.
 
+mod content;
+mod download;
 mod fallback;
 mod handle;
 mod history;
@@ -17,6 +19,8 @@ mod runtime;
 mod types;
 mod widget;
 
+pub use content::{FetchRequest, UnrenderableDocument, is_pdf_type};
+pub use download::{FetchProgress, Fetched, fetch_document, save_into};
 pub use fallback::{
     CapabilityProbe, RawWaylandSubsurfaceFactory, WaylandSubsurfaceFactory, WaylandSubsurfaceLease,
 };
