@@ -740,6 +740,28 @@ class PublisherSignatures(unittest.TestCase):
         self.assertNotIn("installer was invoked", result.stdout)
         self.assertEqual(result.returncode, 1, result.stderr)
 
+    def test_macos_terminal_notes_stop_at_the_first_failed_step(self):
+        self.drafted(macos=True)
+        path = self.directory / "github/releases/v0.2.5/release.json"
+        notes = json.loads(path.read_text())["body"].split("## macOS\n", 1)[1]
+        snippet = notes.split("```sh\n", 1)[1].split("\n```", 1)[0]
+        tools = self.directory / "macos-terminal-commands"
+        tools.mkdir()
+        for name, command in (("curl", "printf '%s\\n' \"$1\""),
+                              ("shasum", "exit 1"),
+                              ("sh", "echo 'installer was invoked'")):
+            tool = tools / name
+            tool.write_text(f"#!/bin/sh\n{command}\n")
+            tool.chmod(0o755)
+        environment = {"PATH": f"{tools}:{os.defpath}"}
+
+        for expected in ("--disable", ""):
+            with self.subTest(first_download=bool(expected)):
+                result = subprocess.run(["/bin/sh", "-c", snippet], cwd=self.directory,
+                                        env=environment, text=True, capture_output=True, timeout=HANG_GUARD)
+                self.assertEqual(result.stdout.strip(), expected)
+                self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])
         signature = (dist / "release-metadata.json.sig").read_text()
