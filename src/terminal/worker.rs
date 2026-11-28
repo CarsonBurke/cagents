@@ -589,6 +589,7 @@ struct PublishedState {
     archive_observer: OnceLock<Arc<ArchiveObserver>>,
     event_observer: Mutex<Option<Arc<ArchiveObserver>>>,
     completed: AtomicBool,
+    completion_observer: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     #[cfg(target_os = "macos")]
     completed_screen_cached: AtomicBool,
     /// An adopted original has not proved its startup commit. Its raw prefix
@@ -677,6 +678,20 @@ impl PublishedState {
         }
     }
 
+    fn mark_completed(&self) {
+        let observer = {
+            let mut observer = self
+                .completion_observer
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            self.completed.store(true, Ordering::Release);
+            observer.take()
+        };
+        if let Some(observer) = observer {
+            observer();
+        }
+    }
+
     fn release_completed_holder(&self) {
         *self.archive.lock().unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Released;
         self.archive_ready.notify_all();
@@ -711,6 +726,7 @@ impl PublishedState {
             archive_observer: OnceLock::new(),
             event_observer: Mutex::new(None),
             completed: AtomicBool::new(false),
+            completion_observer: Mutex::new(None),
             #[cfg(target_os = "macos")]
             completed_screen_cached: AtomicBool::new(false),
             startup_unresolved: AtomicBool::new(false),
@@ -1575,7 +1591,7 @@ impl TerminalHandle {
                 let completion = Arc::clone(&worker_published);
                 if admitted.recv().is_err() {
                     completion.settle_startup();
-                    completion.completed.store(true, Ordering::Release);
+                    completion.mark_completed();
                     return;
                 }
                 let adopting = config.adoption.is_some();
@@ -1593,7 +1609,7 @@ impl TerminalHandle {
                         {
                             // No holder acknowledgement or PTY effect occurred.
                             drop(worker);
-                            completion.completed.store(true, Ordering::Release);
+                            completion.mark_completed();
                             completion.settle_startup();
                             return;
                         }
@@ -1605,7 +1621,7 @@ impl TerminalHandle {
                         })).unwrap_or_else(|_| Some("Adoption commit/activation panicked; complete original Worker retained".into()));
                         if !adopting && let Some(message) = &retained {
                             completion.settle_startup();
-                            completion.completed.store(true, Ordering::Release);
+                            completion.mark_completed();
                             let _ = startup_tx.send(Err(message.clone()));
                             return;
                         }
@@ -1643,7 +1659,7 @@ impl TerminalHandle {
                     Err(error) => {
                         completion.settle_startup();
                         let _ = startup_tx.send(Err(error));
-                        completion.completed.store(true, Ordering::Release);
+                        completion.mark_completed();
                     }
                 }
             })
@@ -1911,7 +1927,7 @@ impl TerminalHandle {
             BLOCK.with(|slot| *slot.borrow_mut() = Some(TlsWait { blocked, entered }));
             // This control models a completed process/body publication, not a
             // real PTY. The OS thread is still alive in its actual TLS destructor.
-            worker_published.completed.store(true, Ordering::Release);
+            worker_published.mark_completed();
         });
         owner.install(worker);
         (
@@ -2037,6 +2053,29 @@ impl TerminalHandle {
     pub fn is_completed(&self) -> bool {
         self.inner.published.completed.load(Ordering::Acquire)
     }
+
+    /// Notify the daemon when this exact worker releases its process ownership.
+    /// The observer runs once, including when completion beat registration.
+    /// It can run on the worker thread or immediately on this caller.
+    pub fn observe_completion(&self, notify: impl FnOnce() + Send + 'static) {
+        let mut observer = self
+            .inner
+            .published
+            .completion_observer
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        if self.is_completed() {
+            drop(observer);
+            notify();
+        } else {
+            assert!(
+                observer.is_none(),
+                "terminal completion already has an observer"
+            );
+            *observer = Some(Box::new(notify));
+        }
+    }
+
     pub fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
@@ -3970,9 +4009,9 @@ impl Worker {
         // A panic during teardown skips both publications and retains live
         // inventory rather than certifying unobserved cleanup.
         let completion = self.run_to_completion();
-        published
-            .completed
-            .store(completion.ownership_released, Ordering::Release);
+        if completion.ownership_released {
+            published.mark_completed();
+        }
         if let Some(completion) = completion.event {
             published.emit_event(&events, completion);
             #[cfg(target_os = "macos")]

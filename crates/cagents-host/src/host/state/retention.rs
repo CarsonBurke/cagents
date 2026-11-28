@@ -2,6 +2,39 @@
 use super::*;
 use std::collections::HashSet;
 
+/// The listener needs only workers that have released ownership. Notices
+/// include the execution instance because a terminal ID can be reused before
+/// the listener gets around to draining its inbox.
+pub(super) struct Completions {
+    sender: crossbeam_channel::Sender<(TerminalId, uuid::Uuid)>,
+    receiver: crossbeam_channel::Receiver<(TerminalId, uuid::Uuid)>,
+    observed: BTreeMap<TerminalId, Instant>,
+}
+
+impl Default for Completions {
+    fn default() -> Self {
+        let (sender, receiver) = crossbeam_channel::unbounded();
+        Self {
+            sender,
+            receiver,
+            observed: BTreeMap::new(),
+        }
+    }
+}
+
+impl Completions {
+    pub(super) fn watch(&mut self, id: TerminalId, handle: &TerminalHandle) {
+        self.observed.remove(&id);
+        let sender = self.sender.clone();
+        let instance = handle.execution_instance();
+        handle.observe_completion(move || {
+            if sender.send((id, instance)).is_ok() {
+                crate::daemon::wake();
+            }
+        });
+    }
+}
+
 enum RetentionVisit {
     Handoff,
     Terminal,
@@ -118,10 +151,18 @@ impl HostState {
         }
     }
 
+    pub(super) fn remove_terminal_record(&mut self, id: TerminalId) -> Option<TerminalRecord> {
+        self.terminal_completions.observed.remove(&id);
+        self.terminals.remove(&id)
+    }
+
     pub(in crate::host) fn observe_completed_terminals(&mut self, now: Instant) {
-        for record in self.terminals.values_mut() {
-            if record.handle.is_completed() {
-                record.completed_at.get_or_insert(now);
+        let completions = &mut self.terminal_completions;
+        for (id, instance) in completions.receiver.try_iter() {
+            if self.terminals.get(&id).is_some_and(|record| {
+                record.handle.execution_instance() == instance && record.handle.is_completed()
+            }) {
+                completions.observed.entry(id).or_insert(now);
             }
         }
     }
@@ -135,6 +176,7 @@ impl HostState {
         !self.shutting_down
             && !self.shutdown_requested
             && self.upgrade.is_none()
+            // A failed worker join or holder release can revoke completion.
             && record.handle.is_completed()
             // A failed startup still owns its original recovery slot. Keep the
             // record reachable until exact checked Close settles that custody.
@@ -157,7 +199,7 @@ impl HostState {
     fn retention_candidates<'a>(
         &'a self,
         pinned: &'a BTreeSet<TerminalId>,
-    ) -> impl Iterator<Item = (&'a TerminalId, &'a TerminalRecord)> + 'a {
+    ) -> impl Iterator<Item = (TerminalId, Instant, &'a TerminalRecord)> + 'a {
         self.retention_candidates_observed(pinned, |_| {})
     }
 
@@ -165,23 +207,33 @@ impl HostState {
         &'a self,
         pinned: &'a BTreeSet<TerminalId>,
         mut visit: impl FnMut(RetentionVisit) + 'a,
-    ) -> impl Iterator<Item = (&'a TerminalId, &'a TerminalRecord)> + 'a {
+    ) -> impl Iterator<Item = (TerminalId, Instant, &'a TerminalRecord)> + 'a {
         // Several deadline/expiry traversals run under HostState's lock. Do not
         // rescan every retained handoff for each unrelated completed terminal.
         // This membership belongs only to this borrow, so new/removed receipts
         // are observed by the next traversal without a persistent cache.
-        let replacements = self
-            .chat_handoffs
-            .values()
-            .map(|receipt| {
-                visit(RetentionVisit::Handoff);
-                receipt.replacement().id
+        let mut replacements = None;
+        self.terminal_completions
+            .observed
+            .iter()
+            .filter_map(move |(&id, &at)| {
+                visit(RetentionVisit::Terminal);
+                if pinned.contains(&id) {
+                    return None;
+                }
+                let replacements = replacements.get_or_insert_with(|| {
+                    self.chat_handoffs
+                        .values()
+                        .map(|receipt| {
+                            visit(RetentionVisit::Handoff);
+                            receipt.replacement().id
+                        })
+                        .collect()
+                });
+                let record = self.terminals.get(&id)?;
+                self.retention_candidate(id, record, replacements)
+                    .then_some((id, at, record))
             })
-            .collect::<HashSet<_>>();
-        self.terminals.iter().filter(move |(id, record)| {
-            visit(RetentionVisit::Terminal);
-            !pinned.contains(id) && self.retention_candidate(**id, record, &replacements)
-        })
     }
 
     pub(in crate::host) fn terminal_retention_deadline(
@@ -190,7 +242,7 @@ impl HostState {
         pinned: &BTreeSet<TerminalId>,
     ) -> Option<Instant> {
         self.retention_candidates(pinned)
-            .filter_map(|(_, record)| record.completed_at?.checked_add(retention))
+            .filter_map(|(_, at, _)| at.checked_add(retention))
             .min()
     }
 
@@ -201,13 +253,8 @@ impl HostState {
         pinned: &BTreeSet<TerminalId>,
     ) -> Vec<(TerminalId, TerminalHandle)> {
         self.retention_candidates(pinned)
-            .filter(|(_, record)| {
-                record
-                    .completed_at
-                    .and_then(|at| at.checked_add(retention))
-                    .is_some_and(|at| at <= now)
-            })
-            .map(|(id, record)| (*id, record.handle.clone()))
+            .filter(|(_, at, _)| at.checked_add(retention).is_some_and(|at| at <= now))
+            .map(|(id, _, record)| (id, record.handle.clone()))
             .collect()
     }
 
@@ -261,11 +308,86 @@ mod tests {
                 RetentionVisit::Handoff => handoffs += 1,
                 RetentionVisit::Terminal => terminals += 1,
             })
-            .map(|(id, _)| *id)
+            .map(|(id, ..)| id)
             .collect();
-        assert_eq!(handoffs, state.chat_handoffs.len());
-        assert_eq!(terminals, state.terminals.len());
+        assert_eq!(
+            handoffs,
+            if state
+                .terminal_completions
+                .observed
+                .keys()
+                .all(|id| pinned.contains(id))
+            {
+                0
+            } else {
+                state.chat_handoffs.len()
+            }
+        );
+        assert_eq!(terminals, state.terminal_completions.observed.len());
         ids
+    }
+
+    #[test]
+    fn retention_tracks_only_the_registered_workers_that_complete() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut state = HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new("retention-completion-test"),
+            boot_id: BootId::new("retention-completion-test"),
+            host_incarnation: HostIncarnation::new("retention-completion-test"),
+        });
+        let recipe = LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec!["-c".into(), "IFS= read -r line".into()],
+            working_directory: directory.path().to_owned(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let session = TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            owned_codex_listener: None,
+            predecessor: None,
+            recovery_origin: None,
+            transcript_path: None,
+            resume_hint: None,
+            continuity: TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+        };
+        let mut install = || {
+            let handle =
+                TerminalHandle::spawn(session.clone(), TerminalConfig::default(), |_| {}).unwrap();
+            state
+                .install_startup_parent(None, session.clone(), handle.clone(), false, None, None)
+                .unwrap();
+            handle
+        };
+        let original = install();
+        original.shutdown().unwrap();
+        assert!(original.is_completed());
+        // Replace the record before draining the old worker's notification.
+        let replacement = install();
+        let completed = Instant::now();
+        state.observe_completed_terminals(completed);
+        let pinned = BTreeSet::new();
+        assert!(!replacement.is_completed());
+        assert!(observed_candidates(&state, &pinned).is_empty());
+        assert_eq!(
+            state.terminal_retention_deadline(Duration::ZERO, &pinned),
+            None
+        );
+
+        replacement.shutdown().unwrap();
+        assert!(replacement.is_completed());
+        state.observe_completed_terminals(completed);
+        let expired = state.expired_terminal_handles(completed, Duration::ZERO, &pinned);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].0, session.id);
+        assert!(expired[0].1.same_worker(&replacement));
+
+        state.retire_terminal(session.id).unwrap();
+        assert!(observed_candidates(&state, &pinned).is_empty());
     }
 
     #[test]
