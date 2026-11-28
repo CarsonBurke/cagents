@@ -21,9 +21,12 @@ use std::{
     time::Instant,
 };
 
+#[path = "support/isolated_git.rs"]
+mod isolated_git;
 #[path = "support/repository_scale.rs"]
 mod scale_support;
-use scale_support::{isolated_git::fixture_git_environment, isolated_large_pathspec_test, phase};
+use isolated_git::fixture_git_environment;
+use scale_support::{isolated_large_pathspec_test, phase};
 
 struct IsolatedExecutor;
 

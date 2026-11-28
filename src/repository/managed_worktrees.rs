@@ -324,14 +324,6 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 }
 
-#[cfg(any(test, feature = "test-support"))]
-#[path = "../../tests/support/isolated_git.rs"]
-mod isolated_git;
-
-#[cfg(any(test, feature = "test-support"))]
-#[doc(hidden)]
-pub use isolated_git::IsolatedGitChild;
-
 /// Runs the named test in a private Git environment. The worker must keep
 /// the returned guard until its test body and local resources have finished.
 #[cfg(any(test, feature = "test-support"))]

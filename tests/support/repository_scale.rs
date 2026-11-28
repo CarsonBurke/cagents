@@ -1,7 +1,5 @@
 // Shared by the library's sparse-index contract and the standalone scale contract.
-#[path = "isolated_git.rs"]
-pub(super) mod isolated_git;
-
+use super::isolated_git;
 use std::{
     fs,
     path::Path,

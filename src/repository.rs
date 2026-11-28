@@ -6,6 +6,9 @@
 //! straightforward to test with a fake executor.
 
 mod ignored_worktree_files;
+#[cfg(any(test, feature = "test-support"))]
+#[path = "../tests/support/isolated_git.rs"]
+mod isolated_git;
 mod managed_worktrees;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "../tests/support/repository_scale.rs"]
@@ -13,9 +16,10 @@ mod scale_support;
 pub use ignored_worktree_files::default_disposable_ignored_directories;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use managed_worktrees::{
-    IsolatedGitChild, isolated_git_test, retained_managed_fixture_directory,
-};
+pub use isolated_git::IsolatedGitChild;
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub use managed_worktrees::{isolated_git_test, retained_managed_fixture_directory};
 mod worktree_setup_intent;
 pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
