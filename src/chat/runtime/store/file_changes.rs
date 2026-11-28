@@ -407,17 +407,19 @@ impl Store {
             Event::SubagentMerged { from, into } => {
                 let old = format!("c:{from}");
                 let new = format!("c:{into}");
-                let transaction = self.db.transaction()?;
-                transaction.execute_batch("PRAGMA defer_foreign_keys=ON")?;
+                // The file index savepoint commits the owner, patch chunks,
+                // and published revision together.
+                let db = &self.db;
+                db.execute_batch("PRAGMA defer_foreign_keys=ON")?;
                 // Unresolved paths are counted under their owner. Resolved
                 // paths share a pathname key across owners and keep that key.
                 {
-                    let mut paths = transaction.prepare(
+                    let mut paths = db.prepare(
                         "SELECT path FROM file_totals WHERE source=?1 AND resolved IS NULL AND succeeded>0",
                     )?;
                     for path in paths.query_map([&old], |row| row.get::<_, String>(0))? {
                         let path = path?;
-                        transaction.execute(
+                        db.execute(
                             "UPDATE file_paths SET identity=?1 WHERE identity=?2",
                             params![
                                 unresolved_file_identity(&new, &path),
@@ -426,20 +428,19 @@ impl Store {
                         )?;
                     }
                 }
-                let changed = transaction.execute(
+                let moved = db.execute(
                     "UPDATE file_edits SET source=?1 WHERE source=?2",
                     params![new, old],
                 )?;
-                transaction.execute(
+                db.execute(
                     "UPDATE file_patch_chunks SET source=?1 WHERE source=?2",
                     params![new, old],
                 )?;
-                transaction.execute(
+                db.execute(
                     "UPDATE file_totals SET source=?1, revision=?3 WHERE source=?2",
                     params![new, old, self.file_revision.saturating_add(1)],
                 )?;
-                transaction.commit()?;
-                if changed > 0 {
+                if moved > 0 {
                     self.file_revision = self.file_revision.saturating_add(1);
                 }
             }

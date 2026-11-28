@@ -1214,7 +1214,9 @@ impl Store {
         }
         if matches!(
             event,
-            Event::SubagentItem { .. } | Event::SubagentItemsRemoved { .. }
+            Event::SubagentItem { .. }
+                | Event::SubagentItemsRemoved { .. }
+                | Event::SubagentMerged { .. }
         ) {
             self.with_file_index(|store| store.index_child_event(&event))?;
         }
