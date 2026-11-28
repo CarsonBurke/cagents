@@ -417,7 +417,7 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
         }
         let terminals: Vec<_> = client
-            .list()?
+            .list_for_floor()?
             .into_iter()
             .map(|item| item.session)
             .collect();
