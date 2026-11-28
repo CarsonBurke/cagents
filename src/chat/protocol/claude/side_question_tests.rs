@@ -9,8 +9,10 @@ fn connected(version: &str) -> Claude {
         ..Default::default()
     };
     adapter
-        .receive(json!({"type":"system","subtype":"init","claude_code_version":version,
-            "slash_commands":["btw","compact","review"]}))
+        .receive(
+            json!({"type":"system","subtype":"init","claude_code_version":version,
+            "slash_commands":["btw","compact","review"]}),
+        )
         .unwrap();
     adapter
 }

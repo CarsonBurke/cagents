@@ -621,11 +621,45 @@ read_frame() {
     return 1
 }
 
+# A /btw side question, answered beside whatever turn is running and never
+# written to the transcript, as Claude Code does. fixture-side-answer.md
+# replaces the default answer; fixture-side-error makes Claude refuse with
+# its text; fixture-side-seconds delays the answer by that many whole seconds
+# without holding up other frames.
+side_question() {
+    local id=$1 frame=$2 delay=0 response
+    if [ -s "$config/fixture-side-error" ]; then
+        response=$(jq -cn --arg id "$id" --rawfile error "$config/fixture-side-error" \
+            '{type:"control_response",response:{subtype:"error",request_id:$id,error:($error | sub("\\s+$"; ""))}}')
+    else
+        local answer=$config/fixture-side-answer.md
+        [ -f "$answer" ] || answer=/dev/null
+        response=$(jq -cn --arg id "$id" --rawfile text "$answer" \
+            --arg question "$(printf '%s' "$frame" | jq -r '.request.question')" \
+            --argjson earlier "$(printf '%s' "$frame" | jq '.request.history // [] | length')" \
+            '{type:"control_response",response:{subtype:"success",request_id:$id,response:{
+                response:(if $text == "" then "You asked: " + $question
+                    + (if $earlier > 0 then " (after \($earlier) earlier side question" + (if $earlier > 1 then "s" else "" end) + ")" else "" end)
+                    else $text end),
+                synthetic:false}}}')
+    fi
+    if [ -s "$config/fixture-side-seconds" ]; then delay=$(tr -dc 0-9 < "$config/fixture-side-seconds"); fi
+    if [ "${delay:-0}" -gt 0 ]; then
+        ( sleep "$delay"; printf '%s\n' "$response" ) &
+    else
+        printf '%s\n' "$response"
+    fi
+}
+
 handle_control() {
     local frame=$1 id subtype metadata requested uuid task tool answer=
     id=$(printf '%s' "$frame" | jq -r '.request_id')
     subtype=$(printf '%s' "$frame" | jq -r '.request.subtype')
     metadata='{}'
+    if [ "$subtype" = side_question ]; then
+        side_question "$id" "$frame"
+        return 0
+    fi
     if [ "$subtype" = interrupt ] && [ "$send_now" = 1 ] &&
         [ "$(printf '%s' "$frame" | jq -r '.request.send_now // false')" = true ]; then
         subtype=send_now
@@ -985,4 +1019,9 @@ while next_frame; do
             fi
             ;;
     esac
+done
+# A side answer still waiting goes with the provider.
+for job in $(jobs -p); do
+    pkill -P "$job" 2>/dev/null || true
+    kill "$job" 2>/dev/null || true
 done

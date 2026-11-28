@@ -115,7 +115,9 @@ impl Cagents {
             return Some(dismiss);
         }
         if let Some(target) = self.focused_side_question() {
-            return Some(Message::ChatUi(chat_ui::Action::DismissSideQuestion(target)));
+            return Some(Message::ChatUi(chat_ui::Action::DismissSideQuestion(
+                target,
+            )));
         }
         self.review_popover_escape()
             .or_else(|| self.usage_reset_question(false).map(|(_, dismiss)| dismiss))

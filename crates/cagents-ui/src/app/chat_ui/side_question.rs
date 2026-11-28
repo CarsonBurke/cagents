@@ -113,8 +113,7 @@ impl Thread {
 
     /// Settles a question still waiting that will get no answer.
     fn fail(&mut self, id: Option<&str>, reason: impl Into<String>) {
-        if id.is_none_or(|id| id == self.current.id)
-            && matches!(self.current.state, State::Asking)
+        if id.is_none_or(|id| id == self.current.id) && matches!(self.current.state, State::Asking)
         {
             self.current.state = State::Failed(reason.into());
         }
@@ -351,7 +350,10 @@ mod tests {
         assert_eq!(invocation("/btw what changed?"), Some("what changed?"));
         assert_eq!(invocation("  /BTW   spaced  "), Some("spaced"));
         assert_eq!(invocation("/btw"), Some(""));
-        assert_eq!(invocation("/btw\non the next line"), Some("on the next line"));
+        assert_eq!(
+            invocation("/btw\non the next line"),
+            Some("on the next line")
+        );
         assert_eq!(invocation("/btwx question"), None);
         assert_eq!(invocation("by the way /btw question"), None);
         assert_eq!(invocation("btw question"), None);
@@ -390,7 +392,10 @@ mod tests {
         assert!(request.history.len() <= chat::SideQuestion::MAX_HISTORY);
         let newest = chat::SideQuestion::MAX_HISTORY + 2;
         assert_eq!(
-            request.history.last().map(|exchange| exchange.question.as_str()),
+            request
+                .history
+                .last()
+                .map(|exchange| exchange.question.as_str()),
             Some(format!("question {newest}").as_str())
         );
     }

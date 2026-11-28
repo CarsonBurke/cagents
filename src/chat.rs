@@ -4702,7 +4702,11 @@ mod tests {
                 })
                 .collect(),
         };
-        assert!(question("id", "why?", SideQuestion::MAX_HISTORY, 1).validate().is_ok());
+        assert!(
+            question("id", "why?", SideQuestion::MAX_HISTORY, 1)
+                .validate()
+                .is_ok()
+        );
         assert!(question("", "why?", 0, 0).validate().is_err());
         assert!(question(&"x".repeat(129), "why?", 0, 0).validate().is_err());
         assert!(question("id", "   ", 0, 0).validate().is_err());

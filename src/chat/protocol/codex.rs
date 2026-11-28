@@ -3076,8 +3076,10 @@ impl Codex {
                             _ => "Codex couldn't answer this side question.".to_owned(),
                         }
                     };
-                    step.events
-                        .push(Event::SideAnswer(chat::SideAnswer::failed(id.clone(), reason)));
+                    step.events.push(Event::SideAnswer(chat::SideAnswer::failed(
+                        id.clone(),
+                        reason,
+                    )));
                     return Ok(step);
                 }
                 if matches!(pending, Pending::Prediction) {

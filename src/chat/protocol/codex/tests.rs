@@ -8253,7 +8253,10 @@ fn a_side_question_samples_the_running_turn_without_joining_it() {
         .receive(json!({"method":"turn/started","params":{"threadId":"thread-exact","turn":{"id":"turn-running","status":"inProgress","items":[]}}}))
         .unwrap();
     let step = current
-        .command(Command::SideQuestion(side_question("q1", "which test failed?")))
+        .command(Command::SideQuestion(side_question(
+            "q1",
+            "which test failed?",
+        )))
         .unwrap();
     let [request] = step.writes.as_slice() else {
         panic!("{:?}", step.writes);

@@ -125,6 +125,13 @@ Each later turn answers with that file's contents instead of the default
 sentence, so replacing the file changes the next answer. A few turns with a
 long file give a transcript long enough to scroll.
 
+`/btw` side questions are answered at once, during a turn too, and never
+written to the transcript. The default answer repeats the question and counts
+the earlier side questions sent with it. `fixture-side-answer.md` replaces it
+with that file's Markdown, `fixture-side-error` has Claude refuse with the
+file's text, and `fixture-side-seconds`, holding a whole number such as `5`,
+delays the answer that long so the waiting card can be seen.
+
 Create `fixture-stream-reply` to send that answer in text deltas before its
 final record. Its first line may hold the delay between deltas in seconds
 (default `0.25`), and its second line the characters per delta (default

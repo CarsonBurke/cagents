@@ -355,10 +355,10 @@ pub(super) fn candidates<'a>(snapshot: &'a Snapshot, token: &Token) -> Vec<Candi
             "Resolve blocked tools and manage permissions",
         ));
         // The composer asks `/btw` itself, where the provider can answer one.
-        let side_question = snapshot
-            .capabilities
-            .side_questions
-            .then_some((super::side_question::COMMAND, super::side_question::DESCRIPTION));
+        let side_question = snapshot.capabilities.side_questions.then_some((
+            super::side_question::COMMAND,
+            super::side_question::DESCRIPTION,
+        ));
         for (name, description) in commands
             .chain(compact)
             .chain(permissions)
