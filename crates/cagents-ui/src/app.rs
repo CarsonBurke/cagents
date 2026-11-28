@@ -3446,6 +3446,7 @@ fn background_poll(message: &Message) -> bool {
             // The phone's status is read only by its own control and popover.
             | Message::Phone(
                 phone_ui::Action::Tick
+                    | phone_ui::Action::ConnectionsObserved { .. }
                     | phone_ui::Action::Probed(_)
                     | phone_ui::Action::Progressed(_)
             )
@@ -21075,6 +21076,11 @@ impl Cagents {
             Message::DaemonHealthUi(action) => self.update_daemon_health_ui(action),
             Message::AutomationApproval(action) => self.update_automation_approval(action),
             Message::DeviceLoad(load) => {
+                // Only the status bar reads load. A new sample does not
+                // invalidate any derived workspace state.
+                if !self.update_tail_may_close_or_commit() {
+                    projection = Projection::Unchanged;
+                }
                 self.device_ui.load = load;
                 Task::none()
             }
