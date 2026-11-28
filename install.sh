@@ -642,6 +642,8 @@ need_command awk
 need_command mktemp
 need_command sed
 need_command tar
+# Archive validation and extraction use the options selected by this installer.
+unset TAR_OPTIONS
 need_command readlink
 [ -z "$PREPARE_CANDIDATE" ] || need_command sync
 
