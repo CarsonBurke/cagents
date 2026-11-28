@@ -1123,11 +1123,24 @@ pub struct ControlClient {
 }
 
 /// Sends a `SignDeviceChallenge` to this computer's daemon.
-type Signer = fn(ClientRequest) -> Result<ServerResponse, ControlError>;
+type Signer = fn(ClientRequest, Option<Instant>) -> Result<ServerResponse, ControlError>;
 
-fn sign_here(request: ClientRequest) -> Result<ServerResponse, ControlError> {
+fn sign_here(
+    request: ClientRequest,
+    deadline: Option<Instant>,
+) -> Result<ServerResponse, ControlError> {
     let local = crate::terminal::ipc::local_daemon_socket_path().map_err(ControlError::Connect)?;
-    ControlClient::connect(&local)?.request_strict(request)
+    let mut client = match deadline {
+        Some(deadline) => {
+            let now = Instant::now();
+            let handshake = deadline.min(now + io_timeout());
+            let stream = connect_control_socket(&local, handshake.saturating_duration_since(now))
+                .map_err(ControlError::Connect)?;
+            ControlClient::from_stream_with_deadline(stream, handshake)?
+        }
+        None => ControlClient::connect(&local)?,
+    };
+    client.device_proof_request(request, deadline)
 }
 
 /// The capability a connection proved on another device, and what it needs
@@ -3080,16 +3093,11 @@ impl ControlClient {
     /// its next request, whatever it is. This computer's daemon then vouches
     /// for the session as it is now: refusing once agents are denied, the
     /// device unlinked or the session ended, and with its current mode.
-    fn for_device(&mut self, request: ClientRequest) -> Result<ClientRequest, ControlError> {
-        self.for_device_with(request, sign_here)
-    }
-
-    /// [`Self::for_device`], with `sign` asking this computer's daemon to
-    /// vouch for the session.
     fn for_device_with(
         &mut self,
         request: ClientRequest,
         sign: Signer,
+        deadline: Option<Instant>,
     ) -> Result<ClientRequest, ControlError> {
         if let Some(peer) = &self.device_peer
             && peer.proved.elapsed() >= crate::device_trust::CAPABILITY_RENEWAL
@@ -3107,7 +3115,7 @@ impl ControlClient {
             // rather than late.
             let proved = Instant::now();
             self.device_peer = Some(DevicePeer {
-                capability: self.prove_session(session.clone(), &device, sign)?,
+                capability: self.prove_session(session.clone(), &device, sign, deadline)?,
                 proved,
                 session,
                 device,
@@ -3129,7 +3137,7 @@ impl ControlClient {
             Some(peer) => peer.capability.clone(),
             None => {
                 let proved = Instant::now();
-                let peer = self.prove_session(session.clone(), &device.name, sign)?;
+                let peer = self.prove_session(session.clone(), &device.name, sign, deadline)?;
                 self.device_peer = Some(DevicePeer {
                     capability: peer.clone(),
                     proved,
@@ -3153,11 +3161,25 @@ impl ControlClient {
         })
     }
 
+    fn device_proof_request(
+        &mut self,
+        request: ClientRequest,
+        deadline: Option<Instant>,
+    ) -> Result<ServerResponse, ControlError> {
+        match deadline {
+            Some(deadline) => {
+                self.request_until(request, None, RequestDeadline::TerminalList(deadline))
+            }
+            None => self.request_strict(request),
+        }
+    }
+
     fn prove_session(
         &mut self,
         session: Authority,
         device: &str,
         sign: Signer,
+        deadline: Option<Instant>,
     ) -> Result<Authority, ControlError> {
         // A daemon that answered, refusing or unable to use its device
         // links, is not a connection failure: say which computer and why,
@@ -3177,15 +3199,18 @@ impl ControlClient {
                 error => error,
             }
         };
-        let nonce = match self.request_strict(ClientRequest::PeerChallenge)? {
+        let nonce = match self.device_proof_request(ClientRequest::PeerChallenge, deadline)? {
             ServerResponse::PeerChallenge { nonce } => nonce,
             response => return Err(unexpected_response("a device challenge", &response)),
         };
-        let (peer, claim, proof) = match sign(ClientRequest::SignDeviceChallenge {
-            authority: session,
-            device: device.to_owned(),
-            nonce,
-        })
+        let (peer, claim, proof) = match sign(
+            ClientRequest::SignDeviceChallenge {
+                authority: session,
+                device: device.to_owned(),
+                nonce,
+            },
+            deadline,
+        )
         .map_err(answered(
             "This computer could not vouch for the session".to_owned(),
         ))? {
@@ -3193,7 +3218,10 @@ impl ControlClient {
             response => return Err(unexpected_response("a device proof", &response)),
         };
         match self
-            .request_strict(ClientRequest::PeerAuthenticate { peer, claim, proof })
+            .device_proof_request(
+                ClientRequest::PeerAuthenticate { peer, claim, proof },
+                deadline,
+            )
             .map_err(answered(format!(
                 "{device} could not check this computer's proof"
             )))? {
@@ -3298,7 +3326,24 @@ impl ControlClient {
         streaming_terminal: Option<TerminalId>,
         deadline: Option<RequestDeadline>,
     ) -> Result<ServerResponse, ControlError> {
-        let request = self.for_device(request)?;
+        let inventory_deadline = match deadline {
+            Some(RequestDeadline::TerminalList(deadline)) => Some(deadline),
+            _ => None,
+        };
+        let inventory_timed_out =
+            || inventory_deadline.is_some_and(|deadline| Instant::now() >= deadline);
+        if inventory_timed_out() {
+            return Err(ControlError::TerminalListTimeout);
+        }
+        let request = self
+            .for_device_with(request, sign_here, inventory_deadline)
+            .map_err(|error| {
+                if inventory_timed_out() {
+                    ControlError::TerminalListTimeout
+                } else {
+                    error
+                }
+            })?;
         let (deadline, list_limited) = match deadline {
             None => (None, false),
             Some(RequestDeadline::Request(deadline)) => (Some(deadline), false),
