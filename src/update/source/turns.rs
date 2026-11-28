@@ -123,6 +123,9 @@ impl TurnReview {
             .filter(|item| {
                 daemon.capability.background_subagents > 0
                     && item.kind == impact::SessionKind::NativeChat
+                    // The exact delivery must settle before provider activity
+                    // can determine whether a stop review is needed.
+                    && item.reason != impact::SessionCause::PendingDelivery
                     && matches!(
                         (daemon.policy, item.disposition),
                         (impact::Policy::WhenIdle, impact::Disposition::WaitsForIdle)
@@ -255,6 +258,58 @@ mod tests {
             reason: "Finishing its turn".into(),
             interrupted_subagents: Vec::new(),
         }
+    }
+
+    #[test]
+    fn pending_delivery_waits_even_when_the_parent_is_done_and_a_child_is_running() {
+        let mut pending = item();
+        pending.reason = impact::SessionCause::PendingDelivery;
+        let observation = Observation {
+            identity: pending.identity.clone(),
+            activity: Snapshot {
+                ready: true,
+                subagents: vec![child(ToolStatus::Running)],
+                ..Snapshot::default()
+            }
+            .into(),
+        };
+        let preview = impact::Preview {
+            editors: Vec::new(),
+            candidate: impact::Candidate {
+                version: "2.0.0".into(),
+                protocol: 156,
+                digest: "candidate".into(),
+            },
+            replaces_daemon: true,
+            daemon: Some(impact::DaemonImpact {
+                capability: crate::terminal_ipc::ShutdownCapability {
+                    proof: HostSessionProof {
+                        host_session_id: HostSessionId::new("delivery-source"),
+                        boot_id: BootId::new("test-boot"),
+                        host_incarnation: HostIncarnation::new("test-daemon"),
+                    },
+                    token: "source-capability".into(),
+                    inventory_generation: 1,
+                    live_terminals: 0,
+                    background_subagents: 1,
+                    background_identity: "background-child".into(),
+                    expires_at_unix_ms: i64::MAX,
+                },
+                policy: impact::Policy::WhenIdle,
+                sessions: vec![pending.clone()],
+                blockers: Vec::new(),
+            }),
+            from_version: "1.0.0".into(),
+            windows: 0,
+            stopped: Vec::new(),
+            stopped_windows: Vec::new(),
+            labels: Default::default(),
+        };
+        let mut review = TurnReview::default();
+        review.observations.insert(pending.id, observation);
+
+        assert_eq!(review.apply(preview.clone()).unwrap(), preview);
+        assert!(review.observations.is_empty());
     }
 
     #[test]
