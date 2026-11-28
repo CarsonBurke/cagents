@@ -11599,6 +11599,11 @@ impl Cagents {
         }
     }
 
+    /// Whether detaching this card can checkpoint the workspace.
+    pub(super) fn has_draft_start_capture(&self, card: CardId) -> bool {
+        self.chat_ui.draft_checkpoints.contains_key(&card)
+    }
+
     /// A first save that will not start its provider may still have
     /// committed B. Queue the B -> A replacement behind it, so storage
     /// converges on the conversation the composer still shows, including
