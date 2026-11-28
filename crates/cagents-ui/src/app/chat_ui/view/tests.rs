@@ -875,8 +875,8 @@ fn recorded_timestamps_reach_parent_child_and_rebuilt_message_copy_footers() {
         assert!(match &messages[0] {
             Message::ChatUi(Action::Copy(target, row, CopyPart::Text)) =>
                 *target == runtime.target && row.id == item.id,
-            Message::ChatUi(Action::CopyMessage(target, id, _)) =>
-                *target == runtime.target && id == &item.id,
+            Message::ChatUi(Action::CopyMessage(target, row, _)) =>
+                *target == runtime.target && row.id == item.id,
             _ => false,
         });
         drop(footer);
@@ -1207,8 +1207,8 @@ fn recorded_tool_timestamp_reserves_footer_space_at_narrow_and_wide_widths() {
         assert!(match &messages[0] {
             Message::ChatUi(Action::Copy(target, row, CopyPart::Text)) =>
                 *target == runtime.target && row.id == item.id,
-            Message::ChatUi(Action::CopyMessage(target, id, _)) =>
-                *target == runtime.target && id == &item.id,
+            Message::ChatUi(Action::CopyMessage(target, row, _)) =>
+                *target == runtime.target && row.id == item.id,
             _ => false,
         });
         let after = element
@@ -5932,8 +5932,8 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             assert!(match &copied[0] {
                 Message::ChatUi(Action::Copy(actual, row, CopyPart::Text)) =>
                     *actual == runtime.target && row.id == item.id,
-                Message::ChatUi(Action::CopyMessage(actual, id, _)) =>
-                    *actual == runtime.target && id == &item.id,
+                Message::ChatUi(Action::CopyMessage(actual, row, _)) =>
+                    *actual == runtime.target && row.id == item.id,
                 _ => false,
             });
             assert!(dispatch(event(copy.clone(), A11yAction::Focus)).is_empty());
@@ -5969,8 +5969,8 @@ fn rendered_exact_tool_targets_keep_verb_prefixed_names() {
             assert!(match &copied[0] {
                 Message::ChatUi(Action::Copy(actual, row, CopyPart::Text)) =>
                     *actual == runtime.target && row.id == item.id,
-                Message::ChatUi(Action::CopyMessage(actual, id, _)) =>
-                    *actual == runtime.target && id == &item.id,
+                Message::ChatUi(Action::CopyMessage(actual, row, _)) =>
+                    *actual == runtime.target && row.id == item.id,
                 _ => false,
             });
             assert!(dispatch(event(copy, A11yAction::Blur)).is_empty());

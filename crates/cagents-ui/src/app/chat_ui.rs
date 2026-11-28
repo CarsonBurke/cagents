@@ -246,6 +246,10 @@ fn row_cache_key<'a>(aliases: &'a HashMap<usize, String>, item: &'a chat::Item) 
         .map_or(&item.id, String::as_str)
 }
 
+fn requires_row_identity(collisions: &HashSet<String>, id: &str) -> bool {
+    collisions.contains(id) || chat::TranscriptPart::parse(id).is_some()
+}
+
 impl PartialEq for RowTarget {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id && self.child == other.child && self.item.ptr_eq(&other.item)
@@ -566,11 +570,16 @@ pub enum Action {
     SessionLinkWindowBackend(String, TerminalId, bool),
     SessionLinkToken(String, TerminalId, Option<String>),
     Copy(Target, RowTarget, CopyPart),
-    CopyMessage(Target, String, Option<chat::TextCopySource>),
+    CopyMessage(Target, RowTarget, Option<chat::TextCopySource>),
     /// Copies a step whose row shows only an excerpt of its output, reading
     /// the whole output from its source.
-    CopyStep(Target, String, CopyPart, chat::TextCopySource),
-    MessageCopied(Target, String, text_copy::Request, Result<String, String>),
+    CopyStep(Target, RowTarget, CopyPart, chat::TextCopySource),
+    MessageCopied(
+        Target,
+        RowTarget,
+        text_copy::Request,
+        Result<String, String>,
+    ),
     /// A complete message read for a window that shows only part of it.
     LogicalProseRead(Target, chat::TextCopySource, Result<String, String>),
     MarkdownPrepared(Target, String, u64, preparation::Ready),
@@ -3958,6 +3967,7 @@ pub(super) struct Runtime {
     parent_cache_keys: HashMap<usize, String>,
     child_cache_keys: HashMap<usize, String>,
     row_expansions: Vec<(RowTarget, bool)>,
+    row_unfolded: HashSet<(RowTarget, String)>,
     /// Each child's own disclosures, stamped separately so pruning departed
     /// children never disturbs the selected child's.
     child_expanded: HashMap<String, Revised<HashSet<String>>>,
@@ -5699,6 +5709,7 @@ impl Runtime {
             parent_cache_keys: HashMap::new(),
             child_cache_keys: HashMap::new(),
             row_expansions: Vec::new(),
+            row_unfolded: HashSet::new(),
             child_expanded: HashMap::new(),
             child_unfolded: HashMap::new(),
             unfolded: HashSet::new(),
@@ -5786,6 +5797,7 @@ impl Runtime {
         self.parent_cache_keys.clear();
         self.child_cache_keys.clear();
         self.row_expansions.clear();
+        self.row_unfolded.clear();
         self.child_expanded.clear();
         self.child_unfolded.clear();
         self.answers.clear();
@@ -6449,7 +6461,10 @@ impl Runtime {
                 row.is(item, self.selected_subagent.as_deref())
                     .then_some(*open)
             })
-            .unwrap_or_else(|| self.item_expanded(&item.id))
+            .unwrap_or_else(|| {
+                !requires_row_identity(&self.colliding_row_ids, &item.id)
+                    && self.item_expanded(&item.id)
+            })
     }
 
     fn fold_key(&self, item: &chat::Item, part: &str) -> String {
@@ -6464,6 +6479,19 @@ impl Runtime {
                 .is_some_and(|set| set.contains(key)),
             None => self.unfolded.contains(key),
         }
+    }
+
+    fn row_part_unfolded(&self, item: &chat::Item, part: &str) -> bool {
+        self.row_unfolded_parts(item).any(|open| open == part)
+            || (!requires_row_identity(&self.colliding_row_ids, &item.id)
+                && self.part_unfolded(&self.fold_key(item, part)))
+    }
+
+    fn row_unfolded_parts<'a>(&'a self, item: &'a chat::Item) -> impl Iterator<Item = &'a str> {
+        self.row_unfolded.iter().filter_map(|(row, part)| {
+            row.is(item, self.selected_subagent.as_deref())
+                .then_some(part.as_str())
+        })
     }
     fn prepared_prompt(&self, item: &chat::Item) -> Option<&prompt::Prepared> {
         self.presentation_cache()
@@ -6694,12 +6722,17 @@ impl Runtime {
             }
             self.row_expansions
                 .retain(|(row, _)| row.item.strong_count() != 0);
+            self.row_unfolded
+                .retain(|(row, _)| row.item.strong_count() != 0);
         }
         let row_expanded = |item: &chat::Item| {
             self.row_expansions
                 .iter()
                 .find_map(|(row, open)| row.is(item, context.as_deref()).then_some(*open))
-                .unwrap_or_else(|| expanded.contains(&item.id))
+                .unwrap_or_else(|| {
+                    !requires_row_identity(&self.colliding_row_ids, &item.id)
+                        && expanded.contains(&item.id)
+                })
         };
         if resume.is_none()
             && self.preparation.sync_context(
@@ -18168,7 +18201,7 @@ impl Cagents {
                     let id = item.id.clone();
                     let open = !runtime.row_expanded(&item);
                     runtime.find_navigation.cancel();
-                    if runtime.colliding_row_ids.contains(&id) {
+                    if requires_row_identity(&runtime.colliding_row_ids, &id) {
                         let row = runtime.row_target(&item);
                         runtime
                             .row_expansions
@@ -18466,11 +18499,7 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
-                let key = if runtime.colliding_row_ids.contains(&row.id) {
-                    text_copy::CopyKey::Row(row.clone(), part.clone())
-                } else {
-                    text_copy::CopyKey::of(row.id.clone(), Some(&part))
-                };
+                let key = text_copy::CopyKey::Row(row.clone(), part.clone());
                 let text = runtime.inline_copy_text(&row, part);
                 if let Some(text) = text {
                     text_copy::invalidate();
@@ -18484,6 +18513,14 @@ impl Cagents {
                 if let Some(runtime) = self.chat_runtime_mut(target)
                     && let Some(item) = runtime.action_item(&row)
                 {
+                    if requires_row_identity(&runtime.colliding_row_ids, &item.id) {
+                        let choice = (runtime.row_target(item), part);
+                        runtime.find_navigation.cancel();
+                        if !runtime.row_unfolded.remove(&choice) {
+                            runtime.row_unfolded.insert(choice);
+                        }
+                        return Task::none();
+                    }
                     let key = runtime.fold_key(item, &part);
                     runtime.find_navigation.cancel();
                     let unfolded = if let Some(child) = &runtime.selected_subagent {

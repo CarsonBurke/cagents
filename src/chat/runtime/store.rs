@@ -1103,6 +1103,7 @@ impl Store {
         transaction.execute("UPDATE file_metadata SET revision=?1", [revision])?;
         transaction.commit()?;
         self.file_revision = revision;
+        self.presented_cursors.clear();
         self.end = end;
         self.first = first;
         self.newest = newest;

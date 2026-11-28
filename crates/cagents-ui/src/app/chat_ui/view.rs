@@ -3527,6 +3527,11 @@ impl Runtime {
         self.row_copy_feedback(item)
             .map(|feedback| (&feedback.key, feedback.refusal.as_deref()))
             .hash(&mut revision);
+        if cached.coordination.is_some() {
+            let mut unfolded: Vec<_> = self.row_unfolded_parts(item).collect();
+            unfolded.sort_unstable();
+            unfolded.hash(&mut revision);
+        }
         revision.finish()
     }
 
@@ -7206,6 +7211,7 @@ impl Runtime {
                     .is_some_and(|part| part.starts_with('#'))
             })
             .map(String::as_str)
+            .chain(self.row_unfolded_parts(item))
             .collect();
         unfolded.sort_unstable();
         unfolded.hash(hasher);
@@ -7811,9 +7817,13 @@ impl Runtime {
                     .coordination_for(item)
                     .is_some_and(|card| card.is_card())
             {
-                Action::CopyMessage(self.target, item.id.clone(), self.message_copy_source(item))
+                Action::CopyMessage(
+                    self.target,
+                    self.row_target(item),
+                    self.message_copy_source(item),
+                )
             } else if let Some(source) = self.excerpted_output_source(item) {
-                Action::CopyStep(self.target, item.id.clone(), CopyPart::Text, source)
+                Action::CopyStep(self.target, self.row_target(item), CopyPart::Text, source)
             } else {
                 Action::Copy(self.target, self.row_target(item), CopyPart::Text)
             },

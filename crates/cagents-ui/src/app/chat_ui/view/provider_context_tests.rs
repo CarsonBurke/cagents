@@ -228,8 +228,8 @@ fn provider_context_copy_footer_uses_canonical_scope_and_recovers_after_failure(
             drop(app.handle_chat_ui(Action::SelectSubagent(target, scope)));
             let action = copy_action(app.chat_runtime_mut(target).unwrap());
             assert!(
-                matches!(&action, Action::CopyMessage(actual, id, Some(captured))
-                if *actual == target && id == "provider-context" && captured == &source)
+                matches!(&action, Action::CopyMessage(actual, row, Some(captured))
+                if *actual == target && row.id == "provider-context" && captured == &source)
             );
             clipboard(
                 app.handle_chat_ui(Action::CopyMessage(target, "provider-context".into(), None)),

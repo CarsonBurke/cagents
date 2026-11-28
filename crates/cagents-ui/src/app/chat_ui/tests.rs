@@ -6115,8 +6115,8 @@ fn row_actions_distinguish_colliding_ids_and_refuse_a_replacement() {
     let runtime = chat_runtime(&app, card);
     assert!(runtime.row_expanded(&second));
     assert!(!runtime.row_expanded(&first));
-    assert!(runtime.part_unfolded(&runtime.fold_key(&second, "details")));
-    assert!(!runtime.part_unfolded(&runtime.fold_key(&first, "details")));
+    assert!(runtime.row_part_unfolded(&second, "details"));
+    assert!(!runtime.row_part_unfolded(&first, "details"));
     assert!(runtime.row_copy_note_shown(&second));
     assert!(!runtime.row_copy_note_shown(&first));
 
@@ -6133,6 +6133,38 @@ fn row_actions_distinguish_colliding_ids_and_refuse_a_replacement() {
     );
     drop(app.handle_chat_ui(Action::Toggle(target, row)));
     assert!(!chat_runtime(&app, card).row_expanded(&first));
+}
+
+#[test]
+fn copy_and_disclosures_stay_with_their_row_across_separate_history_windows() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let id = "answer:native-part:1:text:131072-262144:0-0";
+    let original = presentation_text(id, "Generated part");
+    let replacement = presentation_text(id, "Opaque provider item");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![original.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let row = chat_runtime(&app, card).row_target(&original);
+    drop(app.handle_chat_ui(Action::Toggle(target, row.clone())));
+    drop(app.handle_chat_ui(Action::Unfold(target, row.clone(), "details".into())));
+    drop(app.handle_chat_ui(Action::CopyMessage(target, row, None)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.row_expanded(&original));
+    assert!(runtime.row_part_unfolded(&original, "details"));
+    assert!(runtime.row_copy_note_shown(&original));
+
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![replacement.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let runtime = chat_runtime(&app, card);
+    assert!(!runtime.row_expanded(&replacement));
+    assert!(!runtime.row_part_unfolded(&replacement, "details"));
+    assert!(!runtime.row_copy_note_shown(&replacement));
 }
 
 #[test]

@@ -2327,8 +2327,7 @@ impl Runtime {
         settings: markdown::Settings,
         surface: fn(&cosmic::Theme) -> iced::Color,
     ) -> Element<'static, Message> {
-        let key = self.fold_key(item, part);
-        let open = self.part_unfolded(&key);
+        let open = self.row_part_unfolded(item, part);
         let label = if open { "Show less" } else { unfold }.to_owned();
         let toggle = disclosure::row(
             label.clone(),

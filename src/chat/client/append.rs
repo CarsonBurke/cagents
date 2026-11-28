@@ -2,7 +2,7 @@
 //! Only validated wire append operations create edges. Weak pointers prevent
 //! retained transcript bodies, and keep pointer identities immune to reuse.
 use super::super::{
-    Item, ItemContent, Snapshot,
+    Item, ItemContent, Snapshot, TextCopySource, TranscriptPart,
     presentation::{ItemChange, Presentation},
 };
 use std::collections::VecDeque;
@@ -93,14 +93,20 @@ impl Lineage {
     /// again behind a loading placeholder. Runs on the client's reader thread:
     /// comparing bodies is O(bytes), which the interface thread never pays.
     pub fn adopt(&mut self, previous: &Snapshot, next: &mut Snapshot) {
-        fn adopt_items(edges: &mut Lineage, previous: &[Arc<Item>], next: &mut [Arc<Item>]) {
+        fn adopt_items(
+            edges: &mut Lineage,
+            previous: &[Arc<Item>],
+            next: &mut [Arc<Item>],
+            old_sources: &[Option<TextCopySource>],
+            new_sources: &[Option<TextCopySource>],
+        ) {
             if previous.is_empty() {
                 return;
             }
             let mut ambiguous = std::collections::HashSet::new();
             let mut old_by_id = std::collections::HashMap::new();
-            for item in previous {
-                if old_by_id.insert(item.id.as_str(), item).is_some() {
+            for (index, item) in previous.iter().enumerate() {
+                if old_by_id.insert(item.id.as_str(), (index, item)).is_some() {
                     ambiguous.insert(item.id.as_str());
                 }
             }
@@ -114,14 +120,26 @@ impl Lineage {
             // resident allocation between two distinct transcript rows.
             let ambiguous: std::collections::HashSet<String> =
                 ambiguous.into_iter().map(str::to_owned).collect();
-            for item in next {
+            for (index, item) in next.iter_mut().enumerate() {
                 if ambiguous.contains(item.id.as_str()) {
                     continue;
                 }
-                let Some(old) = old_by_id.get(item.id.as_str()) else {
+                let Some(&(old_index, old)) = old_by_id.get(item.id.as_str()) else {
                     continue;
                 };
                 if Arc::ptr_eq(old, item) {
+                    continue;
+                }
+                if TranscriptPart::parse(&item.id).is_some()
+                    && !matches!(
+                        (old_sources.get(old_index), new_sources.get(index)),
+                        (Some(Some(before)), Some(Some(after)))
+                            if before.cache == after.cache && before.token == after.token
+                                && before.scope == after.scope
+                    )
+                {
+                    // A seek can visit an opaque provider row and a generated
+                    // part in separate windows. Their logical sources differ.
                     continue;
                 }
                 if old.as_ref() == item.as_ref() {
@@ -144,10 +162,24 @@ impl Lineage {
                 }
             }
         }
-        adopt_items(self, &previous.items, &mut next.items);
+        adopt_items(
+            self,
+            &previous.items,
+            &mut next.items,
+            &previous.text_copy_sources.conversation,
+            &next.text_copy_sources.conversation,
+        );
         for agent in &mut next.subagents {
             if let Some(old) = previous.subagents.iter().find(|old| old.id == agent.id) {
-                adopt_items(self, &old.items, &mut agent.items);
+                let old_sources = previous.text_copy_sources.children.get(&agent.id);
+                let new_sources = next.text_copy_sources.children.get(&agent.id);
+                adopt_items(
+                    self,
+                    &old.items,
+                    &mut agent.items,
+                    old_sources.map_or(&[], Vec::as_slice),
+                    new_sources.map_or(&[], Vec::as_slice),
+                );
             }
         }
     }
@@ -198,6 +230,44 @@ mod tests {
         assert!(!Arc::ptr_eq(&next.items[0], &next.items[1]));
         assert!(!Arc::ptr_eq(&previous.items[0], &next.items[0]));
     }
+
+    #[test]
+    fn full_refresh_checks_multipart_row_identity_across_history_windows() {
+        let mut part = text("the same text");
+        Arc::make_mut(&mut part).id = "answer:native-part:1:text:131072-262144:0-0".into();
+        let source = TextCopySource {
+            cache: uuid::Uuid::new_v4(),
+            scope: super::super::super::TextCopyScope::Conversation,
+            token: 1,
+            revision: 1,
+            bytes: 262144,
+        };
+        let mut previous = Snapshot {
+            items: vec![part.clone()],
+            ..Snapshot::default()
+        };
+        previous.text_copy_sources.conversation = vec![Some(source.clone())];
+        for (current, same_row) in [
+            (None, false),
+            (
+                Some(TextCopySource {
+                    token: 2,
+                    ..source.clone()
+                }),
+                false,
+            ),
+            (Some(source), true),
+        ] {
+            let mut next = Snapshot {
+                items: vec![Arc::new((*part).clone())],
+                ..Snapshot::default()
+            };
+            next.text_copy_sources.conversation = vec![current];
+            Lineage::default().adopt(&previous, &mut next);
+            assert_eq!(Arc::ptr_eq(&part, &next.items[0]), same_row);
+        }
+    }
+
     #[test]
     fn coalesced_append_proof_drops_bodies_and_refuses_rewrites() {
         let first = text("first");

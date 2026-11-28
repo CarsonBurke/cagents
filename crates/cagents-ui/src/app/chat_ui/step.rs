@@ -280,12 +280,11 @@ impl Runtime {
             return design::caption("No content.").into();
         };
         let target = self.target;
-        let id = item.id.clone();
         // A long output's row holds only its start and end; Copy reads the
         // whole of it.
         let copy = match (&part, self.excerpted_output_source(item)) {
             (CopyPart::Output, Some(source)) => {
-                Action::CopyStep(target, id.clone(), CopyPart::Output, source)
+                Action::CopyStep(target, self.row_target(item), CopyPart::Output, source)
             }
             _ => Action::Copy(target, self.row_target(item), part.clone()),
         };
