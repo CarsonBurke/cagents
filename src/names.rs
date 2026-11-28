@@ -46,7 +46,7 @@ pub fn normalize_card_name(name: &str) -> Option<String> {
             pending_space = kept > 0;
             continue;
         }
-        if character.is_control() || is_name_formatting(character) {
+        if character.is_control() || is_bidi_control(character) {
             continue;
         }
         if pending_space {
@@ -71,7 +71,7 @@ pub fn normalize_card_name(name: &str) -> Option<String> {
 /// already collapsed into a space. Other invisible format characters are kept
 /// deliberately: a zero-width joiner is load-bearing inside an emoji sequence,
 /// and unlike a bidi control none of them can reorder the text around them.
-fn is_name_formatting(character: char) -> bool {
+pub(crate) fn is_bidi_control(character: char) -> bool {
     matches!(
         character,
         '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'

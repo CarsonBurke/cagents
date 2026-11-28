@@ -2001,11 +2001,11 @@ fn native_queue_names_remote_images_only_when_the_url_has_a_file_name() {
             "result":{"data":[
                 {"id":"named","input":[
                     {"type":"text","text":"Compare"},
-                    {"type":"image","url":"https://example.test/a/after.png?x=1#preview"}
+                    {"type":"image","url":"https://example.test/a/caf%C3%A9%20photo.png?x=1#preview"}
                 ]},
                 {"id":"unnamed","input":[
                     {"type":"text","text":"Describe"},
-                    {"type":"image","url":"https://example.test/?x=1"}
+                    {"type":"image","url":"https://example.test/%20?x=1"}
                 ]}
             ],"nextCursor":null}
         }))
@@ -2019,7 +2019,7 @@ fn native_queue_names_remote_images_only_when_the_url_has_a_file_name() {
         })
         .unwrap();
     assert_eq!(messages.len(), 2);
-    assert_eq!(messages[0].text, "Compare\nafter.png");
+    assert_eq!(messages[0].text, "Compare\ncafé photo.png");
     assert_eq!(messages[1].text, "Describe");
     assert!(
         messages
@@ -6434,6 +6434,13 @@ fn user_image_descriptions_use_only_a_path_or_url_file_name() {
             "id":"images","type":"userMessage","content":[
                 {"type":"localImage","path":"/work/shots/before.png"},
                 {"type":"image","url":"https://example.test/a/after.png?x=1#preview"},
+                {"type":"image","url":"https://example.test/a/caf%C3%A9%20photo+map.png"},
+                {"type":"image","url":"https://example.test/a/slide%0A2.png"},
+                {"type":"image","url":"https://example.test/a/slide%E2%80%A82.png"},
+                {"type":"image","url":"https://example.test/a/review%E2%80%AEmap.png"},
+                {"type":"image","url":"https://example.test/a/%FF.png"},
+                {"type":"image","url":"https://example.test/a/draft%2Fshot.png"},
+                {"type":"image","url":"https://example.test/a/%20"},
                 {"type":"image","url":"https://example.test/"},
                 {"type":"image","url":"https://example.test/a/"},
                 {"type":"image","url":"data:image/png;base64,cGl4ZWxz"},
@@ -6453,7 +6460,24 @@ fn user_image_descriptions_use_only_a_path_or_url_file_name() {
             _ => None,
         })
         .collect::<Vec<_>>();
-    assert_eq!(descriptions, ["before.png", "after.png", "", "", "", ""]);
+    assert_eq!(
+        descriptions,
+        [
+            "before.png",
+            "after.png",
+            "café photo+map.png",
+            "slide%0A2.png",
+            "slide%E2%80%A82.png",
+            "review%E2%80%AEmap.png",
+            "%FF.png",
+            "draft%2Fshot.png",
+            "",
+            "",
+            "",
+            "",
+            "",
+        ]
+    );
 }
 
 #[test]
