@@ -62,6 +62,7 @@ pub(super) fn restore_ordinary_with_process_fixture(
 pub(super) struct ParkedInstalledReady {
     pub(super) restored: state::RestoredUpgrade,
     pub(super) capture: ready::ReadyCapture,
+    pub(super) checkpoint: crate::upgrade::handoff::Checkpoint,
 }
 
 #[cfg(target_os = "macos")]
@@ -69,7 +70,7 @@ pub(super) fn park_installed_ready(
     host: &SharedHost,
     admission: &recovery::ReadyAdmission,
 ) -> Result<Option<ParkedInstalledReady>, String> {
-    if !admission.has_terminal_only_census() || !admission.can_park_checkpoint()? {
+    if !admission.has_carried_work() || !admission.can_park_checkpoint()? {
         return Ok(None);
     }
     park_carried_ready(host, admission.checkpoint_digest())
@@ -89,8 +90,13 @@ pub(super) fn park_carried_ready(
         return Ok(None);
     };
     Ok(
-        state::stage_installed_carried_terminals(host, store, checkpoint)?
-            .map(|restored| ParkedInstalledReady { restored, capture }),
+        state::stage_installed_carried_terminals(host, store, &checkpoint)?.map(|restored| {
+            ParkedInstalledReady {
+                restored,
+                capture,
+                checkpoint,
+            }
+        }),
     )
 }
 
@@ -110,8 +116,42 @@ pub(super) fn restore_installed_ready(
 pub(super) fn finish_parked_ready(
     host: &SharedHost,
     capture: ready::ReadyCapture,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
 ) -> Result<(), String> {
     state::finish_installed_carried_terminals(host)?;
+    for chat in &checkpoint.chats {
+        super::chat::restore_ready_checkpoint(host, &chat.source, checkpoint)?;
+    }
+    let recovered = {
+        let state = host.lock().unwrap_or_else(|error| error.into_inner());
+        checkpoint
+            .chats
+            .iter()
+            .map(|chat| {
+                let record = state
+                    .chats
+                    .get(&chat.source.id)
+                    .ok_or_else(|| format!("Retained chat {} did not reopen", chat.source.id))?;
+                let mut replacement = record.session.clone();
+                replacement.launch.session_id = record.handle.session_id();
+                replacement.native_continuity = record.handle.native_continuity();
+                Ok(crate::upgrade::handoff::RecoveredChat {
+                    evidence: chat.clone(),
+                    replacement,
+                    aliases: Vec::new(),
+                })
+            })
+            .collect::<Result<Vec<_>, String>>()?
+    };
+    if !recovered.is_empty() {
+        let store = Store::discover()?;
+        let reattached = recovered
+            .iter()
+            .map(|chat| chat.evidence.source.id)
+            .collect::<Vec<_>>();
+        store.record_recovered(&recovered)?;
+        store.record_unattached(&[], &reattached)?;
+    }
     chat::retained_actor::reconcile_previous_boot_history(host)?;
     publish_ready_effects(host, Some(capture))
 }

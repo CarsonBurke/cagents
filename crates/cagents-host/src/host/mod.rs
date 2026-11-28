@@ -388,12 +388,16 @@ fn select_parked_terminals(
     host: &SharedHost,
     admission: &crate::upgrade::recovery::ReadyAdmission,
     publication: crate::update::LocalPublication,
+    checkpoint: &crate::upgrade::handoff::Checkpoint,
 ) -> Result<(), String> {
-    let terminals = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .parked_update_inventory()?;
+    let (terminals, proof) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.parked_update_inventory()?, state.proof().clone())
+    };
     admission.verify_parked_terminals(&terminals)?;
+    if !state::parked_native_roster_matches(checkpoint, &proof)? {
+        return Err("An original retained conversation lost custody before selection".into());
+    }
     if daemon::termination_requested() {
         return Err("The daemon was stopped before selecting the installed update".into());
     }
@@ -439,7 +443,7 @@ fn activate_parked_terminals(
         }
         await_receipt(deadline)?;
     }
-    update_recovery::finish_parked_ready(host, installed.capture)?;
+    update_recovery::finish_parked_ready(host, installed.capture, &installed.checkpoint)?;
     save_abandoned_identities(host);
     workspace::adopt_foreign_panes(host);
     save_agent_pane_identities(host);
@@ -453,11 +457,25 @@ fn activate_parked_terminals(
         drop(state);
         await_receipt(deadline)?;
     };
+    let chats = chat::chat_list_inventory(&state);
+    if chats.iter().any(|session| {
+        state
+            .chats
+            .get(&session.id)
+            .is_none_or(|record| record.handle.is_completed() || !record.handle.owns_work())
+    }) {
+        return Err("An original retained conversation is not ready".into());
+    }
     if let Some(admission) = admission {
-        admission.verify_live_inventory(state.proof(), &terminals, &[], &completed)?;
+        admission.verify_live_inventory(state.proof(), &terminals, &chats, &completed)?;
     } else {
-        crate::update::verify_selected_parked_inventory(state.proof(), &terminals, &completed)
-            .map_err(|error| error.to_string())?;
+        crate::update::verify_selected_parked_inventory(
+            state.proof(),
+            &terminals,
+            &chats,
+            &completed,
+        )
+        .map_err(|error| error.to_string())?;
     }
     installed.restored.finish_locked(&mut state)
 }
@@ -1133,8 +1151,13 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         && let Some(parked) =
             update_recovery::park_installed_ready(&host, ready).map_err(io::Error::other)?
     {
-        select_parked_terminals(&host, ready, local_publication.take().unwrap())
-            .map_err(io::Error::other)?;
+        select_parked_terminals(
+            &host,
+            ready,
+            local_publication.take().unwrap(),
+            &parked.checkpoint,
+        )
+        .map_err(io::Error::other)?;
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .publishing_startup = true;
