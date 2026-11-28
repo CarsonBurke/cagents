@@ -593,6 +593,7 @@ pub(super) fn resident_server(body: Option<String>) -> (Server, tempfile::TempDi
             environment: crate::terminal_ipc::ChatExecutionEnvironment(Default::default()),
             recovery_environment: BTreeMap::new(),
             listener,
+            reads: None,
             socket,
             socket_identity: (metadata.dev(), metadata.ino()),
             _directory: None,

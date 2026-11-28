@@ -195,20 +195,10 @@ impl Server {
         &mut self,
         request: Invocation,
     ) -> Result<ServerResponse, String> {
-        // Reuse the same epoch/proof/close-only admission as every invocation.
+        validate_attachment(&request, self.epoch, &self.proof, self.close_only)?;
         let (version, id, after) =
-            serde_json::from_value::<(u16, crate::model::TerminalId, Option<u64>)>(
-                request.args.clone(),
-            )
-            .map_err(|e| e.to_string())?;
-        self.invoke(Invocation {
-            method: "presentation_codec".into(),
-            args: json!([version]),
-            ..request
-        })?;
-        if version != crate::terminal_ipc::PROTOCOL_VERSION {
-            return Err("Retained binary presentation requires a matching wire version".into());
-        }
+            serde_json::from_value(request.args).map_err(|error| error.to_string())?;
+        validate_presentation_codec(version)?;
         Ok(self
             .presentation_response(id, after)?
             .unwrap_or(ServerResponse::ChatSnapshot {

@@ -52,7 +52,10 @@ struct Serving {
 }
 impl Serving {
     fn start() -> Self {
-        let (mut server, root) = tests::resident_server(None);
+        Self::start_server(tests::resident_server(None))
+    }
+
+    fn start_server((mut server, root): (Server, tempfile::TempDir)) -> Self {
         let lease = leased_proof(&mut server.proof);
         // Uninstalled, so hanging up the startup stream ends `serve`.
         server.installed = false;
@@ -77,13 +80,32 @@ impl Serving {
             _root: root,
         }
     }
+    fn send_request(&self, method: &str, args: Value, deadline: Instant) -> UnixStream {
+        let client = UnixStream::connect(&self.socket).unwrap();
+        let request = Invocation {
+            proof: self.request.proof.clone(),
+            epoch: self.request.epoch,
+            method: method.into(),
+            args,
+        };
+        deadline_io::send_until(&client, &request, deadline).unwrap();
+        client
+    }
+
+    fn query<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+        deadline: Instant,
+    ) -> Result<T, String> {
+        let client = self.send_request(method, args, deadline);
+        deadline_io::receive_until(&client, deadline).unwrap()
+    }
+
     /// Ask for the state, which must arrive within `budget`.
     fn state_within(&self, budget: Duration) {
-        let deadline = Instant::now() + budget;
-        let client = UnixStream::connect(&self.socket).unwrap();
-        deadline_io::send_until(&client, &self.request, deadline).unwrap();
-        let state = deadline_io::receive_until::<Result<Value, String>>(&client, deadline)
-            .unwrap()
+        let state: Value = self
+            .query("state", json!([0]), Instant::now() + budget)
             .unwrap();
         assert!(state.is_object(), "{state}");
     }
@@ -128,6 +150,144 @@ fn a_stalled_client_does_not_delay_another_clients_request() {
         }
         serving.stop();
         drop(stalled);
+    });
+}
+
+#[test]
+fn reads_finish_while_the_serve_loop_and_store_writer_are_held() {
+    isolated("CAGENTS_RETAINED_READ_BYPASS_TEST", || {
+        let body = "Copy this transcript λ";
+        let fixture = tests::resident_server(Some(body.into()));
+        let server = &fixture.0;
+        let id = server.source.id;
+        let source = server.source.clone();
+        let record = server.identity.record.clone();
+        let actor = server.actor.clone();
+        let journal = server.journal.clone();
+        let state_reads = server.state_reads.clone();
+        let changed = server.changed.clone();
+        let snapshot = actor.snapshot(None).unwrap();
+        let copy = snapshot.text_copy_sources.conversation[0].as_ref().unwrap();
+        let mut serving = Serving::start_server(fixture);
+
+        // A cold reader gets the existing retry boundary while the writer
+        // is held. Attach and the first watch need no transcript hydration.
+        let write_store = actor.0.store.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let cold = serving.send_request("presentation", json!([id, null]), deadline);
+        let error =
+            deadline_io::receive_until::<Result<Value, String>>(&cold, deadline).unwrap_err();
+        assert_eq!(error, crate::chat::failure::actor_transport::ENDED_EARLY);
+        drop(write_store);
+        let established: Snapshot = serving
+            .query("snapshot", json!([null]), Instant::now() + TIMEOUT)
+            .unwrap();
+        assert_eq!(established.items, snapshot.items);
+
+        // The serial request enters the real serve loop and waits for the
+        // journal. The later connections cannot already have been accepted.
+        let journal = journal.lock().unwrap();
+        let serial = serving.send_request("state", json!([0]), Instant::now() + TIMEOUT);
+        crate::test_timing::eventually("serve loop entered state", || {
+            state_reads.load(Ordering::Acquire) != 0
+        });
+
+        let files = Command::LoadFileChanges {
+            request_id: 7,
+            after: None,
+        };
+        let mut write_store = actor.0.store.lock().unwrap();
+        let before_refresh = changed.load(Ordering::Acquire);
+        let budget = Duration::from_secs(2);
+        let reply: Option<chat::FileChangeReply> = serving
+            .query("file_query", json!([files]), Instant::now() + budget)
+            .unwrap();
+        let Some(chat::FileChangeReply::Files(summary)) = reply else {
+            panic!("missing changed files summary");
+        };
+        assert_eq!(summary.request_id, 7);
+        let page: chat::TextCopyPage = serving
+            .query("text_copy", json!([copy, 0]), Instant::now() + budget)
+            .unwrap();
+        assert_eq!(page.text, body);
+
+        // The transcript publication is already in the journal's lineage.
+        // Fetch it while that journal is still inaccessible to the serve loop.
+        let deadline = Instant::now() + budget;
+        let client = serving.send_request(
+            "presentation_binary",
+            json!([crate::terminal_ipc::PROTOCOL_VERSION, id, null]),
+            deadline,
+        );
+        let bytes = deadline_io::receive_bytes_until(&client, deadline).unwrap();
+        let response: Result<crate::terminal_ipc::ServerResponse, String> =
+            postcard::from_bytes(&bytes).unwrap();
+        let response = response.unwrap();
+        let presented = presentation_metadata(&response).unwrap();
+        assert_eq!(presented.items, snapshot.items);
+
+        // A reset discards the previous cached body as soon as it begins,
+        // even while the actor has yet to apply the new resident metadata.
+        write_store
+            .apply(chat::Event::Reset {
+                reason: "fixture reset".into(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + budget;
+        let after_reset = serving.send_request(
+            "presentation_binary",
+            json!([crate::terminal_ipc::PROTOCOL_VERSION, id, null]),
+            deadline,
+        );
+        let error = deadline_io::receive_bytes_until(&after_reset, deadline).unwrap_err();
+        assert_eq!(error, crate::chat::failure::actor_transport::ENDED_EARLY);
+        drop(write_store);
+        assert!(!Serving::timed_out(&serial));
+
+        drop(journal);
+        let _: Value = receive::<Result<Value, String>>(&serial, TIMEOUT)
+            .unwrap()
+            .unwrap();
+        crate::test_timing::eventually("the helper reannounces the available transcript", || {
+            changed.load(Ordering::Acquire) > before_refresh
+        });
+
+        let stale = serving.request.epoch.take();
+        let attached: Attached = serving
+            .query(
+                "attach_close",
+                json!([source, record]),
+                Instant::now() + TIMEOUT,
+            )
+            .unwrap();
+        serving.request.epoch = stale;
+        assert!(
+            serving
+                .query::<Value>("file_query", json!([files]), Instant::now() + TIMEOUT)
+                .unwrap_err()
+                .contains("superseded")
+        );
+        serving.request.epoch = Some(attached.epoch);
+        assert!(attached.close_only);
+        for (method, args) in [
+            ("file_query", json!([files])),
+            ("text_copy", json!([copy, 0])),
+        ] {
+            assert_eq!(
+                serving.query::<Value>(method, args, Instant::now() + TIMEOUT),
+                Err(close_only_refusal())
+            );
+        }
+        let presentation: Option<crate::terminal_ipc::ServerResponse> = serving
+            .query("presentation", json!([id, null]), Instant::now() + TIMEOUT)
+            .unwrap();
+        assert!(
+            presentation
+                .as_ref()
+                .and_then(presentation_metadata)
+                .is_some()
+        );
+        serving.stop();
     });
 }
 

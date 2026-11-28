@@ -3,6 +3,7 @@ use super::*;
 use crate::chat::{TextCopyPage, TextCopyScope, TextCopySource};
 
 pub(super) const SCHEMA: &str = "
+CREATE TABLE copy_cache(id BLOB NOT NULL);
 CREATE TABLE copy_sources(
  token INTEGER PRIMARY KEY AUTOINCREMENT, item TEXT UNIQUE NOT NULL,
  field INTEGER NOT NULL, revision INTEGER NOT NULL, bytes INTEGER NOT NULL);";
@@ -153,78 +154,94 @@ impl Store {
         state.text_copy_sources.conversation = self.copy_projection.clone();
     }
     /// One page of a conversation item's whole text, from `offset`.
+    #[cfg(test)]
     pub(crate) fn text_copy(
         &self,
         source: &TextCopySource,
         offset: u64,
     ) -> Result<TextCopyPage, String> {
-        if unavailable_by_fixture() {
-            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
-        }
-        self.copy_page(source, offset, changed_by_fixture())
+        text_copy(&self.db, self.copy_cache, source, offset)
     }
 
-    /// One page of the text `source` names, refused as changed when
-    /// `changed`, as when the item was rewritten since `source`. A
-    /// subagent's diagnostic reads its backing through this too, without the
-    /// fixture, because a refusal there clears that backing.
+    /// Diagnostic reads bypass the fixture. A refusal there clears the backing.
     pub(crate) fn copy_page(
         &self,
         source: &TextCopySource,
         offset: u64,
         changed: bool,
     ) -> Result<TextCopyPage, String> {
-        if source.scope != TextCopyScope::Conversation || source.cache != self.copy_cache {
-            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
-        }
-        if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
-            return Err(
-                "This text exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
-            );
-        }
-        let record: Option<(String, i64, u64, u64)> = self
-            .db
-            .query_row(
-                "SELECT item,field,revision,bytes FROM copy_sources WHERE token=?1",
-                [source.token],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-            )
-            .optional()
-            .map_err(|error| error.to_string())?;
-        let Some((id, field, revision, total)) = record else {
-            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
-        };
-        if changed || revision != source.revision || source.bytes > total {
-            return Err(crate::chat::TEXT_COPY_CHANGED.into());
-        }
-        if offset > source.bytes {
-            return Err("Invalid text copy range".into());
-        }
-        let start = usize::try_from(offset).map_err(|_| "Invalid text copy offset")?;
-        let mut end = start
-            .saturating_add(crate::chat::TEXT_COPY_PAGE_BYTES)
-            .min(source.bytes as usize);
-        let mut bytes = self.field(&id, field, start, end)?;
-        if bytes.len() != end - start {
-            return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
-        }
-        if end < source.bytes as usize {
-            while std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_none()) {
-                bytes.pop();
-                end -= 1;
-            }
-        }
-        let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 text copy range")?;
-        if text.is_empty() && offset < source.bytes {
-            return Err("Text copy made no progress".into());
-        }
-        Ok(TextCopyPage {
-            source: source.clone(),
-            offset,
-            text,
-            done: end == source.bytes as usize,
-        })
+        copy_page(&self.db, self.copy_cache, source, offset, changed)
     }
+}
+
+pub(super) fn text_copy(
+    db: &Connection,
+    cache: uuid::Uuid,
+    source: &TextCopySource,
+    offset: u64,
+) -> Result<TextCopyPage, String> {
+    if unavailable_by_fixture() {
+        return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
+    }
+    copy_page(db, cache, source, offset, changed_by_fixture())
+}
+
+fn copy_page(
+    db: &Connection,
+    cache: uuid::Uuid,
+    source: &TextCopySource,
+    offset: u64,
+    changed: bool,
+) -> Result<TextCopyPage, String> {
+    if source.scope != TextCopyScope::Conversation || source.cache != cache {
+        return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
+    }
+    if source.bytes > crate::chat::TEXT_COPY_LIMIT_BYTES as u64 {
+        return Err(
+            "This text exceeds the 32 MiB clipboard limit; use its provider transcript".into(),
+        );
+    }
+    let record: Option<(String, i64, u64, u64)> = db
+        .query_row(
+            "SELECT item,field,revision,bytes FROM copy_sources WHERE token=?1",
+            [source.token],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    let Some((id, field, revision, total)) = record else {
+        return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
+    };
+    if changed || revision != source.revision || source.bytes > total {
+        return Err(crate::chat::TEXT_COPY_CHANGED.into());
+    }
+    if offset > source.bytes {
+        return Err("Invalid text copy range".into());
+    }
+    let start = usize::try_from(offset).map_err(|_| "Invalid text copy offset")?;
+    let mut end = start
+        .saturating_add(crate::chat::TEXT_COPY_PAGE_BYTES)
+        .min(source.bytes as usize);
+    let mut bytes = read_field(db, &id, field, start, end)?;
+    if bytes.len() != end - start {
+        return Err(crate::chat::TEXT_COPY_UNAVAILABLE.into());
+    }
+    if end < source.bytes as usize {
+        while std::str::from_utf8(&bytes).is_err_and(|error| error.error_len().is_none()) {
+            bytes.pop();
+            end -= 1;
+        }
+    }
+    let text = String::from_utf8(bytes).map_err(|_| "Invalid UTF-8 text copy range")?;
+    if text.is_empty() && offset < source.bytes {
+        return Err("Text copy made no progress".into());
+    }
+    Ok(TextCopyPage {
+        source: source.clone(),
+        offset,
+        text,
+        done: end == source.bytes as usize,
+    })
 }
 
 #[cfg(test)]
