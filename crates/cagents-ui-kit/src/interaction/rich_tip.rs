@@ -413,15 +413,18 @@ fn ink<'a, Message: 'a>(
 }
 
 fn table<'a, Message: 'a>(rows: Vec<TipRow<'a>>) -> Element<'a, Message> {
+    use cosmic::iced::widget::text::Wrapping;
+
+    let body = |text| design::body(text).wrapping(Wrapping::WordOrGlyph);
     let mut cells = Vec::with_capacity(rows.len() * COLUMNS);
     for row in rows {
-        cells.push(ink(design::body(row.label), TipTone::Secondary));
+        cells.push(ink(body(row.label), TipTone::Secondary));
         cells.push(match row.value {
-            TipValue::Text(text) => ink(design::body(text), row.tone),
+            TipValue::Text(text) => ink(body(text), row.tone),
             TipValue::Shortcut(chord) => key_caps(&chord),
         });
         cells.push(match row.detail {
-            Some(detail) => ink(design::body(detail), TipTone::Secondary),
+            Some(detail) => ink(body(detail), TipTone::Secondary),
             None => cosmic::iced::widget::Space::new().into(),
         });
     }
@@ -526,6 +529,22 @@ struct Table<'a, Message> {
     cells: Vec<Element<'a, Message>>,
 }
 
+/// Fits the columns to the available width, preserving short columns and
+/// putting an equal cap on the remaining ones when their text has to wrap.
+fn column_limits(widths: [f32; COLUMNS], room: f32) -> [f32; COLUMNS] {
+    let mut sorted = widths;
+    sorted.sort_by(f32::total_cmp);
+    let mut remaining = room;
+    for (index, width) in sorted.into_iter().enumerate() {
+        let share = remaining / (COLUMNS - index) as f32;
+        if width > share {
+            return widths.map(|width| width.min(share));
+        }
+        remaining -= width;
+    }
+    widths
+}
+
 impl<Message> Widget<Message, Theme, Renderer> for Table<'_, Message> {
     fn children(&self) -> Vec<Tree> {
         self.cells.iter().map(Tree::new).collect()
@@ -547,62 +566,58 @@ impl<Message> Widget<Message, Theme, Renderer> for Table<'_, Message> {
     ) -> layout::Node {
         let max = limits.max();
         let loose = layout::Limits::new(Size::ZERO, max);
-        // Labels and values keep their natural widths; a qualifier wraps in
-        // what they leave.
+        // Measure each natural width before laying out any overflowing
+        // cell again with its column's actual room.
         let mut nodes: Vec<layout::Node> = Vec::with_capacity(self.cells.len());
         let mut widths = [0.0_f32; COLUMNS];
         for (index, (cell, tree)) in self.cells.iter_mut().zip(&mut tree.children).enumerate() {
             let column = index % COLUMNS;
-            if column == COLUMNS - 1 {
-                nodes.push(layout::Node::default());
-                continue;
-            }
             let node = cell.as_widget_mut().layout(tree, renderer, &loose);
             widths[column] = widths[column].max(node.size().width);
             nodes.push(node);
         }
-        // An empty column takes no gap.
+        let gaps = widths
+            .iter()
+            .filter(|width| **width > 0.0)
+            .count()
+            .saturating_sub(1) as f32;
+        let gap = COLUMN_GAP.min(max.width / (2.0 * gaps.max(1.0)));
+        let widths = column_limits(widths, max.width - gap * gaps);
         let mut starts = [0.0_f32; COLUMNS];
+        let mut edge = widths[0];
         for column in 1..COLUMNS {
-            let previous = widths[column - 1];
-            starts[column] = starts[column - 1]
-                + if previous > 0.0 {
-                    previous + COLUMN_GAP
-                } else {
-                    0.0
-                };
+            if edge > 0.0 && widths[column] > 0.0 {
+                edge += gap;
+            }
+            starts[column] = edge;
+            edge += widths[column];
         }
-        let detail_limits = layout::Limits::new(
-            Size::ZERO,
-            Size::new((max.width - starts[COLUMNS - 1]).max(0.0), max.height),
-        );
-        let mut width: f32 = 0.0;
-        let mut y = 0.0;
-        for (row, (cells, trees)) in self
+        for (index, ((cell, tree), node)) in self
             .cells
-            .chunks_mut(COLUMNS)
-            .zip(tree.children.chunks_mut(COLUMNS))
+            .iter_mut()
+            .zip(&mut tree.children)
+            .zip(&mut nodes)
             .enumerate()
         {
-            let first = row * COLUMNS;
-            nodes[first + COLUMNS - 1] = cells[COLUMNS - 1].as_widget_mut().layout(
-                &mut trees[COLUMNS - 1],
-                renderer,
-                &detail_limits,
-            );
-            let height = nodes[first..first + COLUMNS]
+            let width = widths[index % COLUMNS];
+            if node.size().width > width {
+                *node = cell.as_widget_mut().layout(
+                    tree,
+                    renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(width, max.height)),
+                );
+            }
+        }
+        let mut width: f32 = 0.0;
+        let mut y = 0.0;
+        for row in nodes.chunks_mut(COLUMNS) {
+            let height = row
                 .iter()
                 .map(|node| node.size().height)
                 .fold(0.0, f32::max);
-            // The row's first line: a label or value, which do not wrap.
-            let line = nodes[first..first + COLUMNS - 1]
-                .iter()
-                .map(|node| node.size().height)
-                .fold(0.0, f32::max);
-            for (column, node) in nodes[first..first + COLUMNS].iter_mut().enumerate() {
-                // Text starts at the top, so a wrapped qualifier hangs below
-                // its value; anything shorter than a line, such as key caps,
-                // sits level with it.
+            let line = height.min(design::LINE_BODY);
+            for (column, node) in row.iter_mut().enumerate() {
+                // Align the first lines even when some cells wrap.
                 let top = y + ((line - node.size().height) / 2.0).max(0.0);
                 node.move_to_mut(Point::new(starts[column], top));
                 if node.size().width > 0.0 {
@@ -783,6 +798,33 @@ mod tests {
                 texts.0.iter().any(|seen| seen == text),
                 "{text}: {:?}",
                 texts.0
+            );
+        }
+    }
+
+    #[test]
+    fn a_long_value_wraps_without_clipping_other_detail_columns() {
+        let renderer = crate::workspace_widget::forwarding_test::renderer();
+        let mut element: Element<'_, ()> = table(vec![
+            TipRow::new("Model", "provider-long-model-identifier-".repeat(6)),
+            TipRow::new("Weekly allowance", "25% left").detail("resets in five hours"),
+        ]);
+        let mut tree = Tree::new(&element);
+        let width = DETAILED_MAX_WIDTH - 2.0 * (space::S + space::XXS);
+        let node = element.as_widget_mut().layout(
+            &mut tree,
+            &renderer,
+            &layout::Limits::new(Size::ZERO, Size::new(width, 400.0)),
+        );
+        let cells = node.children();
+        assert!(cells[1].size().height > design::LINE_BODY);
+        assert!(cells[5].size().width > 0.0);
+        for cell in cells.iter().filter(|cell| cell.size().width > 0.0) {
+            let bounds = cell.bounds();
+            assert!(
+                bounds.x + bounds.width <= node.size().width + 0.01,
+                "{bounds:?} outside {:?}",
+                node.bounds()
             );
         }
     }
