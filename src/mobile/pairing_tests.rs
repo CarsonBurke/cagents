@@ -373,6 +373,13 @@ fn assert_restricted_pairing(key: PublicKey) {
         )
     );
     assert!(!scene.pairing.directory.exists(), "the bridge cleaned up");
+    let relay = url::Url::parse("https://ntfy.sh").unwrap();
+    assert!(
+        scene
+            .keys
+            .notification_topic(&key.fingerprint(), &relay)
+            .is_ok_and(|topic| topic.len() == 32)
+    );
     // The backup never holds a one-time key.
     let backup = scene.keys.path().with_file_name(BACKUP_NAME);
     assert!(!backup.exists() || !fs::read_to_string(backup).unwrap().contains("pairing"));
