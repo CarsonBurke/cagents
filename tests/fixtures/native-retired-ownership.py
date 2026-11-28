@@ -290,6 +290,16 @@ def self_test():
     pane = '11111111-1111-4111-8111-111111111111'
     source = '22222222-2222-4222-8222-222222222222'
     descriptor = {'kind': 'chat', 'id': source, 'launch': {'provider': 'Claude', 'session_id': thread, 'recipe': {'arguments': []}}, 'proof': {'fixture': True}}
+    deleted_channels = [
+        ('44444444-4444-4444-8444-444444444444',),
+        ('55555555-5555-4555-8555-555555555555',),
+    ]
+
+    def check_deleted_channels(db, version):
+        if version >= 29:
+            rows = db.execute('SELECT CAST(id AS BLOB) FROM deleted_channels ORDER BY id').fetchall()
+            assert rows == [(channel.encode(),) for channel, in deleted_channels], rows
+
     count = 0
     def database(version):
         db = sqlite3.connect(':memory:')
@@ -302,6 +312,9 @@ def self_test():
             db.executescript('CREATE TABLE shared_view_scopes(scope TEXT); CREATE TABLE shared_views(scope TEXT,revision INTEGER,panes TEXT); CREATE TABLE shared_view_panes(id TEXT,scope TEXT); INSERT INTO shared_view_scopes VALUES(\'current\');')
             db.execute('INSERT INTO shared_view_panes VALUES(?,?)', (pane, 'current'))
             db.execute('INSERT INTO shared_views VALUES(?,?,?)', ('current', 11, json.dumps([{'id': pane, 'kind': descriptor}])))
+        if version >= 29:
+            db.execute('CREATE TABLE deleted_channels(id TEXT PRIMARY KEY) STRICT')
+            db.executemany('INSERT INTO deleted_channels VALUES(?)', deleted_channels)
         return db
     for version in [22, *NORMALIZED]:
         with closing(database(version)) as db:
@@ -381,10 +394,12 @@ def self_test():
             record = recorded_fault(db)
             restore_record(db, record)
             assert db.execute('SELECT actor,ownership FROM native_actor_ownerships ORDER BY actor').fetchall() == [('fixture-actor', record['original']), ('unrelated', 'untouched')]
+            check_deleted_channels(db, version)
             restore_count += 1
             try:
                 restore_record(db, record)
             except ValueError:
+                check_deleted_channels(db, version)
                 restore_count += 1
             else:
                 raise AssertionError('Accepted a second restore of the same fault')
@@ -416,6 +431,7 @@ def self_test():
                 except ValueError:
                     assert db.execute('SELECT actor,ownership FROM native_actor_ownerships ORDER BY actor').fetchall() == before_owners
                     assert db.execute('SELECT actor,receipt FROM native_actor_retirements ORDER BY actor').fetchall() == before_receipts
+                    check_deleted_channels(db, version)
                     restore_count += 1
                 else:
                     raise AssertionError(f'Accepted a {version} {mismatch} restore mismatch')
