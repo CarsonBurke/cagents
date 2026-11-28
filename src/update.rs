@@ -26,6 +26,13 @@ mod floor_prediction;
 mod handoff;
 pub mod in_flight;
 mod installed;
+#[cfg(target_os = "linux")]
+mod linux_handoff;
+#[cfg(all(target_os = "linux", feature = "host"))]
+#[doc(hidden)]
+pub use linux_handoff::{
+    AcceptedHandoff as AcceptedLinuxHandoff, accept as accept_linux_update_handoff,
+};
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 mod publication;
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
@@ -522,7 +529,15 @@ fn state_dir(prefix: &Path) -> Result<PathBuf, UpdateError> {
 pub(crate) fn exclude_update_jobs(
     prefix: &Path,
 ) -> Result<crate::instance::OwnedLock, UpdateError> {
-    acquire_lock(&state_dir(prefix)?)
+    let state = state_dir(prefix)?;
+    let lock = acquire_lock(&state)?;
+    #[cfg(target_os = "linux")]
+    if let Some(job) = read_job(&state)?
+        && linux_handoff::pending(&state, &job)?
+    {
+        return Err(UpdateError::Busy);
+    }
+    Ok(lock)
 }
 
 /// Left by `install.sh` in a version tree whose readiness it could not
@@ -1643,7 +1658,7 @@ fn start_job(
 
     recovery::inspect_pending_current()?;
     let state = installation.state_dir()?;
-    let lock = acquire_lock(&state)?;
+    let lock = exclude_update_jobs(&installation.prefix)?;
     #[cfg(target_os = "macos")]
     ready_plan::begin_new_job()?;
     #[cfg(target_os = "macos")]
@@ -1784,6 +1799,10 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
                     JOB_STATE_LIMIT,
                 )?)?;
                 if !job.phase.is_terminal() {
+                    #[cfg(target_os = "linux")]
+                    if linux_handoff::pending(&state, &job)? {
+                        return Ok(Some(job));
+                    }
                     #[cfg(target_os = "macos")]
                     {
                         let layout = locate(&installation.prefix.join("current/bin/cagents"))?;
@@ -2223,17 +2242,12 @@ fn settle_under_worker_lease(
     Ok(true)
 }
 
-/// Run once by a daemon that has finished starting, serving as `serving`.
-///
-/// A 0.2.3 worker records its update failed after this build already took
-/// over, because it checks the successor through its own older protocol
-/// (#3877). The daemon of the target is the one process that can prove that
-/// record wrong without a window: it waits for that worker to finish, and if
-/// the worker's own verifier receipt names this daemon serving, it settles the
-/// job complete. Anything else leaves the record as it is.
+/// Finish an accepted handoff when the worker exits, or settle an older
+/// worker's protocol refusal against the target's own verifier receipt.
 #[cfg(feature = "host")]
 pub fn settle_as_successor(
     serving: crate::model::HostSessionProof,
+    #[cfg(target_os = "linux")] accepted: Option<AcceptedLinuxHandoff>,
     #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory + Send + 'static,
 ) {
@@ -2254,6 +2268,8 @@ pub fn settle_as_successor(
                 &layout,
                 &state,
                 &serving,
+                #[cfg(target_os = "linux")]
+                accepted.as_ref(),
                 #[cfg(target_os = "macos")]
                 entry_checkpoint,
                 #[cfg(target_os = "macos")]
@@ -2279,6 +2295,7 @@ fn settle_after_worker(
     layout: &InstallLayout,
     state: &Path,
     serving: &crate::model::HostSessionProof,
+    #[cfg(target_os = "linux")] accepted: Option<&AcceptedLinuxHandoff>,
     #[cfg(target_os = "macos")] entry_checkpoint: CutoverStartupCheckpoint,
     #[cfg(target_os = "macos")] observe_live: impl FnOnce() -> CutoverLiveInventory,
 ) -> Result<Option<String>, UpdateError> {
@@ -2287,11 +2304,15 @@ fn settle_after_worker(
     // job cannot change status between reading and recording the outcome.
     let file = open_worker_lock(state)?;
     let _lease = crate::instance::owned_file_lock(file, libc::LOCK_EX)?;
-    let job: UpdateJob = match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error),
+    let Some(job) = read_job(state)? else {
+        return Ok(None);
     };
+    #[cfg(target_os = "linux")]
+    if let Some(accepted) = accepted
+        && let Some(completed) = accepted.finish(layout, state, serving, &job)?
+    {
+        return Ok(Some(completed));
+    }
     #[cfg(target_os = "macos")]
     if let Some(completed) = cutover::finish(
         layout,
@@ -2895,6 +2916,10 @@ fn perform_update(
             UpdatePhase::Installing,
             "Checkpointing sessions and switching the installation",
         )?;
+        #[cfg(target_os = "linux")]
+        if handoff.is_some() {
+            linux_handoff::record(state, job, &target_daemon, &recovery, &guard)?;
+        }
         run_installer(
             installation,
             &release,
@@ -3996,15 +4021,34 @@ fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>, UpdateError> {
     }
     Ok(bytes)
 }
+#[cfg(any(target_os = "linux", feature = "host"))]
+fn read_job(state: &Path) -> Result<Option<UpdateJob>, UpdateError> {
+    match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    write_state_file(state, "status.json", job)
+}
+
+fn write_state_file(state: &Path, name: &str, value: &impl Serialize) -> Result<(), UpdateError> {
     let temporary = state.join(format!("status-{}.tmp", uuid::Uuid::new_v4()));
-    let mut file = private_create(&temporary)?;
-    serde_json::to_writer(&mut file, job)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    fs::rename(&temporary, state.join("status.json"))?;
-    File::open(state)?.sync_all()?;
-    Ok(())
+    let result = (|| {
+        let mut file = private_create(&temporary)?;
+        serde_json::to_writer(&mut file, value)?;
+        file.write_all(b"\n")?;
+        file.sync_all()?;
+        fs::rename(&temporary, state.join(name))?;
+        File::open(state)?.sync_all()?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(temporary);
+    }
+    result
 }
 fn acquire_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateError> {
     lock_file(open_worker_lock(state)?)
@@ -7925,6 +7969,8 @@ mod reconciliation_tests {
                 &layout,
                 &state,
                 proof,
+                #[cfg(target_os = "linux")]
+                None,
                 #[cfg(target_os = "macos")]
                 CutoverStartupCheckpoint::Absent,
                 #[cfg(target_os = "macos")]

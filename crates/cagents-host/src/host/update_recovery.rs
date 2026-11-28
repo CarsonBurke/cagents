@@ -156,7 +156,7 @@ pub(super) fn finish_parked_ready(
     publish_ready_effects(host, Some(capture))
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(super) fn restore_observed_adoption(host: &SharedHost, digest: &str) -> Result<(), String> {
     restore_ordinary_with(
         host,
