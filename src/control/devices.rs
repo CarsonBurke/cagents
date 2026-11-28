@@ -40,7 +40,7 @@ pub enum DeviceCommand {
     },
     /// Bring a device to this computer's cagents build so it can connect.
     #[command(
-        after_help = "Sends this computer's installed build over SSH, installs it beside the device's with its own installer, and hands the device's daemon over through the device's update review, so its terminals keep running. Nothing is sent when the device already has the build. A device running a newer build is never downgraded. Run it in a system terminal outside cagents."
+        after_help = "Stages this computer's build on Linux or uses the matching signed release on Apple Silicon. The device reviews the handover so work can continue. Use --check to see whether the Mac needs the installer first."
     )]
     Update {
         /// A device name from devices.json.
@@ -214,7 +214,7 @@ fn update(
     use crate::device::provision::{Outcome, Step};
     let device = saved(name)?;
     crate::device::select(Some(name)).map_err(|error| AppError::new("device", error))?;
-    let version = crate::version();
+    let mut version = crate::version().to_owned();
     let terminal = io::stderr().is_terminal();
     // Without a terminal, such as under the app, each tenth is a line of its own.
     let mut reported_tenth = None;
@@ -260,11 +260,17 @@ fn update(
             None,
             format!("{name}'s cagents already uses protocol {protocol}. Nothing changed."),
         ),
-        Outcome::Updated { sent } => (
-            "updated",
+        Outcome::Updated {
             sent,
-            format!("{name} now runs cagents {version}."),
-        ),
+            version: installed,
+        } => {
+            version = installed;
+            (
+                "updated",
+                sent,
+                format!("{name} now runs cagents {version}."),
+            )
+        }
         Outcome::Installed { sent } => (
             "installed",
             Some(sent),
