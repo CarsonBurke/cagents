@@ -2975,6 +2975,45 @@ pub fn read_navigable_session_ids(path: &Path) -> Result<Vec<TerminalId>> {
     Ok(ids)
 }
 
+/// The saved chat descriptors that can still refer to stopped update history.
+/// Closing a card or its workspace does not remove it from saved conversations.
+/// Unlike navigation, deletion must abort when a descriptor cannot be read.
+#[cfg(feature = "host")]
+pub fn read_saved_chat_ids_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<TerminalId>> {
+    #[derive(serde::Deserialize)]
+    struct Identity {
+        id: TerminalId,
+    }
+
+    budget.check_deadline()?;
+    let connection = Connection::open_with_flags(
+        crate::secure_file::sqlite_path(path),
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )?;
+    connection.busy_timeout(Duration::from_millis(100))?;
+    let mut statement = connection.prepare(
+        "SELECT CASE WHEN length(CAST(content_json AS BLOB)) <= 4194304 THEN content_json END
+         FROM cards WHERE kind_tag = 'chat'",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut ids = Vec::new();
+    while let Some(row) = rows.next()? {
+        let content = row
+            .get_ref(0)?
+            .as_bytes()
+            .map_err(|error| StoreError::corrupt_row("saved conversation identity", error))?;
+        budget.reserve_bytes(content.len() as u64)?;
+        // The floor can match a saved descriptor from before the provider
+        // confirmed its conversation ID. The allocation ID is enough to keep it.
+        ids.push(from_json_bytes::<Identity>("saved conversation identity", content)?.id);
+    }
+    budget.check_deadline()?;
+    Ok(ids)
+}
+
 /// Saved ownership evidence from another window. Directory scopes are not
 /// project identities: callers must classify them against current shared roots.
 #[derive(Debug, Clone, PartialEq, Eq)]
