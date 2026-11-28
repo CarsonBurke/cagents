@@ -313,15 +313,43 @@ pub fn inventory_groups(resets: &[UsageReset], now_secs: i64) -> Vec<InventoryGr
     groups
 }
 
+/// What a group of resets clears, as inventory copy names it: `account`,
+/// `Unknown scope`, or the scopes, such as `Session + Weekly`.
+pub fn inventory_scope(scopes: &[ResetScope]) -> String {
+    match ordered_scopes(scopes).as_slice() {
+        [ResetScope::Account] => "account".into(),
+        [] => "Unknown scope".into(),
+        _ => scope_label(scopes),
+    }
+}
+
+/// Whether a group can be spent now: one with no known scope cannot.
+pub fn inventory_usable(group: &InventoryGroup) -> bool {
+    group.usable_now && !group.scopes.is_empty()
+}
+
+/// When a group's first reset expires, as `expires Jan 1`, `first expires
+/// Jan 1`, or `first known expiry Jan 1` when some expiries are unknown.
+pub fn inventory_expiry(group: &InventoryGroup, now_secs: i64) -> Option<String> {
+    let at = group.next_expiry?;
+    let expiry = if group.unknown_expiry {
+        "first known expiry"
+    } else if group.count == 1 {
+        "expires"
+    } else {
+        "first expires"
+    };
+    Some(format!(
+        "{expiry} {}",
+        super::format_local_moment(at, now_secs)
+    ))
+}
+
 /// Scope-first inventory copy. Only non-spendable groups carry a qualifier;
 /// the chosen action, rather than repeated “available” labels, names a spend.
 pub fn inventory_caption(scopes: &[ResetScope], count: u64, usable_now: bool) -> String {
     let plural = if count == 1 { "" } else { "s" };
-    let scope = match ordered_scopes(scopes).as_slice() {
-        [ResetScope::Account] => "account".into(),
-        [] => "Unknown scope".into(),
-        _ => scope_label(scopes),
-    };
+    let scope = inventory_scope(scopes);
     let availability = if usable_now && !scopes.is_empty() {
         ""
     } else {
@@ -337,18 +365,9 @@ pub fn inventory_lines(resets: &[UsageReset], now_secs: i64) -> Vec<String> {
         .into_iter()
         .map(|group| {
             let mut line = inventory_caption(&group.scopes, group.count, group.usable_now);
-            if let Some(at) = group.next_expiry {
-                let expiry = if group.unknown_expiry {
-                    "first known expiry"
-                } else if group.count == 1 {
-                    "expires"
-                } else {
-                    "first expires"
-                };
-                line.push_str(&format!(
-                    " · {expiry} {}",
-                    super::format_local_moment(at, now_secs)
-                ));
+            if let Some(expiry) = inventory_expiry(&group, now_secs) {
+                line.push_str(" · ");
+                line.push_str(&expiry);
             }
             line
         })

@@ -4111,17 +4111,17 @@ impl Runtime {
                     .into(),
                     small_icon(
                         Icon::ChevronUp,
-                        "Previous match — Shift+Enter in search",
+                        crate::interaction::find_tips::previous(),
                         Action::FindNext(target, false),
                     ),
                     small_icon(
                         Icon::ChevronDown,
-                        "Next match — Enter in search",
+                        crate::interaction::find_tips::next(),
                         Action::FindNext(target, true),
                     ),
                     small_icon(
                         Icon::Close,
-                        "Close find — Escape",
+                        crate::interaction::find_tips::close(),
                         Action::CloseFind(target),
                     ),
                 ])
@@ -5310,26 +5310,30 @@ impl Runtime {
         // Send now reaches the turn without cancelling it, so while it is on
         // offer Stop points there.
         let instead = match (self.can_send_now(), at_stake > 0) {
-            (true, true) => {
-                ". Send now delivers queued messages without stopping the turn or its subagents."
-            }
-            (true, false) => ". Send now delivers queued messages without cancelling the turn.",
-            (false, _) => "",
+            (true, true) => Some(
+                "Send now delivers queued messages without stopping the turn or its subagents.",
+            ),
+            (true, false) => Some("Send now delivers queued messages without cancelling the turn."),
+            (false, _) => None,
         };
         let tooltip = if armed {
-            Cow::Owned(format!(
-                "Confirm: cancel the active turn and stop {at_stake} background {subagents} (Esc){instead}"
+            crate::interaction::RichTip::new(format!(
+                "Confirm: cancel the active turn and stop {at_stake} background {subagents}"
             ))
         } else if at_stake > 0 {
-            Cow::Owned(format!(
-                "Cancel active turn and its {at_stake} background {subagents} (Esc){instead}"
+            crate::interaction::RichTip::new(format!(
+                "Cancel active turn and its {at_stake} background {subagents}"
             ))
         } else if self.turn_running() {
-            Cow::Owned(format!("Cancel active turn (Esc){instead}"))
+            crate::interaction::RichTip::new("Cancel active turn")
         } else {
-            Cow::Borrowed(
-                "Stop before the turn begins (Esc). Unsent messages return to the composer.",
-            )
+            crate::interaction::RichTip::new("Stop before the turn begins")
+                .note("Unsent messages return to the composer.")
+        }
+        .shortcut("Escape");
+        let tooltip = match instead {
+            Some(instead) => tooltip.note(instead),
+            None => tooltip,
         };
         let mut control = crate::ui_controls::icon_button(Icon::Stop, tooltip)
             .id(card_control_id(target.card, "chat-stop"))
@@ -5840,9 +5844,10 @@ impl Runtime {
                 .on_press(action(Action::PermissionPicker(target, !open)));
                 controls.push(crate::interaction::tooltip_above(
                     anchor,
-                    crate::workspace_widget::shortcut_tooltip(
+                    crate::workspace_widget::shortcut_tooltip_named(
                         crate::workspace_widget::GlobalShortcut::ChatPermissions,
                         shortcuts,
+                        "Choose permissions",
                     ),
                 ));
             }
@@ -5886,9 +5891,9 @@ impl Runtime {
                     .into(),
             }
         };
-        let usage = |tooltip: String| match gauge {
-            Some(gauge) => format!("{tooltip}\n\n{}", gauge.detail),
-            None => tooltip,
+        let usage = |tip: crate::interaction::RichTip<'static>| match gauge {
+            Some(gauge) => gauge.detail(tip),
+            None => tip,
         };
         if transitioning || !self.choosing() || !accounts.choosable {
             // Manual choices are made before the first message. Automatic
@@ -5916,24 +5921,24 @@ impl Runtime {
                         .spacing(step::GAP_XS)
                         .align_y(Alignment::Center),
                 ),
-                usage(format!(
-                    "This conversation runs on {}. {}",
-                    accounts.current,
-                    if !accounts.choosable {
-                        "It is the only account signed in for this agent."
-                    } else if self
-                        .session
-                        .launch
-                        .recipe
-                        .environment
-                        .get(account::routing::AUTOMATIC_MARKER)
-                        .is_some_and(|value| value == "1")
-                    {
-                        "Automatic can switch to another signed-in account between turns when needed."
-                    } else {
-                        "This account is pinned. Start a new conversation to use another account."
-                    }
-                )),
+                usage(
+                    crate::interaction::RichTip::new(accounts.current.to_owned()).note(
+                        if !accounts.choosable {
+                            "The only account signed in for this agent."
+                        } else if self
+                            .session
+                            .launch
+                            .recipe
+                            .environment
+                            .get(account::routing::AUTOMATIC_MARKER)
+                            .is_some_and(|value| value == "1")
+                        {
+                            "Automatic can switch accounts between turns."
+                        } else {
+                            "Pinned to this conversation. Start a new one to use another account."
+                        },
+                    ),
+                ),
             );
         }
         let anchor = widget::button::custom(
@@ -5962,18 +5967,21 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::AccountPicker(target, !open)));
-        let shortcut = crate::workspace_widget::shortcut_tooltip(
+        let tip = crate::workspace_widget::shortcut_tooltip_named(
             crate::workspace_widget::GlobalShortcut::ChatAccount,
             shortcuts,
+            "Choose an account",
         );
-        let anchor = crate::interaction::tooltip_above(
-            anchor,
-            usage(if named {
-                shortcut
-            } else {
-                format!("Account: {} · {shortcut}", accounts.current)
-            }),
-        );
+        // A narrow footer shows no name, so the tooltip says it first.
+        let tip = if named {
+            tip
+        } else {
+            tip.row(crate::interaction::TipRow::new(
+                "Account",
+                accounts.current.to_owned(),
+            ))
+        };
+        let anchor = crate::interaction::tooltip_above(anchor, usage(tip));
         let choices = open.then(|| {
             widget::column::with_children(
                 accounts
@@ -6084,9 +6092,10 @@ impl Runtime {
         // An unlisted model is named by its id, which has no bound. Cut, the
         // trailing group stays narrow enough that the footer's leading group
         // keeps a column, and the tooltip says the whole name.
-        let shortcut = crate::workspace_widget::shortcut_tooltip(
+        let tip = crate::workspace_widget::shortcut_tooltip_named(
             crate::workspace_widget::GlobalShortcut::ChatModel,
             shortcuts,
+            "Choose a model",
         );
         // The tightest footer shows the provider's icon alone, and says the
         // model on hover and to assistive technology.
@@ -6094,16 +6103,16 @@ impl Runtime {
         let limit = fit.label_limit();
         let (mut tooltip, name) = if !named || label.chars().count() > limit {
             (
-                format!("Model: {label} · {shortcut}"),
+                tip.row(crate::interaction::TipRow::new("Model", label.to_string())),
                 Cow::Owned(format!("Choose a model, now {label}")),
             )
         } else {
-            (shortcut, Cow::Borrowed("Choose a model"))
+            (tip, Cow::Borrowed("Choose a model"))
         };
         if !self.is_draft()
             && let Some(choice) = staged_model_choice(&self.snapshot, self.chosen_model())
         {
-            tooltip = format!("{choice} applies from the next turn");
+            tooltip = tooltip.note(format!("{choice} applies from the next turn."));
         }
         let anchor = widget::button::custom(
             widget::row::with_children(

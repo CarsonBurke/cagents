@@ -397,9 +397,10 @@ impl Runtime {
         }
         let target = self.target;
         let (tooltip, selected) = match &self.dictation {
-            Some(Pane::Session(session)) if session.phase == Phase::Finishing => {
-                ("Finishing dictation".to_owned(), true)
-            }
+            Some(Pane::Session(session)) if session.phase == Phase::Finishing => (
+                crate::interaction::RichTip::new("Finishing dictation"),
+                true,
+            ),
             Some(Pane::Session(_)) => (
                 shortcut_tooltip_named(GlobalShortcut::Dictate, shortcuts, "Stop dictating"),
                 true,

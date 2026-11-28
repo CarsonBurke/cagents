@@ -87,13 +87,13 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | --- | --- |
 | New terminal | `Ctrl+Shift+T` |
 | New native thread tab | `Ctrl+T` or `Ctrl+Shift+N` |
-| Choose native chat account | `Ctrl+Shift+A` |
+| Choose native chat account | `Ctrl+U` |
 | Choose native chat model | `Ctrl+M` |
 | Choose native chat permission mode | `Ctrl+O` |
 | Command palette | `Ctrl+Shift+P` |
 | Open settings | `Ctrl+Comma` |
 | Open worktrees | `Ctrl+Shift+E` |
-| Toggle Projects / inspector | `Ctrl+Shift+B` / `Ctrl+Shift+I` |
+| Toggle Projects / inspector | `Ctrl+Shift+B` / `Alt+I` |
 | Rename focused pane | `F2` |
 | Move pane left / right | `Alt+Shift+Left` / `Alt+Shift+Right` |
 | Reopen closed pane | `Ctrl+Shift+Z` |
@@ -103,7 +103,7 @@ Launch **cagents** from the application menu, or run `cagents ui`.
 | Close focused pane | `Ctrl+W` |
 | Find in the focused pane / search projects | `Ctrl+F` |
 | Previous / next pane | `Alt+Q` / `Alt+R`, or `Ctrl+PageUp` / `Ctrl+PageDown` |
-| Cycle pane width | `Alt+Shift+R` |
+| Cycle pane width | `Alt+W` |
 | Previous / next workspace | `Alt+Shift+Tab` / `Alt+Tab`, or `Ctrl+Alt+PageUp` / `Ctrl+Alt+PageDown` |
 | Mark review file viewed | `Alt+V` |
 | Next / previous review file | `Alt+Down` / `Alt+Up` |
@@ -122,19 +122,17 @@ determine which models and permission modes are available.
 
 - Workspace shortcuts work while a terminal has focus: **Ctrl+W** closes
   its pane, **Alt+Q** and **Alt+R** move to the previous and next pane,
-  **Alt+Shift+R** cycles its width, and **Ctrl+T** creates a native thread
-  tab. These chords are withheld from the terminal program. Other shell keys
-  reach the program unless you bind them to workspace actions.
+  **Alt+W** cycles its width, **Alt+I** toggles its inspector, and **Ctrl+T**
+  creates a native thread tab. These chords are withheld from the terminal
+  program. Other shell keys reach the program unless you bind them to
+  workspace actions.
   **Ctrl+F** finds in the focused terminal,
   chat transcript or editor, and otherwise searches projects. The
   review chords act in pull request and local diff panes.
   `Ctrl+PageUp`/`Ctrl+PageDown` and configured `Ctrl+Shift` letters
   also belong to the workspace.
-- Earlier versions changed close and width cycling to `Ctrl+Shift+W` and
-  `Ctrl+Shift+R`. Close has returned to **Ctrl+W**. Pane navigation now also
-  answers to **Alt+Q** and **Alt+R**, so width cycling moved to
-  **Alt+Shift+R**; customized shortcuts are kept. Older navigation and creation defaults also
-  upgrade where they remain unchanged. See
+- Settings from an older version move to the current defaults wherever they
+  still hold an old default; shortcuts you changed are kept. See
   [Upgrading older settings files](configuration.md#upgrading-older-settings-files).
 
 - Hold the pane shortcuts to move repeatedly. Navigation scrolls only far
@@ -144,7 +142,7 @@ determine which models and permission modes are available.
 - Use the command palette to search commands, panes, channels and workspaces.
   Keyboard settings let you record a chord, remove it, or reset a command;
   conflicts name the command that already uses the chord.
-- **Alt+Shift+R** cycles the focused pane through **1/3, 1/2, 2/3, and full**
+- **Alt+W** cycles the focused pane through **1/3, 1/2, 2/3, and full**
   viewport width, repeating while held. Widths stay relative to the viewport
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan

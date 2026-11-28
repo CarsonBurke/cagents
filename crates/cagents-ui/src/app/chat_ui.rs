@@ -175,7 +175,7 @@ const INTERRUPT_CONFIRMATION: Duration = Duration::from_secs(4);
 /// thing, and is the same size, wherever it appears.
 fn icon<'a>(
     name: Icon,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<crate::interaction::TipBody<'a>>,
     enabled: bool,
     message: Action,
 ) -> Element<'a, Message> {
@@ -191,7 +191,7 @@ fn icon<'a>(
 /// looked like a toolbar bolted to every answer.
 fn small_icon<'a>(
     name: Icon,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<crate::interaction::TipBody<'a>>,
     message: Action,
 ) -> Element<'a, Message> {
     crate::ui_controls::icon_button(name, label)

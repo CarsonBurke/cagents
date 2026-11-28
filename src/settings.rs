@@ -417,7 +417,7 @@ impl KeyboardShortcuts {
                 find_in_pane: chords(&["Ctrl+F"]),
                 previous_column: chords(&["Alt+Q", "Ctrl+PageUp"]),
                 next_column: chords(&["Alt+R", "Ctrl+PageDown"]),
-                cycle_pane_width: chords(&["Alt+Shift+R"]),
+                cycle_pane_width: chords(&["Alt+W"]),
                 previous_workspace: chords(&["Alt+Shift+Tab", "Ctrl+Alt+PageUp"]),
                 next_workspace: chords(&["Alt+Tab", "Ctrl+Alt+PageDown"]),
                 review_toggle_viewed: chords(&["Alt+V"]),
@@ -430,8 +430,10 @@ impl KeyboardShortcuts {
                 new_native_thread: chords(&["Ctrl+T", "Ctrl+Shift+N"]),
                 chat_permissions: chords(&["Ctrl+O"]),
                 chat_model: chords(&["Ctrl+M"]),
-                chat_account: chords(&["Ctrl+Shift+A"]),
-                toggle_inspector: chords(&["Ctrl+Shift+I"]),
+                // `Ctrl+A` selects the message, so the account picker takes
+                // `U`, for the user it signs in as.
+                chat_account: chords(&["Ctrl+U"]),
+                toggle_inspector: chords(&["Alt+I"]),
                 open_settings: chords(&["Ctrl+Comma"]),
                 move_pane_left: chords(&["Alt+Shift+Left"]),
                 move_pane_right: chords(&["Alt+Shift+Right"]),
@@ -2077,7 +2079,7 @@ struct V2TomlSettings {
 /// `shortcut_defaults_revision`; one without it predates the first change of
 /// defaults and is at revision 1. Loading a file at an older revision moves
 /// every action still bound to that revision's default onto this build's.
-pub const SHORTCUT_DEFAULTS_REVISION: u32 = 7;
+pub const SHORTCUT_DEFAULTS_REVISION: u32 = 8;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
@@ -2156,6 +2158,11 @@ struct RetiredShortcutDefault {
 /// Revision 7 puts pane navigation under the left hand, on `Alt+Q` and
 /// `Alt+R` beside `Ctrl+PageUp`/`Ctrl+PageDown`, and moves width cycling to
 /// `Alt+Shift+R`.
+/// Revision 8 drops Shift where it kept a chord apart from nothing: width
+/// cycling and the inspector join the workspace's `Alt` letters on `Alt+W`
+/// and `Alt+I`, and the account picker joins `Ctrl+M` and `Ctrl+O` on
+/// `Ctrl+U`. Creating a terminal, clone or channel keeps `Ctrl+Shift`, as a
+/// family beside `Ctrl+T` for a thread.
 const LINUX_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
     RetiredShortcutDefault {
         action: "new_terminal",
@@ -2236,6 +2243,21 @@ const LINUX_RETIRED_SHORTCUT_DEFAULTS: &[RetiredShortcutDefault] = &[
         action: "cycle_pane_width",
         retired_in: 7,
         chords: &["Alt+R"],
+    },
+    RetiredShortcutDefault {
+        action: "cycle_pane_width",
+        retired_in: 8,
+        chords: &["Alt+Shift+R"],
+    },
+    RetiredShortcutDefault {
+        action: "chat_account",
+        retired_in: 8,
+        chords: &["Ctrl+Shift+A"],
+    },
+    RetiredShortcutDefault {
+        action: "toggle_inspector",
+        retired_in: 8,
+        chords: &["Ctrl+Shift+I"],
     },
 ];
 
@@ -5300,10 +5322,7 @@ next_column = ["Alt+W", "Alt+Right"]
             ["Alt+R", "Ctrl+PageDown"]
         );
         assert!(migrated.editor_auto_save);
-        assert_eq!(
-            migrated.keyboard_shortcuts.cycle_pane_width,
-            ["Alt+Shift+R"]
-        );
+        assert_eq!(migrated.keyboard_shortcuts.cycle_pane_width, ["Alt+W"]);
         save(&path, &migrated).unwrap();
         assert_eq!(load(&path).unwrap(), migrated);
     }
@@ -5392,6 +5411,65 @@ next_column = ["Alt+W", "Alt+Right"]
         }
     }
 
+    /// Revision 8 moves the chords that held Shift without needing it, and
+    /// only those still on their revision-7 default.
+    #[cfg(target_os = "linux")] // Linux's defaults history
+    #[test]
+    fn revision_8_moves_shortcuts_still_on_their_default_off_shift() {
+        let revision_7 = [
+            ("cycle_pane_width", "Alt+Shift+R", "Alt+W"),
+            ("chat_account", "Ctrl+Shift+A", "Ctrl+U"),
+            ("toggle_inspector", "Ctrl+Shift+I", "Alt+I"),
+        ];
+        let load_revision_7 = |extend: &dyn Fn(&mut toml::Table)| {
+            let directory = tempfile::tempdir().unwrap();
+            let path = path_in(&directory);
+            let mut document = toml::Table::try_from(AppSettings::default()).unwrap();
+            document.insert("shortcut_defaults_revision".into(), 7.into());
+            let shortcuts = document["keyboard_shortcuts"].as_table_mut().unwrap();
+            for (action, old, _) in revision_7 {
+                shortcuts.insert(action.into(), vec![old].into());
+            }
+            extend(shortcuts);
+            fs::write(&path, toml::to_string(&document).unwrap()).unwrap();
+            let loaded = load(&path).unwrap();
+            save(&path, &loaded).unwrap();
+            assert_eq!(load(&path).unwrap(), loaded);
+            loaded
+        };
+
+        // Every action on its old default moves.
+        let loaded = load_revision_7(&|_| {});
+        assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
+        assert_eq!(
+            loaded.shortcut_defaults_revision,
+            SHORTCUT_DEFAULTS_REVISION
+        );
+
+        // A chord the user changed or added to stays as they set it.
+        let loaded = load_revision_7(&|shortcuts| {
+            shortcuts.insert("chat_account".into(), vec!["Ctrl+Shift+A", "Alt+A"].into());
+            shortcuts.insert("toggle_inspector".into(), vec!["F12"].into());
+        });
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.chat_account, ["Ctrl+Shift+A", "Alt+A"]);
+        assert_eq!(shortcuts.toggle_inspector, ["F12"]);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+W"]);
+
+        // A new chord another action holds stays with it, and the action
+        // that would have moved onto it keeps its old chord.
+        let loaded = load_revision_7(&|shortcuts| {
+            shortcuts.insert("new_terminal".into(), vec!["Ctrl+U"].into());
+            shortcuts.insert("open_settings".into(), vec!["Alt+I"].into());
+        });
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Ctrl+U"]);
+        assert_eq!(shortcuts.chat_account, ["Ctrl+Shift+A"]);
+        assert_eq!(shortcuts.open_settings, ["Alt+I"]);
+        assert_eq!(shortcuts.toggle_inspector, ["Ctrl+Shift+I"]);
+        assert_eq!(shortcuts.cycle_pane_width, ["Alt+W"]);
+    }
+
     #[test]
     fn pane_find_can_be_explicitly_unbound_and_stays_unbound_on_reload() {
         let directory = tempfile::tempdir().unwrap();
@@ -5407,7 +5485,7 @@ next_column = ["Alt+W", "Alt+Right"]
     fn introducing_pane_cycling_preserves_an_existing_binding_of_its_default() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.toml");
-        for (version, binding) in [(2, "\"Alt+Shift+R\""), (3, "[\"Alt+Shift+R\"]")] {
+        for (version, binding) in [(2, "\"Alt+W\""), (3, "[\"Alt+W\"]")] {
             let inspector = if version == 3 {
                 "inspector_width = 380.0\n"
             } else {
@@ -5415,7 +5493,7 @@ next_column = ["Alt+W", "Alt+Right"]
             };
             fs::write(&path, format!("schema_version = {version}\nmax_hot_cards = 6\nhibernation_delay_ms = 30000\nterminal_font_size = 14.0\nsidebar_width = 280.0\ndefault_column_fraction = 0.72\n{inspector}[keyboard_shortcuts]\nnew_terminal = {binding}\n")).unwrap();
             let migrated = load(&path).unwrap();
-            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+Shift+R"]);
+            assert_eq!(migrated.keyboard_shortcuts.new_terminal, ["Alt+W"]);
             assert!(migrated.keyboard_shortcuts.cycle_pane_width.is_empty());
             save(&path, &migrated).unwrap();
             assert_eq!(load(&path).unwrap(), migrated);
@@ -5532,7 +5610,7 @@ next_column = ["Alt+W", "Alt+Right"]
                     close
                 };
                 let expected_width = if matches!(revision, 2 | 3) && width == ["Ctrl+Shift+R"] {
-                    vec!["Alt+Shift+R"]
+                    vec!["Alt+W"]
                 } else {
                     width
                 };
@@ -5564,10 +5642,10 @@ next_column = ["Alt+W", "Alt+Right"]
         shortcuts.remove("chat_account");
         shortcuts.remove("chat_model");
         shortcuts.insert("chat_permissions".into(), Vec::<String>::new().into());
-        shortcuts.insert("new_terminal".into(), vec!["Ctrl+Shift+A"].into());
+        shortcuts.insert("new_terminal".into(), vec!["Ctrl+U"].into());
         fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+Shift+A"]);
+        assert_eq!(loaded.keyboard_shortcuts.new_terminal, ["Ctrl+U"]);
         assert!(loaded.keyboard_shortcuts.chat_account.is_empty());
         assert_eq!(loaded.keyboard_shortcuts.chat_model, ["Ctrl+M"]);
         assert!(loaded.keyboard_shortcuts.chat_permissions.is_empty());
@@ -5587,7 +5665,7 @@ next_column = ["Alt+W", "Alt+Right"]
             shortcuts.insert("close_focused_column".into(), vec!["Ctrl+Shift+W"].into());
             shortcuts.insert("cycle_pane_width".into(), vec!["Ctrl+Shift+R"].into());
             shortcuts.insert("new_channel".into(), vec!["Ctrl+W"].into());
-            shortcuts.insert("clone_pane".into(), vec!["Alt+Shift+R"].into());
+            shortcuts.insert("clone_pane".into(), vec!["Alt+W"].into());
             fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
             let loaded = load_detailed(&path).unwrap();
             assert_eq!(loaded.set_aside().count(), 0, "revision {revision}");
@@ -5595,7 +5673,7 @@ next_column = ["Alt+W", "Alt+Right"]
             assert_eq!(shortcuts.close_focused_column, ["Ctrl+Shift+W"]);
             assert_eq!(shortcuts.cycle_pane_width, ["Ctrl+Shift+R"]);
             assert_eq!(shortcuts.new_channel, ["Ctrl+W"]);
-            assert_eq!(shortcuts.clone_pane, ["Alt+Shift+R"]);
+            assert_eq!(shortcuts.clone_pane, ["Alt+W"]);
             save(&path, &loaded.settings).unwrap();
             assert_eq!(load(&path).unwrap(), loaded.settings);
         }
@@ -5637,11 +5715,11 @@ next_column = ["Alt+W", "Alt+Right"]
         shortcuts.insert("next_column".into(), vec!["Ctrl+PageDown"].into());
         shortcuts.insert("cycle_pane_width".into(), vec!["Alt+R"].into());
         shortcuts.insert("clone_pane".into(), vec!["Alt+Q"].into());
-        shortcuts.insert("open_settings".into(), vec!["Alt+Shift+R"].into());
+        shortcuts.insert("open_settings".into(), vec!["Alt+W"].into());
         fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
         let shortcuts = load(&path).unwrap().keyboard_shortcuts;
         assert_eq!(shortcuts.clone_pane, ["Alt+Q"]);
-        assert_eq!(shortcuts.open_settings, ["Alt+Shift+R"]);
+        assert_eq!(shortcuts.open_settings, ["Alt+W"]);
         assert_eq!(shortcuts.previous_column, ["Ctrl+PageUp"]);
         // Its new default taken, width cycling keeps Alt+R, so next pane
         // cannot have it.

@@ -6673,12 +6673,13 @@ fn header<'a>(
             ),
             // Closing the controls also ends the search, so say so.
             if state.controls_expanded && state.has_search_query() {
-                "Close and clear search".to_owned()
+                crate::interaction::TipBody::from("Close and clear search")
             } else {
                 crate::workspace_widget::shortcut_tooltip(
                     crate::workspace_widget::GlobalShortcut::FocusProjectSearch,
                     shortcuts,
                 )
+                .into()
             },
         );
         if compact {
@@ -6909,12 +6910,13 @@ fn utility_controls<'a>(
     shortcuts: Option<&crate::settings::KeyboardShortcuts>,
 ) -> [Element<'a, SidebarAction>; 3] {
     let label = shortcuts.map_or_else(
-        || "Settings".to_owned(),
+        || crate::interaction::TipBody::from("Settings"),
         |shortcuts| {
             crate::workspace_widget::shortcut_tooltip(
                 crate::workspace_widget::GlobalShortcut::OpenSettings,
                 shortcuts,
             )
+            .into()
         },
     );
     let settings: Element<'a, SidebarAction> =
@@ -8996,11 +8998,18 @@ fn rail_deletion_badges(
 
 /// A row's tooltip. The rail has no room for the expanded row's "Deleting…"
 /// caption or its failure badge, so its tooltip says what they would.
-fn rail_tooltip(tooltip: &str, deletion: Option<&RowDeletion>, compact: bool) -> String {
+fn rail_tooltip(
+    tooltip: &str,
+    deletion: Option<&RowDeletion>,
+    compact: bool,
+) -> crate::interaction::TipBody<'static> {
+    let tip = crate::interaction::RichTip::new(tooltip.to_owned());
     match deletion.filter(|_| compact) {
-        Some(RowDeletion::Deleting) => format!("{tooltip}\nDeleting…"),
-        Some(RowDeletion::Failed(reason)) => format!("{tooltip}\nCould not delete: {reason}"),
-        None => tooltip.to_owned(),
+        Some(RowDeletion::Deleting) => tip.note("Deleting…").into(),
+        Some(RowDeletion::Failed(reason)) => {
+            tip.error(format!("Could not delete: {reason}")).into()
+        }
+        None => tooltip.to_owned().into(),
     }
 }
 
@@ -13070,7 +13079,7 @@ fn changes_footer<'a>(
         .name(format!("{commit_label} (Ctrl+Enter)"))
         .id(chrome.commit_id.clone())
         .on_press_maybe(can_commit.then_some(commit_action)),
-        format!("{commit_hint} (Ctrl+Enter)"),
+        crate::interaction::RichTip::new(commit_hint).shortcut("Ctrl+Enter"),
     );
 
     if has_subject {
@@ -13823,7 +13832,7 @@ fn centered_icon_handle_button<'a>(
 /// One icon command in shared workspace chrome.
 fn icon_action<'a>(
     icon_name: Icon,
-    label: impl Into<Cow<'a, str>>,
+    label: impl Into<crate::interaction::TipBody<'a>>,
     action: Option<SidebarAction>,
     id: Id,
 ) -> Element<'a, SidebarAction> {
@@ -13975,7 +13984,10 @@ pub fn status_icon<'a, Message: Clone + 'a>(
     label: impl Into<Cow<'a, str>> + 'a,
     tone: BadgeTone,
 ) -> Element<'a, Message> {
-    crate::interaction::tooltip(toned_icon(icon_name, tone), label)
+    crate::interaction::tooltip(
+        toned_icon(icon_name, tone),
+        crate::interaction::TipBody::Text(label.into()),
+    )
 }
 
 pub fn check_indicator<Message: Clone + 'static>(status: CheckStatus) -> Element<'static, Message> {

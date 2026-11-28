@@ -1582,7 +1582,6 @@ fn default_shortcuts_leave_shell_keys_to_a_focused_terminal() {
         character("e", Code::KeyE, ctrl),
         character("g", Code::KeyG, ctrl),
         character("p", Code::KeyP, ctrl),
-        character("w", Code::KeyW, alt),
         character("e", Code::KeyE, alt),
         character("g", Code::KeyG, alt),
         character("f", Code::KeyF, alt),
@@ -1679,7 +1678,6 @@ fn project_search_and_pane_find_have_distinct_workspace_chords() {
 fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
     use keyboard::key::Code;
     let shortcuts = linux_shortcuts();
-    let alt_shift = keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT;
     for focused in [
         FocusedPane::Terminal,
         FocusedPane::Review,
@@ -1692,7 +1690,12 @@ fn pane_close_and_width_defaults_apply_even_over_a_terminal() {
                 keyboard::Modifiers::CTRL,
                 GlobalShortcut::CloseFocusedCard,
             ),
-            ("R", Code::KeyR, alt_shift, GlobalShortcut::CyclePaneWidth),
+            (
+                "w",
+                Code::KeyW,
+                keyboard::Modifiers::ALT,
+                GlobalShortcut::CyclePaneWidth,
+            ),
         ] {
             assert!(is_global_shortcut_chord(
                 &keyboard::Key::Character(character.into()),
@@ -3281,9 +3284,9 @@ fn only_configured_global_chords_are_reserved_from_card_children() {
     assert!(!reserved("a".into(), Code::KeyA, ctrl_shift));
     assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::CTRL));
     assert!(!reserved("w".into(), Code::KeyW, ctrl_shift));
-    assert!(!reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
+    assert!(reserved("w".into(), Code::KeyW, keyboard::Modifiers::ALT));
     assert!(reserved("r".into(), Code::KeyR, keyboard::Modifiers::ALT));
-    assert!(reserved(
+    assert!(!reserved(
         "R".into(),
         Code::KeyR,
         keyboard::Modifiers::ALT | keyboard::Modifiers::SHIFT
@@ -3438,7 +3441,7 @@ fn held_page_navigation_crosses_four_cards_and_stops_at_edges() {
 fn the_inspector_shortcut_acts_only_where_there_is_an_inspector() {
     use keyboard::key::Code;
     let shortcuts = linux_shortcuts();
-    let modifiers = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
+    let modifiers = keyboard::Modifiers::ALT;
     for (focused, acts) in [
         (FocusedPane::Terminal, true),
         (FocusedPane::Review, true),
@@ -3472,10 +3475,11 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
     let shortcuts = linux_shortcuts();
     let ctrl = keyboard::Modifiers::CTRL;
     let ctrl_shift = keyboard::Modifiers::CTRL | keyboard::Modifiers::SHIFT;
-    // Ctrl+M is carriage return and Ctrl+O is operate-and-get-next to a shell:
-    // a focused terminal must still receive both.
+    // Ctrl+U is kill-line, Ctrl+M carriage return and Ctrl+O
+    // operate-and-get-next to a shell: a focused terminal must still receive
+    // each.
     for (key, code, modifiers, action) in [
-        ("a", Code::KeyA, ctrl_shift, GlobalShortcut::ChatAccount),
+        ("u", Code::KeyU, ctrl, GlobalShortcut::ChatAccount),
         ("m", Code::KeyM, ctrl, GlobalShortcut::ChatModel),
         ("o", Code::KeyO, ctrl, GlobalShortcut::ChatPermissions),
         (" ", Code::Space, ctrl_shift, GlobalShortcut::Dictate),
@@ -3506,6 +3510,23 @@ fn chat_selection_shortcuts_only_capture_keys_in_native_chat() {
             );
         }
     }
+    // The composer keeps the editing chords beside the pickers'.
+    for (key, code) in [
+        ("a", Code::KeyA),
+        ("c", Code::KeyC),
+        ("x", Code::KeyX),
+        ("v", Code::KeyV),
+    ] {
+        assert_eq!(
+            global_shortcut(
+                &key_press(key, code, ctrl, false),
+                &shortcuts,
+                FocusedPane::Chat
+            ),
+            None,
+            "Ctrl+{key} was taken from the composer"
+        );
+    }
     let customized = KeyboardShortcuts {
         chat_model: vec!["Alt+M".into()],
         ..shortcuts
@@ -3534,19 +3555,19 @@ fn shortcut_tooltips_follow_customized_and_unbound_bindings() {
         search_projects: vec!["Alt+S".into(), "Ctrl+Shift+F".into()],
         ..linux_shortcuts()
     };
-    assert_eq!(
-        shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts),
-        "Search projects — Alt+S, Ctrl+Shift+F"
-    );
+    // The tip shows the first chord as key caps; the palette and settings
+    // list every one.
+    let tip = shortcut_tooltip(GlobalShortcut::FocusProjectSearch, &shortcuts);
+    assert_eq!(tip.title(), "Search projects");
+    assert_eq!(tip.shortcut_chord(), Some("Alt+S"));
     shortcuts.close_focused_column.clear();
-    assert_eq!(
-        shortcut_tooltip_named(
-            GlobalShortcut::CloseFocusedCard,
-            &shortcuts,
-            "Close terminal"
-        ),
-        "Close terminal — unbound"
+    let tip = shortcut_tooltip_named(
+        GlobalShortcut::CloseFocusedCard,
+        &shortcuts,
+        "Close terminal",
     );
+    assert_eq!(tip.title(), "Close terminal");
+    assert_eq!(tip.shortcut_chord(), None);
 }
 
 #[test]

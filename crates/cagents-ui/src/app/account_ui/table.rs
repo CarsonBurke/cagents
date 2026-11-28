@@ -1045,7 +1045,7 @@ fn row<'a>(
                         Column::Plan.width(layout.usage),
                     );
                     crate::interaction::tooltip(
-                        crate::ui_controls::labelled(badge, label.clone()),
+                        crate::ui_controls::labelled(badge, label.plain()),
                         label,
                     )
                 }),

@@ -63,7 +63,7 @@ FRAMES
     evidence drive click 'Message' >/dev/null
     evidence drive type 'Draft launch notes: confirm the checklist with the team.' >/dev/null
     # Save the same unobstructed workspace on both wide and narrow desktops.
-    evidence drive key ctrl+shift+i >/dev/null
+    evidence drive key alt+i >/dev/null
     sleep 2
     shot seeded-draft
     ;;

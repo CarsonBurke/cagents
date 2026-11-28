@@ -13225,7 +13225,7 @@ fn stop_and_send_now_each_say_what_the_other_does() {
         .find(|(label, _)| label.starts_with("Cancel active turn"))
         .unwrap_or_else(|| panic!("Stop: {nodes:?}"));
     assert!(
-        stop.0
+        stop.1
             .ends_with("Send now delivers queued messages without cancelling the turn."),
         "{stop:?}"
     );

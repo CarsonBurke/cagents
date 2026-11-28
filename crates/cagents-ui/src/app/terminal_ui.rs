@@ -1060,16 +1060,22 @@ impl Cagents {
                     .into(),
                 crate::ui_controls::icon_button(
                     Icon::ChevronUp,
-                    "Previous match — Shift+Enter in search",
+                    crate::interaction::find_tips::previous(),
                 )
                 .on_press(message(Action::Next(card, true)))
                 .into(),
-                crate::ui_controls::icon_button(Icon::ChevronDown, "Next match — Enter in search")
-                    .on_press(message(Action::Next(card, false)))
-                    .into(),
-                crate::ui_controls::icon_button(Icon::Close, "Close find — Escape")
-                    .on_press(message(Action::Close(card)))
-                    .into(),
+                crate::ui_controls::icon_button(
+                    Icon::ChevronDown,
+                    crate::interaction::find_tips::next(),
+                )
+                .on_press(message(Action::Next(card, false)))
+                .into(),
+                crate::ui_controls::icon_button(
+                    Icon::Close,
+                    crate::interaction::find_tips::close(),
+                )
+                .on_press(message(Action::Close(card)))
+                .into(),
             ])
             .spacing(space::XS)
             .align_y(Alignment::Center)
