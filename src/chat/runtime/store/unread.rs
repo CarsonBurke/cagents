@@ -43,26 +43,6 @@ impl Following {
             }
         }
     }
-
-    /// What is remembered after a read that failed: what changed since, and
-    /// what the failed read was to serve, `previous`.
-    fn restored(self, previous: Self) -> Self {
-        match (self, previous) {
-            (Self::Changed(mut ids), Self::Changed(older)) => {
-                for id in older {
-                    ids.insert(id);
-                    if ids.len() > REMEMBERED {
-                        return Self::Lost;
-                    }
-                }
-                Self::Changed(ids)
-            }
-            (Self::Lost, Self::Changed(_)) => Self::Lost,
-            // The failed read was to start again from the newest items; the
-            // next one still is.
-            (_, previous) => previous,
-        }
-    }
 }
 
 /// One read of what changed in the conversation.
@@ -82,7 +62,7 @@ pub struct Unread {
     pub newest: Option<String>,
     /// Items asked for again that the conversation no longer has.
     pub gone: Vec<String>,
-    /// More changed items are waiting after this bounded read.
+    /// More items are waiting after this bounded read.
     pub more: bool,
 }
 
@@ -96,44 +76,42 @@ impl Store {
     }
 
     /// The items changed since the last call, or the newest ones when no
-    /// change was remembered, together with the items `again` names. What
-    /// does not fit in one read is served by the next. A read that fails
-    /// forgets nothing.
+    /// change was remembered, together with the items `again` names. Unserved
+    /// changes carry over to the next read. The caller passes any items it
+    /// still needs again. A read that fails forgets nothing.
     pub(in crate::chat::runtime) fn unread(&mut self, again: &[String]) -> Result<Unread, String> {
         let started = std::time::Instant::now();
         // Streamed prose waits for its next part before it is stored.
         self.flush_text().map_err(|error| error.to_string())?;
-        let previous = std::mem::replace(&mut self.following, Following::Changed(HashSet::new()));
         let mut budget = READ_BYTES;
-        let read = self.read_following(&previous, again, &mut budget);
-        match &read {
-            Ok(unread) if !unread.items.is_empty() => tracing::debug!(
+        let mut remaining = HashSet::new();
+        let unread = self
+            .read_following(again, &mut budget, &mut remaining)
+            .map_err(|error| error.to_string())?;
+        self.following = Following::Changed(remaining);
+        if !unread.items.is_empty() {
+            tracing::debug!(
                 items = unread.items.len(),
                 bytes = READ_BYTES - budget,
                 restarted = unread.restarted,
                 micros = started.elapsed().as_micros() as u64,
                 "served a conversation's follower"
-            ),
-            Ok(_) => {}
-            Err(_) => {
-                let since = std::mem::take(&mut self.following);
-                self.following = since.restored(previous);
-            }
+            );
         }
-        read.map_err(|error| error.to_string())
+        Ok(unread)
     }
 
     fn read_following(
-        &mut self,
-        previous: &Following,
+        &self,
         again: &[String],
         budget: &mut usize,
+        remaining: &mut HashSet<String>,
     ) -> Result<Unread, StoreError> {
         let mut unread = Unread {
             has_earlier: self.provider_earlier,
             ..Unread::default()
         };
-        let ids = match previous {
+        let ids = match &self.following {
             Following::Changed(changed) => {
                 let mut ordered = Vec::with_capacity(changed.len() + again.len());
                 for id in changed {
@@ -185,8 +163,11 @@ impl Store {
                     None => left = true,
                 }
             }
-            // What does not fit is served by the next read.
-            self.following.changed(&id);
+            // Only the unread portion of the original change set carries
+            // over. The caller can ask again for additional items.
+            if !matches!(&self.following, Following::Changed(changed) if !changed.contains(&id)) {
+                remaining.insert(id);
+            }
         }
         unread.more = left;
         unread.newest = self
@@ -500,6 +481,64 @@ mod tests {
         assert_eq!(
             rest.items.last().map(|item| item.id.as_str()),
             Some(format!("b{}", count - 1).as_str())
+        );
+    }
+
+    #[test]
+    fn deferred_repeats_do_not_consume_the_change_budget() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let big = "x".repeat(BODY_BYTES);
+        let big_items = READ_BYTES / BODY_BYTES;
+        for index in 0..big_items {
+            store
+                .apply(Event::Item(command(
+                    &format!("big-{index}"),
+                    &big,
+                    ToolStatus::Succeeded,
+                )))
+                .unwrap();
+        }
+        let again: Vec<_> = (0..big_items)
+            .map(|index| format!("held-{index}"))
+            .collect();
+        for id in &again {
+            store
+                .apply(Event::Item(command(id, "", ToolStatus::Succeeded)))
+                .unwrap();
+        }
+        store.follow();
+        for id in (0..big_items).map(|index| format!("big-{index}")) {
+            store
+                .apply(Event::OutputDelta {
+                    id,
+                    offset: big.len(),
+                    delta: ".".into(),
+                })
+                .unwrap();
+        }
+        for index in big_items..REMEMBERED {
+            store
+                .apply(Event::Item(command(
+                    &format!("new-{index}"),
+                    "",
+                    ToolStatus::Succeeded,
+                )))
+                .unwrap();
+        }
+
+        let first = store.unread(&again).unwrap();
+        assert!(first.more);
+        assert!(first.items.iter().all(|item| item.id.starts_with("big-")));
+        let rest = store.unread(&again).unwrap();
+        assert!(!rest.more && !rest.restarted && !rest.has_earlier);
+        assert_eq!(
+            first.items.len() + rest.items.len(),
+            REMEMBERED + again.len()
+        );
+        assert!(
+            again
+                .iter()
+                .all(|id| rest.items.iter().any(|item| &item.id == id))
         );
     }
 }
