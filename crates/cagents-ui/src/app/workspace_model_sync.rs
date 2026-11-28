@@ -2696,25 +2696,43 @@ impl Cagents {
                 None => {}
             }
         }
-        for (scope, revision) in changes.removed {
-            self.shared_views
-                .view_sequences
-                .entry(scope.clone())
-                .and_modify(|held| *held = (*held).max(changes.sequence))
-                .or_insert(changes.sequence);
-            let newer_incarnation = views
-                .iter()
-                .any(|view| view.scope == scope && view.revision > revision);
-            if !newer_incarnation {
+        if !changes.removed.is_empty() {
+            // Registry maintenance can retire a batch of empty views at
+            // once. Compact the window's views in order, using the newest
+            // removal per scope as its revision fence.
+            let mut removed = HashMap::with_capacity(changes.removed.len());
+            for (scope, revision) in changes.removed {
+                removed
+                    .entry(scope)
+                    .and_modify(|(held, _)| *held = u64::max(*held, revision))
+                    .or_insert((revision, false));
+            }
+            let held = views.len();
+            views.retain(|view| {
+                let Some((revision, recreated)) = removed.get_mut(&view.scope) else {
+                    return true;
+                };
+                if view.revision <= *revision {
+                    return false;
+                }
+                *recreated = true;
+                true
+            });
+            changed |= views.len() != held;
+            for (scope, (_, recreated)) in removed {
                 self.shared_views
-                    .scope_absences
+                    .view_sequences
                     .entry(scope.clone())
                     .and_modify(|held| *held = (*held).max(changes.sequence))
                     .or_insert(changes.sequence);
+                if !recreated {
+                    self.shared_views
+                        .scope_absences
+                        .entry(scope)
+                        .and_modify(|held| *held = (*held).max(changes.sequence))
+                        .or_insert(changes.sequence);
+                }
             }
-            let held = views.len();
-            views.retain(|view| view.scope != scope || view.revision > revision);
-            changed |= views.len() != held;
         }
         for (scope, sequence) in changes.absent {
             self.shared_views
