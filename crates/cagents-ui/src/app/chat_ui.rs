@@ -3492,7 +3492,9 @@ fn unaccounted(
     type Claim = fn(&chat::QueuedMessage, &chat::QueuedMessage) -> bool;
     let claims: [Claim; 3] = [
         |listed, saved| listed.id == saved.id && same_words(listed, saved),
-        |listed, saved| same_words(listed, saved),
+        // A preview may contain only a caption. It cannot prove that an
+        // independently identified, restorable message is still queued.
+        |listed, saved| (!saved.editable || listed.editable) && same_words(listed, saved),
         |listed, saved| listed.id == saved.id,
     ];
     let mut listed: Vec<&chat::QueuedMessage> = snapshot.queued_messages.iter().collect();

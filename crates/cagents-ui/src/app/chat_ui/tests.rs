@@ -12670,6 +12670,20 @@ fn each_listed_message_accounts_for_one_saved_message() {
     );
 }
 
+#[test]
+fn preview_caption_cannot_account_for_a_different_saved_message() {
+    let preview = chat::QueuedMessage {
+        editable: false,
+        ..chat::QueuedMessage::new("remote-image".into(), "Image".into())
+    };
+    let saved = chat::QueuedMessage::new("saved-text".into(), "Image".into());
+    let snapshot = Snapshot {
+        queued_messages: vec![preview],
+        ..Snapshot::default()
+    };
+    assert_eq!(unaccounted(&snapshot, vec![saved.clone()]), [saved]);
+}
+
 /// A queue saved under an earlier daemon than the one the conversation
 /// last connected through outlived a build that keeps none, which ran in
 /// between; what it lists is long settled and does not come back.
