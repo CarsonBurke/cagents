@@ -546,6 +546,11 @@ enum DaemonLaunch {
 
 #[cfg(any(feature = "host", test))]
 impl DaemonAdmissionGuard {
+    #[cfg(all(feature = "host", target_os = "linux"))]
+    pub fn inherited_launch_fence(&self) -> bool {
+        matches!(self._launch, DaemonLaunch::Inherited { .. })
+    }
+
     pub fn acquire() -> io::Result<Self> {
         Self::acquire_with_publication(
             #[cfg(target_os = "macos")]

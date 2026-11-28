@@ -3,7 +3,7 @@ use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
 #[cfg(target_os = "linux")]
 use crate::flock::process_owns_lock as process_owns_slot;
 use crate::pinned_process::PinnedProcess;
-#[cfg(target_os = "macos")]
+#[cfg(any(feature = "host", target_os = "linux"))]
 use std::time::Instant;
 use std::{
     env,
@@ -130,6 +130,7 @@ static WINDOW_SLOT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
 /// Recovery windows may display existing owners and retained history, while
 /// provider starts continue to require an explicit action in the pane.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(target_os = "linux", derive(serde::Serialize, serde::Deserialize))]
 pub enum WindowRestorePolicy {
     #[default]
     Ordinary,
@@ -471,7 +472,7 @@ pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
     Ok(held)
 }
 
-#[cfg(feature = "ui")]
+#[cfg(any(target_os = "linux", feature = "ui"))]
 pub(crate) fn update_fence_path() -> io::Result<PathBuf> {
     Ok(daemon_admission::fence_path_in(&runtime_directory()?))
 }
@@ -756,6 +757,15 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
                 "saved conversation inventory exceeds the recovery limit",
             ));
         }
+        #[cfg(all(target_os = "linux", feature = "ui"))]
+        {
+            let (startup, changed) = &WINDOW_STARTUP;
+            startup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .saved_chats = Some(saved_chats);
+            changed.notify_all();
+        }
         write_ui_launch_line(
             &format!("{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{saved_chats}"),
             false,
@@ -765,11 +775,26 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
-#[cfg(target_os = "macos")]
+#[cfg(any(feature = "host", feature = "ui", target_os = "linux"))]
 const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "macos", feature = "ui"))]
 static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
     (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+#[cfg(all(target_os = "linux", feature = "ui"))]
+struct WindowStartup {
+    saved_chats: Option<usize>,
+    result: Option<String>,
+}
+
+#[cfg(all(target_os = "linux", feature = "ui"))]
+static WINDOW_STARTUP: (std::sync::Mutex<WindowStartup>, std::sync::Condvar) = (
+    std::sync::Mutex::new(WindowStartup {
+        saved_chats: None,
+        result: None,
+    }),
+    std::sync::Condvar::new(),
+);
 
 /// Records that the UI's main window is on screen. A failure after this ends
 /// a running window, not its startup.
@@ -793,6 +818,16 @@ pub fn report_ui_startup_with_pane_notes(notes: &str) -> io::Result<()> {
 
 fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()> {
     static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    #[cfg(all(target_os = "linux", feature = "ui"))]
+    {
+        let (startup, changed) = &WINDOW_STARTUP;
+        startup
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .result
+            .get_or_insert_with(|| ui_startup_message(result, true));
+        changed.notify_all();
+    }
     if result.is_ok() {
         #[cfg(all(target_os = "macos", feature = "ui"))]
         {
@@ -806,18 +841,23 @@ fn report_ui_startup_result(result: Result<Option<&str>, &str>) -> io::Result<()
     }
     if ui_launch_handshake_requested() && !REPORTED.swap(true, std::sync::atomic::Ordering::AcqRel)
     {
-        let message = match result {
-            Ok(Some(notes))
-                if env::var_os(UI_LAUNCH_PANE_NOTES_ENV).as_deref() == Some("1".as_ref()) =>
-            {
-                format!("{UI_LAUNCH_PANE_NOTES_PREFIX}{notes}").replace('\n', " ")
-            }
-            Ok(_) => UI_LAUNCH_READY.to_owned(),
-            Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
-        };
+        let message = ui_startup_message(
+            result,
+            env::var_os(UI_LAUNCH_PANE_NOTES_ENV).as_deref() == Some("1".as_ref()),
+        );
         write_ui_launch_line(&message, true)?;
     }
     Ok(())
+}
+
+fn ui_startup_message(result: Result<Option<&str>, &str>, pane_notes: bool) -> String {
+    match result {
+        Ok(Some(notes)) if pane_notes => {
+            format!("{UI_LAUNCH_PANE_NOTES_PREFIX}{notes}").replace('\n', " ")
+        }
+        Ok(_) => UI_LAUNCH_READY.to_owned(),
+        Err(error) => format!("{UI_LAUNCH_ERROR_PREFIX}{error}").replace('\n', " "),
+    }
 }
 
 fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
@@ -827,8 +867,17 @@ fn write_ui_launch_line(message: &str, final_response: bool) -> io::Result<()> {
     }
     let _ = final_response;
     let mut stdout = io::stdout().lock();
-    writeln!(stdout, "{message}")?;
-    stdout.flush()
+    let written = writeln!(stdout, "{message}").and_then(|()| stdout.flush());
+    #[cfg(target_os = "linux")]
+    if written
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::BrokenPipe)
+    {
+        // A killed updater can leave this window in the middle of restoring
+        // its panes. Finish so the successor can verify it over activation.
+        return Ok(());
+    }
+    written
 }
 
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
@@ -1563,83 +1612,93 @@ fn verified_window_lease_owners_in(
     runtime: &Path,
     proc_root: &Path,
 ) -> io::Result<Vec<VerifiedWindow>> {
-    let slots = running_window_slots(runtime)?;
     let mut owners = Vec::new();
-    for slot in slots {
-        let lease_path = runtime.join(slot_lock_name(&slot));
-        let lock = OpenOptions::new()
-            .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(&lease_path)?;
-        let expected = lock.metadata()?;
-        if !expected.is_file() || expected.uid() != current_uid() || expected.nlink() != 1 {
-            return Err(io::Error::other("invalid live window lease"));
+    for slot in running_window_slots(runtime)? {
+        if let Some(owner) =
+            verified_window_lease_owner(&runtime.join(slot_lock_name(&slot)), proc_root, &slot)?
+        {
+            owners.push(owner);
         }
-        // /proc/locks is only an index into processes; fdinfo below proves
-        // ownership. Avoid scanning every descriptor of every agent per window.
-        // Btrfs subvolume st_dev can differ from the superblock device printed
-        // in /proc/locks. Index by inode, then disambiguate using the actual
-        // locked descriptor's stat device and inode, not a mere open descriptor.
-        // The index can miss a held lock under churn, so the owner the window
-        // recorded in its lease is a candidate too.
-        let owner = daemon_admission::recorded_owner(&lock);
-        let recorded: Vec<u32> = owner
-            .iter()
-            .map(daemon_admission::RecordedOwner::pid)
-            .collect();
-        let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
-            // A candidate that exits or hides its descriptors mid-proof, as a
-            // stale recorded pid may, is simply not the owner.
-            let process = match PinnedProcess::open(pid) {
-                Ok(process) => process,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(error),
-            };
-            #[cfg(target_os = "linux")]
-            if !fs::metadata(proc_root.join(pid.to_string()))
-                .is_ok_and(|metadata| metadata.uid() == current_uid())
-            {
-                return Ok(None);
-            }
-            // Darwin has no lock index, so the recorded owner is the only
-            // candidate, and only the very process it names can prove it.
-            #[cfg(target_os = "macos")]
-            if !owner
-                .as_ref()
-                .is_some_and(|owner| owner.names(&process).unwrap_or(false))
-            {
-                return Ok(None);
-            }
-            if !owns_lease(proc_root, &process, &lock, &expected).unwrap_or(false) {
-                return Ok(None);
-            }
-            let verified = VerifiedWindow {
-                executable: process.executable()?,
-                process,
-                pid,
-                lease: lock.try_clone()?,
-                lease_path: lease_path.clone(),
-            };
-            if !verified.still_owns_lease()? {
-                return Err(io::Error::other(
-                    "window ownership changed during verification",
-                ));
-            }
-            Ok(Some(verified))
-        })?;
-        // A window that closed after the slots were listed is not live.
-        if matches.is_empty() && lease_released(&lock, &expected)? {
-            continue;
-        }
-        if matches.len() != 1 {
-            return Err(io::Error::other(format!(
-                "cannot authenticate live window {slot}: {} verified lease owners",
-                matches.len()
-            )));
-        }
-        owners.push(matches.pop().unwrap());
     }
     Ok(owners)
+}
+
+fn verified_window_lease_owner(
+    lease_path: &Path,
+    proc_root: &Path,
+    slot: &str,
+) -> io::Result<Option<VerifiedWindow>> {
+    let lock = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lease_path)?;
+    let expected = lock.metadata()?;
+    if !expected.is_file() || expected.uid() != current_uid() || expected.nlink() != 1 {
+        return Err(io::Error::other("invalid live window lease"));
+    }
+    // /proc/locks is only an index into processes; fdinfo below proves
+    // ownership. Avoid scanning every descriptor of every agent per window.
+    // Btrfs subvolume st_dev can differ from the superblock device printed
+    // in /proc/locks. Index by inode, then disambiguate using the actual
+    // locked descriptor's stat device and inode, not a mere open descriptor.
+    // The index can miss a held lock under churn, so the owner the window
+    // recorded in its lease is a candidate too.
+    let owner = daemon_admission::recorded_owner(&lock);
+    let recorded: Vec<u32> = owner
+        .iter()
+        .map(daemon_admission::RecordedOwner::pid)
+        .collect();
+    let mut matches = crate::flock::proven_owners(proc_root, &expected, &recorded, |pid| {
+        // A candidate that exits or hides its descriptors mid-proof, as a
+        // stale recorded pid may, is simply not the owner.
+        let process = match PinnedProcess::open(pid) {
+            Ok(process) => process,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        #[cfg(target_os = "linux")]
+        if !fs::metadata(proc_root.join(pid.to_string()))
+            .is_ok_and(|metadata| metadata.uid() == current_uid())
+        {
+            return Ok(None);
+        }
+        // Darwin has no lock index, so the recorded owner is the only
+        // candidate, and only the very process it names can prove it.
+        #[cfg(target_os = "macos")]
+        if !owner
+            .as_ref()
+            .is_some_and(|owner| owner.names(&process).unwrap_or(false))
+        {
+            return Ok(None);
+        }
+        if !owns_lease(proc_root, &process, &lock, &expected).unwrap_or(false) {
+            return Ok(None);
+        }
+        let verified = VerifiedWindow {
+            executable: process.executable()?,
+            process,
+            pid,
+            lease: lock.try_clone()?,
+            lease_path: lease_path.to_owned(),
+        };
+        if !verified.still_owns_lease()? {
+            return Err(io::Error::other(
+                "window ownership changed during verification",
+            ));
+        }
+        Ok(Some(verified))
+    })?;
+    // A window that closed after the slots were listed is not live.
+    if matches.is_empty() && lease_released(&lock, &expected)? {
+        return Ok(None);
+    }
+    if matches.len() != 1 {
+        return Err(io::Error::other(format!(
+            "cannot authenticate live window {slot}: {} verified lease owners",
+            matches.len()
+        )));
+    }
+    Ok(matches.pop())
 }
 
 /// Whether nobody holds the exclusive lease `lock` opened, probed through a separate
@@ -1891,6 +1950,16 @@ impl UiUpdateGuard {
         self.restore_policy = WindowRestorePolicy::ExistingOnly;
     }
 
+    #[cfg(target_os = "linux")]
+    pub(crate) fn restore_policy(&self) -> WindowRestorePolicy {
+        self.restore_policy
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn set_restore_policy(&mut self, policy: WindowRestorePolicy) {
+        self.restore_policy = policy;
+    }
+
     /// An exact successor may still be restoring and holds its own copy of
     /// the launch fence. Close this copy without unlocking that description.
     #[cfg_attr(
@@ -1954,9 +2023,16 @@ impl UiUpdateGuard {
         Self::acquire_with_operation(libc::LOCK_EX | libc::LOCK_NB)
     }
 
+    /// Wait for the updater's installer or successor to release its
+    /// inherited fence, including during slow restoration.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn acquire_after_updater() -> io::Result<Self> {
+        Self::acquire_with_operation(libc::LOCK_EX)
+    }
+
     /// Let a window that is already taking its slot reach the fence naturally.
     /// The detached flock waiter owns no update lease if this budget expires.
-    #[cfg(all(target_os = "macos", feature = "host"))]
+    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn acquire_for_cutover() -> io::Result<Self> {
         match Self::acquire() {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
@@ -2395,25 +2471,67 @@ impl UiUpdateGuard {
         slots: &[String],
         executable: &Path,
     ) -> io::Result<()> {
-        let running = running_window_slots(&self.runtime)?;
-        let missing: Vec<_> = slots
-            .iter()
-            .filter(|slot| !running.contains(slot))
-            .cloned()
-            .collect();
-        self.relaunch_windows(&missing, executable)
+        self.relaunch_missing_windows_with_notes(slots, executable)
+            .map(|_| ())
     }
 
-    #[cfg(target_os = "macos")]
+    pub(crate) fn relaunch_missing_windows_with_notes(
+        self,
+        slots: &[String],
+        executable: &Path,
+    ) -> io::Result<Option<String>> {
+        let running = running_window_slots(&self.runtime)?;
+        let mut missing = Vec::new();
+        for slot in slots {
+            if running.contains(slot) {
+                continue;
+            }
+            #[cfg(target_os = "linux")]
+            if self.reconnecting_slot(slot, executable)? {
+                continue;
+            }
+            missing.push(slot.clone());
+        }
+        self.relaunch_windows_with_notes(&missing, executable)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn reconnecting_slot(&self, slot: &str, image: &Path) -> io::Result<bool> {
+        let lock = device_reconnect_lock_path(slot)?;
+        if !private_lock_is_held(&lock)?
+            || window_device_identity(&self.runtime, slot, &crate::device::list()?)?.is_none()
+        {
+            return Ok(false);
+        }
+        Ok(
+            verified_window_lease_owner(&lock, Path::new("/proc"), slot)?
+                .is_some_and(|owner| owner.executable == image),
+        )
+    }
+
+    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        #[cfg(target_os = "macos")]
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
         let windows = self.verified_windows()?;
         for slot in slots {
+            #[cfg(target_os = "linux")]
+            let deadline = Instant::now() + crate::control::ui_launch_timeout(true)?;
             let lease = self.runtime.join(slot_lock_name(slot));
-            let owner = windows
-                .iter()
-                .find(|window| window.lease_path == lease && window.executable == image)
-                .ok_or_else(|| io::Error::other("A saved window has no matching restored owner"))?;
+            let Some(owner) = windows.iter().find(|window| window.lease_path == lease) else {
+                #[cfg(target_os = "linux")]
+                if self.reconnecting_slot(slot, image)? {
+                    continue;
+                }
+                return Err(io::Error::other(
+                    "A saved window has no matching restored owner",
+                ));
+            };
+            if owner.executable != image {
+                return Err(io::Error::other(
+                    "A saved window has no matching restored owner",
+                ));
+            }
             let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
             let peer = crate::pinned_process::peer_credentials(&stream)?;
             if peer.uid != current_uid() || peer.pid != owner.pid {
@@ -2426,9 +2544,17 @@ impl UiUpdateGuard {
                 .checked_duration_since(Instant::now())
                 .filter(|remaining| !remaining.is_zero())
                 .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
-            stream.set_read_timeout(Some(remaining))?;
             writeln!(&mut stream, "update-ready")?;
-            if read_capped_line(&stream)? != "ready" || !owner.still_owns_lease()? {
+            #[cfg(target_os = "linux")]
+            crate::control::read_ui_launch_handshake(&mut stream, remaining)?;
+            #[cfg(target_os = "macos")]
+            {
+                stream.set_read_timeout(Some(remaining))?;
+                if read_capped_line(&stream)? != "ready" {
+                    return Err(io::Error::other("A saved window is still reopening"));
+                }
+            }
+            if !owner.still_owns_lease()? {
                 return Err(io::Error::other("A saved window is still reopening"));
             }
         }
@@ -2495,7 +2621,7 @@ impl UiUpdateGuard {
 }
 
 /// A naturally opened window can take its lease before binding activation.
-#[cfg(target_os = "macos")]
+#[cfg(any(feature = "host", target_os = "linux"))]
 fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
     use std::os::fd::AsFd;
 
@@ -3447,7 +3573,6 @@ fn serve_activation_socket(listener: UnixListener, events: async_channel::Sender
         let _ = stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT));
         match read_activation_request(&stream) {
             Ok(ActivationRequest::Shutdown) => break,
-            #[cfg(target_os = "macos")]
             Ok(ActivationRequest::UpdateReady) => report_cutover_ready(stream),
             Ok(ActivationRequest::Activate(token)) => {
                 // The acknowledgement is the launcher's proof that a window
@@ -3542,12 +3667,82 @@ fn report_cutover_ready(mut stream: UnixStream) {
     }
 }
 
+#[cfg(all(feature = "ui", target_os = "linux"))]
+fn report_cutover_ready(mut stream: UnixStream) {
+    static WAITING: AtomicBool = AtomicBool::new(false);
+    let (startup, changed) = &WINDOW_STARTUP;
+    let state = startup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(result) = state.result.clone() {
+        drop(state);
+        let _ = writeln!(stream, "{result}");
+        return;
+    }
+    drop(state);
+    if WAITING.swap(true, Ordering::AcqRel) {
+        return;
+    }
+    if std::thread::Builder::new()
+        .name("cutover-window-ready".into())
+        .spawn(move || {
+            if let Ok(timeout) = crate::control::ui_launch_timeout(true) {
+                let _ = wait_for_cutover_window(&mut stream, startup, changed, timeout);
+            }
+            WAITING.store(false, Ordering::Release);
+        })
+        .is_err()
+    {
+        WAITING.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(all(feature = "ui", target_os = "linux"))]
+fn wait_for_cutover_window(
+    stream: &mut UnixStream,
+    startup: &std::sync::Mutex<WindowStartup>,
+    changed: &std::sync::Condvar,
+    timeout: Duration,
+) -> io::Result<()> {
+    let started = Instant::now();
+    let mut deadline = started + timeout;
+    let mut announced = false;
+    let mut state = startup
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    loop {
+        if let Some(result) = state.result.clone() {
+            drop(state);
+            return writeln!(stream, "{result}");
+        }
+        if let Some(items) = state.saved_chats.filter(|_| !announced) {
+            announced = true;
+            deadline = crate::control::ui_recovery_deadline(started, deadline, items as u64);
+            drop(state);
+            writeln!(stream, "{UI_LAUNCH_RECOVERY_PROGRESS_PREFIX}{items}")?;
+            state = startup
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "A saved window is still reopening",
+            ));
+        }
+        (state, _) = changed
+            .wait_timeout(state, remaining)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
 #[cfg(feature = "ui")]
 enum ActivationRequest {
     Activate(Option<String>),
     Session(crate::model::TerminalId, Option<String>),
     Shutdown,
-    #[cfg(target_os = "macos")]
     UpdateReady,
     Update(UiUpdateAction),
 }
@@ -3581,7 +3776,6 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     match line.split_once(' ') {
         None if line == "activate" => Ok(ActivationRequest::Activate(None)),
         None if line == "shutdown" => Ok(ActivationRequest::Shutdown),
-        #[cfg(target_os = "macos")]
         None if line == "update-ready" => Ok(ActivationRequest::UpdateReady),
         None if line == "update-prepare" => Ok(ActivationRequest::Update(UiUpdateAction::Prepare)),
         None if line == "update-cancel" => Ok(ActivationRequest::Update(UiUpdateAction::Cancel)),
@@ -4933,10 +5127,16 @@ mod tests {
 
             let mut guard = UiUpdateGuard::acquire().unwrap();
             guard.set_recovery_restore_only();
+            let _reopened = owned_lock(
+                &guard.runtime.join(slot_lock_name("second")),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .unwrap();
             guard
-                .relaunch_windows(&[PRIMARY_WINDOW.into()], &executable)
+                .relaunch_missing_windows(&[PRIMARY_WINDOW.into(), "second".into()], &executable)
                 .unwrap();
             let explicit_arguments = fs::read_to_string(&arguments).unwrap();
+            assert!(explicit_arguments.contains("--window\nprimary\n"));
             assert!(
                 explicit_arguments
                     .lines()
@@ -5014,6 +5214,37 @@ mod tests {
                 .kind(),
             io::ErrorKind::WouldBlock,
         );
+    }
+
+    #[cfg(all(feature = "ui", target_os = "linux"))]
+    #[test]
+    fn a_window_replays_its_startup_progress_to_the_successor() {
+        let (mut reporting, mut verifying) = UnixStream::pair().unwrap();
+        verifying
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let startup = std::sync::Mutex::new(WindowStartup {
+            saved_chats: Some(2),
+            result: None,
+        });
+        let changed = std::sync::Condvar::new();
+        std::thread::scope(|scope| {
+            let reporter = scope.spawn(|| {
+                wait_for_cutover_window(&mut reporting, &startup, &changed, Duration::from_secs(2))
+            });
+            let progress = read_capped_line(&verifying);
+            startup.lock().unwrap().result =
+                Some(ui_startup_message(Ok(Some("saved panes")), true));
+            changed.notify_all();
+            assert_eq!(progress.unwrap(), "recovering: 2");
+            assert_eq!(
+                crate::control::read_ui_launch_handshake(&mut verifying, Duration::from_secs(2))
+                    .unwrap()
+                    .as_deref(),
+                Some("saved panes")
+            );
+            reporter.join().unwrap().unwrap();
+        });
     }
 
     #[test]

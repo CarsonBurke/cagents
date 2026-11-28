@@ -432,6 +432,9 @@ pub enum TopCommand {
         #[arg(help = "Detached update job ID.")]
         job_id: String,
     },
+    #[cfg(target_os = "linux")]
+    #[command(hide = true)]
+    FinishUpdateHandoff,
     /// Cooperatively fence application windows around an external installer.
     #[command(hide = true)]
     CoordinateInstall {
@@ -4546,6 +4549,10 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
+    #[cfg(target_os = "linux")]
+    if matches!(command, TopCommand::FinishUpdateHandoff) {
+        return false;
+    }
     // `daemon upgrade` enters the served candidate's updater. An older owner's
     // preflight cannot qualify the panes this candidate knows how to carry.
     !matches!(
@@ -4781,6 +4788,16 @@ fn execute_with_model_context(
                 human: "Application update complete".into(),
             })
         }
+        #[cfg(target_os = "linux")]
+        TopCommand::FinishUpdateHandoff => {
+            crate::update::finish_linux_update_handoff()
+                .map_err(|error| AppError::new("update", error))?;
+            Ok(CommandOutput {
+                command: "update.finish_handoff",
+                data: json!({}),
+                human: String::new(),
+            })
+        }
         TopCommand::RestartWindows { instance } => {
             crate::update::restart_windows(&instance)
                 .map_err(|error| AppError::new("update", error))?;
@@ -5012,17 +5029,7 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
     // budget is not stored on the client, whose repository filesystem is gated.
     // What the child opens decides, not what this process selected: a device
     // window opened from this computer reaches its device all the same.
-    let local = || {
-        crate::upgrade::handoff::startup_timeout()
-            .map(|budget| budget + UI_LAUNCH_HANDSHAKE_TIMEOUT)
-            .map_err(io::Error::other)
-    };
-    // A launcher on a device can't read the handoff budget either way.
-    let timeout = match (opens_device_window(command), crate::device::is_remote()) {
-        (_, true) => remote_ui_launch_timeout(),
-        (true, false) => local()?.max(remote_ui_launch_timeout()),
-        (false, false) => local()?,
-    };
+    let timeout = ui_launch_timeout(opens_device_window(command))?;
     command
         .env(UI_LAUNCH_HANDSHAKE_ENV, "1")
         .env(instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV, "1")
@@ -5052,6 +5059,20 @@ pub fn spawn_ui_process(command: &mut Command) -> io::Result<Option<String>> {
         .ok_or_else(|| io::Error::other("cagents-ui handshake pipe was not created"))
         .and_then(|stdout| read_ui_launch_handshake(stdout, timeout));
     finish_ui_launch(child, result, stdout)
+}
+
+pub(crate) fn ui_launch_timeout(device_window: bool) -> io::Result<Duration> {
+    // A launcher on a device can't read the local handoff budget.
+    if crate::device::is_remote() {
+        return Ok(remote_ui_launch_timeout());
+    }
+    let local = crate::upgrade::handoff::startup_timeout().map_err(io::Error::other)?
+        + UI_LAUNCH_HANDSHAKE_TIMEOUT;
+    Ok(if device_window {
+        local.max(remote_ui_launch_timeout())
+    } else {
+        local
+    })
 }
 
 fn finish_ui_launch(
@@ -5119,7 +5140,11 @@ fn handshake_reports_already_running(error: &io::Error) -> bool {
     error.to_string() == instance::ApplicationLeaseError::AlreadyRunning.to_string()
 }
 
-fn read_ui_launch_handshake(
+pub(crate) fn ui_recovery_deadline(started: Instant, deadline: Instant, items: u64) -> Instant {
+    deadline.max(started + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(30 * items))
+}
+
+pub(crate) fn read_ui_launch_handshake(
     response_stream: &mut (impl Read + AsFd),
     timeout: Duration,
 ) -> io::Result<Option<String>> {
@@ -5160,9 +5185,7 @@ fn read_ui_launch_handshake(
                         // The daemon may have consumed the checkpoint before
                         // this window starts. Its saved-pane inventory supplies
                         // one bounded allowance, never an endless keepalive.
-                        deadline = deadline.max(
-                            started + UI_LAUNCH_HANDSHAKE_TIMEOUT + Duration::from_secs(30 * items),
-                        );
+                        deadline = ui_recovery_deadline(started, deadline, items);
                         response = remaining;
                         continue;
                     }

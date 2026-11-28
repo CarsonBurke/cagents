@@ -92,8 +92,7 @@ pub(super) fn complete_selection(
     Ok(())
 }
 
-#[derive(Clone, PartialEq, Eq)]
-#[cfg_attr(target_os = "macos", derive(Serialize, Deserialize))]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -430,6 +429,10 @@ pub(super) fn perform(
             startup_attempted = true;
             startup_owned = true;
             let receipt = survivors.recovery_receipt();
+            #[cfg(target_os = "linux")]
+            if handoff.is_some() {
+                linux_handoff::arm(state, job, &daemon, &recovery, &guard)?;
+            }
             #[cfg(target_os = "macos")]
             let ready_plan = receipt
                 .filter(|receipt| receipt.is_ready())
