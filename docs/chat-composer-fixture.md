@@ -202,6 +202,9 @@ To see a resume that fails, create `fixture-fail-resume` too: the next
 resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
 
+With `fixture-stop-without-record`, the fixture acknowledges Stop and ends the
+turn with a success result. Its saved transcript contains no stop record.
+
 Claude Code 2.1 reports `session_state_changed` `idle` once a turn has
 settled. Create `fixture-session-idle` to send that frame after a main
 turn's reply or stop settles it. A turn stopped with **Stop** must

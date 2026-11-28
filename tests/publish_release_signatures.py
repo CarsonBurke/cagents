@@ -152,6 +152,12 @@ if arguments[:2] == ["release", "download"]:
         ids[f"{arguments[2]}/{swap.read_text().strip()}"] = 999
         (state / "ids.json").write_text(json.dumps(ids))
         swap.unlink()
+    publish = state / "publish-after-download" / arguments[2]
+    if publish.exists():
+        predecessor = release(publish.read_text().strip())
+        predecessor["draft"] = False
+        save(predecessor)
+        publish.unlink()
 elif arguments[:2] == ["release", "upload"]:
     files = [value for value in arguments[3:] if value.startswith("/")]
     for path in files:
@@ -432,6 +438,42 @@ class PublisherSignatures(unittest.TestCase):
         self.assertRefused(self.verify("0.2.6", self.bundle("0.2.6", ["new"])), "follows the one before")
         self.release("0.2.7", ["old", "new"], generation=1)
         self.assertRefused(self.verify("0.2.7", self.bundle("0.2.7", ["new"])), "follows the one before")
+
+    def test_a_new_generation_keeps_the_previous_generations_macos_build(self):
+        self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
+        bridge = self.bundle("0.2.4", ["old"])
+        metadata = ("release-metadata.json", "release-metadata.json.sig")
+        self.published("0.2.4", bridge, {name: name for name in metadata})
+        macos = self.bundle("0.2.5", ["new"], macos=True)
+        macos_assets = ("cagents-0.2.5-aarch64-apple-darwin.tar.gz", "install-macos.sh", "SHA256SUMS-macos")
+        self.published("0.2.5", macos, {name: name for name in macos_assets})
+
+        self.release("0.2.6", ["new"])
+        ordinary = self.publish("0.2.6", self.bundle("0.2.6", ["new"]))
+        self.assertEqual(ordinary.returncode, 0, ordinary.stderr)
+
+        self.release("0.2.7", ["new", "next"], generation=3)
+        candidate = self.bundle("0.2.7", ["new"])
+        self.assertRefused(self.publish("0.2.7", candidate, "--draft"), "needs the Apple Silicon build")
+        draft = self.directory / "github/releases/v0.2.7"
+        self.assertFalse(draft.exists())
+        candidate = self.bundle("0.2.7", ["new"], macos=True)
+        accepted = self.publish("0.2.7", candidate, "--draft")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        carried = draft / "assets/release-metadata-2.json"
+        self.assertEqual(carried.read_bytes(), (candidate / "release-metadata.json").read_bytes())
+
+    def test_a_macos_release_published_during_bridge_validation_keeps_the_draft(self):
+        self.drafted(macos=True)
+        self.release("0.2.6", ["new", "next"], generation=3)
+        pending = self.directory / "github/publish-after-download/v0.2.6"
+        pending.parent.mkdir(parents=True)
+        pending.write_text("v0.2.5\n")
+        candidate = self.bundle("0.2.6", ["new"])
+        self.assertRefused(self.publish("0.2.6", candidate), "the published release inventory changed")
+        draft = self.directory / "github/releases/v0.2.6/release.json"
+        self.assertIn('"draft": true', draft.read_text())
+        self.assertRefused(self.publish("0.2.6", candidate), "needs the Apple Silicon build")
 
     def test_publication_carries_the_bridge_as_the_bridge_release_serves_it(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})

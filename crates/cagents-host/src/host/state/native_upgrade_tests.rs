@@ -46,10 +46,8 @@ fn run_darwin_native_fixture(test: &str, mode: &str) {
     );
 }
 
-#[cfg(target_os = "macos")]
 struct CloseFixtureChat<'a>(&'a SharedHost, ClientId, Option<TerminalId>);
 
-#[cfg(target_os = "macos")]
 impl Drop for CloseFixtureChat<'_> {
     fn drop(&mut self) {
         if let Some(chat_id) = self.2 {
@@ -60,6 +58,157 @@ impl Drop for CloseFixtureChat<'_> {
             );
         }
     }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
+    use crate::daemon::PinnedProcess;
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use crate::update::impact::{Disposition, Policy, SessionCause};
+
+    let (provider_alive, durable) = match std::env::var(MODE).as_deref() {
+        Ok("lost-holder-live") => (true, false),
+        Ok("lost-durable-holder-live") => (true, true),
+        Ok("lost-holder-ended") => (false, false),
+        Ok("lost-durable-holder-ended") => (false, true),
+        _ => {
+            let test = thread::current().name().unwrap().to_owned();
+            run_isolated(&test, "lost-holder-ended");
+            run_isolated(&test, "lost-durable-holder-ended");
+            run_isolated(&test, "lost-holder-live");
+            run_isolated(&test, "lost-durable-holder-live");
+            return;
+        }
+    };
+    // The isolated test owns the orphan's wait and holds the zombie until
+    // after impact has been reviewed.
+    assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+    let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
+    let program = install_provider(&root);
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("lost-holder-fixture"),
+        host_incarnation: HostIncarnation::new("source"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+    };
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
+    host.lock().unwrap().register_client(0);
+    let mut source = provider_session(&root, &program, &proof);
+    if !durable {
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_UPGRADE_CODEX_VERSION".into(), "0.169.0".into());
+    }
+    if provider_alive {
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CAGENTS_UPGRADE_DROP_SOCKET".into(), "1".into());
+    }
+    let chat_id = source.id;
+    super::super::chat::start_execution(
+        &host,
+        0,
+        source,
+        Arc::new(crate::chat::protocol::ExecutionContext::default()),
+    )
+    .unwrap();
+    let _close = CloseFixtureChat(&host, 0, Some(chat_id));
+    let handle = host.lock().unwrap().chats[&chat_id].handle.clone();
+    wait_until(
+        || {
+            handle.confirmed_session_id().as_deref() == Some(THREAD)
+                && handle.check_update_readiness()
+                    == Ok(crate::chat::runtime::UpdateReadiness::Idle)
+        },
+        "the original chat did not become idle",
+    );
+    assert_eq!(handle.native_continuity().retains_provider(), durable);
+    let directory = registry::directory(Kind::Native).unwrap();
+    let socket = registry::socket(&directory, chat_id);
+    let record = registry::evidence(&socket, Kind::Native).unwrap().unwrap();
+    let pin = |identity: &registry::Process| {
+        let pin = PinnedProcess::open(identity.pid as u32).unwrap();
+        assert_eq!(registry::Process::read(identity.pid).unwrap(), *identity);
+        pin
+    };
+    let holder = pin(&record.holder);
+    let provider = pin(&record.root);
+    assert!(holder.signal(libc::SIGKILL).unwrap());
+    wait_until(|| holder.exited().unwrap(), "the holder did not exit");
+    struct Orphan(PinnedProcess, i32);
+    impl Drop for Orphan {
+        fn drop(&mut self) {
+            let _ = self.0.signal(libc::SIGKILL);
+            while unsafe { libc::waitpid(self.1, std::ptr::null_mut(), 0) } < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted
+            {
+            }
+        }
+    }
+    let provider = Orphan(provider, record.root.pid);
+    let review = || {
+        let (response, _, _) = super::super::client::process_request(
+            &host,
+            0,
+            ClientRequest::UpgradeImpact {
+                policy: Policy::WhenIdle,
+            },
+        )
+        .unwrap();
+        let ServerResponse::UpgradeImpact(impact) = response else {
+            panic!("unexpected upgrade impact response: {response:?}");
+        };
+        let [session] = impact.sessions.as_slice() else {
+            panic!("expected one conversation: {impact:?}");
+        };
+        assert_eq!(session.id, chat_id);
+        (session.disposition, session.reason.clone())
+    };
+    if provider_alive {
+        handle
+            .command(crate::chat::Command::Prompt {
+                text: "Disconnect the fixture socket".into(),
+                attachments: Vec::new(),
+                mode: crate::chat::PromptMode::Send,
+            })
+            .unwrap();
+        wait_until(
+            || {
+                handle
+                    .snapshot(None)
+                    .is_some_and(|snapshot| snapshot.exited)
+            },
+            "the chat worker did not stop after its socket closed",
+        );
+        assert_eq!(
+            review(),
+            (Disposition::Blocked, SessionCause::UnsettledProvider)
+        );
+        assert!(!provider.0.exited().unwrap());
+        assert_eq!(
+            registry::execution_record(&socket).unwrap().as_ref(),
+            Some(&record)
+        );
+    }
+    assert!(provider.0.signal(libc::SIGKILL).unwrap());
+    wait_until(|| provider.0.exited().unwrap(), "the provider did not exit");
+    wait_until(
+        || review() == (Disposition::Resumes, SessionCause::ProviderEnded),
+        "update impact never settled the exact exited provider",
+    );
+    assert!(handle.is_completed());
+    assert_eq!(handle.native_continuity(), NativeContinuity::ReconnectOnly);
+    assert_eq!(
+        registry::Process::read(record.root.pid).unwrap(),
+        record.root
+    );
+    assert!(registry::execution_record(&socket).unwrap().is_none());
 }
 
 #[cfg(target_os = "macos")]
@@ -1800,6 +1949,13 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         track(id);
         ids.insert(thread, id);
     }
+    let pane_session = host.lock().unwrap().chats[&ids[stalled]].current_session();
+    assert_eq!(pane_session.proof.as_ref(), Some(&proof));
+    assert_eq!(pane_session.launch.session_id.as_deref(), Some(stalled));
+    assert_eq!(
+        pane_session.native_continuity,
+        NativeContinuity::ReconnectOnly
+    );
     use crate::update::impact::Disposition;
     verify_agent_run_warning(&host, &root, ids[retained], Disposition::Continues, &[]);
     let (agent, queued) = verify_agent_run_warning(
@@ -1990,22 +2146,42 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         );
     }
 
-    // Reopening a stopped conversation starts it again, and it no longer
-    // needs attention.
+    // Use the framed client that the pane uses. Its ordinary restore only
+    // attaches, and Reopen sends an explicit Start with the saved descriptor.
+    let connect = |session, intent| {
+        let (stream, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        let host = updated.clone();
+        let serving =
+            thread::spawn(move || super::super::client::serve_fixture_user(peer, 1, host));
+        let result =
+            crate::chat::client::ClientHandle::fixture_connect(stream, session, intent, None);
+        (result, serving)
+    };
     fs::remove_file(root.join(format!("stall-{stalled}"))).unwrap();
-    let mut reopen = saved(stalled).source;
-    reopen.proof = None;
-    super::super::client::process_request(
-        &updated,
-        0,
-        crate::terminal::ipc::ClientRequest::ChatStart {
-            session: reopen,
-            source: None,
-            terminate_source: false,
-            execution_environment: Default::default(),
-        },
-    )
-    .unwrap();
+    let (restored, serving) = connect(pane_session.clone(), crate::chat::Intent::RestoreExisting);
+    let refused_restore = restored.err().expect("the update stopped this pane");
+    assert_eq!(
+        refused_restore.recovery,
+        crate::chat::Recovery::UpdateStopped
+    );
+    serving.join().unwrap();
+
+    // A stale Codex pane can still claim durable continuity and match its
+    // stopped identity. The durable path must refuse to start another owner.
+    let mut durable_alias = pane_session.clone();
+    durable_alias.native_continuity = saved(retained).source.native_continuity;
+    assert!(durable_alias.native_continuity.retains_provider());
+    assert!(durable_alias.has_valid_native_continuity());
+    let (stale, serving) = connect(durable_alias, crate::chat::Intent::Start);
+    let refused_start = stale.err().expect("a durable start must not relaunch");
+    assert_eq!(refused_start.recovery, crate::chat::Recovery::Blocked);
+    assert_eq!(refused_start.message, refused_restore.message);
+    serving.join().unwrap();
+    assert!(!updated.lock().unwrap().chats.contains_key(&ids[stalled]));
+    assert_eq!(store().unattached().unwrap().len(), 2);
+
+    let (reopened, serving) = connect(pane_session, crate::chat::Intent::Start);
+    let reopened = reopened.unwrap();
     let handle = updated.lock().unwrap().chats[&ids[stalled]].handle.clone();
     track(ids[stalled]);
     wait_until(
@@ -2015,6 +2191,10 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
     let unattached = store().unattached().unwrap();
     assert_eq!(unattached.len(), 1);
     assert_eq!(unattached[0].id, ids[refused]);
+    assert_eq!(reopened.session().id, ids[stalled]);
+    reopened.close().unwrap();
+    drop(reopened);
+    serving.join().unwrap();
 
     // The restored ones are attached as their panes would attach them.
     for thread in [retained, restarted] {
@@ -2038,7 +2218,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
         )
         .unwrap();
     }
-    for thread in [retained, restarted, stalled] {
+    for thread in [retained, restarted] {
         assert!(matches!(
             super::super::client::process_request(
                 &updated,
@@ -2428,6 +2608,10 @@ fn provider() {
                     json!({"thread":{"id":thread,"canAcceptDirectInput":true,"status":{"type":"idle"}},"model":"fixture-model"})
                 }
                 "turn/start" => {
+                    if std::env::var_os("CAGENTS_UPGRADE_DROP_SOCKET").is_some() {
+                        websocket.close(None).unwrap();
+                        break;
+                    }
                     assert_eq!(frame["params"]["threadId"], thread);
                     turns += 1;
                     let turn = format!("{}-{turns}", std::process::id());

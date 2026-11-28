@@ -4070,23 +4070,27 @@ fn already_stopped() -> CommandOutput {
     }
 }
 
-/// `daemon status` for a selected device whose bridge confirmed that no
-/// daemon is running or holding its inventory lease there.
-fn remote_daemon_stopped() -> CommandOutput {
+/// `daemon status` after the read-only bridge checked the device's lease.
+fn remote_daemon_not_serving(daemon_present: bool) -> CommandOutput {
     let device = crate::device::selected().map(|device| device.name.as_str());
+    let state = if daemon_present {
+        "is starting or stopping"
+    } else {
+        "stopped"
+    };
     CommandOutput {
         command: "daemon.status",
         data: json!({
             "instance": instance::NAME,
             "device": device,
             "running": false,
-            "daemon_present": false,
+            "daemon_present": daemon_present,
             "socket": null,
             "daemon_version": null,
             "cli_version": crate::version()
         }),
         human: format!(
-            "{} daemon on {} stopped; cli {}",
+            "{} daemon on {} {state}; cli {}",
             instance::NAME,
             device.unwrap_or("the selected device"),
             crate::version()
@@ -4538,6 +4542,11 @@ where
                 crate::device::report_absent_bridge();
                 ExitCode::from(crate::device::BRIDGE_ABSENT_EXIT)
             }
+            Err(error) if crate::device::daemon_transitioning(&error) => {
+                eprintln!("cagents daemon bridge: {error}");
+                crate::device::report_transitioning_bridge();
+                ExitCode::from(crate::device::BRIDGE_TRANSITION_EXIT)
+            }
             Err(error) => {
                 eprintln!("cagents daemon bridge: {error}");
                 ExitCode::FAILURE
@@ -4554,11 +4563,36 @@ where
                 return ExitCode::SUCCESS;
             }
             if reading_daemon_status {
-                emit_success(cli.global.json, remote_daemon_stopped());
+                emit_success(cli.global.json, remote_daemon_not_serving(false));
                 return ExitCode::SUCCESS;
             }
             emit_error(cli.global.json, &AppError::new("daemon_not_running", error));
             return ExitCode::FAILURE;
+        }
+        if reading_daemon_status {
+            use crate::device::RemoteStatusRefusal;
+            match crate::device::remote_status_refusal() {
+                Some(RemoteStatusRefusal::Transitioning) => {
+                    emit_success(cli.global.json, remote_daemon_not_serving(true));
+                    return ExitCode::SUCCESS;
+                }
+                Some(RemoteStatusRefusal::OldCli) => {
+                    let name = &crate::device::selected()
+                        .expect("selected remote device")
+                        .name;
+                    emit_error(
+                        cli.global.json,
+                        &AppError::new(
+                            "device_cli_too_old",
+                            format!(
+                                "{name} runs a cagents CLI too old to check daemon status over SSH. Run `cagents device update {name}` to update the device."
+                            ),
+                        ),
+                    );
+                    return ExitCode::FAILURE;
+                }
+                None => {}
+            }
         }
         emit_error(cli.global.json, &device_app_error(error));
         return ExitCode::FAILURE;
@@ -5758,7 +5792,15 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
             });
-            let mut human = if running {
+            let mut human = if let Some(device) = crate::device::selected().filter(|_| running) {
+                format!(
+                    "{} daemon {} running on {}; cli {}",
+                    instance::NAME,
+                    daemon_version.as_deref().unwrap_or("starting"),
+                    device.name,
+                    crate::version()
+                )
+            } else if running {
                 format!(
                     "{} daemon {} running ({}); cli {}",
                     instance::NAME,

@@ -193,7 +193,7 @@ fn accept_client(
     capacity: &ClientCapacity,
     clients: &mut Vec<JoinHandle<()>>,
 ) -> io::Result<()> {
-    let (stream, _) = crate::descriptor::accept(listener)?;
+    let (stream, _peer_address) = crate::descriptor::accept(listener)?;
     match daemon::peer_uid(&stream) {
         Ok(uid) if uid == daemon::current_uid() => {}
         Ok(uid) => {
@@ -213,10 +213,17 @@ fn accept_client(
     };
     let client_id = next_client_id.fetch_add(1, Ordering::Relaxed);
     let client_host = Arc::clone(host);
+    let serve = client::serve;
+    #[cfg(all(test, target_os = "linux"))]
+    let serve = if exit_drain_tests::take_fixture_client(&_peer_address) {
+        client::serve_fixture_user
+    } else {
+        serve
+    };
     match thread::Builder::new()
         .name(format!("cagentsd-client-{client_id}"))
         .spawn(move || {
-            client::serve(stream, client_id, client_host);
+            serve(stream, client_id, client_host);
             // Free the slot before the wake, so its next peer can be admitted.
             drop(permit);
             daemon::wake();

@@ -388,7 +388,6 @@ pub fn notices(snapshot: &notifications::Snapshot) -> Vec<api::Notice> {
     snapshot
         .notices
         .iter()
-        .rev()
         .filter(|notice| !notice.acknowledged)
         .map(notice)
         .collect()

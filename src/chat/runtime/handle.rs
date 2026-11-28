@@ -786,6 +786,22 @@ impl Handle {
             Owner::Remote(remote) => remote.state().completed,
         }
     }
+    /// Whether this worker stopped acknowledging commands. Cleanup can still
+    /// be outstanding after the local worker has stopped consuming them.
+    pub fn worker_stopped(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => {
+                local.is_completed() || local.0.draining.load(std::sync::atomic::Ordering::Acquire)
+            }
+            Owner::Remote(remote) => remote.state().completed,
+        }
+    }
+    #[cfg(target_os = "linux")]
+    pub fn settle_lost_native_owner(&self) {
+        if let Owner::Local(local) = &self.0 {
+            local.settle_lost_native_owner();
+        }
+    }
     /// Provider-owned input observed at verified exit. The live snapshot
     /// remains a bounded presentation and may only show previews.
     pub fn exited_recovery_queue(&self) -> Option<Vec<chat::QueuedMessage>> {

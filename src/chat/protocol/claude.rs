@@ -19,6 +19,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
+use stop_markers::Receipt as StopReceipt;
 use streamed_input::StreamedInput;
 
 /// The first Claude Code release whose async input contract (`next` and
@@ -233,8 +234,9 @@ fn create_inner(
         .as_deref()
         .map(|id| History::locate(launch, id).map(|place| (place, id)))
         .transpose()?;
+    let stop_marker_root = stop_markers::root();
     let (history, history_error) = match transcript
-        .map(|((config, cwd), id)| History::open(&config, &cwd, id))
+        .map(|((config, cwd), id)| History::open(&config, &cwd, id, stop_marker_root.as_deref()))
         .transpose()
     {
         Ok(history) => (history, None),
@@ -272,6 +274,7 @@ fn create_inner(
             cwd: launch.recipe.working_directory.clone(),
             history,
             history_error,
+            stop_marker_root,
             titles: super::claude_titles::ClaudeTitles::new(launch),
             selected: launch_model(&launch.recipe.arguments),
             ..Claude::default()
@@ -871,6 +874,15 @@ struct ManualCompaction {
     boundary: bool,
 }
 
+struct DeferredAttention {
+    key: Option<String>,
+    outcome: crate::notifications::Kind,
+    execution: Option<crate::model::RunId>,
+    session: Option<String>,
+    stop: Option<StopReceipt>,
+    abort_diagnostic: Option<String>,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -919,14 +931,9 @@ struct Claude {
     started_generation: Option<u64>,
     confirmed_start_generation: Option<u64>,
     root_message_starts: VecDeque<[u8; 32]>,
-    deferred_attention: HashMap<
-        u64,
-        (
-            Option<String>,
-            crate::notifications::Kind,
-            Option<crate::model::RunId>,
-        ),
-    >,
+    deferred_attention: HashMap<u64, DeferredAttention>,
+    stop_marker_root: Option<PathBuf>,
+    turn_carriers: stop_markers::Carriers,
     execution: Option<crate::model::RunId>,
     pending: HashMap<String, Value>,
     retired: VecDeque<String>,
@@ -1560,6 +1567,71 @@ impl Claude {
             self.retired.pop_front();
         }
     }
+    fn save_stop(&self, session: Option<&str>, stop: &StopReceipt) {
+        if let (Some(root), Some(session)) = (&self.stop_marker_root, session)
+            && let Err(error) = stop_markers::save(root, session, stop)
+        {
+            tracing::warn!(%error, "Cannot save Claude stop marker");
+        }
+    }
+
+    fn interrupt_accepted(&mut self, generation: u64, step: &mut Step) {
+        if let Some(ended) = self.deferred_attention.remove(&generation) {
+            self.finish_deferred(generation, ended, true, step);
+        } else if generation == self.attention_generation && self.interruption.is_some() {
+            self.interruption = Some(true);
+            step.events.push(Event::Status {
+                busy: self.busy,
+                detail: "Claude acknowledged interruption; waiting for turn settlement".into(),
+            });
+        }
+    }
+
+    fn finish_deferred(
+        &mut self,
+        generation: u64,
+        ended: DeferredAttention,
+        accepted: bool,
+        step: &mut Step,
+    ) {
+        let latest = generation.wrapping_add(1) == self.attention_generation
+            && self.started_generation != Some(self.attention_generation)
+            && self.session_id == ended.session;
+        // Run outcomes retain their own identity even after a newer turn
+        // owns the conversation and its notification preview.
+        step.suppress_current_notification = !latest;
+        let outcome = if accepted {
+            if let Some(stop) = ended.stop {
+                self.save_stop(ended.session.as_deref(), &stop);
+                if latest {
+                    self.settle_stopped_calls(None, step);
+                    step.events.push(Event::Item(chat::stopped_notice(stop.id)));
+                    self.ended_interrupted = true;
+                    let busy = !self.pending.is_empty();
+                    self.status(
+                        busy,
+                        if busy {
+                            "Claude turn ended; decisions remain"
+                        } else {
+                            chat::TURN_INTERRUPTED
+                        },
+                        step,
+                    );
+                }
+            }
+            crate::notifications::Kind::Cancelled
+        } else {
+            if latest && let Some(message) = ended.abort_diagnostic {
+                step.events.push(Event::Error {
+                    message,
+                    fatal: false,
+                });
+            }
+            ended.outcome
+        };
+        publish_turn_outcome(ended.key, outcome, ended.execution, step);
+    }
+
     fn tool(&mut self, parent: Option<&str>, item: Item) {
         let key = ScopedId::new(parent, &item.id);
         if !self.tools.contains_key(&key) {
@@ -1878,6 +1950,7 @@ impl Claude {
         }
         if !self.busy && mode == PromptMode::Send {
             self.start_turn(&mut step);
+            self.turn_carriers.observe(&id);
             self.status(true, "Claude is working", &mut step);
         }
         Ok(step)
@@ -2346,7 +2419,14 @@ impl Claude {
             step.events.push(Event::Item(gap_item(gap)));
             return Ok(());
         }
-        self.message_with_tools(&record.frame, step, &record.tool_calls, true)
+        self.message_with_tools(&record.frame, step, &record.tool_calls, true)?;
+        step.events.extend(
+            record
+                .stop_markers
+                .iter()
+                .map(|id| Event::Item(chat::stopped_notice(id.clone()))),
+        );
+        Ok(())
     }
     fn message_with_tools(
         &mut self,
@@ -4500,13 +4580,21 @@ impl Adapter for Claude {
                 self.control(json!({"subtype":"stop_task", "task_id":task}))
             }
             Command::Interrupt => {
-                // A second stop asks for what the first already asked for.
-                if self.interruption.is_some() {
+                let generation = self.attention_generation;
+                // Either of two attempts can confirm Stop. Further presses
+                // leave room for other controls if Claude never answers.
+                if self.interruption == Some(true)
+                    || self
+                        .controls
+                        .values()
+                        .filter(|request| interrupt_generation(request) == Some(generation))
+                        .nth(1)
+                        .is_some()
+                {
                     return Ok(Step::default());
                 }
-                let step = self.control(
-                    json!({"subtype":"interrupt", "_cagents_turn": self.attention_generation}),
-                )?;
+                let step =
+                    self.control(json!({"subtype":"interrupt", "_cagents_turn": generation}))?;
                 self.interruption = self.busy.then_some(false);
                 Ok(step)
             }
@@ -4867,6 +4955,7 @@ impl Claude {
                 self.started_generation = None;
                 self.confirmed_start_generation = None;
                 self.root_message_starts.clear();
+                self.turn_carriers = Default::default();
                 self.session_id = None;
                 self.history = None;
                 if let Some(titles) = &mut self.titles {
@@ -4938,35 +5027,34 @@ impl Claude {
                 let Some(request) = self.controls.remove(id) else {
                     return Ok(step);
                 };
-                if string(&request, "subtype") == "interrupt"
-                    && let Some(generation) = request["_cagents_turn"].as_u64()
-                {
-                    let accepted = string(response, "subtype") == "success";
-                    if let Some((key, outcome, execution)) =
-                        self.deferred_attention.remove(&generation)
-                    {
-                        // This acknowledgement may settle the old run after
-                        // another accepted prompt has begun. Keep its exact
-                        // execution result without replacing that prompt's
-                        // current notification context.
-                        step.suppress_current_notification = generation
-                            != self.attention_generation
-                            && self.started_generation == Some(self.attention_generation);
-                        let outcome = if accepted {
-                            crate::notifications::Kind::Cancelled
-                        } else {
-                            outcome
-                        };
-                        step.events.push(Event::TurnFinished { key, outcome });
-                        if let Some(run) = execution {
-                            step.events.push(Event::Execution {
-                                run,
-                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
-                            });
+                if let Some(generation) = interrupt_generation(&request) {
+                    match string(response, "subtype") {
+                        "success" => {
+                            self.controls
+                                .retain(|_, other| interrupt_generation(other) != Some(generation));
+                            self.interrupt_accepted(generation, &mut step);
+                            return Ok(step);
                         }
-                    } else if generation == self.attention_generation && self.interruption.is_some()
-                    {
-                        self.interruption = accepted.then_some(true);
+                        "error" => {
+                            // Either attempt can establish that Stop took. A
+                            // refused retry cannot overrule an outstanding one.
+                            if self
+                                .controls
+                                .values()
+                                .any(|other| interrupt_generation(other) == Some(generation))
+                            {
+                                return Ok(step);
+                            }
+                            if let Some(ended) = self.deferred_attention.remove(&generation) {
+                                self.finish_deferred(generation, ended, false, &mut step);
+                                if step.suppress_current_notification {
+                                    return Ok(step);
+                                }
+                            } else if generation == self.attention_generation {
+                                self.interruption = None;
+                            }
+                        }
+                        _ => return Err("Unsupported Claude control response subtype".into()),
                     }
                 }
                 let send_now = self
@@ -5166,14 +5254,6 @@ impl Claude {
                                 }
                             }
                         }
-                        "interrupt" => {
-                            step.events.push(Event::Status {
-                                busy: self.busy,
-                                detail:
-                                    "Claude acknowledged interruption; waiting for turn settlement"
-                                        .into(),
-                            });
-                        }
                         "get_context_usage" => {
                             // A model change, reset or compaction after an
                             // automatic request makes its answer stale.
@@ -5206,6 +5286,17 @@ impl Claude {
                         self.accept_user_prompt(id, &mut step);
                     }
                     self.message(&frame, &mut step)?;
+                    if string(&frame, "parent_tool_use_id").is_empty()
+                        && frame["isReplay"] != true
+                        && frame["isSidechain"] != true
+                        && string(&frame, "teamName").is_empty()
+                        && !model_only(&frame)
+                        && !(frame["type"] == "user" && stop_record(&frame["message"]))
+                        && let Some(id) = frame["uuid"].as_str()
+                        && !self.retracted.contains(id)
+                    {
+                        self.turn_carriers.observe(id);
+                    }
                 }
             }
             "stream_event" => {
@@ -5362,12 +5453,29 @@ impl Claude {
                     && self.started_generation == Some(self.attention_generation);
                 let had_turn = self.busy;
                 let interruption = self.interruption.take();
-                // A turn the person stopped ends as stopped, not failed: its
-                // calls settle, and a marker shows where, once. Only Claude
-                // Code's record of the stop or its acknowledgement says the
-                // stop took: a stop still unacknowledged when the turn ends
-                // may yet be refused, so the turn's own failure stands.
-                let stopped = !made_way && (self.stop_marked || interruption == Some(true));
+                let native_stop = std::mem::take(&mut self.stop_marked);
+                // A provider record or successful acknowledgement proves the stop.
+                let stopped = !made_way && (native_stop || interruption == Some(true));
+                let result_id = frame["uuid"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                let carriers = std::mem::take(&mut self.turn_carriers);
+                let stop = carriers.finish(
+                    format!("{result_id}:stopped"),
+                    frame["command_uuid"].as_str(),
+                );
+                let mut result_error =
+                    (frame["is_error"] == true && !stopped && !made_way).then(|| {
+                        let errors = content_text(&frame["errors"]);
+                        if !errors.is_empty() {
+                            errors
+                        } else if !string(&frame, "result").is_empty() {
+                            string(&frame, "result").into()
+                        } else {
+                            format!("Claude result: {}", string(&frame, "subtype"))
+                        }
+                    });
                 if self.tracked_compaction.as_ref().is_some_and(|compaction| {
                     frame["command_uuid"]
                         .as_str()
@@ -5399,46 +5507,31 @@ impl Claude {
                 }
                 if stopped {
                     self.settle_stopped_calls(None, &mut step);
-                    if !std::mem::take(&mut self.stop_marked) {
-                        let id = frame["uuid"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    if native_stop {
+                        let generation = self.attention_generation;
+                        self.controls
+                            .retain(|_, request| interrupt_generation(request) != Some(generation));
+                    } else {
+                        self.save_stop(self.session_id.as_deref(), &stop);
                         step.events
-                            .push(Event::Item(chat::stopped_notice(format!("{id}:stopped"))));
+                            .push(Event::Item(chat::stopped_notice(stop.id.clone())));
                     }
                 }
                 if had_turn || frame["uuid"].as_str().is_some() {
                     step.events.push(Event::TurnSettled);
                 }
                 if handing_over {
-                    self.hand_over = Some(format!(
-                        "claude:{}",
-                        frame["uuid"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-                    ));
+                    self.hand_over = Some(format!("claude:{result_id}"));
                 } else if had_turn || frame["uuid"].as_str().is_some() {
                     use crate::notifications::Kind;
-                    // A delayed interrupt acknowledgement can arrive during
-                    // another turn. Allocate its fallback identity now instead
-                    // of borrowing that later turn's runtime identity.
-                    let key = Some(format!(
-                        "claude:{}",
-                        frame["uuid"]
-                            .as_str()
-                            .map(str::to_owned)
-                            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
-                    ));
-                    let outcome =
-                        if interruption == Some(true) || (interruption.is_none() && stopped) {
-                            Kind::Cancelled
-                        } else if frame["is_error"].as_bool() == Some(true) && !made_way {
-                            Kind::Failed
-                        } else {
-                            Kind::Succeeded
-                        };
+                    let key = Some(format!("claude:{result_id}"));
+                    let outcome = if stopped {
+                        Kind::Cancelled
+                    } else if frame["is_error"].as_bool() == Some(true) && !made_way {
+                        Kind::Failed
+                    } else {
+                        Kind::Succeeded
+                    };
                     let execution = self.execution.take();
                     if let Some(run) = execution {
                         step.events.push(Event::Execution {
@@ -5446,17 +5539,26 @@ impl Claude {
                             event: crate::agent_execution::ProviderEvent::Settled,
                         });
                     }
-                    if interruption == Some(false) {
-                        self.deferred_attention
-                            .insert(self.attention_generation, (key, outcome, execution));
+                    if interruption == Some(false) && !stopped {
+                        // The provider can acknowledge an interrupt after
+                        // naturally completing the turn. A late reply needs
+                        // an abort-shaped error or a named abort to establish
+                        // a stop. Ending a success at tool use is ambiguous.
+                        let aborted = cut_short(&frame)
+                            && (frame["is_error"] == true || frame["terminal_reason"].is_string());
+                        self.deferred_attention.insert(
+                            self.attention_generation,
+                            DeferredAttention {
+                                key,
+                                outcome,
+                                execution,
+                                session: self.session_id.clone(),
+                                stop: aborted.then_some(stop),
+                                abort_diagnostic: if aborted { result_error.take() } else { None },
+                            },
+                        );
                     } else {
-                        step.events.push(Event::TurnFinished { key, outcome });
-                        if let Some(run) = execution {
-                            step.events.push(Event::Execution {
-                                run,
-                                event: crate::agent_execution::ProviderEvent::Finished { outcome },
-                            });
-                        }
+                        publish_turn_outcome(key, outcome, execution, &mut step);
                     }
                 }
                 self.attention_generation = self.attention_generation.wrapping_add(1);
@@ -5533,15 +5635,7 @@ impl Claude {
                     }
                 }
                 step.events.push(Event::Usage(self.usage.clone()));
-                if frame["is_error"].as_bool() == Some(true) && !stopped && !made_way {
-                    let errors = content_text(&frame["errors"]);
-                    let message = if !errors.is_empty() {
-                        errors
-                    } else if !string(&frame, "result").is_empty() {
-                        string(&frame, "result").into()
-                    } else {
-                        format!("Claude result: {}", string(&frame, "subtype"))
-                    };
+                if let Some(message) = result_error {
                     step.events.push(Event::Error {
                         message,
                         fatal: false,
@@ -5599,6 +5693,7 @@ impl Claude {
                         if state == "started" && self.submissions.contains_key(id) {
                             self.hand_over = None;
                             self.confirm_turn_start(&mut step);
+                            self.turn_carriers.observe(id);
                             self.status(true, "Claude is working", &mut step);
                         }
                         self.queued.retain(|message| message.id != id);
@@ -7797,6 +7892,29 @@ fn stop_record(message: &Value) -> bool {
     )
 }
 
+fn interrupt_generation(request: &Value) -> Option<u64> {
+    if request["subtype"] == "interrupt" {
+        request["_cagents_turn"].as_u64()
+    } else {
+        None
+    }
+}
+
+fn publish_turn_outcome(
+    key: Option<String>,
+    outcome: crate::notifications::Kind,
+    execution: Option<crate::model::RunId>,
+    step: &mut Step,
+) {
+    step.events.push(Event::TurnFinished { key, outcome });
+    if let Some(run) = execution {
+        step.events.push(Event::Execution {
+            run,
+            event: crate::agent_execution::ProviderEvent::Finished { outcome },
+        });
+    }
+}
+
 /// Whether a main-turn result says only that the turn was cut short: stopped
 /// while streaming or running tools, as Claude Code ends a turn it interrupts.
 /// Claude Code 2.1.296 words it as `error_during_execution` with nothing but
@@ -8994,6 +9112,7 @@ struct History {
     /// Result carriers' ancestor calls across the visible branches. Offset
     /// metadata only; no input or patch bodies are retained.
     result_calls: history_branches::ResultCalls,
+    stop_markers: HashMap<u64, Vec<String>>,
     tool_identities: history_branches::ToolIdentities,
     /// Messages in this conversation that were skipped because they were
     /// damaged, such as cut short by a crash.
@@ -9227,6 +9346,7 @@ type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 #[derive(Debug)]
 struct HistoryRecord {
     frame: Value,
+    stop_markers: Vec<String>,
     tool_calls: HistoryCalls,
     /// Messages that could not be shown at this point, in place of a record.
     gap: Option<Gap>,
@@ -9287,6 +9407,52 @@ struct Compaction {
     /// continue from here then.
     preceding: Option<String>,
 }
+/// Attach each receipt to its last surviving carrier on the displayed
+/// history. A native stop record in that turn is authoritative.
+fn index_stop_markers(
+    stops: Vec<StopReceipt>,
+    nodes: &HashMap<String, HistoryNode>,
+    chain: &[Link],
+    provider_stops: &HashMap<u64, String>,
+    refused_results: &HashSet<u64>,
+) -> HashMap<u64, Vec<String>> {
+    let mut markers = HashMap::<u64, Vec<String>>::new();
+    for stop in stops {
+        if let Some(node) = stop
+            .anchors
+            .iter()
+            .filter_map(|id| nodes.get(id))
+            .find(|node| node.visible)
+        {
+            markers.entry(node.range.0).or_default().push(stop.id);
+        }
+    }
+    if !markers.is_empty() {
+        // Walk the saved ancestry so a stop on a later automatic
+        // turn or a sibling branch cannot absorb an earlier receipt.
+        let mut crossed = HashSet::new();
+        for id in chain
+            .iter()
+            .filter_map(Link::offset)
+            .filter_map(|at| provider_stops.get(&at))
+        {
+            let mut parent = nodes.get(id).and_then(HistoryNode::original_parent);
+            while let Some((id, node)) = parent.and_then(|id| nodes.get(id).map(|node| (id, node)))
+            {
+                markers.remove(&node.range.0);
+                if !refused_results.contains(&node.range.0) || !crossed.insert(id) {
+                    break;
+                }
+                parent = node.original_parent();
+            }
+        }
+        for ids in markers.values_mut() {
+            ids.sort_unstable();
+        }
+    }
+    markers
+}
+
 impl History {
     /// About how many items the links not handed over hold, once a page of
     /// `links` of them held `items`: exact when none are left. Links hold
@@ -9359,7 +9525,12 @@ impl History {
         Ok((config, cwd))
     }
 
-    fn open(config: &Path, cwd: &Path, id: &str) -> Result<Self, HistoryUnavailable> {
+    fn open(
+        config: &Path,
+        cwd: &Path,
+        id: &str,
+        stop_marker_root: Option<&Path>,
+    ) -> Result<Self, HistoryUnavailable> {
         let path = crate::agent::claude_transcript_for_start(config, cwd, id).map_err(|error| {
             let error = match error {
                 crate::agent::ClaudeTranscriptError::Invalid(message) => {
@@ -9390,7 +9561,15 @@ impl History {
                 HistoryUnavailable::Unreadable(failure)
             }
         })?;
-        let mut history = Self::index_for_start(file, id, 32 * 1024 * 1024, 200_000)
+        let stops = stop_marker_root
+            .map(|root| stop_markers::load(root, id))
+            .transpose()
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "Cannot read saved Claude stop markers");
+                None
+            })
+            .unwrap_or_default();
+        let mut history = Self::index_for_start(file, id, 32 * 1024 * 1024, 200_000, stops)
             .map_err(HistoryUnavailable::Unreadable)?;
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
@@ -9406,7 +9585,7 @@ impl History {
         tool_bytes_limit: usize,
         tool_count_limit: usize,
     ) -> Result<Self, String> {
-        Self::index_for_start(file, id, tool_bytes_limit, tool_count_limit)
+        Self::index_for_start(file, id, tool_bytes_limit, tool_count_limit, Vec::new())
             .map_err(|error| error.to_string())
     }
     fn index_for_start(
@@ -9414,6 +9593,7 @@ impl History {
         id: &str,
         tool_bytes_limit: usize,
         tool_count_limit: usize,
+        stops: Vec<StopReceipt>,
     ) -> Result<Self, super::SetupError> {
         use std::io::BufRead as _;
         let metadata = file
@@ -9429,6 +9609,8 @@ impl History {
         let mut retracted = std::collections::HashSet::<String>::new();
         let mut task_notices = Vec::new();
         let mut user_prompts = HashSet::new();
+        let mut provider_stops = HashMap::new();
+        let mut refused_results = HashSet::new();
         let mut main_message: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
@@ -9523,6 +9705,25 @@ impl History {
             let Some(uuid) = value["uuid"].as_str() else {
                 continue;
             };
+            if !stops.is_empty()
+                && main
+                && value["type"] == "user"
+                && string(&value, "parent_tool_use_id").is_empty()
+            {
+                if stop_record(&value["message"]) {
+                    provider_stops.insert(record_offset, uuid.to_owned());
+                } else if value["message"]["content"]
+                    .as_array()
+                    .is_some_and(|blocks| {
+                        !blocks.is_empty()
+                            && blocks.iter().all(|block| {
+                                block["type"] == "tool_result" && block["is_error"] == true
+                            })
+                    })
+                {
+                    refused_results.insert(record_offset);
+                }
+            }
             if nodes.len() >= 200_000 {
                 return Err("Claude transcript exceeds the history index limit".into());
             }
@@ -9936,6 +10137,8 @@ impl History {
             .filter_map(Link::offset)
             .filter(|offset| user_prompts.contains(offset))
             .max();
+        let stop_markers =
+            index_stop_markers(stops, &nodes, &chain, &provider_stops, &refused_results);
         let offset = chain.len();
         let mut history = Self {
             file,
@@ -9954,6 +10157,7 @@ impl History {
             background_agent_tools: HashSet::new(),
             call_outcomes: HashMap::new(),
             result_calls,
+            stop_markers,
             tool_identities,
             damaged,
             oversized,
@@ -10299,12 +10503,14 @@ impl History {
                     positions.insert(offset, result.len());
                     HistoryRecord {
                         frame: self.read_record_for_start(offset, len, base)?,
+                        stop_markers: self.stop_markers.get(&offset).cloned().unwrap_or_default(),
                         tool_calls: HashMap::new(),
                         gap: None,
                     }
                 }
                 Link::Gap(gap) => HistoryRecord {
                     frame: Value::Null,
+                    stop_markers: Vec::new(),
                     tool_calls: HashMap::new(),
                     gap: Some(gap),
                 },
@@ -10728,6 +10934,7 @@ mod history_branches;
 #[cfg(test)]
 mod history_tests;
 mod narration;
+mod stop_markers;
 mod streamed_input;
 
 #[cfg(test)]
@@ -10744,7 +10951,7 @@ mod startup_history_retryability_tests {
     const SESSION: &str = "00000000-0000-4000-8000-000000000001";
 
     fn indexed(path: &Path) -> History {
-        History::index_for_start(File::open(path).unwrap(), SESSION, 4096, 16).unwrap()
+        History::index_for_start(File::open(path).unwrap(), SESSION, 4096, 16, Vec::new()).unwrap()
     }
 
     #[test]
@@ -10921,7 +11128,13 @@ mod startup_history_retryability_tests {
         )
         .unwrap();
         assert!(matches!(
-            History::index_for_start(File::open(fixture.path()).unwrap(), session, 1024, 16),
+            History::index_for_start(
+                File::open(fixture.path()).unwrap(),
+                session,
+                1024,
+                16,
+                Vec::new()
+            ),
             Err(super::super::SetupError::Invalid(_))
         ));
         std::fs::write(
@@ -10944,7 +11157,7 @@ mod startup_history_retryability_tests {
                 .unwrap()
         };
         assert!(matches!(
-            History::index_for_start(write_only(), session, 1024, 16),
+            History::index_for_start(write_only(), session, 1024, 16, Vec::new()),
             Err(super::super::SetupError::Unavailable(_))
         ));
         let mut history = History::index(File::open(fixture.path()).unwrap(), session).unwrap();

@@ -300,6 +300,21 @@ impl Holder {
         &self.identity.record.root
     }
 
+    #[cfg(target_os = "linux")]
+    pub(in crate::chat) fn observe_server(&mut self, server: Process) {
+        self.identity.server_process = Some(server);
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(in crate::chat) fn retire_after_transport_loss(&mut self) -> Result<bool, String> {
+        if !self.identity.retire_after_transport_loss()? {
+            return Ok(false);
+        }
+        self.control.take();
+        self.release_on_drop = false;
+        Ok(true)
+    }
+
     pub fn is_durable(&self) -> bool {
         self.durable
     }
@@ -511,8 +526,18 @@ impl Holder {
         // A holder that exited with its provider closes its control connection
         // without answering, and never will. If it wrote its receipt first,
         // that receipt settles the close as a reply would have.
-        if !self.identity.receipt(retain, detached)? && !self.identity.retire_exited() {
-            return Err(unanswered);
+        if !self.identity.receipt(retain, detached)? {
+            #[cfg(target_os = "linux")]
+            let abandoned = if self.identity.server_process.is_some() {
+                self.retire_after_transport_loss()?
+            } else {
+                self.identity.retire_exited()
+            };
+            #[cfg(target_os = "macos")]
+            let abandoned = self.identity.retire_exited();
+            if !abandoned {
+                return Err(unanswered);
+            }
         }
         self.control.take();
         self.release_on_drop = false;
@@ -778,6 +803,8 @@ pub fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, String> {
                 proof: source_proof.clone(),
                 source: retained_source,
                 original_role: None,
+                #[cfg(target_os = "linux")]
+                server_process: None,
                 receipt_proof: source_proof.clone(),
             },
         }),
@@ -916,6 +943,8 @@ pub fn adopt(
                         source: recovery.source.clone(),
                         proof: proof.clone(),
                         original_role,
+                        #[cfg(target_os = "linux")]
+                        server_process: recovery.server_process.clone(),
                         receipt_proof: proof.clone(),
                     },
                 },
