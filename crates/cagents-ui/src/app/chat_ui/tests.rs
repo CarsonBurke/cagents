@@ -23234,10 +23234,16 @@ fn valid_message_copy_completion(
     (card, target, request, body)
 }
 
+/// Providers whose oversized child failures the daemon retains in full.
+/// Details and Copy details follow the published copy source, so each must
+/// behave alike here.
+const RETAINED_CHILD_DIAGNOSTICS: [Provider; 2] = [Provider::Codex, Provider::Omp];
+
 fn valid_child_failure_copy_completion(
     app: &mut Cagents,
+    provider: Provider,
 ) -> (Target, String, text_copy::FailureRequest, String) {
-    let (card, target, handle) = history_fixture(app);
+    let (card, target, handle) = history_fixture_for_provider(app, provider);
     app.workspace.focus(card).unwrap();
     let raw = format!(
         "You've hit your session limit · resets 3:40pm (America/Vancouver)\n{}\nTAIL original λ",
@@ -23251,10 +23257,7 @@ fn valid_child_failure_copy_completion(
         ),
     ))
     .clone();
-    assert!(chat::failure::mark_provider_error(
-        Provider::Codex,
-        &mut preview
-    ));
+    assert!(chat::failure::mark_provider_error(provider, &mut preview));
     let source = chat::TextCopySource {
         cache: uuid::Uuid::new_v4(),
         scope: chat::TextCopyScope::Subagent { id: "child".into() },
@@ -23281,7 +23284,15 @@ fn valid_child_failure_copy_completion(
         .unwrap()
         .key
         .clone();
+    // Details tells the reader the full original is the one Copy details
+    // takes, and the plan reads it from the child's published source.
+    assert_eq!(
+        runtime.failure_originals_retained(&key),
+        Some(true),
+        "{provider:?}"
+    );
     let plan = runtime.failure_copy_plan(&key).unwrap().unwrap();
+    assert!(plan.reads_original(), "{provider:?}");
     let request =
         text_copy::FailureRequest::for_test(handle, runtime.selected_subagent.clone(), plan);
     (target, key, request, raw)
@@ -23292,9 +23303,11 @@ fn child_failure_copy_completion_writes_exact_original_and_rechecks_deferred_aut
     let _context = text_copy::isolated_context();
     // This UI oracle begins at the completed worker boundary. The HOST
     // actor oracle separately exercises actual owned-source page reads.
-    for change in ["none", "source", "remove", "new-copy", "selection"] {
+    for (provider, change) in RETAINED_CHILD_DIAGNOSTICS.into_iter().flat_map(|provider| {
+        ["none", "source", "remove", "new-copy", "selection"].map(|change| (provider, change))
+    }) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (target, key, request, raw) = valid_child_failure_copy_completion(&mut app);
+        let (target, key, request, raw) = valid_child_failure_copy_completion(&mut app, provider);
         let handle = app
             .chat_runtime_mut(target)
             .unwrap()
@@ -23340,42 +23353,47 @@ fn child_failure_copy_completion_writes_exact_original_and_rechecks_deferred_aut
 #[test]
 fn child_failure_copy_refuses_unavailable_original_instead_of_copying_preview() {
     let _context = text_copy::isolated_context();
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (target, key, _, _) = valid_child_failure_copy_completion(&mut app);
-    let runtime = app.chat_runtime_mut(target).unwrap();
-    let handle = runtime.handle().unwrap().clone();
-    let mut snapshot = (*handle.snapshot()).clone();
-    snapshot
-        .text_copy_sources
-        .children
-        .insert("child".into(), vec![None]);
-    snapshot.generation += 1;
-    handle.publish_snapshot_for_test(snapshot);
-    runtime.refresh();
-    assert_eq!(runtime.failure_originals_retained(&key), Some(false));
-    let task = app.handle_chat_ui(Action::CopyFailure(target, key));
-    assert_chat_copy_task_has_no_clipboard_write(
-        task,
-        "an unavailable original must never copy the resident excerpt",
-    );
-    let runtime = app.chat_runtime_mut(target).unwrap();
-    assert!(
-        copy_refusal(runtime)
-            .unwrap()
-            .contains("Original diagnostic unavailable")
-    );
-    assert!(
-        runtime.error.is_none(),
-        "a copy is not the conversation's failure"
-    );
+    for provider in RETAINED_CHILD_DIAGNOSTICS {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (target, key, _, _) = valid_child_failure_copy_completion(&mut app, provider);
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        let handle = runtime.handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot
+            .text_copy_sources
+            .children
+            .insert("child".into(), vec![None]);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        runtime.refresh();
+        assert_eq!(runtime.failure_originals_retained(&key), Some(false));
+        let task = app.handle_chat_ui(Action::CopyFailure(target, key));
+        assert_chat_copy_task_has_no_clipboard_write(
+            task,
+            "an unavailable original must never copy the resident excerpt",
+        );
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        assert!(
+            copy_refusal(runtime)
+                .unwrap()
+                .contains("Original diagnostic unavailable")
+        );
+        assert!(
+            runtime.error.is_none(),
+            "a copy is not the conversation's failure"
+        );
+    }
 }
 
 #[test]
 fn child_failure_read_error_says_why_it_did_not_copy_when_withdrawn_or_replaced() {
     let _context = text_copy::isolated_context();
-    for change in ["withdrawn", "replacement"] {
+    for (provider, change) in RETAINED_CHILD_DIAGNOSTICS
+        .into_iter()
+        .flat_map(|provider| ["withdrawn", "replacement"].map(|change| (provider, change)))
+    {
         let mut app = crate::app::tests::context_inspector_test_app(false);
-        let (target, key, request, _) = valid_child_failure_copy_completion(&mut app);
+        let (target, key, request, _) = valid_child_failure_copy_completion(&mut app, provider);
         let handle = app
             .chat_runtime_mut(target)
             .unwrap()

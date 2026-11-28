@@ -56,7 +56,7 @@ both use the same fixture data and selected providers.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--startup-timeout SECONDS]
         [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape|usage-resets]
-        [--acp] [--instance NAME] [--ui-trace] [--workspace-trace] [--daemon-trace FILTER]
+        [--acp] [--omp] [--instance NAME] [--ui-trace] [--workspace-trace] [--daemon-trace FILTER]
         [--ui-scoped-fixture]
         [--projection-oracle] [--wayland-debug] [--restore-existing-only]
         [--launch-handshake]
@@ -76,6 +76,9 @@ both use the same fixture data and selected providers.
                   and muse-upstream, with a muse wrapper that runs it as the
                   reader's does; tests/fixtures/fixture-acp.sh says how to sign
                   either out. Without it, neither is installed.
+                  --omp installs the offline Oh My Pi peer as the fixture's omp:
+                  one conversation whose two subagents failed with oversized
+                  diagnostics. Without it, omp is not installed.
                   --ui-trace has the UI log a summary of its UI-thread work
                   every 5 seconds: updates by message, view, subscription,
                   layout, draw, events, overlays and the rest of the widget
@@ -658,7 +661,7 @@ prepare_fixture() {
     require_fixture_environment
     local path
     for path in bin bin/lib bin/curl bin/muse home/.config home/.gemini avatars project \
-                libexec libexec/claude-terminal scripts acp/agy acp/muse; do
+                libexec libexec/claude-terminal libexec/omp scripts acp/agy acp/muse; do
         require_task_path 'fixture state' "$fixture/$path"
     done
     require_task_path 'fixture sign-in record' "$fixture/config/muse/auth.json"
@@ -685,6 +688,7 @@ prepare_fixture() {
     install -m 755 "$tool_root/tests/fixtures/fixture-xdg-open.sh" "$fixture/bin/xdg-open"
     install_codex
     install_acp
+    install_omp
     if [ ! -e "$fixture/project/.git" ]; then
         (
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -831,6 +835,17 @@ install_acp() {
     if [ ! -e "$fixture/acp/muse/signed-out" ] && [ ! -e "$fixture/config/muse/auth.json" ]; then
         printf '{"fixture": true}\n' >"$fixture/config/muse/auth.json"
     fi
+}
+
+# An omp on PATH makes the app list Oh My Pi as installed, so the offline
+# peer is installed only when --omp asks.
+install_omp() {
+    rm -rf -- "$fixture/libexec/omp"
+    rm -f -- "$fixture/bin/omp"
+    [ "$(cat -- "$state/omp" 2>/dev/null)" = 1 ] || return 0
+    mkdir -p -- "$fixture/libexec/omp"
+    install -m 644 -t "$fixture/libexec/omp" -- "$tool_root/tests/fixtures/omp-child-errors.py"
+    install -m 755 "$tool_root/tests/fixtures/fixture-omp.sh" "$fixture/bin/omp"
 }
 
 # The fixture's runtime directory and HOME are the proof of ownership: nothing else
@@ -1427,7 +1442,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= acp= ui_trace= ui_scoped_fixture= workspace_trace= daemon_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=$default_limit startup_timeout=180 portal= codex= codex_executable= acp= omp= ui_trace= ui_scoped_fixture= workspace_trace= daemon_trace= projection_oracle= wayland_debug= restore_existing_only= launch_handshake=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -1445,6 +1460,7 @@ cmd_start() {
             --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors, terminal-escape or usage-resets}; shift 2 ;;
             --codex-executable) codex_executable=${2:?--codex-executable needs an absolute ELF path}; shift 2 ;;
             --acp) acp=1; shift ;;
+            --omp) omp=1; shift ;;
             --ui-trace) ui_trace=1; shift ;;
             --ui-scoped-fixture) ui_scoped_fixture=1; shift ;;
             --workspace-trace) workspace_trace=1; shift ;;
@@ -1504,6 +1520,7 @@ cmd_start() {
     printf '%s\n' "$portal" >"$state/portal"
     printf '%s\n' "$codex" >"$state/codex"
     printf '%s\n' "$acp" >"$state/acp"
+    printf '%s\n' "$omp" >"$state/omp"
     printf '%s\n' "$ui_trace" >"$state/ui-trace"
     printf '%s\n' "$ui_scoped_fixture" >"$state/ui-scoped-fixture"
     printf '%s\n' "$workspace_trace" >"$state/workspace-trace"
