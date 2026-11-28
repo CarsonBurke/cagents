@@ -6338,18 +6338,18 @@ fn a_window_joining_with_an_unshared_channel_keeps_and_publishes_it() {
     );
 }
 
-/// A channel this window made in a worktree that was removed, or stopped being
-/// a worktree, before the registry heard of it is introduced in the main
-/// checkout, where its panes already start: the registry would refuse such a
-/// checkout every time the channel was offered.
+/// A channel introduced after its worktree was removed keeps the saved checkout
+/// for recovery. An existing directory that is no longer a worktree falls back
+/// to the main checkout.
 #[test]
-fn an_unshared_channel_whose_worktree_fails_is_published_in_the_main_checkout() {
+fn an_unshared_channel_keeps_its_removed_checkout_when_published() {
     let (mut app, project, _) = app_with_project();
     let directory = tempfile::tempdir().unwrap();
     let removed = ChannelId::new();
     let broken = ChannelId::new();
+    let removed_checkout = directory.path().join("removed-worktree");
     let mut gone = local(removed, project, "gone", 0);
-    gone.checkout = Some(directory.path().join("removed-worktree"));
+    gone.checkout = Some(removed_checkout.clone());
     let mut plain = local(broken, project, "plain directory", 1);
     plain.checkout = Some(directory.path().to_path_buf());
     Arc::make_mut(&mut app.durable)
@@ -6366,7 +6366,7 @@ fn an_unshared_channel_whose_worktree_fails_is_published_in_the_main_checkout() 
             _ => None,
         })
         .collect::<HashMap<_, _>>();
-    assert_eq!(created.get(&removed), Some(&None));
+    assert_eq!(created.get(&removed), Some(&Some(removed_checkout)));
     assert_eq!(created.get(&broken), Some(&None));
 }
 
