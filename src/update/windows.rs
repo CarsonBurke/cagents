@@ -1,6 +1,7 @@
 //! Prove native presentation before changing daemon ownership, and retain the
 //! window slots separately from daemon recovery.
 use super::*;
+use std::os::unix::fs::PermissionsExt;
 
 pub const PROBE_ARGUMENT: &str = "--internal-first-frame-probe";
 pub const PROBE_RECEIPT: &str = "first-frame-v1\n";
@@ -93,13 +94,11 @@ fn probe(
     } else {
         "/var/tmp"
     };
-    let workspace = tempfile::Builder::new()
-        .prefix("cgp-")
-        .tempdir_in(temp_base)?;
+    let mut directory = tempfile::Builder::new();
+    directory.permissions(fs::Permissions::from_mode(0o700));
+    let workspace = directory.prefix("cgp-").tempdir_in(temp_base)?;
     let root = workspace.path().canonicalize()?;
-    let image = tempfile::Builder::new()
-        .prefix("window-probe-")
-        .tempdir_in(state)?;
+    let image = directory.prefix("window-probe-").tempdir_in(state)?;
     let ui = image.path().canonicalize()?.join("cagents-ui");
     {
         let source = executable()?;
@@ -374,6 +373,9 @@ mod tests {
 set -eu
 test "$1" = --internal-first-frame-probe
 test "${0##*/}" = cagents-ui
+for dir in "$PWD" "${0%/*}"; do
+    case "$(/bin/ls -ld "$dir")" in drwx------*) ;; *) exit 1 ;; esac
+done
 for dir in "$HOME" "$XDG_RUNTIME_DIR" "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$CLAUDE_CONFIG_DIR" "$CODEX_HOME" "$PATH"; do
     test -d "$dir"
     test "${dir%/*}" = "$PWD"
