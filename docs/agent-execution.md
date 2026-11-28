@@ -340,10 +340,26 @@ A delivered message is a prompt framed for the agent:
 ```text
 [cagents message from session 3e81d0aa "Fix flaky login test"]
 I am refactoring src/auth.rs; hold edits there until I report back
-[Reply in a shell: cagents reply 9a41c2e7 "…" · seal 5f0c…]
+[Reply in a shell: cagents reply 9a41c2e7 "…"]
 ```
 
-The daemon seals each frame with a keyed hash under a secret it keeps in its registry. Windows show a sealed prompt as a message from its sender, both when it is delivered and when the transcript is read back from provider history; a prompt that only looks like one stays the user's own words. The seal proves who wrote a frame, not what its sender may ask for: a message is as trustworthy as a prompt from the session that sent it, and the recipient decides what to do with it. Nor does it bind a frame to the conversation it was delivered to; a sealed frame pasted into another conversation shows there as the same message. A caller without a daemon-issued capability is the user, so a process that drops its capability speaks as the user, as any program the user runs can.
+Before submitting a courier prompt, the daemon records a keyed digest of its text
+and recipient session ID, with the message boundaries for a batch. The app and
+`cagents transcript` use that record to show the sender and body when the provider
+echoes or replays the prompt. A copied prompt stays plain text in an unrelated
+cagents session. A verified successor can read its predecessor's mail in shared
+history. The digest authenticates delivery to that cagents session and leaves the
+recipient to decide how to act on the sender's message.
+
+These records live beside the workspace registry and survive mailbox pruning
+and registry rollback. A rollback below workspace schema 33 can discard some
+predecessor links, so a later upgrade may lose attribution for mail inherited
+through those links. Older binaries need the inline seal and can show newer
+prompts as plain text. Mail to a retained helper from an earlier release keeps
+its inline seal until that conversation is reopened with a current helper.
+Current binaries still verify old inline seals in saved histories, including
+their original cross-session behavior. A caller without a
+daemon-issued capability speaks as the user.
 
 A message body is at most 64 KiB, and a lineage holds at most 64 undelivered messages. The user reads messages only when they choose to, so the cap there applies to each sender separately. The courier deletes messages 30 days after they were sent, checking hourly. The daemon registry keeps messages from schema version 5.
 

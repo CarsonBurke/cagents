@@ -4308,14 +4308,7 @@ impl OpeningTitle {
 
 #[cfg(feature = "host")]
 fn mailbox_prompt(text: &str) -> bool {
-    // This filters title candidates on replay. A seal grants no authority
-    // here. Only the daemon's recognizer can turn a prompt into a delivery.
-    text.starts_with("[cagents ")
-        && crate::agent_execution::mailbox::open_all(
-            text,
-            &crate::agent_execution::mailbox::SealShaped,
-        )
-        .is_some()
+    crate::agent_execution::mailbox::looks_like_delivery(text)
 }
 
 #[cfg(test)]

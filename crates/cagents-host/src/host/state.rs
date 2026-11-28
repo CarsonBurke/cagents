@@ -396,9 +396,9 @@ pub(crate) struct HostState {
     pub(super) device_stats: super::device_stats::Watch,
     /// Wakes the courier that hands messages to idle conversations.
     pub(super) mailbox: Option<super::agent_execution::mailbox::Handle>,
-    /// Seals the messages the courier delivers and recognizes them in
-    /// transcripts. Absent without the registry that keeps its key.
+    /// The legacy verifier and recipient-bound records for courier prompts.
     pub(super) mailbox_seal: Option<Arc<crate::agent_execution::mailbox::Seal>>,
+    pub(super) delivered_frames: Option<Arc<super::model::DeliveredFrames>>,
     /// Operations own their gates, including while waiting to acquire them.
     /// Weak entries let later lookups reclaim gates after every caller leaves.
     /// Each gate holds the run whose dispatcher released it to wait for the
@@ -644,6 +644,7 @@ impl HostState {
             device_stats: Default::default(),
             mailbox: None,
             mailbox_seal: None,
+            delivered_frames: None,
             execution_gates: BTreeMap::new(),
             execution_starts: BTreeMap::new(),
             reopened_runs: std::collections::VecDeque::new(),
@@ -782,6 +783,13 @@ impl HostState {
             Ok(key) => Some(Arc::new(crate::agent_execution::mailbox::Seal::new(key))),
             Err(error) => {
                 tracing::error!(%error, "cannot read the mailbox key; messages are unavailable");
+                None
+            }
+        };
+        self.delivered_frames = match registry.open_delivered_frames() {
+            Ok(frames) => Some(Arc::new(frames)),
+            Err(error) => {
+                tracing::error!(%error, "cannot open delivered mailbox frames");
                 None
             }
         };

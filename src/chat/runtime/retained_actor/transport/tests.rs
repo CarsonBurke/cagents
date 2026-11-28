@@ -123,6 +123,8 @@ IFS= read -r frame || :
             directory_fd: None,
             directory_identity: None,
             mailbox_recognition: None,
+            mailbox_recipients: Vec::new(),
+            mailbox_batches: 0,
             provider_directory_observed: false,
             recovery_environment: BTreeMap::new(),
         }
@@ -148,6 +150,10 @@ IFS= read -r frame || :
         Server::start_after_scope_enrollment(startup(PROTOCOL), &control, reject, || {}).unwrap();
     let socket = server.socket.clone();
     let record = server.identity.record.clone();
+    // A helper without a mailbox key leaves inline recognition to its daemon.
+    use crate::agent_execution::mailbox::{EVIDENCE_CAPABILITY, FRAMES_CAPABILITY};
+    assert!(!has_frame_capability(&record, FRAMES_CAPABILITY));
+    assert!(!has_frame_capability(&record, EVIDENCE_CAPABILITY));
     let record_path = registry::directory(Kind::Native)
         .unwrap()
         .join(format!("{}.json", record.terminal));
@@ -321,6 +327,8 @@ while IFS= read -r frame; do :; done
         directory_fd: None,
         directory_identity: None,
         mailbox_recognition: None,
+            mailbox_recipients: Vec::new(),
+            mailbox_batches: 0,
         provider_directory_observed: false,
         recovery_environment: BTreeMap::new(),
     };

@@ -121,6 +121,11 @@ enum InputPayload {
         command: Command,
         decline_only: bool,
     },
+    Mailbox {
+        run: Option<crate::model::RunId>,
+        text: String,
+        evidence: crate::agent_execution::mailbox::FrameEvidence,
+    },
     Interrupt {
         run: Option<crate::model::RunId>,
         including_subagents: bool,
@@ -328,6 +333,10 @@ struct Startup {
     directory_fd: Option<RawFd>,
     directory_identity: Option<crate::agent_execution::DirectoryIdentity>,
     mailbox_recognition: Option<crate::agent_execution::mailbox::RetainedRecognition>,
+    #[serde(default)]
+    mailbox_recipients: Vec<crate::model::TerminalId>,
+    #[serde(default)]
+    mailbox_batches: usize,
     provider_directory_observed: bool,
     recovery_environment: BTreeMap<String, String>,
 }
@@ -406,9 +415,7 @@ struct Remote {
     desired_visible: Mutex<Option<bool>>,
     wake: Arc<push::Wake>,
     binary_codec: std::sync::OnceLock<bool>,
-    /// The daemon's recognizer, held only for a helper built before the
-    /// frames the daemon now seals: what it shows as a person's prompt is
-    /// opened here, as its own store would have.
+    /// Open inline frames for a helper built before their current format.
     frames: std::sync::OnceLock<Arc<crate::agent_execution::mailbox::Recognizer>>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
@@ -528,6 +535,17 @@ impl RemoteActor {
     #[cfg(any(test, feature = "test-support"))]
     pub fn fixture() -> Self {
         Self::fixture_at(PathBuf::from("/nonexistent/cagents-actor-fixture"))
+    }
+    #[cfg(any(test, feature = "test-support"))]
+    pub(in crate::chat::runtime) fn mailbox_input_fixture() -> Self {
+        let mut actor = Self::fixture();
+        let remote = Arc::get_mut(&mut actor.0).expect("a new fixture proxy is unshared");
+        let mut build = registry::BuildIdentity::current(Kind::Native);
+        build
+            .capabilities
+            .push(crate::agent_execution::mailbox::EVIDENCE_CAPABILITY.into());
+        remote.identity.record.build = Some(build);
+        actor
     }
     /// A fixture proxy for `source`'s retained actor, held under `scope`, whose
     /// helper socket is `socket`. Its holder record names `source`'s terminal
@@ -1199,6 +1217,18 @@ impl RemoteActor {
             .map(|context| context.provider_directory_observed(&spec.working_directory))
             .transpose()?
             .unwrap_or(false);
+        // Bound each private frame even when a conversation has long history.
+        const EVIDENCE_PER_BATCH: usize = 4096;
+        let replay = spec
+            .messages
+            .as_ref()
+            .map(|recognizer| recognizer.delivery_replay())
+            .transpose()
+            .unwrap_or_else(|error| {
+                tracing::warn!(%error, "cannot load delivered mailbox frames for retained history");
+                None
+            })
+            .unwrap_or_default();
         let request = Startup {
             protocol: PROTOCOL,
             prepared_identity,
@@ -1218,6 +1248,8 @@ impl RemoteActor {
                 .messages
                 .as_ref()
                 .map(|recognizer| recognizer.delegate_to_retained_owner()),
+            mailbox_recipients: replay.recipients,
+            mailbox_batches: replay.records.len().div_ceil(EVIDENCE_PER_BATCH),
             provider_directory_observed: observed,
             recovery_environment,
         };
@@ -1295,7 +1327,11 @@ impl RemoteActor {
         drop(remote);
         // Keep this channel through installation. EOF before commit asks the
         // helper to clean its still-private actor and every descendant.
-        send(&control, &request, Duration::from_secs(30))?;
+        let startup_deadline = Instant::now() + Duration::from_secs(30);
+        deadline_io::send_until(&control, &request, startup_deadline)?;
+        for records in replay.records.chunks(EVIDENCE_PER_BATCH) {
+            deadline_io::send_until(&control, &records, startup_deadline)?;
+        }
         let attached: Result<Attached, String> = receive(&control, Duration::from_secs(30))?;
         let attached = attached?;
         let handle = Self::from_attached(attached, proof, Some(control), notify)?;
@@ -2603,6 +2639,39 @@ impl RemoteActor {
             .recv_timeout(ACKNOWLEDGEMENT_WAIT)
             .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
+    pub(in crate::chat::runtime) fn accepts_mailbox_evidence(&self) -> bool {
+        has_frame_capability(
+            &self.0.identity.record,
+            crate::agent_execution::mailbox::EVIDENCE_CAPABILITY,
+        )
+    }
+
+    pub(in crate::chat::runtime) fn deliver_mailbox(
+        &self,
+        run: Option<crate::model::RunId>,
+        text: String,
+        evidence: crate::agent_execution::mailbox::FrameEvidence,
+    ) -> Result<(), Rejection> {
+        let wait = if run.is_some() {
+            ACKNOWLEDGEMENT_WAIT
+        } else {
+            Duration::ZERO
+        };
+        let receiver = self
+            .enqueue_payload_within(
+                InputPayload::Mailbox {
+                    run,
+                    text,
+                    evidence,
+                },
+                wait,
+            )
+            .map_err(Rejection::Refused)?;
+        receiver
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
+    }
+
     pub fn interrupt(
         &self,
         run: Option<crate::model::RunId>,
@@ -2636,16 +2705,18 @@ impl RemoteActor {
         }
         snapshot
     }
-    /// Lets the daemon open the frames it sealed in what this helper shows,
-    /// when the helper was built before those frames and cannot.
-    pub fn open_frames_for_older_helper(
+    pub(in crate::chat::runtime) fn open_mailbox_frames(
         &self,
-        recognizer: &Arc<crate::agent_execution::mailbox::Recognizer>,
+        recognizer: Arc<crate::agent_execution::mailbox::Recognizer>,
     ) {
-        if !reads_current_frames(&self.0.identity.record) {
-            let _ = self.0.frames.set(recognizer.clone());
+        if !has_frame_capability(
+            &self.0.identity.record,
+            crate::agent_execution::mailbox::FRAMES_CAPABILITY,
+        ) {
+            let _ = self.0.frames.set(recognizer);
         }
     }
+
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
         // Use the same publication fence as the observer. No local revision
@@ -3055,9 +3126,20 @@ impl Server {
         spec.working_directory = startup.working_directory;
         spec.unset_environment.clear();
         spec.execution = Some(Arc::new(execution));
+        let recognizes_legacy_mail = startup.mailbox_recognition.is_some();
+        let recognizes_recorded_mail =
+            recognizes_legacy_mail && !startup.mailbox_recipients.is_empty();
         spec.messages = startup
             .mailbox_recognition
-            .map(|recognition| Arc::new(recognition.into_recognizer()));
+            .map(|recognition| Arc::new(recognition.into_recognizer(startup.mailbox_recipients)));
+        let evidence_deadline = Instant::now() + Duration::from_secs(30);
+        for _ in 0..startup.mailbox_batches {
+            let records: Vec<crate::agent_execution::mailbox::FrameEvidence> =
+                deadline_io::receive_until(control, evidence_deadline)?;
+            if let Some(recognizer) = &spec.messages {
+                recognizer.record_retained(records);
+            }
+        }
         let environment = crate::terminal_ipc::ChatExecutionEnvironment(spec.environment.clone());
         let initial = spec_and_adapter.1.initialize()?;
         let mut initial = initial;
@@ -3130,9 +3212,16 @@ impl Server {
             build.capabilities.push(CAPABILITY.into());
             #[cfg(target_os = "macos")]
             build.capabilities.push(SCOPED_CLOSE.into());
-            build
-                .capabilities
-                .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
+            if recognizes_legacy_mail {
+                build
+                    .capabilities
+                    .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
+            }
+            if recognizes_recorded_mail {
+                build
+                    .capabilities
+                    .push(crate::agent_execution::mailbox::EVIDENCE_CAPABILITY.into());
+            }
             let identity = ActorIdentity {
                 instance: uuid::Uuid::new_v4(),
                 record: Record {
@@ -3903,27 +3992,51 @@ impl Server {
                     // this helper does not.
                     Err(error) => refuse!(UNSUPPORTED_INPUT, error),
                 };
+                let provider = |run, command, decline_only, mailbox| {
+                    let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
+                    let command = super::super::ActorCommand::RetainedProvider {
+                        run,
+                        command,
+                        decline_only,
+                        effects: state.clone(),
+                        mailbox,
+                    };
+                    (command, run, run.map(|run| (run, state)))
+                };
                 let (command, run, effects) = match payload {
-                    InputPayload::IdlePrompt { text } => {
-                        (super::super::ActorCommand::IdlePrompt(text), None, None)
-                    }
+                    InputPayload::IdlePrompt { text } => (
+                        super::super::ActorCommand::IdlePrompt {
+                            text,
+                            mailbox: None,
+                        },
+                        None,
+                        None,
+                    ),
                     InputPayload::Command {
                         run,
                         command,
                         decline_only,
-                    } => {
-                        let state = Arc::new(std::sync::atomic::AtomicU8::new(0));
-                        (
-                            super::super::ActorCommand::RetainedProvider {
-                                run,
-                                command,
-                                decline_only,
-                                effects: state.clone(),
+                    } => provider(run, command, decline_only, None),
+                    InputPayload::Mailbox {
+                        run,
+                        text,
+                        evidence,
+                    } => match run {
+                        Some(run) => provider(
+                            Some(run),
+                            super::super::handle::mailbox_command(text),
+                            false,
+                            Some(evidence),
+                        ),
+                        None => (
+                            super::super::ActorCommand::IdlePrompt {
+                                text,
+                                mailbox: Some(evidence),
                             },
-                            run,
-                            run.map(|run| (run, state)),
-                        )
-                    }
+                            None,
+                            None,
+                        ),
+                    },
                     InputPayload::Interrupt {
                         run,
                         including_subagents,
@@ -4990,13 +5103,12 @@ mod push;
 #[path = "transport_binary.rs"]
 mod binary;
 
-/// Whether the helper `record` describes opens the frames this daemon seals.
-fn reads_current_frames(record: &Record) -> bool {
+fn has_frame_capability(record: &Record, name: &str) -> bool {
     record.build.as_ref().is_some_and(|build| {
         build
             .capabilities
             .iter()
-            .any(|capability| capability == crate::agent_execution::mailbox::FRAMES_CAPABILITY)
+            .any(|capability| capability == name)
     })
 }
 
@@ -5009,18 +5121,33 @@ mod frame_capability_tests {
         let older = RemoteActor::completed_failure_fixture();
         let mut record = older.identity().record;
         record.build = None;
-        assert!(!reads_current_frames(&record), "a record without a build");
+        assert!(
+            !has_frame_capability(
+                &record,
+                crate::agent_execution::mailbox::EVIDENCE_CAPABILITY
+            ),
+            "a record without a build"
+        );
         record.build = Some(registry::BuildIdentity::current(Kind::Native));
-        assert!(!reads_current_frames(&record), "a build before the frames");
+        assert!(
+            !has_frame_capability(
+                &record,
+                crate::agent_execution::mailbox::EVIDENCE_CAPABILITY
+            ),
+            "a build before the frames"
+        );
         record
             .build
             .as_mut()
             .unwrap()
             .capabilities
-            .push(crate::agent_execution::mailbox::FRAMES_CAPABILITY.into());
-        assert!(reads_current_frames(&record));
+            .push(crate::agent_execution::mailbox::EVIDENCE_CAPABILITY.into());
+        assert!(has_frame_capability(
+            &record,
+            crate::agent_execution::mailbox::EVIDENCE_CAPABILITY
+        ));
         let seal = crate::agent_execution::mailbox::Seal::new([2; 32]);
-        older.open_frames_for_older_helper(&Arc::new(seal.recognizer()));
+        older.open_mailbox_frames(Arc::new(seal.recognizer()));
         assert!(older.opens_frames_for_helper());
 
         // What that helper shows reaches a window opened.

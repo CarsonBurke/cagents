@@ -57,7 +57,7 @@ pub(super) fn require_published_snapshot(db: &Connection) -> Result<(), String> 
     require_open_layout(db, inspect(db)?.version)
 }
 
-fn prepare_file(path: &Path) -> Result<(), String> {
+pub(super) fn prepare_file(path: &Path) -> Result<(), String> {
     // POSIX close(any descriptor for an inode) releases the process's fcntl
     // locks, even if another SQLite connection owns them. Never open/close an
     // existing database outside SQLite. Serialize only the creation prelude so

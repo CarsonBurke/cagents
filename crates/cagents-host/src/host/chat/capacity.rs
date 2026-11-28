@@ -736,7 +736,8 @@ fn reload_history(
     if session.launch.session_id.is_none() {
         return Err("The provider conversation identity is unconfirmed".into());
     }
-    let (spec, _, mut initial) = load_history(session)?;
+    let (mut spec, _, mut initial) = load_history(session)?;
+    spec.messages = crate::host::agent_execution::mailbox::recognizer(host, session.id);
     chat::runtime::preflight(&spec, &mut initial)
 }
 
@@ -845,12 +846,7 @@ pub(super) fn restore_saved_history(
     super::super::account_lifecycle::ensure_idle(host)?;
     require_unmanaged_for_start(host, session.id).map_err(setup_error)?;
     let (mut spec, adapter, mut initial) = load_history_for_start(&session).map_err(setup_error)?;
-    spec.messages = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .mailbox_seal
-        .as_ref()
-        .map(|seal| Arc::new(seal.recognizer()));
+    spec.messages = crate::host::agent_execution::mailbox::recognizer(host, session.id);
     let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
     let environment = spec.environment.clone();
     let weak = Arc::downgrade(host);

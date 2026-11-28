@@ -2,6 +2,10 @@
 //! A message is pending until the courier gives it to a live conversation or
 //! its recipient reads it; either settles it once.
 
+mod frames;
+
+pub(crate) use frames::DeliveredFrames;
+
 use super::Registry;
 use crate::{
     agent_execution::{
@@ -363,6 +367,12 @@ fn select_messages(
 }
 
 impl Registry {
+    pub(crate) fn open_delivered_frames(&self) -> Result<DeliveredFrames, String> {
+        let path = self.path.with_extension("mailbox-frames.sqlite3");
+        super::schema::prepare_file(&path)?;
+        DeliveredFrames::open(&path).map_err(|e| e.to_string())
+    }
+
     /// The key that seals delivered messages, made when the store was.
     pub(crate) fn mailbox_key(&self) -> Result<[u8; 32], String> {
         let secret: Vec<u8> = self

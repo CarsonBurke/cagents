@@ -79,11 +79,13 @@ pub(super) fn recover_attachment(host: &SharedHost, requested: &Session) -> Resu
 }
 
 fn projection(
+    host: &SharedHost,
     saved: &crate::upgrade::floor::StoppedSnapshot,
     session: &Session,
 ) -> Result<(ProcessSpec, Step, chat::runtime::Store), String> {
     let mut spec = ProcessSpec::from(&session.launch.recipe);
     spec.transport = TransportSpec::History;
+    spec.messages = crate::host::agent_execution::mailbox::recognizer(host, saved.source.id);
     let mut events = vec![chat::Event::History {
         items: saved
             .snapshot
@@ -137,7 +139,7 @@ pub(super) fn reload(
         return Ok(None);
     }
     let saved = crate::upgrade::floor::snapshot(&original)?;
-    projection(&saved, session).map(|(_, _, store)| Some(store))
+    projection(host, &saved, session).map(|(_, _, store)| Some(store))
 }
 
 fn install(
@@ -176,7 +178,7 @@ fn install(
                 .map_err(|error| error.message)?;
             state.inventory_changed();
         }
-        let (spec, initial, store) = projection(saved, &session)?;
+        let (spec, initial, store) = projection(host, saved, &session)?;
         let environment = spec.environment.clone();
         let weak = Arc::downgrade(host);
         let handle = Handle::start_owned(

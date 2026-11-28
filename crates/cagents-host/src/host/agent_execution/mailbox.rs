@@ -29,13 +29,13 @@ use crate::{
         AcceptanceError, Accepted, Authority, Lineage, Origin,
         directory::{Member, Scope, UsageLimit},
         mailbox::{
-            Delivery, Handed, Handoff, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent,
-            State, To,
+            Delivery, FramedPrompt, Handed, Handoff, Inbox, Message, Outgoing, Party, Reach,
+            Receipt, Recognizer, Seal, Sent, State, To,
         },
     },
     chat::{self, runtime::Rejection},
-    host::model::MessageHandoff,
-    model::{MessageId, TerminalId},
+    host::model::{DeliveredFrames, MessageHandoff},
+    model::{MessageId, RunId, TerminalId},
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -64,6 +64,92 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// The shortest handle a session can be named by, so a typo does not reach
 /// a stranger that happens to share one character.
 pub(super) const MIN_HANDLE: usize = 4;
+
+/// Resolve exact predecessors for a resumed conversation. A sibling or a
+/// separately opened transcript does not inherit delivery evidence.
+pub(in crate::host) fn recognizer(
+    host: &SharedHost,
+    session: TerminalId,
+) -> Option<Arc<Recognizer>> {
+    let (seal, frames, registry) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            state.mailbox_seal.clone()?,
+            state.delivered_frames.clone(),
+            state.execution_registry.clone(),
+        )
+    };
+    let Some(frames) = frames else {
+        return Some(Arc::new(seal.recognizer()));
+    };
+    let mut recipients = vec![session];
+    if let Some(registry) = registry {
+        match registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .notice_predecessors(session)
+        {
+            Ok(predecessors) => recipients.extend(predecessors),
+            Err(error) => tracing::warn!(%session, %error, "cannot verify mailbox predecessors"),
+        }
+    }
+    Some(Arc::new(frames.recognizer(seal, recipients)))
+}
+
+/// A managed message can wait for the agent to reopen under a different
+/// session ID. Record its evidence only once the dispatcher has that owner.
+pub(super) fn deliver_run(
+    host: &SharedHost,
+    session: TerminalId,
+    run: RunId,
+    handle: &chat::runtime::Handle,
+    text: String,
+) -> Result<(), Rejection> {
+    let (seal, frames) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.mailbox_seal.clone(), state.delivered_frames.clone())
+    };
+    if let (Some(seal), Some(frames)) = (seal, frames)
+        && handle.accepts_mailbox_evidence()
+    {
+        let prompt = seal.unseal_run(&text).ok_or_else(|| {
+            Rejection::Refused("The queued mailbox prompt could not be verified".into())
+        })?;
+        return deliver_recorded(&frames, &seal, session, handle, Some(run), prompt);
+    }
+    handle.command_for_run(
+        run,
+        chat::Command::Prompt {
+            text,
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        },
+    )
+}
+
+fn deliver_recorded(
+    frames: &DeliveredFrames,
+    seal: &Seal,
+    session: TerminalId,
+    handle: &chat::runtime::Handle,
+    run: Option<RunId>,
+    prompt: FramedPrompt,
+) -> Result<(), Rejection> {
+    let evidence = prompt.evidence(seal, session);
+    let digest = evidence.digest;
+    let inserted = frames
+        .record(session, &evidence)
+        .map_err(|error| Rejection::Refused(format!("Cannot record mailbox delivery: {error}")))?;
+    let result = handle.deliver_mailbox(run, prompt.text, evidence);
+    // An ambiguous submission can already be in provider history.
+    if matches!(result, Err(Rejection::Refused(_)))
+        && inserted
+        && let Err(error) = frames.forget(session, digest)
+    {
+        tracing::warn!(%session, %error, "cannot retire evidence of a refused mailbox prompt");
+    }
+    result
+}
 
 /// Sends as an older CLI asks to, without reporting the recipient.
 pub(in crate::host) fn send(
@@ -868,6 +954,7 @@ struct Inner {
     host: Weak<crate::host::state::HostLock>,
     registry: SharedRegistry,
     seal: Arc<Seal>,
+    frames: Option<Arc<DeliveredFrames>>,
     state: Mutex<WakeState>,
     wait: wait::Wait,
     /// What each conversation's subscribers were last told of its limit.
@@ -1006,17 +1093,22 @@ impl Courier {
 
     fn start_in(host: &SharedHost, update_runtime: Option<PathBuf>) -> Result<Self, String> {
         let registry = registry(host)?;
-        let seal = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .mailbox_seal
-            .clone()
-            .ok_or("The mailbox key is unavailable")?;
+        let (seal, frames) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            (
+                state
+                    .mailbox_seal
+                    .clone()
+                    .ok_or("The mailbox key is unavailable")?,
+                state.delivered_frames.clone(),
+            )
+        };
         let handle = Handle(Arc::new(Inner {
             update_runtime,
             host: Arc::downgrade(host),
             registry,
             seal,
+            frames,
             state: Mutex::new(WakeState::default()),
             wait: wait::Wait::new(),
             limits: Mutex::new(BTreeMap::new()),
@@ -1525,7 +1617,12 @@ impl Handle {
             tracing::debug!(message = %message.id, session = %chat.id, "messages wait for the person's follow-ups");
             return Ok(Delivered::Yields(until));
         }
-        let messages = self.together(message, recipient, now)?;
+        let messages = self.together(
+            message,
+            recipient,
+            now,
+            chat.handle.accepts_mailbox_evidence(),
+        )?;
         Ok(if self.hand_over(&messages, chat.id, &chat.handle)? {
             Delivered::Prompted
         } else {
@@ -1555,6 +1652,7 @@ impl Handle {
         message: &Message,
         recipient: crate::agent_execution::Lineage,
         now: u64,
+        accepts_evidence: bool,
     ) -> Result<Vec<Message>, String> {
         let registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
         let takes_runs = match registry.lineage_agent(recipient)? {
@@ -1572,8 +1670,16 @@ impl Handle {
         let mut bytes = 0;
         let mut together = Vec::with_capacity(waiting.len());
         for waiting in waiting {
-            bytes += self.0.seal.seal(&waiting, now).len() + 2;
-            if !together.is_empty() && bytes > crate::agent_execution::MAX_PROMPT_BYTES {
+            let len = if self.0.frames.is_some() && accepts_evidence {
+                crate::agent_execution::mailbox::frame(&waiting, now).len() + 1
+            } else {
+                self.0.seal.seal(&waiting, now).len()
+            };
+            bytes += len;
+            if !together.is_empty() {
+                bytes += 2; // Blank line between frames.
+            }
+            if bytes > crate::agent_execution::MAX_PROMPT_BYTES {
                 break;
             }
             together.push(waiting);
@@ -1598,11 +1704,12 @@ impl Handle {
         handle: &chat::runtime::Handle,
     ) -> Result<bool, String> {
         let registry = &self.0.registry;
+        let now = super::now();
         let ids: Vec<MessageId> = messages.iter().map(|message| message.id).collect();
         let claimed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .deliver_messages(&ids, session, super::now())?;
+            .deliver_messages(&ids, session, now)?;
         if claimed.is_empty() {
             return Ok(true);
         }
@@ -1612,7 +1719,18 @@ impl Handle {
         if let Some(host) = self.0.host.upgrade() {
             super::given_work(&host, session);
         }
-        match handle.try_idle_prompt(self.0.seal.seal_all(given, super::now())) {
+        let result = match &self.0.frames {
+            Some(frames) if handle.accepts_mailbox_evidence() => deliver_recorded(
+                frames,
+                &self.0.seal,
+                session,
+                handle,
+                None,
+                FramedPrompt::batch(given, now),
+            ),
+            _ => handle.try_idle_prompt(self.0.seal.seal_all(given, now)),
+        };
+        match result {
             Ok(()) => {}
             Err(Rejection::Refused(error)) => {
                 // The conversation took a turn of its own since it was seen
@@ -1663,6 +1781,82 @@ enum Delivered {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn prompt_item(text: String) -> chat::Item {
+        chat::Item {
+            id: "courier-prompt".into(),
+            role: chat::Role::User,
+            content: chat::ItemContent::Text {
+                text,
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        }
+    }
+
+    #[test]
+    fn delivery_evidence_survives_pruning_and_rollback_for_exact_predecessors() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let first = TerminalId::new();
+        let next = TerminalId::new();
+        let unrelated = TerminalId::new();
+        let message = Message {
+            id: MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: Some(crate::agent_execution::Lineage(first)),
+                session: Some(first),
+                title: None,
+            },
+            reply_to: None,
+            body: "Keep this message after inbox expiry".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: 0,
+        };
+        let prompt = FramedPrompt::batch([&message], 0);
+
+        {
+            let mut registry = crate::host::model::Registry::at(&path).unwrap();
+            registry.succeed(next, first, None, |_| false).unwrap();
+            registry.post_message(&message).unwrap();
+            assert_eq!(
+                registry.deliver_messages(&[message.id], first, 0).unwrap(),
+                [message.id]
+            );
+            let seal = Seal::new(registry.mailbox_key().unwrap());
+            let frames = registry.open_delivered_frames().unwrap();
+            let evidence = prompt.evidence(&seal, first);
+            assert!(frames.record(first, &evidence).unwrap());
+            assert!(!frames.record(first, &evidence).unwrap());
+            assert_eq!(registry.prune_messages(1).unwrap(), 1);
+        }
+        // Cold rollback edits the workspace schema, then the matched upgrade
+        // reopens it. The evidence survives both conversions.
+        crate::host::model::Registry::downgrade_at(&path, 33).unwrap();
+        let host = crate::host::service::test_host();
+        assert!(
+            host.lock()
+                .unwrap()
+                .install_model(crate::host::model::Registry::at(&path).unwrap())
+        );
+        let tampered = prompt_item(prompt.text.replace("Keep this", "Change this"));
+        let item = prompt_item(prompt.text);
+        for recipient in [first, next] {
+            let recognizer = super::recognizer(&host, recipient).unwrap();
+            assert!(recognizer.recognized(&item).is_some());
+            assert!(recognizer.recognized(&tampered).is_none());
+        }
+        assert!(
+            super::recognizer(&host, unrelated)
+                .unwrap()
+                .recognized(&item)
+                .is_none()
+        );
+    }
 
     #[test]
     fn courier_defers_new_dispatch_and_wakes_when_the_update_releases_its_fence() {
@@ -1735,11 +1929,13 @@ mod tests {
             created_ms: super::super::now(),
         };
         registry.lock().unwrap().post_message(&message).unwrap();
+        let frames = Arc::new(registry.lock().unwrap().open_delivered_frames().unwrap());
         let courier = Handle(Arc::new(Inner {
             update_runtime: None,
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([7; 32])),
+            frames: Some(frames.clone()),
             state: Mutex::default(),
             wait: wait::Wait::new(),
             limits: Mutex::default(),
@@ -1747,6 +1943,8 @@ mod tests {
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
+        let recognizer = frames.recognizer(courier.0.seal.clone(), vec![session]);
+        let prompt = prompt_item(FramedPrompt::batch([&message], 0).text);
         let stored = || {
             registry
                 .lock()
@@ -1801,6 +1999,7 @@ mod tests {
             "refused mail must remain retryable"
         );
         assert_eq!(refused.to.session, None);
+        assert!(recognizer.recognized(&prompt).is_none());
         assert_eq!(
             actor.prompt_count(),
             0,
@@ -1825,6 +2024,7 @@ mod tests {
         let delivered = stored();
         assert_eq!(delivered.state, State::Delivered);
         assert_eq!(delivered.to.session, Some(session));
+        assert!(recognizer.recognized(&prompt).is_some());
         assert_eq!(actor.prompt_count(), 1);
         courier
             .hand_over(std::slice::from_ref(&message), session, &actor.handle)
@@ -1868,6 +2068,7 @@ mod tests {
             host: Weak::new(),
             registry: registry.clone(),
             seal: Arc::new(Seal::new([8; 32])),
+            frames: None,
             state: Mutex::default(),
             wait: wait::Wait::new(),
             limits: Mutex::default(),
@@ -1933,11 +2134,13 @@ mod tests {
                 created_ms: super::super::now(),
             };
             registry.lock().unwrap().post_message(&message).unwrap();
+            let frames = Arc::new(registry.lock().unwrap().open_delivered_frames().unwrap());
             let courier = Handle(Arc::new(Inner {
                 update_runtime: None,
                 host: Weak::new(),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([9; 32])),
+                frames: Some(frames.clone()),
                 state: Mutex::default(),
                 wait: wait::Wait::new(),
                 limits: Mutex::default(),
@@ -1945,6 +2148,8 @@ mod tests {
                 scanned_generation: Mutex::new(None),
                 scanned: Condvar::new(),
             }));
+            let recognizer = frames.recognizer(courier.0.seal.clone(), vec![session]);
+            let prompt = prompt_item(FramedPrompt::batch([&message], 0).text);
             let stored = || {
                 registry
                     .lock()
@@ -1964,10 +2169,11 @@ mod tests {
                     &delivery_actor,
                 )
             });
-            // This completes a genuinely pending Remote IdlePrompt envelope;
-            // hand_over has already committed its claim before invoking it.
+            // The proxy admitted the framed input after the courier
+            // committed the claim and its delivery evidence.
             assert_eq!(answer(outcome), 1);
             delivery.join().unwrap().unwrap();
+            assert_eq!(recognizer.recognized(&prompt).is_some(), !refused);
             let settled = stored();
             if refused {
                 assert_eq!(settled.state, State::Pending);
@@ -2063,6 +2269,7 @@ mod tests {
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
             )),
             seal: Arc::new(Seal::new([7; 32])),
+            frames: None,
             state: Mutex::default(),
             wait: wait::Wait::new(),
             limits: Mutex::default(),
@@ -2167,6 +2374,7 @@ mod tests {
                 crate::host::model::Registry::at(&temporary.path().join("model.sqlite3")).unwrap(),
             )),
             seal: Arc::new(Seal::new([7; 32])),
+            frames: None,
             state: Mutex::default(),
             wait: wait::Wait::new(),
             limits: Mutex::default(),
@@ -2234,6 +2442,7 @@ mod tests {
                 crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
             )),
             seal: Arc::new(Seal::new([7; 32])),
+            frames: None,
             state: Mutex::default(),
             wait: wait::Wait::new(),
             limits: Mutex::default(),
@@ -2343,11 +2552,13 @@ mod tests {
             for message in messages.iter().rev() {
                 registry.lock().unwrap().post_message(message).unwrap();
             }
+            let frames = Arc::new(registry.lock().unwrap().open_delivered_frames().unwrap());
             let courier = Handle(Arc::new(Inner {
                 update_runtime: None,
                 host: Arc::downgrade(&host),
                 registry: registry.clone(),
                 seal: Arc::new(Seal::new([7; 32])),
+                frames: Some(frames),
                 state: Mutex::default(),
                 wait: wait::Wait::new(),
                 limits: Mutex::default(),
@@ -2406,23 +2617,31 @@ mod tests {
             }
         }
 
-        /// The bodies each prompt the conversation took carried, in the
-        /// order it read them.
-        fn prompted(&self) -> Vec<Vec<String>> {
-            self.actor
-                .prompt_texts()
-                .iter()
-                .map(|text| {
-                    crate::agent_execution::mailbox::open_all(
-                        text,
-                        &crate::agent_execution::mailbox::SealShaped,
-                    )
-                    .expect("each prompt is the courier's frames")
-                    .into_iter()
-                    .map(|opened| opened.body)
-                    .collect()
-                })
-                .collect()
+        fn assert_batch(&self) {
+            let received = self.actor.prompt_texts();
+            let prompt = FramedPrompt::batch(&self.messages, 0);
+            assert_eq!(received, [prompt.text]);
+            let item = prompt_item(received.into_iter().next().unwrap());
+            let frames = self.courier.0.frames.as_ref().unwrap();
+            let seal = &self.courier.0.seal;
+            assert!(matches!(
+                frames
+                    .recognizer(seal.clone(), vec![self.session])
+                    .recognized(&item)
+                    .unwrap()
+                    .content,
+                chat::ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Message,
+                    ..
+                }
+            ));
+            assert!(
+                frames
+                    .recognizer(seal.clone(), vec![TerminalId::new()])
+                    .recognized(&item)
+                    .is_none(),
+                "a verbatim copy in another conversation carries no attribution"
+            );
         }
     }
 
@@ -2430,7 +2649,7 @@ mod tests {
     fn every_waiting_message_reaches_the_conversation_in_one_prompt_in_order() {
         let mut fixture = Delivering::new(&["First", "Second", "Third"]);
         assert_eq!(fixture.pass(), None);
-        assert_eq!(fixture.prompted(), [["First", "Second", "Third"]]);
+        fixture.assert_batch();
         // Each settles on its own, as the recipient reading it would.
         assert_eq!(fixture.states(), fixture.all(State::Delivered));
         // Nothing is given twice.
@@ -2468,7 +2687,7 @@ mod tests {
 
         fixture.actor.set_persons_queue(false);
         fixture.pass();
-        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        fixture.assert_batch();
         assert_eq!(fixture.states(), fixture.all(State::Delivered));
         fixture.actor.close();
     }
@@ -2498,7 +2717,7 @@ mod tests {
         );
         fixture.actor.set_persons_queue(false);
         fixture.pass();
-        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        fixture.assert_batch();
         assert_eq!(fixture.states(), fixture.all(State::Delivered));
         fixture.actor.close();
     }
@@ -2523,7 +2742,7 @@ mod tests {
             .get_mut(&fixture.session)
             .unwrap() -= PERSON_FIRST.as_millis() as u64;
         fixture.pass();
-        assert_eq!(fixture.prompted(), [["First", "Second"]]);
+        fixture.assert_batch();
         assert_eq!(fixture.states(), fixture.all(State::Delivered));
         fixture.actor.close();
     }
