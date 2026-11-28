@@ -22,6 +22,12 @@ use crate::{
     upgrade::handoff::{STARTUP_BASE, StartupInventory},
 };
 
+#[cfg(any(
+    target_os = "macos",
+    all(test, not(any(feature = "host", feature = "ui")))
+))]
+use super::ipc::client_session::connect_until_with_owner;
+
 use super::{
     KeyInput, MouseInput, PasteOrigin, RenderSnapshot, TerminalEvent, TerminalSendError,
     TerminalSize, TerminalWake,
@@ -1596,8 +1602,6 @@ fn ensure_daemon_ready_at(
 
     refuse_update_launch(socket)?;
 
-    let timeout = crate::upgrade::handoff::startup_timeout()
-        .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe = crate::process::current_executable()
         .map_err(HostedTerminalStartError::CurrentExecutable)?;
     if application == crate::notifications::Application::Ceditor {
@@ -1609,6 +1613,12 @@ fn ensure_daemon_ready_at(
     if !daemon_binary.is_file() {
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
+    #[cfg(target_os = "macos")]
+    let timeout = crate::upgrade::handoff::startup_timeout_for(&daemon_binary)
+        .map_err(HostedTerminalStartError::HostStartup)?;
+    #[cfg(not(target_os = "macos"))]
+    let timeout = crate::upgrade::handoff::startup_timeout()
+        .map_err(HostedTerminalStartError::HostStartup)?;
 
     // User scopes execute the command locally and preserve explicitly
     // forwarded descriptors, including both update admission and inventory.
@@ -1660,13 +1670,36 @@ fn connect_existing_daemon(
     let mut inventory = StartupInventory::capture().ok();
     let mut dial = connect_until(socket, started + DAEMON_READY_TIMEOUT, || false);
     let mut extended_deadline = None;
-    if dial
+    let extend = dial
         .as_ref()
-        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
-    {
+        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut);
+    #[cfg(target_os = "macos")]
+    let selected = if dial.as_ref().is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+        )
+    }) {
+        crate::update::selected_listener_startup(socket, None)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let extend = extend || selected.is_some();
+    if extend {
         refuse_update_launch(socket)?;
         let deadline = startup_restore_deadline(started, inventory.take());
-        dial = connect_until(socket, deadline, || false);
+        #[cfg(not(target_os = "macos"))]
+        let result = connect_until(socket, deadline, || false);
+        #[cfg(target_os = "macos")]
+        let (deadline, result) = match selected {
+            Some((owner, allowance)) => {
+                let deadline = deadline + allowance;
+                (deadline, connect_until_with_owner(socket, deadline, &owner))
+            }
+            None => (deadline, connect_until(socket, deadline, || false)),
+        };
+        dial = result;
         if dial
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
@@ -1676,17 +1709,22 @@ fn connect_existing_daemon(
         extended_deadline = Some(deadline);
     }
     match dial {
-        Ok(stream) => verify_startup_stream(socket, stream, |stream| match extended_deadline {
-            Some(deadline) => {
-                crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
-            }
-            None => {
-                crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
-                    startup_restore_deadline(started, inventory)
-                })
-            }
-        })
-        .map(Some),
+        Ok(stream) => {
+            #[cfg(target_os = "macos")]
+            let allowance = startup_allowance_for_stream(socket, &stream);
+            #[cfg(not(target_os = "macos"))]
+            let allowance = || Duration::ZERO;
+            verify_startup_stream(socket, stream, |stream| match extended_deadline {
+                Some(deadline) => crate::control::ControlClient::from_stream_with_startup_budget(
+                    stream,
+                    deadline.max(started + STARTUP_BASE + allowance()),
+                ),
+                None => {
+                    startup_hello_with_allowance(stream, started, started, inventory, allowance)
+                }
+            })
+            .map(Some)
+        }
         Err(error)
             if matches!(
                 error.kind(),
@@ -1707,6 +1745,30 @@ fn startup_restore_deadline(started: Instant, inventory: Option<StartupInventory
         + inventory
             .and_then(|inventory| inventory.timeout().ok())
             .unwrap_or(STARTUP_BASE)
+}
+
+#[cfg(target_os = "macos")]
+fn startup_allowance_for_stream<'a>(
+    socket: &'a Path,
+    stream: &UnixStream,
+) -> impl FnOnce() -> Duration + use<'a> {
+    let peer = crate::daemon::peer_credentials(stream).ok();
+    move || {
+        peer.and_then(|peer| crate::update::selected_listener_startup(socket, Some(peer)))
+            .map_or(Duration::ZERO, |(_, allowance)| allowance)
+    }
+}
+
+fn startup_hello_with_allowance(
+    stream: UnixStream,
+    started: Instant,
+    deadline_floor: Instant,
+    inventory: Option<StartupInventory>,
+    allowance: impl FnOnce() -> Duration,
+) -> Result<crate::control::ControlClient, crate::control::ControlError> {
+    crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
+        deadline_floor.max(startup_restore_deadline(started, inventory) + allowance())
+    })
 }
 
 fn validate_editor_daemon_installation(executable: &Path) -> Result<(), HostedTerminalStartError> {
@@ -1741,10 +1803,68 @@ fn start_and_verify_daemon_at(
     scoped: bool,
     launch: impl FnMut(bool) -> io::Result<Child>,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
-    let deadline = Instant::now() + timeout;
-    let stream = start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
+    let started = Instant::now();
+    let deadline = started + timeout;
+    let connection = start_daemon_at(socket, timeout, daemon_binary, scoped, launch);
+    #[cfg(target_os = "macos")]
+    if matches!(
+        &connection,
+        Err(HostedTerminalStartError::HostReadyTimeout { .. })
+    ) {
+        refuse_update_launch(socket)?;
+        if let Some((owner, allowance)) = crate::update::selected_listener_startup(socket, None) {
+            let deadline = deadline.max(started + STARTUP_BASE + allowance);
+            return join_selected_daemon(socket, &owner, started, deadline);
+        }
+    }
+    let stream = connection?;
+    #[cfg(target_os = "macos")]
+    let allowance = startup_allowance_for_stream(socket, &stream);
     verify_startup_stream(socket, stream, |stream| {
+        #[cfg(target_os = "macos")]
+        {
+            // The winner may be the selected recovery daemon while our own
+            // companion (for example Ceditor's) has no selected inventory.
+            startup_hello_with_allowance(
+                stream,
+                started,
+                deadline,
+                StartupInventory::capture().ok(),
+                allowance,
+            )
+        }
+        #[cfg(not(target_os = "macos"))]
         crate::control::ControlClient::from_stream_until(stream, deadline)
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(test, not(any(feature = "host", feature = "ui")))
+))]
+fn join_selected_daemon(
+    socket: &Path,
+    owner: &crate::pinned_process::PinnedProcess,
+    started: Instant,
+    deadline: Instant,
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
+    let stream = connect_until_with_owner(socket, deadline, owner).map_err(|source| {
+        if source.kind() == io::ErrorKind::TimedOut {
+            HostedTerminalStartError::HostReadyTimeout {
+                path: socket.to_owned(),
+                timeout: deadline.duration_since(started),
+            }
+        } else {
+            HostedTerminalStartError::HostSocket {
+                path: socket.to_owned(),
+                source,
+            }
+        }
+    })?;
+    // The selected daemon can consume its recovery evidence before accepting
+    // the connection. Carry the admitted deadline into hello.
+    verify_startup_stream(socket, stream, |stream| {
+        crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
     })
 }
 
@@ -3940,9 +4060,7 @@ mod tests {
                     let result = verify_startup_stream(
                         &socket,
                         UnixStream::connect(&socket).unwrap(),
-                        |stream| {
-                            crate::control::ControlClient::from_stream_until(stream, Instant::now())
-                        },
+                        crate::control::ControlClient::from_stream,
                     );
                     assert_eq!(result.is_ok(), answer, "{result:?}");
                     server.join()
@@ -4102,7 +4220,13 @@ mod tests {
         const CHILD: &str = "CAGENTS_TEST_EXISTING_DAEMON_RESTORE";
         const TEST: &str = "terminal::hosted::tests::existing_listener_handshake_waits_out_restoration_with_and_without_checkpoint";
         let Ok(checkpoint) = std::env::var(CHILD) else {
-            for checkpoint in ["absent", "damaged", "consumed"] {
+            for checkpoint in [
+                "absent",
+                "damaged",
+                "consumed",
+                "selected-reconnects",
+                "cold-deadline",
+            ] {
                 let root = tempfile::tempdir().unwrap();
                 std::fs::create_dir(root.path().join("tmp")).unwrap();
                 let mut command = Command::new(std::env::current_exe().unwrap());
@@ -4132,7 +4256,7 @@ mod tests {
             .join("daemon-upgrade");
         let checkpoint_path = upgrade.join("daemon-upgrade.json");
         let contents: &[u8] = match checkpoint.as_str() {
-            "absent" => b"",
+            "absent" | "selected-reconnects" | "cold-deadline" => b"",
             "damaged" => b"damaged checkpoint",
             "consumed" => br#"{"version":1,"terminals":[],"chats":[{}]}"#,
             _ => unreachable!("unknown checkpoint fixture"),
@@ -4184,16 +4308,27 @@ mod tests {
             thread::sleep(restore);
             let _ = stream.write_all(&reply[6..]);
         });
-        let result = if checkpoint == "consumed" {
+        let result = if matches!(
+            checkpoint.as_str(),
+            "consumed" | "selected-reconnects" | "cold-deadline"
+        ) {
             // Spend the base budget before the fixture starts. After the
-            // ordinary hello times out, only the captured restore allowance
-            // can still extend the deadline.
-            let started = Instant::now() - crate::upgrade::handoff::STARTUP_BASE;
+            // ordinary hello times out, let the checkpoint, actual listener,
+            // or captured cold deadline supply the rest of the wait.
+            let started = Instant::now() - STARTUP_BASE;
+            let (deadline_floor, reconnects) = match checkpoint.as_str() {
+                "selected-reconnects" => (started + STARTUP_BASE, 3),
+                "cold-deadline" => (started + STARTUP_BASE + Duration::from_secs(5), 0),
+                _ => (started, 0),
+            };
             verify_startup_stream(&socket, UnixStream::connect(&socket).unwrap(), |stream| {
-                let inventory = StartupInventory::capture().ok();
-                crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
-                    startup_restore_deadline(started, inventory)
-                })
+                startup_hello_with_allowance(
+                    stream,
+                    started,
+                    deadline_floor,
+                    StartupInventory::capture().ok(),
+                    || crate::upgrade::handoff::selected_reconnect_allowance(reconnects),
+                )
             })
         } else {
             ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
@@ -4201,7 +4336,7 @@ mod tests {
         server.join().unwrap();
         result.unwrap();
         match checkpoint.as_str() {
-            "absent" => assert!(
+            "absent" | "selected-reconnects" | "cold-deadline" => assert!(
                 !upgrade.exists(),
                 "budget estimation must not create upgrade storage"
             ),
@@ -4246,6 +4381,32 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[cfg(not(any(feature = "host", feature = "ui")))]
+    #[test]
+    fn selected_daemon_hello_keeps_the_admitted_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        let owner = crate::pinned_process::PinnedProcess::open(std::process::id()).unwrap();
+        let _budget = crate::control::ordinary_budget::quick();
+        let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(200);
+        let server = thread::spawn(move || {
+            let mut stream = accept_connection(&listener);
+            thread::sleep(restore);
+            answer_ready_hello(&mut stream);
+        });
+        let now = Instant::now();
+        let client = join_selected_daemon(
+            &socket,
+            &owner,
+            now - STARTUP_BASE,
+            now + Duration::from_secs(5),
+        )
+        .unwrap();
+        assert_eq!(client.proof(), &proof("restored"));
+        server.join().unwrap();
     }
 
     #[test]

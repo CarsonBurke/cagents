@@ -4,7 +4,7 @@
 use super::Recovery;
 use crate::{
     chat::{
-        Session,
+        NATIVE_HOLDER_START_IO_TIMEOUT as START_TIMEOUT, Session,
         protocol::{LaunchCleanup, LaunchOutcome, ProcessSpec, TransportSpec},
     },
     daemon::{
@@ -35,7 +35,6 @@ use std::{
 const ARGUMENT: &str = "--cagents-native-holder";
 const PROTOCOL: u32 = 3;
 const TIMEOUT: Duration = Duration::from_secs(5);
-const START_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_FRAME: usize = 16 << 20;
 // This status is emitted only after the helper's owned descendants have all
 // been reaped. Signals, panics and ordinary setup exits are not cleanup proof.

@@ -31,6 +31,19 @@ pub(crate) fn recorded_owner(lock: &File) -> io::Result<(HostSessionProof, u32)>
     decode_owner(&read_owner_bytes(lock)?)
 }
 
+/// Pin the live owner without connecting to its listener or removing a stale one.
+#[cfg(target_os = "macos")]
+pub(crate) fn observe_owner(
+    paths: &RuntimePaths,
+) -> Result<crate::pinned_process::PinnedProcess, PlatformError> {
+    let (proof, expected) = recorded_owner(&open_lock(paths)?)?;
+    let (owner, process) = crate::daemon::lease_owner_process(&paths.lock, &proof)?;
+    if owner != expected {
+        return Err(io::Error::other("daemon lease owner changed").into());
+    }
+    Ok(process)
+}
+
 #[cfg(target_os = "macos")]
 pub(crate) fn decode_owner(bytes: &[u8]) -> io::Result<(HostSessionProof, u32)> {
     #[derive(serde::Deserialize)]
