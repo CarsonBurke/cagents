@@ -1457,6 +1457,63 @@ fn host_chat(
 }
 
 #[test]
+fn conversation_watch_can_retry_a_reserved_chat_until_it_is_hosted() {
+    use crate::{
+        model::{HostIncarnation, HostSessionId, HostSessionProof},
+        terminal_ipc::{ClientRequest, ServerResponse},
+    };
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(
+        crate::host::state::HostState::new(HostSessionProof {
+            host_session_id: HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            host_incarnation: HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+        }),
+    ));
+    let work = Handle::idle(Arc::downgrade(&host));
+    let id = host_recorded_chat(&host, Vec::new());
+    // Keep the fixture's record off the host until the start settles.
+    let record = {
+        let mut state = host.lock().unwrap();
+        state.work = Some(work.clone());
+        state.register_client(1);
+        let record = state.chats.remove(&id).unwrap();
+        state.chat_spawning.insert(id, record.session.clone());
+        record
+    };
+    let watch = |conversation| {
+        crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::WatchConversationPullRequests { conversation },
+        )
+    };
+
+    let pending = watch(id).unwrap_err();
+    assert_eq!(pending.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(pending.retryable);
+    let unknown = watch(TerminalId::new()).unwrap_err();
+    assert_eq!(unknown.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!unknown.retryable);
+    assert!(work.conversations().watched.is_empty());
+
+    assert!(host.lock().unwrap().clear_chat_reservation(&record.session));
+    assert!(!watch(id).unwrap_err().retryable);
+    {
+        let mut state = host.lock().unwrap();
+        state.chats.insert(id, record);
+        state.chat_added(id);
+    }
+    assert!(matches!(
+        watch(id).unwrap().0,
+        ServerResponse::Work(crate::work::Response::WatchingConversation { .. })
+    ));
+    assert!(work.conversations().watched[&id].watchers.contains_key(&1));
+
+    let record = host.lock().unwrap().chats.remove(&id).unwrap();
+    let _ = record.handle.close();
+}
+
+#[test]
 fn a_recorded_chat_added_while_the_loop_waits_is_read_without_anything_showing_it() {
     use crate::chat::{CommandAction, Item, ItemContent, Role, ToolStatus};
     use crate::model::{HostIncarnation, HostSessionId, HostSessionProof};

@@ -1755,9 +1755,8 @@ fn process_admitted_request(
             let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
             let delivery =
                 delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
-            let (revision, pull_requests) = work
-                .watch_conversation(host, client_id, conversation, delivery)
-                .map_err(|message| unavailable(&message))?;
+            let (revision, pull_requests) =
+                work.watch_conversation(host, client_id, conversation, delivery)?;
             Ok((
                 ServerResponse::Work(crate::work::Response::WatchingConversation {
                     revision,
