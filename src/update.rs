@@ -670,11 +670,14 @@ fn installed_version(text: &str) -> Result<Version, UpdateError> {
 /// No installation or updater files are created by this call.
 pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateError> {
     #[cfg(all(feature = "ui", feature = "development"))]
-    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
-        && let Some(release) = review_fixture::release(Path::new(&root))?
-    {
-        let installer_only = review_fixture::offers_installer(Path::new(&root));
-        return Ok(offered(release, installer_only));
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
+        let root = Path::new(&root);
+        if let Some(release) = review_fixture::release(root)? {
+            return Ok(offered(release, review_fixture::offers_installer(root)));
+        }
+        if let Some(version) = review_fixture::current_version(root)? {
+            return Ok(UpdateState::Current { version });
+        }
     }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
@@ -750,12 +753,12 @@ enum UpdateRequest {
     InstalledFromTerminal { root: PathBuf },
 }
 
-/// Whether this build asks for newer releases. A development build never
-/// does, apart from offering the native evidence fixture's release.
+/// Whether this build checks for updates. Development only checks when
+/// the native evidence fixture supplies a result.
 pub fn discovers_releases() -> bool {
     #[cfg(all(feature = "ui", feature = "development"))]
     if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
-        .is_some_and(|root| review_fixture::offers_release(Path::new(&root)))
+        .is_some_and(|root| review_fixture::has_check_result(Path::new(&root)))
     {
         return true;
     }
