@@ -1845,7 +1845,7 @@ fn a_stopped_codex_reopen_restores_the_issued_terminal() {
     let bound = execution.lock().unwrap().agent(agent).unwrap();
     assert_eq!(bound.session, Some(HostedSession::Chat(session)));
     let courier = super::super::agent_execution::mailbox::Courier::start(&reopened_host).unwrap();
-    let message = "Keep going from the reopened conversation";
+    let message = REOPENED_MESSAGE;
     let answered = super::super::agent_execution::mailbox::hand(
         &reopened_host,
         &Authority::default(),
@@ -2306,6 +2306,7 @@ fn upgrade_restore_stops_only_the_conversations_whose_restart_fails() {
 const HELD_PROMPT: &str = "Work until this test interrupts the turn";
 const FIRST_MESSAGE: &str = "first accepted message";
 const SECOND_MESSAGE: &str = "second accepted message";
+const REOPENED_MESSAGE: &str = "Keep going from the reopened conversation";
 
 fn verify_agent_run_warning(
     host: &SharedHost,
@@ -2684,7 +2685,7 @@ fn provider() {
                             .append(true)
                             .open(root.join("queued-provider-inputs"))
                             .unwrap();
-                        let mut bodies = [FIRST_MESSAGE, SECOND_MESSAGE]
+                        let mut bodies = [FIRST_MESSAGE, SECOND_MESSAGE, REOPENED_MESSAGE]
                             .into_iter()
                             .filter(|body| text.contains(body));
                         let body = bodies.next().expect("one accepted message per prompt");
