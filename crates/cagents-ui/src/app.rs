@@ -9871,7 +9871,6 @@ impl Cagents {
             projection_stage!("row_selection", self.prune_sidebar_row_selection());
         }
         projection_stage!("worktree_panes", self.refresh_sidebar_worktree_panes());
-        let git = projection_stage!("git_interest", self.refresh_git_interest());
         projection_stage!("worktrees_pane", self.refresh_worktrees_pane());
         // Ahead of the rebind, which pins what the inspector drawing source
         // control chose: a pane that has just arrived, closed or taken focus
@@ -9879,6 +9878,8 @@ impl Cagents {
         projection_stage!("pane_inspectors", self.sync_pane_inspectors());
         projection_stage!("pull_request_inspector", self.sync_pull_request_inspector());
         let binding = projection_stage!("source_control", self.rebind_source_control());
+        // Interest follows the new binding and its reset section disclosures.
+        let git = projection_stage!("git_interest", self.refresh_git_interest());
         if let Some(source) = self.sidebar_model.source_control.as_ref() {
             let selected = self
                 .workspace

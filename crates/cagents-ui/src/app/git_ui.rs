@@ -2871,6 +2871,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn projection_moves_untracked_interest_with_the_panel_binding() {
+        use git_watch::Interest::Inspected;
+
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.sidebar_model = sidebar::test_support::panel_model();
+        app.sidebar_state = sidebar::test_support::panel_state(&app.sidebar_model);
+        let main = app.sidebar_state.active_worktree().unwrap().clone();
+        let linked = app
+            .sidebar_model
+            .worktree_at(Path::new("/repo/fix-sidebar"))
+            .unwrap();
+        app.active_workspace = Some(main.canonical_path.clone());
+        app.open_pane_inspector_now(card);
+        app.context_sections
+            .set_open(context_sections::Section::Workspace, true);
+        let interest = |app: &Cagents, key: &ActiveWorktreeKey| {
+            app.refresh_ui
+                .git
+                .work
+                .get(&(key.project_id, key.worktree_id))
+                .copied()
+        };
+        drop(app.project_workspace(false));
+        assert_eq!(interest(&app, &main), Some(Inspected));
+
+        app.active_workspace = Some(linked.canonical_path.clone());
+        drop(app.project_workspace(false));
+        assert_eq!(app.sidebar_state.active_worktree(), Some(&linked));
+        assert_eq!(interest(&app, &linked), Some(Inspected));
+        assert_ne!(interest(&app, &main), Some(Inspected));
+
+        drop(app.update(Message::Sidebar(SidebarAction::ToggleSection {
+            key: linked.clone(),
+            section: PanelSection::Untracked,
+        })));
+        assert_ne!(interest(&app, &linked), Some(Inspected));
+        app.active_workspace = Some(main.canonical_path.clone());
+        drop(app.project_workspace(false));
+        assert_eq!(interest(&app, &main), Some(Inspected));
+    }
+
     /// Panes come into and out of view all the time; that re-plans watches
     /// only when it can change which checkouts' files are watched.
     #[test]
