@@ -359,10 +359,13 @@ impl Rollouts {
     fn read(&self, rollout: Rollout) -> Arc<Vec<Item>> {
         const MAX_ENTRIES: usize = 4;
         const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+        // Short records, such as compactions, still allocate a complete Item
+        // and its strings. Bound that expansion separately from source bytes.
+        const MAX_ITEMS_PER_ENTRY: usize = 16_384;
 
-        let Some(revision) = FileRevision::of(rollout.metadata())
-            .filter(|revision| revision.len <= MAX_SOURCE_BYTES)
-        else {
+        let Some(revision) = FileRevision::of(rollout.metadata()).filter(|revision| {
+            revision.len <= MAX_SOURCE_BYTES && rollout.supports_revision_cache()
+        }) else {
             return Arc::new(rollout.read().0);
         };
         let entry = {
@@ -391,7 +394,9 @@ impl Rollouts {
         }
         let (items, closing) = rollout.read();
         let items = Arc::new(items);
-        if closing.as_ref().and_then(FileRevision::of) == Some(revision) {
+        if items.capacity() <= MAX_ITEMS_PER_ENTRY
+            && closing.as_ref().and_then(FileRevision::of) == Some(revision)
+        {
             *cached = Some(items.clone());
         }
         items

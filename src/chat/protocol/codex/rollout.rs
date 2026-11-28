@@ -70,6 +70,10 @@ impl Rollout {
         &self.metadata
     }
 
+    pub fn supports_revision_cache(&self) -> bool {
+        crate::git_watch::supports_open_file_revisions(&self.file)
+    }
+
     /// Reads up to the opening length. Return closing metadata only when the
     /// whole span was read, so a partial read cannot seed a reusable snapshot.
     pub fn read(self) -> (Vec<Item>, Option<Metadata>) {
