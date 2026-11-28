@@ -941,6 +941,7 @@ impl PatchModel {
                                     .center_y(SEPARATOR_HEIGHT),
                                 )
                                 .on_press(on_event(Event::Unfold(fold)))
+                                .interaction(iced::mouse::Interaction::Pointer)
                                 .into(),
                             );
                         }
