@@ -3,8 +3,6 @@ use crate::flock::fdinfo_owns_lock as fdinfo_owns_slot;
 #[cfg(target_os = "linux")]
 use crate::flock::process_owns_lock as process_owns_slot;
 use crate::pinned_process::PinnedProcess;
-#[cfg(any(feature = "host", target_os = "linux"))]
-use std::time::Instant;
 use std::{
     env,
     fs::{self, File, OpenOptions},
@@ -22,7 +20,7 @@ use std::{
         OnceLock,
         atomic::{AtomicBool, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 #[cfg(feature = "ui")]
 use std::{
