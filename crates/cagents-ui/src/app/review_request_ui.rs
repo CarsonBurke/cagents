@@ -16,11 +16,71 @@ fn review_interval(focused: bool, daemon_unavailable: bool) -> Duration {
     }
 }
 
+/// Evidence from a successful local remote read. GitHub may resolve a
+/// different default than the one used for the local review cache.
+#[derive(Debug, Clone)]
+pub(super) struct RepositoryBinding {
+    pub(super) local: Option<GitHubRepoKey>,
+    pub(super) resolved: Option<GitHubRepoKey>,
+    pub(super) remotes: BTreeMap<String, GitHubRepoKey>,
+}
+
+pub(super) struct Watch {
+    repository: GitHubRepoKey,
+    remotes: Option<BTreeMap<String, GitHubRepoKey>>,
+}
+
 impl Cagents {
+    pub(super) fn update_review_binding(
+        &mut self,
+        project: ProjectId,
+        availability: &GitHubAvailability,
+        binding: Option<RepositoryBinding>,
+    ) {
+        if let Some(binding) = &binding {
+            if let Some(local) = &binding.local {
+                self.review_repositories.insert(project, local.clone());
+            } else {
+                self.review_repositories.remove(&project);
+            }
+        }
+        if let Some(key) = availability.repository_key() {
+            self.review_watches.insert(
+                project,
+                Watch {
+                    repository: key.clone(),
+                    remotes: binding.map(|binding| binding.remotes),
+                },
+            );
+        } else if availability.refresh_succeeded() {
+            self.review_watches.remove(&project);
+        } else if let Some(binding) = binding
+            && let std::collections::hash_map::Entry::Occupied(mut entry) =
+                self.review_watches.entry(project)
+        {
+            let watch = entry.get_mut();
+            let changed = match &binding.resolved {
+                Some(resolved) => !watch.repository.same_repository(resolved),
+                None => watch.remotes.as_ref().is_some_and(|old| {
+                    old.len() != binding.remotes.len()
+                        || old.iter().any(|(name, key)| {
+                            binding
+                                .remotes
+                                .get(name)
+                                .is_none_or(|new| !key.same_repository(new))
+                        })
+                }),
+            };
+            if changed {
+                entry.remove();
+            } else {
+                watch.remotes = Some(binding.remotes);
+            }
+        }
+    }
+
     fn watches_review_requests(&self) -> bool {
-        self.github_availability
-            .values()
-            .any(|availability| availability.repository_key().is_some())
+        !self.review_watches.is_empty()
     }
 
     pub(super) fn review_request_subscription(&self) -> Subscription<Message> {
@@ -44,23 +104,15 @@ impl Cagents {
     }
 
     pub(super) fn update_review_requests(&mut self, action: Action) -> Task<Message> {
-        let repositories = self
-            .github_availability
-            .iter()
-            .filter_map(|(&project, availability)| {
-                availability
-                    .repository_key()
-                    .cloned()
-                    .map(|key| (project, key))
-            })
-            .collect::<HashMap<_, _>>();
         let revision = self.refresh_ui.review_requests.revision();
         let task = self
             .refresh_ui
             .review_requests
             .update_observing(
                 action,
-                repositories.values().cloned(),
+                self.review_watches
+                    .values()
+                    .map(|watch| watch.repository.clone()),
                 crate::notifications::Application::Cagents,
             )
             .map(Message::ReviewRequests)
@@ -92,11 +144,11 @@ impl Cagents {
             .map(cosmic::Action::App)
         };
         for project in &mut self.sidebar_model.projects {
-            let snapshot = repositories.get(&project.id).and_then(|repository| {
+            let snapshot = self.review_watches.get(&project.id).and_then(|watch| {
                 self.refresh_ui
                     .review_requests
                     .snapshots()
-                    .find(|(key, _)| key.same_repository(repository))
+                    .find(|(key, _)| key.same_repository(&watch.repository))
                     .map(|(_, snapshot)| snapshot)
             });
             if let Some(snapshot) = snapshot {
@@ -197,14 +249,22 @@ mod tests {
     fn watching_one_repository() -> Cagents {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
-        app.github_availability.insert(
+        let key = GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap();
+        let availability = GitHubAvailability::Ready {
+            repository_key: key.clone(),
+            pull_requests: Vec::new(),
+            refreshed_at: 1,
+        };
+        app.update_review_binding(
             project,
-            GitHubAvailability::Ready {
-                repository_key: GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
-                pull_requests: Vec::new(),
-                refreshed_at: 1,
-            },
+            &availability,
+            Some(RepositoryBinding {
+                local: Some(key.clone()),
+                resolved: Some(key.clone()),
+                remotes: BTreeMap::from([("origin".into(), key)]),
+            }),
         );
+        app.github_availability.insert(project, availability);
         let row = sidebar::SidebarPullRequest::new(
             project,
             7,
@@ -231,6 +291,99 @@ mod tests {
         project.worktrees[0].set_pull_request(row);
         app.sidebar_model.projects.push(project);
         app
+    }
+
+    #[test]
+    fn review_watch_outlives_transient_sidebar_failures_until_the_repository_changes() {
+        let mut app = watching_one_repository();
+        let project = app.sidebar_model.projects[0].id;
+        app.repository_generations.insert(project, 1);
+        app.complete_review_read_for_test(&[7]);
+        let original = app
+            .refresh_ui
+            .review_requests
+            .snapshots()
+            .next()
+            .unwrap()
+            .0
+            .clone();
+
+        for availability in [
+            GitHubAvailability::Failed {
+                detail: "listing unavailable".into(),
+            },
+            GitHubAvailability::RateLimited {
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 60,
+                ),
+            },
+        ] {
+            drop(app.update_git(git_ui::Action::Remote {
+                project,
+                generation: 1,
+                result: Ok(git_ui::RemoteRead {
+                    availability,
+                    archived: Vec::new(),
+                    binding: Some(Box::new(RepositoryBinding {
+                        local: Some(original.clone()),
+                        resolved: None,
+                        remotes: BTreeMap::from([("origin".into(), original.clone())]),
+                    })),
+                }),
+            }));
+            assert!(!app.sidebar_model.projects[0].github_ready);
+            assert!(app.watches_review_requests());
+            assert!(
+                app.refresh_ui
+                    .review_requests
+                    .snapshots()
+                    .any(|(key, snapshot)| *key == original && snapshot.requested.contains_key(&7))
+            );
+        }
+
+        let replacement = GitHubRepoKey::new("github.com", None, "owner", "replacement").unwrap();
+        drop(app.update_git(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok(git_ui::RemoteRead {
+                availability: GitHubAvailability::Ready {
+                    repository_key: replacement.clone(),
+                    pull_requests: Vec::new(),
+                    refreshed_at: 2,
+                },
+                archived: Vec::new(),
+                binding: Some(Box::new(RepositoryBinding {
+                    local: Some(replacement.clone()),
+                    resolved: Some(replacement.clone()),
+                    remotes: BTreeMap::from([("origin".into(), replacement.clone())]),
+                })),
+            }),
+        }));
+        assert!(
+            app.refresh_ui
+                .review_requests
+                .snapshots()
+                .all(|(key, _)| *key != original)
+        );
+        assert_eq!(app.review_watches[&project].repository, replacement);
+
+        drop(app.update_git(git_ui::Action::Remote {
+            project,
+            generation: 1,
+            result: Ok(git_ui::RemoteRead {
+                availability: GitHubAvailability::Failed {
+                    detail: "could not resolve the new remote".into(),
+                },
+                archived: Vec::new(),
+                binding: Some(Box::new(RepositoryBinding {
+                    local: Some(original.clone()),
+                    resolved: None,
+                    remotes: BTreeMap::from([("origin".into(), original)]),
+                })),
+            }),
+        }));
+        assert!(!app.watches_review_requests());
+        assert!(app.refresh_ui.review_requests.snapshots().next().is_none());
     }
 
     #[test]

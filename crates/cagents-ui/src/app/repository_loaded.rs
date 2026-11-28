@@ -131,6 +131,7 @@ impl Cagents {
                     }
                     self.github_availability.remove(&project_id);
                     self.review_repositories.remove(&project_id);
+                    self.review_watches.remove(&project_id);
                     self.sync_worktree_operation_rows();
                     self.sidebar_model.data_state = SidebarDataState::Ready;
                     if open_cards && !self.refuse_in_deleting_worktree(&worktree) {
@@ -212,11 +213,11 @@ impl Cagents {
                 } else {
                     loaded.github.label().into()
                 };
-                if let Some(key) = loaded.review_repository.clone() {
-                    self.review_repositories.insert(project_id, key);
-                } else {
-                    self.review_repositories.remove(&project_id);
-                }
+                self.update_review_binding(
+                    project_id,
+                    &loaded.github,
+                    loaded.review_binding.clone(),
+                );
                 self.github_availability
                     .insert(project_id, loaded.github.clone());
                 if let Some(existing) = self
@@ -335,7 +336,6 @@ impl Cagents {
                     project.github_status = unavailable.label().into();
                 }
                 self.github_availability.insert(project_id, unavailable);
-                self.review_repositories.remove(&project_id);
                 self.status = Some(TransientNotice::error(error.clone()));
                 finish_repository_load_failure(&mut self.sidebar_model, project_id, error);
                 task = self.apply_closed_project_tombstones();

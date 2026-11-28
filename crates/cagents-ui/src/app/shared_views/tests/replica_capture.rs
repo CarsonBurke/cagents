@@ -756,7 +756,7 @@ fn presentation_replica_capture_repository_reconciliation_is_a_structural_barrie
         repository: None,
         worktrees: vec![],
         github: GitHubAvailability::NotAssociated,
-        review_repository: None,
+        review_binding: None,
         head_repositories: HashMap::new(),
     };
     drop(app.update(Message::RepositoryLoaded {

@@ -974,6 +974,7 @@ impl Cagents {
         }
         self.github_availability.remove(&id);
         self.review_repositories.remove(&id);
+        self.review_watches.remove(&id);
         self.project_ui.projects.remove(&id);
         self.repository_generations.remove(&id);
         if let Some(cancellation) = self.repository_pr_cancellations.remove(&id) {
@@ -1030,7 +1031,12 @@ impl Cagents {
         self.refresh_sidebar_channels();
         self.refresh_sidebar_worktree_panes();
         self.persist();
-        Task::batch([select, self.lifecycle_sweep(), self.sync_chrome()])
+        Task::batch([
+            select,
+            self.lifecycle_sweep(),
+            self.sync_chrome(),
+            self.update_review_requests(review_request_ui::Action::Tick),
+        ])
     }
 
     pub(super) fn editor_discovery_task() -> Task<Message> {

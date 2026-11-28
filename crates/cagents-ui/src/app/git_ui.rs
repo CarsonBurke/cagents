@@ -574,7 +574,7 @@ pub enum Action {
     Remote {
         project: ProjectId,
         generation: u64,
-        result: Result<(GitHubAvailability, Vec<ArchivedWorktreePr>), String>,
+        result: Result<RemoteRead, String>,
     },
     Changed,
     Read {
@@ -582,6 +582,13 @@ pub enum Action {
         generation: u64,
         result: Result<LocalRead, String>,
     },
+}
+
+#[derive(Debug, Clone)]
+pub struct RemoteRead {
+    pub(super) availability: GitHubAvailability,
+    pub(super) archived: Vec<ArchivedWorktreePr>,
+    pub(super) binding: Option<Box<review_request_ui::RepositoryBinding>>,
 }
 
 #[derive(Debug, Clone)]
@@ -878,8 +885,15 @@ impl Cagents {
                     return Task::none();
                 }
                 self.refresh_ui.projects.remove(&project);
-                let (availability, archived) = result
-                    .unwrap_or_else(|detail| (GitHubAvailability::Failed { detail }, Vec::new()));
+                let RemoteRead {
+                    availability,
+                    archived,
+                    binding,
+                } = result.unwrap_or_else(|detail| RemoteRead {
+                    availability: GitHubAvailability::Failed { detail },
+                    archived: Vec::new(),
+                    binding: None,
+                });
                 self.refresh_ui
                     .finished(project, availability.refresh_succeeded());
                 if matches!(availability, GitHubAvailability::Ready { .. })
@@ -919,6 +933,7 @@ impl Cagents {
                     row.revoke_github();
                 }
                 row.github_status = availability.label().into();
+                self.update_review_binding(project, &availability, binding.map(|binding| *binding));
                 self.github_availability.insert(project, availability);
                 return Task::batch([
                     self.open_pending_pull_requests(project),
@@ -1686,7 +1701,7 @@ impl Cagents {
         self.refresh_ui.started(project);
         cosmic::task::future(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let availability =
+                let (availability, binding) =
                     load_repository_github(&snapshot.repository, true, &cancellation);
                 let archived = if let GitHubAvailability::Ready {
                     repository_key,
@@ -1709,7 +1724,11 @@ impl Cagents {
                 } else {
                     Vec::new()
                 };
-                (availability, archived)
+                RemoteRead {
+                    availability,
+                    archived,
+                    binding: binding.map(Box::new),
+                }
             })
             .await
             .map_err(|error| error.to_string());
@@ -3248,14 +3267,15 @@ mod tests {
         drop(app.update_git(Action::Remote {
             project: project.id,
             generation: 1,
-            result: Ok((
-                GitHubAvailability::Ready {
+            result: Ok(RemoteRead {
+                availability: GitHubAvailability::Ready {
                     repository_key: key,
                     pull_requests: Vec::new(),
                     refreshed_at: 0,
                 },
                 archived,
-            )),
+                binding: None,
+            }),
         }));
         assert_eq!(
             app.sidebar_model.projects[0].worktrees[0]
@@ -3350,14 +3370,15 @@ mod tests {
         drop(app.update_git(Action::Remote {
             project,
             generation: 1,
-            result: Ok((
-                GitHubAvailability::Ready {
+            result: Ok(RemoteRead {
+                availability: GitHubAvailability::Ready {
                     repository_key: key.clone(),
                     pull_requests: Vec::new(),
                     refreshed_at: 0,
                 },
                 archived,
-            )),
+                binding: None,
+            }),
         }));
     }
 

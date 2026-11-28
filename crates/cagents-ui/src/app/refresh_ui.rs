@@ -1689,7 +1689,11 @@ mod tests {
         drop(app.update(Message::GitUi(git_ui::Action::Remote {
             project,
             generation: 1,
-            result: Ok((availability(), Vec::new())),
+            result: Ok(git_ui::RemoteRead {
+                availability: availability(),
+                archived: Vec::new(),
+                binding: None,
+            }),
         })));
         assert_eq!(app.refresh_ui.schedule.failures.get(&project), Some(&1));
         drop(app.update(Message::RepositoryLoaded {
@@ -1708,7 +1712,7 @@ mod tests {
                 repository: None,
                 worktrees: Vec::new(),
                 github: availability(),
-                review_repository: None,
+                review_binding: None,
                 head_repositories: HashMap::new(),
             })),
         }));
