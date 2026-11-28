@@ -72,6 +72,10 @@ pub(crate) type SharedHost = Arc<HostLock>;
 thread_local! {
     pub(super) static AFTER_SPAWN_RESERVATION: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
+    static REFUSE_NEXT_TERMINAL_PUBLICATION: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static REFUSE_NEXT_AGENT_REBIND: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
 }
 
 pub(crate) struct TerminalRecord {
@@ -295,6 +299,7 @@ struct PendingPublication {
     handle: TerminalHandle,
     source: TerminalSession,
     pane: Option<crate::model::CardId>,
+    paired_instance: Option<uuid::Uuid>,
     original: PublicationSource,
     reservation: Option<super::workspace::PendingTerminal>,
 }
@@ -488,6 +493,9 @@ pub(crate) struct HostState {
     pub(super) worktree_removals: super::worktree_removal::Reservations,
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
+    /// Exact actors published by a pane's stopped paired restart. Upgrade
+    /// lineage belongs to the conversation ID; it cannot identify a process.
+    pub(super) paired_restarts: BTreeMap<TerminalId, uuid::Uuid>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
     pub(super) history_retirement: Option<std::sync::mpsc::SyncSender<()>>,
     pub(super) exited_queue_transfers: super::chat::queue_transfer::Transfers,
@@ -693,6 +701,7 @@ impl HostState {
             control_gate: Arc::default(),
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
+            paired_restarts: BTreeMap::new(),
             chat_resolutions: BTreeMap::new(),
             history_retirement: None,
             exited_queue_transfers: Default::default(),
@@ -1025,7 +1034,35 @@ impl HostState {
         self.mobile_watchers.retain(|_, watch| watch.topic != topic);
     }
 
+    pub(super) fn paired_restart(&self, id: TerminalId) -> Option<&super::chat::Record> {
+        self.chats
+            .get(&id)
+            .filter(|record| self.paired_restarts.get(&id) == Some(&record.execution_instance))
+    }
+
+    pub(super) fn pending_codex_view(
+        &self,
+        source: &TerminalSession,
+        recipe: &crate::model::LaunchRecipe,
+        options: &TerminalSpawnOptions,
+        instance: uuid::Uuid,
+    ) -> bool {
+        self.publication_pending
+            .get(&source.id)
+            .is_some_and(|pending| {
+                pending.source == *source
+                    && pending.pane.is_none()
+                    && pending.paired_instance == Some(instance)
+                    && self.terminals.get(&source.id).is_some_and(|record| {
+                        pending.handle.same_worker(&record.handle)
+                            && record.execution_launch() == recipe
+                            && record.options == *options
+                    })
+            })
+    }
+
     pub(super) fn remove_chat(&mut self, id: TerminalId) -> Option<super::chat::Record> {
+        self.paired_restarts.remove(&id);
         let record = self.chats.remove(&id)?;
         self.exited_queue_archive
             .forget_resident(record.execution_instance);
@@ -2106,7 +2143,7 @@ impl HostState {
 
     /// Records that a restored terminal continues `source`, so clients that
     /// still hold the previous daemon's session find it again.
-    fn adopt_upgrade_lineage(
+    pub(super) fn adopt_upgrade_lineage(
         &mut self,
         source: &TerminalSession,
         previous_sources: &[TerminalSession],
@@ -4007,7 +4044,17 @@ fn restore_terminal_execution_authority(
 /// refused rather than delivered to an unproved process. It does not fail the
 /// restore: the conversation itself was relaunched and confirmed, and windows
 /// still resolve it through the upgrade aliases.
-fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+pub(super) fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    if let Err(reason) = rebind_relaunched_execution_authority(host, id) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+pub(super) fn rebind_relaunched_execution_authority(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<(), String> {
     let (registry, successor, sources) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let (Some(registry), Some(record), Some(sources)) = (
@@ -4015,15 +4062,20 @@ fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
             state.chats.get(&id),
             state.upgrade_chats.get(&id),
         ) else {
-            return;
+            return Err(
+                "The relaunched conversation's agent registry or exact lineage is unavailable"
+                    .into(),
+            );
         };
         (registry, record.session.clone(), sources.clone())
     };
-    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
-        tracing::warn!(session = %id, %reason,
-            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    #[cfg(test)]
+    if REFUSE_NEXT_AGENT_REBIND.replace(false) {
+        return Err("fixture refused agent rebinding".into());
     }
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    adopt_relaunched_agent(&mut registry, &sources, successor)?;
+    Ok(())
 }
 
 fn adopt_relaunched_agent(
@@ -5038,11 +5090,12 @@ fn restore_upgrade_checkpoint(
 /// as after a reboot or once the holder itself exited: nothing in cagents can
 /// reattach or close them any more, so they would otherwise warn forever.
 /// Their identity stays in the log for manual recovery from provider storage.
-/// A conversation whose restart was stopped never has a holder, so its notice
-/// lasts until the next daemon start; its pane can reopen it at any time.
+/// A stopped restart has no native holder. Its paired terminal recipe is
+/// still required when the conversation reopens.
 fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     use crate::daemon::holder_registry::{self as registry, Kind};
-    let conversations = match store.unattached() {
+    use crate::upgrade::handoff::UnattachedDisposition;
+    let conversations = match store.unattached_chats() {
         Ok(conversations) if conversations.is_empty() => return,
         Ok(conversations) => conversations,
         Err(error) => {
@@ -5059,6 +5112,11 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     };
     let departed = conversations
         .iter()
+        .filter(|entry| {
+            entry.summary.disposition != UnattachedDisposition::Stopped
+                || entry.terminal.is_none()
+        })
+        .map(|entry| &entry.summary)
         .filter(|conversation| {
             let gone = match registry::evidence(
                 &registry::socket(&directory, conversation.id),
@@ -5734,6 +5792,7 @@ pub(super) fn spawn_codex_view_reserved(
     session: TerminalSession,
     options: TerminalSpawnOptions,
     execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: &super::chat::TerminalViewReservation<'_>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     start_terminal_view_owned_reserved(
@@ -5746,7 +5805,7 @@ pub(super) fn spawn_codex_view_reserved(
         None,
         None,
         None,
-        None,
+        execution_recipe,
         Some(transition),
         None,
     )
@@ -5839,12 +5898,18 @@ fn start_terminal_view_owned_reserved(
     // else. The window attaches the terminal on a terminal connection once it
     // has the handoff, so that requester never subscribes to it here.
     let subscriber = execution_environment.is_none().then_some(client_id);
+    let paired_instance = transition.and_then(super::chat::TerminalViewReservation::codex_instance);
     let repair = {
         let state = shared.lock().unwrap_or_else(|p| p.into_inner());
         state
             .publication_pending
             .get(&session.id)
-            .filter(|p| p.source == session && p.pane == pending_pane)
+            .filter(|p| {
+                p.source == session
+                    && p.pane == pending_pane
+                    && p.paired_instance == paired_instance
+                    && transition.is_none_or(|view| view.authorizes(&state, session.id))
+            })
             .map(|p| p.handle.clone())
     };
     if let Some(handle) = repair {
@@ -5984,7 +6049,11 @@ fn start_terminal_view_owned_reserved(
             .flatten();
         let mut state = shared.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(pending) = state.publication_pending.get(&terminal_id) {
-            if pending.source != session || pending.pane != pending_pane {
+            if pending.source != session
+                || pending.pane != pending_pane
+                || pending.paired_instance != paired_instance
+                || transition.is_some_and(|view| !view.authorizes(&state, terminal_id))
+            {
                 return Err(pending_save_conflict());
             }
             let handle = pending.handle.clone();
@@ -6390,6 +6459,7 @@ fn start_terminal_view_owned_reserved(
                 handle: handle.clone(),
                 source: session.clone(),
                 pane: pending_pane,
+                paired_instance,
                 original: if parked {
                     PublicationSource::AfterSelection
                 } else {
@@ -6453,6 +6523,12 @@ fn publish_installed_terminal(
     expected: &TerminalHandle,
     options: &TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
+    #[cfg(test)]
+    if REFUSE_NEXT_TERMINAL_PUBLICATION.replace(false) {
+        return Err(model_unavailable(
+            "fixture refused terminal publication".into(),
+        ));
+    }
     let writer = super::workspace::writer(shared);
     #[cfg(test)]
     let writer = writer.ok();

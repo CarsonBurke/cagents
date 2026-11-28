@@ -700,6 +700,7 @@ fn publishing_a_spawn_reveals_a_worker_hidden_while_it_started() {
                     handle: stream.handle.clone(),
                     source: super::redraw_identity_tests::session(id),
                     pane: None,
+                    paired_instance: None,
                     original: PublicationSource::Observed(None),
                     reservation: None,
                 },

@@ -3397,7 +3397,9 @@ fn managed_cli_keeps_the_active_actor_and_close_retires_both_views() {
             let closing = capacity::Reservation::closing(&host, &mut state, &owners.target.source)?;
             (owners, closing)
         };
-        codex_terminal_view(&host, client, chat_id, owners, &closing, session, recipe)
+        codex_terminal_view(
+            &host, client, chat_id, owners, &closing, session, recipe, None,
+        )
     };
     let first = view(1, session.clone(), recipe.clone()).unwrap();
     let ServerResponse::ChatTerminal {
