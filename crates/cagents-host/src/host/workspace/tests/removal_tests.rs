@@ -223,7 +223,9 @@ fn proven_absence_is_fenced_against_publish_retire_and_daemon_change() {
         .unwrap();
     assert_eq!(edit(&host, 1, removal).unwrap(), removed);
     assert_eq!(
-        host.lock().unwrap().terminals[&id].handle.execution_instance(),
+        host.lock().unwrap().terminals[&id]
+            .handle
+            .execution_instance(),
         later_worker.handle.execution_instance(),
     );
 }
