@@ -8837,6 +8837,143 @@ fn a_kept_closed_pane_waits_for_the_strip_without_stopping_again() {
     assert!(app.durable.stopping_chats.is_empty());
 }
 
+#[test]
+fn a_kept_closed_pane_admitted_with_its_first_identity_obeys_the_stop() {
+    use crate::chat::{NativeContinuity, client::UpgradeRecovery};
+
+    let (mut app, mut pane, _) = closed_chat_its_view_kept();
+    let CardKind::Chat(canonical) = &mut pane.kind else {
+        panic!("a chat pane");
+    };
+    canonical.native_continuity = NativeContinuity::ReconnectOnly;
+    let mut source = canonical.clone();
+    source.launch.session_id = None;
+    canonical.proof.as_mut().unwrap().host_incarnation = "successor".into();
+    let canonical = canonical.clone();
+    assert!(UpgradeRecovery::is_candidate(&source, &canonical));
+    app.card_state_mut(pane.id).unwrap().kind = CardKind::Chat(source.clone());
+    Arc::make_mut(&mut app.durable).stopping_chats[0].session = source.clone();
+    let saved = app.persistent_workspace();
+    let mut model = app.workspace_model.clone();
+    *model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .find(|listed| listed.id == pane.id)
+        .unwrap() = pane.clone();
+
+    for (admit_before_asking, answer_before_admission) in
+        [(true, false), (false, false), (false, true)]
+    {
+        for refused in [false, true] {
+            let with_draft = answer_before_admission && !refused;
+            let mut next = crate::app::tests::context_inspector_test_app(false);
+            next.durable = saved.clone();
+            next.workspace = Cagents::rebuild_workspace(&next.durable);
+            next.workspace_model = model.clone();
+            next.shared_views.initialized = app.shared_views.initialized.clone();
+            if with_draft {
+                next.chat_ui = super::super::chat_ui::State::with_drafts(HashMap::from([(
+                    pane.id,
+                    "an unsent message under the original identity".into(),
+                )]));
+            }
+            next.await_shared_chat_admission(pane.id, source.clone());
+
+            let ask = |next: &mut Cagents| {
+                drop(next.resume_stopping_chats());
+                next.background_close_for_test(pane.id)
+                    .expect("startup asks about the saved stop")
+            };
+            let answer = |next: &mut Cagents, target| {
+                let result = if refused {
+                    Err("the provider did not stop".into())
+                } else {
+                    Ok(())
+                };
+                drop(
+                    next.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+                        target, result,
+                    ))),
+                );
+            };
+            let target = (!admit_before_asking).then(|| ask(&mut next));
+            if answer_before_admission {
+                answer(&mut next, target.unwrap());
+            }
+
+            drop(next.reconcile_shared_views());
+            if !answer_before_admission {
+                assert!(!next.chat_start_pending(pane.id), "waits for the stop");
+                assert!(next.workspace.is_hidden(pane.id));
+                let target = target.unwrap_or_else(|| ask(&mut next));
+                answer(&mut next, target);
+            }
+            assert!(!next.holds_reopen(pane.id));
+            assert!(next.durable.stopping_chats.is_empty());
+            if with_draft {
+                let snapshot = next.persistent_workspace();
+                let (&copy, copied_source) =
+                    snapshot.pending_chat_admissions.iter().next().unwrap();
+                assert_ne!(copy, pane.id);
+                assert_eq!(copied_source, &source);
+                assert_eq!(snapshot.pending_chat_admissions.len(), 1);
+                assert_eq!(
+                    snapshot.chat_drafts[&copy],
+                    "an unsent message under the original identity"
+                );
+                assert!(!next.chat_start_pending(copy));
+            } else {
+                assert!(next.durable.pending_chat_admissions.is_empty());
+            }
+            if refused {
+                assert!(next.chat_start_matches(pane.id, &canonical));
+                assert!(!next.workspace.is_hidden(pane.id));
+                assert!(!next.has_close_failure_notices());
+            } else {
+                assert!(!next.chat_start_pending(pane.id));
+                assert!(!next.card_state(pane.id).unwrap().existence.is_open());
+            }
+        }
+    }
+}
+
+#[test]
+fn an_unresolved_upgrade_only_allows_a_completed_stop_to_remove_its_pane() {
+    for result in [Ok(()), Err("the provider did not stop".into())] {
+        let refused = result.is_err();
+        let (mut app, pane, _) = closed_chat_its_view_kept();
+        let CardKind::Chat(session) = &pane.kind else {
+            panic!("a chat pane");
+        };
+        let mut next = crate::app::tests::context_inspector_test_app(false);
+        next.durable = app.persistent_workspace();
+        next.workspace = Cagents::rebuild_workspace(&next.durable);
+        next.await_shared_chat_admission(pane.id, session.clone());
+        drop(next.resume_stopping_chats());
+        let target = next.background_close_for_test(pane.id).unwrap();
+        drop(
+            next.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+                target, result,
+            ))),
+        );
+
+        drop(next.retain_unresolved_shared_upgrade(&pane));
+        assert!(!next.chat_start_pending(pane.id));
+        assert!(next.durable.pending_chat_admissions.is_empty());
+        if refused {
+            assert!(matches!(
+                next.cards.get(&pane.id),
+                Some(CardRuntime::Failed(_))
+            ));
+            assert!(next.durable.stopping_chats[0].refused.is_some());
+        } else {
+            assert!(!next.card_state(pane.id).unwrap().existence.is_open());
+            assert!(next.durable.stopping_chats.is_empty());
+        }
+    }
+}
+
 /// At the next launch, a closed pane its view kept stays out of sight even
 /// when the view admits it before the launch asks about its stop, and goes
 /// once it has. A conversation reopened while that stop is asked again, then

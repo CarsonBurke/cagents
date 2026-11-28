@@ -458,7 +458,7 @@ pub(super) struct State {
     /// Last actual canonical descriptors, before optimistic local edits.
     observed_chats: HashMap<CardId, crate::chat::Session>,
     observed_terminals: HashMap<CardId, TerminalSession>,
-    applying: bool,
+    pub(super) applying: bool,
     /// Panes `detach_shared_pane` detached that are still in the strip. The
     /// active strip's projection takes them out in its one edit, and
     /// `finish_shared_viewport_projection` takes out any left.

@@ -419,7 +419,14 @@ impl Cagents {
             return (Task::none(), None);
         };
         assert!(runtime.awaiting_admission());
+        // The canonical pane may already belong to a close. Admit it
+        // through that lifecycle before considering any upgrade attachment.
+        let close = match &pane.kind {
+            CardKind::Chat(canonical) if listed => self.shared_chat_close(pane.id, canonical),
+            _ => None,
+        };
         if resolve_upgrade
+            && close.is_none()
             && let CardKind::Chat(canonical) = &pane.kind
             && chat::client::UpgradeRecovery::is_candidate(&runtime.session, canonical)
         {
@@ -528,10 +535,10 @@ impl Cagents {
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();
         }
-        if !resolve_upgrade {
+        if !resolve_upgrade && !matches!(close, Some(background_close::SharedChatClose::Stopped)) {
             // Failed exact lineage is not permission to restart either actor.
             // Keep the source copy inert and leave the canonical pane's retry
-            // explicit instead of falling through to ordinary resume/start.
+            // explicit. Only a completed stop can take the pane away here.
             let kept_here = self
                 .chat_ui
                 .drafts
@@ -560,7 +567,7 @@ impl Cagents {
                 // A conversation still stopping after its pane closed, or
                 // whose stop was refused, attaches as any pane a view shows
                 // it on does: after the stop, or to what still runs.
-                self.attach_shared_chat(pane.id, session.clone())
+                self.attach_shared_chat_with_close(pane.id, session.clone(), close)
             }
             _ => Task::none(),
         };
