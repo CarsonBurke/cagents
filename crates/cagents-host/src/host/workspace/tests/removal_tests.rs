@@ -215,11 +215,19 @@ fn proven_absence_is_fenced_against_publish_retire_and_daemon_change() {
     assert!(removed.views[0].panes.is_empty());
     // A lost acknowledgement replays the receipt without acquiring authority
     // over a later worker or changing the already committed model sequence.
+    let id = source.id;
+    let later_worker = RenderStreamFixture::new(|_| {});
     host.lock()
         .unwrap()
-        .finish_spawn(2, source, replacement.handle.clone(), false)
+        .finish_spawn(2, source, later_worker.handle.clone(), false)
         .unwrap();
     assert_eq!(edit(&host, 1, removal).unwrap(), removed);
+    assert_eq!(
+        host.lock().unwrap().terminals[&id]
+            .handle
+            .execution_instance(),
+        later_worker.handle.execution_instance(),
+    );
 }
 
 #[test]
