@@ -53,6 +53,7 @@ CASES = (
     Case("fixture-codex.sh", "CODEX_HOME", "login", "codex"),
     Case("rehearsal-codex.sh", "CODEX_HOME", "version", "codex"),
     Case("fixture-acp.sh", "HOME", "acp", "agy"),
+    Case("fixture-omp.sh", "HOME", "stdio", "omp"),
     Case("fixture-gh.sh", "HOME", "forge", "gh"),
     Case("fixture-xdg-open.sh", "HOME", "open", "xdg-open"),
     Case("linear-curl.sh", "HOME", "linear", "curl"),
@@ -66,6 +67,7 @@ CASES = (
     Case("rehearsal-codex.py", "CODEX_HOME", "version"),
     Case("terminal-escape-codex.py", "CODEX_HOME", "version"),
     Case("fake-acp-agent.py", "HOME"),
+    Case("omp-child-errors.py", "HOME"),
     Case("claude-long-history.py", "HOME", "long-history"),
     Case("claude-damaged-history.py", "HOME", "damaged-history"),
     Case("conversation-work.py", "HOME", "conversation"),
@@ -253,7 +255,7 @@ class Home(unittest.TestCase):
         target = self.home / "bin" / case.installed
         shutil.copy2(FIXTURES / case.filename, target)
         # Installed fixtures retain their usual native-evidence directory shape.
-        for leaf in ("bin/lib", "libexec", "libexec/codex", "libexec/acp", "scripts", "tests/fixtures/lib"):
+        for leaf in ("bin/lib", "libexec", "libexec/codex", "libexec/acp", "libexec/omp", "scripts", "tests/fixtures/lib"):
             (self.home / leaf).mkdir(parents=True, exist_ok=True)
         for leaf in ("libexec/fixture-home.sh", "libexec/fixture_home.py",
                      "libexec/codex/fixture_home.py", "libexec/acp/fixture_home.py",
@@ -265,6 +267,7 @@ class Home(unittest.TestCase):
         for source in FIXTURES.glob("*.py"):
             shutil.copy2(source, self.home / "libexec/codex" / source.name)
         shutil.copy2(FIXTURES / "fake-acp-agent.py", self.home / "libexec/acp/fake-acp-agent.py")
+        shutil.copy2(FIXTURES / "omp-child-errors.py", self.home / "libexec/omp/omp-child-errors.py")
         (self.home / "libexec/codex/peer").write_text("tool-rows\n")
         (self.home / "home/.config/fixture-forge").touch()
         (self.home / "read").write_text('{"data":{}}\n')

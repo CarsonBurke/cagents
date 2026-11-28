@@ -61,6 +61,13 @@ fn child_copy_source(snapshot: &Snapshot, child: &str, id: &str) -> Option<chat:
 }
 
 impl CopyPlan {
+    /// Whether any part is read from a retained original rather than its
+    /// resident text.
+    #[cfg(test)]
+    pub(super) fn reads_original(&self) -> bool {
+        self.parts.iter().any(|(_, source, _)| source.is_some())
+    }
+
     pub(super) fn is_current(&self, snapshot: &Snapshot) -> bool {
         self.parts
             .iter()
@@ -1299,18 +1306,12 @@ impl Runtime {
         let mut complete = true;
         for source in &incident.sources {
             if let Source::ChildItem(child, id) = source {
-                let item = self
-                    .snapshot
-                    .subagents
-                    .iter()
-                    .find(|agent| &agent.id == child)
-                    .and_then(|agent| agent.items.iter().find(|item| &item.id == id));
                 // A short failure is resident in full; only a preview
                 // depends on its retained original.
-                if item.is_some_and(|item| {
-                    chat::failure::provider_error_text(Provider::Codex, item)
-                        .is_some_and(chat::failure::is_preview)
-                }) {
+                if self
+                    .child_provider_error(child, id)
+                    .is_some_and(chat::failure::is_preview)
+                {
                     retained = true;
                     complete &= child_copy_source(&self.snapshot, child, id).is_some();
                 }
@@ -1319,6 +1320,22 @@ impl Runtime {
             }
         }
         retained.then_some(complete)
+    }
+
+    /// The resident body of child `child`'s item `id` when it is a failure
+    /// this conversation's provider marked. Whether its whole original can
+    /// be copied is decided by the copy source the daemon published for it,
+    /// not by which provider reported it.
+    fn child_provider_error(&self, child: &str, id: &str) -> Option<&str> {
+        let item = self
+            .snapshot
+            .subagents
+            .iter()
+            .find(|agent| agent.id == child)?
+            .items
+            .iter()
+            .find(|item| item.id == id)?;
+        chat::failure::provider_error_text(self.session.launch.provider, item)
     }
 
     /// The sources a reader sees and copies for an incident. A child's bare
@@ -1351,17 +1368,9 @@ impl Runtime {
         else {
             return Ok(None);
         };
-        let retained = incident.sources.iter().any(|source| match source {
-            Source::ChildItem(child, id) => self
-                .snapshot
-                .subagents
-                .iter()
-                .find(|agent| &agent.id == child)
-                .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
-                .is_some_and(|item| {
-                    chat::failure::provider_error_text(Provider::Codex, item).is_some()
-                }),
-            _ => false,
+        let retained = incident.sources.iter().any(|source| {
+            matches!(source, Source::ChildItem(child, id)
+                if self.child_provider_error(child, id).is_some())
         });
         if !retained {
             return Ok(None);
@@ -1372,14 +1381,7 @@ impl Runtime {
                 .ok_or("Original diagnostic unavailable in this view")?;
             let source = match identity {
                 Source::ChildItem(child, id) => {
-                    let item = self
-                        .snapshot
-                        .subagents
-                        .iter()
-                        .find(|agent| &agent.id == child)
-                        .and_then(|agent| agent.items.iter().find(|item| &item.id == id))
-                        .ok_or("Original diagnostic item is unavailable")?;
-                    match chat::failure::provider_error_text(Provider::Codex, item) {
+                    match self.child_provider_error(child, id) {
                         Some(text) => match child_copy_source(&self.snapshot, child, id) {
                             Some(source) => Some(source),
                             // The resident text is the whole original.
