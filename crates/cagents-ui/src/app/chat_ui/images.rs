@@ -1391,7 +1391,7 @@ impl Gallery {
     /// Whether the read of the entry `id`, as this gallery opened `serial`,
     /// is for the picture it shows now: one it has moved on from is not kept.
     fn awaits(&self, serial: u64, id: &str) -> bool {
-        serial == self.serial && self.entries[self.selected].id == id
+        serial != 0 && serial == self.serial && self.entries[self.selected].id == id
     }
     /// The whole picture of the entry `id`, read for this gallery.
     pub(in crate::app) fn loaded(&mut self, serial: u64, id: &str, loaded: Loaded) {
@@ -1425,6 +1425,7 @@ impl Gallery {
             entry.full = None;
         }
         self.reading = None;
+        self.serial = 0;
         self.selected = if forward {
             (self.selected + 1) % self.entries.len()
         } else {
@@ -2744,9 +2745,12 @@ mod tests {
             serial: 1,
             reading: None,
         };
+        gallery.entries[1].id = gallery.entries[0].id.clone();
         drop(gallery.next(ViewerHost::Dialog, false));
         assert_eq!(gallery.selected, 1);
         assert_eq!(gallery.reset, 1);
+        gallery.loaded(1, "a", Loaded::Failed("old decode".into()));
+        assert!(gallery.entries[1].error.is_none());
         drop(gallery.next(ViewerHost::Dialog, true));
         assert_eq!(gallery.selected, 0);
         assert_eq!(gallery.url().unwrap().as_str(), "file:///fixture/a.png");
