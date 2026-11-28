@@ -4218,7 +4218,7 @@ fn restart_or_stop(
     host: &SharedHost,
     chat: &crate::upgrade::handoff::Chat,
     unattached: &mut Vec<crate::upgrade::handoff::UnattachedChat>,
-    queue_budget: &mut super::chat::UpgradeRestoreQueueBudget,
+    queue_budget: &crate::chat::runtime::UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
     // A debug fixture's stand-in for a restart that fails: nothing starts,
     // and the conversation is stopped and recorded as a failed one is.
@@ -4747,13 +4747,13 @@ fn restore_upgrade_checkpoint(
     // failed restart must be positively stopped before restore proceeds. Share
     // lock queue time so one external lock holder cannot delay every restart
     // by another minute while this daemon cannot yet accept clients.
-    let mut queue_budget = super::chat::UpgradeRestoreQueueBudget::default();
+    let queue_budget = crate::chat::runtime::UpgradeRestoreQueueBudget::default();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if ChatRestore::of(chat) == ChatRestore::CodexListener {
-                restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
+                restart_or_stop(host, chat, &mut unattached, &queue_budget)?;
             }
         }
         // Carried terminals are adopted before anything is relaunched: their
@@ -4918,7 +4918,7 @@ fn restore_upgrade_checkpoint(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
+            restart_or_stop(host, chat, &mut unattached, &queue_budget)?;
         }
         let recovered = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
