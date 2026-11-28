@@ -126,6 +126,7 @@ REQUIRE_EMPTY_DAEMON=0
 RELAUNCH_AGENTS=
 PREPARE_CANDIDATE=
 PREPARED_CANDIDATE=
+APPIMAGE_CURRENT=
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -147,6 +148,11 @@ while [ "$#" -gt 0 ]; do
             STAGE_ONLY=1
             STAGE_FOR_UPGRADE=1
             shift
+            ;;
+        --appimage-current)
+            [ "$#" -ge 2 ] && [ -n "$2" ] || fail '--appimage-current requires the current target'
+            APPIMAGE_CURRENT=$2
+            shift 2
             ;;
         --prepare-candidate|--prepared-candidate)
             [ "$#" -ge 2 ] || fail "$1 requires a job UUID"
@@ -224,6 +230,19 @@ if [ "$STAGE_ONLY" -eq 1 ]; then
     [ "$RESTART_DAEMON" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] \
         && [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] && [ -z "$RELAUNCH_AGENTS" ] \
         || fail '--stage-only cannot be combined with restart, relaunch, uninstall or purge options'
+fi
+if [ -n "$APPIMAGE_CURRENT" ]; then
+    [ "$STAGE_ONLY" -eq 1 ] && [ "$STAGE_FOR_UPGRADE" -eq 0 ] && [ -z "$SELECT_VERSION" ] \
+        && [ -n "${CAGENTS_ARCHIVE:-}" ] && [ -n "${CAGENTS_CHECKSUMS:-}" ] \
+        || fail '--appimage-current requires a local archive, checksums and --stage-only'
+    case $APPIMAGE_CURRENT in
+        -) ;;
+        versions/[0-9]*)
+            case ${APPIMAGE_CURRENT#versions/} in
+                *..*|*[!0-9A-Za-z.+~-]*) fail 'unsafe AppImage source version' ;;
+            esac ;;
+        *) fail 'unsafe AppImage current target' ;;
+    esac
 fi
 
 [ -z "$RELAUNCH_AGENTS" ] || [ "$RESTART_DAEMON" -eq 1 ] \
@@ -1378,6 +1397,17 @@ if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
     fi
     installer_tool "$COORDINATOR" "$@" >/dev/null \
         || fail 'inherited application update fence is invalid; installation was not changed'
+    # AppRun compared the installed version before raising its window. Check
+    # the exact selection again under the install guard before staging files.
+    if [ -n "$APPIMAGE_CURRENT" ]; then
+        if [ "$APPIMAGE_CURRENT" = - ]; then
+            [ ! -e "$PREFIX/current" ] && [ ! -L "$PREFIX/current" ] \
+                || fail 'the installed version changed; open the AppImage again'
+        else
+            [ "$(readlink "$PREFIX/current" 2>/dev/null || :)" = "$APPIMAGE_CURRENT" ] \
+                || fail 'the installed version changed; open the AppImage again'
+        fi
+    fi
 else
     INSTALLER_SOURCE=$0
     if [ ! -f "$INSTALLER_SOURCE" ] || [ ! -r "$INSTALLER_SOURCE" ]; then
@@ -1401,6 +1431,7 @@ else
     elif [ "$STAGE_ONLY" -eq 1 ]; then
         set -- "$@" --stage-only
     fi
+    [ -z "$APPIMAGE_CURRENT" ] || set -- "$@" --appimage-current "$APPIMAGE_CURRENT"
     [ -z "$SELECT_VERSION" ] || set -- "$@" --select "$SELECT_VERSION"
     [ "$RESTART_DAEMON" -eq 0 ] || set -- "$@" --restart-daemon
     [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] || set -- "$@" --require-empty-daemon

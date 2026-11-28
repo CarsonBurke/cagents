@@ -3,6 +3,92 @@
 set -euo pipefail
 artifact=$1
 version=$2
+fail() { printf 'artifact smoke: %s\n' "$*" >&2; exit 1; }
+[[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]] || fail 'runtime timezone database is unavailable'
+
+if [[ $artifact == *.AppImage ]]; then
+    [[ $(id -u) != 0 ]] || fail 'AppImage requires an ordinary user'
+    if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} ]]; then
+        exec dbus-run-session -- /bin/bash "$0" "$@"
+    fi
+    export WAYLAND_DISPLAY=wayland-cagents-smoke ICED_BACKEND=tiny-skia
+    weston -B headless --renderer=pixman --socket="$WAYLAND_DISPLAY" --width=1280 --height=800 \
+        --idle-time=0 --no-config >/tmp/weston.log 2>&1 &
+    compositor=$!
+    window_pid=
+    trap '[[ -z $window_pid ]] || kill "$window_pid" 2>/dev/null || :; kill "$compositor" 2>/dev/null || :; wait "$compositor" 2>/dev/null || :' EXIT
+    for attempt in {1..50}; do
+        [[ ! -S $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ]] || break
+        kill -0 "$compositor" 2>/dev/null || break
+        sleep 0.1
+    done
+    if [[ ! -S $XDG_RUNTIME_DIR/$WAYLAND_DISPLAY ]]; then
+        cat /tmp/weston.log >&2
+        fail 'AppImage compositor did not start'
+    fi
+    mkdir -p "$XDG_DATA_HOME/cagents" "$XDG_CONFIG_HOME/cagents"
+    printf 'saved-user-data\n' > "$XDG_DATA_HOME/cagents/smoke-sentinel"
+    printf 'saved-user-data\n' > "$XDG_CONFIG_HOME/cagents/smoke-sentinel"
+    # HTTP release assets do not carry Unix mode bits.
+    install -m 0755 /artifact /tmp/cagents.AppImage
+    /tmp/cagents.AppImage --appimage-extract-and-run > /tmp/appimage-first
+    grep -Fxq 'cagents-ui started' /tmp/appimage-first || fail 'first AppImage launch did not open a window'
+    installation=$XDG_DATA_HOME/cagents-install
+    binaries=$installation/versions/$version/bin
+    public_command=$HOME/.local/bin/cagents
+    [[ $(readlink "$installation/current") == "versions/$version" ]] || fail 'wrong AppImage version selected'
+    [[ $(readlink -f "$public_command") == "$binaries/cagents" ]] || fail 'wrong AppImage command link'
+    [[ -f $XDG_DATA_HOME/applications/dev.cagents.Cagents.desktop &&
+        -f $XDG_DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg &&
+        -f $XDG_CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop ]] || fail 'missing AppImage desktop integration'
+    "$public_command" --no-start --json daemon status > /tmp/appimage-status
+    jq -e --arg version "$version" '.ok and .data.running and .data.startup == "ready" and .data.instance == "production" and .data.daemon_version == $version' /tmp/appimage-status >/dev/null
+    daemon_pid=$(jq -er '.pid | select(type == "number" and . > 1)' "$XDG_RUNTIME_DIR/cagents/cagentsd.lock")
+    [[ $(readlink "/proc/$daemon_pid/exe") == "$binaries/cagentsd" ]] || fail 'wrong AppImage daemon executable'
+    for process in /proc/[0-9]*/exe; do
+        if [[ $(readlink -- "$process" 2>/dev/null || :) == "$binaries/cagents-ui" ]]; then
+            window_pid=${process#/proc/}
+            window_pid=${window_pid%/exe}
+            break
+        fi
+    done
+    [[ -n $window_pid ]] || fail 'installed window process is missing'
+    window_start=$(awk '{print $22}' "/proc/$window_pid/stat")
+    daemon_start=$(awk '{print $22}' "/proc/$daemon_pid/stat")
+    same_process() {
+        local pid=$1 executable=$2 start=$3
+        [[ $(readlink "/proc/$pid/exe" 2>/dev/null || :) == "$executable" ]] &&
+            [[ $(awk '{print $22}' "/proc/$pid/stat" 2>/dev/null || :) == "$start" ]]
+    }
+    previous=$(stat -c %i "$installation/current")
+    /tmp/cagents.AppImage --appimage-extract-and-run > /tmp/appimage-second
+    grep -Fxq 'cagents is already running' /tmp/appimage-second || fail 'second AppImage launch did not activate the installed window'
+    [[ $(stat -c %i "$installation/current") == "$previous" ]] || fail 'second launch changed the installation'
+    same_process "$window_pid" "$binaries/cagents-ui" "$window_start" &&
+        same_process "$daemon_pid" "$binaries/cagentsd" "$daemon_start" ||
+        fail 'second launch replaced a running process'
+    if [[ $CAGENTS_SMOKE_BUNDLED_EDITOR == 1 ]]; then
+        digest=$(sha256sum -- "$binaries/ceditor")
+        printf '%s\n' "${digest%% *}" > /tmp/ceditor.sha256
+    fi
+    kill "$window_pid"
+    for attempt in {1..100}; do
+        same_process "$window_pid" "$binaries/cagents-ui" "$window_start" || break
+        sleep 0.05
+    done
+    if same_process "$window_pid" "$binaries/cagents-ui" "$window_start"; then
+        fail 'AppImage window did not exit before removal'
+    fi
+    window_pid=
+    "$binaries/cagents-uninstall"
+    [[ ! -e $installation/current && ! -L $installation/current &&
+        ! -L $public_command && ! -L $XDG_DATA_HOME/applications/dev.cagents.Cagents.desktop ]] ||
+        fail 'AppImage uninstall left program launchers'
+    [[ $(cat "$XDG_DATA_HOME/cagents/smoke-sentinel") == saved-user-data &&
+        $(cat "$XDG_CONFIG_HOME/cagents/smoke-sentinel") == saved-user-data ]] || fail 'AppImage uninstall changed saved user data'
+    exit 0
+fi
+
 mkdir -m 700 /run/fixture
 [[ $(dpkg --print-architecture) == amd64 ]] || { printf 'artifact smoke: wrong rootfs architecture\n' >&2; exit 1; }
 mkdir -p /root/data/cagents /root/config/cagents /root/config/ceditor /usr/local/share
@@ -10,8 +96,6 @@ printf 'unrelated-system-file\n' > /usr/local/share/cagents-smoke-sentinel
 for directory in /root/data/cagents /root/config/cagents /root/config/ceditor; do
     printf 'saved-user-data\n' > "$directory/smoke-sentinel"
 done
-fail() { printf 'artifact smoke: %s\n' "$*" >&2; exit 1; }
-[[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]] || fail 'runtime timezone database is unavailable'
 daemon_cli=
 cleanup() {
     if [[ -n $daemon_cli ]]; then

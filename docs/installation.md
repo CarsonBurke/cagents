@@ -3,6 +3,7 @@
 - [Requirements](#requirements)
 - [Install with the verified installer](#install-with-the-verified-installer)
 - [Convenience install](#convenience-install)
+- [Linux AppImage](#linux-appimage)
 - [Debian packages](#debian-packages)
 - [Portable archive](#portable-archive)
 - [What the installer does](#what-the-installer-does)
@@ -150,6 +151,21 @@ that tag's installer and name the version:
     sh "$download_dir/install.sh" --version "$VERSION"
 )
 ```
+
+## Linux AppImage
+
+Download [cagents-x86_64.AppImage](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-x86_64.AppImage).
+In your file manager, allow it to run as a program, then open it. The first
+launch installs cagents for your account and opens the installed app. It uses
+the same files and launchers as the script installer, so the download can be
+deleted after installation. Later updates are available inside cagents.
+
+Opening an older or equal AppImage opens your installed app. A newer AppImage
+opens the installed app and stages the files for the usual update review.
+
+The AppImage uses the static type-2 runtime with FUSE 3. If FUSE is unavailable,
+mark the file executable and run it with `--appimage-extract-and-run`. That
+opens the same installer after extracting the files to a temporary directory.
 
 ## Debian packages
 

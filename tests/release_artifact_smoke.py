@@ -32,7 +32,7 @@ BUILD_CACHE_ID = (
     "242cd8898b33ea806ef5f13b1076ed7c76f9f989d18384452f7166692438ff1a\n"
 )
 SMOKE_CACHE_ID = (
-    "cagents-release-smoke-v4 ubuntu-24.04.3 amd64 "
+    "cagents-release-smoke-v5 ubuntu-24.04.3 amd64 "
     "6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9\n"
 )
 # Bounds only a hang; a passing wait returns as soon as its event arrives.
@@ -44,7 +44,9 @@ ARTIFACTS = (
     f"cagents-browserless-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
     f"ceditor-{VERSION}-x86_64-unknown-linux-gnu.tar.gz",
 )
-EDITOR_ARTIFACTS = (ARTIFACTS[0], ARTIFACTS[2], ARTIFACTS[4])
+APPIMAGE = f"cagents-{VERSION}-x86_64.AppImage"
+APPIMAGE_ALIAS = "cagents-x86_64.AppImage"
+EDITOR_ARTIFACTS = (ARTIFACTS[0], ARTIFACTS[2], ARTIFACTS[4], APPIMAGE)
 
 
 class SmokeBoundary(unittest.TestCase):
@@ -121,6 +123,46 @@ class SmokeBoundary(unittest.TestCase):
         self.assertEqual(list(self.work.iterdir()), [])
         self.assertEqual((self.base / "base-sentinel").read_text(), "untouched\n")
         self.assertFalse(self.network_calls.exists())
+
+    def test_appimage_requires_both_names_and_uses_private_nonroot_runtime(self):
+        command = ["--dist", str(self.dist), "--version", VERSION, "--rootfs", str(self.base), "--appimage"]
+        missing = self.invoke(arguments=command)
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn(APPIMAGE, missing.stderr)
+        self.assertEqual(self.recorded(), [])
+        (self.dist / APPIMAGE).write_text("boundary fixture only\n")
+        missing_alias = self.invoke(arguments=command)
+        self.assertNotEqual(missing_alias.returncode, 0)
+        self.assertIn(APPIMAGE_ALIAS, missing_alias.stderr)
+        self.assertEqual(self.recorded(), [])
+        (self.dist / APPIMAGE_ALIAS).hardlink_to(self.dist / APPIMAGE)
+        result = self.invoke(arguments=command)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn(f"Artifact smoke passed: {APPIMAGE}", result.stdout)
+        by_name = {arguments[-2]: arguments for arguments in self.recorded()}
+        self.assertEqual(set(by_name), {*ARTIFACTS, APPIMAGE})
+        arguments = by_name[APPIMAGE]
+        self.assertEqual(arguments[arguments.index("--uid") + 1], str(os.getuid()))
+        self.assertEqual(arguments[arguments.index("--gid") + 1], str(os.getgid()))
+        self.assertIn("/home/smoke", arguments)
+        self.assertIn("/run/fixture", arguments)
+        self.assertIn("/etc/passwd", arguments)
+        self.assertIn("/etc/group", arguments)
+        self.assertIn("--unshare-all", arguments)
+        self.assertIn("--clearenv", arguments)
+        self.assert_clean()
+
+    def test_appimage_alias_triggers_validation_even_without_appimage_flag(self):
+        (self.dist / APPIMAGE_ALIAS).write_text("stable fixture\n")
+        missing_image = self.invoke()
+        self.assertNotEqual(missing_image.returncode, 0)
+        self.assertIn(APPIMAGE, missing_image.stderr)
+        (self.dist / APPIMAGE).write_text("different versioned fixture\n")
+        mismatch = self.invoke()
+        self.assertNotEqual(mismatch.returncode, 0)
+        self.assertIn("AppImage alias differs", mismatch.stderr)
+        self.assertEqual(self.recorded(), [])
+        self.assert_clean()
 
     def test_an_interrupted_smoke_stops_every_run_before_removing_their_roots(self):
         running = self.directory / "running"
@@ -223,6 +265,8 @@ class SmokeBoundary(unittest.TestCase):
         self.assert_clean()
 
     def test_same_version_editor_with_different_bytes_fails_the_release_smoke(self):
+        (self.dist / APPIMAGE).write_text("boundary fixture only\n")
+        (self.dist / APPIMAGE_ALIAS).hardlink_to(self.dist / APPIMAGE)
         for artifact in EDITOR_ARTIFACTS[1:]:
             with self.subTest(artifact=artifact):
                 result = self.invoke(SMOKE_CONTRACT_OTHER_EDITOR=artifact)
@@ -306,7 +350,7 @@ class SmokeBoundary(unittest.TestCase):
         smoke_cache = self.directory / "old-runtime-cache"
         smoke_cache.mkdir(mode=0o700)
         marker = smoke_cache / ".cagents-release-smoke-cache"
-        marker.write_text(SMOKE_CACHE_ID.replace("v4", "v3", 1))
+        marker.write_text(SMOKE_CACHE_ID.replace("v5", "v4", 1))
         build_cache = self.directory / "build-cache"
         output = self.directory / "release-output"
 
@@ -394,9 +438,9 @@ class SmokeBoundary(unittest.TestCase):
         marker.write_text(SMOKE_CACHE_ID)
         (smoke_cache / "ubuntu-base.tar.gz").touch()
         (smoke_cache / "rootfs/opt").mkdir(parents=True)
-        (smoke_cache / "rootfs/opt/.cagents-release-smoke-provisioned-v4").write_text(SMOKE_CACHE_ID)
+        (smoke_cache / "rootfs/opt/.cagents-release-smoke-provisioned-v5").write_text(SMOKE_CACHE_ID)
         checksum = self.bin / "sha256sum"
-        checksum.write_text("#!/bin/sh\nexit 0\n")
+        checksum.write_text("#!/bin/sh\ncat >/dev/null\n")
         checksum.chmod(0o755)
         # Simulate a sandbox child that leaves the launcher's session and
         # keeps using scratch after the launcher receives TERM. Neither
@@ -582,12 +626,13 @@ class ShutdownOrdering(unittest.TestCase):
                 )
                 cli.chmod(0o755)
                 environment = os.environ | dict(
-                    PATH=f"{tools}:{os.environ['PATH']}", SMOKE_PID=str(daemon.pid), SMOKE_EPOCH=epoch,
+                    SMOKE_BIN=str(tools), SMOKE_PID=str(daemon.pid), SMOKE_EPOCH=epoch,
                     SMOKE_EXECUTABLE=executable, SMOKE_CLI=str(cli), SMOKE_SOCKET=str(endpoint),
                     SMOKE_OBSERVED=str(observed), SMOKE_PREMATURE=str(premature), SMOKE_MODE=mode,
                 )
+                # Prepend the probe after Bash startup, which can reorder PATH.
                 script = (
-                    'set -euo pipefail\npid=$SMOKE_PID\nstart=$SMOKE_EPOCH\n'
+                    'set -euo pipefail\nexport PATH="$SMOKE_BIN:$PATH"\npid=$SMOKE_PID\nstart=$SMOKE_EPOCH\n'
                     'daemon_executable=$SMOKE_EXECUTABLE\ndaemon_cli=$SMOKE_CLI\n'
                     'fail() { printf "%s\\n" "$*" >&2; exit 1; }\n'
                     + guard + shutdown.replace("/tmp/status", shlex.quote(str(directory / "status")))

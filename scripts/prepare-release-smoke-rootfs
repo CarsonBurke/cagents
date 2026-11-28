@@ -3,11 +3,11 @@
 set -euo pipefail
 
 PROGRAM=prepare-release-smoke-rootfs
-CACHE=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64"}
+CACHE=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64-v5"}
 BASE_URL=https://cdimage.ubuntu.com/ubuntu-base/releases/24.04/release/ubuntu-base-24.04.3-base-amd64.tar.gz
 BASE_SHA256=6bc2cde3930ad088b3bb46fa45279e96d25bc3810f209850ecbe4722711874f9
-CACHE_ID="cagents-release-smoke-v4 ubuntu-24.04.3 amd64 $BASE_SHA256"
-PROVISION_MARKER=.cagents-release-smoke-provisioned-v4
+CACHE_ID="cagents-release-smoke-v5 ubuntu-24.04.3 amd64 $BASE_SHA256"
+PROVISION_MARKER=.cagents-release-smoke-provisioned-v5
 fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
 while (($#)); do
     case $1 in
@@ -19,7 +19,7 @@ while (($#)); do
                 'Prepare an isolated Ubuntu 24.04 amd64 runtime with real package dependencies.' \
                 'Downloads the pinned official base and installs runtime packages using network-enabled bubblewrap.' \
                 'Prints the prepared rootfs path. Artifact smoke uses it offline and never installs on the host.' \
-                'DIR defaults to CAGENTS_RELEASE_SMOKE_CACHE or ${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64.'
+                'DIR defaults to CAGENTS_RELEASE_SMOKE_CACHE or ${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64-v5.'
             exit 0 ;;
         *) fail "unknown argument: $1" ;;
     esac
@@ -124,10 +124,12 @@ FAKEROOTDONTTRYCHOWN=1 /usr/bin/fakeroot-sysv -- /bin/sh -ec '
 # libasound2 dependency; libasound2 itself is only a virtual package there.
 apt-get -o Dir::Bin::dpkg=/usr/local/sbin/cagents-dpkg install --yes --no-install-recommends \
     ca-certificates tzdata curl git libsecret-tools libc6 libegl1 libfontconfig1 libfreetype6 libgcc-s1 libstdc++6 \
-    libwayland-client0 libxkbcommon0 libasound2t64 zlib1g xdg-utils jq fakeroot libfakeroot
+    libwayland-client0 libxkbcommon0 libasound2t64 zlib1g xdg-utils jq fakeroot libfakeroot \
+    dbus weston fonts-dejavu-core
 dpkg --compare-versions "$(dpkg-query -W -f='${Version}' git)" ge 2.36
 audit=$(dpkg --audit)
 [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; exit 1; }
+[[ -x /usr/bin/weston && -x /usr/bin/dbus-run-session ]]
 printf '%s\n' "$CAGENTS_SMOKE_CACHE_ID" > "/opt/$CAGENTS_SMOKE_PROVISION_MARKER"
 PROVISION
     timeout --signal=TERM --kill-after=10s 900s \

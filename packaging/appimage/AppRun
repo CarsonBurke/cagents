@@ -1,0 +1,62 @@
+#!/bin/bash
+set -euo pipefail
+
+fail() { printf 'cagents AppImage: %s\n' "$*" >&2; exit 1; }
+appdir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)
+IFS= read -r version < "$appdir/VERSION"
+stable='(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)'
+[[ $version =~ ^$stable$ ]] || fail 'invalid bundled version'
+: "${HOME:?HOME is not set}"
+data_home=${XDG_DATA_HOME:-"$HOME/.local/share"}
+[[ $HOME == /* && $data_home == /* ]] || fail 'HOME and XDG_DATA_HOME must be absolute'
+prefix=$data_home/cagents-install
+current=$prefix/current
+uid=$(id -u)
+[[ $uid != 0 ]] || fail 'open the AppImage from your ordinary user account'
+[[ ! -L $prefix && ! -L $prefix/versions ]] || fail 'unsafe installation directory'
+owned() {
+    local metadata mode
+    metadata=$(stat -c '%u %a' -- "$1") || return 1
+    mode=${metadata#* }
+    [[ ${metadata%% *} == "$uid" && $mode =~ ^[0-7]{3,4}$ ]] &&
+        (( (8#$mode & 0022) == 0 ))
+}
+
+# Only the installer inherits the local archive paths. The installed app
+# must remain usable after the AppImage is unmounted or deleted.
+unset APPIMAGE APPDIR OWD ARGV0
+expected=-
+if [[ -e $current || -L $current ]]; then
+    [[ -L $current ]] || fail 'invalid installed selection'
+    expected=$(readlink -- "$current")
+    [[ $expected =~ ^versions/$stable([+][0-9A-Za-z.-]+)?$ ]] ||
+        fail 'unrecognized installed version'
+    existing=$prefix/$expected
+    marker=$prefix/.cagents-install-root
+    [[ -f $marker && ! -L $marker && $(stat -c %s -- "$marker") -le 64 &&
+        -d $existing && ! -L $existing && ! -L $existing/bin &&
+        -f $existing/bin/cagents && ! -L $existing/bin/cagents && -x $existing/bin/cagents ]] ||
+        fail 'incomplete installed version'
+    for path in "$prefix" "$prefix/versions" "$existing" "$existing/bin" "$existing/bin/cagents" "$marker"; do
+        owned "$path" || fail 'the installation is not privately owned'
+    done
+    [[ $(cat -- "$marker") == 'cagents install root' ]] || fail 'unrecognized installation marker'
+    installed=${expected#versions/}
+    installed=${installed%%+*}
+    newest=$(printf '%s\n' "$version" "$installed" | LC_ALL=C sort -V | tail -n 1)
+    if [[ $newest == "$installed" ]]; then
+        exec "$existing/bin/cagents" ui "$@"
+    fi
+    # Even a cold install needs its existing window open before staging.
+    # That window sees the staged installation and offers the usual review.
+    "$existing/bin/cagents" ui "$@"
+fi
+
+CAGENTS_ARCHIVE=$appdir/cagents-$version-x86_64-unknown-linux-gnu.tar.gz \
+    CAGENTS_CHECKSUMS=$appdir/SHA256SUMS \
+    sh "$appdir/install.sh" --version "$version" --prefix "$prefix" \
+        --stage-only --appimage-current "$expected"
+
+if [[ $expected == - ]]; then
+    exec "$current/bin/cagents" ui "$@"
+fi

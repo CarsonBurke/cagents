@@ -54,14 +54,14 @@ if [[ ${1:-} == --provision ]]; then
         libgbm-dev libgl1-mesa-dev libssl-dev libudev-dev libwayland-dev \
         libxkbcommon-dev ninja-build pkg-config python3 xz-utils libasound2-dev bzip2 \
         appstream desktop-file-utils dpkg-dev jq fakeroot libfakeroot libcurl4-openssl-dev \
-        dbus
+        dbus squashfs-tools
     audit=$(dpkg --audit)
     [[ -z $audit ]] || { printf '%s\n' "$audit" >&2; fail 'unfinished build dependencies'; }
     [[ -x /usr/bin/clang && -x /usr/bin/clang++ && -d /usr/lib/llvm-14/lib ]]
     # Earlier marked roots already contain the checksum-pinned toolchains.
     # Upgrade runtime/build prerequisites without downloading them again.
     if [[ ! -f /opt/.cagents-release-provisioned-v2 && ! -f /opt/.cagents-release-provisioned-v3 \
-        && ! -f /opt/.cagents-release-provisioned-v4 ]]; then
+        && ! -f /opt/.cagents-release-provisioned-v4 && ! -f /opt/.cagents-release-provisioned-v5 ]]; then
         # Install the three official, version-pinned Rust components directly;
         # no mutable rustup bootstrap or host toolchain is involved.
         for component in rustc cargo rust-std; do
@@ -108,8 +108,10 @@ if [[ ${1:-} == --provision ]]; then
     [[ $(/usr/bin/git --version) == 'git version 2.55.0' ]]
     [[ -x /usr/bin/dbus-run-session ]]
     [[ -r /usr/share/zoneinfo/UTC && -r /usr/share/zoneinfo/America/Vancouver ]]
+    mkdir -p /opt/appimage
+    /bin/bash /prepare-appimage-runtime /opt/appimage/runtime-x86_64
     printf '%s\n' 'Ubuntu 22.04; Rust 1.93.0; Zig 0.15.2; Git 2.55.0; system Git diverted' \
-        > /opt/.cagents-release-provisioned-v5
+        > /opt/.cagents-release-provisioned-v6
     exit 0
 fi
 
@@ -199,6 +201,12 @@ done
 # scripts/build-release-linux), so the signature covers every one of them.
 sed -i "s|^DEFAULT_REPOSITORY='<OWNER>/<REPO>'$|DEFAULT_REPOSITORY='CarsonBurke/cagents'|" /dist/install.sh
 grep -Fqx "DEFAULT_REPOSITORY='CarsonBurke/cagents'" /dist/install.sh
+appimage=()
+if [[ -x ./scripts/package-appimage ]]; then
+    ./scripts/package-appimage "$VERSION" /dist /dist/install.sh /opt/appimage/runtime-x86_64
+    appimage=("cagents-$VERSION-x86_64.AppImage" cagents-x86_64.AppImage)
+    ln -T -- "/dist/${appimage[0]}" "/dist/${appimage[1]}"
+fi
 
 staging=$(mktemp -d)
 trap 'rm -rf -- "$staging"' EXIT
@@ -300,12 +308,12 @@ settings_path=$(XDG_CONFIG_HOME="$editor_config" "$editor_root/bin/ceditor" --se
         "cagents-browserless-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
         "cagents-browserless_${VERSION}_${DEB_ARCH}.deb" "cagents-browserless-$VERSION-sizes.txt" \
         "ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" \
-        SHA256SUMS-browserless SHA256SUMS-ceditor install.sh > SHA256SUMS
+        SHA256SUMS-browserless SHA256SUMS-ceditor install.sh "${appimage[@]}" > SHA256SUMS
     sha256sum --check --strict SHA256SUMS
     sha256sum --check --strict SHA256SUMS-browserless
     sha256sum --check --strict SHA256SUMS-ceditor
     shopt -s nullglob dotglob
     assets=(*)
-    ((${#assets[@]} == 12)) || fail 'expected exactly 12 release assets'
+    ((${#assets[@]} == 12 + ${#appimage[@]})) || fail 'unexpected release asset count'
 )
 printf 'Verified all local release assets for %s at source %s\n' "$VERSION" "$SOURCE_COMMIT"
