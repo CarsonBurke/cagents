@@ -27,6 +27,7 @@ mod resume;
 pub(super) use resume::resume_after_boot;
 pub(super) mod terminals;
 mod transcript;
+pub(super) use transcript::Rollouts;
 pub(super) mod working_directory;
 pub(super) use ownership::{
     Reconciliation, cancel_agent_run_under_control, interactive, reconcile_agent_run_under_control,

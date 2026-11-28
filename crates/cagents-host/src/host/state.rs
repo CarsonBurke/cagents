@@ -384,6 +384,8 @@ pub(crate) struct HostState {
     pub(super) automations: Option<super::automations::Handle>,
     /// Answers Work board reads; absent before startup and after shutdown.
     pub(super) work: Option<super::work::Handle>,
+    /// Recent parsed Codex transcripts shared by the daemon's request workers.
+    pub(super) rollouts: Arc<super::agent_execution::Rollouts>,
     /// The connections watching the device's load, and its sampler.
     pub(super) device_stats: super::device_stats::Watch,
     /// Wakes the courier that hands messages to idle conversations.
@@ -597,6 +599,7 @@ impl HostState {
             peers: Default::default(),
             automations: None,
             work: None,
+            rollouts: Arc::default(),
             device_stats: Default::default(),
             mailbox: None,
             mailbox_seal: None,

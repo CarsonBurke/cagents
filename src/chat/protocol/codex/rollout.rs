@@ -13,7 +13,7 @@
 
 use std::{
     collections::HashMap,
-    fs::File,
+    fs::{File, Metadata},
     io::{BufRead, BufReader, Read},
     path::Path,
 };
@@ -48,14 +48,41 @@ const HARNESS_CONTEXT: &[&str] = &[
 
 /// Every item in the rollout at `path`, oldest first.
 pub fn read(path: &Path) -> Result<Vec<Item>, String> {
-    let (file, len) = open(path)?;
-    if len > MAX_ROLLOUT {
-        return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());
-    }
-    Ok(parse(file.take(MAX_ROLLOUT)))
+    Ok(Rollout::open(path)?.read().0)
 }
 
-fn open(path: &Path) -> Result<(File, u64), String> {
+/// One securely opened rollout and the file version we observed on opening it.
+pub struct Rollout {
+    file: File,
+    metadata: Metadata,
+}
+
+impl Rollout {
+    pub fn open(path: &Path) -> Result<Self, String> {
+        let (file, metadata) = open(path)?;
+        if metadata.len() > MAX_ROLLOUT {
+            return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());
+        }
+        Ok(Self { file, metadata })
+    }
+
+    pub fn metadata(&self) -> &Metadata {
+        &self.metadata
+    }
+
+    /// Reads up to the opening length. Return closing metadata only when the
+    /// whole span was read, so a partial read cannot seed a reusable snapshot.
+    pub fn read(self) -> (Vec<Item>, Option<Metadata>) {
+        let mut reader = (&self.file).take(self.metadata.len());
+        let items = parse(&mut reader);
+        let finished = (reader.limit() == 0)
+            .then(|| self.file.metadata().ok())
+            .flatten();
+        (items, finished)
+    }
+}
+
+fn open(path: &Path) -> Result<(File, Metadata), String> {
     use std::os::unix::fs::OpenOptionsExt as _;
     crate::secure_file::reject_symlink_components(path).map_err(|error| error.to_string())?;
     let file = std::fs::OpenOptions::new()
@@ -67,7 +94,7 @@ fn open(path: &Path) -> Result<(File, u64), String> {
     if !metadata.is_file() {
         return Err("The Codex rollout must be a regular file smaller than 256 MiB".into());
     }
-    Ok((file, metadata.len()))
+    Ok((file, metadata))
 }
 
 /// An opening prompt for a resumed thread whose newest history page doesn't
@@ -75,8 +102,8 @@ fn open(path: &Path) -> Result<(File, u64), String> {
 /// user text that names the conversation.
 pub(super) fn opening_title(home: &Path, id: &str) -> Option<crate::chat::OpeningTitle> {
     let path = crate::agent::codex_rollout(home, id).ok()?;
-    let (file, len) = open(&path).ok()?;
-    let mut reader = BufReader::new(file.take(len.min(OPENING_BYTES)));
+    let (file, metadata) = open(&path).ok()?;
+    let mut reader = BufReader::new(file.take(metadata.len().min(OPENING_BYTES)));
     let mut line = Vec::new();
     let mut exact = false;
     let mut fallback = None;
