@@ -1,17 +1,10 @@
 //! `cagents device update`: bring a saved device to the build this computer
 //! runs, so its windows and commands can reach the device's daemon again.
 //!
-//! The window speaks the daemon's internal protocol through the bridge, so the
-//! two must match. Rather than ask for a matched install on both computers,
-//! this ships the installed version tree this computer runs over the device's
-//! own SSH connection, stages it there with that build's installer, and hands
-//! the device's daemon over with the device's reviewed `daemon upgrade`, which
-//! carries its terminals across. Only the version tree is sent: no settings,
-//! state or credentials. See docs/devices.md#updating-a-device.
-//!
-//! The device may run any older build, so nothing here relies on its CLI
-//! beyond `daemon protocol-version` and the update it stages: the facts come
-//! from a POSIX shell script.
+//! The window and the daemon must speak the same protocol. Linux receives
+//! the desktop's installed build over SSH. Apple Silicon uses its own
+//! verified, matching release and runs its installed updater over SSH.
+//! Both routes use the device's update review. See docs/devices.md#updating-a-device.
 
 use std::{
     fs,
@@ -33,6 +26,11 @@ const INSTALLER: &str = include_str!("../../install.sh");
 /// the version it was staged beside.
 const STAGED_MARKER: &str = ".cagents-local-candidate-v1";
 const TARGET: &str = "x86_64-unknown-linux-gnu";
+const LINUX_BUILD: bool = cfg!(all(
+    target_os = "linux",
+    target_arch = "x86_64",
+    target_env = "gnu"
+));
 /// zlib level for the archive. Level 1 compresses this tree at several
 /// hundred MB/s to within a few percent of level 6, which needs seconds more
 /// than it saves on a local network.
@@ -114,15 +112,19 @@ pub fn check(device: &Device) -> io::Result<(Check, Option<String>)> {
         return Ok((Check::Newer { protocol }, None));
     }
     let plan = plan(device, &local, &remote, &daemon)?;
+    verify_mac_release(device, &local.version, &plan.action)?;
     let check = match plan.action {
         Action::Nothing => Check::Compatible,
         Action::Install { upgrade: false, .. } => Check::Install,
-        Action::Install { .. } | Action::Upgrade { .. } => Check::Update {
-            protocol: match daemon {
-                Daemon::Speaks(protocol) => Some(protocol),
-                _ => remote.protocol,
-            },
-        },
+        Action::Install { .. } | Action::Upgrade { .. } | Action::MacRelease { .. } => {
+            Check::Update {
+                protocol: match daemon {
+                    Daemon::Speaks(protocol) => Some(protocol),
+                    _ => remote.protocol,
+                },
+            }
+        }
+        Action::MacInstaller => unreachable!("Installer requirement was reported by verification"),
     };
     Ok((check, plan.note))
 }
@@ -140,12 +142,13 @@ pub fn update(
     let remote = Remote::probe(&session, device, &local.version)?;
     let daemon = daemon_state();
     let plan = plan(device, &local, &remote, &daemon)?;
+    let mac_release = verify_mac_release(device, &local.version, &plan.action)?;
     if let Some(note) = &plan.note {
         progress(Step::Note(note));
     }
     let hands_over = matches!(
         plan.action,
-        Action::Upgrade { .. } | Action::Install { upgrade: true, .. }
+        Action::Upgrade { .. } | Action::MacRelease { .. } | Action::Install { upgrade: true, .. }
     );
     // Refuse before sending anything when nobody can answer the review.
     if hands_over && !options.yes && !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
@@ -160,7 +163,8 @@ pub fn update(
                 running: daemon == Daemon::Compatible,
             });
         }
-        Action::Upgrade { .. } => None,
+        Action::Upgrade { .. } | Action::MacRelease { .. } => None,
+        Action::MacInstaller => unreachable!("Installer requirement was reported by verification"),
         Action::Install { prefix, .. } => {
             let sent = session.upload_and_stage(&local, prefix, progress)?;
             Some(sent)
@@ -175,13 +179,33 @@ pub fn update(
         Action::Install { prefix, .. } => {
             format!("{prefix}/versions/{}/bin/cagents", local.version)
         }
-        Action::Upgrade { cli } => cli,
-        Action::Nothing => unreachable!("returned above"),
+        Action::Upgrade { cli } | Action::MacRelease { cli } => cli,
+        Action::Nothing | Action::MacInstaller => unreachable!("returned above"),
     };
     progress(Step::Upgrading);
-    session.upgrade(device, &cli, options)?;
+    let release = mac_release
+        .as_deref()
+        .map(|digest| (local.version.as_str(), digest));
+    session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
     match daemon_state() {
+        Daemon::Stopped if release.is_some() => {
+            let selected = Remote::probe(&session, device, &local.version)?;
+            if selected.protocol == Some(PROTOCOL_VERSION)
+                && selected
+                    .installation
+                    .and_then(|found| found.current)
+                    .as_deref()
+                    == Some(&local.version)
+            {
+                Ok(Outcome::Updated { sent })
+            } else {
+                Err(io::Error::other(format!(
+                    "Could not verify the installed update on {}",
+                    device.name
+                )))
+            }
+        }
         Daemon::Compatible | Daemon::Stopped => Ok(Outcome::Updated { sent }),
         Daemon::Speaks(actual) => Err(io::Error::other(format!(
             "{name}'s update finished, but its daemon still speaks protocol {actual}, not {PROTOCOL_VERSION}. Run `cagents --device {name} daemon status` to see what it runs.",
@@ -194,6 +218,35 @@ pub fn update(
     }
 }
 
+fn verify_mac_release(
+    device: &Device,
+    version: &str,
+    action: &Action,
+) -> io::Result<Option<String>> {
+    if !matches!(action, Action::MacRelease { .. } | Action::MacInstaller) {
+        return Ok(None);
+    }
+    let digest = crate::update::macos_device_release_digest(version).map_err(|error| {
+        io::Error::other(format!(
+            "Could not verify the Apple Silicon release for {}: {error}",
+            device.name
+        ))
+    })?;
+    if *action == Action::MacInstaller {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!(
+                "Install cagents {version} on {} with the macOS installer before reconnecting. Run this on the Mac:
+
+{}",
+                device.name,
+                crate::update::installer_command(Some(version)),
+            ),
+        ));
+    }
+    Ok(Some(digest))
+}
+
 /// The installed build this executable belongs to.
 struct Local {
     version: String,
@@ -202,14 +255,10 @@ struct Local {
 
 impl Local {
     fn current() -> io::Result<Self> {
-        if !cfg!(all(
-            target_os = "linux",
-            target_arch = "x86_64",
-            target_env = "gnu"
-        )) {
+        if !(LINUX_BUILD || cfg!(all(target_os = "macos", target_arch = "aarch64"))) {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
-                "Updating a device is supported from Linux x86_64 installations",
+                "Device updates need an installed cagents build for x86-64 Linux or Apple Silicon macOS",
             ));
         }
         let executable = crate::process::current_executable()?;
@@ -217,7 +266,7 @@ impl Local {
             io::Error::new(
                 io::ErrorKind::Unsupported,
                 format!(
-                    "This cagents ({}) is not an installed build, so it has nothing to send to a device. Install it with install.sh or scripts/install-local, then run the installed `cagents device update`.",
+                    "This cagents ({}) is not an installed build, so it has nothing to send to a device. Install cagents for this computer, then run its installed CLI.",
                     executable.display()
                 ),
             )
@@ -321,6 +370,8 @@ struct Remote {
     off_path: bool,
     default_prefix: String,
     installation: Option<Installation>,
+    /// The installed Mac can require a particular verified release digest.
+    signed_release_updates: bool,
     /// What `daemon protocol-version` of the device's CLI printed.
     protocol: Option<u16>,
 }
@@ -341,11 +392,35 @@ struct Installation {
 
 const PROBE: &str = r#"
 field() { printf '%s=%s\n' "$1" "$2"; }
-field os "$(uname -s)"
+resolve_macos_cli() {
+    file=$1
+    case $file in /*) ;; *) file=$PWD/$file ;; esac
+    remaining=40
+    while [ "$remaining" -gt 0 ]; do
+        directory=$(CDPATH= cd -P "${file%/*}/" && pwd -P) || return 1
+        file=${directory%/}/${file##*/}
+        if [ ! -L "$file" ]; then
+            [ -x "$file" ] || return 1
+            printf '%s\n' "$file"
+            return
+        fi
+        link=$(readlink "$file") || return 1
+        case $link in /*) file=$link ;; *) file=$directory/$link ;; esac
+        remaining=$((remaining - 1))
+    done
+    return 1
+}
+os=$(uname -s)
+field os "$os"
 field arch "$(uname -m)"
-field glibc "$(getconf GNU_LIBC_VERSION 2>/dev/null)"
 field home "$HOME"
-prefix=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
+case $os in
+    Darwin) prefix="$HOME/Library/Application Support/cagents-install" ;;
+    *)
+        field glibc "$(getconf GNU_LIBC_VERSION 2>/dev/null)"
+        prefix=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
+        ;;
+esac
 field default_prefix "$prefix"
 path=$(command -v "$exe" 2>/dev/null) || path=
 if [ -z "$path" ] && [ -x "$prefix/current/bin/cagents" ]; then
@@ -353,7 +428,12 @@ if [ -z "$path" ] && [ -x "$prefix/current/bin/cagents" ]; then
     field off_path 1
 fi
 resolved=
-[ -z "$path" ] || resolved=$(readlink -f "$path" 2>/dev/null) || resolved=
+if [ -n "$path" ]; then
+    case $os in
+        Darwin) resolved=$(resolve_macos_cli "$path" 2>/dev/null) || resolved= ;;
+        *) resolved=$(readlink -f "$path" 2>/dev/null) || resolved= ;;
+    esac
+fi
 field resolved "$resolved"
 case $resolved in
     */versions/*/bin/cagents)
@@ -369,7 +449,14 @@ case $resolved in
         fi
         ;;
 esac
-[ -z "$resolved" ] || field protocol "$("$resolved" daemon protocol-version 2>/dev/null)"
+if [ -n "$resolved" ]; then
+    field protocol "$("$resolved" daemon protocol-version 2>/dev/null)"
+    if [ "$os" = Darwin ] && [ -f "$prefix/.cagents-install-root" ] &&
+        "$prefix/current/bin/cagents" daemon upgrade --help 2>/dev/null | grep -q -e --require-release
+    then
+        field signed_release_updates 1
+    fi
+fi
 "#;
 
 impl Remote {
@@ -407,6 +494,7 @@ impl Remote {
                 "off_path" => remote.off_path = value == "1",
                 "resolved" => remote.resolved = some(value),
                 "protocol" => remote.protocol = value.trim().parse().ok(),
+                "signed_release_updates" => remote.signed_release_updates = value == "1",
                 "prefix" => {
                     installation = Some(Installation {
                         prefix: value.to_owned(),
@@ -439,6 +527,12 @@ enum Action {
     Upgrade {
         cli: String,
     },
+    /// Let the installed Mac fetch and apply a specific signed release.
+    MacRelease {
+        cli: String,
+    },
+    /// This Mac needs the supported manual installer entry point.
+    MacInstaller,
     /// Send the build, stage it under `prefix`, then hand the daemon over
     /// unless there was no installation to hand over from.
     Install {
@@ -457,6 +551,7 @@ struct Plan {
 /// from the files it reads to learn them.
 trait Build {
     fn version(&self) -> &str;
+    fn can_send_linux(&self) -> bool;
     fn required_glibc(&self) -> io::Result<Option<(Vec<u32>, String)>>;
 }
 
@@ -464,6 +559,10 @@ impl Build for Local {
     fn version(&self) -> &str {
         &self.version
     }
+    fn can_send_linux(&self) -> bool {
+        LINUX_BUILD
+    }
+
     fn required_glibc(&self) -> io::Result<Option<(Vec<u32>, String)>> {
         Local::required_glibc(self)
     }
@@ -510,11 +609,54 @@ fn plan(device: &Device, local: &dyn Build, remote: &Remote, daemon: &Daemon) ->
             "{name} has a newer cagents (protocol {actual}) than this computer (protocol {PROTOCOL_VERSION}). A device is never downgraded; update cagents on this computer, then connect again."
         ));
     }
+    if remote.os == "Darwin" && remote.arch == "arm64" {
+        let installed_link = format!("{}/.local/bin/cagents", remote.home);
+        let installation = remote.installation.as_ref().filter(|found| found.marked);
+        if let Some(current) = installation.and_then(|found| found.current.as_deref()) {
+            let selected = semver::Version::parse(current).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Could not compare the version selected on {name}: {current}"),
+                )
+            })?;
+            let desired = semver::Version::parse(version).map_err(io::Error::other)?;
+            match selected.cmp_precedence(&desired) {
+                std::cmp::Ordering::Greater => {
+                    return refuse(format!(
+                        "{name} already selects cagents {current}. Update this computer before reconnecting."
+                    ));
+                }
+                std::cmp::Ordering::Equal => {
+                    return refuse(format!(
+                        "{name} already selects cagents {current}, but the serving daemon could not be verified with it. Review the installation on the Mac before reconnecting."
+                    ));
+                }
+                std::cmp::Ordering::Less => {}
+            }
+        }
+        let action = match installation {
+            Some(installation) if remote.signed_release_updates => Action::MacRelease {
+                cli: format!("{}/current/bin/cagents", installation.prefix),
+            },
+            _ => Action::MacInstaller,
+        };
+        return Ok(Plan {
+            action,
+            note: remote
+                .off_path
+                .then(|| unreachable_note(device, &installed_link)),
+        });
+    }
     if remote.os != "Linux" || remote.arch != "x86_64" {
         return refuse(format!(
-            "{name} is a {} {} computer; this computer can send its build only to Linux x86_64. Install cagents there for its own platform.",
+            "{name} is a {} {} computer. Device updates support x86-64 Linux with glibc and Apple Silicon macOS.",
             remote.os, remote.arch
         ));
+    }
+    if !local.can_send_linux() {
+        return refuse(
+            "Updating a Linux device needs an installed x86-64 Linux build on this computer".into(),
+        );
     }
     let Some(theirs) = &remote.glibc else {
         return refuse(format!(
@@ -839,9 +981,22 @@ impl Session {
 
     /// Hands the device's daemon over to the staged build through its own
     /// reviewed update. A person at a terminal answers its review there.
-    fn upgrade(&self, device: &Device, cli: &str, options: Options) -> io::Result<()> {
+    fn upgrade(
+        &self,
+        device: &Device,
+        cli: &str,
+        release: Option<(&str, &str)>,
+        options: Options,
+    ) -> io::Result<()> {
         let interactive = !options.yes;
         let mut remote = format!("{} daemon upgrade", quote(cli));
+        if let Some((version, digest)) = release {
+            remote.push_str(&format!(
+                " --version {} --require-release {} --require-protocol {PROTOCOL_VERSION}",
+                quote(version),
+                quote(digest)
+            ));
+        }
         if options.yes {
             remote.push_str(" --yes");
         }
@@ -860,8 +1015,13 @@ impl Session {
         command.args(["--", &self.host, &remote]);
         let status = command.stderr(Stdio::inherit()).status()?;
         if !status.success() {
+            let staged = if release.is_some() {
+                ""
+            } else {
+                " The build stays staged there, so retrying sends nothing."
+            };
             return Err(io::Error::other(format!(
-                "{name}'s daemon was not handed over to cagents {version}; its update said why above. The build stays staged there, so running `cagents device update {name}` again sends nothing.",
+                "{name}'s daemon did not switch to cagents {version}. The device reported the reason above.{staged}",
                 name = device.name,
                 version = crate::version()
             )));

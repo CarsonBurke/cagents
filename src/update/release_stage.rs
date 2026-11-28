@@ -139,6 +139,20 @@ pub(super) fn extract_and_exec(
     let archive_name = format!("cagents-{}", release.version);
     let source = stage_dir.path().join(&archive_name);
     let digest = programs_digest(&source)?;
+    if let Some(expected) = release.required_protocol {
+        let staged = candidate::Staged::from_installed(
+            source.join("bin/cagents"),
+            release.version.clone(),
+            digest.clone(),
+            cancellation,
+        )?;
+        let actual = staged.identity.protocol;
+        if actual != expected {
+            return Err(invalid(format!(
+                "The downloaded cagents build speaks protocol {actual}; this device update requires {expected}"
+            )));
+        }
+    }
     for binary in PROGRAMS {
         File::open(source.join("bin").join(binary))?.sync_all()?;
     }
@@ -331,6 +345,7 @@ mod tests {
             url: String::new(),
             notes: String::new(),
             metadata: [0; 32],
+            required_protocol: None,
             installer: asset.clone(),
             archive: asset.clone(),
             checksums: asset,

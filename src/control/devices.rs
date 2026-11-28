@@ -40,7 +40,7 @@ pub enum DeviceCommand {
     },
     /// Bring a device to this computer's cagents build so it can connect.
     #[command(
-        after_help = "Sends this computer's installed build over SSH, installs it beside the device's with its own installer, and hands the device's daemon over through the device's update review, so its terminals keep running. Nothing is sent when the device already has the build. A device running a newer build is never downgraded. Run it in a system terminal outside cagents."
+        after_help = "Stages this computer's build on Linux or uses the matching signed release on Apple Silicon. The device reviews the handover so work can continue. Use --check to see whether the Mac needs the installer first."
     )]
     Update {
         /// A device name from devices.json.

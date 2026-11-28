@@ -37,20 +37,33 @@ const GENERATIONS: [(&str, &str); GENERATION] = [
 ];
 const SCHEMA: u32 = 2;
 const PRODUCT: &str = "cagents";
-/// The release target this build installs, and the installer and checksum
-/// file its metadata entry names. A release carries each platform's whole.
+#[derive(Clone, Copy)]
+struct Platform {
+    target: &'static str,
+    installer: &'static str,
+    checksums: &'static str,
+}
+
+const APPLE_SILICON: Platform = Platform {
+    target: "aarch64-apple-darwin",
+    installer: "install-macos.sh",
+    checksums: "SHA256SUMS-macos",
+};
 #[cfg(not(target_os = "macos"))]
-const TARGET: &str = "x86_64-unknown-linux-gnu";
-#[cfg(not(target_os = "macos"))]
-const INSTALLER: &str = "install.sh";
-#[cfg(not(target_os = "macos"))]
-const CHECKSUMS: &str = "SHA256SUMS";
+const NATIVE: Platform = Platform {
+    target: "x86_64-unknown-linux-gnu",
+    installer: "install.sh",
+    checksums: "SHA256SUMS",
+};
 #[cfg(target_os = "macos")]
-const TARGET: &str = "aarch64-apple-darwin";
-#[cfg(target_os = "macos")]
-const INSTALLER: &str = "install-macos.sh";
-#[cfg(target_os = "macos")]
-const CHECKSUMS: &str = "SHA256SUMS-macos";
+const NATIVE: Platform = APPLE_SILICON;
+
+#[cfg(test)]
+const TARGET: &str = NATIVE.target;
+#[cfg(test)]
+const INSTALLER: &str = NATIVE.installer;
+#[cfg(test)]
+const CHECKSUMS: &str = NATIVE.checksums;
 /// A private feed for rehearsing updates: an `https://` URL or `file://`
 /// directory with the public layout. Only development and rehearsal builds
 /// read it, so the environment cannot redirect a published build's updates.
@@ -67,6 +80,7 @@ struct Metadata {
     schema_version: u32,
     repository: String,
     version: String,
+    protocol: Option<u16>,
     #[serde(default)]
     notes: String,
     assets: BTreeMap<String, AssetDigest>,
@@ -149,6 +163,25 @@ impl Feed {
         version: &str,
         cancellation: &CancellationToken,
     ) -> Result<Release, UpdateError> {
+        self.release_for(version, NATIVE, None, cancellation)
+    }
+
+    pub(super) fn macos_for_protocol(
+        &self,
+        version: &str,
+        protocol: u16,
+        cancellation: &CancellationToken,
+    ) -> Result<Release, UpdateError> {
+        self.release_for(version, APPLE_SILICON, Some(protocol), cancellation)
+    }
+
+    fn release_for(
+        &self,
+        version: &str,
+        platform: Platform,
+        required_protocol: Option<u16>,
+        cancellation: &CancellationToken,
+    ) -> Result<Release, UpdateError> {
         let directory = format!("download/v{version}");
         let (metadata, signature) =
             self.fetch_metadata(&directory, cancellation)?
@@ -177,7 +210,7 @@ impl Feed {
         let signature = String::from_utf8(signature)
             .map_err(|_| invalid("the release signature is malformed"))?;
         signature::verify(&metadata, &signature, &self.keys)?;
-        let release = self.parse(&metadata)?;
+        let release = self.parse_for(&metadata, platform, required_protocol)?;
         if release.version != version {
             return Err(invalid(
                 "the release's signed metadata names a different version",
@@ -219,7 +252,17 @@ impl Feed {
         Ok(None)
     }
 
+    #[cfg(test)]
     fn parse(&self, bytes: &[u8]) -> Result<Release, UpdateError> {
+        self.parse_for(bytes, NATIVE, None)
+    }
+
+    fn parse_for(
+        &self,
+        bytes: &[u8],
+        platform: Platform,
+        required_protocol: Option<u16>,
+    ) -> Result<Release, UpdateError> {
         let metadata: Metadata = serde_json::from_slice(bytes)?;
         if metadata.schema_version != SCHEMA {
             return Err(invalid(format!(
@@ -232,16 +275,32 @@ impl Feed {
         }
         let version = metadata.version;
         stable_version(&version)?;
+        if let Some(expected) = required_protocol
+            && metadata.protocol != Some(expected)
+        {
+            let actual = metadata.protocol.map_or_else(
+                || "no daemon protocol".to_owned(),
+                |n| format!("daemon protocol {n}"),
+            );
+            return Err(invalid(format!(
+                "The signed release for cagents {version} declares {actual}; this computer needs protocol {expected}"
+            )));
+        }
+        let Platform {
+            target,
+            installer,
+            checksums,
+        } = platform;
         let product = metadata
             .targets
             .iter()
-            .find(|target| target.target == TARGET)
+            .find(|entry| entry.target == target)
             .and_then(|target| target.products.get(PRODUCT))
-            .ok_or_else(|| invalid(format!("the release has no {TARGET} build")))?;
-        let archive_name = format!("{PRODUCT}-{version}-{TARGET}.tar.gz");
+            .ok_or_else(|| invalid(format!("the release has no {target} build")))?;
+        let archive_name = format!("{PRODUCT}-{version}-{target}.tar.gz");
         if product.archive != archive_name
-            || product.installer.as_deref() != Some(INSTALLER)
-            || product.checksums != CHECKSUMS
+            || product.installer.as_deref() != Some(installer)
+            || product.checksums != checksums
         {
             return Err(invalid("release metadata names unexpected files"));
         }
@@ -267,9 +326,10 @@ impl Feed {
             },
             notes: metadata.notes,
             metadata: Sha256::digest(bytes).into(),
+            required_protocol,
             archive: asset(&archive_name, ARCHIVE_LIMIT)?,
-            checksums: asset(CHECKSUMS, SMALL_ASSET_LIMIT)?,
-            installer: asset(INSTALLER, SMALL_ASSET_LIMIT)?,
+            checksums: asset(checksums, SMALL_ASSET_LIMIT)?,
+            installer: asset(installer, SMALL_ASSET_LIMIT)?,
             version,
         })
     }
@@ -459,7 +519,7 @@ fn read_all(mut file: File) -> Result<Vec<u8>, UpdateError> {
     Ok(bytes)
 }
 
-fn parse_digest(text: &str) -> Result<[u8; 32], UpdateError> {
+pub(super) fn parse_digest(text: &str) -> Result<[u8; 32], UpdateError> {
     let bytes = text.as_bytes();
     if bytes.len() != 64 {
         return Err(invalid("invalid SHA-256 digest"));
@@ -581,6 +641,42 @@ mod tests {
         assert_eq!(release.archive.size, 100);
         assert_eq!(release.installer.size, 300);
         assert_eq!(release.checksums.sha256, [0xab; 32]);
+    }
+
+    #[test]
+    fn apple_silicon_device_release_requires_the_signed_desktop_protocol_and_mac_assets() {
+        let parse = |value: &serde_json::Value| {
+            feed().parse_for(
+                &serde_json::to_vec(value).unwrap(),
+                APPLE_SILICON,
+                Some(195),
+            )
+        };
+        let mut value = metadata("0.2.0");
+        assert_eq!(
+            parse(&value).unwrap().installer.name,
+            APPLE_SILICON.installer
+        );
+        value["protocol"] = 194.into();
+        assert!(
+            parse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("protocol 194")
+        );
+        value.as_object_mut().unwrap().remove("protocol");
+        assert!(parse(&value).is_err());
+        value["protocol"] = 195.into();
+        value["assets"]
+            .as_object_mut()
+            .unwrap()
+            .remove(APPLE_SILICON.installer);
+        assert!(
+            parse(&value)
+                .unwrap_err()
+                .to_string()
+                .contains("install-macos.sh")
+        );
     }
 
     #[test]

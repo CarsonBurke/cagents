@@ -176,32 +176,25 @@ updated to match it:
 cagents device update build-host
 ```
 
-The command sends this computer's installed cagents to the device over your SSH
-connection, checks there that it arrived intact, and installs it beside the
-device's current version with the same installer a release uses. The device's daemon then
-hands over to the new version the way `cagents daemon upgrade` does locally:
-terminals keep their processes, and work that cannot be carried waits or is
-listed for your decision. Run it from a terminal to answer those prompts; pass
-`--yes` to accept the handover without prompting, and `--interrupt` to also stop
-work that would otherwise block it. A device that is already compatible is left
-alone. `--check` reports what an update would do without changing anything,
-including a device executable SSH commands would not find.
+For an x86-64 Linux device, the command sends the desktop's installed Linux
+build over SSH and checks that it arrived intact before staging it beside the
+current version. The device's glibc must meet the desktop build's requirements.
 
-It needs only SSH: the device downloads nothing, and no credentials are copied.
-It refuses, without changing the device, when:
+For an Apple Silicon Mac, the command verifies the published macOS release
+for the desktop's version and protocol. The Mac downloads the signed release
+and uses its own updater, keeping its app bundle and login item. If it needs
+the installer first, `--check` gives the command to run on the Mac.
 
-- the device runs a newer cagents than this computer (update this computer
-  instead; a device is never downgraded),
-- the device is not 64-bit x86 Linux with glibc, or its glibc is older than this
-  build requires,
-- the device's `cagents` was installed some other way, such as a distribution
-  package (update it that way), or
-- this computer runs a development build rather than an installed one.
+Both paths use the device's update review. Terminals keep their processes.
+Other work can wait until idle or require a decision. Run the command in a
+terminal to review it, or pass `--yes` to accept the safe choice. Add
+`--interrupt` to allow active work to stop. `--check` reports what would happen
+without changing the device.
 
-On a device without cagents, it installs into `~/.local/share/cagents-install`
-with links in `~/.local/bin`; set the device's `executable` to
-`~/.local/bin/cagents` if it is `cagents` and that directory is not on the
-non-interactive SSH `PATH`.
+A compatible device stays as it is. If the device runs a newer protocol,
+update the desktop before reconnecting. Use an installed desktop build and
+the release installer on the device. For a first Linux install, the device
+needs an executable path that finds `~/.local/bin/cagents` over SSH.
 
 The first device-window implementation uses Device files for remote filesystem
 and essential Git operations. The existing rich repository editor, language
