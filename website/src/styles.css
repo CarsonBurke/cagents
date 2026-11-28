@@ -185,6 +185,33 @@ kbd {
   font-size: 0.9375rem;
 }
 
+.meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: center;
+  gap: 0.75rem;
+}
+
+.platforms {
+  display: inline-flex;
+  gap: 0.25rem;
+}
+
+.platform {
+  display: inline-flex;
+  padding: 0.375rem;
+  border-radius: 0.5rem;
+  color: var(--muted);
+  transition: color 120ms ease, background-color 120ms ease;
+}
+
+.platform:hover,
+.platform:focus-visible {
+  color: var(--text);
+  background: var(--surface-raised);
+}
+
 /* Navigation */
 
 .nav {
@@ -246,6 +273,19 @@ kbd {
   flex-wrap: wrap;
   justify-content: center;
   gap: 0.75rem;
+}
+
+/* Stacked buttons share one width instead of each hugging its label. */
+@media (max-width: 480px) {
+  .actions {
+    flex-direction: column;
+    width: min(100%, 20rem);
+    margin-inline: auto;
+  }
+
+  .actions .button {
+    justify-content: center;
+  }
 }
 
 .button {

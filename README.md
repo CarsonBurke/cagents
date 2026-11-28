@@ -4,7 +4,7 @@
 
 <h1 align="center">cagents</h1>
 
-<p align="center">A native Linux workspace for coding agents.</p>
+<p align="center">A native workspace for coding agents, on Linux and macOS.</p>
 
 <p align="center">
   <a href="https://cagents.carsonburke.com/">Website</a> ·
@@ -64,19 +64,23 @@ restart the UI while your agents keep working.
 ## Install
 
 cagents runs on **Linux x86_64 with Wayland**, glibc 2.35 or newer, and Git 2.36
-or newer. The installer downloads releases with `curl`; no GitHub account is
-needed.
+or newer. A preview for **Apple Silicon Macs** on macOS 11 or newer ships with
+each release from 0.2.4. The installers download releases with `curl`; no
+GitHub account is needed.
 
-Follow the [installation guide](docs/installation.md#install-with-the-verified-installer)
-for the checksum-verified installer. It installs as your user without root.
-You can also download full or browserless Debian packages and portable archives
-from [Releases](https://github.com/CarsonBurke/cagents/releases).
+Follow the installation guide for the checksum-verified installer
+[on Linux](docs/installation.md#install-with-the-verified-installer) or
+[on a Mac](docs/installation.md#install-on-apple-silicon-macos). Both install
+as your user without root. On Linux you can also download full or browserless
+Debian packages and portable archives from
+[Releases](https://github.com/CarsonBurke/cagents/releases).
 
 Install the agent CLIs you want to use and sign in with your own accounts.
 
 ## Your first session
 
-Launch **cagents** from your application menu, or run:
+Launch **cagents** from your application menu (on a Mac, **Cagents** is in the
+Applications folder of your home folder), or run:
 
 ```sh
 cagents ui
@@ -90,7 +94,10 @@ Choose **New tab → Resume conversation** to reopen a saved chat, including
 conversations from configured provider history. Move between panes with
 `Alt+Q` and `Alt+R` (or `Ctrl+PageUp` and `Ctrl+PageDown`); resize the focused
 pane with `Alt+W`.
-The [user guide](docs/user-guide.md#navigation) covers the rest of the workspace
+On a Mac, move between panes with `Cmd+Option+Left` and `Cmd+Option+Right`,
+and change the focused pane's width with `Cmd+Option+R`. The command palette
+shows each action's shortcut, and the
+[user guide](docs/user-guide.md#navigation) covers the rest of the workspace
 and its shortcuts.
 
 To inspect the daemon and its terminals:
