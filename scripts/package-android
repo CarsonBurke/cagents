@@ -1,0 +1,276 @@
+#!/usr/bin/python3 -I
+"""Build Android release assets on the build host, or verify them offline."""
+
+import argparse
+import hashlib
+import os
+from pathlib import Path
+import re
+import shutil
+import socket
+import stat
+import subprocess
+import sys
+import tempfile
+import tomllib
+
+ROOT = Path(__file__).resolve().parents[1]
+PACKAGE = "dev.cagents.mobile"
+ALIAS = "cagents-android.apk"
+CHECKSUMS = "SHA256SUMS-android"
+RECEIPT = "android-build-receipt"
+UNSIGNED = Path("mobile/androidApp/build/outputs/apk/release/androidApp-release-unsigned.apk")
+
+
+class Refused(Exception):
+    pass
+
+
+def version_code(version: str) -> int:
+    if not re.fullmatch(r"(0|[1-9][0-9]{0,3})\.(0|[1-9][0-9]{0,2})\.(0|[1-9][0-9]{0,2})", version):
+        raise Refused("Android needs MAJOR.MINOR.PATCH with minor and patch below 1000")
+    major, minor, patch = map(int, version.split("."))
+    code = major * 1_000_000 + minor * 1_000 + patch
+    if not 1 <= code <= 2_100_000_000:
+        raise Refused("Android version code must be between 1 and 2100000000")
+    return code
+
+
+def apk_name(version: str) -> str:
+    return f"cagents-android-{version}.apk"
+
+
+def plain_file(path: Path):
+    if not path.is_file() or path.is_symlink() or not path.stat().st_size:
+        raise Refused(f"expected a nonempty regular file at {path}")
+
+
+def digest(path: Path) -> str:
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def build_tools() -> Path:
+    sdk = Path(os.environ.get("ANDROID_HOME") or Path.home() / "Android/Sdk")
+    tools = Path(os.environ.get("CAGENTS_ANDROID_BUILD_TOOLS") or sdk / "build-tools/36.0.0").resolve()
+    for name in ("aapt", "apksigner"):
+        if not (tools / name).is_file() or not os.access(tools / name, os.X_OK):
+            raise Refused(f"missing {name} in {tools}; set CAGENTS_ANDROID_BUILD_TOOLS")
+    return tools
+
+
+def check_identity(tools: Path, apk: Path, version: str):
+    expected_code = version_code(version)
+    badging = subprocess.check_output([tools / "aapt", "dump", "badging", apk], text=True)
+    package = re.search(r"^package: name='([^']+)' versionCode='([^']+)' versionName='([^']+)'",
+                        badging, re.MULTILINE)
+    if not package or package.groups() != (PACKAGE, str(expected_code), version):
+        raise Refused(f"APK must be {PACKAGE} with version {version} and version code {expected_code}")
+    if re.search(r"^application-debuggable\b", badging, re.MULTILINE):
+        raise Refused("APK is debuggable")
+
+
+def check_signature(tools: Path, apk: Path, signer: str):
+    signature = subprocess.check_output(
+        [tools / "apksigner", "verify", "-Werr", "--print-certs", apk], text=True,
+    )
+    fingerprints = re.findall(r"^Signer #[0-9]+ certificate SHA-256 digest: ([0-9a-f]{64})$",
+                              signature, re.MULTILINE)
+    if len(fingerprints) != 1:
+        raise Refused("APK must have exactly one verified signer")
+    if re.search(r"^Signer #1 certificate DN: .*\bCN=Android Debug(?:,|$)", signature, re.MULTILINE):
+        raise Refused("APK is signed by the Android debug key")
+    if fingerprints[0] != signer:
+        raise Refused("APK signer differs from the expected Android signing certificate")
+
+
+def checksum_manifest(directory: Path, version: str) -> str:
+    name = apk_name(version)
+    versioned = digest(directory / name)
+    if digest(directory / ALIAS) != versioned:
+        raise Refused(f"{ALIAS} differs from {name}")
+    return f"{versioned}  {name}\n{versioned}  {ALIAS}\n"
+
+
+def expected_signer() -> str:
+    fingerprint = os.environ.get("CAGENTS_ANDROID_SIGNER_SHA256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise Refused("set CAGENTS_ANDROID_SIGNER_SHA256 to the lowercase SHA-256 of the trusted Android certificate")
+    return fingerprint
+
+
+def verify_assets(directory: Path, version: str, signer: str):
+    version_code(version)
+    for name in (apk_name(version), ALIAS, CHECKSUMS):
+        plain_file(directory / name)
+    if (directory / CHECKSUMS).read_bytes() != checksum_manifest(directory, version).encode("ascii"):
+        raise Refused(f"{CHECKSUMS} does not match the two APKs")
+    tools = build_tools()
+    apk = directory / apk_name(version)
+    check_identity(tools, apk, version)
+    check_signature(tools, apk, signer)
+
+
+def git(*args: str, cwd: Path = ROOT) -> bytes:
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    return subprocess.check_output(["git", "-C", cwd, *args], env=environment)
+
+
+def private_path(path: Path, kind: int):
+    info = path.lstat()
+    if stat.S_IFMT(info.st_mode) != kind or info.st_uid != os.getuid() or info.st_mode & 0o077:
+        raise Refused(f"{path} must be owned by the build user with no group or other access")
+
+
+def signing_material(directory: Path, output: Path) -> tuple[Path, Path, str]:
+    if not directory.is_absolute():
+        raise Refused("--signing-dir must be an absolute path on the build host")
+    private_path(directory, stat.S_IFDIR)
+    directory = directory.resolve()
+    containing_checkout = subprocess.run(
+        ["git", "-C", directory, "rev-parse", "--is-inside-work-tree"],
+        capture_output=True, check=False,
+        env={key: value for key, value in os.environ.items() if not key.startswith("GIT_")},
+    )
+    if directory.is_relative_to(ROOT) or containing_checkout.stdout == b"true\n":
+        raise Refused("Android signing material must be stored outside a Git checkout")
+    if output.is_relative_to(directory):
+        raise Refused("--output must be outside the signing directory")
+    keystore, password, pin = (directory / name for name in ("release.p12", "store.pass", "signer.sha256"))
+    for path in (keystore, password, pin):
+        private_path(path, stat.S_IFREG)
+        plain_file(path)
+    if not re.fullmatch(rb"[^\0\r\n]{1,1024}\n?", password.read_bytes()):
+        raise Refused("store.pass must contain a single nonempty password line")
+    fingerprint = pin.read_text(encoding="ascii").strip()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise Refused("signer.sha256 must contain the lowercase SHA-256 of the DER certificate")
+    try:
+        certificate = subprocess.check_output([
+            "keytool", "-exportcert", "-storetype", "PKCS12", "-keystore", keystore,
+            "-storepass:file", password, "-alias", "cagents-android",
+        ], stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+    except subprocess.CalledProcessError:
+        raise Refused("cannot read cagents-android certificate; check the keystore, alias and password") from None
+    if hashlib.sha256(certificate).hexdigest() != fingerprint:
+        raise Refused("keystore certificate differs from signer.sha256")
+    return keystore, password, fingerprint
+
+
+def build(ref: str, output: Path, signing_dir: Path):
+    host = os.environ.get("CAGENTS_BUILD_REMOTE") or "fw16"
+    if socket.gethostname().split(".")[0] != host:
+        raise Refused(f"run this task on the Android build host ({host})")
+    if os.path.lexists(output):
+        raise Refused("--output must be a new directory")
+    output = output.resolve()
+    commit = git("rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}").decode().strip()
+    try:
+        git("cat-file", "-e", f"{commit}:scripts/package-android")
+    except subprocess.CalledProcessError:
+        raise Refused(f"{commit} predates Android APK packaging") from None
+    version = tomllib.loads(git("show", f"{commit}:Cargo.toml").decode())["package"]["version"]
+    code = version_code(version)
+    tools = build_tools()
+    keystore, password, fingerprint = signing_material(signing_dir, output)
+    with tempfile.TemporaryDirectory(prefix=".android-", dir=output.parent) as temporary:
+        work = Path(temporary)
+        source = work / "source"
+        source.mkdir()
+        archive = work / "source.tar"
+        git("archive", "--output", str(archive), commit, "mobile", "scripts/gradle-remote",
+            "crates/mobile-api/fixtures")
+        subprocess.run(["tar", "-xf", archive, "-C", source], check=True)
+        environment = dict(os.environ, CAGENTS_BUILD_REMOTE=host)
+        environment.pop("CAGENTS_GRADLE_LOCAL", None)
+        subprocess.run([source / "scripts/gradle-remote", "--", ":androidApp:assembleRelease",
+                        f"-Pcagents.releaseVersion={version}", f"-Pcagents.releaseVersionCode={code}"],
+                       cwd=source, env=environment, stdin=subprocess.DEVNULL, check=True)
+        unsigned = source / UNSIGNED
+        plain_file(unsigned)
+        check_identity(tools, unsigned, version)
+        assets = work / "assets"
+        assets.mkdir()
+        apk = assets / apk_name(version)
+        try:
+            subprocess.run([
+                tools / "apksigner", "sign", "--ks", keystore, "--ks-type", "PKCS12",
+                "--ks-key-alias", "cagents-android", "--ks-pass", f"file:{password}",
+                "--v4-signing-enabled", "false", "--out", apk, unsigned,
+            ], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+        except subprocess.CalledProcessError:
+            raise Refused("apksigner failed; check the Android signing material and unsigned APK") from None
+        check_signature(tools, apk, fingerprint)
+        shutil.copyfile(apk, assets / ALIAS)
+        (assets / CHECKSUMS).write_text(checksum_manifest(assets, version), encoding="ascii")
+        (assets / RECEIPT).write_text(receipt(assets, commit), encoding="ascii")
+        # Never replace an output directory created by another invocation.
+        output.mkdir()
+        try:
+            for name in (apk.name, ALIAS, CHECKSUMS, RECEIPT):
+                (assets / name).rename(output / name)
+        except OSError:
+            shutil.rmtree(output)
+            raise
+    print(f"Built {apk_name(version)} from {commit} into {output}")
+
+
+def receipt(directory: Path, commit: str) -> str:
+    return f"{commit}\n{digest(directory / CHECKSUMS)}\n"
+
+
+def stage(directory: Path, output: Path, version: str, commit: str):
+    version_code(version)
+    if not re.fullmatch(r"[0-9a-f]{40}", commit):
+        raise Refused("--source-commit must be a full lowercase SHA-1")
+    assets = (apk_name(version), ALIAS, CHECKSUMS)
+    if any(os.path.lexists(output / name) for name in assets):
+        raise Refused("the release bundle already contains Android assets")
+    # Verify the copied bytes, so an interrupted or concurrent transfer
+    # cannot leave a bundle with files from two builds.
+    with tempfile.TemporaryDirectory(prefix=".android-", dir=output.parent) as temporary:
+        snapshot = Path(temporary)
+        for name in (*assets, RECEIPT):
+            plain_file(directory / name)
+            shutil.copyfile(directory / name, snapshot / name)
+        if (snapshot / RECEIPT).read_bytes() != receipt(snapshot, commit).encode("ascii"):
+            raise Refused("Android build receipt does not match the source commit and checksums")
+        verify_assets(snapshot, version, expected_signer())
+        for name in assets:
+            (snapshot / name).rename(output / name)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="command", required=True)
+    package = commands.add_parser("build")
+    package.add_argument("--ref", required=True, help="Git commit or ref to export")
+    package.add_argument("--output", type=Path, required=True, help="new directory for the APKs and receipt")
+    package.add_argument("--signing-dir", type=Path, required=True, help="private directory on the build host")
+    verify = commands.add_parser("verify")
+    verify.add_argument("--dir", type=Path, required=True)
+    verify.add_argument("--version", required=True)
+    attach = commands.add_parser("stage")
+    attach.add_argument("--dir", type=Path, required=True)
+    attach.add_argument("--output", type=Path, required=True, help="private release bundle staging directory")
+    attach.add_argument("--version", required=True)
+    attach.add_argument("--source-commit", required=True)
+    args = parser.parse_args()
+    try:
+        if args.command == "build":
+            build(args.ref, args.output, args.signing_dir)
+        elif args.command == "verify":
+            verify_assets(args.dir, args.version, expected_signer())
+        else:
+            stage(args.dir, args.output, args.version, args.source_commit)
+    except (Refused, OSError, ValueError) as error:
+        print(f"package-android: {error}", file=sys.stderr)
+        return 1
+    except subprocess.CalledProcessError as error:
+        print(f"package-android: {Path(error.cmd[0]).name} failed (exit {error.returncode})", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
