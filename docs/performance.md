@@ -14,6 +14,7 @@
 - [Idle Codex app-servers](#idle-codex-app-servers)
 - [Work board polling](#work-board-polling)
 - [Git watcher during builds](#git-watcher-during-builds)
+- [Saved Codex transcript pages](#saved-codex-transcript-pages)
 - [Reference results](#reference-results)
 
 These workloads are opt-in, local, and non-gating. Never compare unoptimized
@@ -1108,6 +1109,38 @@ one per touch (0.41/s).
 
 A live daemon with 8,715 watches across several large projects showed the same
 pattern. A 60 s replica of its watch set saw 714 events/s, 701 of them opens.
+
+## Saved Codex transcript pages
+
+The opt-in host test measures the saved-history reader and page builder used
+by `cagents transcript`. It creates a private Codex home for each process.
+The fixture has 900 turns, about 16 MB of JSONL, and a mix of raw tool calls
+and calls with richer completion records.
+
+```sh
+scratch=$(mktemp -d /var/tmp/cagents-transcript.XXXXXX)
+python3 tests/fixtures/codex-transcript-benchmark.py "$scratch"
+for scenario in latest deep append warm-deep; do
+    CAGENTS_BUILD_REMOTE=local TMPDIR="$scratch" \
+        CAGENTS_TRANSCRIPT_FIXTURE="$scratch" CAGENTS_TRANSCRIPT_SCENARIO="$scenario" \
+        mise run test:host -- --lib \
+        host::agent_execution::transcript::tests::measure_rollout_page -- --ignored --exact --nocapture
+done
+```
+
+Each process reports page-building time, logical bytes read (`/proc/self/io`
+`rchar`), process peak RSS, and a digest of the entries and earlier cursor.
+Latest and deep start with an empty daemon cache. Append primes the cache
+with a latest read, then adds one turn. Warm-deep repeats the same deep query.
+Process peak RSS includes any priming read. The fixture copy can warm the
+filesystem page cache.
+
+To count records decoded during replay, run a separate sample with `CAGENTS_LOCAL_DEBUG=1`
+and `RUST_LOG=cagents::chat::protocol::codex::rollout=trace`. Sum the batch
+`records` values after the `measuring` marker. For an uncached revision, the
+turn index scans the whole file and validates candidate turn markers. Its
+record count is the fixture's line count, including the appended turn when
+applicable.
 
 ## Reference results
 

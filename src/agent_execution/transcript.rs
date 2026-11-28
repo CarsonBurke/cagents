@@ -104,7 +104,7 @@ pub fn cursor(id: &str) -> String {
 }
 
 /// Whether `before`, an entry ID or its [`cursor`], names the entry `id`.
-fn names(before: &str, id: &str) -> bool {
+pub fn matches_cursor(before: &str, id: &str) -> bool {
     id == before || (before.len() == CURSOR_DIGITS && cursor(id) == before)
 }
 
@@ -386,7 +386,7 @@ impl Builder {
             return false;
         }
         if let Some(cursor) = &self.before {
-            if names(cursor, &item.id) {
+            if matches_cursor(cursor, &item.id) {
                 // Until an older item joins the page, the cursor's entry
                 // still marks where the next page begins: by its ID, as
                 // `earlier` always is, whichever name the caller gave.
@@ -768,8 +768,8 @@ mod tests {
         assert!(one.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(one, other);
         assert_eq!(one, cursor("msg_011Ch5wPqUWsnCetdsGqDMp3:0"), "stable");
-        assert!(names(&one, "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
-        assert!(!names(&one[..8], "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+        assert!(matches_cursor(&one, "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
+        assert!(!matches_cursor(&one[..8], "msg_011Ch5wPqUWsnCetdsGqDMp3:0"));
     }
 
     #[test]

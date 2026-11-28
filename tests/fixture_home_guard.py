@@ -94,6 +94,7 @@ NOT_APPLICABLE = {
     "model-picker-scene.sh": "all writes go through native-evidence env/cli",
     "composer-attachments-scene.sh": "all writes go through native-evidence env/nested",
     "many-subagents-frames.py": "generates a static JSONL asset from an explicit output path",
+    "codex-transcript-benchmark.py": "creates JSONL assets in an explicit output directory",
     "check-claude-resume-history.py": "unittest harness creates invented fixture roots",
     "test_seed_refusal_registry.py": "unittest harness creates invented fixture roots",
     "reasoning-row-scene/locate.py": "read-only OCR parser; no provider or app state",
