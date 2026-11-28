@@ -119,8 +119,7 @@ pub(super) fn status_mark<'a>(child: &chat::Subagent) -> Element<'a, Message> {
 /// click aimed at the first, so the strip holds its tabs where they were
 /// until the pointer leaves, and only then settles. A held child that
 /// finished keeps its slot and shows its new state; nothing else moves.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub(super) struct Hold(Vec<String>);
+pub(super) type Hold = crate::interaction::hover_hold::Held<String>;
 
 /// Keep metadata scanning cheap and mounted controls bounded. The chooser is
 /// the complete catalog; its selected child always keeps a direct tab.
@@ -139,19 +138,18 @@ fn direct_tabs<'a>(
     hold: Option<&Hold>,
 ) -> Vec<&'a chat::Subagent> {
     let live = live_tabs(children, selected, focused);
-    let Some(Hold(held)) = hold else {
+    let Some(held) = hold else {
         return live;
     };
     let listed: HashMap<&str, &chat::Subagent> = children
         .iter()
         .map(|child| (child.id.as_str(), child))
         .collect();
-    let mut rows: Vec<_> = held
-        .iter()
-        .filter_map(|id| listed.get(id.as_str()).copied())
-        .collect();
-    rows.extend(live.into_iter().filter(|child| !held.contains(&child.id)));
-    rows
+    held.arrange(
+        |id| listed.get(id.as_str()).copied(),
+        live,
+        |child| &child.id,
+    )
 }
 
 /// The tabs the strip shows as its children stand: live work by rank, and
@@ -645,7 +643,7 @@ impl Runtime {
     /// The tabs the strip shows now, held as they stand; see [`Hold`].
     pub(super) fn child_strip_now(&self) -> Hold {
         let focused = self.child_tab_focus.borrow();
-        Hold(
+        Hold::new(
             direct_tabs(
                 &self.snapshot.subagents,
                 self.selected_subagent.as_deref(),
@@ -653,8 +651,7 @@ impl Runtime {
                 self.child_strip_hold.as_ref(),
             )
             .into_iter()
-            .map(|child| child.id.clone())
-            .collect(),
+            .map(|child| child.id.clone()),
         )
     }
 
@@ -824,10 +821,9 @@ impl Runtime {
         )
         .width(Length::Fill)
         .clip(true);
-        widget::mouse_area(strip)
-            .on_enter(action(Action::SubagentStripHover(target, true)))
-            .on_exit(action(Action::SubagentStripHover(target, false)))
-            .into()
+        crate::interaction::hover_region(strip, self.child_strip_hold.is_some(), move |over| {
+            action(Action::SubagentStripHover(target, over))
+        })
     }
 
     /// Where focus goes when the chooser closes: back to the control that
