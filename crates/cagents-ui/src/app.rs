@@ -10025,6 +10025,8 @@ impl Cagents {
                 .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
+        // After the titles above, which set the width a renewed hold takes.
+        self.refresh_tabs_hold();
         self.sync_window_title()
     }
 

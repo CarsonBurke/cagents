@@ -21,7 +21,12 @@ impl Cagents {
         // `SidebarAction`s that arrive right here, so refusing
         // everything while it is up would strand it with no way out - a
         // worse fault than the one this guard exists for.
-        if self.modal_is_open() && !answers_discard_confirmation(&action) {
+        // The pointer's coming and going is reported whatever is open, so a
+        // hold does not outlast the dialog.
+        if self.modal_is_open()
+            && !answers_discard_confirmation(&action)
+            && !matches!(action, SidebarAction::ListHover(_))
+        {
             return ControlFlow::Break(Task::none());
         }
         if matches!(

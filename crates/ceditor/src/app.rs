@@ -5160,9 +5160,12 @@ impl Application for Editor {
             task,
             self.notification_focus(),
             self.open_requested_review(),
-            // Only a change of tab is revealed: a tab closed beside the
-            // active one leaves the strip where the pointer had it.
-            if previous_tabs.0 != self.active {
+            // Only a tab the user chose or opened is revealed: a close,
+            // of the active tab or another, leaves the strip where the
+            // pointer had it.
+            if previous_tabs.0 != self.active
+                && previous_tabs.0.is_none_or(|previous| self.tab(previous).is_some())
+            {
                 self.reveal_active_tab()
             } else {
                 Task::none()

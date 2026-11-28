@@ -14579,8 +14579,14 @@ fn compact_rail_rows_hold_still_under_the_pointer() {
     assert!(shows(&model, &state), "a row whose work ended stays drawn");
     state.release_list_hold();
     assert!(!shows(&model, &state), "and goes once released");
-    // Work starting under the pointer shows at once.
+    // Work starting under the pointer shows at once, and stays drawn once
+    // it ends while the pointer is still there.
     state.hover_list(&model, true, true);
     model.projects[0].channels[0].activity = Some(crate::agent::ActivityState::Working);
     assert!(shows(&model, &state));
+    state.follow_list(&model, true);
+    model.projects[0].channels[0].activity = None;
+    assert!(shows(&model, &state));
+    state.hover_list(&model, true, false);
+    assert!(!shows(&model, &state));
 }

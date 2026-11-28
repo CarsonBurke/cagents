@@ -3834,8 +3834,15 @@ impl SidebarState {
             .into_iter()
             .map(InProgressRow::row)
             .collect();
+        // What the rail drew since stays drawn as well.
+        let rail: Vec<_> = if compact {
+            ListHold::rail_rows(model, self).collect()
+        } else {
+            Vec::new()
+        };
         if let Some(hold) = self.list_hold.get_mut() {
             hold.in_progress.extend(rows);
+            hold.rail.extend(rail);
         }
     }
 
@@ -4151,7 +4158,11 @@ impl SidebarState {
     /// once: a new approval or question must not wait for the pointer.
     fn held_in_list(&self, row: SelectionRow, live: bool) -> bool {
         match self.list_hold.get() {
-            Some(hold) => hold.listed.contains(&row) || (live && !hold.in_progress.contains(&row)),
+            // A folded In progress section shows no slot to keep.
+            Some(hold) => {
+                hold.listed.contains(&row)
+                    || (live && (self.in_progress_collapsed || !hold.in_progress.contains(&row)))
+            }
             None => live,
         }
     }
@@ -14595,19 +14606,27 @@ impl ListHold {
                     .into_iter()
                     .map(InProgressRow::row),
             ),
-            hide_read: !state.retained_attention.is_empty(),
+            hide_read: model.projects.iter().any(|project| {
+                project
+                    .channels
+                    .iter()
+                    .any(|channel| state.channel_listing(channel) != Listing::Live)
+                    || project
+                        .panes
+                        .iter()
+                        .any(|card| state.card_listing(card) != Listing::Live)
+            }),
             ..Self::default()
         };
+        hold.rail = Self::rail_rows(model, state).collect();
         for project in &model.projects {
-            for channel in &project.channels {
-                let row = SelectionRow::Channel(channel.id);
-                if state.lists_channel(channel) {
-                    hold.listed.insert(row);
-                }
-                if compact_rail_shows_channel(state, channel) {
-                    hold.rail.insert(row);
-                }
-            }
+            hold.listed.extend(
+                project
+                    .channels
+                    .iter()
+                    .filter(|channel| state.lists_channel(channel))
+                    .map(|channel| SelectionRow::Channel(channel.id)),
+            );
             hold.listed.extend(
                 project
                     .panes
@@ -14615,15 +14634,28 @@ impl ListHold {
                     .filter(|card| state.lists_card(card))
                     .map(|card| SelectionRow::Card(card.id)),
             );
-            hold.rail.extend(
-                project
-                    .worktrees
-                    .iter()
-                    .filter(|worktree| compact_rail_shows_worktree(state, project.id, worktree))
-                    .map(|worktree| SelectionRow::Worktree(project.id, worktree.id)),
-            );
         }
         hold
+    }
+
+    /// The channel and worktree rows the compact rail draws now.
+    fn rail_rows<'a>(
+        model: &'a SidebarModel,
+        state: &'a SidebarState,
+    ) -> impl Iterator<Item = SelectionRow> + 'a {
+        model.projects.iter().flat_map(move |project| {
+            let channels = project
+                .channels
+                .iter()
+                .filter(move |channel| compact_rail_shows_channel(state, channel))
+                .map(|channel| SelectionRow::Channel(channel.id));
+            let worktrees = project
+                .worktrees
+                .iter()
+                .filter(move |worktree| compact_rail_shows_worktree(state, project.id, worktree))
+                .map(move |worktree| SelectionRow::Worktree(project.id, worktree.id));
+            channels.chain(worktrees)
+        })
     }
 }
 

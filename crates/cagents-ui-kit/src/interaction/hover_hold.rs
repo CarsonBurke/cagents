@@ -22,6 +22,8 @@ use cosmic::iced::advanced::{
 };
 use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector, mouse};
 use cosmic::{Element, Renderer, Theme};
+use std::collections::HashSet;
+use std::hash::Hash;
 
 /// What a region held when the pointer came over it, until the pointer
 /// leaves or the region is no longer drawn.
@@ -76,33 +78,43 @@ impl<T> Hold<T> {
 /// them since, and puts what arrived meanwhile after them, so nothing the
 /// pointer could be resting on moves.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Held<K>(Vec<K>);
+pub struct Held<K: Eq + Hash> {
+    order: Vec<K>,
+    /// The same keys, so asking after one costs the same however many are
+    /// held.
+    keys: HashSet<K>,
+}
 
-impl<K> Default for Held<K> {
+impl<K: Eq + Hash> Default for Held<K> {
     fn default() -> Self {
-        Self(Vec::new())
+        Self {
+            order: Vec::new(),
+            keys: HashSet::new(),
+        }
     }
 }
 
-impl<K: PartialEq> Held<K> {
+impl<K: Eq + Hash + Clone> Held<K> {
     pub fn new(keys: impl IntoIterator<Item = K>) -> Self {
-        Self(keys.into_iter().collect())
+        let mut held = Self::default();
+        held.extend(keys);
+        held
     }
 
     pub fn contains(&self, key: &K) -> bool {
-        self.0.contains(key)
+        self.keys.contains(key)
     }
 
     pub fn keys(&self) -> &[K] {
-        &self.0
+        &self.order
     }
 
     /// Holds the `keys` not yet held, after those that are, so what arrived
     /// while held keeps the place it arrived at.
     pub fn extend(&mut self, keys: impl IntoIterator<Item = K>) {
         for key in keys {
-            if !self.contains(&key) {
-                self.0.push(key);
+            if self.keys.insert(key.clone()) {
+                self.order.push(key);
             }
         }
     }
@@ -117,7 +129,7 @@ impl<K: PartialEq> Held<K> {
         live: impl IntoIterator<Item = T>,
         key: impl Fn(&T) -> &K,
     ) -> Vec<T> {
-        let mut items: Vec<T> = self.0.iter().filter_map(&mut find).collect();
+        let mut items: Vec<T> = self.order.iter().filter_map(&mut find).collect();
         items.extend(live.into_iter().filter(|item| !self.contains(key(item))));
         items
     }
@@ -134,13 +146,13 @@ impl<K: PartialEq> Held<K> {
 /// [`Self::holds`]). Nor is a row that has less room than it had, which
 /// would scroll, or squeeze, at the held width.
 #[derive(Debug, Clone, PartialEq)]
-pub struct HeldWidth<K> {
+pub struct HeldWidth<K: Eq + Hash> {
     width: f32,
     room: f32,
     keys: Held<K>,
 }
 
-impl<K: PartialEq> HeldWidth<K> {
+impl<K: Eq + Hash + Clone> HeldWidth<K> {
     /// A hold on `width`, in a row `room` wide, shared by the items `keys`.
     pub fn new(width: f32, room: f32, keys: impl IntoIterator<Item = K>) -> Self {
         Self {
