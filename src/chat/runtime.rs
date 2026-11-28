@@ -4195,11 +4195,13 @@ impl Actor {
                             .lock()
                             .unwrap_or_else(|p| p.into_inner())
                             .history_failed();
+                        self.apply(Event::HistoryError(message.clone()));
+                    } else {
+                        self.apply(Event::Error {
+                            message: message.clone(),
+                            fatal: false,
+                        });
                     }
-                    self.apply(Event::Error {
-                        message: message.clone(),
-                        fatal: false,
-                    });
                     let _ = refuse(message);
                 }
             }

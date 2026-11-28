@@ -1628,6 +1628,18 @@ impl Scroll {
         }
     }
 
+    pub(super) fn unfetched_target(self, history: chat::HistoryExtent) -> Option<Sought> {
+        let unfetched = history.unfetched.filter(|count| *count > 0)?;
+        if self.unloaded.before > 0.0 && self.at_top() {
+            return Some(Sought::Start);
+        }
+        let Some(Unseen::Before(fraction)) = self.unseen() else {
+            return None;
+        };
+        let position = f64::from(fraction) * history.earlier() as f64;
+        (position < unfetched as f64).then_some(Sought::Unfetched)
+    }
+
     /// How far from a loaded edge a page is fetched: far enough that wheel
     /// and Page Up reading does not reach the edge before the page arrives.
     fn prefetch_reach(self) -> f32 {
@@ -2428,6 +2440,23 @@ impl Runtime {
         } else {
             Sought::Cached { index: 0, at: 0.0 }
         }
+    }
+
+    pub(super) fn failed_history_seek(&self) -> Option<Sought> {
+        if !self.earlier_page_failed
+            || self.selected_subagent.is_some()
+            || !self.snapshot.has_earlier
+        {
+            return None;
+        }
+        self.parent_scroll().unfetched_target(self.snapshot.history)
+    }
+
+    pub(super) fn can_retry_history_seek(&self) -> bool {
+        !self.disconnected
+            && self.queued.is_none()
+            && self.commands.is_idle()
+            && self.paging().is_none()
     }
 
     /// The loaded item the reader asked to land on in history that was not
@@ -4315,6 +4344,7 @@ impl Runtime {
                             }),
                             unloaded,
                             landing: self.landing_item(),
+                            earlier_failure: self.earlier_page_failed.then_some(snapshot.history),
                         }
                     } else {
                         scroll::History::default()
@@ -4336,6 +4366,11 @@ impl Runtime {
         };
         drop(transcript_part);
         let transcript_layer = crate::performance::ui_trace::region("transcript", transcript_layer);
+        let transcript_layer = crate::interaction::layer(
+            transcript_layer,
+            self.history_retry_view(transitioning)
+                .unwrap_or_else(|| widget::Space::new().into()),
+        );
         // The jump to new activity floats over the transcript's foot rather
         // than taking a row of its own, so neither the transcript nor the
         // strip below it moves when it comes and goes. Its slot is always
@@ -5250,6 +5285,33 @@ impl Runtime {
             .find_map(|pending| pending.page)
             .or(self.page_request.map(|(page, _)| page))
             .or(self.snapshot.history_loading.then_some(Page::Earlier))
+    }
+
+    fn history_retry_view(&self, transitioning: bool) -> Option<Element<'_, Message>> {
+        self.failed_history_seek()?;
+        let severity = crate::app::NoticeSeverity::Error;
+        let retry = widget::button::text("Retry")
+            .id(card_control_id(self.target.card, "retry-earlier-history"))
+            .name("Retry loading earlier history")
+            .class(crate::app::notice_surface_button(severity))
+            .on_press_maybe(
+                (!transitioning && self.can_retry_history_seek())
+                    .then(|| action(Action::RetryEarlierHistory(self.target))),
+            );
+        Some(
+            widget::container(
+                widget::container(crate::app::notice_surface(
+                    severity,
+                    crate::app::notice_body("Could not load earlier history"),
+                    Some(retry.into()),
+                    false,
+                ))
+                .max_width(super::layout::READING_COLUMN),
+            )
+            .padding(step::GAP_M)
+            .center(Length::Fill)
+            .into(),
+        )
     }
 
     /// The plan the conversation is working to, or nothing where the provider

@@ -1740,6 +1740,8 @@ impl Store {
     /// page before asking again.
     pub(super) fn history_failed(&mut self) {
         self.fill = Fill::Unanswered;
+        self.pending_earlier = None;
+        self.pending_pivot = None;
     }
     /// Whether [`Store::fill`] would ask for a page now.
     pub(super) fn wants_fill(&self) -> bool {
@@ -4291,7 +4293,10 @@ mod tests {
 
     #[test]
     fn latest_or_failed_request_prevents_a_late_history_response_from_repinning() {
-        for cancel_with_latest in [true, false] {
+        let cancellations: [fn(&mut Store); 3] = [Store::latest, Store::history_failed, |store| {
+            store.apply(Event::HistoryLoading(false)).unwrap();
+        }];
+        for cancel in cancellations {
             let mut store = Store::at(std::env::temp_dir()).unwrap();
             let text = |id: &str| Item {
                 id: id.into(),
@@ -4317,11 +4322,7 @@ mod tests {
             assert!(store.window().unwrap().has_earlier);
             assert!(!store.earlier().unwrap());
             assert!(store.pending_earlier.is_some());
-            if cancel_with_latest {
-                store.latest();
-            } else {
-                store.apply(Event::HistoryLoading(false)).unwrap();
-            }
+            cancel(&mut store);
             assert!(store.pending_earlier.is_none());
             store
                 .apply(Event::History {
