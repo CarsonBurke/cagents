@@ -5,7 +5,7 @@
 //! The daemon owns the board and pushes each changed one; this state only
 //! filters and presents it. A pin is shown at once and confirmed by the next
 //! board, so a card moves the moment it is moved.
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
 
 use cosmic::{
     Element, Theme,
@@ -16,8 +16,8 @@ use cosmic::{
 use crate::{
     agent::ActivityState,
     design::{self, space},
-    model::TerminalId,
-    ui_controls::{Close, Icon, icon_button, placeholder, popover, popover_item},
+    model::{HostSessionProof, TerminalId},
+    ui_controls::{Close, Icon, icon_button, owned, placeholder, popover, popover_item},
     work::{ActivitySource, Board, Column, Forge, Item, ItemKey, PullRequestState},
 };
 
@@ -115,13 +115,26 @@ impl Layout {
     }
 }
 
+/// A revision belongs to one daemon incarnation.
+#[derive(Debug, Clone)]
+pub struct BoardVersion {
+    pub daemon: Arc<HostSessionProof>,
+    pub revision: u64,
+}
+
+impl BoardVersion {
+    fn supersedes(&self, old: &Self) -> bool {
+        self.daemon != old.daemon || self.revision > old.revision
+    }
+}
+
 /// What the board subscription reports.
 #[derive(Debug, Clone)]
 pub enum Watch {
     /// A board, and whether it is the first of its connection, whose
     /// revisions start where that daemon's do.
     Board {
-        revision: u64,
+        version: BoardVersion,
         board: Arc<Board>,
         first: bool,
     },
@@ -129,9 +142,54 @@ pub enum Watch {
     Lost(String),
 }
 
+/// The destination on the rendered row, which can change under the same card key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Destination {
+    Worktree(PathBuf),
+    PullRequest { number: u64, url: String },
+}
+
+fn worktree_destination(item: &Item) -> Option<Destination> {
+    Some(Destination::Worktree(item.worktree.as_ref()?.path.clone()))
+}
+
+fn pr_destination(item: &Item) -> Option<Destination> {
+    let pr = item.pull_request.as_ref()?;
+    Some(Destination::PullRequest {
+        number: pr.number,
+        url: pr.url.clone(),
+    })
+}
+
+fn primary_destination(item: &Item) -> Option<Destination> {
+    worktree_destination(item).or_else(|| pr_destination(item))
+}
+
+#[derive(Debug, Clone)]
+pub struct PinTicket {
+    pane: u64,
+    card: CardRef,
+    operation: uuid::Uuid,
+}
+
+#[derive(Debug)]
+struct Pin {
+    pane: u64,
+    operation: uuid::Uuid,
+    /// What the daemon is currently being asked to save.
+    submitted: Option<Column>,
+    /// The latest placement chosen by the user.
+    desired: Option<Column>,
+    /// A later click can choose the same column again after another choice.
+    queued: bool,
+    /// Wait for a board after a successful reply to reconcile with the daemon.
+    accepted: Option<BoardVersion>,
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
-    Watched(Watch),
+    Watched(u64, Watch),
+    Rendered(u64, Box<Action>),
     /// The clock moved: relative times are redrawn.
     Tick,
     ScopeMenu(bool),
@@ -146,21 +204,20 @@ pub enum Action {
     Layout(Layout),
     /// Rescans every project and polls GitHub now.
     Refresh,
-    Refreshed(Result<(), String>),
+    Refreshed(uuid::Uuid, Result<(), String>),
     /// The card's main action: its worktree, else its pull request.
-    Open(CardRef),
+    Open(CardRef, Option<Destination>),
     /// Opens a card's actions from its actions control, or closes them.
-    Menu(Option<CardRef>),
+    Menu(CardRef, bool),
     /// Opens a card's actions from a right click on the card itself.
     CardMenu(CardRef),
-    OpenWorktree(CardRef),
-    OpenPullRequest(CardRef),
-    OpenUrl(String),
-    FocusSession(TerminalId),
-    Copy(String),
+    OpenDestination(CardRef, Destination),
+    OpenUrl(CardRef, String),
+    FocusSession(CardRef, TerminalId),
+    Copy(CardRef, String),
     /// Pins a card to a column, or unpins it with `None`.
     Pin(CardRef, Option<Column>),
-    Pinned(Result<(), String>),
+    Pinned(PinTicket, Result<BoardVersion, String>),
 }
 
 impl Action {
@@ -169,7 +226,7 @@ impl Action {
     pub fn background(&self) -> bool {
         matches!(
             self,
-            Self::Watched(_) | Self::Tick | Self::Refreshed(_) | Self::Pinned(_)
+            Self::Watched(..) | Self::Tick | Self::Refreshed(..) | Self::Pinned(..)
         )
     }
 }
@@ -177,12 +234,13 @@ impl Action {
 /// What only the application can do for this pane.
 #[derive(Debug, Clone)]
 pub enum Effect {
-    Refresh,
+    Refresh(uuid::Uuid),
     /// Return the keyboard to this control.
     Focus(widget::Id),
     Pin {
+        ticket: PinTicket,
         project: PathBuf,
-        item: String,
+        item: ItemKey,
         column: Option<Column>,
     },
     OpenWorktree {
@@ -201,6 +259,7 @@ pub enum Effect {
 
 #[derive(Debug, Default)]
 pub struct State {
+    pane: u64,
     /// The board shown: the daemon's, with the pins not yet confirmed.
     board: Option<Arc<Board>>,
     /// The daemon's last board, which a refused pin reverts to.
@@ -213,7 +272,7 @@ pub struct State {
     order: Vec<usize>,
     /// The board time the cards were last sorted at.
     sorted_at_unix_ms: Option<u64>,
-    revision: u64,
+    version: Option<BoardVersion>,
     /// Why the subscription is down, while it is retried.
     lost: Option<String>,
     scope: Option<PathBuf>,
@@ -229,7 +288,8 @@ pub struct State {
     /// Whether the card's menu opened from a right click on the card,
     /// rather than from its actions control.
     menu_from_card: bool,
-    refreshing: bool,
+    refreshing: Option<uuid::Uuid>,
+    pins: HashMap<CardRef, Pin>,
     /// The last refresh or pin that failed.
     error: Option<String>,
     now_unix_ms: u64,
@@ -251,12 +311,22 @@ impl State {
     pub fn reset(&mut self) {
         let scope = self.scope.take();
         let (layout, board_layout) = (self.layout, self.board_layout);
+        let mut pins = std::mem::take(&mut self.pins);
+        // Closing the pane retires its presentation. A sent write still
+        // owns its card's transport lane until its reply arrives.
+        pins.retain(|_, pin| pin.accepted.is_none());
         *self = Self {
+            pins,
+            pane: self.pane + 1,
             scope,
             layout,
             board_layout,
             ..Self::default()
         };
+    }
+
+    pub fn pane(&self) -> u64 {
+        self.pane
     }
 
     pub fn layout(&self) -> Layout {
@@ -282,15 +352,30 @@ impl State {
 
     pub fn update(&mut self, action: Action) -> Option<Effect> {
         match action {
-            Action::Watched(Watch::Board {
-                revision,
-                board,
-                first,
-            }) => {
+            Action::Rendered(pane, action) if pane == self.pane && self.layout.is_board() => {
+                self.update(*action)
+            }
+            Action::Watched(
+                pane,
+                Watch::Board {
+                    version,
+                    board,
+                    first,
+                },
+            ) if pane == self.pane => {
                 // A board pushed while the subscription was answered can
                 // arrive before the answer; the newer one stands.
-                if first || revision > self.revision {
-                    self.revision = revision;
+                if self
+                    .version
+                    .as_ref()
+                    .is_none_or(|old| version.supersedes(old))
+                {
+                    self.pins.retain(|_, pin| {
+                        pin.accepted
+                            .as_ref()
+                            .is_none_or(|through| !version.supersedes(through))
+                    });
+                    self.version = Some(version);
                     self.now_unix_ms = board.generated_at_unix_ms.max(now_unix_ms());
                     self.search = board.items.iter().map(search_text).collect();
                     let (order, sorted_at) = settled_order(
@@ -322,13 +407,15 @@ impl State {
                     if self.problems_open && problems(&board, self.scope.as_deref()).is_empty() {
                         self.problems_open = false;
                     }
-                    self.confirmed = Some(board.clone());
-                    self.board = Some(board);
+                    self.confirmed = Some(board);
+                    self.apply_pins();
+                    self.lost = None;
+                } else if first {
                     self.lost = None;
                 }
                 None
             }
-            Action::Watched(Watch::Lost(error)) => {
+            Action::Watched(pane, Watch::Lost(error)) if pane == self.pane => {
                 self.lost = Some(error);
                 None
             }
@@ -354,13 +441,32 @@ impl State {
                 None
             }
             Action::Dismiss(opener) => {
-                let open = std::mem::take(&mut self.scope_menu)
-                    | std::mem::take(&mut self.problems_open)
-                    | self.menu.take().is_some();
-                // A dismissal queued behind another close moves nothing.
-                open.then_some(Effect::Focus(opener))
+                if self.scope_menu && opener == widget::Id::new(SCOPE_CONTROL_ID) {
+                    self.scope_menu = false;
+                } else if self.problems_open && opener == widget::Id::new(PROBLEMS_CONTROL_ID) {
+                    self.problems_open = false;
+                } else if self
+                    .menu
+                    .as_ref()
+                    .is_some_and(|card| self.menu_opener(card) == opener)
+                {
+                    self.menu = None;
+                } else {
+                    return None;
+                }
+                Some(Effect::Focus(opener))
             }
             Action::Scope(scope) => {
+                if let Some(repository) = &scope
+                    && !self.board.as_ref().is_some_and(|board| {
+                        board
+                            .projects
+                            .iter()
+                            .any(|project| project.repository == *repository)
+                    })
+                {
+                    return None;
+                }
                 self.scope = scope;
                 self.scope_menu = false;
                 self.problems_open = false;
@@ -381,90 +487,209 @@ impl State {
                 None
             }
             Action::Refresh => {
-                if self.refreshing {
+                if self.refreshing.is_some() {
                     return None;
                 }
-                self.refreshing = true;
+                let operation = uuid::Uuid::new_v4();
+                self.refreshing = Some(operation);
                 self.error = None;
-                Some(Effect::Refresh)
+                Some(Effect::Refresh(operation))
             }
-            Action::Refreshed(result) => {
-                self.refreshing = false;
-                self.error = result.err();
-                None
-            }
-            Action::Open(card) => {
-                let item = self.item(&card)?;
-                if item.worktree.is_some() {
-                    self.update(Action::OpenWorktree(card))
-                } else {
-                    self.update(Action::OpenPullRequest(card))
-                }
-            }
-            Action::Menu(menu) => {
-                if menu.is_some() {
-                    self.scope_menu = false;
-                    self.problems_open = false;
-                }
-                self.menu = menu;
-                self.menu_from_card = false;
-                None
-            }
-            Action::CardMenu(card) => {
-                self.update(Action::Menu(Some(card)));
-                self.menu_from_card = true;
-                None
-            }
-            Action::OpenWorktree(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                Some(Effect::OpenWorktree {
-                    project: item.project.clone(),
-                    path: item.worktree.as_ref()?.path.clone(),
-                })
-            }
-            Action::OpenPullRequest(card) => {
-                self.menu = None;
-                let item = self.item(&card)?;
-                let pull_request = item.pull_request.as_ref()?;
-                Some(Effect::OpenPullRequest {
-                    project: item.project.clone(),
-                    number: pull_request.number,
-                    url: pull_request.url.clone(),
-                })
-            }
-            Action::OpenUrl(url) => {
-                self.menu = None;
-                Some(Effect::OpenUrl(url))
-            }
-            Action::FocusSession(id) => {
-                self.menu = None;
-                Some(Effect::FocusSession(id))
-            }
-            Action::Copy(text) => {
-                self.menu = None;
-                Some(Effect::Copy(text))
-            }
-            Action::Pin(card, column) => {
-                self.menu = None;
-                let board = Arc::make_mut(self.board.as_mut()?);
-                let stale_after_days = board.stale_after_days;
-                let item = board.items.iter_mut().find(|item| card.names(item))?;
-                crate::work::place(item, column, self.now_unix_ms, stale_after_days);
-                Some(Effect::Pin {
-                    project: card.project,
-                    item: card.key.storage_key(),
-                    column,
-                })
-            }
-            Action::Pinned(result) => {
-                // A pin the daemon took arrives with its next board; one it
-                // refused changed nothing there, so no board will undo it.
+            Action::Refreshed(operation, result) if self.refreshing == Some(operation) => {
+                self.refreshing = None;
                 if let Err(error) = result {
-                    self.board = self.confirmed.clone();
                     self.error = Some(error);
                 }
                 None
+            }
+            Action::Open(card, destination) => {
+                if primary_destination(self.item(&card)?) != destination {
+                    return None;
+                }
+                self.update(Action::OpenDestination(card, destination?))
+            }
+            Action::Menu(card, open) => {
+                if open {
+                    self.item(&card)?;
+                    self.scope_menu = false;
+                    self.problems_open = false;
+                    self.menu = Some(card);
+                    self.menu_from_card = false;
+                } else {
+                    self.close_card_menu(&card);
+                }
+                None
+            }
+            Action::CardMenu(card) => {
+                self.item(&card)?;
+                self.update(Action::Menu(card, true));
+                self.menu_from_card = true;
+                None
+            }
+            Action::OpenDestination(card, destination) => {
+                let item = self.item(&card)?;
+                let current = match &destination {
+                    Destination::Worktree(_) => worktree_destination(item),
+                    Destination::PullRequest { .. } => pr_destination(item),
+                };
+                if current.as_ref() != Some(&destination) {
+                    return None;
+                }
+                self.close_card_menu(&card);
+                match destination {
+                    Destination::Worktree(path) => Some(Effect::OpenWorktree {
+                        project: card.project,
+                        path,
+                    }),
+                    Destination::PullRequest { number, url } => Some(Effect::OpenPullRequest {
+                        project: card.project,
+                        number,
+                        url,
+                    }),
+                }
+            }
+            Action::OpenUrl(card, url) => {
+                if self.item(&card)?.linear.as_ref()?.url.as_ref() != Some(&url) {
+                    return None;
+                }
+                self.close_card_menu(&card);
+                Some(Effect::OpenUrl(url))
+            }
+            Action::FocusSession(card, id) => {
+                if !self
+                    .item(&card)?
+                    .sessions
+                    .iter()
+                    .any(|session| session.id == id)
+                {
+                    return None;
+                }
+                self.close_card_menu(&card);
+                Some(Effect::FocusSession(id))
+            }
+            Action::Copy(card, text) => {
+                if copy_branch(self.item(&card)?) != Some(&text) {
+                    return None;
+                }
+                self.close_card_menu(&card);
+                Some(Effect::Copy(text))
+            }
+            Action::Pin(card, column) => {
+                self.item(&card)?;
+                self.close_card_menu(&card);
+                let effect = if let Some(pin) = self
+                    .pins
+                    .get_mut(&card)
+                    .filter(|pin| pin.accepted.is_none())
+                {
+                    // Submit one write per card at a time. Later choices remain
+                    // optimistic and coalesce to the last choice.
+                    pin.pane = self.pane;
+                    pin.desired = column;
+                    pin.queued = true;
+                    None
+                } else {
+                    Some(self.submit_pin(card, column))
+                };
+                self.apply_pins();
+                effect
+            }
+            Action::Pinned(ticket, result) => {
+                let card = ticket.card;
+                let pin = self
+                    .pins
+                    .get(&card)
+                    .filter(|pin| pin.operation == ticket.operation && pin.accepted.is_none())?;
+                if pin.pane != self.pane {
+                    self.pins.remove(&card);
+                    return None;
+                }
+                let desired = pin.desired;
+                let current = self
+                    .confirmed
+                    .as_ref()
+                    .and_then(|board| board.items.iter().find(|item| card.names(item)));
+                let effect = if current.is_some()
+                    && (ticket.pane != self.pane
+                        || pin.submitted != desired
+                        || (pin.queued && result.is_err()))
+                {
+                    Some(self.submit_pin(card, desired))
+                } else {
+                    match (current, result) {
+                        (Some(_), Ok(through))
+                            if self
+                                .version
+                                .as_ref()
+                                .is_none_or(|head| !head.supersedes(&through)) =>
+                        {
+                            self.pins.get_mut(&card).expect("validated pin").accepted =
+                                Some(through);
+                        }
+                        (Some(_), Err(error)) => {
+                            self.pins.remove(&card);
+                            self.error = Some(error);
+                        }
+                        _ => {
+                            self.pins.remove(&card);
+                        }
+                    }
+                    None
+                };
+                self.apply_pins();
+                effect
+            }
+            Action::Rendered(..) | Action::Watched(..) | Action::Refreshed(..) => None,
+        }
+    }
+
+    fn close_card_menu(&mut self, card: &CardRef) {
+        if self.menu.as_ref() == Some(card) {
+            self.menu = None;
+        }
+    }
+
+    fn submit_pin(&mut self, card: CardRef, column: Option<Column>) -> Effect {
+        let operation = uuid::Uuid::new_v4();
+        self.pins.insert(
+            card.clone(),
+            Pin {
+                pane: self.pane,
+                operation,
+                submitted: column,
+                desired: column,
+                queued: false,
+                accepted: None,
+            },
+        );
+        Effect::Pin {
+            project: card.project.clone(),
+            item: card.key.clone(),
+            ticket: PinTicket {
+                pane: self.pane,
+                card,
+                operation,
+            },
+            column,
+        }
+    }
+
+    fn apply_pins(&mut self) {
+        self.board.clone_from(&self.confirmed);
+        let mut active = self
+            .pins
+            .iter()
+            .filter(|(_, pin)| pin.pane == self.pane)
+            .peekable();
+        if active.peek().is_none() {
+            return;
+        }
+        let Some(board) = self.board.as_mut().map(Arc::make_mut) else {
+            return;
+        };
+        for (card, pin) in active {
+            if let Some(item) = board.items.iter_mut().find(|item| card.names(item)) {
+                crate::work::place(item, pin.desired, self.now_unix_ms, board.stale_after_days);
             }
         }
     }
@@ -498,7 +723,13 @@ impl State {
     }
 
     pub fn view(&self) -> Element<'_, Action> {
-        crate::ui_controls::responsive(move |size| self.layout_view(size.width)).into()
+        let view: Element<'_, Action> =
+            crate::ui_controls::responsive(move |size| self.layout_view(size.width)).into();
+        let pane = self.pane;
+        owned(
+            pane,
+            view.map(move |action| Action::Rendered(pane, Box::new(action))),
+        )
     }
 
     fn layout_view(&self, width: f32) -> Element<'_, Action> {
@@ -546,7 +777,7 @@ impl State {
 
     fn header(&self) -> Element<'_, Action> {
         let layout = layout_switch(self.layout);
-        let refresh: Element<'_, Action> = if self.refreshing {
+        let refresh: Element<'_, Action> = if self.refreshing.is_some() {
             crate::interaction::tooltip(
                 widget::container(crate::ui_controls::activity_spinner(
                     14.0,
@@ -621,34 +852,33 @@ impl State {
         .padding([space::XS, space::S])
         .on_press_maybe((!projects.is_empty()).then_some(Action::ScopeMenu(!self.scope_menu)));
         let content = self.scope_menu.then(|| {
-            let count = |scope: Option<&PathBuf>| {
-                self.board.as_ref().map_or(0, |board| {
-                    board
-                        .items
-                        .iter()
-                        .filter(|item| scope.is_none_or(|scope| item.project == *scope))
-                        .count()
-                })
-            };
-            let mut items = vec![
+            let board = self.board.as_deref();
+            let mut counts = HashMap::new();
+            for item in board.into_iter().flat_map(|board| &board.items) {
+                *counts.entry(&item.project).or_insert(0) += 1;
+            }
+            let mut items = vec![owned(
+                None::<PathBuf>,
                 popover_item(
                     Icon::Grid.handle(),
                     "All projects",
-                    cards(count(None)),
+                    cards(board.map_or(0, |board| board.items.len())),
                     Action::Scope(None),
                 )
-                .selected(self.scope.is_none())
-                .into(),
-            ];
+                .selected(self.scope.is_none()),
+            )];
             items.extend(projects.iter().map(|project| {
-                popover_item(
-                    Icon::Folder.handle(),
-                    project.name.as_str(),
-                    cards(count(Some(&project.repository))),
-                    Action::Scope(Some(project.repository.clone())),
+                let repository = project.repository.clone();
+                owned(
+                    Some(repository.clone()),
+                    popover_item(
+                        Icon::Folder.handle(),
+                        project.name.as_str(),
+                        cards(counts.get(&repository).copied().unwrap_or_default()),
+                        Action::Scope(Some(repository)),
+                    )
+                    .selected(self.scope.as_ref() == Some(&project.repository)),
                 )
-                .selected(self.scope.as_ref() == Some(&project.repository))
-                .into()
             }));
             widget::scrollable(widget::column::with_children(items).width(SCOPE_MENU_WIDTH))
                 .height(Length::Shrink)
@@ -985,6 +1215,7 @@ impl State {
     /// moved. It says what a list row says, stacked to the lane's width.
     fn card<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
         let card = CardRef::of(item);
+        let destination = primary_destination(item);
         let mut top = vec![
             status_glyph(item),
             design::heading(title(item))
@@ -1040,10 +1271,12 @@ impl State {
             .class(card_style(selected))
             .padding(space::S)
             .width(Length::Fill)
-            .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::CardMenu(card))
-            .into()
+            .on_press(Action::Open(card.clone(), destination.clone()));
+        owned(
+            (card.clone(), destination),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::CardMenu(card)),
+        )
     }
 
     /// A list row: its pull request's title, or its branch when it has
@@ -1053,6 +1286,7 @@ impl State {
     /// age leave it unsaid.
     fn row<'a>(&'a self, item: &'a Item) -> Element<'a, Action> {
         let card = CardRef::of(item);
+        let destination = primary_destination(item);
         let mut title = vec![
             status_glyph(item),
             crate::ui_controls::FadeText::heading(title(item))
@@ -1104,10 +1338,12 @@ impl State {
                 .class(card_style(selected))
                 .padding([space::XS + space::XXS, space::S])
                 .width(Length::Fill)
-                .on_press(Action::Open(card.clone()));
-        widget::mouse_area(crate::interaction::hover(button))
-            .on_right_press(Action::CardMenu(card))
-            .into()
+                .on_press(Action::Open(card.clone(), destination.clone()));
+        owned(
+            (card.clone(), destination),
+            widget::mouse_area(crate::interaction::hover(button))
+                .on_right_press(Action::CardMenu(card)),
+        )
     }
 
     /// How long ago the card's last activity was, in a column of its own so
@@ -1266,11 +1502,14 @@ impl State {
             _ => format!("{lead}; {}", members.description()),
         };
         Some(crate::interaction::tooltip(
-            widget::button::custom(mark)
-                .name(name)
-                .class(crate::ui_controls::control_style(false, None))
-                .padding([space::XXS, space::XS])
-                .on_press(Action::FocusSession(first.id)),
+            owned(
+                first.id,
+                widget::button::custom(mark)
+                    .name(name)
+                    .class(crate::ui_controls::control_style(false, None))
+                    .padding([space::XXS, space::XS])
+                    .on_press(Action::FocusSession(CardRef::of(item), first.id)),
+            ),
             tip.join("\n"),
         ))
     }
@@ -1282,7 +1521,7 @@ impl State {
             .compact()
             .id(card.control_id("actions"))
             .selected(open)
-            .on_press(Action::Menu((!open).then(|| card.clone())));
+            .on_press(Action::Menu(card.clone(), !open));
         let content = open.then(|| {
             let mut items: Vec<Element<'a, Action>> = Vec::new();
             // Getting to an agent that waits comes first.
@@ -1294,71 +1533,84 @@ impl State {
                 );
                 let label = format!("Focus {}", session_label(session));
                 let state = session_state(session.state);
-                items.push(
-                    popover_item(icon, label.clone(), state, Action::FocusSession(session.id))
-                        .name(format!("{label}, {state}"))
-                        .into(),
-                );
+                items.push(owned(
+                    MenuTarget::Session(session.id),
+                    popover_item(
+                        icon,
+                        label.clone(),
+                        state,
+                        Action::FocusSession(card.clone(), session.id),
+                    )
+                    .name(format!("{label}, {state}")),
+                ));
             }
             // The rest are in the worktree, the least urgent of them.
             let more = urgent.len().saturating_sub(MENU_AGENTS);
             if let Some(worktree) = &item.worktree {
-                items.push(
+                let path = &worktree.path;
+                let destination = Destination::Worktree(path.clone());
+                items.push(owned(
+                    MenuTarget::Destination(destination.clone()),
                     popover_item(
                         Icon::OpenFolder.handle(),
                         "Open worktree",
                         match more {
-                            0 => crate::ui_controls::display_path(&worktree.path).to_string(),
+                            0 => crate::ui_controls::display_path(path).to_string(),
                             more => format!(
                                 "{more} more {} there · {}",
                                 if more == 1 { "session" } else { "sessions" },
-                                crate::ui_controls::display_path(&worktree.path)
+                                crate::ui_controls::display_path(path)
                             ),
                         },
-                        Action::OpenWorktree(card.clone()),
-                    )
-                    .into(),
-                );
+                        Action::OpenDestination(card.clone(), destination.clone()),
+                    ),
+                ));
             }
-            if let Some(pull_request) = &item.pull_request {
-                items.push(
+            if let Some(destination @ Destination::PullRequest { number, .. }) =
+                pr_destination(item)
+            {
+                items.push(owned(
+                    MenuTarget::Destination(destination.clone()),
                     popover_item(
                         Icon::PullRequest.handle(),
                         "Open pull request",
-                        format!("#{}", pull_request.number),
-                        Action::OpenPullRequest(card.clone()),
-                    )
-                    .into(),
-                );
+                        format!("#{number}"),
+                        Action::OpenDestination(card.clone(), destination),
+                    ),
+                ));
             }
             if let Some(ticket) = &item.linear
                 && let Some(url) = &ticket.url
             {
-                items.push(
+                items.push(owned(
+                    MenuTarget::Url(url.clone()),
                     popover_item(
                         Icon::Browser.handle(),
                         "Open Linear issue",
                         ticket.identifier.clone().unwrap_or_default(),
-                        Action::OpenUrl(url.clone()),
-                    )
-                    .into(),
-                );
+                        Action::OpenUrl(card.clone(), url.clone()),
+                    ),
+                ));
             }
             if let Some(branch) = &item.branch {
-                let action = copy_branch_action(item);
+                let action =
+                    copy_branch(item).map(|branch| Action::Copy(card.clone(), branch.clone()));
                 let enabled = action.is_some();
                 let control = popover_item(
                     Icon::Copy.handle(),
                     "Copy branch name",
                     branch.as_str(),
-                    Action::Copy(branch.clone()),
+                    Action::Copy(card.clone(), branch.clone()),
                 )
                 .on_press_maybe(action);
-                items.push(if enabled {
-                    control.into()
-                } else {
-                    crate::interaction::tooltip(control, "This branch name is not valid UTF-8")
-                });
+                items.push(owned(
+                    MenuTarget::Copy(branch.clone()),
+                    if enabled {
+                        control.into()
+                    } else {
+                        crate::interaction::tooltip(control, "This branch name is not valid UTF-8")
+                    },
+                ));
             }
             items.push(design::horizontal_rule());
             for column in Column::ALL {
@@ -1370,7 +1622,8 @@ impl State {
                 } else {
                     "Pin here"
                 };
-                items.push(
+                items.push(owned(
+                    MenuTarget::Pin(Some(column)),
                     popover_item(
                         if current {
                             Icon::Check.handle()
@@ -1381,32 +1634,47 @@ impl State {
                         description,
                         Action::Pin(card.clone(), Some(column)),
                     )
-                    .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column))))
-                    .into(),
-                );
+                    .on_press_maybe((!current).then(|| Action::Pin(card.clone(), Some(column)))),
+                ));
             }
             if item.pinned {
-                items.push(
+                items.push(owned(
+                    MenuTarget::Pin(None),
                     popover_item(
                         Icon::Undo.handle(),
                         "Unpin",
                         format!("Return to {}", item.derived.label()),
                         Action::Pin(card.clone(), None),
-                    )
-                    .into(),
-                );
+                    ),
+                ));
             }
             widget::column::with_children(items)
                 .width(CARD_MENU_WIDTH)
                 .into()
         });
-        popover(
-            anchor,
-            content,
-            widget::popover::Position::Bottom,
-            Close::new(Action::Menu(None), self.menu_opener(card), Action::Dismiss),
+        owned(
+            card.clone(),
+            popover(
+                anchor,
+                content,
+                widget::popover::Position::Bottom,
+                Close::new(
+                    Action::Menu(card.clone(), false),
+                    self.menu_opener(card),
+                    Action::Dismiss,
+                ),
+            ),
         )
     }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+enum MenuTarget {
+    Session(TerminalId),
+    Destination(Destination),
+    Url(String),
+    Copy(String),
+    Pin(Option<Column>),
 }
 
 /// The pane's views: the board's two layouts and the project checkouts.
@@ -1428,13 +1696,13 @@ pub fn layout_switch<'a>(current: Layout) -> Element<'a, Action> {
 }
 
 /// Clipboard text cannot preserve an invalid branch name's raw bytes.
-fn copy_branch_action(item: &Item) -> Option<Action> {
+fn copy_branch(item: &Item) -> Option<&String> {
     if let ItemKey::Branch(identity) = &item.key
         && crate::work::branch_name(identity).to_str().is_none()
     {
         return None;
     }
-    item.branch.clone().map(Action::Copy)
+    item.branch.as_ref()
 }
 
 /// Whether `query`, already lowercase, appears in anything the card shows.
@@ -2229,20 +2497,37 @@ mod tests {
         })
     }
 
-    fn watched(state: &mut State, revision: u64, board: Arc<Board>) {
-        state.update(Action::Watched(Watch::Board {
+    fn version(revision: u64) -> BoardVersion {
+        BoardVersion {
+            daemon: Arc::new(HostSessionProof {
+                host_session_id: crate::model::HostSessionId::from("board-test"),
+                boot_id: crate::model::BootId::from("board-test"),
+                host_incarnation: crate::model::HostIncarnation::from("board-test"),
+            }),
             revision,
-            board,
-            first: false,
-        }));
+        }
+    }
+
+    fn watched(state: &mut State, revision: u64, board: Arc<Board>) {
+        state.update(Action::Watched(
+            state.pane(),
+            Watch::Board {
+                version: version(revision),
+                board,
+                first: false,
+            },
+        ));
     }
 
     fn connected(state: &mut State, revision: u64, board: Arc<Board>) {
-        state.update(Action::Watched(Watch::Board {
-            revision,
-            board,
-            first: true,
-        }));
+        state.update(Action::Watched(
+            state.pane(),
+            Watch::Board {
+                version: version(revision),
+                board,
+                first: true,
+            },
+        ));
     }
 
     const RATE_LIMIT: &str = "GitHub rate limit reached. Retrying at 18:42 UTC";
@@ -2474,12 +2759,17 @@ mod tests {
     fn in_a_narrow_window_the_count_keeps_its_room() {
         let mut state = State::default();
         connected(&mut state, 1, rate_limited(16));
-        state.update(Action::Watched(Watch::Lost(
-            "the daemon closed the socket".into(),
-        )));
-        state.update(Action::Refreshed(Err(
-            "GitHub did not answer the refresh".into()
-        )));
+        state.update(Action::Watched(
+            state.pane(),
+            Watch::Lost("the daemon closed the socket".into()),
+        ));
+        let Some(Effect::Refresh(operation)) = state.update(Action::Refresh) else {
+            panic!("refresh")
+        };
+        state.update(Action::Refreshed(
+            operation,
+            Err("GitHub did not answer the refresh".into()),
+        ));
         let laid_out = laid_out(state.status().unwrap(), 400.0);
         let bounds = |wanted: &str| {
             laid_out
@@ -2537,7 +2827,25 @@ mod tests {
         );
         // A new daemon starts its revisions over, whether or not this pane
         // saw the old connection fail.
-        connected(&mut state, 1, board(vec![item("restarted", "cagents")]));
+        connected(
+            &mut state,
+            1,
+            board(vec![item("stale reconnect", "cagents")]),
+        );
+        assert_eq!(
+            state.visible().map(Item::label).collect::<Vec<_>>(),
+            ["new"]
+        );
+        let mut restarted = version(1);
+        Arc::make_mut(&mut restarted.daemon).host_incarnation = "new daemon".into();
+        state.update(Action::Watched(
+            state.pane(),
+            Watch::Board {
+                version: restarted,
+                board: board(vec![item("restarted", "cagents")]),
+                first: true,
+            },
+        ));
         assert_eq!(
             state.visible().map(Item::label).collect::<Vec<_>>(),
             ["restarted"]
@@ -2624,7 +2932,7 @@ mod tests {
         let effect = state.update(Action::Pin(card.clone(), Some(Column::Stale)));
         assert!(matches!(
             effect,
-            Some(Effect::Pin { ref item, column: Some(Column::Stale), .. }) if item == "branch:feat/board"
+            Some(Effect::Pin { ref item, column: Some(Column::Stale), .. }) if item.storage_key() == "branch:feat/board"
         ));
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::Stale, true));
@@ -2638,16 +2946,16 @@ mod tests {
     fn non_utf8_branch_copy_is_disabled_without_affecting_the_literal_label() {
         let mut invalid = item(r"legacy-\xFF", "cagents");
         invalid.key = ItemKey::Branch(":6c65676163792dff".into());
-        assert!(copy_branch_action(&invalid).is_none());
+        assert!(copy_branch(&invalid).is_none());
 
         let literal = item("legacy-\u{fffd}", "cagents");
         assert!(matches!(
-            copy_branch_action(&literal),
-            Some(Action::Copy(name)) if name == "legacy-\u{fffd}"
+            copy_branch(&literal),
+            Some(name) if name == "legacy-\u{fffd}"
         ));
 
         invalid.key = ItemKey::Branch(":6c65676163792dff:second-checkout".into());
-        assert!(copy_branch_action(&invalid).is_none());
+        assert!(copy_branch(&invalid).is_none());
 
         let worktree_path = PathBuf::from("/repos/cagents/.worktrees/legacy-raw");
         invalid.worktree = Some(crate::work::Worktree {
@@ -2662,9 +2970,12 @@ mod tests {
         assert!(matches!(
             effect,
             Some(Effect::Pin { item, column: Some(Column::Stale), .. })
-                if item == "branch::6c65676163792dff:second-checkout"
+                if item.storage_key() == "branch::6c65676163792dff:second-checkout"
         ));
-        let effect = state.update(Action::OpenWorktree(CardRef::of(&invalid)));
+        let effect = state.update(Action::OpenDestination(
+            CardRef::of(&invalid),
+            Destination::Worktree(worktree_path.clone()),
+        ));
         assert!(matches!(
             effect,
             Some(Effect::OpenWorktree { project, path })
@@ -2677,10 +2988,15 @@ mod tests {
         let mut state = State::default();
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));
         let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
-        state.update(Action::Pin(card.clone(), Some(Column::Stale)));
-        state.update(Action::Pinned(Err(
-            "the Work board store is unavailable".into()
-        )));
+        let Some(Effect::Pin { ticket, .. }) =
+            state.update(Action::Pin(card.clone(), Some(Column::Stale)))
+        else {
+            panic!("pin")
+        };
+        state.update(Action::Pinned(
+            ticket,
+            Err("the Work board store is unavailable".into()),
+        ));
         let shown = state.item(&card).unwrap();
         assert_eq!((shown.column, shown.pinned), (Column::InProgress, false));
         assert!(state.error.is_some());
@@ -2696,7 +3012,11 @@ mod tests {
         let confirmed = state.confirmed.clone().unwrap();
         let card = CardRef::of(&confirmed.items[0]);
 
-        state.update(Action::Pin(card.clone(), Some(Column::InReview)));
+        let Some(Effect::Pin { ticket, .. }) =
+            state.update(Action::Pin(card.clone(), Some(Column::InReview)))
+        else {
+            panic!("pin")
+        };
         let shown = state.item(&card).unwrap();
         assert_eq!(
             (shown.column, shown.pinned, shown.derived),
@@ -2709,7 +3029,7 @@ mod tests {
             (Column::Stale, true, Column::InProgress)
         );
 
-        state.update(Action::Pinned(Err("Permission denied".into())));
+        state.update(Action::Pinned(ticket, Err("Permission denied".into())));
         let shown = state.item(&card).unwrap();
         assert_eq!(
             (shown.column, shown.pinned, shown.derived),
@@ -2721,11 +3041,159 @@ mod tests {
     }
 
     #[test]
+    fn pin_replies_respect_card_pane_and_publication_order() {
+        let mut state = State::default();
+        let a = item("fix", "app");
+        let b = item("fix", "docs");
+        let card = CardRef::of(&a);
+        let other = CardRef::of(&b);
+        let listing = board(vec![a.clone(), b]);
+        connected(&mut state, 1, listing.clone());
+        let Some(Effect::Pin { ticket: old, .. }) =
+            state.update(Action::Pin(card.clone(), Some(Column::Stale)))
+        else {
+            panic!("pin")
+        };
+        let Some(Effect::Pin {
+            ticket: unrelated, ..
+        }) = state.update(Action::Pin(other, Some(Column::InReview)))
+        else {
+            panic!("other pin")
+        };
+        state.update(Action::Pinned(
+            unrelated,
+            Err("other project refused".into()),
+        ));
+        assert_eq!(state.item(&card).unwrap().column, Column::Stale);
+
+        state.reset();
+        connected(&mut state, 1, listing.clone());
+        assert!(!state.item(&card).unwrap().pinned);
+        assert!(
+            state
+                .update(Action::Pin(card.clone(), Some(Column::InReview)))
+                .is_none(),
+            "the reopened pane waits for its earlier write to finish"
+        );
+        let Some(Effect::Pin {
+            ticket: current,
+            column: Some(Column::InReview),
+            ..
+        }) = state.update(Action::Pinned(old.clone(), Err("old pane".into())))
+        else {
+            panic!("latest pin")
+        };
+        assert!(state.error.is_none());
+        assert!(
+            state
+                .update(Action::Pinned(old, Err("duplicate".into())))
+                .is_none()
+        );
+        state.update(Action::Pinned(current, Ok(version(2))));
+        watched(&mut state, 2, listing);
+        assert_eq!(
+            state.item(&card).unwrap().column,
+            Column::InReview,
+            "an older publication can arrive after the write reply"
+        );
+        // A newer board is authoritative, even when another window has pinned it since.
+        let mut external = a;
+        external.column = Column::Stale;
+        external.pinned = true;
+        watched(&mut state, 3, board(vec![external]));
+        assert_eq!(state.item(&card).unwrap().column, Column::Stale);
+    }
+
+    #[test]
+    fn an_old_failure_cannot_settle_a_new_selection_of_the_same_column() {
+        let mut state = State::default();
+        let item = item("fix", "app");
+        let card = CardRef::of(&item);
+        connected(&mut state, 1, board(vec![item]));
+        let Some(Effect::Pin { ticket, .. }) =
+            state.update(Action::Pin(card.clone(), Some(Column::Stale)))
+        else {
+            panic!("pin")
+        };
+        state.update(Action::Pin(card.clone(), Some(Column::InReview)));
+        state.update(Action::Pin(card.clone(), Some(Column::Stale)));
+        assert!(matches!(
+            state.update(Action::Pinned(ticket, Err("first write failed".into()))),
+            Some(Effect::Pin {
+                column: Some(Column::Stale),
+                ..
+            })
+        ));
+        assert_eq!(state.item(&card).unwrap().column, Column::Stale);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn stale_work_actions_cannot_retarget_a_destination_or_reopened_pane() {
+        let mut state = State::default();
+        let mut a = item("fix", "app");
+        let b = item("fix", "docs");
+        let old_path = PathBuf::from("/repos/old");
+        a.worktree = Some(crate::work::Worktree {
+            path: old_path.clone(),
+            primary: false,
+            locked: false,
+            created_at_unix_ms: None,
+        });
+        let card = CardRef::of(&a);
+        let other = CardRef::of(&b);
+        let original = board(vec![a.clone(), b.clone()]);
+        connected(&mut state, 1, original.clone());
+        let pane = state.pane();
+        let Some(Effect::Refresh(refresh)) = state.update(Action::Refresh) else {
+            panic!("refresh")
+        };
+        a.worktree.as_mut().unwrap().path = "/repos/replacement".into();
+        watched(&mut state, 2, board(vec![a, b.clone()]));
+        assert!(
+            state
+                .update(Action::Open(
+                    card.clone(),
+                    Some(Destination::Worktree(old_path))
+                ))
+                .is_none()
+        );
+        state.update(Action::Menu(other.clone(), true));
+        state.update(Action::Menu(card.clone(), false));
+        state.update(Action::Dismiss(card.control_id("actions")));
+        assert_eq!(state.menu.as_ref(), Some(&other));
+
+        state.reset();
+        connected(&mut state, 1, board(vec![b]));
+        let Some(Effect::Refresh(current)) = state.update(Action::Refresh) else {
+            panic!("new refresh")
+        };
+        state.update(Action::Watched(
+            pane,
+            Watch::Board {
+                version: version(100),
+                board: original,
+                first: true,
+            },
+        ));
+        state.update(Action::Refreshed(refresh, Err("old refresh".into())));
+        state.update(Action::Rendered(
+            pane,
+            Box::new(Action::Scope(Some(other.project.clone()))),
+        ));
+        state.update(Action::Scope(Some(card.project)));
+        assert_eq!(state.refreshing, Some(current));
+        assert!(state.scope.is_none());
+        assert!(state.error.is_none());
+        assert_eq!(state.visible().count(), 1);
+    }
+
+    #[test]
     fn a_card_menu_closes_when_its_card_leaves_the_board() {
         let mut state = State::default();
         watched(&mut state, 1, board(vec![item("feat/board", "cagents")]));
         let card = CardRef::of(&state.board.as_ref().unwrap().items[0]);
-        state.update(Action::Menu(Some(card.clone())));
+        state.update(Action::Menu(card.clone(), true));
         watched(&mut state, 2, board(vec![item("feat/board", "cagents")]));
         assert_eq!(state.menu.as_ref(), Some(&card));
         watched(&mut state, 3, board(vec![item("feat/other", "cagents")]));
@@ -3397,8 +3865,10 @@ mod tests {
     /// click opened its menu on.
     #[test]
     fn dismissing_a_popover_returns_to_what_opened_it() {
-        let card = CardRef::of(&item("fix", "cagents"));
+        let item = item("fix", "cagents");
+        let card = CardRef::of(&item);
         let mut state = State::default();
+        connected(&mut state, 1, board(vec![item]));
         let dismissed = |state: &mut State, opener: widget::Id| {
             assert!(matches!(
                 state.update(Action::Dismiss(opener.clone())),
@@ -3415,7 +3885,7 @@ mod tests {
         state.problems_open = true;
         dismissed(&mut state, widget::Id::new(PROBLEMS_CONTROL_ID));
         for (open, role) in [
-            (Action::Menu(Some(card.clone())), "actions"),
+            (Action::Menu(card.clone(), true), "actions"),
             (Action::CardMenu(card.clone()), "open"),
         ] {
             state.update(open);

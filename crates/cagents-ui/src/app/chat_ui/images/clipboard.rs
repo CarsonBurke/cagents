@@ -279,7 +279,7 @@ pub(in crate::app) fn resolve(runtime: &Runtime, image: Id) -> Option<Resolved> 
         // An image an answer's Markdown shows.
         return runtime.figures.resolve(image);
     };
-    let item = items(runtime).iter().find(|item| item.id == *id)?;
+    let item = super::image_item(runtime, id)?;
     Some(Resolved {
         item: Some(id.clone()),
         handle: handle.clone(),
@@ -313,7 +313,13 @@ impl Cagents {
         match command {
             ImageCommand::Open => match (image, resolved.item) {
                 (ImageRef::Transcript(target, _), Some(item)) => {
-                    self.handle_chat_ui(Action::OpenImage(target, item))
+                    let Some(row) = self.chat_runtime_mut(target).and_then(|runtime| {
+                        let item = super::image_item(runtime, &item)?;
+                        Some(runtime.row_target(item))
+                    }) else {
+                        return Task::none();
+                    };
+                    self.handle_chat_ui(Action::OpenImage(target, row))
                 }
                 _ => Task::none(),
             },

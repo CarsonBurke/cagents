@@ -60,7 +60,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 225,
+    proven_at: 226,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -491,12 +491,13 @@ impl OlderClient {
             && !self.cannot_read_work_checks_for(request)
             && !matches!(
                 request,
-                ClientRequest::Agent {
-                    operation: crate::agent_execution::Operation::Compact(_)
-                        | crate::agent_execution::Operation::CompactTracked(_)
-                        | crate::agent_execution::Operation::CompactionStatus(_),
-                    ..
-                }
+                ClientRequest::Work(crate::work::Request::PinCard { .. })
+                    | ClientRequest::Agent {
+                        operation: crate::agent_execution::Operation::Compact(_)
+                            | crate::agent_execution::Operation::CompactTracked(_)
+                            | crate::agent_execution::Operation::CompactionStatus(_),
+                        ..
+                    }
             )
     }
 

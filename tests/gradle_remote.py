@@ -69,6 +69,8 @@ class GradleRemoteTest(unittest.TestCase):
         (self.checkout / "crates/mobile-api/fixtures/v1.jsonl").write_text("{}\n")
         self.home = self.temp / "host-home"
         self.home.mkdir()
+        self.caller_home = self.temp / "caller-home"
+        self.caller_home.mkdir()
         bin_directory = self.temp / "bin"
         bin_directory.mkdir()
         for name, text in (("ssh", FAKE_SSH), ("rsync", FAKE_RSYNC)):
@@ -78,6 +80,7 @@ class GradleRemoteTest(unittest.TestCase):
         self.gradle_record = self.temp / "gradle.txt"
         self.env = {
             **os.environ,
+            "HOME": str(self.caller_home),
             "PATH": f"{bin_directory}:{os.environ['PATH']}",
             "FAKE_HOME": str(self.home),
             "FAKE_RECORD": str(self.record),
@@ -86,6 +89,7 @@ class GradleRemoteTest(unittest.TestCase):
             "CAGENTS_BUILD_REMOTE": "buildhost",
         }
         self.env.pop("ANDROID_HOME", None)
+        self.env.pop("ANDROID_DEBUG_KEYSTORE", None)
         self.env.pop("CAGENTS_GRADLE_LOCAL", None)
 
     def run_script(self, *args, **env):
@@ -125,6 +129,15 @@ class GradleRemoteTest(unittest.TestCase):
         mobile = self.checkout / "mobile"
         self.assertTrue((mobile / "shared/build/test-results/jvmTest/TEST-a.xml").is_file())
         self.assertFalse((mobile / "androidApp/build/outputs/apk/debug/app-debug.apk").exists())
+
+    def test_copies_only_the_debug_keystore_supplied_by_the_fixture(self):
+        keystore = self.temp / "fixture-debug.keystore"
+        keystore.write_text("disposable fixture keystore\n")
+        result = self.run_script(":a", ANDROID_DEBUG_KEYSTORE=str(keystore))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-Pcagents.debugKeystore=../debug.keystore", self.gradle_record.read_text())
+        copied = self.remote_mobile().parent / "debug.keystore"
+        self.assertEqual(copied.read_text(), "disposable fixture keystore\n")
 
     def test_runs_here_only_when_asked_to(self):
         result = self.run_script(":a", CAGENTS_BUILD_REMOTE="local")

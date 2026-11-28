@@ -122,10 +122,14 @@ fn apply_items(
     order: Vec<String>,
     changes: Vec<ItemChange>,
 ) -> Result<Vec<std::sync::Arc<Item>>, &'static str> {
+    let previous_count = previous.len();
     let previous: HashMap<_, _> = previous
         .iter()
         .map(|item| (item.id.as_str(), item))
         .collect();
+    if previous.len() != previous_count {
+        return Err("Ambiguous transcript base");
+    }
     let mut changed = HashSet::new();
     for change in &changes {
         if !changed.insert(change.id()) {
@@ -249,6 +253,16 @@ impl Presentation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_delta_cannot_choose_the_survivor_of_an_ambiguous_base() {
+        use std::sync::Arc;
+        let previous = vec![
+            Arc::new(text("shared", "surviving text")),
+            Arc::new(text("shared", "departed text")),
+        ];
+        assert!(apply_items(&previous, vec!["shared".into()], Vec::new()).is_err());
+    }
+
     #[test]
     fn full_window_updates_share_payloads_with_the_retained_ui_snapshot() {
         let items: Vec<_> = (0..127)

@@ -1947,7 +1947,18 @@ impl HostState {
                 true,
             ));
         }
+        let local_startups = self
+            .native_actor_startups
+            .values()
+            .filter_map(super::chat::retained_actor::Startup::local_source);
         if (self.chat_spawning.contains_key(&terminal_id) && !owns_transition)
+            || local_startups.clone().any(|source| {
+                source.id == terminal_id
+                    || source
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|paired| paired.id == terminal_id)
+            })
             || self.chats.get(&terminal_id).is_some_and(|record| {
                 record.handle.owns_work()
                     && !paired.is_some_and(|terminal| {
@@ -1970,22 +1981,26 @@ impl HostState {
         // is returning to. Adopting a holder launches nothing.
         let handoff = self.handoff_terminals.get(&terminal_id);
         if let Some(spawned) = spawned.filter(|_| !adopting)
-            && self.chat_spawning.iter().any(|(id, claim)| {
-                *id != terminal_id
-                    && Some(id) != handoff
-                    && claim
-                        .terminal
-                        .as_ref()
-                        .is_none_or(|terminal| terminal.id != terminal_id)
-                    && claim.launch.provider == crate::agent::Provider::Codex
-                    && claim
-                        .launch
-                        .session_id
-                        .as_deref()
-                        .is_some_and(|conversation| {
-                            super::chat::terminal_runs_codex_conversation(spawned, conversation)
-                        })
-            })
+            && self
+                .chat_spawning
+                .iter()
+                .chain(local_startups.map(|source| (&source.id, source)))
+                .any(|(id, claim)| {
+                    *id != terminal_id
+                        && Some(id) != handoff
+                        && claim
+                            .terminal
+                            .as_ref()
+                            .is_none_or(|terminal| terminal.id != terminal_id)
+                        && claim.launch.provider == crate::agent::Provider::Codex
+                        && claim
+                            .launch
+                            .session_id
+                            .as_deref()
+                            .is_some_and(|conversation| {
+                                super::chat::terminal_runs_codex_conversation(spawned, conversation)
+                            })
+                })
         {
             return Err(ProtocolError::new(
                 ProtocolErrorCode::TerminalUnavailable,
@@ -4218,7 +4233,7 @@ fn restart_or_stop(
     host: &SharedHost,
     chat: &crate::upgrade::handoff::Chat,
     unattached: &mut Vec<crate::upgrade::handoff::UnattachedChat>,
-    queue_budget: &mut super::chat::UpgradeRestoreQueueBudget,
+    queue_budget: &crate::chat::runtime::UpgradeRestoreQueueBudget,
 ) -> Result<(), String> {
     // A debug fixture's stand-in for a restart that fails: nothing starts,
     // and the conversation is stopped and recorded as a failed one is.
@@ -4747,13 +4762,13 @@ fn restore_upgrade_checkpoint(
     // failed restart must be positively stopped before restore proceeds. Share
     // lock queue time so one external lock holder cannot delay every restart
     // by another minute while this daemon cannot yet accept clients.
-    let mut queue_budget = super::chat::UpgradeRestoreQueueBudget::default();
+    let queue_budget = crate::chat::runtime::UpgradeRestoreQueueBudget::default();
     let restored = (|| {
         // A managed CLI connects to its thread's server. Recreate that exact
         // actor first; starting the TUI first races a socket that does not exist.
         for chat in &checkpoint.chats {
             if ChatRestore::of(chat) == ChatRestore::CodexListener {
-                restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
+                restart_or_stop(host, chat, &mut unattached, &queue_budget)?;
             }
         }
         // Carried terminals are adopted before anything is relaunched: their
@@ -4918,7 +4933,7 @@ fn restore_upgrade_checkpoint(
             if crate::daemon::termination_requested() {
                 return Err(RESTORE_TERMINATED.to_owned());
             }
-            restart_or_stop(host, chat, &mut unattached, &mut queue_budget)?;
+            restart_or_stop(host, chat, &mut unattached, &queue_budget)?;
         }
         let recovered = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());

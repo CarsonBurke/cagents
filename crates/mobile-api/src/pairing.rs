@@ -34,8 +34,8 @@ pub enum PairClientLine {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PairRequest {
-    /// The phone's own public key, in OpenSSH form: `ssh-ed25519 AAAA…`.
-    /// Only Ed25519 keys are accepted.
+    /// The phone's own public key in OpenSSH form, using `ssh-ed25519`
+    /// or `ecdsa-sha2-nistp256`.
     pub key: String,
     /// What the computer calls the phone, such as `Pixel 9`. The computer
     /// keeps letters, digits, spaces and common punctuation, at most

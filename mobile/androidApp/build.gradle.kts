@@ -4,6 +4,14 @@ plugins {
     alias(libs.plugins.kotlin.serialization)
 }
 
+// The release packager sets these from the source commit's Cargo version.
+// Gradle builds the unsigned APK. Signing inputs stay out of its configuration.
+val releaseVersion = providers.gradleProperty("cagents.releaseVersion").orNull
+val releaseVersionCode = providers.gradleProperty("cagents.releaseVersionCode").orNull
+require((releaseVersion == null) == (releaseVersionCode == null)) {
+    "Set both cagents.releaseVersion and cagents.releaseVersionCode"
+}
+
 android {
     namespace = "dev.cagents.mobile.android"
     compileSdk = libs.versions.compileSdk.get().toInt()
@@ -12,8 +20,8 @@ android {
         applicationId = "dev.cagents.mobile"
         minSdk = libs.versions.minSdk.get().toInt()
         targetSdk = libs.versions.targetSdk.get().toInt()
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = releaseVersionCode?.toInt() ?: 1
+        versionName = releaseVersion ?: "0.1.0"
     }
 
     // scripts/gradle-remote passes the debug key of the machine that asked
@@ -32,8 +40,8 @@ android {
             isShrinkResources = true
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
-        // Release code, signed with the debug key until release signing
-        // exists. It installs over the debug build, keeping that build's
+        // Release code with the development identity and debug key. It
+        // installs over the debug build, keeping that build's
         // phone key and trusted hosts. Use it on a phone: a debuggable build
         // runs Compose several times slower, and its lists stutter.
         create("preview") {

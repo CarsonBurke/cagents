@@ -1028,10 +1028,7 @@ fn preview_pressure_admits_newer_images_only_after_retained_trees_release_pixels
     executor.block_on(pressure.available());
     finish_preview(runtime, &items[0], images::bounded_handle(bytes, &budget));
     assert!(runtime.cache[&items[0].id].image.is_some());
-    assert_eq!(
-        runtime.preview_request.as_deref(),
-        Some(items[0].id.as_str())
-    );
+    assert!(runtime.preview_requested(&items[0]));
 }
 #[test]
 fn preview_interest_bounds_manual_requests_and_suppresses_over_budget_recent_candidates() {
@@ -1058,7 +1055,7 @@ fn preview_interest_bounds_manual_requests_and_suppresses_over_budget_recent_can
     assert!(runtime.cache[&items[17].id].image_source.is_none());
     for item in items.iter().take(12) {
         images::request(runtime, &item.id);
-        assert_eq!(runtime.preview_request.as_deref(), Some(item.id.as_str()));
+        assert!(runtime.preview_requested(item));
         assert!(
             runtime
                 .cache
@@ -1224,7 +1221,7 @@ fn explicit_preview_pressure_can_retire_automatic_owners_in_other_panes() {
         app.chat_runtime_mut(target).unwrap(),
         std::slice::from_ref(&requested),
     );
-    drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone())));
+    drop(app.handle_chat_ui(Action::LoadImage(target, requested.id.clone().into())));
     let attempt = chat_runtime(&app, requested_card).cache[&requested.id].image_attempt;
     drop(app.handle_chat_ui(Action::ImageLoaded(
         target,
@@ -5785,10 +5782,10 @@ fn child_find_ownership_follows_window_pruning_and_preserves_manual_choices() {
     assert!(runtime.child_expanded["same-child"].contains(&last_item));
     // A step drawn as one row opens its tool call for the match.
     assert!(runtime.child_expanded["same-child"].contains(&last_part));
-    drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
-    drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone())));
-    drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
-    drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone())));
+    drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone().into())));
+    drop(app.handle_chat_ui(Action::Toggle(target, last_item.clone().into())));
+    drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone().into())));
+    drop(app.handle_chat_ui(Action::Toggle(target, last_part.clone().into())));
     drop(app.handle_chat_ui(Action::CloseFind(target)));
     let runtime = chat_runtime(&app, card);
     assert_eq!(
@@ -6041,7 +6038,7 @@ fn selected_presentation_admits_only_current_child_and_prunes_old_backing() {
     let parent_revision = runtime.cache[&parent.id].revision;
     let raw = runtime.snapshot.clone();
     drop(app.handle_chat_ui(Action::SelectSubagent(target, Some("child-0".into()))));
-    drop(app.handle_chat_ui(Action::Toggle(target, tool.id.clone())));
+    drop(app.handle_chat_ui(Action::Toggle(target, tool.id.clone().into())));
     let runtime = chat_runtime(&app, card);
     assert_eq!(runtime.child_cache.len(), 1);
     assert!(Arc::ptr_eq(&raw, &runtime.snapshot));
@@ -6083,6 +6080,132 @@ fn selected_presentation_admits_only_current_child_and_prunes_old_backing() {
     );
 }
 #[test]
+fn row_actions_distinguish_colliding_ids_and_refuse_a_replacement() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let id = "answer:native-part:1:text:131072-262144:0-0";
+    let first = presentation_text(id, "Generated part");
+    let second = presentation_text(id, "Opaque provider item");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![first.clone(), second.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+
+    let runtime = chat_runtime(&app, card);
+    assert_ne!(runtime.cache_key(&first), runtime.cache_key(&second));
+    for item in [&first, &second] {
+        let cached = &runtime.cache[runtime.cache_key(item)];
+        assert!(Arc::ptr_eq(cached.item.as_ref().unwrap(), item));
+    }
+    let row = runtime.row_target(&second);
+    assert_eq!(
+        runtime.inline_copy_text(&row, CopyPart::Text).as_deref(),
+        Some("Opaque provider item")
+    );
+    assert_eq!(
+        runtime
+            .inline_copy_text(&runtime.row_target(&first), CopyPart::Text)
+            .as_deref(),
+        Some("Generated part")
+    );
+    drop(app.handle_chat_ui(Action::Copy(target, row.clone(), CopyPart::Text)));
+    drop(app.handle_chat_ui(Action::Toggle(target, row.clone())));
+    drop(app.handle_chat_ui(Action::Unfold(target, row.clone(), "details".into())));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.row_expanded(&second));
+    assert!(!runtime.row_expanded(&first));
+    assert!(runtime.row_part_unfolded(&second, "details"));
+    assert!(!runtime.row_part_unfolded(&first, "details"));
+    assert!(runtime.row_copy_note_shown(&second));
+    assert!(!runtime.row_copy_note_shown(&first));
+
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items.pop();
+    snapshot.items.push(presentation_text(id, "Replacement"));
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    assert_eq!(
+        app.handle_chat_ui(Action::Copy(target, row.clone(), CopyPart::Text))
+            .units(),
+        0
+    );
+    drop(app.handle_chat_ui(Action::Toggle(target, row)));
+    assert!(!chat_runtime(&app, card).row_expanded(&first));
+}
+
+#[test]
+fn copy_and_disclosures_stay_with_their_row_across_separate_history_windows() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let id = "answer:native-part:1:text:131072-262144:0-0";
+    let original = presentation_text(id, "Generated part");
+    let replacement = presentation_text(id, "Opaque provider item");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![original.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let row = chat_runtime(&app, card).row_target(&original);
+    drop(app.handle_chat_ui(Action::Toggle(target, row.clone())));
+    drop(app.handle_chat_ui(Action::Unfold(target, row.clone(), "details".into())));
+    drop(app.handle_chat_ui(Action::CopyMessage(target, row, None)));
+    let runtime = chat_runtime(&app, card);
+    assert!(runtime.row_expanded(&original));
+    assert!(runtime.row_part_unfolded(&original, "details"));
+    assert!(runtime.row_copy_note_shown(&original));
+
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![replacement.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let runtime = chat_runtime(&app, card);
+    assert!(!runtime.row_expanded(&replacement));
+    assert!(!runtime.row_part_unfolded(&replacement, "details"));
+    assert!(!runtime.row_copy_note_shown(&replacement));
+}
+
+#[test]
+fn find_reveals_and_restores_only_the_matching_report_continuation() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let report = |body: &str| {
+        Arc::new(chat::Item {
+            id: "report:native-part:1:delivery:131072-140000:0-0".into(),
+            role: chat::Role::User,
+            content: ItemContent::Delivery {
+                kind: chat::DeliveryKind::Report,
+                from: String::new(),
+                sender: "Fixture".into(),
+                summary: "Review report".into(),
+                body: body.into(),
+            },
+            at: None,
+            started_at: None,
+        })
+    };
+    let neighbor = report("Summary of the first review");
+    let matching = report("The second report includes an exact-find-needle");
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.items = vec![neighbor.clone(), matching.clone()];
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    drop(find_navigation::find_for_test(
+        &mut app,
+        target,
+        "exact-find-needle".into(),
+    ));
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    assert!(runtime.row_expanded(&matching));
+    assert!(!runtime.row_expanded(&neighbor));
+    runtime.restore_find_disclosures();
+    assert!(!runtime.row_expanded(&matching));
+}
+
+#[test]
 fn selected_presentation_same_item_id_keeps_parent_and_child_copy_independent() {
     use iced::futures::StreamExt;
     let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -6118,7 +6241,8 @@ fn selected_presentation_same_item_id_keeps_parent_and_child_copy_independent() 
             .map(|turn| (turn.key.clone(), turn.summary.clone()))
             .collect::<Vec<_>>()
     );
-    let copy = app.handle_chat_ui(Action::Copy(target, "same-id".into(), CopyPart::Text));
+    let row = runtime.row_target(&child);
+    let copy = app.handle_chat_ui(Action::Copy(target, row, CopyPart::Text));
     let text = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -6186,13 +6310,21 @@ fn selected_presentation_bounds_child_disclosure_history_without_crossing_transc
     handle.publish_snapshot_for_test(snapshot.clone());
     app.chat_runtime_mut(target).unwrap().refresh();
     preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
-    drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
+    drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
+    drop(app.handle_chat_ui(Action::Unfold(
+        target,
+        item.id.clone().into(),
+        "body".into(),
+    )));
     for child in ["long-running-child", "other-child"] {
         drop(app.handle_chat_ui(Action::SelectSubagent(target, Some(child.into()))));
         preparation::drain_fixture(app.chat_runtime_mut(target).unwrap());
-        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
-        drop(app.handle_chat_ui(Action::Unfold(target, format!("{}#body", item.id))));
+        drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
+        drop(app.handle_chat_ui(Action::Unfold(
+            target,
+            item.id.clone().into(),
+            "body".into(),
+        )));
     }
     let runtime = app.chat_runtime_mut(target).unwrap();
     // Represent choices accumulated over evicted windows of the same
@@ -8966,7 +9098,8 @@ fn a_chooser_refusal_survives_a_deferred_account_change() {
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
     );
-    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert_eq!(task.units(), 2, "only skills and permission are refreshed");
+    assert!(runtime.draft_permission.pending.is_some());
     assert!(runtime.attachments.is_empty());
     assert_eq!(runtime.pastes_pending, 0);
     assert!(!ticket.active());
@@ -9012,7 +9145,8 @@ fn a_chooser_choice_is_judged_by_the_provider_the_draft_adopts() {
             "This chat can attach only images (PNG, JPEG, GIF or WebP). Paste the contents of other files into your message instead."
         )
     );
-    assert_eq!(task.units(), 1, "only draft skills refresh is scheduled");
+    assert_eq!(task.units(), 2, "only skills and permission are refreshed");
+    assert!(runtime.draft_permission.pending.is_some());
     assert!(runtime.attachments.is_empty());
     assert_eq!(runtime.pastes_pending, 0);
     assert!(!ticket.active());
@@ -15077,7 +15211,9 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
 }
 
 #[test]
-fn draft_permission_preview_reads_config_once_per_recipe() {
+fn draft_permission_preview_resolves_once_and_discards_superseded_reads() {
+    use iced::futures::StreamExt;
+
     let home = tempfile::tempdir().unwrap();
     let account = home.path().join(".codex");
     std::fs::create_dir_all(&account).unwrap();
@@ -15087,7 +15223,10 @@ fn draft_permission_preview_reads_config_once_per_recipe() {
         "approval_policy = 'never'\nsandbox_mode = 'danger-full-access'\n",
     )
     .unwrap();
-    let mut recipe = LaunchRecipe {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, home.path());
+    let target = chat_runtime(&app, card).target;
+    let recipe = LaunchRecipe {
         unset_environment: Default::default(),
         program: "codex".into(),
         arguments: Vec::new(),
@@ -15098,36 +15237,96 @@ fn draft_permission_preview_reads_config_once_per_recipe() {
         ]
         .into(),
     };
-    let mut preview = DraftPermissionPreview::default();
+    app.chat_runtime_mut(target).unwrap().session.launch.recipe = recipe.clone();
+    let first = app.load_draft_permission(target);
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    assert_eq!(app.load_draft_permission(target).units(), 0);
+    let executor = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let read = |task| {
+        executor.block_on(async move {
+            let mut outputs = iced::runtime::task::into_stream(task).unwrap();
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(message))) =
+                outputs.next().await
+            else {
+                panic!("the worker must answer");
+            };
+            message
+        })
+    };
+    let first = read(first);
+
+    // A recipe can change twice while a read is in flight. The equal recipe
+    // after the second change must require its own receipt.
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .arguments = vec!["--yolo".into()];
+    assert_eq!(app.load_draft_permission(target).units(), 0);
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
         Some("yolo")
     );
     std::fs::write(
-        &config,
+        config,
         "approval_policy = 'on-request'\nsandbox_mode = 'read-only'\n",
     )
     .unwrap();
+    app.chat_runtime_mut(target).unwrap().session.launch.recipe = recipe;
+    let latest = app.load_draft_permission(target);
+    let _ = app.update(first);
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    let _ = app.update(read(latest));
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("yolo"),
-        "an unchanged recipe keeps its preview"
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
+        Some("readOnly")
     );
-    recipe.arguments = ["-a", "on-request", "-s", "workspace-write"]
-        .map(String::from)
-        .into();
+    assert_eq!(app.load_draft_permission(target).units(), 0);
+}
+
+#[test]
+fn a_returned_draft_can_restart_a_preview_in_flight_during_first_send() {
+    let home = tempfile::tempdir().unwrap();
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let card = draft_chat_in(&mut app, Provider::Codex, home.path());
+    let target = chat_runtime(&app, card).target;
+    app.chat_runtime_mut(target)
+        .unwrap()
+        .session
+        .launch
+        .recipe
+        .working_directory = home.path().join("changed");
+    let _ = app.load_draft_permission(target);
+    let runtime = app.chat_runtime_mut(target).unwrap();
+    let old_read = runtime.draft_permission.pending.expect("a pending read");
+    let new_target = Target {
+        generation: target.generation + 1,
+        ..target
+    };
+    runtime.retarget(new_target);
+    // Simulate restoring the draft after an unsuccessful first send. The
+    // recipe is the same, but Ready retargeted the runtime.
+    assert!(app.load_draft_permission(new_target).units() > 0);
+    let new_read = chat_runtime(&app, card).draft_permission.pending.unwrap();
+    assert_ne!(old_read, new_read);
+
+    let _ = app.update(action(Action::DraftPermissionResolved(
+        target,
+        old_read,
+        Some("yolo".into()),
+    )));
+    assert_eq!(chat_runtime(&app, card).snapshot.permission_mode, None);
+    let _ = app.update(action(Action::DraftPermissionResolved(
+        new_target,
+        new_read,
+        Some("manual".into()),
+    )));
     assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("workspaceWrite")
-    );
-    assert_eq!(
-        preview.get(&recipe, Provider::Omp),
-        None,
-        "the provider is part of the key"
-    );
-    assert_eq!(
-        preview.get(&recipe, Provider::Codex).as_deref(),
-        Some("workspaceWrite")
+        chat_runtime(&app, card).snapshot.permission_mode.as_deref(),
+        Some("manual")
     );
 }
 
@@ -25959,7 +26158,7 @@ fn collapsed_tool_bookmarks_survive_runtime_updates_and_reopen_only_after_worker
                         Some("selected-child".into()),
                     )));
                 }
-                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 let memory = runtime.scroll_memory.clone();
                 let context = runtime.selected_subagent.clone();
@@ -26021,7 +26220,7 @@ fn collapsed_tool_bookmarks_survive_runtime_updates_and_reopen_only_after_worker
                 }
                 let original_proofs = memory.reader_proofs(context.as_deref());
                 assert_eq!(original_proofs.len(), 4);
-                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
                 assert!(
                     !app.chat_runtime_mut(target)
                         .unwrap()
@@ -26085,7 +26284,7 @@ fn collapsed_tool_bookmarks_survive_runtime_updates_and_reopen_only_after_worker
                 );
                 // Reopen before output arrives: Toggle must preserve the
                 // actual admitted owner rather than construct a cold reader.
-                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
                 let runtime = app.chat_runtime_mut(target).unwrap();
                 assert!(runtime.item_expanded(&item.id));
                 assert!(runtime.presentation_cache()[&item.id].preparing);
@@ -26136,8 +26335,8 @@ fn collapsed_tool_bookmarks_survive_runtime_updates_and_reopen_only_after_worker
                     assert!(Arc::ptr_eq(&shared, &reader.text));
                 }
                 let source_owner = cached.tool_output.as_ref().unwrap().text.clone();
-                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
-                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone())));
+                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
+                drop(app.handle_chat_ui(Action::Toggle(target, item.id.clone().into())));
                 assert!(
                     Arc::ptr_eq(
                         &source_owner,
@@ -27137,13 +27336,14 @@ fn a_closed_pane_a_view_brings_back_at_the_next_launch_goes_again() {
         let closed = app.persistent_workspace();
         assert_eq!(stopping(&app), vec![(source.id, None)]);
 
-        // The next launch: the view still holds the pane, as the window
-        // saved the close but the view did not hear it.
+        // The next launch loads the saved close. The view still holds the
+        // pane and brings it back at the chosen time.
         let mut next = crate::app::tests::context_inspector_test_app(false);
         next.durable = closed;
-        Arc::make_mut(&mut next.durable).cards = open.cards.clone();
         next.workspace = Cagents::rebuild_workspace(&next.durable);
         let came_back = |next: &mut Cagents| {
+            Arc::make_mut(&mut next.durable).cards = open.cards.clone();
+            next.workspace = Cagents::rebuild_workspace(&next.durable);
             let task = next.attach_shared_chat(card, source.clone());
             assert!(
                 !next.cards.contains_key(&card) && next.chat_ui.attempt(card).is_none(),

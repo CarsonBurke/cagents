@@ -60,7 +60,7 @@ fn viewing(app: &mut Cagents) -> (CardId, Target, Vec<(String, iced::advanced::i
     let images = show_images(runtime, 2);
     drop(app.update(Message::ChatUi(Action::OpenImage(
         target,
-        images[0].0.clone(),
+        images[0].0.clone().into(),
     ))));
     (card, target, images)
 }

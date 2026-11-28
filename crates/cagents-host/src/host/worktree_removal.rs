@@ -205,6 +205,9 @@ impl Reservation {
             for closing in state.native_closing.values() {
                 hosted.push(("A closing chat", closing.working_directory().to_owned()));
             }
+            for startup in state.native_actor_startups.values() {
+                hosted.push(("A starting chat", startup.working_directory().to_owned()));
+            }
             for (session, _) in state.execution_startups.values() {
                 let directory = match session {
                     crate::agent_execution::HostedSession::Chat(session) => {

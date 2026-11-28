@@ -385,7 +385,9 @@ use crate::{
 /// loaded window, cached or still with the provider, and appends the `Seek`
 /// chat command that moves the window to any cached item. An older CLI is sent
 /// snapshots without the count, and an older update source is read without it.
-pub const PROTOCOL_VERSION: u16 = 225;
+///
+/// Version 226 adds exact Work card pins and a publication watermark for replies.
+pub const PROTOCOL_VERSION: u16 = 226;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";

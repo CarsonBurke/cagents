@@ -26,6 +26,33 @@ What it does:
 The app lists terminal agents. The API supports a read-only terminal view
 that the app does not yet display.
 
+## Install on Android
+
+Open the [Android APK download](https://github.com/CarsonBurke/cagents/releases/latest/download/cagents-android.apk)
+on your phone and tap the downloaded file. On Android 14 and later, if the
+installer asks for permission, tap **Settings**, enable **Allow from this
+source**, then go back and tap **Install**. You can also find that permission
+under **Settings → Apps → Special app access → Install unknown apps**. Select
+the browser or file manager you used to open the APK. You can turn the
+permission off again after installing.
+
+Open the app from the installer and [pair it with your computers](#connect-a-computer).
+To update, open and install a newer APK. Android keeps your pairing data
+when the newer release uses the same signing key.
+
+### Move from a preview build
+
+The debug-key preview uses `dev.cagents.mobile.debug` and can stay installed
+beside the release app. Open the release directly from the installer and
+use its in-app scanner to pair each computer again. It creates a new phone
+key and stores its own trusted hosts. Remove the preview after verifying the
+new connections.
+
+If you manually installed a debug-key build with the production ID
+`dev.cagents.mobile`, Android will refuse to install the release over it.
+Uninstall that build, then install the release and pair again. Uninstalling
+deletes that build's local data.
+
 ## Connect a computer
 
 The computer needs cagents with phone pairing (the phone icon in its status
@@ -119,8 +146,8 @@ They are signed with this machine's debug key (`~/.android/debug.keystore`,
 or `ANDROID_DEBUG_KEYSTORE`), which the build host borrows for the build, so
 they also replace what was installed from here before.
 
-- The preview is release code: minified by R8, not debuggable, and signed with
-  the debug key until release signing exists. Use it on a phone. On a Pixel 8,
+- The preview runs release code with R8 minification and uses the debug key.
+  Use it on a phone. On a Pixel 8,
   scrolling a list of real sessions had 0.1% janky frames with it, against
   11–25% with the debug build, whose 90th-percentile frame was 32–48 ms.
 - The debug build is for `run-as` and the debugger. It leaves its public key

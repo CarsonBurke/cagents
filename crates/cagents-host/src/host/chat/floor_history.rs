@@ -189,6 +189,7 @@ fn install(
             store,
             session.clone(),
             environment,
+            None,
             move |update| changed(&weak, id, update),
         )?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1036,6 +1037,7 @@ mod flow_tests {
             store,
             live.clone(),
             Default::default(),
+            None,
             |_| {},
         )
         .unwrap();

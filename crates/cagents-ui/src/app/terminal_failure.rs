@@ -8,6 +8,7 @@ use std::ops::Deref;
 pub(super) enum Failure {
     Generic(String),
     Creation {
+        incident: uuid::Uuid,
         code: &'static str,
         message: String,
         guidance: Option<&'static str>,
@@ -60,6 +61,7 @@ impl From<&str> for Failure {
 
 #[derive(Debug, Clone)]
 pub(super) struct Details {
+    incident: Option<uuid::Uuid>,
     code: &'static str,
     message: &'static str,
     terminal: TerminalId,
@@ -189,6 +191,7 @@ pub(super) fn creation_title(pane: Option<&str>) -> Cow<'static, str> {
 pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
     if login_busy {
         return Failure::Creation {
+            incident: uuid::Uuid::new_v4(),
             code: "login_callback_busy",
             message: account::login::PORT_BUSY.into(),
             guidance: None,
@@ -200,6 +203,7 @@ pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
         .and_then(|tail| tail.strip_suffix(": No such file or directory (os error 2)"))
     {
         return Failure::Creation {
+            incident: uuid::Uuid::new_v4(),
             code: "terminal_directory_missing",
             message: format!(
                 "The terminal’s folder is missing: {}.",
@@ -219,6 +223,7 @@ pub(super) fn creation_failure(reason: &str, login_busy: bool) -> Failure {
         sentence.push('.');
     }
     Failure::Creation {
+        incident: uuid::Uuid::new_v4(),
         code: "start_failed",
         message: sentence,
         guidance: Some("Fix the problem above, then choose Retry."),
@@ -343,6 +348,7 @@ pub(super) fn missing_terminal_warning(
 ) -> Option<&'static str> {
     let code = missing_terminal_code(message)?;
     Details {
+        incident: None,
         code,
         message: known_failure(code).1,
         terminal: session.id,
@@ -532,6 +538,7 @@ impl Details {
             new_terminal_consequence(session)
         };
         Self {
+            incident: None,
             code,
             message,
             terminal: session.id,
@@ -596,6 +603,7 @@ impl Details {
 
 #[derive(Debug, Clone)]
 struct Probe {
+    activation: Option<DiagnosticIntent>,
     operation: uuid::Uuid,
     session: TerminalSession,
     saved_context: Option<(uuid::Uuid, PathBuf)>,
@@ -659,12 +667,42 @@ impl std::fmt::Debug for Permit {
         f.write_str("ValidatedTranscriptPermit")
     }
 }
+/// The terminal and incident whose diagnostics were on screen.
+#[derive(Debug, Clone)]
+pub struct DiagnosticIntent {
+    source: super::terminal_end_ui::TerminalSource,
+    incident: Option<uuid::Uuid>,
+    code: &'static str,
+    exit: Option<crate::model::TerminalExit>,
+}
+
+impl PartialEq for DiagnosticIntent {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.incident == other.incident
+            && (self.incident.is_some() || (self.code == other.code && self.exit == other.exit))
+    }
+}
+impl Eq for DiagnosticIntent {}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TranscriptIntent {
+    diagnostic: DiagnosticIntent,
+    operation: uuid::Uuid,
+}
+
+impl TranscriptIntent {
+    pub(super) fn card(&self) -> CardId {
+        self.diagnostic.source.card
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum Action {
-    Copy(CardId),
+    Copy(Box<DiagnosticIntent>),
     /// A new shell beside a pane that can't restart.
     NewTerminal(CardId),
-    Reveal(CardId),
+    Reveal(Box<TranscriptIntent>),
     Probed {
         card: CardId,
         operation: uuid::Uuid,
@@ -772,11 +810,16 @@ impl Cagents {
         {
             return Some((**details).clone());
         }
-        if let Some(CardRuntime::Failed(Failure::Creation { code, guidance, .. })) =
-            self.cards.get(&card)
+        if let Some(CardRuntime::Failed(Failure::Creation {
+            incident,
+            code,
+            guidance,
+            ..
+        })) = self.cards.get(&card)
         {
             let mut details = self.capture_terminal_details(card, true)?;
             (details.code, details.message) = known_failure(code);
+            details.incident = Some(*incident);
             if crate::device::is_remote() {
                 details.cwd =
                     bounded_path_text(&session.launch.working_directory.to_string_lossy());
@@ -843,12 +886,40 @@ impl Cagents {
             details.code = "login_callback_busy";
             details.message = account::login::PORT_BUSY;
         }
+        details.incident = Some(uuid::Uuid::new_v4());
         Failure::Terminal(Box::new(details))
     }
+    fn diagnostic_intent(&self, card: CardId) -> Option<DiagnosticIntent> {
+        let source = super::terminal_end_ui::TerminalSource::current(self, card)?;
+        let details = self.terminal_details(card)?;
+        Some(DiagnosticIntent {
+            source,
+            incident: details.incident,
+            code: details.code,
+            exit: details.exit,
+        })
+    }
+
+    fn diagnostic_is_current(&self, intent: &DiagnosticIntent) -> bool {
+        self.diagnostic_intent(intent.source.card).as_ref() == Some(intent)
+    }
+
+    fn transcript_intent(&self, card: CardId) -> Option<TranscriptIntent> {
+        let probe = self.terminal_failure.probes.get(&card)?;
+        if probe.pending || !probe.available || !self.probe_current(card, probe.operation) {
+            return None;
+        }
+        Some(TranscriptIntent {
+            diagnostic: self.diagnostic_intent(card)?,
+            operation: probe.operation,
+        })
+    }
+
     fn probe_current(&self, card: CardId, operation: uuid::Uuid) -> bool {
         !crate::device::is_remote()
             && self.terminal_failure.probes.get(&card).is_some_and(|probe| {
                 probe.operation == operation
+                    && probe.activation.as_ref().is_none_or(|intent| self.diagnostic_is_current(intent))
                     && (self.saved_terminal_current(card).is_none() || probe.saved_context.is_some())
                     && probe.saved_context == self.saved_terminal_transcript_context(card)
                     && self.card_state(card).is_some_and(|state| {
@@ -912,6 +983,10 @@ impl Cagents {
                 .get(&card)
                 .is_some_and(|probe| {
                     probe.saved_context != saved_context
+                        || probe
+                            .activation
+                            .as_ref()
+                            .is_some_and(|intent| !self.diagnostic_is_current(intent))
                         || (saved_context.is_some() && &probe.session != session)
                 })
             {
@@ -940,6 +1015,7 @@ impl Cagents {
                 .map_or(0, |probe| probe.failures);
             let remote = crate::device::is_remote();
             let mut probe = Probe {
+                activation: None,
                 operation,
                 session: session.clone(),
                 saved_context: saved_context.clone(),
@@ -1000,31 +1076,38 @@ impl Cagents {
             .into()
     }
     pub(super) fn terminal_diagnostic_controls(&self, card: CardId) -> Element<'static, Message> {
+        let intent = self.diagnostic_intent(card).map(Box::new);
+        let copy = crate::ui_controls::button::secondary("Copy details")
+            .id(card_control_id(card, "failure.copy"))
+            .on_press_maybe(
+                intent
+                    .clone()
+                    .map(|intent| Message::TerminalFailure(Action::Copy(intent))),
+            );
         widget::row::with_children(vec![
-            crate::ui_controls::button::secondary("Copy details")
-                .id(card_control_id(card, "failure.copy"))
-                .on_press(Message::TerminalFailure(Action::Copy(card)))
-                .into(),
-            self.terminal_transcript_control(
-                card,
-                Some(Message::TerminalFailure(Action::Reveal(card))),
-            ),
+            crate::ui_controls::owned(intent, copy),
+            self.terminal_transcript_control(card, |intent| {
+                Message::TerminalFailure(Action::Reveal(intent))
+            }),
         ])
         .spacing(space::S)
         .wrap()
         .into()
     }
+
     pub(super) fn terminal_transcript_control(
         &self,
         card: CardId,
-        action: Option<Message>,
+        message: impl FnOnce(Box<TranscriptIntent>) -> Message,
     ) -> Element<'static, Message> {
         let probe = self.terminal_failure.probes.get(&card);
         let remote = crate::device::is_remote();
         let no_transcript = self.terminal_creation_without_transcript(card);
-        let available = !no_transcript
-            && !remote
-            && probe.is_some_and(|probe| probe.available && !probe.pending);
+        let intent = (!no_transcript)
+            .then(|| self.transcript_intent(card))
+            .flatten()
+            .map(Box::new);
+        let available = intent.is_some();
         let folder = crate::ui_controls::button::secondary("Open transcript folder")
             .instead("No transcript created", no_transcript)
             .instead(
@@ -1033,12 +1116,7 @@ impl Cagents {
             )
             .instead("Transcript unavailable", !available)
             .id(card_control_id(card, "failure.folder"));
-        let folder = if let Some(action) = action.filter(|_| available) {
-            folder.on_press(action)
-        } else {
-            folder
-        };
-        folder.into()
+        crate::ui_controls::owned(intent.clone(), folder.on_press_maybe(intent.map(message)))
     }
 
     pub(super) fn terminal_runtime_claims(&self, terminal: TerminalId) -> bool {
@@ -1142,8 +1220,10 @@ impl Cagents {
     }
     pub(super) fn update_terminal_failure(&mut self, action: Action) -> Task<Message> {
         match action {
-            Action::Copy(card) => self
-                .terminal_details(card)
+            Action::Copy(intent) => self
+                .diagnostic_is_current(&intent)
+                .then(|| self.terminal_details(intent.source.card))
+                .flatten()
                 .map(|details| {
                     chat_ui::invalidate_copy_intent();
                     iced::clipboard::write(details.copy_text()).map(cosmic::Action::App)
@@ -1179,28 +1259,19 @@ impl Cagents {
                 Task::none()
             }
             Action::ProbeRetryDue => Task::none(),
-            Action::Reveal(card) => {
-                if self
-                    .terminal_failure
-                    .probes
-                    .get(&card)
-                    .is_none_or(|probe| !self.probe_current(card, probe.operation))
-                {
+            Action::Reveal(intent) => {
+                let card = intent.diagnostic.source.card;
+                if self.transcript_intent(card).as_ref() != Some(intent.as_ref()) {
                     return Task::none();
                 }
-                let Some(probe) = self
+                let probe = self
                     .terminal_failure
                     .probes
                     .get_mut(&card)
-                    .filter(|probe| probe.available && !probe.pending)
-                else {
-                    return Task::none();
-                };
-                if crate::device::is_remote() {
-                    return Task::none();
-                }
+                    .expect("intent requires a probe");
                 probe.pending = true;
                 probe.operation = uuid::Uuid::new_v4();
+                probe.activation = Some(intent.diagnostic);
                 let operation = probe.operation;
                 let session = probe.session.clone();
                 let saved_context = probe.saved_context.clone();
@@ -1262,6 +1333,7 @@ impl Cagents {
                 let mut retry = Task::none();
                 if self.probe_current(card, operation) {
                     if let Some(probe) = self.terminal_failure.probes.get_mut(&card) {
+                        probe.activation = None;
                         if result.is_err() {
                             if let Some(at) = probe.unavailable(false, Instant::now()) {
                                 retry = probe_retry_timer(at);
@@ -2539,12 +2611,63 @@ mod tests {
         assert!(!app.terminal_start_in_flight(card));
     }
     #[test]
+    fn terminal_diagnostic_actions_reject_another_incident_or_launch() {
+        let (mut app, card, session) = app_and_session();
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        let operation = uuid::Uuid::new_v4();
+        app.terminal_failure.probes.insert(
+            card,
+            Probe {
+                activation: None,
+                operation,
+                session,
+                saved_context: None,
+                available: true,
+                pending: false,
+                retry_at: Instant::now(),
+                failures: 0,
+            },
+        );
+        let copy = app.diagnostic_intent(card).unwrap();
+        let reveal = app.transcript_intent(card).unwrap();
+        // Another failure with the same classification still owns a new incident.
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
+        assert_eq!(app.diagnostic_intent(card).unwrap().code, copy.code);
+        assert_eq!(
+            app.update_terminal_failure(Action::Copy(Box::new(copy)))
+                .units(),
+            0
+        );
+        assert_eq!(
+            app.update_terminal_failure(Action::Reveal(Box::new(reveal)))
+                .units(),
+            0
+        );
+        assert_eq!(app.terminal_failure.probes[&card].operation, operation);
+
+        let reveal = app.transcript_intent(card).unwrap();
+        assert_eq!(
+            app.update_terminal_failure(Action::Reveal(Box::new(reveal)))
+                .units(),
+            1
+        );
+        let current = app.terminal_failure.probes[&card].operation;
+        let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
+            unreachable!()
+        };
+        session.id = TerminalId::new();
+        assert!(!app.probe_current(card, current));
+    }
+
+    #[test]
     fn old_reveal_reply_cannot_release_a_new_activation() {
         let (mut app, card, session) = app_and_session();
+        app.fail_runtime(card, TERMINAL_NOT_HOSTED.into());
         let old = uuid::Uuid::new_v4();
         app.terminal_failure.probes.insert(
             card,
             Probe {
+                activation: None,
                 operation: old,
                 session,
                 saved_context: None,
@@ -2554,7 +2677,8 @@ mod tests {
                 failures: 0,
             },
         );
-        drop(app.update_terminal_failure(Action::Reveal(card)));
+        let intent = app.transcript_intent(card).unwrap();
+        drop(app.update_terminal_failure(Action::Reveal(Box::new(intent))));
         let current = app.terminal_failure.probes[&card].operation;
         assert_ne!(old, current);
         assert!(app.terminal_failure.probes[&card].pending);
@@ -2573,6 +2697,7 @@ mod tests {
         app.terminal_failure.probes.insert(
             card,
             Probe {
+                activation: None,
                 operation,
                 session,
                 saved_context: None,
@@ -2618,6 +2743,7 @@ mod tests {
         app.terminal_failure.probes.insert(
             card,
             Probe {
+                activation: None,
                 operation,
                 session: session.clone(),
                 saved_context: None,
@@ -2629,6 +2755,21 @@ mod tests {
         );
         operation
     }
+    #[test]
+    fn a_background_probe_settles_during_a_queued_close() {
+        let (mut app, card, session) = app_and_session();
+        let operation = probing(&mut app, card, &session);
+        app.queue_card_close(card, false);
+        assert!(app.pane_close_owned(card));
+        drop(app.update_terminal_failure(Action::Probed {
+            card,
+            operation,
+            available: true,
+        }));
+        let probe = &app.terminal_failure.probes[&card];
+        assert!(probe.available && !probe.pending);
+    }
+
     /// The update tail retries an unavailable probe, but nothing else may run
     /// that tail by then, so the reply arms its own retry at the probe's
     /// retry time. A found transcript arms nothing and resets the backoff.
@@ -2703,6 +2844,7 @@ mod tests {
         let (_, _, session) = app_and_session();
         let now = Instant::now();
         let mut probe = Probe {
+            activation: None,
             operation: uuid::Uuid::new_v4(),
             session,
             saved_context: None,

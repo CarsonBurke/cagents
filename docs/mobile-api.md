@@ -86,9 +86,10 @@ line:
 {"type":"pair","key":"ssh-ed25519 AAAA…","name":"Pixel 9"}
 ```
 
-`key` is the phone's own public key, in OpenSSH form; only Ed25519 keys are
-accepted. `name` is how the computer will list the phone. Once the request is
-in front of the person, the computer answers:
+`key` is the phone's own OpenSSH public key, either `ssh-ed25519` or
+`ecdsa-sha2-nistp256`. P-256 keys carry the `nistp256` curve name and an
+uncompressed public point. `name` is how the computer will list the phone.
+Once the request is in front of the person, the computer answers:
 
 ```json
 {"type":"pair_waiting"}
@@ -235,6 +236,18 @@ approves only by choosing an action.
 | `terminal_screen` | The current viewport and observed activity of a watched terminal agent. |
 | `terminal_ended` | `session`, `message` describe why a terminal watch ended. |
 | `closing` | `message`: the bridge is about to exit, such as when the daemon stops. |
+
+### Notifications
+
+Start `notifications.watch` after reconnecting to get the daemon's current
+unacknowledged attention. A pending question or approval has kind `waiting`.
+`failed` and `succeeded` describe run outcomes. Use `kind` to include those
+outcomes alongside requests. The `asks` flag identifies notices that ask the
+person to act. The `request` detail, when present, distinguishes a question,
+approval or consent request.
+
+Acknowledgement uses the exact notice ID. A newer notice for the same
+conversation has its own ID.
 
 ### Sessions
 

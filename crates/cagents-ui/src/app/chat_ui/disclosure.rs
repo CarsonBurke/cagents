@@ -448,7 +448,12 @@ pub(super) fn row_named(
         .spacing(step::GAP_S)
         .align_y(Alignment::Center);
     if let Some(toggle) = toggle {
-        crate::interaction::a11y_target(
+        let owner = match &toggle {
+            Action::Toggle(_, row) => Some((row.clone(), None)),
+            Action::Unfold(_, row, part) => Some((row.clone(), Some(part.clone()))),
+            _ => None,
+        };
+        let control = crate::interaction::a11y_target(
             widget::button::custom(line)
                 .name(name)
                 .description(if expanded == Some(true) {
@@ -460,7 +465,11 @@ pub(super) fn row_named(
                 .width(Length::Fill)
                 .padding([step::GAP_XS as u16, step::GAP_S as u16])
                 .on_press(action(toggle)),
-        )
+        );
+        match owner {
+            Some(owner) => crate::ui_controls::owned(owner, control),
+            None => control,
+        }
     } else {
         widget::container(line)
             .width(Length::Fill)

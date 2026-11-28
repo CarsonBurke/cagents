@@ -238,7 +238,8 @@ the workspace each pane's share by kind, such as `pane chat` or
 and `bars and overlays`, and `subscription` into the application's domain
 subscriptions, such as `chat` or `conversation pull request`. Each call that
 takes 50 ms or more is logged as it returns, as `ui-trace slow PHASE LABEL MS`.
-A nested `update` counts toward the outermost one. Overlays' own layout and
+A nested `update` counts toward the outermost one. The `dispatch` lines show
+each forwarded handler's inclusive share of that time. Overlays' own layout and
 drawing, the libcosmic chrome around the application view, and the renderer's
 presentation run outside the measured root, so the thread's CPU time exceeds
 the traced total.

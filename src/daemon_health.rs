@@ -220,6 +220,15 @@ pub(crate) fn request<T>(stream: &UnixStream, result: &Result<T, ControlError>, 
     }
 }
 pub(crate) fn frame(stream: &UnixStream, error: Option<&FrameError>, request: Request) {
+    frame_with_budget(stream, error, request, None)
+}
+
+pub(crate) fn frame_with_budget(
+    stream: &UnixStream,
+    error: Option<&FrameError>,
+    request: Request,
+    budget: Option<Duration>,
+) {
     if selected_stream(stream) {
         let outcome = match error {
             None => Some(Outcome::Responsive),
@@ -234,10 +243,8 @@ pub(crate) fn frame(stream: &UnixStream, error: Option<&FrameError>, request: Re
                 Some(Outcome::Unreachable)
             }
             Some(error) if timeout(error) => Some(Outcome::TimedOut(
-                stream
-                    .read_timeout()
-                    .ok()
-                    .flatten()
+                budget
+                    .or_else(|| stream.read_timeout().ok().flatten())
                     .unwrap_or(Duration::from_secs(5)),
             )),
             _ => None,

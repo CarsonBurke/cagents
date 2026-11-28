@@ -2605,7 +2605,7 @@ fn a_regrown_final_answer_reuses_its_unchanged_fence_highlights() {
     body.push_str("\n\nAnother final paragraph.");
     let next = item(&body);
     state.stage_reusing(
-        &next,
+        (&next.id, &next),
         false,
         theme,
         |_, _| true,
@@ -2650,7 +2650,7 @@ fn a_regrown_final_answer_highlights_only_its_changed_fence() {
     body.push_str("\n\nAnother final paragraph.");
     let next = item(&body);
     state.stage_reusing(
-        &next,
+        (&next.id, &next),
         false,
         theme,
         |_, _| false,
@@ -2688,7 +2688,7 @@ fn open_blocks_are_not_reused() {
     );
     assert!(!cached.blocks[&key].is_settled());
     state.stage_reusing(
-        &source,
+        (&source.id, &source),
         false,
         theme,
         |_, _| false,
@@ -2723,7 +2723,7 @@ fn a_streamed_answer_turning_final_reuses_its_fences() {
             .unwrap(),
     );
     state.stage_reusing(
-        &source,
+        (&source.id, &source),
         false,
         theme,
         |_, _| true,

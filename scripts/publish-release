@@ -146,6 +146,9 @@ PAYLOADS=(
 MACOS_ARCHIVE=cagents-$VERSION-aarch64-apple-darwin.tar.gz
 MACOS_PAYLOADS=("$MACOS_ARCHIVE" install-macos.sh SHA256SUMS-macos)
 MACOS=false
+ANDROID_APK=cagents-android-$VERSION.apk
+ANDROID_PAYLOADS=("$ANDROID_APK" cagents-android.apk SHA256SUMS-android)
+ANDROID=false
 # The signed metadata names every other asset with its size and digest. A
 # bundle holds it as release-metadata.json. Published, each trust generation
 # has its own name (src/update/feed.rs): a release carries its own metadata
@@ -167,11 +170,12 @@ generation_at() {
 
 GENERATION=$(generation_at "$SOURCE_COMMIT")
 OWN_METADATA=$(metadata_name "$GENERATION")
-# The files a bundle holds and a release publishes, with or without macOS.
+# The files a bundle holds and a release publishes.
 define_assets() {
     local generation name
     SHIPPED=("${PAYLOADS[@]}" SHA256SUMS)
     if "$MACOS"; then SHIPPED+=("${MACOS_PAYLOADS[@]}"); fi
+    if "$ANDROID"; then SHIPPED+=("${ANDROID_PAYLOADS[@]}"); fi
     BUNDLE_ASSETS=("${SHIPPED[@]}" release-metadata.json release-metadata.json.sig)
     ASSETS=("${SHIPPED[@]}")
     for ((generation = 1; generation <= GENERATION; generation++)); do
@@ -181,16 +185,16 @@ define_assets() {
     EXPECTED_BUNDLE=$(printf '%s\n' "${BUNDLE_ASSETS[@]}" | sort)
     EXPECTED_ASSETS=$(printf '%s\n' "${ASSETS[@]}" | sort)
 }
-define_assets
 
-# Whether DIRECTORY, or with --names the listed names, includes any macOS file.
-# The asset set then requires all three, and the signed metadata its target.
-carries_macos() {
-    local name
-    for name in "${MACOS_PAYLOADS[@]}"; do
-        if [[ $1 == --names ]]; then
-            grep -qxF -- "$name" <<< "$2" && return 0
-        elif [[ -e $1/$name || -L $1/$name ]]; then
+# One recognized file requires the whole platform asset set. For promotion,
+# detect it from the draft's names before downloading the files.
+carries_platform_assets() {
+    local directory=$1 names=$2 name
+    shift 2
+    for name; do
+        if [[ -z $directory ]]; then
+            grep -qxF -- "$name" <<< "$names" && return 0
+        elif [[ -e $directory/$name || -L $directory/$name ]]; then
             return 0
         fi
     done
@@ -201,27 +205,38 @@ version_after() {
     [[ $1 != "$2" && $(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n1) == "$1" ]]
 }
 
+published_candidates() {
+    jq -rs '
+        .[][] | select(.draft == false) | .tag_name as $tag |
+        ($tag | ltrimstr("v")) as $version |
+        [$tag, any(.assets[]?; .name == "cagents-\($version)-aarch64-apple-darwin.tar.gz")] | @tsv
+    ' | sort -uV
+}
+
 # The releases before this one whose builds check for updates, oldest first,
 # as `TAG GENERATION` lines. Publication takes them from GitHub: a tag pushed
 # but never published is no one's build, and no bridge. Every one must be in
 # this checkout, where its keys and generation are read. --verify-only, which
 # works offline, takes every release tag in the tagged history.
 EARLIER=()
+declare -A MACOS_READERS=()
 if "$VERIFY_ONLY"; then
     candidates=$(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*') || fail 'cannot list the release tags here'
 else
     command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
     candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
-        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '.[][] | select(.draft == false) | .tag_name') \
+        "repos/$REPOSITORY/releases?per_page=100" | published_candidates) \
         || fail 'cannot list the published releases'
 fi
-while IFS= read -r earlier; do
+while IFS=$'\t' read -r earlier apple_silicon; do
     [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
     version_after "$VERSION" "${earlier#v}" || continue
     checkout_git merge-base --is-ancestor "refs/tags/$earlier" "$SOURCE_COMMIT" 2>/dev/null \
         || fail "the published $earlier is not in $TAG's history here; fetch the release tags"
     checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
-    EARLIER+=("$earlier $(generation_at "$earlier")")
+    earlier_generation=$(generation_at "$earlier")
+    EARLIER+=("$earlier $earlier_generation")
+    if [[ $apple_silicon == true ]]; then MACOS_READERS[$earlier_generation]=$earlier; fi
 done < <(sort -uV <<< "$candidates")
 PREVIOUS_GENERATION=1
 if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
@@ -535,7 +550,9 @@ check_macos_archive() {
 # A bundle is checked before anything is made for it; promotion makes it
 # from the draft.
 if [[ -z $PROMOTE ]]; then
-    if carries_macos "$DIST_DIR"; then MACOS=true; define_assets; fi
+    if carries_platform_assets "$DIST_DIR" '' "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
+    if carries_platform_assets "$DIST_DIR" '' "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
+    define_assets
     check_asset_set "$DIST_DIR"
 fi
 WORK_DIR=$(mktemp -d "${TMPDIR:-/var/tmp}/cagents-publish.XXXXXX")
@@ -560,7 +577,10 @@ if [[ -n $PROMOTE ]]; then
         || fail "there is no one release of $TAG to publish; the release workflow leaves it as a draft"
     jq -e '.draft == true' <<< "$draft" >/dev/null || fail "$TAG is published already"
     DRAFT_ASSETS=$(draft_assets "$draft")
-    if carries_macos --names "$(jq -r '.assets[].name' <<< "$draft")"; then MACOS=true; define_assets; fi
+    draft_names=$(jq -r '.assets[].name' <<< "$draft")
+    if carries_platform_assets '' "$draft_names" "${MACOS_PAYLOADS[@]}"; then MACOS=true; fi
+    if carries_platform_assets '' "$draft_names" "${ANDROID_PAYLOADS[@]}"; then ANDROID=true; fi
+    define_assets
     mkdir "$WORK_DIR/draft"
     gh release download "$TAG" --repo "$REPOSITORY" --dir "$WORK_DIR/draft" \
         || fail "cannot download the draft of $TAG"
@@ -578,6 +598,13 @@ if [[ -n $PROMOTE ]]; then
     DIST_DIR=$WORK_DIR/from-draft
 fi
 
+# The bridge must serve every platform already using the preceding generation.
+# That generation will keep seeing this release even after later ones ship.
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    macos_reader=${MACOS_READERS[$PREVIOUS_GENERATION]:-}
+    [[ -z $macos_reader ]] || fail "$TAG needs the Apple Silicon build to bridge trust generation $PREVIOUS_GENERATION, which shipped it in $macos_reader"
+fi
+
 # A private snapshot keeps uploads and comparisons bound to the bytes validated here.
 mkdir "$WORK_DIR/bundle"
 for asset in "${BUNDLE_ASSETS[@]}"; do
@@ -591,6 +618,9 @@ check_archive "$DIST_DIR" "$FULL_ARCHIVE" cagents dev.cagents.Cagents
 check_archive "$DIST_DIR" "$BROWSERLESS_ARCHIVE" cagents-browserless dev.cagents.Cagents.Browserless
 check_archive "$DIST_DIR" "$EDITOR_ARCHIVE" ceditor io.github.cagents.ceditor
 if "$MACOS"; then check_macos_archive "$DIST_DIR"; fi
+if "$ANDROID"; then
+    "$ROOT_DIR/scripts/package-android" verify --dir "$DIST_DIR" --version "$VERSION"
+fi
 if [[ -z $PROMOTE ]]; then
     smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
     if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
@@ -852,8 +882,14 @@ check_metadata "$WORK_DIR/served"
 check_remote_tag
 # Publishing makes this the latest release; never above a newer one, nor a
 # second release of a version.
-newer=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100" |
-    jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' |
+published_now=$(gh api --hostname github.com --paginate "repos/$REPOSITORY/releases?per_page=100")
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    # A predecessor may have published the first Mac build during verification.
+    current_candidates=$(published_candidates <<< "$published_now")
+    [[ $current_candidates == "$candidates" ]] \
+        || fail "the published release inventory changed while $TAG was verified; run this again"
+fi
+newer=$(jq -rs --arg id "$RELEASE_ID" '.[][] | select(.draft == false and (.id | tostring) != $id) | .tag_name' <<< "$published_now" |
     sed -n 's/^v\([0-9]*\.[0-9]*\.[0-9]*\)$/\1/p' |
     while IFS= read -r published; do
         version_after "$VERSION" "$published" || printf '%s\n' "$published"

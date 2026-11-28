@@ -333,9 +333,9 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     };
     let snapshot = notifications::Snapshot {
         notices: vec![
-            notice(false, "older"),
-            notice(true, "dismissed"),
             notice(false, "newer"),
+            notice(true, "dismissed"),
+            notice(false, "older"),
         ],
         diagnostic: None,
     };
@@ -349,14 +349,25 @@ fn only_unacknowledged_notices_reach_the_phone_newest_first() {
     assert_eq!(sent[0].title, "Agent needs your attention");
     assert!(sent.iter().all(|notice| notice.asks));
 
+    let mut question = notice(false, "question");
+    question.event.content.as_mut().unwrap().request = Some(notifications::RequestType::Question);
+    let mut failed = notice(false, "failed");
+    failed.event.evidence.kind = notifications::Kind::Failed;
+    failed.event.content = None;
     let mut finished = notice(false, "done");
     finished.event.evidence.kind = notifications::Kind::Succeeded;
     finished.event.content = None;
-    let finished_snapshot = notifications::Snapshot {
-        notices: vec![finished],
+    let outcomes = notices(&notifications::Snapshot {
+        notices: vec![question, failed, finished],
         diagnostic: None,
-    };
-    assert!(!notices(&finished_snapshot)[0].asks);
+    });
+    assert_eq!(outcomes[0].kind, api::NoticeKind::Waiting);
+    assert_eq!(outcomes[0].request, Some(api::RequestKind::Question));
+    assert_eq!(outcomes[1].kind, api::NoticeKind::Failed);
+    assert_eq!(outcomes[2].kind, api::NoticeKind::Succeeded);
+    assert!(outcomes[0].asks);
+    assert!(outcomes[1..].iter().all(|notice| !notice.asks));
+    assert!(outcomes[1..].iter().all(|notice| notice.preview.is_none()));
 }
 
 #[test]

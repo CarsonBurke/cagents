@@ -4486,3 +4486,72 @@ fn listing_pages_the_inventory_and_refuses_a_whole_reply_that_cannot_fit() {
         handle.shutdown().unwrap();
     }
 }
+
+#[test]
+fn oversized_terminal_inventory_lists_through_the_connection_writer() {
+    use crate::{control::ControlClient, model::LaunchRecipe, terminal::RenderStreamFixture};
+
+    let (_, host) = panic_test_host("wire-list-pages");
+    // Each launch fits in a page. Together the descriptors exceed even the
+    // wire frame limit, as a large set of terminals with environment maps can.
+    let recipe = LaunchRecipe {
+        program: "/bin/sh".into(),
+        arguments: Vec::new(),
+        working_directory: "/".into(),
+        environment: (0..8)
+            .map(|index| (format!("FIXTURE_VALUE_{index}"), "x".repeat(120 * 1024)))
+            .collect(),
+        unset_environment: Default::default(),
+    };
+    let mut ids = Vec::new();
+    let _terminals = {
+        let mut state = host.lock().unwrap();
+        state.register_client(1);
+        (0..9)
+            .map(|_| {
+                let id = TerminalId::new();
+                let terminal = RenderStreamFixture::new(|_| {});
+                state.reserve_spawn(id).unwrap();
+                state
+                    .finish_spawn(
+                        1,
+                        TerminalDescriptor::relaunchable(id, recipe.clone(), None).session,
+                        terminal.handle.clone(),
+                        false,
+                    )
+                    .unwrap();
+                ids.push(id);
+                terminal
+            })
+            .collect::<Vec<_>>()
+    };
+    ids.sort_unstable();
+
+    thread::scope(|scope| {
+        let (stream, peer) = UnixStream::pair().unwrap();
+        scope.spawn(move || serve_fixture_user(peer, 2, host));
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let refusal = client.fixture_request(ClientRequest::List).unwrap_err();
+        assert!(matches!(
+            refusal,
+            crate::control::ControlError::Remote {
+                code: ProtocolErrorCode::InvalidRequest,
+                message,
+                retryable: false,
+            } if message.contains("too large to list in one reply")
+        ));
+        let listed = client.list().unwrap();
+        assert_eq!(
+            listed
+                .iter()
+                .map(|terminal| terminal.session.id)
+                .collect::<Vec<_>>(),
+            ids
+        );
+        assert!(
+            listed
+                .iter()
+                .all(|terminal| terminal.session.launch == recipe)
+        );
+    });
+}

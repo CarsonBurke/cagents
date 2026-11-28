@@ -426,6 +426,54 @@ class ReleaseCut(unittest.TestCase):
         self.assertIn(f"unpin {self.fix}", self.log("prebuild.log"))
         self.assertEqual(self.git("tag", "--list", "v0.2.4"), "")
 
+    def test_cut_only_attaches_prepared_android_assets_for_its_source(self):
+        self.set_version("0.2.5")
+        shutil.copy2(ROOT / "scripts/package-android", self.repo / "scripts/package-android")
+        commit = self.commit("feat(android): package the companion APK")
+        self.git("push", "-q", "origin", "main")
+        self.bundle(commit, version="0.2.5")
+        assets = self.root / "android-assets"
+        assets.mkdir()
+        apk, alias = "cagents-android-0.2.5.apk", "cagents-android.apk"
+        content = b"fixture APK"
+        for name in (apk, alias):
+            (assets / name).write_bytes(content)
+        sha = hashlib.sha256(content).hexdigest()
+        manifest = f"{sha}  {apk}\n{sha}  {alias}\n"
+        (assets / "SHA256SUMS-android").write_text(manifest)
+        receipt = assets / "android-build-receipt"
+        manifest_hash = hashlib.sha256(manifest.encode()).hexdigest()
+        receipt.write_text(f"{self.fix}\n{manifest_hash}\n")
+        args = ("cut", "--commit", commit, "--android-assets", str(assets))
+        refused = self.release(*args)
+        self.assertIn("receipt does not match", refused.stderr)
+        self.assertEqual(self.git("tag", "--list", "v0.2.5"), "")
+        self.assertFalse((self.root / "bundles/0.2.5").exists())
+
+        receipt.write_text(f"{commit}\n{manifest_hash}\n")
+        fingerprint = "a" * 64
+        self.env["CAGENTS_ANDROID_BUILD_TOOLS"] = str(self.bin)
+        self.env["CAGENTS_ANDROID_SIGNER_SHA256"] = fingerprint
+        self.tool(self.bin / "aapt", "#!/bin/sh\n"
+                  "echo \"package: name='dev.cagents.mobile' versionCode='2005' versionName='0.2.5'\"\n")
+        self.tool(self.bin / "apksigner", "#!/bin/sh\n"
+                  f"echo 'Signer #1 certificate SHA-256 digest: {fingerprint}'\n")
+        result = self.release(*args)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        bundle = self.root / "bundles/0.2.5"
+        metadata = json.loads((bundle / "release-metadata.json").read_text())
+        self.assertEqual(metadata["source_commit"], commit)
+        self.assertEqual(metadata["assets"][apk], metadata["assets"][alias])
+        self.assertIn("SHA256SUMS-android", metadata["assets"])
+        self.assertFalse((bundle / receipt.name).exists())
+        self.assertEqual(self.git("rev-parse", "v0.2.5^{commit}"), commit)
+
+    def test_actions_cut_refuses_prepared_android_assets(self):
+        result = self.release("cut", "--actions", "--android-assets", "/fixture")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("--android-assets is for local cut and build", result.stderr)
+        self.assertEqual(self.log("prebuild.log"), [])
+
     def test_wait_prebuilds_the_tip_and_requires_its_tests(self):
         self.bundle(self.feature)
         self.bundle(self.fix, where=self.root / "waiting")

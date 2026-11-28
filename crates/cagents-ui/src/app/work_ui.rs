@@ -1,5 +1,5 @@
 use super::*;
-use crate::work_ui::{Action, Effect, Watch};
+use crate::work_ui::{Action, BoardVersion, Effect, Watch};
 use cosmic::iced::futures::SinkExt;
 
 mod transport;
@@ -19,7 +19,7 @@ impl Cagents {
         if !self.refresh_ui.focused || !visible || self.work_ui.shows_worktrees() {
             return Subscription::none();
         }
-        let watch = Subscription::run(watch_board).map(Message::WorkUi);
+        let watch = Subscription::run_with(self.work_ui.pane(), watch_board).map(Message::WorkUi);
         Subscription::batch([
             watch,
             cosmic::iced::time::every(CLOCK).map(|_| Message::WorkUi(Action::Tick)),
@@ -34,19 +34,26 @@ impl Cagents {
             Effect::Focus(opener) => {
                 crate::ui_controls::return_focus(opener).map(cosmic::Action::App)
             }
-            Effect::Refresh => control(
+            Effect::Refresh(operation) => control(
                 transport::Purpose::Read,
                 |client| client.refresh_work_board(),
-                Action::Refreshed,
+                move |result| Action::Refreshed(operation, result),
             ),
             Effect::Pin {
+                ticket,
                 project,
                 item,
                 column,
             } => control(
                 transport::Purpose::Mutation,
-                move |client| client.pin_work_card(project, item, column),
-                Action::Pinned,
+                move |client| {
+                    let revision = client.pin_work_card_exact(project, item, column)?;
+                    Ok(BoardVersion {
+                        daemon: Arc::new(client.proof().clone()),
+                        revision,
+                    })
+                },
+                move |result| Action::Pinned(ticket, result),
             ),
             Effect::OpenWorktree { project, path } => {
                 let opened = self
@@ -113,12 +120,12 @@ impl Cagents {
 }
 
 /// Runs one blocking daemon request off the UI thread.
-fn control(
+fn control<T: Send + 'static>(
     purpose: transport::Purpose,
-    request: impl FnOnce(&mut crate::control::ControlClient) -> Result<(), crate::control::ControlError>
+    request: impl FnOnce(&mut crate::control::ControlClient) -> Result<T, crate::control::ControlError>
     + Send
     + 'static,
-    answer: impl FnOnce(Result<(), String>) -> Action + Send + 'static,
+    answer: impl FnOnce(Result<T, String>) -> Action + Send + 'static,
 ) -> Task<Message> {
     let context = transport::Context::capture();
     let scoped = context.is_scoped();
@@ -147,7 +154,8 @@ fn control(
 /// Dropping the stream, when Work is hidden or the window loses focus, hangs
 /// up the connection: the thread's blocking read then fails, it finds no one
 /// listening, and the daemon forgets the watcher.
-fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
+fn watch_board(pane: &u64) -> impl cosmic::iced::futures::Stream<Item = Action> + use<> {
+    let pane = *pane;
     let context = transport::Context::capture();
     cosmic::iced::stream::channel(4, async move |mut output| {
         let (sender, receiver) = async_channel::bounded(1);
@@ -174,15 +182,16 @@ fn watch_board() -> impl cosmic::iced::futures::Stream<Item = Action> {
             });
         if let Err(error) = spawned {
             let _ = output
-                .send(Action::Watched(Watch::Lost(format!(
-                    "the board could not be watched: {error}"
-                ))))
+                .send(Action::Watched(
+                    pane,
+                    Watch::Lost(format!("the board could not be watched: {error}")),
+                ))
                 .await;
             return;
         }
         let _hangup = HangUpOnDrop(hangup);
         while let Ok(watch) = receiver.recv().await {
-            if output.send(Action::Watched(watch)).await.is_err() {
+            if output.send(Action::Watched(pane, watch)).await.is_err() {
                 break;
             }
         }
@@ -203,10 +212,14 @@ fn watch(
     if sender.is_closed() {
         return Ok(());
     }
+    let daemon = Arc::new(client.proof().clone());
     let (mut revision, board) = client.watch_work().map_err(|error| error.to_string())?;
     sender
         .send_blocking(Watch::Board {
-            revision,
+            version: BoardVersion {
+                daemon: daemon.clone(),
+                revision,
+            },
             board: Arc::new(board),
             first: true,
         })
@@ -218,7 +231,10 @@ fn watch(
         revision = next;
         sender
             .send_blocking(Watch::Board {
-                revision,
+                version: BoardVersion {
+                    daemon: daemon.clone(),
+                    revision,
+                },
                 board: Arc::new(board),
                 first: false,
             })

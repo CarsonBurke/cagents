@@ -190,6 +190,19 @@ impl Staged {
             .get("running")
             .and_then(serde_json::Value::as_bool)
             .ok_or_else(|| invalid("candidate did not return a valid daemon status"))?;
+        // Candidates predating the presence field report only whether they
+        // can reach a serving daemon.
+        let daemon_present = match data.get("daemon_present") {
+            Some(value) => value
+                .as_bool()
+                .ok_or_else(|| invalid("candidate did not return a valid daemon status"))?,
+            None => running,
+        };
+        if daemon_present && !running {
+            return Err(invalid(
+                "The terminal service is starting or stopping; wait before updating",
+            ));
+        }
         if running
             && data
                 .get("daemon_version")
@@ -302,6 +315,47 @@ esac
         fs::remove_file(&cli).unwrap();
         std::os::unix::fs::symlink("other", cli).unwrap();
         assert!(staged.daemon_running(&CancellationToken::new()).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn candidate_status_distinguishes_stopped_from_starting_or_stopping() {
+        let cancellation = CancellationToken::new();
+        for (status, expected_running) in [
+            (r#"{"running":false}"#, Some(false)),
+            (r#"{"running":false,"daemon_present":false}"#, Some(false)),
+            (
+                r#"{"running":true,"daemon_present":true,"daemon_version":"9.8.7"}"#,
+                Some(true),
+            ),
+            (r#"{"running":false,"daemon_present":true}"#, None),
+            (r#"{"running":false,"daemon_present":null}"#, None),
+        ] {
+            let mut executable = anonymous_file().unwrap();
+            write!(
+                executable,
+                r#"#!/bin/sh
+case "$*" in
+    '--json daemon protocol-version') printf '%s\n' '{{"data":{{"protocol_version":123}}}}' ;;
+    '--json daemon status') printf '%s\n' '{{"data":{status}}}' ;;
+    *) exit 42 ;;
+esac
+"#,
+            )
+            .unwrap();
+            let candidate = Staged::from_file(
+                seal_file(executable).unwrap(),
+                "9.8.7".into(),
+                "fixture digest".into(),
+                &cancellation,
+            )
+            .unwrap();
+            assert_eq!(
+                candidate.daemon_running(&cancellation).ok(),
+                expected_running,
+                "{status}"
+            );
+        }
     }
 
     #[test]
