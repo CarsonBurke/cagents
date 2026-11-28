@@ -2089,7 +2089,7 @@ impl HostState {
 
     /// Records that a restored terminal continues `source`, so clients that
     /// still hold the previous daemon's session find it again.
-    fn adopt_upgrade_lineage(
+    pub(super) fn adopt_upgrade_lineage(
         &mut self,
         source: &TerminalSession,
         previous_sources: &[TerminalSession],
@@ -3990,7 +3990,7 @@ fn restore_terminal_execution_authority(
 /// refused rather than delivered to an unproved process. It does not fail the
 /// restore: the conversation itself was relaunched and confirmed, and windows
 /// still resolve it through the upgrade aliases.
-fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+pub(super) fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
     let (registry, successor, sources) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let (Some(registry), Some(record), Some(sources)) = (
@@ -5021,11 +5021,12 @@ fn restore_upgrade_checkpoint(
 /// as after a reboot or once the holder itself exited: nothing in cagents can
 /// reattach or close them any more, so they would otherwise warn forever.
 /// Their identity stays in the log for manual recovery from provider storage.
-/// A conversation whose restart was stopped never has a holder, so its notice
-/// lasts until the next daemon start; its pane can reopen it at any time.
+/// A stopped restart has no native holder. Its paired terminal recipe is
+/// still required when the conversation reopens.
 fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     use crate::daemon::holder_registry::{self as registry, Kind};
-    let conversations = match store.unattached() {
+    use crate::upgrade::handoff::UnattachedDisposition;
+    let conversations = match store.unattached_chats() {
         Ok(conversations) if conversations.is_empty() => return,
         Ok(conversations) => conversations,
         Err(error) => {
@@ -5042,6 +5043,11 @@ fn forget_departed_unattached(store: &crate::upgrade::handoff::Store) {
     };
     let departed = conversations
         .iter()
+        .filter(|entry| {
+            entry.summary.disposition != UnattachedDisposition::Stopped
+                || entry.terminal.is_none()
+        })
+        .map(|entry| &entry.summary)
         .filter(|conversation| {
             let gone = match registry::evidence(
                 &registry::socket(&directory, conversation.id),
@@ -5717,6 +5723,7 @@ pub(super) fn spawn_codex_view_reserved(
     session: TerminalSession,
     options: TerminalSpawnOptions,
     execution_environment: Option<crate::terminal_ipc::ChatExecutionEnvironment>,
+    execution_recipe: Option<crate::model::LaunchRecipe>,
     transition: &super::chat::TerminalViewReservation<'_>,
 ) -> Result<(TerminalDescriptor, TerminalHandle), ProtocolError> {
     start_terminal_view_owned_reserved(
@@ -5729,7 +5736,7 @@ pub(super) fn spawn_codex_view_reserved(
         None,
         None,
         None,
-        None,
+        execution_recipe,
         Some(transition),
         None,
     )

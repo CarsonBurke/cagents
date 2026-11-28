@@ -2462,6 +2462,13 @@ pub mod handoff {
                 .unwrap_or_default())
         }
 
+        #[cfg(feature = "host")]
+        pub fn unattached_chats(&self) -> Result<Vec<UnattachedChat>, String> {
+            Ok(self
+                .read_unattached::<UnattachedChat>()?
+                .unwrap_or_default())
+        }
+
         fn read_unattached<T: serde::de::DeserializeOwned>(
             &self,
         ) -> Result<Option<Vec<T>>, String> {
@@ -2538,35 +2545,39 @@ pub mod handoff {
             self.retire_unattached_where(id, |_| true)
         }
 
-        /// Why this restore stopped the conversation an exact descriptor it
-        /// issued names, if it did. Only a complete issued source, or the
-        /// confirmed alias a pane learned once its thread was named,
-        /// retrieves the reason, as with a retained conversation's refusal.
+        /// The stopped restore for an exact issued chat or confirmed alias.
+        #[cfg(feature = "host")]
+        pub fn stopped_chat(
+            &self,
+            source: &crate::chat::Session,
+        ) -> Result<Option<UnattachedChat>, String> {
+            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
+            Ok(self.unattached_chats()?.into_iter().find(|entry| {
+                entry.summary.id == source.id
+                    && entry.summary.disposition == UnattachedDisposition::Stopped
+                    && entry
+                        .evidence
+                        .previous_sources
+                        .iter()
+                        .chain(std::iter::once(&ChatSource {
+                            source: entry.evidence.source.clone(),
+                            launch: entry.evidence.launch.clone(),
+                        }))
+                        .any(|issued| issued_chat_source_matches(issued, source))
+            }))
+        }
+
+        /// Why this restore stopped the conversation an exact pane names.
         #[cfg(feature = "host")]
         pub fn stopped_reason(&self, source: &crate::chat::Session) -> Option<String> {
-            let _update = self.unattached.lock().unwrap_or_else(|p| p.into_inner());
-            self.read_unattached::<UnattachedChat>()
+            self.stopped_chat(source)
                 .ok()
-                .flatten()?
-                .into_iter()
-                .find(|entry| {
-                    entry.summary.id == source.id
-                        && entry.summary.disposition == UnattachedDisposition::Stopped
-                        && entry
-                            .evidence
-                            .previous_sources
-                            .iter()
-                            .chain(std::iter::once(&ChatSource {
-                                source: entry.evidence.source.clone(),
-                                launch: entry.evidence.launch.clone(),
-                            }))
-                            .any(|issued| issued_chat_source_matches(issued, source))
-                })
+                .flatten()
                 .map(|entry| entry.summary.reason)
         }
 
-        /// Forgets a stopped conversation once it has been started again. A
-        /// retained entry for the same id still names a provider of its own.
+        /// An ordinary native start resolves an unpaired stopped conversation.
+        /// A paired entry also needs a confirmed terminal installation.
         #[cfg(feature = "host")]
         pub fn retire_stopped_unattached(
             &self,
@@ -2574,6 +2585,7 @@ pub mod handoff {
         ) -> Result<(), String> {
             self.retire_unattached_where(id, |entry| {
                 entry.summary.disposition == UnattachedDisposition::Stopped
+                    && entry.terminal.is_none()
             })
         }
 
