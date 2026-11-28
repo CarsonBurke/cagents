@@ -71,12 +71,14 @@ esac''')
         path.write_text(f"#!/bin/sh\n{body}\n")
         path.chmod(0o755)
 
-    def run_installer(self, *options):
+    def run_installer(self, *options, check=True):
         result = subprocess.run(
             ["/bin/sh", str(self.installer), "--prefix", str(self.prefix), *options],
             env=self.environment, cwd=self.root, text=True, capture_output=True, timeout=30,
         )
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        if check:
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        return result
 
     def reinstall(self):
         self.run_installer("--no-start", "--version", VERSION, "--publish-tree", str(self.stage),
@@ -126,6 +128,22 @@ exec /usr/bin/rmdir "$@"
         self.assertFalse(self.tree.exists())
         self.reinstall()
         self.assertEqual((self.prefix / "late.txt").read_text(), "late user file\n")
+
+    def test_uninstall_keeps_a_directory_added_at_the_marker_path(self):
+        self.environment["FIXTURE_PREFIX"] = str(self.prefix)
+        self.executable(self.root / "tools/rmdir", r'''
+if [ "$1" = "$FIXTURE_PREFIX" ]; then
+    mkdir "$1/.cagents-install-root"
+    printf 'user file\n' > "$1/.cagents-install-root/sentinel"
+fi
+exec /usr/bin/rmdir "$@"
+''')
+        result = self.run_installer("--uninstall", "--publish-removal", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not restore the installation marker", result.stderr)
+        marker = self.prefix / ".cagents-install-root"
+        self.assertEqual(list(marker.iterdir()), [marker / "sentinel"])
+        self.assertEqual((marker / "sentinel").read_text(), "user file\n")
 
 
 if __name__ == "__main__":

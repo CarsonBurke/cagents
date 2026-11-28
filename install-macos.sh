@@ -346,8 +346,11 @@ if [ "$UNINSTALL" -eq 1 ]; then
             (
                 CDPATH= cd -P "$PREFIX" || exit 1
                 [ "$(stat -f '%d:%i' .)" = "$prefix_identity" ] || exit 1
-                set -C
-                printf '%s\n' "$MARKER_TEXT" > "${MARKER##*/}"
+                marker_stage=$(mktemp -d .cagents-marker.XXXXXX) || exit 1
+                trap 'rm -rf "$marker_stage"' EXIT
+                source_marker=$marker_stage/${MARKER##*/}
+                printf '%s\n' "$MARKER_TEXT" > "$source_marker" || exit 1
+                ln "$source_marker" .
             ) || fail "could not restore the installation marker at $PREFIX"
         fi
     fi
