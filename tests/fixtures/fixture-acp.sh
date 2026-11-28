@@ -26,6 +26,8 @@
 # Every frame the agent receives goes to acp/AGENT/frames.log, so a check can
 # read which settings and prompts cagents sent.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home HOME
 here=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 fixture=${here%/bin}
 case ${0##*/} in
@@ -42,6 +44,8 @@ case ${HOME:-} in
 esac
 # The turn tests/fixtures/conversation-work.py prepares, for a `work` prompt.
 export FAKE_ACP_WORK="${FAKE_ACP_WORK:-$fixture/home/.claude/fixture-frames.jsonl}"
+require_fixture_home FAKE_ACP_STATE
+require_fixture_home FAKE_ACP_LOG
 mkdir -p -- "$FAKE_ACP_STATE"
 if [ -z "${FAKE_ACP_BACKGROUND_SECONDS:-}" ] && [ -s "$FAKE_ACP_STATE/background-seconds" ]; then
     FAKE_ACP_BACKGROUND_SECONDS=$(cat -- "$FAKE_ACP_STATE/background-seconds")

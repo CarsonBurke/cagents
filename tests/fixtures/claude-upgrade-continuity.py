@@ -8,9 +8,25 @@ resume exits before work exactly once, so the native Failed-card Retry must
 recover through normal daemon lifecycle and admission. The marker is SDK
 fixture diagnostics, never an execution proof or application receipt.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
+require_fixture_home("CLAUDE_CONFIG_DIR")
 import json, os, pathlib, sys, time, uuid, stat
 os.umask(0o077)
 scriptroot=pathlib.Path(__file__).resolve().parent.parent
+require_fixture_home('HOME', scriptroot)
+root=scriptroot
+assert root.name.startswith('updater1513-') and root.stat().st_uid==os.getuid()
+assert stat.S_IMODE(root.stat().st_mode)==0o700
 tracepath=scriptroot/'provider-trace.jsonl'
 def trace(value):
     # Fixed allowlist below; never record prompt bodies, argv, or the environment.
@@ -21,9 +37,6 @@ def trace(value):
     except OSError:
         pass  # Diagnostic I/O must not change the provider's protocol behavior.
 trace({'event':'bootstrap','HOME':os.environ.get('HOME'),'CLAUDE_CONFIG_DIR':os.environ.get('CLAUDE_CONFIG_DIR'),'cwd':os.getcwd(),'scriptroot':str(scriptroot)})
-root=scriptroot
-assert root.name.startswith('updater1513-') and root.stat().st_uid==os.getuid()
-assert stat.S_IMODE(root.stat().st_mode)==0o700
 if sys.argv[1:2]==['--version']:
     print('2.1.286 (offline updater1513 fixture)'); raise SystemExit
 if sys.argv[1:2]==['auth']:

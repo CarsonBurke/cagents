@@ -4,7 +4,10 @@ bind calls the real function. The updater sees the product's ordinary startup
 error and must restore and verify the original service and workload.
 
 `scripts/rehearse_update_retry.py` compiles the shim with the private root and
-candidate executable fixed into it. `scripts/rehearse-update` loads it only from
+candidate executable fixed into it. Before binding or logging, its shared C
+guard resolves that root and the log directory and requires an ancestor holding
+`.cagents-fixture-root`; an environment HOME cannot provide a fallback.
+`scripts/rehearse-update` loads it only from
 that marked root's `.fixture` directory into its private environment. The armed
 sentinel blocks only that exact candidate executable and serving socket. The
 retry orchestrator removes it only after real rollback, census verification,

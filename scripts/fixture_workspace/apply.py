@@ -7,12 +7,15 @@ window which channels the registry already holds.
 
 import json
 import os
+from pathlib import Path
 import re
 import shutil
 import subprocess
 import tempfile
 
-from .generate import MARKER
+from fixture_home import FIXTURE_ROOT_MARKER, require_fixture_home
+
+from .generate import MARKER, OWNER
 
 
 def load_plan(root):
@@ -36,6 +39,9 @@ def environment(root, instance, runtime=None):
                    XDG_CONFIG_HOME=os.path.join(root, "config"), XDG_CACHE_HOME=os.path.join(root, "cache"),
                    XDG_STATE_HOME=os.path.join(root, "state"), XDG_RUNTIME_DIR=runtime)
         env.pop("CAGENTS_DEVELOPMENT_INSTANCE", None)
+        for name in ("HOME", "XDG_DATA_HOME", "XDG_CONFIG_HOME", "XDG_CACHE_HOME",
+                     "XDG_STATE_HOME", "XDG_RUNTIME_DIR"):
+            require_fixture_home(name, env[name])
     else:
         # As the development executables and scripts/run-development accept it.
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,23}", instance):
@@ -57,6 +63,16 @@ def apply(root, bin_dir, instance=None, log=print):
     if plan[1]["root"] != os.path.realpath(root):
         raise SystemExit(f"{root} holds a plan generated at {plan[1]['root']}, whose repositories and history its "
                          "paths name. Generate it again where it is to be applied.")
+    fixture = Path(root).resolve()
+    # Workspaces generated before the shared marker already carry an ownership
+    # file. Keep those plans usable after upgrading the tooling.
+    owner = fixture / OWNER
+    if not owner.is_symlink() and owner.is_file():
+        try:
+            (fixture / FIXTURE_ROOT_MARKER).touch(exist_ok=False)
+        except FileExistsError:
+            pass
+    require_fixture_home("HOME", fixture / "home")
     if instance is not None:
         return load(plan, bin_dir, instance, None, log)
     # The seed's leases live here only while it runs: a fixture copied to

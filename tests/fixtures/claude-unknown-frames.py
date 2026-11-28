@@ -8,8 +8,19 @@ The prompt `post-turn-summary` answers with only known frames plus the
 `post_turn_summary` system event Claude Code 2.1.296 sends before each result;
 its fields are copied from a live haiku turn, with fixture identifiers.
 """
-import json
+
 import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
+require_fixture_home("CLAUDE_CONFIG_DIR")
+import json
 import uuid
 
 

@@ -2471,6 +2471,18 @@ harness, it provides:
   also works, under the last session's side, for setup that needs the daemon
   stopped, such as converting a store. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
+- **Fixture home guard.** Fixture creators place a regular file named
+  `.cagents-fixture-root` at the root. Provider stand-ins and state seeders
+  check that the resolved configuration path is under a marked root before
+  accessing state. Set `CLAUDE_CONFIG_DIR`, `CODEX_HOME` and `HOME` to the
+  fixture's paths when launching a provider by hand.
+  Shell fixtures source `tests/fixtures/lib/fixture-home.sh`, Python fixtures
+  import `scripts/fixture_home.py`, and JavaScript fixtures require
+  `tests/fixtures/lib/fixture-home.js`. Call `require_fixture_home`
+  (`requireFixtureHome` in JavaScript) on each effective configuration path,
+  preserving any stricter ownership checks. Scenes that write through
+  `native-evidence env` or `cli` inherit its guarded environment. Scenes that
+  write directly check their destinations first.
 - **Seeded chats reopen.** A chat records its provider home's device and inode
   and won't reopen once that directory is replaced, and a transcript's
   location records its file's. So `start` restores the seed into the existing

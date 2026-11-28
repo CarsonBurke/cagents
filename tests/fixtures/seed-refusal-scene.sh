@@ -10,6 +10,13 @@ if [ "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
     printf '%s\n' 'seed-refusal-scene: run on the native-evidence host through plain SSH; inherited agent authority was not modified' >&2
     exit 77
 fi
+fixture_guard=$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh
+if [ ! -f "$fixture_guard" ] && [ -n "${CAGENTS_EVIDENCE_TASK:-}" ]; then
+    fixture_guard=$CAGENTS_EVIDENCE_TASK/fixture/bin/lib/fixture-home.sh
+fi
+. "$fixture_guard"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
 scene=${1:?usage: seed-refusal-scene.sh seed|refuse|notice|retry}
 layout=${2:-wide}
 case "$layout" in wide|narrow) ;; *) exit 2 ;; esac
@@ -22,6 +29,7 @@ fixture=$CAGENTS_EVIDENCE_TASK/fixture
     exit 2
 }
 scene_state=$fixture/state/seed-refusal-scene
+require_fixture_home XDG_STATE_HOME "$scene_state"
 mkdir -p "$scene_state"
 evidence() { "$CAGENTS_EVIDENCE_TOOL" --task "$CAGENTS_EVIDENCE_TASK" "$@"; }
 shot() {

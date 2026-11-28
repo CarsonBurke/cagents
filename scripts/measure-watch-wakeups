@@ -31,16 +31,19 @@ seconds=${2:-120}
     exit 2
 }
 checkout=$(cd "$(dirname "$0")/.." && pwd)
+. "$checkout/tests/fixtures/lib/fixture-home.sh"
 root=$(mktemp -d "$HOME/.local/state/watch-wakeups.XXXXXX")
 # Unix socket paths are short: keep the runtime beneath the real one.
 runtime=$(mktemp -d "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/ww.XXXXXX")
-mkdir -p "$root"/{home,data,config,cache,logs}
+mark_fixture_root "$root"
+mkdir -p "$root"/{home,data,config,cache,state,logs}
 
 fixture() {
-    env -u CLAUDE_CONFIG_DIR -u CAGENTS_SESSION_ID \
+    env -u CAGENTS_SESSION_ID \
         HOME="$root/home" XDG_RUNTIME_DIR="$runtime" \
+        CLAUDE_CONFIG_DIR="$root/home/.claude" CODEX_HOME="$root/home/.codex" \
         XDG_DATA_HOME="$root/data" XDG_CONFIG_HOME="$root/config" \
-        XDG_CACHE_HOME="$root/cache" "$@"
+        XDG_CACHE_HOME="$root/cache" XDG_STATE_HOME="$root/state" "$@"
 }
 fixture_processes() {
     grep -lzx "XDG_RUNTIME_DIR=$runtime" /proc/[0-9]*/environ 2>/dev/null |

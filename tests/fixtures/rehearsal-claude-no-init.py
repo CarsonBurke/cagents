@@ -6,10 +6,20 @@ There is intentionally no transcript to resume. Stop the fixture by closing
 stdin or terminating it; an interrupt acknowledges control but does not settle
 its unconfirmed turn.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
+require_fixture_home("CLAUDE_CONFIG_DIR")
 import json
 import os
-from pathlib import Path
-import sys
 
 
 def emit(value):

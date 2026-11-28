@@ -6,14 +6,23 @@ native validator must observe the running command before creating
 ROOT/complete-stream; completed aggregatedOutput cannot establish Stream proof.
 No commercial provider, credentials, network service or daemon is contacted.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import base64
 import hashlib
 import json
 import os
-from pathlib import Path
 import socket
 import struct
-import sys
 import threading
 import time
 import uuid
@@ -97,7 +106,7 @@ def private_listener(parent, runtime):
 
 
 def atomic_json(path, value):
-    temporary = path.with_suffix(".tmp")
+    temporary = require_fixture_home("terminal stream receipt", path.with_suffix(".tmp"))
     temporary.write_text(json.dumps(value, indent=2) + "\n")
     temporary.replace(path)
 
@@ -167,9 +176,10 @@ def serve(connection, root, payload_bytes, start_lock, stream_started):
         with write_lock:
             connection.sendall(frame(value, opcode))
     thread_id = str(uuid.uuid4())
+    intake = require_fixture_home("terminal stream intake", root / "rpc-intake.jsonl")
     while True:
         request = receive(connection, lambda payload: send(payload, opcode=10))
-        with (root / "rpc-intake.jsonl").open("a") as log:
+        with intake.open("a") as log:
             log.write(json.dumps(request, separators=(",", ":")) + "\n")
         identifier = request.get("id")
         method = request.get("method")
@@ -208,10 +218,11 @@ def serve(connection, root, payload_bytes, start_lock, stream_started):
 
 
 def main():
+    require_fixture_home("CODEX_HOME")
     if "--version" in sys.argv:
         print("codex-cli 0.162.0 (offline terminal stream fixture)")
         return
-    root = Path(os.environ["CAGENTS_ESCAPE_FIXTURE_ROOT"]).resolve(strict=True)
+    root = require_fixture_home("CAGENTS_ESCAPE_FIXTURE_ROOT").resolve(strict=True)
     home = Path(os.environ["CODEX_HOME"]).resolve(strict=True)
     if not home.is_relative_to(root) or root.stat().st_uid != os.getuid() or root.stat().st_mode & 0o077:
         raise SystemExit("fixture requires a private owned root and CODEX_HOME beneath it")

@@ -60,14 +60,23 @@ child, with its agent path, once its turn has started.
 With CODEX_HOME/fixture-running-child-past-window present, thread/list exposes
 33 active children, with the oldest on the second page. Their turns stay open.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import copy
 import fcntl
 import importlib.util
 import json
 import os
-from pathlib import Path
 import socket
-import sys
 import tempfile
 import threading
 import time
@@ -955,6 +964,7 @@ def serve(connection, codex_home, scenario, request_lock, notifications=None):
 
 
 def main():
+    require_fixture_home("CODEX_HOME")
     if "--version" in sys.argv:
         print("codex-cli 0.162.0 (offline tool-rows fixture)")
         return

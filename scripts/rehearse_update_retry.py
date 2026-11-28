@@ -17,6 +17,7 @@ import socket
 import sys
 import time
 
+sys.dont_write_bytecode = True
 import rehearse_update_pty as pty
 import rehearse_update_records as records
 import rehearse_update_restart as restart
@@ -38,7 +39,8 @@ def fixture_sources():
              'scripts/rehearse_update_retry.py', 'scripts/rehearse_update_pty.py',
              'scripts/rehearse_update_run.py', 'scripts/rehearse_update_records.py', 'scripts/rehearse_update_restart.py',
              'tests/fixtures/rehearsal-startup-bind.c', 'tests/fixtures/rehearsal-codex.py',
-             'tests/fixtures/codex-tool-rows.py', 'tests/fixtures/chat-composer-claude.sh')
+             'tests/fixtures/codex-tool-rows.py', 'tests/fixtures/chat-composer-claude.sh',
+             'scripts/fixture_home.py', 'tests/fixtures/lib/fixture-home.sh')
     return {name: sha256(repository / name) for name in names}
 
 
@@ -337,6 +339,7 @@ class RetryRehearsal(scenario.Rehearsal):
         self.old_version = args.old_version
         try:
             self.call('init')
+            self.require_fixture_state()
             (self.root / 'retry').mkdir()
             sources = fixture_sources()
             write_json(self.root / 'retry/source.json', sources)

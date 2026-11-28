@@ -19,6 +19,9 @@
 set -euo pipefail
 scene=${1:?usage: update-resume-scene.sh prepare|shots}
 fx=$(evidence env sh -c 'printf %s "$CAGENTS_EVIDENCE_FIXTURE"' | tail -1)
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "$fx/home"
+require_fixture_home CLAUDE_CONFIG_DIR "$fx/home/.claude"
 config=$fx/home/.claude
 channel_title='Release checks'
 

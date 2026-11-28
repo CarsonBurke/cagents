@@ -30,7 +30,12 @@ import os
 from pathlib import Path
 import pwd
 import sqlite3
+import sys
 import uuid
+
+sys.dont_write_bytecode = True
+sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
+from fixture_home import require_fixture_home
 
 CONVERSATIONS = {
     "Cleared": "a1b2c3d4-1111-4111-8111-000000003390",
@@ -58,6 +63,7 @@ def project_directory(root):
 
 def history(root):
     project, directory = project_directory(root)
+    directory = require_fixture_home("CLAUDE_CONFIG_DIR", directory)
     directory.mkdir(parents=True, exist_ok=True)
     base = datetime.now(timezone.utc) - timedelta(minutes=10)
     written = {}
@@ -151,7 +157,8 @@ def current_boot():
 
 
 def reboot(root):
-    receipt = root / "cleared-terminal-reboot.json"
+    require_fixture_home("XDG_DATA_HOME", root / "data")
+    receipt = require_fixture_home("fixture receipt", root / "cleared-terminal-reboot.json")
     if receipt.exists():
         raise ValueError(f"this fixture was already rebooted; see {receipt}")
     boot = current_boot()
@@ -159,6 +166,7 @@ def reboot(root):
     stores = sorted((root / "data").rglob("*.sqlite3"))
     if database(root) not in stores:
         raise ValueError("the workspace model is missing")
+    stores = [require_fixture_home("workspace database", path) for path in stores]
     connections = []
     try:
         for path in stores:

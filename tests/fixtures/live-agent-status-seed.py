@@ -6,16 +6,27 @@ The seed contains twelve historical background launches with no end receipt,
 four completed agents, and a failed agent that the live phase resumes.
 The next prompt replays live-agent-status-live.jsonl via the synthetic provider.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 import json
 import os
-from pathlib import Path
 import pwd
 import re
 import stat
 
 
 def seed(root):
+    require_fixture_home("HOME")
     root = Path(root).resolve(strict=True)
     real_home = Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
     home = root / "home"
@@ -25,6 +36,7 @@ def seed(root):
         raise ValueError("the fixture root must be owned by this user and private")
     project = (root / "project").resolve(strict=True)
     config = home / ".claude"
+    require_fixture_home("CLAUDE_CONFIG_DIR", config)
     if config.is_symlink():
         raise ValueError("the fixture Claude home cannot be a symlink")
     directory = config / "projects" / re.sub(r"[^A-Za-z0-9]", "-", str(project))

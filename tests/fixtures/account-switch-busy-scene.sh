@@ -20,6 +20,10 @@
 # switch for that reason before changing anything; the scene then removes the
 # copy and sends again.
 set -euo pipefail
+. "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")/lib/fixture-home.sh"
+require_fixture_home HOME "${CAGENTS_EVIDENCE_TASK:+$CAGENTS_EVIDENCE_TASK/fixture/home}"
+require_fixture_home CLAUDE_CONFIG_DIR "$CAGENTS_EVIDENCE_TASK/fixture/home/.claude"
+require_fixture_home CODEX_HOME "$CAGENTS_EVIDENCE_TASK/fixture/home/.codex"
 scene=${1:?usage: account-switch-busy-scene.sh prepare|wide|narrow}
 case $scene in prepare|wide|narrow) ;; *) exit 2 ;; esac
 here=$(cd "$(dirname "$0")" && pwd)
@@ -51,6 +55,7 @@ fi
 # Each step leaves the located text beside the shots, so a failed run says
 # where it stopped.
 notes=${CAGENTS_EVIDENCE_NOTES:-$CAGENTS_EVIDENCE_TASK/scene-${SIDE:-side}-$scene${VARIANT:+-$VARIANT}}
+require_fixture_home CAGENTS_EVIDENCE_NOTES "$notes"
 mkdir -p "$notes"
 step() {
     echo "== $1" >&2

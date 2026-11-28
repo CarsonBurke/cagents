@@ -37,8 +37,13 @@ case "$scene" in cli-send | approval) ;; *) exit 2 ;; esac
 here=$(cd -- "$(dirname -- "$0")" && pwd)
 evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/../../scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name a ready native-evidence task}"
+. "$here/lib/fixture-home.sh"
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 config=$fixture/home/.claude
+require_fixture_home CLAUDE_CONFIG_DIR "$config"
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-frames.jsonl"
+require_fixture_home CLAUDE_CONFIG_DIR "$config/fixture-run-once"
+require_fixture_home 'fixture proposal' "$fixture/proposal.json"
 # Never create a provider directory except inside an existing evidence fixture.
 [ -d "$fixture/bin" ] && [ -d "$fixture/project/.git" ] && [ -d "$config" ] || {
     printf '%s\n' 'raw-id-scene: start native-evidence first' >&2

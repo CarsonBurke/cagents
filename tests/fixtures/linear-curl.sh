@@ -1,6 +1,9 @@
 #!/bin/sh
 # Fixture transport: inspect requests without sending credentials over the network.
 set -eu
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home HOME
+require_fixture_home LINEAR_FIXTURE
 printf '%s\n' "$@" > "$LINEAR_FIXTURE/argv"
 cat > "$LINEAR_FIXTURE/request"
 cat "$LINEAR_FIXTURE/request" >> "$LINEAR_FIXTURE/requests"

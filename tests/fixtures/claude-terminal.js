@@ -28,7 +28,11 @@ const readline = require('readline');
 
 const os = require('os');
 
-const config = process.env.CLAUDE_CONFIG_DIR || path.join(process.env.HOME, '.claude');
+// Native evidence installs the companion beside this executable. In the
+// checkout it is in lib/, alongside the shell guard.
+const guard = __filename.endsWith('.js') ? './lib/fixture-home.js' : './fixture-home.js';
+const { requireFixtureHome } = require(guard);
+const config = requireFixtureHome('CLAUDE_CONFIG_DIR');
 // Never write into the account's real Claude home, whatever HOME says.
 const realpath = (file) => {
     try {
@@ -42,8 +46,9 @@ if (realpath(config) === realpath(path.join(os.userInfo().homedir, '.claude'))) 
     process.exit(1);
 }
 const cwd = fs.realpathSync(process.cwd());
-const projectDirectory = path.join(config, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-'));
-const recordPath = path.join(config, 'sessions', `${process.pid}.json`);
+const projectDirectory = requireFixtureHome('CLAUDE_CONFIG_DIR',
+    path.join(config, 'projects', cwd.replace(/[^a-zA-Z0-9]/g, '-')));
+const recordPath = requireFixtureHome('CLAUDE_CONFIG_DIR', path.join(config, 'sessions', `${process.pid}.json`));
 
 let resumed = null;
 let picker = false;
@@ -78,7 +83,7 @@ const columns = () => Math.max(40, process.stdout.columns || 80);
 const clip = (text, width) => (text.length > width ? `${text.slice(0, width - 1)}…` : text);
 
 function transcriptPath(id) {
-    return path.join(projectDirectory, `${id}.jsonl`);
+    return requireFixtureHome('CLAUDE_CONFIG_DIR', path.join(projectDirectory, `${id}.jsonl`));
 }
 
 function readTranscript(file) {

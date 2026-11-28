@@ -30,6 +30,8 @@ evidence() { "${CAGENTS_EVIDENCE_TOOL:-$here/scripts/native-evidence}" "$@"; }
 : "${CAGENTS_EVIDENCE_TASK:?name the native-evidence task}"
 fixture=$CAGENTS_EVIDENCE_TASK/fixture
 frames=$fixture/home/.claude/fixture-frames.jsonl
+. "$here/tests/fixtures/lib/fixture-home.sh"
+require_fixture_home CLAUDE_CONFIG_DIR "$frames"
 
 frames_for() {
     case $1 in

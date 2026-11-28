@@ -1,6 +1,9 @@
 #!/bin/sh
 set -eu
-root=${CLAUDE_ESTABLISHMENT_FIXTURE_ROOT:?fixture evidence directory is required}
+. "$(dirname -- "$(readlink -f -- "$0")")/lib/fixture-home.sh"
+require_fixture_home CLAUDE_CONFIG_DIR
+require_fixture_home CLAUDE_ESTABLISHMENT_FIXTURE_ROOT
+root=$fixture_home_resolved
 printf 'spawn\n' >> "$root/spawns"
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 while [ "$#" -gt 0 ]; do

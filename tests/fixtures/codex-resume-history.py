@@ -6,11 +6,21 @@ Writes only ROOT/home/.codex, refusing an existing provider home. The result
 on stdout names the thread, rollout and working directory for native evidence.
 No provider executable, credentials or network service is used.
 """
+
+import sys
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
 import os
-from pathlib import Path
 import pwd
 import uuid
 
@@ -23,6 +33,7 @@ def seed(root, turns=3):
     account_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
     if home.resolve() == (account_home / ".codex").resolve():
         raise ValueError("refusing the account's real Codex home")
+    require_fixture_home("CODEX_HOME", home)
     # A new provider home cannot contain a real thread or credentials, and a
     # rerun cannot rewrite a rollout a running provider might have loaded.
     home.mkdir(parents=True)

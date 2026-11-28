@@ -28,6 +28,7 @@ class SeedRefusalRegistry(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="seed-refusal-", dir="/var/tmp")
         self.addCleanup(self.directory.cleanup)
         self.root = Path(self.directory.name)
+        (self.root / ".cagents-fixture-root").touch()
         for leaf in ["home", "data/cagents-development", "bin", "project/.git"]:
             (self.root / leaf).mkdir(parents=True, exist_ok=True)
         self.db = self.root / "data/cagents-development/workspace-model.sqlite3"
@@ -161,7 +162,7 @@ class SeedRefusalRegistry(unittest.TestCase):
         before = self.snapshot()
         result = self.run_script("arm", self.channel, env=self.env | {"HOME": "/home/not-the-fixture"})
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("HOME must be the fixture", result.stderr)
+        self.assertIn("fixture-home: refusing HOME=/home/not-the-fixture", result.stderr)
         self.assertEqual(self.snapshot(), before)
 
     def test_missing_channel_does_not_clear_any_view_or_projection(self):

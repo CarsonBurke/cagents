@@ -41,7 +41,8 @@ checkout being validated:
 ```sh
 fixture_root="$PWD/.worktrees/chat-composer-fixture"
 fixture_runtime=$(mktemp -d "$XDG_RUNTIME_DIR/composer.XXXXXX")
-mkdir -p "$fixture_root"/{home,data,config,cache,bin,project}
+mkdir -p "$fixture_root"/{home/.claude,home/.codex,data,config,cache,state,bin,project}
+touch "$fixture_root/.cagents-fixture-root"
 ln -s "$PWD/tests/fixtures/chat-composer-claude.sh" "$fixture_root/bin/claude"
 git init --initial-branch=main "$fixture_root/project"
 ```
@@ -55,8 +56,9 @@ fixture_env() {
     printf '%s\n' 'This fixture requires a genuine User shell; inherited agent authority was not modified.' >&2
     return 77
   fi
-  env -u CLAUDE_CONFIG_DIR \
-    HOME="$fixture_root/home" XDG_RUNTIME_DIR="$fixture_runtime" \
+  env HOME="$fixture_root/home" XDG_RUNTIME_DIR="$fixture_runtime" \
+    CLAUDE_CONFIG_DIR="$fixture_root/home/.claude" CODEX_HOME="$fixture_root/home/.codex" \
+    XDG_STATE_HOME="$fixture_root/state" \
     XDG_DATA_HOME="$fixture_root/data" XDG_CONFIG_HOME="$fixture_root/config" \
     XDG_CACHE_HOME="$fixture_root/cache" PATH="$fixture_root/bin:$PATH" \
     CARGO_HOME="${CARGO_HOME:-$HOME/.cargo}" \
@@ -328,8 +330,8 @@ Pro plan; to report another, such as one in an organization, write it to
 For multiple synthetic accounts, put an `auth status --json` response in each
 account's `fixture-auth-status.json`, such as
 `{"loggedIn":true,"email":"account-one@example.test","subscriptionType":"pro"}`.
-The fixture reads it from `CLAUDE_CONFIG_DIR`, or `HOME/.claude` when no config
-directory is selected. Give each account a distinct email so the app treats
+The fixture reads it from the marked home named by `CLAUDE_CONFIG_DIR`.
+Give each account a distinct email so the app treats
 the homes as separate sign-ins, and put its usage response in that home's
 `fixture-usage.json`. Without an auth file, the fixture keeps its default
 `fixture@example.test` identity. Keep all these homes inside the isolated fixture;

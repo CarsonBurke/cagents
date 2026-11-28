@@ -11,8 +11,8 @@ but for Antigravity's `--app-data-dir DIR`, which keeps that process's
 conversations apart from the ones it lists otherwise, as `agy` keeps them
 in ~/.gemini/DIR rather than ~/.gemini/antigravity-cli.
 
-Each conversation is saved under FAKE_ACP_STATE (default: a directory in
-the system's temporary directory) as the session updates it sent, so
+Each conversation is saved under the explicitly supplied FAKE_ACP_STATE
+inside a marked fixture home as the session updates it sent, so
 `session/load` replays it and `session/list` lists it, newest first.
 
 The prompt chooses the turn, by the first of these words it contains as a
@@ -109,22 +109,25 @@ account commands.
 import fcntl
 import json
 import os
+from pathlib import Path
 import queue
 import re
 import sys
-import tempfile
 import threading
 import time
 import uuid
 
+sys.dont_write_bytecode = True
+for _fixture_parent in Path(__file__).resolve().parents:
+    if (_fixture_parent / "scripts/fixture_home.py").is_file():
+        sys.path.insert(0, str(_fixture_parent / "scripts"))
+        break
+from fixture_home import require_fixture_home
+
 SHAPE = os.environ.get("FAKE_ACP_SHAPE") or (
     "muse" if os.path.basename(sys.argv[0]).startswith("muse") else "agy"
 )
-# Never a real data directory: without FAKE_ACP_STATE, conversations last
-# only as long as the temporary directory does.
-STATE = os.environ.get("FAKE_ACP_STATE") or os.path.join(
-    tempfile.gettempdir(), f"fake-acp-agent-{os.getuid()}"
-)
+STATE = os.environ.get("FAKE_ACP_STATE", "")
 # The account states below, which hold for every process of the agent,
 # whatever data directory it keeps.
 MARKS = STATE
@@ -301,8 +304,9 @@ class Session:
                                 self.id, ".session.lock")
         else:
             path = os.path.join(home, ".gemini", APP_DATA, "presence", self.id + ".lock")
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        self.lock = open(path, "a")
+        path = require_fixture_home("presence lock", path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock = path.open("a")
         fcntl.flock(self.lock, fcntl.LOCK_EX)
 
     def release_presence(self):
@@ -1063,6 +1067,16 @@ def command_line(arguments):
 
 
 if __name__ == "__main__":
+    require_fixture_home("HOME")
+    require_fixture_home("FAKE_ACP_STATE", MARKS)
+    require_fixture_home("FAKE_ACP_STATE", STATE)
+    if PROBE_DATA:
+        for store in ("brain", "conversations", "annotations", "implicit"):
+            require_fixture_home("HOME", Path(PROBE_DATA) / store)
+    if auth_file := os.environ.get("FAKE_ACP_AUTH_FILE"):
+        require_fixture_home("FAKE_ACP_AUTH_FILE", auth_file)
+    if LOG:
+        LOG = str(require_fixture_home("FAKE_ACP_LOG", LOG))
     status = command_line(sys.argv[1:])
     if status is not None:
         sys.exit(status)

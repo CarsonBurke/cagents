@@ -12,6 +12,8 @@ import hashlib
 import json
 import os
 
+from fixture_home import require_fixture_home
+
 from . import content
 from .determinism import iso
 
@@ -224,6 +226,8 @@ def chain_record(line):
 def write(home, spec, stream):
     """Writes one conversation the workspace plan describes. Returns what a
     reader should find in it."""
+    home = str(require_fixture_home("HOME", home))
+    require_fixture_home("CLAUDE_CONFIG_DIR", os.path.join(home, ".claude"))
     conversation = Conversation(stream, spec["session_id"], spec["cwd"], spec["branch"], spec["started_at"])
     edge = spec.get("edge")
     prefix = []

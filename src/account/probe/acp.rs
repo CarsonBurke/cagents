@@ -649,6 +649,14 @@ mod tests {
         fn new() -> Self {
             use std::os::unix::fs::PermissionsExt;
             let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            std::fs::write(root.join(".cagents-fixture-root"), "").unwrap();
+            std::fs::create_dir(root.join("scripts")).unwrap();
+            std::fs::write(
+                root.join("scripts/fixture_home.py"),
+                include_str!("../../../scripts/fixture_home.py"),
+            )
+            .unwrap();
             let program = directory.path().join("agy");
             std::fs::write(
                 &program,
