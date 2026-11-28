@@ -756,6 +756,8 @@ pub enum Action {
     /// Native viewport geometry and, for deliberate navigation, its direction.
     /// A collapsed page can fit at both edges; geometry cannot choose its next page.
     Scrolled(Target, Option<String>, view::Scroll, Option<view::Page>),
+    HistoryRetryViewportChanged(Target),
+    RetryEarlierHistory(Target),
     /// Opens or closes the model search.
     ModelPicker(Target, bool),
     PermissionPicker(Target, bool),
@@ -932,6 +934,7 @@ impl Action {
             | Self::ReadComposer(target, ..)
             | Self::ComposerCursor(target, ..)
             | Self::Scrolled(target, ..)
+            | Self::HistoryRetryViewportChanged(target)
             | Self::CompletionScrolled(target, ..)
             | Self::CompletionMove(target, ..)
             | Self::ChangeListScrolled(target, ..)
@@ -1163,6 +1166,8 @@ impl Action {
             Self::ReopenRefusedClose(..) => "ReopenRefusedClose",
             Self::DismissCloseFailure(..) => "DismissCloseFailure",
             Self::Scrolled(..) => "Scrolled",
+            Self::HistoryRetryViewportChanged(..) => "HistoryRetryViewportChanged",
+            Self::RetryEarlierHistory(..) => "RetryEarlierHistory",
             Self::ModelPicker(..) => "ModelPicker",
             Self::PermissionPicker(..) => "PermissionPicker",
             Self::ResolvePermissions(..) => "ResolvePermissions",
@@ -1289,6 +1294,7 @@ impl Action {
             | Self::DiscardClosedDraft(target, _)
             | Self::AppendProviderDraft(target)
             | Self::Command(target, _)
+            | Self::RetryEarlierHistory(target)
             | Self::Interrupt(target)
             | Self::Attach(target)
             | Self::Paste(target)
@@ -3997,6 +4003,8 @@ pub(super) struct Runtime {
     subagent_scroll: HashMap<String, view::Scroll>,
     page_request: Option<(view::Page, u64)>,
     deferred_page: Option<HistoryNavigation>,
+    /// Pause automatic navigation into unfetched history until an explicit retry.
+    earlier_page_failed: bool,
     unseen_activity: bool,
     /// The loaded transcript's height when a page of history was last asked
     /// for from that end, and `None` while the reader is not at that end.
@@ -5685,6 +5693,7 @@ impl Runtime {
             subagent_scroll: HashMap::new(),
             page_request: None,
             deferred_page: None,
+            earlier_page_failed: false,
             unseen_activity: false,
             earlier_asked: None,
             later_asked: None,
@@ -5711,6 +5720,7 @@ impl Runtime {
         self.subagent_scroll.clear();
         self.page_request = None;
         self.deferred_page = None;
+        self.earlier_page_failed = false;
         self.scroll = view::Scroll::default();
         self.history_estimate.take();
         self.sought = None;
@@ -7057,6 +7067,9 @@ impl Runtime {
         mut snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
+        if snapshot.history.unfetched != self.snapshot.history.unfetched {
+            self.earlier_page_failed = false;
+        }
         self.scroll_memory.latest_source(
             self.page_request
                 .filter(|(page, _)| *page == view::Page::Latest)
@@ -14111,7 +14124,7 @@ impl Cagents {
             // page that arrives is followed by the next until it reaches the
             // reader, who waits in the space standing for it.
             view::Sought::Unfetched => {
-                if !runtime.snapshot.has_earlier {
+                if !runtime.snapshot.has_earlier || runtime.earlier_page_failed {
                     return Task::none();
                 }
                 runtime.scroll_memory.release(scroll::Edge::Latest);
@@ -14295,6 +14308,7 @@ impl Cagents {
             runtime.page_request = Some((page, runtime.snapshot.generation));
             match page {
                 view::Page::Earlier => {
+                    runtime.earlier_page_failed = false;
                     runtime.earlier_asked = Some(runtime.parent_scroll().content())
                 }
                 view::Page::Newer | view::Page::Latest => {
@@ -15636,6 +15650,7 @@ impl Cagents {
                             // restarted daemon can begin again at generation 1.
                             runtime.page_request = None;
                             runtime.deferred_page = None;
+                            runtime.earlier_page_failed = false;
                             // A seek the old handle took may never have
                             // reached the daemon, so the same one is sent
                             // again rather than awaited.
@@ -17418,6 +17433,19 @@ impl Cagents {
                     runtime.recall(false);
                 }
             }
+            Action::RetryEarlierHistory(target) => {
+                let Some(runtime) = self.chat_runtime_mut(target) else {
+                    return Task::none();
+                };
+                let Some(sought) = runtime.failed_history_seek() else {
+                    return Task::none();
+                };
+                if !runtime.can_retry_history_seek() {
+                    return Task::none();
+                }
+                runtime.earlier_page_failed = false;
+                return self.follow_into_history(target, sought);
+            }
             Action::Command(target, command) => {
                 if matches!(command, Command::Compact | Command::Branch { .. })
                     && let Some(runtime) = self.chat_runtime_mut(target)
@@ -17917,6 +17945,13 @@ impl Cagents {
                         None
                     }
                     (Err(error), None) => {
+                        let failed_earlier_page = pending.page == Some(view::Page::Earlier)
+                            && runtime.snapshot.history.unfetched.unwrap_or(0) > 0;
+                        let failed_provider_seek = pending.seeks()
+                            && runtime.deferred_page == Some(HistoryNavigation::ContinueSeek);
+                        if failed_earlier_page || failed_provider_seek {
+                            runtime.earlier_page_failed = true;
+                        }
                         if pending.page == Some(view::Page::Latest) {
                             runtime.scroll_memory.release(scroll::Edge::Latest);
                             runtime.scroll_memory.cancel_preserve(pending.id);
@@ -19397,6 +19432,8 @@ impl Cagents {
                     return self.start_chat(target.card, session, chat::Intent::Start, None, false);
                 }
             }
+            // The viewport observation is already shared with the view.
+            Action::HistoryRetryViewportChanged(_) => {}
             Action::Scrolled(target, subagent, scroll, direction) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();

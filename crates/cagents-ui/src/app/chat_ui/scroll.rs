@@ -373,6 +373,8 @@ pub(super) struct History<'a> {
     pub unloaded: view::Unloaded,
     /// The loaded item the reader asked to land on, see [`Memory::land`].
     pub landing: Option<&'a str>,
+    /// The provider extent when a page failure can be retried in its placeholder.
+    pub earlier_failure: Option<crate::chat::HistoryExtent>,
 }
 
 /// The item a page slides the window around, by its place among the
@@ -1818,6 +1820,35 @@ impl Operation for SetBottom {
 }
 
 impl Anchored<'_> {
+    fn report_scroll(
+        &self,
+        shell: &mut Shell<'_, Message>,
+        scroll: Scroll,
+        direction: Option<view::Page>,
+    ) {
+        let subagent = self.subagent.map(str::to_owned);
+        let retry_changed = self.observations.as_ref().is_some_and(|observations| {
+            let previous = observations.borrow_mut().insert(subagent.clone(), scroll);
+            self.history.earlier_failure.is_some_and(|history| {
+                previous
+                    .and_then(|scroll| scroll.unfetched_target(history))
+                    .is_some()
+                    != scroll.unfetched_target(history).is_some()
+            })
+        });
+        // Geometry is shared without a model update except when a reading
+        // gesture needs history or crosses the recovery control's boundary.
+        if let Some(target) = self.target {
+            if self.observations.is_none() || direction.is_some() {
+                shell.publish(action(Action::Scrolled(
+                    target, subagent, scroll, direction,
+                )));
+            } else if retry_changed {
+                shell.publish(action(Action::HistoryRetryViewportChanged(target)));
+            }
+        }
+    }
+
     /// The item a page slides this transcript's window around.
     fn pivot_id(&self) -> Option<&str> {
         let pivot = self.history.pivot?;
@@ -2426,22 +2457,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                         top,
                         geometry: saved_geometry,
                     });
-                    if let Some(observations) = &self.observations {
-                        observations
-                            .borrow_mut()
-                            .insert(self.subagent.map(str::to_owned), scroll);
-                    }
-                    if let Some(target) = self
-                        .target
-                        .filter(|_| self.observations.is_none() || direction.is_some())
-                    {
-                        shell.publish(action(Action::Scrolled(
-                            target,
-                            self.subagent.map(str::to_owned),
-                            scroll,
-                            direction,
-                        )));
-                    }
+                    self.report_scroll(shell, scroll, direction);
                 }
                 // Preserve row-relative restoration across the remaining cold
                 // measurements, including a fitting placeholder's zero delta.
@@ -2538,25 +2554,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     top,
                     geometry,
                 });
-                if let Some(observations) = &self.observations {
-                    observations
-                        .borrow_mut()
-                        .insert(self.subagent.map(str::to_owned), scroll);
-                }
-                // Native geometry is shared directly with the Runtime. Only
-                // navigation needs a model message; a streamed height change
-                // must not cause another complete update/view/layout cycle.
-                if let Some(target) = self
-                    .target
-                    .filter(|_| self.observations.is_none() || direction.is_some())
-                {
-                    shell.publish(action(Action::Scrolled(
-                        target,
-                        self.subagent.map(str::to_owned),
-                        scroll,
-                        direction,
-                    )));
-                }
+                self.report_scroll(shell, scroll, direction);
             }
         }
     }

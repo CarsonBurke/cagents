@@ -3624,9 +3624,9 @@ fn a_seek_uses_the_history_extent_after_an_in_flight_provider_page() {
 }
 
 #[test]
-fn a_failed_page_stops_its_own_unfetched_history_continuation() {
+fn a_failed_page_pauses_a_history_seek_until_the_reader_retries() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target, _) = reader_waiting_at_the_start(&mut app);
+    let (card, target, handle) = reader_waiting_at_the_start(&mut app);
     assert_eq!(
         chat_runtime(&app, card).deferred_page,
         Some(HistoryNavigation::ContinueSeek)
@@ -3637,6 +3637,74 @@ fn a_failed_page_stops_its_own_unfetched_history_continuation() {
     assert_eq!(runtime.scroll_memory.edge(None), None);
     assert_eq!(runtime.deferred_page, None);
     assert!(runtime.commands.is_idle());
+    assert_eq!(runtime.failed_history_seek(), Some(view::Sought::Start));
+    assert!(runtime.can_retry_history_seek());
+    let scroll = runtime.parent_scroll();
+    drop(app.handle_chat_ui(Action::Scrolled(
+        target,
+        None,
+        scroll,
+        Some(view::Page::Earlier),
+    )));
+    assert!(chat_runtime(&app, card).commands.is_idle());
+
+    drop(app.handle_chat_ui(Action::RetryEarlierHistory(target)));
+    let runtime = chat_runtime(&app, card);
+    assert_eq!(runtime.failed_history_seek(), None);
+    assert_eq!(runtime.deferred_page, Some(HistoryNavigation::ContinueSeek));
+    assert_eq!(
+        runtime.commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+    earlier_page_arrives(&mut app, card, &handle, 2);
+    assert_eq!(
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+}
+
+#[test]
+fn a_failed_provider_page_offers_retry_only_where_the_reader_is_waiting() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let (card, target, handle) = history_fixture(&mut app);
+    let mut snapshot = (*handle.snapshot()).clone();
+    snapshot.generation += 1;
+    snapshot.history.unfetched = Some(500);
+    handle.publish_snapshot_for_test(snapshot);
+    app.chat_runtime_mut(target).unwrap().refresh();
+    let scroll = |top| {
+        view::Scroll::new(top, 25_000.0, 600.0).with_unloaded(view::Unloaded {
+            before: 20_000.0,
+            after: 0.0,
+        })
+    };
+    let drag = |app: &mut Cagents, top| {
+        drop(app.handle_chat_ui(Action::Scrolled(target, None, scroll(top), None)));
+    };
+    drag(&mut app, 10_000.0);
+    settle(&mut app, card, Err("history unavailable".into()));
+    assert_eq!(
+        chat_runtime(&app, card).failed_history_seek(),
+        Some(view::Sought::Unfetched)
+    );
+
+    drag(&mut app, 21_000.0);
+    drop(app.handle_chat_ui(Action::RetryEarlierHistory(target)));
+    assert_eq!(chat_runtime(&app, card).failed_history_seek(), None);
+    assert!(chat_runtime(&app, card).commands.is_idle());
+
+    drag(&mut app, 10_000.0);
+    assert!(chat_runtime(&app, card).commands.is_idle());
+    drop(app.handle_chat_ui(Action::RetryEarlierHistory(target)));
+    assert_eq!(
+        chat_runtime(&app, card).commands.in_flight().unwrap().page,
+        Some(view::Page::Earlier)
+    );
+    settle(&mut app, card, Err("history still unavailable".into()));
+    assert_eq!(
+        chat_runtime(&app, card).failed_history_seek(),
+        Some(view::Sought::Unfetched)
+    );
 }
 
 #[test]

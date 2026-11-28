@@ -3160,6 +3160,85 @@ fn native_geometry_updates_the_reader_without_echoing_a_model_message() {
 }
 
 #[test]
+fn wheeling_out_of_failed_unfetched_history_reports_the_retry_visibility_change() {
+    let renderer = crate::app::tests::headless_renderer();
+    let observations: Observations = Default::default();
+    let target = Target {
+        card: CardId::new(),
+        generation: 0,
+    };
+    let history = crate::chat::HistoryExtent {
+        unfetched: Some(60),
+        ..Default::default()
+    };
+    let mut element = transcript_observed(
+        widget::Space::new().height(1_400.0).width(Length::Fill),
+        target,
+        None,
+        vec![],
+        true,
+        vec![],
+        observations.clone(),
+        Memory::default(),
+        false,
+        HashSet::new(),
+        None,
+        History {
+            unloaded: view::Unloaded {
+                before: 600.0,
+                after: 0.0,
+            },
+            earlier_failure: Some(history),
+            ..History::default()
+        },
+    );
+    let bounds = Rectangle::with_size(Size::new(400.0, 400.0));
+    let limits = layout::Limits::new(Size::ZERO, bounds.size());
+    let mut tree = Tree::new(&element);
+    let node = element
+        .as_widget_mut()
+        .layout(&mut tree, &renderer, &limits);
+    element.as_widget_mut().operate(
+        &mut tree,
+        Layout::new(&node),
+        &renderer,
+        &mut SetBottom(650.0),
+    );
+    let mut report = |event, messages: &mut Vec<Message>| {
+        element.as_widget_mut().update(
+            &mut tree,
+            &event,
+            Layout::new(&node),
+            mouse::Cursor::Available(iced::Point::new(50.0, 50.0)),
+            &renderer,
+            &mut iced::advanced::clipboard::Null,
+            &mut Shell::new(messages),
+            &bounds,
+        );
+    };
+    report(
+        Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)),
+        &mut Vec::new(),
+    );
+    assert_eq!(
+        observations.borrow()[&None].unfetched_target(history),
+        Some(view::Sought::Unfetched)
+    );
+    let mut messages = Vec::new();
+    report(
+        Event::Mouse(mouse::Event::WheelScrolled {
+            delta: mouse::ScrollDelta::Pixels { x: 0.0, y: -100.0 },
+        }),
+        &mut messages,
+    );
+    assert!(matches!(
+        messages.as_slice(),
+        [Message::ChatUi(Action::HistoryRetryViewportChanged(found))] if *found == target
+    ));
+    assert_eq!(observations.borrow()[&None].unfetched_target(history), None);
+}
+
+#[test]
 fn native_layout_reports_fitting_content_and_anchors_real_column_children() {
     use iced::advanced::renderer::Headless;
     let renderer = tokio::runtime::Builder::new_current_thread()
