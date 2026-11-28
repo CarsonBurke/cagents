@@ -91,8 +91,8 @@ pub struct ModelChannel {
     /// `None` is the project's main checkout, which is what every channel
     /// created before channels had a checkout works in.
     ///
-    /// Fixed when the channel is created, and checked then to be a worktree of
-    /// [`Self::repository`] (see [`ModelEdit::canonicalized`]).
+    /// Fixed when the channel is created. If present on disk, it must be a
+    /// worktree of [`Self::repository`]. A recorded path can outlive its worktree.
     #[serde(default)]
     pub checkout: Option<PathBuf>,
 }
@@ -775,7 +775,7 @@ impl ModelEdit {
             } => {
                 let repository = canonical_repository(&repository)?;
                 let checkout = match checkout {
-                    Some(checkout) => canonical_checkout(&repository, &checkout)?,
+                    Some(checkout) => canonical_channel_checkout(&repository, &checkout)?,
                     None => None,
                 };
                 Self::CreateChannel {
@@ -887,6 +887,23 @@ pub fn canonical_repository(path: &Path) -> Result<PathBuf, String> {
 /// writer, instead of a `git` process per edit, and it cannot accept a copied
 /// `.git` file or a worktree of another repository.
 pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<PathBuf>, String> {
+    resolve_checkout(repository, checkout, false)
+}
+
+/// Resolves a channel's checkout, retaining an absent path for a channel
+/// whose worktree was removed. An existing checkout must belong to the project.
+pub fn canonical_channel_checkout(
+    repository: &Path,
+    checkout: &Path,
+) -> Result<Option<PathBuf>, String> {
+    resolve_checkout(repository, checkout, true)
+}
+
+fn resolve_checkout(
+    repository: &Path,
+    checkout: &Path,
+    retain_missing: bool,
+) -> Result<Option<PathBuf>, String> {
     if !checkout.is_absolute() {
         return Err(format!(
             "a channel's checkout must be absolute, but `{}` is relative",
@@ -896,14 +913,30 @@ pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<P
     // As with the repository key, a remote device's daemon checks its own
     // files when the edit reaches it.
     if crate::device::is_remote() {
-        return Ok((checkout != repository).then(|| checkout.to_path_buf()));
+        return Ok((checkout != repository
+            && !(retain_missing && main_checkout_location(repository, checkout)))
+        .then(|| checkout.to_path_buf()));
     }
-    let checkout = std::fs::canonicalize(checkout).map_err(|error| {
-        format!(
-            "the checkout `{}` cannot be used for a channel: {error}",
-            checkout.display()
-        )
-    })?;
+    let checkout = match std::fs::canonicalize(checkout) {
+        Ok(path) => path,
+        Err(error)
+            if retain_missing
+                && matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+        {
+            return Ok(
+                (!main_checkout_location(repository, checkout)).then(|| checkout.to_path_buf())
+            );
+        }
+        Err(error) => {
+            return Err(format!(
+                "the checkout `{}` cannot be used for a channel: {error}",
+                checkout.display()
+            ));
+        }
+    };
     let dot_git = checkout.join(".git");
     // A folder project is its own checkout, and a Git project's main checkout
     // holds the common directory itself or, as a submodule or a checkout made
@@ -935,6 +968,13 @@ pub fn canonical_checkout(repository: &Path, checkout: &Path) -> Result<Option<P
             repository.display()
         )),
     }
+}
+
+/// The main checkout of an ordinary Git project or folder, even when absent.
+pub fn main_checkout_location(repository: &Path, checkout: &Path) -> bool {
+    checkout == repository
+        || (repository.file_name().is_some_and(|name| name == ".git")
+            && repository.parent() == Some(checkout))
 }
 
 /// The branch checked out at `checkout`, a checkout of `repository` (its common
@@ -1082,6 +1122,27 @@ impl CheckoutFixture {
 mod tests {
     use super::*;
     use crate::model::ChannelTitleSource;
+
+    #[test]
+    fn creating_a_channel_keeps_a_removed_checkout_without_admitting_it_for_execution() {
+        let fixture = CheckoutFixture::new();
+        let edit = ModelEdit::CreateChannel {
+            id: ChannelId::new(),
+            repository: fixture.repository.clone(),
+            title: "feature".into(),
+            title_source: ChannelTitleSource::Manual,
+            checkout: Some(fixture.linked.clone()),
+        };
+        std::fs::remove_dir_all(&fixture.linked).unwrap();
+        assert!(canonical_checkout(&fixture.repository, &fixture.linked).is_err());
+        assert_eq!(edit.clone().canonicalized().unwrap(), edit);
+
+        std::fs::create_dir(&fixture.linked).unwrap();
+        assert!(
+            edit.canonicalized().is_err(),
+            "an unrelated directory is never a checkout"
+        );
+    }
 
     /// A channel's checkout is its repository's main checkout (`None`) or one
     /// of its linked worktrees, whatever spelling names it; anything else is

@@ -3939,7 +3939,7 @@ impl Cagents {
         tasks.push(self.run_deferred_default_pane());
         // A closed pane a view brought back after its conversation stopped
         // goes again, now that the views it is removed from are settled.
-        tasks.push(self.remove_stopped_returns());
+        tasks.push(self.remove_returned_chats());
         // A closed pane a view put back while its conversation stops stays
         // out of sight, now that the strip holds it.
         tasks.push(self.hide_returned_closes());

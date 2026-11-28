@@ -1806,6 +1806,10 @@ pub struct WorkspaceState {
     /// stopped, or refused to stop, oldest first.
     #[serde(default)]
     pub stopping_chats: Vec<StoppingChat>,
+    /// Returned panes still to close, keyed by pane identity and bound to the
+    /// conversation they held. The conversation may already have reopened.
+    #[serde(default)]
+    pub pending_chat_pane_removals: HashMap<CardId, crate::chat::Session>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1858,6 +1862,7 @@ impl Default for WorkspaceState {
             kept_chat_drafts: HashMap::new(),
             returned_chat_queues: BTreeMap::new(),
             stopping_chats: Vec::new(),
+            pending_chat_pane_removals: Default::default(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),

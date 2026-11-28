@@ -17361,7 +17361,7 @@ impl Application for Cagents {
             sidebar_state: SidebarState::default(),
             project_ui: project_ui::State::default(),
             worktree_protections: Default::default(),
-            channel_ui: channel_ui::State::default(),
+            channel_ui: channel_ui::State::with_saved_worktrees(&worktrees),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
             chat_ui,
             resume_ui: resume_ui::State::default(),

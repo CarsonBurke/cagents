@@ -669,6 +669,7 @@ fn scope_descriptor(
         kept_chat_drafts: HashMap::new(),
         returned_chat_queues: Default::default(),
         stopping_chats: Vec::new(),
+        pending_chat_pane_removals: Default::default(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -1452,8 +1453,8 @@ impl Cagents {
         let source_control = self.rebind_source_control();
         // Closed panes whose conversation stopped while this strip was not
         // shown go now that it is.
-        let stopped_returns = self.remove_stopped_returns();
-        Task::batch([viewport, residency, source_control, stopped_returns])
+        let returns_to_remove = self.remove_returned_chats();
+        Task::batch([viewport, residency, source_control, returns_to_remove])
     }
 
     pub(super) fn terminal_directory(&self) -> Option<PathBuf> {
@@ -1660,8 +1661,8 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).focused = self.workspace.focused();
             self.persist();
         }
-        let stopped_returns = self.remove_stopped_returns();
-        Task::batch([stopped_returns, self.rebind_source_control()])
+        let returns_to_remove = self.remove_returned_chats();
+        Task::batch([returns_to_remove, self.rebind_source_control()])
     }
 
     /// Where a new pane goes in the strip and in the saved cards: directly

@@ -13,7 +13,9 @@
 use super::{Registry, checkout_key, repository_key, take_ordinal, views};
 use crate::model::{ChannelId, ChannelTitleSource};
 use crate::workspace_model::views::{Change, Scope};
-use crate::workspace_model::{ModelEdit, NavigationItem, canonical_checkout, checkout_branch};
+use crate::workspace_model::{
+    ModelEdit, NavigationItem, canonical_channel_checkout, checkout_branch, main_checkout_location,
+};
 use rusqlite::{OptionalExtension, Transaction, params};
 use std::path::{Path, PathBuf};
 
@@ -29,9 +31,9 @@ struct Home {
 
 impl Home {
     fn of(repository: &Path, path: &Path) -> Self {
-        let checkout = match canonical_checkout(repository, path) {
+        let checkout = match canonical_channel_checkout(repository, path) {
             Ok(checkout) => checkout,
-            Err(_) if main_location(repository, path) => None,
+            Err(_) if main_checkout_location(repository, path) => None,
             Err(_) => Some(path.to_path_buf()),
         };
         let title = checkout_branch(repository, path)
@@ -42,14 +44,6 @@ impl Home {
             .unwrap_or_else(|| path.display().to_string());
         Self { checkout, title }
     }
-}
-
-/// Whether `path` is where the project's main checkout lives, even when it is
-/// missing: the folder itself, or the directory holding a `.git` repository.
-fn main_location(repository: &Path, path: &Path) -> bool {
-    path == repository
-        || (repository.file_name().is_some_and(|name| name == ".git")
-            && repository.parent() == Some(path))
 }
 
 /// What the repair changed.

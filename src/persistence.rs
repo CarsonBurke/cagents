@@ -292,6 +292,7 @@ pub struct WorkspaceManifest {
     pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub kept_chat_drafts: HashMap<CardId, crate::model::KeptChatDraft>,
     pub stopping_chats: Vec<crate::model::StoppingChat>,
+    pub pending_chat_pane_removals: HashMap<CardId, crate::chat::Session>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -2364,6 +2365,7 @@ impl StateStore {
             kept_chat_drafts: manifest.kept_chat_drafts,
             returned_chat_queues,
             stopping_chats: manifest.stopping_chats,
+            pending_chat_pane_removals: manifest.pending_chat_pane_removals,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -4844,6 +4846,11 @@ fn save_workspace_transaction(
     )?;
     set_metadata(
         transaction,
+        &format!("workspace:{workspace_id}:navigation:pending_chat_pane_removals"),
+        &ordered_map_json(&state.pending_chat_pane_removals)?,
+    )?;
+    set_metadata(
+        transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
         &ordered_map_json(&state.repository_navigation)?,
     )?;
@@ -6671,6 +6678,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("closed chats still stopping", &value))
         .transpose()?
         .unwrap_or_default(),
+        pending_chat_pane_removals: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:pending_chat_pane_removals"),
+        )?
+        .map(|value| from_json("pending chat pane removals", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -7383,6 +7397,7 @@ mod tests {
             kept_chat_drafts: HashMap::new(),
             returned_chat_queues: Default::default(),
             stopping_chats: Vec::new(),
+            pending_chat_pane_removals: Default::default(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -8953,21 +8968,24 @@ mod tests {
             ..pending.clone()
         };
         workspace.stopping_chats = vec![pending, refused, stopped];
+        workspace
+            .pending_chat_pane_removals
+            .insert(workspace.cards[0].id, chat);
         let mut lane = SaveLane::default();
         lane.save(&store, &workspace).unwrap();
         let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
         assert_eq!(restored.stopping_chats, workspace.stopping_chats);
+        assert_eq!(
+            restored.pending_chat_pane_removals,
+            workspace.pending_chat_pane_removals
+        );
 
         workspace.stopping_chats.clear();
+        workspace.pending_chat_pane_removals.clear();
         lane.save(&store, &workspace).unwrap();
-        assert!(
-            store
-                .load_workspace(workspace.id, None)
-                .unwrap()
-                .unwrap()
-                .stopping_chats
-                .is_empty()
-        );
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert!(restored.stopping_chats.is_empty());
+        assert!(restored.pending_chat_pane_removals.is_empty());
     }
 
     fn agent_workspace(provider: crate::agent::Provider) -> (WorkspaceState, crate::chat::Session) {

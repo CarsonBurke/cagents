@@ -1588,17 +1588,13 @@ pub(super) struct State {
     /// A shared view that never heard of the close, as when the window closed
     /// first, can bring one back. Its automatic removal consumes this entry.
     stopped_closes: HashMap<CardId, chat::Session>,
-    /// Such panes a view brought back before putting them in the strip: they
-    /// go once it has.
-    stopped_returns: HashSet<CardId>,
+    /// Returned panes waiting for placement, admission or another removal.
+    returns_to_remove: HashSet<CardId>,
     /// Whether one of those waited for another pane's removal to finish, and
     /// goes once it has.
     returns_await_removal: bool,
-    /// Closed panes their view fences, which never attach, to close by
-    /// identity once another pane's removal no longer holds the strip.
-    fenced_returns: HashSet<CardId>,
-    /// Closed panes a shared view put back while their conversation stops,
-    /// kept out of sight until the stop settles.
+    /// Closed panes a shared view put back, kept out of sight until their
+    /// stop settles or their pending removal commits.
     hidden_returns: HashSet<CardId>,
     /// Unsent composer text belonging to a card whose chat runtime has been
     /// dropped.
@@ -1703,9 +1699,8 @@ impl Default for State {
             close_refused: HashSet::new(),
             refusals_to_show: HashMap::new(),
             stopped_closes: HashMap::new(),
-            stopped_returns: HashSet::new(),
+            returns_to_remove: HashSet::new(),
             returns_await_removal: false,
-            fenced_returns: HashSet::new(),
             hidden_returns: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
@@ -1739,12 +1734,24 @@ impl Default for State {
 }
 impl State {
     pub(super) fn for_workspace(workspace: &WorkspaceState) -> Self {
-        Self::with_draft_attachments(
+        let mut state = Self::with_draft_attachments(
             workspace.chat_drafts.clone(),
             workspace.chat_draft_attachments.clone(),
         )
         .with_waiting_messages(workspace.chat_waiting_messages.clone())
-        .with_draft_models(workspace.chat_draft_models.clone())
+        .with_draft_models(workspace.chat_draft_models.clone());
+        if !workspace.pending_chat_pane_removals.is_empty() {
+            state
+                .hidden_returns
+                .extend(workspace.cards.iter().filter_map(|saved| {
+                    let source = workspace.pending_chat_pane_removals.get(&saved.id)?;
+                    (saved.existence.is_open()
+                        && matches!(&saved.kind, CardKind::Chat(session)
+                    if background_close::returned_pane_source_matches(source, session)))
+                    .then_some(saved.id)
+                }));
+        }
+        state
     }
 
     #[cfg(test)]

@@ -8516,7 +8516,7 @@ fn a_kept_closed_pane_whose_stop_settles_off_strip_goes_with_its_strip() {
         app.workspace = strip;
         app.rehide_closing_panes();
         assert!(app.workspace.is_hidden(pane.id), "out of sight");
-        drop(app.remove_stopped_returns());
+        drop(app.remove_returned_chats());
         assert!(
             !app.card_state(pane.id)
                 .is_some_and(|state| state.existence.is_open()),
@@ -8562,7 +8562,7 @@ fn a_kept_closed_pane_another_window_reuses_stays() {
     app.workspace = strip;
     app.rehide_closing_panes();
     assert!(!app.workspace.is_hidden(pane.id));
-    drop(app.remove_stopped_returns());
+    drop(app.remove_returned_chats());
     assert!(
         app.card_state(pane.id)
             .is_some_and(|state| state.existence.is_open()),
@@ -8701,7 +8701,7 @@ fn a_kept_closed_pane_does_not_keep_its_conversation_from_reopening() {
         if settled {
             app.workspace = strip;
             app.rehide_closing_panes();
-            drop(app.remove_stopped_returns());
+            drop(app.remove_returned_chats());
         }
         assert!(
             !app.card_state(pane.id)
@@ -9033,7 +9033,15 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
     // Fenced while it awaits admission, with a reopen during the stop: off
     // the strip shown, in it, and in it while another pane's removal holds
     // it.
-    for (in_strip, busy) in [(false, false), (true, false), (true, true)] {
+    for (in_strip, busy, restart, unfence, switch_strip) in [
+        (false, false, false, false, false),
+        (true, false, false, false, false),
+        (true, true, false, false, false),
+        (true, true, false, true, false),
+        (true, true, false, false, true),
+        (true, true, true, false, false),
+        (true, true, true, true, false),
+    ] {
         let mut next = launch();
         next.await_shared_chat_admission(pane.id, session.clone());
         next.shared_views.quarantined.insert(pane.id);
@@ -9085,7 +9093,9 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
                 Err("the provider did not exit".into()),
             ))),
         );
-        let case = format!("in_strip={in_strip} busy={busy}");
+        let case = format!(
+            "in_strip={in_strip} busy={busy} restart={restart} unfence={unfence} switch_strip={switch_strip}"
+        );
         assert!(
             !next.reopen_superseded(reopened),
             "{case}: it does not give way to a pane that never attaches"
@@ -9108,8 +9118,56 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
             );
             assert!(next.closes_out_of_sight(pane.id), "{case}: out of sight");
             assert_eq!(next.status, None, "{case}: with nothing to report");
-            next.workspace.cancel_close(other).unwrap();
-            drop(next.settle_close_queue());
+            assert!(
+                !next.awaits_stop(reopened, &session),
+                "the reopened conversation can attach"
+            );
+            if restart {
+                let saved = next.persistent_workspace();
+                let mut restored = crate::app::tests::context_inspector_test_app(false);
+                restored.chat_ui = super::super::chat_ui::State::for_workspace(&saved);
+                restored.durable = saved;
+                restored.workspace = Cagents::rebuild_workspace(&restored.durable);
+                restored.rehide_closing_panes();
+                restored.await_shared_chat_admission(pane.id, session.clone());
+                if !unfence {
+                    restored.shared_views.quarantined.insert(pane.id);
+                }
+                assert!(restored.workspace.is_hidden(pane.id));
+                drop(restored.resume_stopping_chats());
+                assert!(
+                    restored.background_close_for_test(pane.id).is_none(),
+                    "no second provider stop"
+                );
+                next = restored;
+            } else {
+                if unfence {
+                    next.shared_views.quarantined.remove(&pane.id);
+                }
+                next.workspace.cancel_close(other).unwrap();
+                if switch_strip {
+                    next.workspace = Cagents::rebuild_workspace(&Default::default());
+                    next.cards.remove(&pane.id);
+                }
+                drop(next.settle_close_queue());
+            }
+            if unfence {
+                assert!(
+                    next.card_state(pane.id).unwrap().existence.is_open(),
+                    "still held by the view"
+                );
+                assert!(
+                    next.workspace.is_hidden(pane.id),
+                    "waits out of sight for admission"
+                );
+                assert!(
+                    next.awaits_stop(pane.id, &session),
+                    "the pending removal survives a save"
+                );
+                let (task, saved_copy) = next.admit_shared_chat(&admitted);
+                drop(task);
+                assert_eq!(saved_copy, None);
+            }
         }
         assert!(
             !next
@@ -9117,15 +9175,99 @@ fn a_kept_closed_pane_its_view_fences_leaves_a_refused_reopen_attached() {
                 .is_some_and(|state| state.existence.is_open()),
             "{case}: the fenced pane goes, rather than stay beside it"
         );
-        assert!(
+        assert_eq!(
             next.shared_views.fenced_closes.contains(&pane.id),
-            "{case}: its view hears that it closed, by identity"
+            !unfence,
+            "{case}"
         );
+        assert!(!next.awaits_stop(pane.id, &session));
+        assert!(!next.chat_start_pending(pane.id));
         assert!(!next.closes_out_of_sight(pane.id));
         assert!(
             !next.durable.kept_chat_drafts.contains_key(&pane.id),
             "{case}: its draft is not kept twice"
         );
+    }
+}
+
+#[test]
+fn a_refused_chat_reopens_elsewhere_while_its_return_awaits_admission_to_close() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, pane, stopping) =
+        closed_chat_its_view_kept_from(Some(directory.path()), "kept draft");
+    let CardKind::Chat(session) = app.card_state(pane.id).unwrap().kind.clone() else {
+        panic!("a chat pane");
+    };
+    app.await_shared_chat_admission(pane.id, session.clone());
+    app.shared_views.quarantined.insert(pane.id);
+    drop(app.insert_terminal_card(attention_terminal_source(), None));
+    let other = app.workspace.order().find(|card| *card != pane.id).unwrap();
+    app.workspace.request_close(other).unwrap();
+    drop(
+        app.update(Message::ChatUi(super::super::chat_ui::Action::Retired(
+            stopping,
+            Err("the provider did not exit".into()),
+        ))),
+    );
+    assert!(app.has_close_failure_notices());
+    app.shared_views.quarantined.remove(&pane.id);
+    app.workspace.cancel_close(other).unwrap();
+    drop(app.settle_close_queue());
+    assert!(app.chat_awaiting_admission(pane.id));
+    assert!(app.workspace.is_hidden(pane.id));
+
+    drop(app.reopen_refused_close(session.id));
+
+    assert!(!app.has_close_failure_notices());
+    assert!(app.durable.cards.iter().any(|card| {
+        card.id != pane.id
+            && app.chat_start_pending(card.id)
+            && matches!(&card.kind, CardKind::Chat(reopened)
+                if super::super::chat_ui::shares_conversation(&session, reopened))
+    }));
+}
+
+#[test]
+fn a_saved_returned_pane_removal_leaves_a_replacement_that_reuses_the_chat_id() {
+    for draft in [false, true] {
+        let (mut app, pane, _) = closed_chat_its_view_kept();
+        let CardKind::Chat(source) = app.card_state(pane.id).unwrap().kind.clone() else {
+            panic!("a chat pane");
+        };
+        Arc::make_mut(&mut app.durable).stopping_chats.clear();
+        Arc::make_mut(&mut app.durable)
+            .pending_chat_pane_removals
+            .insert(pane.id, source.clone());
+        app.await_shared_chat_admission(pane.id, source.clone());
+        drop(app.resume_stopping_chats());
+
+        let mut replacement = source;
+        if draft {
+            replacement.launch.session_id = None;
+            replacement.proof = None;
+            replacement.terminal = None;
+            replacement.owned_codex_listener = None;
+            replacement.native_continuity = crate::chat::NativeContinuity::ReconnectOnly;
+            assert!(replacement.is_unstarted());
+        } else {
+            replacement.launch.session_id = Some("11111111-1111-4111-8111-111111111111".into());
+        }
+        let new_pane = Pane {
+            kind: CardKind::Chat(replacement.clone()),
+            ..pane
+        };
+        let (task, _) = app.admit_shared_chat(&new_pane);
+        drop(task);
+
+        assert!(
+            !app.durable
+                .pending_chat_pane_removals
+                .contains_key(&new_pane.id)
+        );
+        assert!(!app.workspace.is_hidden(new_pane.id));
+        let state = app.card_state(new_pane.id).unwrap();
+        assert!(state.existence.is_open());
+        assert_eq!(state.kind, CardKind::Chat(replacement));
     }
 }
 
