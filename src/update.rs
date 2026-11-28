@@ -1698,7 +1698,7 @@ fn start_job(
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
-    write_job(&state, &job)?;
+    write_new_job(&state, &job)?;
     let request_file = private_create(&state.join(format!("{id}.request")))?;
     serde_json::to_writer(&request_file, request)?;
     request_file.sync_all()?;
@@ -4044,10 +4044,14 @@ fn read_job(state: &Path) -> Result<Option<UpdateJob>, UpdateError> {
 }
 
 fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
-    write_state_file(state, "status.json", job)?;
-    if job.phase == UpdatePhase::Starting
-        && let Err(error) = resume_census::clear(state)
-    {
+    write_state_file(state, "status.json", job)
+}
+
+/// With the worker lease held, publish the replacement before retiring the
+/// optional details for the previous job.
+fn write_new_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    write_job(state, job)?;
+    if let Err(error) = resume_census::clear(state) {
         tracing::warn!(%error, "could not clear superseded update resume data");
     }
     Ok(())
@@ -4055,12 +4059,21 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
 
 fn write_state_file(state: &Path, name: &str, value: &impl Serialize) -> Result<(), UpdateError> {
     let temporary = state.join(format!("status-{}.tmp", uuid::Uuid::new_v4()));
+    write_state_file_through(state, name, &temporary, value)
+}
+
+fn write_state_file_through(
+    state: &Path,
+    name: &str,
+    temporary: &Path,
+    value: &impl Serialize,
+) -> Result<(), UpdateError> {
+    let mut file = private_create(temporary)?;
     let result = (|| {
-        let mut file = private_create(&temporary)?;
         serde_json::to_writer(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&temporary, state.join(name))?;
+        fs::rename(temporary, state.join(name))?;
         File::open(state)?.sync_all()?;
         Ok(())
     })();

@@ -4,13 +4,16 @@
 //! rollback proof. Keep these details in a separate job artifact so those
 //! builds can still return to the exact original checkpoint.
 use super::in_flight::{InFlight, QueuedText, ResumeData};
-use super::{UpdateError, retention, write_state_file};
+use super::{UpdateError, retention, write_state_file_through};
 use crate::chat::{QueuedMessage, Snapshot};
 use crate::model::TerminalId;
 use serde::{Deserialize, Serialize};
 use std::{fs, io, path::Path};
 
 const FILE: &str = "resume-census.json";
+// Capture holds the worker lease. A fixed path lets the next writer remove
+// any private text a killed writer left before the atomic rename.
+const TEMPORARY: &str = "resume-census.tmp";
 const LIMIT: usize = 512 * 1024;
 
 #[derive(Serialize, Deserialize)]
@@ -97,9 +100,10 @@ impl Capture {
         if self.entries.is_empty() {
             return Ok(());
         }
-        write_state_file(
+        write_state_file_through(
             state,
             FILE,
+            &state.join(TEMPORARY),
             &Saved {
                 job: job.to_owned(),
                 entries: self.entries,
@@ -111,14 +115,18 @@ impl Capture {
 /// The worker lease serializes capture and publication of a newer job.
 /// Both clear any optional payload from an earlier capture.
 pub(super) fn clear(state: &Path) -> Result<(), UpdateError> {
-    match fs::remove_file(state.join(FILE)) {
-        Ok(()) => {
-            fs::File::open(state)?.sync_all()?;
-            Ok(())
+    let mut removed = false;
+    for name in [TEMPORARY, FILE] {
+        match fs::remove_file(state.join(name)) {
+            Ok(()) => removed = true,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(error.into()),
     }
+    if removed {
+        fs::File::open(state)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Only the UI's view of a terminal job needs access to the private data.
@@ -164,7 +172,9 @@ mod tests {
     use crate::update::in_flight::{Fate, Outcome};
     use crate::update::{UpdateJob, UpdatePhase};
     use crate::upgrade::recovery::Census;
-    use std::os::unix::fs::PermissionsExt;
+    use sha2::{Digest, Sha256};
+    use std::ffi::OsString;
+    use std::os::unix::{ffi::OsStringExt, fs::PermissionsExt};
 
     fn job(work: InFlight) -> UpdateJob {
         UpdateJob {
@@ -199,7 +209,12 @@ mod tests {
             in_flight: vec![work.clone()],
             ..Census::default()
         };
-        let legacy = serde_json::to_vec(&census).unwrap();
+        // The previous launcher's census shape and field order. Its Ready
+        // return fingerprint hashes this census as part of the reservation.
+        let legacy = format!(
+            r#"{{"terminals":[],"chats":[],"snapshots":[],"aliases":[],"presentations":[],"in_flight":[{{"id":"{id}","queued":["q"]}}]}}"#
+        );
+        let legacy_digest = Sha256::digest(legacy.as_bytes());
         let mut capture = Capture::new();
         capture.observe(&work, &snapshot);
 
@@ -216,7 +231,9 @@ mod tests {
         assert_eq!(job.in_flight[0].resume.queued_text[0].text, private);
         assert!(!format!("{job:?}").contains("and then push"));
         assert_eq!(serde_json::to_vec(&job).unwrap(), before);
-        assert_eq!(serde_json::to_vec(&census).unwrap(), legacy);
+        let wire_census = serde_json::to_vec(&census).unwrap();
+        assert_eq!(wire_census, legacy.as_bytes());
+        assert_eq!(Sha256::digest(&wire_census), legacy_digest);
         assert_eq!(
             serde_json::to_value(&census).unwrap()["in_flight"],
             serde_json::json!([{ "id": id, "queued": ["q"] }]),
@@ -240,8 +257,6 @@ mod tests {
             ..Snapshot::default()
         };
         let work = InFlight::observe(TerminalId::new(), Provider::Claude, &snapshot);
-        let mut superseding = job(work.clone());
-        superseding.phase = UpdatePhase::Starting;
         let mut failed = job(work.clone());
         failed.phase = UpdatePhase::Failed;
         let capture = || {
@@ -259,11 +274,43 @@ mod tests {
             "keep my request"
         );
 
+        let write_interrupted_capture = || {
+            use std::io::Write;
+            let mut file = super::super::private_create(&state.join(TEMPORARY)).unwrap();
+            file.write_all(b"interrupted capture").unwrap();
+        };
+
+        write_interrupted_capture();
         Capture::new().save(state, &failed.id).unwrap();
         assert!(!state.join(FILE).exists());
-        capture();
-        super::super::write_job(state, &superseding).unwrap();
-        assert!(!state.join(FILE).exists());
+        assert!(!state.join(TEMPORARY).exists());
+
+        for phase in [UpdatePhase::Starting, UpdatePhase::Installing] {
+            super::super::write_job(state, &failed).unwrap();
+            capture();
+            write_interrupted_capture();
+            let mut superseding = job(work.clone());
+            superseding.phase = phase;
+            // Serializing a non-UTF-8 path fails before replacing status.json.
+            superseding.log_path = OsString::from_vec(vec![0xff]).into();
+            assert!(super::super::write_new_job(state, &superseding).is_err());
+            let mut current = super::super::read_job(state).unwrap().unwrap();
+            assert_eq!(current.id, failed.id);
+            enrich(state, &mut current);
+            assert_eq!(
+                current.in_flight[0].resume.queued_text[0].text,
+                "keep my request"
+            );
+
+            superseding.log_path = state.join("superseding.log");
+            super::super::write_new_job(state, &superseding).unwrap();
+            assert!(!state.join(FILE).exists());
+            assert!(!state.join(TEMPORARY).exists());
+            assert_eq!(
+                super::super::read_job(state).unwrap().unwrap().id,
+                superseding.id
+            );
+        }
     }
 
     #[test]
