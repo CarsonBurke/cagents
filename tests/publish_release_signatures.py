@@ -507,6 +507,18 @@ class PublisherSignatures(unittest.TestCase):
         result = self.promote("0.2.5", digest)
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_an_asset_uploaded_again_while_publishing_keeps_the_draft(self):
+        release = self.drafted()
+        swap = self.directory / "github/swap-after-download/v0.2.5"
+        swap.parent.mkdir(parents=True)
+        swap.write_text("install.sh\n")
+        state = self.directory / "github/releases/v0.2.5/release.json"
+        self.assertRefused(self.publish("0.2.5", release), "the draft of v0.2.5 changed while it was verified")
+        self.assertIn('"draft": true', state.read_text())
+        result = self.publish("0.2.5", release)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('"draft": false', state.read_text())
+
     def test_publication_never_puts_a_release_above_a_newer_one(self):
         self.published("0.2.3", self.bundle("0.2.3", ["old"]), {})
         bridge = self.bundle("0.2.4", ["old"])
@@ -587,6 +599,13 @@ class PublisherSignatures(unittest.TestCase):
                         "--dir", str(dist), "--version", version, "--source-commit", commit, "--protocol", "9"],
                        check=True, capture_output=True, timeout=HANG_GUARD)
         self.sign(dist, signers)
+
+    def test_archive_validation_ignores_user_tar_options(self):
+        bridge = self.bridges(release_metadata=self.bundle("0.2.4", ["old"]))
+        candidate = self.bundle("0.2.5", ["new"])
+        self.environment["TAR_OPTIONS"] = "--quoting-style=shell-always"
+        result = self.verify("0.2.5", candidate, "--bridge", str(bridge))
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_a_signature_file_holds_only_signatures(self):
         dist = self.bundle("0.2.5", ["new"])

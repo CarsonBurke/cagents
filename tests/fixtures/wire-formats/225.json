@@ -731,10 +731,6 @@
         [
           "Unknown",
           "Unit"
-        ],
-        [
-          "CagentsManaged",
-          "Unit"
         ]
       ]
     },
@@ -5018,6 +5014,17 @@
         [
           "SendQueuedNow",
           "Unit"
+        ],
+        [
+          "Seek",
+          {
+            "Struct": [
+              [
+                "index",
+                "U64"
+              ]
+            ]
+          }
         ]
       ]
     },
@@ -5397,6 +5404,24 @@
         [
           "offset",
           "U64"
+        ]
+      ]
+    },
+    "cagents::chat::HistoryExtent": {
+      "Struct": [
+        [
+          "before",
+          "U64"
+        ],
+        [
+          "after",
+          "U64"
+        ],
+        [
+          "unfetched",
+          {
+            "Option": "U64"
+          }
         ]
       ]
     },
@@ -6523,6 +6548,12 @@
                 "U64"
               ]
             }
+          }
+        ],
+        [
+          "history",
+          {
+            "Container": "cagents::chat::HistoryExtent"
           }
         ]
       ]
@@ -10551,32 +10582,6 @@
         [
           "WatchDeviceStats",
           "Unit"
-        ],
-        [
-          "ProviderUpdate",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
-        ],
-        [
-          "ProviderManage",
-          {
-            "Struct": [
-              [
-                "provider",
-                {
-                  "Container": "cagents::agent::Provider"
-                }
-              ]
-            ]
-          }
         ]
       ]
     },

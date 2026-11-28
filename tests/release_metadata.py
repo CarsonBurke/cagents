@@ -5,10 +5,12 @@ import importlib.machinery
 import importlib.util
 import json
 import os
+import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parent.parent / "scripts" / "release-metadata"
 loader = importlib.machinery.SourceFileLoader("release_metadata", str(SCRIPT))
@@ -249,6 +251,85 @@ class ReleaseMetadata(unittest.TestCase):
         result = run("feed", "--dir", str(bridge), "--feed", str(self.root / "other"),
                      "--bridge", str(self.release), check=False)
         self.assertIn("not older than", result.stderr)
+
+    def test_feed_retry_advances_latest_without_replacing_the_tagged_release(self):
+        older = self.root / "older"
+        older.mkdir()
+        for name in (ARCHIVE.replace(VERSION, "1.2.2"), "install.sh", "SHA256SUMS"):
+            (older / name).write_bytes(b"old")
+        run("write", "--dir", str(older), "--version", "1.2.2", "--source-commit", COMMIT, "--protocol", "196")
+        (older / metadata.SIGNATURE).write_text("old signature")
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("new signature")
+        for legacy in (False, True):
+            with self.subTest(legacy=legacy):
+                feed = self.root / str(legacy)
+                run("feed", "--dir", str(older), "--feed", str(feed))
+                latest = feed / "latest/download"
+                if legacy and latest.is_symlink():
+                    tagged_old = latest.resolve()
+                    latest.unlink()
+                    latest.mkdir()
+                    for path in tagged_old.glob("release-metadata*"):
+                        shutil.copyfile(path, latest / path.name)
+                tagged = feed / f"download/v{VERSION}"
+                fail_next_move = True
+
+                def fail_before_selection(move):
+                    def interrupted(source, destination):
+                        nonlocal fail_next_move
+                        if fail_next_move and destination == latest:
+                            fail_next_move = False
+                            raise OSError("fixture interrupted latest selection")
+                        return move(source, destination)
+                    return interrupted
+
+                with (patch.object(Path, "rename", fail_before_selection(Path.rename)),
+                      patch.object(Path, "replace", fail_before_selection(Path.replace)),
+                      self.assertRaisesRegex(OSError, "interrupted latest")):
+                    metadata.feed(self.release, feed, 2, None)
+
+                inode = tagged.stat().st_ino
+                self.assertEqual((tagged / ARCHIVE).read_bytes(), b"archive")
+                old_latest = (latest / metadata.METADATA).read_bytes() if latest.is_dir() else None
+                result = run("feed", "--dir", str(self.release), "--feed", str(feed), check=False)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(tagged.stat().st_ino, inode)
+                self.assertEqual(old_latest, (older / metadata.METADATA).read_bytes())
+                self.assertEqual((latest / metadata.METADATA).read_bytes(),
+                                 (self.release / metadata.METADATA).read_bytes())
+
+    def test_feed_retry_repairs_missing_latest_only_for_a_matching_tagged_release(self):
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("signature")
+        feed = self.root / "feed"
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        latest = feed / "latest/download"
+        if latest.is_symlink():
+            latest.unlink()
+        else:
+            shutil.rmtree(latest)
+        tagged_archive = feed / f"download/v{VERSION}" / ARCHIVE
+        tagged_archive.write_bytes(b"different archive")
+        refused = run("feed", "--dir", str(self.release), "--feed", str(feed), check=False)
+        self.assertIn("never replaces", refused.stderr)
+        self.assertEqual(tagged_archive.read_bytes(), b"different archive")
+        self.assertFalse(latest.exists())
+        tagged_archive.write_bytes(b"archive")
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        self.assertEqual((latest / metadata.METADATA).read_bytes(), (self.release / metadata.METADATA).read_bytes())
+
+    def test_feed_supports_a_latest_directory_reached_by_symlink(self):
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("signature")
+        feed = self.root / "feed"
+        feed.mkdir()
+        latest = self.root / "elsewhere/latest"
+        latest.mkdir(parents=True)
+        (feed / "latest").symlink_to(latest, target_is_directory=True)
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        self.assertEqual((latest / "download" / metadata.METADATA).read_bytes(),
+                         (self.release / metadata.METADATA).read_bytes())
 
     def test_feed_refuses_unsigned_metadata(self):
         self.write()
