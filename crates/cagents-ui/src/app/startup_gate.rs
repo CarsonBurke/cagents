@@ -1264,6 +1264,7 @@ impl Cagents {
             return false;
         }
         self.startup_gate.rechecked_job = None;
+        self.startup_gate.retained = false;
         if self.notice_stands(NoticeKey::StartupRecovery) {
             self.startup_gate.reported_notice = None;
             self.resolve_notice(NoticeKey::StartupRecovery);

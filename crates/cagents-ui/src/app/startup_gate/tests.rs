@@ -711,8 +711,6 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     let startup = app.status.take().unwrap();
     assert_eq!(startup.key, Some(NoticeKey::StartupRecovery));
     app.notices.record(startup);
-    let pane_note = TransientNotice::warning("A pane still needs attention.");
-    app.notices.record(pane_note.clone());
     let job_id = uuid::Uuid::new_v4();
     let mut job = crate::update::UpdateJob {
         id: job_id.to_string(),
@@ -744,9 +742,16 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     let (check, answer) = request();
     assert_eq!(app.recheck_startup(check).units(), 0);
     assert!(answer.try_recv().unwrap().starts_with("error: "));
-    assert!(app.card_state(cards[0]).is_some());
+    let card = cards[0];
+    let CardKind::Terminal(terminal) = &app.card_state(card).unwrap().kind else {
+        panic!("the saved terminal changed kind");
+    };
+    let pane_failure = "the saved terminal holder did not answer";
+    app.startup_attach_failed(card, terminal.id, pane_failure.into());
+    app.startup_gate.retries.expire_window();
+    assert!(app.startup_terminal_gave_up(card));
+    assert_eq!(app.startup_gave_up_caption(card), RETAINED_TERMINAL_CAPTION);
 
-    end_terminals(&mut app, &cards);
     let (check, answer) = request();
     let save = app.recheck_startup(check);
     assert!(
@@ -758,18 +763,28 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     };
     assert!(settings.is_ok() && saved.is_ok());
     app.finish_startup_recheck(check, settings, saved);
-    assert_eq!(answer.try_recv().unwrap(), instance::UI_LAUNCH_READY);
-    assert!(app.card_state(cards[0]).is_some());
+    let report = answer.try_recv().unwrap();
+    assert!(report.starts_with("ready-with-pane-notes: "), "{report}");
+    assert!(report.contains(pane_failure), "{report}");
+    let pane_note = app.status.take().unwrap();
+    app.notices.record(pane_note.clone());
+    assert!(app.card_state(card).is_some());
     assert!(app.startup_gate.reported);
     assert!(app.notices.has(NoticeKey::StartupRecovery));
     assert!(!app.resolve_startup_recheck(&uuid::Uuid::new_v4().to_string()));
     assert!(app.notices.has(NoticeKey::StartupRecovery));
+    assert_eq!(app.startup_gave_up_caption(card), RETAINED_TERMINAL_CAPTION);
 
     job.phase = crate::update::UpdatePhase::Complete;
     job.message = "Update installed; saved windows reopened after retry".into();
     drop(app.update(poll(Some(job.id.clone()), job)));
     assert!(!app.notices.has(NoticeKey::StartupRecovery));
     assert!(!app.notices.has(verification));
+    assert!(app.startup_terminal_gave_up(card));
+    assert_eq!(
+        app.startup_gave_up_caption(card),
+        unavailable_terminal_caption(Some(pane_failure))
+    );
     assert!(app.notices.recent().any(|entry| entry.notice == pane_note));
     assert!(
         app.notices
