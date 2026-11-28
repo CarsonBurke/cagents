@@ -294,6 +294,18 @@ class ReleaseMetadata(unittest.TestCase):
         run("feed", "--dir", str(self.release), "--feed", str(feed))
         self.assertEqual((latest / metadata.METADATA).read_bytes(), (self.release / metadata.METADATA).read_bytes())
 
+    def test_feed_supports_a_latest_directory_reached_by_symlink(self):
+        self.write()
+        (self.release / metadata.SIGNATURE).write_text("signature")
+        feed = self.root / "feed"
+        feed.mkdir()
+        latest = self.root / "elsewhere/latest"
+        latest.mkdir(parents=True)
+        (feed / "latest").symlink_to(latest, target_is_directory=True)
+        run("feed", "--dir", str(self.release), "--feed", str(feed))
+        self.assertEqual((latest / "download" / metadata.METADATA).read_bytes(),
+                         (self.release / metadata.METADATA).read_bytes())
+
     def test_feed_refuses_unsigned_metadata(self):
         self.write()
         result = run("feed", "--dir", str(self.release), "--feed", str(self.root / "feed"), check=False)

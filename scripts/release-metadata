@@ -284,12 +284,12 @@ def feed(directory: Path, destination: Path, generation: int, bridge: Path | Non
     downloads = destination / "download"
     release = downloads / f"v{version}"
     latest = destination / "latest/download"
-    target = Path(os.path.relpath(release, latest.parent))
     files = {path.name: path for path in payloads(directory)} | published_names
     downloads.mkdir(parents=True, exist_ok=True)
     lock = os.open(downloads / ".feed.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(lock, "rb+") as lock_file:
         fcntl.flock(lock_file, fcntl.LOCK_EX)
+        target = Path(os.path.relpath(downloads.resolve() / release.name, latest.parent.resolve()))
         newest = max(
             (path.name[1:] for path in downloads.iterdir() if path.name.startswith("v")
              and VERSION.fullmatch(path.name[1:]) and not path.is_symlink() and path.is_dir()),
