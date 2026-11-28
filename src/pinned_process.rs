@@ -667,6 +667,48 @@ fn ready(descriptor: BorrowedFd<'_>, timeout: Duration) -> io::Result<bool> {
     Ok(poll.revents & (libc::POLLIN | libc::POLLHUP) != 0)
 }
 
+/// A Darwin ancestry observation for a process outside the account. It is
+/// pinned to an exit event and can read public process metadata. It cannot
+/// authorize acting on a process or replace a pin for a same-account ancestor.
+#[cfg(all(target_os = "macos", feature = "host"))]
+pub(crate) struct ForeignAncestor {
+    pid: u32,
+    account: u32,
+    watch: OwnedFd,
+}
+
+#[cfg(all(target_os = "macos", feature = "host"))]
+impl ForeignAncestor {
+    pub(crate) fn open(pid: u32, account: u32) -> io::Result<Self> {
+        let ancestor = Self {
+            pid,
+            account,
+            watch: imp::watch_exit(pid)?,
+        };
+        ancestor.parent_pid()?;
+        Ok(ancestor)
+    }
+
+    pub(crate) fn parent_pid(&self) -> io::Result<u32> {
+        let info = imp::short_bsd_info(self.pid)?;
+        // A setuid process belonging to this account still needs the ordinary
+        // ancestry inspection. A different UID is proved by the kernel.
+        if info.pbsi_uid == self.account
+            || info.pbsi_ruid == self.account
+            || info.pbsi_svuid == self.account
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        if info.pbsi_pid != self.pid
+            || info.pbsi_status == libc::SZOMB
+            || ready(self.watch.as_fd(), Duration::ZERO)?
+        {
+            return Err(io::ErrorKind::NotFound.into());
+        }
+        Ok(info.pbsi_ppid)
+    }
+}
+
 /// The pids of `pid`'s children, zombies included.
 ///
 /// # Errors
@@ -963,6 +1005,39 @@ mod imp {
         Ok(info)
     }
 
+    #[cfg(feature = "host")]
+    pub(super) fn short_bsd_info(pid: u32) -> io::Result<libc::proc_bsdshortinfo> {
+        // SAFETY: the output record contains only scalar fields and bytes.
+        let mut info: libc::proc_bsdshortinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of_val(&info) as libc::c_int;
+        // SAFETY: this flavor writes at most size bytes to the exact record.
+        let written = unsafe {
+            *libc::__error() = 0;
+            libc::proc_pidinfo(
+                pid as libc::c_int,
+                libc::PROC_PIDT_SHORTBSDINFO,
+                0,
+                (&raw mut info).cast(),
+                size,
+            )
+        };
+        if written == size {
+            return Ok(info);
+        }
+        if written <= 0 {
+            let error = io::Error::last_os_error();
+            return Err(if error.raw_os_error() == Some(0) {
+                io::ErrorKind::NotFound.into()
+            } else {
+                vanished(error)
+            });
+        }
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the kernel returned a short process record",
+        ))
+    }
+
     pub(super) fn start_of(pid: u32) -> io::Result<Start> {
         let pid =
             libc::c_int::try_from(pid).map_err(|_| io::Error::from(io::ErrorKind::NotFound))?;
@@ -1113,6 +1188,19 @@ mod imp {
         // kqueue descriptors are not inherited across fork, but mark it
         // close-on-exec as well so no exec'd child sees it.
         crate::descriptor::set_close_on_exec(watch.as_fd())?;
+        Ok(watch)
+    }
+
+    #[cfg(feature = "host")]
+    pub(super) fn watch_exit(pid: u32) -> io::Result<OwnedFd> {
+        let watch = queue()?;
+        register(
+            &watch,
+            pid as libc::uintptr_t,
+            libc::EVFILT_PROC,
+            libc::NOTE_EXIT,
+        )
+        .map_err(vanished)?;
         Ok(watch)
     }
 
