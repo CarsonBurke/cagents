@@ -1222,7 +1222,7 @@ pub(super) fn restore_pass(
     ) else {
         return false;
     };
-    let registry = match store.load() {
+    let registry = match store.load_for_restore(&homes) {
         Ok(registry) if !registry.is_newer() => registry,
         Ok(_) => return host.strong_count() > 0,
         Err(error) => {
@@ -1231,24 +1231,13 @@ pub(super) fn restore_pass(
         }
     };
     for (provider, key, _) in homes.unregistered(&registry) {
-        if sweep.defers((provider, key)) {
+        if registry.is_released(key) {
+            // The marker is still missing. Keep excluding this home even
+            // if the list disappears before backfill can mark it.
+            sweep.examined.insert((provider, key));
             continue;
         }
-        if registry.is_released(key) {
-            // Released before releases were marked beside their homes, or its
-            // marker could not be written then. The list never forgets a
-            // release whose home is kept, so record it where it survives the
-            // list's loss. A home whose marker cannot be written is retried
-            // by the next daemon.
-            if let Err(error) = homes.mark_released(provider, key) {
-                sweep.examined.insert((provider, key));
-                tracing::warn!(
-                    provider = provider.executable(),
-                    %key,
-                    %error,
-                    "could not mark a released sign-in's home"
-                );
-            }
+        if sweep.defers((provider, key)) {
             continue;
         }
         let operation = crate::account::remote::Operation::Restore { provider, key };
