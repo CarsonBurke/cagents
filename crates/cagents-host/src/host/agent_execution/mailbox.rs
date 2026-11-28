@@ -195,7 +195,7 @@ pub(super) fn with_control<T>(host: &SharedHost, work: impl FnOnce() -> T) -> Op
 }
 
 /// Check under control admission before claiming or starting provider work.
-pub(super) fn defers_for_update(host: &SharedHost) -> bool {
+pub(in crate::host) fn defers_for_update(host: &SharedHost) -> bool {
     let courier = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())

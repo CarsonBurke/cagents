@@ -63,10 +63,6 @@ impl Drop for CloseFixtureChat<'_> {
 #[cfg(target_os = "linux")]
 #[test]
 fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
-    use crate::daemon::PinnedProcess;
-    use crate::terminal_ipc::{ClientRequest, ServerResponse};
-    use crate::update::impact::{Disposition, Policy, SessionCause};
-
     let (provider_alive, durable) = match std::env::var(MODE).as_deref() {
         Ok("lost-holder-live") => (true, false),
         Ok("lost-durable-holder-live") => (true, true),
@@ -81,8 +77,36 @@ fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
             return;
         }
     };
+    lost_codex_holder_fixture(provider_alive, durable, LostHolderObserver::UpdateImpact);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn session_inventory_settles_lost_codex_holder_after_observed_provider_exit() {
+    if std::env::var(MODE).as_deref() != Ok("lost-holder-inventory") {
+        let test = thread::current().name().unwrap().to_owned();
+        run_isolated(&test, "lost-holder-inventory");
+        return;
+    }
+    lost_codex_holder_fixture(true, false, LostHolderObserver::SessionInventory);
+}
+
+#[cfg(target_os = "linux")]
+enum LostHolderObserver {
+    UpdateImpact,
+    SessionInventory,
+}
+
+#[cfg(target_os = "linux")]
+fn lost_codex_holder_fixture(provider_alive: bool, durable: bool, observer: LostHolderObserver) {
+    use crate::agent_execution::{Authority, Operation, Reply, directory::Scope};
+    use crate::daemon::PinnedProcess;
+    use crate::terminal_ipc::{ClientRequest, ServerResponse};
+    use crate::update::impact::{Disposition, Policy, SessionCause};
+
+    let inventory_only = matches!(observer, LostHolderObserver::SessionInventory);
     // The isolated test owns the orphan's wait and holds the zombie until
-    // after impact has been reviewed.
+    // after the daemon has published its exit.
     assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
     let root = PathBuf::from(std::env::var_os("CAGENTS_UPGRADE_ROOT").unwrap());
     let program = install_provider(&root);
@@ -95,6 +119,13 @@ fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
     let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
     let host = Arc::new(HostLock::new(HostState::new(proof.clone())));
     host.lock().unwrap().register_client(0);
+    if inventory_only {
+        assert!(
+            host.lock().unwrap().install_model(
+                crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap()
+            )
+        );
+    }
     let mut source = provider_session(&root, &program, &proof);
     if !durable {
         source
@@ -152,6 +183,29 @@ fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
         }
     }
     let provider = Orphan(provider, record.root.pid);
+    let inventory = || {
+        let (response, _, _) = super::super::client::process_request(
+            &host,
+            0,
+            ClientRequest::Agent {
+                authority: Authority::default(),
+                operation: Operation::Context {
+                    scope: Scope::All,
+                    standing: true,
+                },
+            },
+        )
+        .unwrap();
+        let ServerResponse::Agent(Reply::Context(context)) = response else {
+            panic!("unexpected sessions response: {response:?}");
+        };
+        context
+            .into_sessions()
+            .sessions
+            .into_iter()
+            .find(|member| member.session.id == chat_id)
+            .map(|member| member.exited)
+    };
     let review = || {
         let (response, _, _) = super::super::client::process_request(
             &host,
@@ -186,22 +240,61 @@ fn update_impact_settles_a_lost_codex_holder_only_after_the_provider_exits() {
             },
             "the chat worker did not stop after its socket closed",
         );
-        assert_eq!(
-            review(),
-            (Disposition::Blocked, SessionCause::UnsettledProvider)
-        );
+        if inventory_only {
+            assert_eq!(inventory(), Some(false));
+        } else {
+            assert_eq!(
+                review(),
+                (Disposition::Blocked, SessionCause::UnsettledProvider)
+            );
+        }
         assert!(!provider.0.exited().unwrap());
         assert_eq!(
             registry::execution_record(&socket).unwrap().as_ref(),
             Some(&record)
         );
     }
+    let lifecycle_wait = inventory_only.then(|| {
+        let mut lifecycle = super::super::lifecycle::Lifecycle::new();
+        wait_until(
+            || {
+                lifecycle.maintain(&host, true);
+                lifecycle.waiting_holders().len() == 1
+            },
+            "lifecycle did not watch the surviving provider",
+        );
+        let listener = std::os::unix::net::UnixListener::bind(root.join("wait.sock")).unwrap();
+        // Drain any worker wake already queued. The listener stays quiet.
+        crate::daemon::wait_for_activity_until(&listener, Some(Instant::now()), &[]).unwrap();
+        (lifecycle, listener)
+    });
     assert!(provider.0.signal(libc::SIGKILL).unwrap());
-    wait_until(|| provider.0.exited().unwrap(), "the provider did not exit");
-    wait_until(
-        || review() == (Disposition::Resumes, SessionCause::ProviderEnded),
-        "update impact never settled the exact exited provider",
-    );
+    if let Some((mut lifecycle, listener)) = lifecycle_wait {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        crate::daemon::wait_for_activity_until(
+            &listener,
+            Some(deadline),
+            lifecycle.waiting_holders(),
+        )
+        .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "provider exit did not wake lifecycle"
+        );
+        assert!(provider.0.exited().unwrap());
+        lifecycle.maintain(&host, true);
+        assert_ne!(
+            inventory(),
+            Some(false),
+            "session inventory still lists the exact exited provider as live"
+        );
+    } else {
+        wait_until(|| provider.0.exited().unwrap(), "the provider did not exit");
+        wait_until(
+            || review() == (Disposition::Resumes, SessionCause::ProviderEnded),
+            "update impact never settled the exact exited provider",
+        );
+    }
     assert!(handle.is_completed());
     assert_eq!(handle.native_continuity(), NativeContinuity::ReconnectOnly);
     assert_eq!(

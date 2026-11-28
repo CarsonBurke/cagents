@@ -305,13 +305,15 @@ impl Holder {
     }
 
     #[cfg(target_os = "linux")]
-    pub(in crate::chat) fn retire_after_transport_loss(&mut self) -> Result<bool, String> {
-        if !self.identity.retire_after_transport_loss()? {
-            return Ok(false);
+    pub(in crate::chat) fn retire_after_transport_loss(
+        &mut self,
+    ) -> Result<super::NativeExit, String> {
+        let exit = self.identity.retire_after_transport_loss()?;
+        if matches!(exit, super::NativeExit::Exited) {
+            self.control.take();
+            self.release_on_drop = false;
         }
-        self.control.take();
-        self.release_on_drop = false;
-        Ok(true)
+        Ok(exit)
     }
 
     pub fn is_durable(&self) -> bool {
@@ -528,7 +530,10 @@ impl Holder {
         if !self.identity.receipt(retain, detached)? {
             #[cfg(target_os = "linux")]
             let abandoned = if self.identity.server_process.is_some() {
-                self.retire_after_transport_loss()?
+                matches!(
+                    self.retire_after_transport_loss()?,
+                    super::NativeExit::Exited
+                )
             } else {
                 self.identity.retire_exited()
             };

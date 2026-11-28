@@ -258,7 +258,7 @@ impl Handle {
         revision: u64,
         request: Uuid,
         confirmed: bool,
-    ) -> Result<Firing, String> {
+    ) -> Result<Firing, service::Error> {
         if !confirmed {
             return Err(
                 "Confirm this automation's target, account and permissions before running it"
@@ -275,6 +275,9 @@ impl Handle {
             return Ok(previous);
         }
         let host = self.0.host.upgrade().ok_or("The daemon is stopping")?;
+        if agent_execution::mailbox::defers_for_update(&host) {
+            return Err(service::Error::UpdateInProgress);
+        }
         let (automation, identity) = self
             .0
             .registry
@@ -304,6 +307,7 @@ impl Handle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .automation_firing(firing.id)
+            .map_err(Into::into)
     }
 
     fn claim_manual(
@@ -595,7 +599,12 @@ impl Handle {
         let Some(_control) = control.try_shared() else {
             return Ok(Some(Duration::from_millis(250)));
         };
-        if crate::host::client::ensure_control_open(host).is_err() {
+        if crate::host::client::ensure_control_open(host).is_err()
+            || agent_execution::mailbox::defers_for_update(host)
+        {
+            // The updater takes the launch fence before draining control
+            // admission. Leave scheduled claims, slot retries and precheck
+            // receipts pending until it releases that fence.
             return Ok(Some(Duration::from_millis(250)));
         }
         let now = service::now()?;

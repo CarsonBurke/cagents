@@ -687,6 +687,66 @@ fn explicit_recovery_uses_exact_census_bytes_with_unknown_fields() {
     assert!(validate_request_origin(&received, &request).is_err());
 }
 
+fn census_with_extension(census: &StoredCensus, counter: u32) -> StoredCensus {
+    let original = serde_json::to_string(census).unwrap();
+    serde_json::from_str(&format!(
+        r#"{{"future_field": {{"counter": {counter}}}, {}"#,
+        &original[1..]
+    ))
+    .unwrap()
+}
+
+#[test]
+fn acknowledged_and_ready_authority_bind_the_exact_stored_census() {
+    let root = crate::test_fixture::tempdir().unwrap();
+    let mut preparation = preparation(root.path());
+    let census = preparation.authority.census.clone();
+    preparation.authority.census = census_with_extension(&census, 1);
+    let checkpoint = checkpoint(&preparation, "Prepared");
+    preparation
+        .bind_acknowledged_checkpoint(&checkpoint)
+        .unwrap();
+    let authority = &preparation.authority;
+    assert!(validate_acknowledged_capture(authority).unwrap().is_some());
+    assert!(authority.same_evidence(authority));
+
+    let mut changed = authority.clone();
+    changed.census = census_with_extension(&census, 2);
+    assert_eq!(
+        changed.census, authority.census,
+        "the decoded roster is identical"
+    );
+    assert_eq!(
+        (
+            validate_acknowledged_capture(&changed).is_err(),
+            authority.same_evidence(&changed),
+        ),
+        (true, false)
+    );
+}
+
+#[test]
+fn verified_successor_binds_the_exact_stored_census() {
+    let files = settled_files();
+    let verify = |census: &StoredCensus| {
+        read_verified_record_identity(
+            &files.checkpoint,
+            &files.record.checkpoint_hash,
+            &files.record.source,
+            census,
+            &files.target,
+            None,
+            Some(&files.record.target_hash),
+            files.record.successor.as_ref().unwrap(),
+        )
+    };
+    let original = &files.record.census;
+    let changed = census_with_extension(original, 1);
+    assert_eq!(&changed, original, "the decoded roster is identical");
+    assert!(verify(original).is_ok());
+    assert!(verify(&changed).is_err());
+}
+
 #[test]
 #[cfg_attr(
     not(target_os = "linux"),
@@ -2779,7 +2839,7 @@ fn settled_prepared_is_read_only_history_without_active_update_authority() {
             .unwrap()
             .unwrap();
         assert_eq!(classified.source, record.source);
-        assert_eq!(classified.census, *record.census);
+        assert!(classified.census.same_bytes(&record.census).unwrap());
         assert_eq!(classified.paused_terminals, record.paused_terminals);
         assert!(classified.paused_chats.is_empty());
         assert_eq!(

@@ -1,4 +1,6 @@
 //! Daemon-owned, non-PTY provider actor. Detaching never stops its transport.
+#[cfg(target_os = "linux")]
+use super::native_holder::NativeExit;
 use super::{
     AgentAddress, Command, Event, Item, ItemContent, Phase, Snapshot, Subagent, ToolStatus,
     protocol::{Adapter, HeldStop, MetadataWake, ProcessSpec, SetupError, Step, TransportSpec},
@@ -41,7 +43,7 @@ pub use handle::RetainedInputOutcome;
 pub use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub use retained_actor::execution_exit::codex_abandoned as codex_execution_abandoned;
 #[cfg(target_os = "linux")]
-pub(super) use retained_actor::execution_exit::native_holder_abandoned;
+pub(super) use retained_actor::execution_exit::native_holder_exit;
 #[cfg(any(test, feature = "test-support"))]
 pub use retained_actor::journal::ContinuityLoss;
 pub use retained_actor::journal::OutboxEntry;
@@ -486,6 +488,8 @@ struct Inner {
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
+    #[cfg(target_os = "linux")]
+    native_exit_pending: Arc<AtomicBool>,
     history_only: bool,
     provider_process: Arc<Mutex<Option<crate::daemon::holder_registry::Process>>>,
     /// Milliseconds a launched server spent blocked behind another process's
@@ -780,6 +784,8 @@ impl LocalHandle {
         };
         let adopted_native = expected_native_peer.is_some();
         let native_installed = Arc::new(AtomicBool::new(false));
+        #[cfg(target_os = "linux")]
+        let native_exit_pending = Arc::new(AtomicBool::new(false));
         let provider_process = Arc::new(Mutex::new(None));
         let startup_lock_wait = Arc::new(AtomicU64::new(0));
         let startup_budget = StartupBudget::current();
@@ -864,6 +870,8 @@ impl LocalHandle {
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
+            #[cfg(target_os = "linux")]
+            native_exit_pending: native_exit_pending.clone(),
             history_only: matches!(spec.transport, TransportSpec::History),
             provider_process: provider_process.clone(),
             startup_lock_wait: startup_lock_wait.clone(),
@@ -1017,7 +1025,7 @@ impl LocalHandle {
                     && native_installed.load(Ordering::Acquire)
                     && !preserve_native.load(Ordering::Acquire)
                     && actor.native_holder.as_mut().is_some_and(|holder| {
-                        holder.retire_after_transport_loss().unwrap_or(false)
+                        matches!(holder.retire_after_transport_loss(), Ok(NativeExit::Exited))
                     });
                 #[cfg(target_os = "macos")]
                 let abandoned_holder = false;
@@ -1109,6 +1117,12 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                #[cfg(target_os = "linux")]
+                let deferred_native_exit = (preserve_holder || !native_closed)
+                    && !actor.stop.load(Ordering::Acquire)
+                    && !preserve_native.load(Ordering::Acquire);
+                #[cfg(target_os = "linux")]
+                native_exit_pending.store(deferred_native_exit, Ordering::Release);
                 actor.settle_compaction(if shared_websocket || preserve_holder || !direct_closed || !native_closed {
                     crate::agent_execution::CompactionOutcome::Unconfirmed(
                         "The connection to the original provider closed before compaction was confirmed".into(),
@@ -1174,6 +1188,10 @@ impl LocalHandle {
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
+                }
+                #[cfg(target_os = "linux")]
+                if deferred_native_exit {
+                    crate::daemon::wake();
                 }
             })
             .map_err(|e| e.to_string())?;
@@ -1913,20 +1931,29 @@ impl LocalHandle {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn settle_lost_native_owner(&self) {
-        if !self.0.native_installed.load(Ordering::Acquire)
-            || self.0.stop.load(Ordering::Acquire)
-            || self.0.preserve_native.load(Ordering::Acquire)
-        {
-            return;
+    pub(crate) fn native_exit_pending(&self) -> bool {
+        self.0.native_installed.load(Ordering::Acquire)
+            && self.0.native_exit_pending.load(Ordering::Acquire)
+            && !self.0.stop.load(Ordering::Acquire)
+            && !self.0.preserve_native.load(Ordering::Acquire)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn settle_lost_native_owner(&self) -> NativeExit {
+        if !self.native_exit_pending() {
+            return NativeExit::Unobservable;
         }
         // Keep explicit Close serialized with the retry and let the worker
-        // publish its own result first if it is still finalizing the exit.
+        // publish its own result first. The worker's wake can reach lifecycle
+        // maintenance before its thread has returned.
         let Ok(worker) = self.0.worker.try_lock() else {
-            return;
+            return NativeExit::Pending;
         };
+        if !self.native_exit_pending() {
+            return NativeExit::Unobservable;
+        }
         if !worker.as_ref().is_some_and(JoinHandle::is_finished) {
-            return;
+            return NativeExit::Pending;
         }
         let mut retained = self
             .0
@@ -1941,10 +1968,16 @@ impl LocalHandle {
         let settled = match (retained.as_mut(), detached.as_ref()) {
             (Some(holder), None) => holder.retire_after_transport_loss(),
             (None, Some(owner)) => owner.retire_after_transport_loss(),
-            _ => return,
+            _ => Ok(NativeExit::Unobservable),
         };
-        if !matches!(settled, Ok(true)) {
-            return;
+        match settled {
+            Ok(NativeExit::Exited) => {}
+            Ok(NativeExit::Unobservable) => {
+                self.0.native_exit_pending.store(false, Ordering::Release);
+                return NativeExit::Unobservable;
+            }
+            Ok(exit) => return exit,
+            Err(_) => return NativeExit::Pending,
         }
         retained.take();
         detached.take();
@@ -1957,6 +1990,7 @@ impl LocalHandle {
         // A provider that outlived its worker might have consumed its queue.
         // Do not recover the actor's last unconfirmed copy of that input.
         self.0.completed.store(true, Ordering::Release);
+        self.0.native_exit_pending.store(false, Ordering::Release);
         drop(detached);
         drop(retained);
         drop(worker);
@@ -1964,6 +1998,7 @@ impl LocalHandle {
         if self.0.visible.load(Ordering::Acquire) {
             (self.0.notify)(Update::Presentation);
         }
+        NativeExit::Exited
     }
 
     fn exited_recovery_queue(&self) -> Option<Arc<[super::QueuedMessage]>> {
@@ -2173,6 +2208,10 @@ impl LocalHandle {
     }
     pub(crate) fn commit_native_installation(&self) {
         self.0.native_installed.store(true, Ordering::Release);
+        #[cfg(target_os = "linux")]
+        if self.native_exit_pending() {
+            crate::daemon::wake();
+        }
     }
 
     pub(crate) fn native_continuity(&self) -> super::NativeContinuity {

@@ -802,11 +802,9 @@ fn start_prepared(asked: &Session, prepared: Session) -> Result<Session, String>
 /// Refuses new work while the daemon is closing or an update holds it back,
 /// as the courier's own starts are refused.
 fn open_for_work(host: &SharedHost) -> Result<(), String> {
-    const HELD: &str =
-        "The daemon is not starting new work now, as during an update; try again shortly";
-    crate::host::client::ensure_control_open(host).map_err(|_| HELD.to_owned())?;
+    crate::host::client::ensure_control_open(host).map_err(|_| super::NEW_WORK_HELD.to_owned())?;
     if mailbox::defers_for_update(host) {
-        return Err(HELD.into());
+        return Err(super::NEW_WORK_HELD.into());
     }
     Ok(())
 }

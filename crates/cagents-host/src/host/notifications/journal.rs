@@ -228,6 +228,28 @@ impl Journal {
         Self::open_reader(path)?.list()
     }
 
+    pub(super) fn latest_ordinal(&mut self) -> Result<i64, diesel::result::Error> {
+        notices::table
+            .select(diesel::dsl::max(notices::ordinal))
+            .first::<Option<i64>>(&mut self.0)
+            .map(Option::unwrap_or_default)
+    }
+
+    pub(super) fn unread_events_since(
+        &mut self,
+        after: i64,
+        through: i64,
+    ) -> Result<Vec<String>, diesel::result::Error> {
+        notices::table
+            .filter(notices::acknowledged.eq(false))
+            .filter(notices::ordinal.gt(after))
+            .filter(notices::ordinal.le(through))
+            .order(notices::ordinal.desc())
+            .select(notices::event)
+            .limit(MAX_SESSIONS)
+            .load(&mut self.0)
+    }
+
     pub fn remember_review_watch(&mut self, repository: &str, seconds: i64) -> Result<(), String> {
         diesel::sql_query(
             "INSERT INTO review_watches(repository,watched) VALUES (?1,?2)
