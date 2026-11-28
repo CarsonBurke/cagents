@@ -1774,20 +1774,28 @@ impl Cagents {
                             if self.startup_gate.reported_notice()
                                 != Some(failure.notice.message.as_str())
                             {
-                                self.status = Some(failure.notice);
+                                self.status = Some(
+                                    failure
+                                        .notice
+                                        .with_key(NoticeKey::UpdateVerification(job.id.clone())),
+                                );
                             }
-                        } else if job.phase == UpdatePhase::Complete
-                            && self.update_ui.job.as_ref().is_some_and(|shown| {
-                                shown.id == job.id && !shown.phase.is_terminal()
-                            })
-                        {
-                            self.notices.record(
-                                TransientNotice::success(format!(
-                                    "Updated to cagents {}",
-                                    job.version
-                                ))
-                                .with_details(job.message.clone()),
-                            );
+                        } else if job.phase == UpdatePhase::Complete {
+                            self.resolve_notice(NoticeKey::UpdateVerification(job.id.clone()));
+                            let rechecked = self.resolve_startup_recheck(&job.id);
+                            if rechecked
+                                || self.update_ui.job.as_ref().is_some_and(|shown| {
+                                    shown.id == job.id && shown.phase != UpdatePhase::Complete
+                                })
+                            {
+                                self.notices.record(
+                                    TransientNotice::success(format!(
+                                        "Updated to cagents {}",
+                                        job.version
+                                    ))
+                                    .with_details(job.message.clone()),
+                                );
+                            }
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.

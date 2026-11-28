@@ -362,6 +362,10 @@ enum NoticeKey {
     CloseWaiting(CardId),
     /// Putting the conversations that lost their connection back on it.
     ChatReattach,
+    /// A window whose first startup could not verify its recovered workspace.
+    StartupRecovery,
+    /// A job whose update could not be verified.
+    UpdateVerification(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19679,7 +19683,7 @@ impl Cagents {
             }
             Message::UiUpdate(request) => match request.action {
                 #[cfg(target_os = "linux")]
-                instance::UiUpdateAction::Recheck => self.recheck_startup(request),
+                instance::UiUpdateAction::Recheck(_) => self.recheck_startup(request),
                 instance::UiUpdateAction::Prepare => {
                     if self.update_prepared {
                         let _ = request

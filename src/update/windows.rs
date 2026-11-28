@@ -307,7 +307,7 @@ pub(crate) fn reopen(id: &str) -> Result<Option<String>, UpdateError> {
     let ui = selected.join("bin/cagents-ui");
     let launched = guard.relaunch_missing_windows_with_notes(&saved.slots, &ui);
     let guard = crate::instance::UiUpdateGuard::acquire_for_cutover()?;
-    let verified = guard.recheck_cutover_windows(&saved.slots, &ui);
+    let verified = guard.recheck_cutover_windows(&saved.slots, &ui, id);
     let notes = match (launched, verified) {
         (Ok(launched), Ok(verified)) => Some(
             launched
@@ -318,7 +318,12 @@ pub(crate) fn reopen(id: &str) -> Result<Option<String>, UpdateError> {
         )
         .filter(|notes| !notes.is_empty()),
         (Err(_), Ok(notes)) => notes,
-        (Err(error), Err(_)) | (Ok(_), Err(error)) => return Err(error.into()),
+        (Err(launch), Err(verify)) => {
+            return Err(invalid(format!(
+                "{launch}. The verification retry reported {verify}"
+            )));
+        }
+        (Ok(_), Err(error)) => return Err(error.into()),
     };
     if confirm_owner()? != serving {
         return Err(invalid(

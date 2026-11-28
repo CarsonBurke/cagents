@@ -708,11 +708,34 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     assert!(app.startup_gate.reported);
     assert_eq!(reported(&app), Some(RETAINED_NOTICE));
 
+    let startup = app.status.take().unwrap();
+    assert_eq!(startup.key, Some(NoticeKey::StartupRecovery));
+    app.notices.record(startup);
+    let pane_note = TransientNotice::warning("A pane still needs attention.");
+    app.notices.record(pane_note.clone());
+    let job_id = uuid::Uuid::new_v4();
+    let mut job = crate::update::UpdateJob {
+        id: job_id.to_string(),
+        version: "0.2.4".into(),
+        phase: crate::update::UpdatePhase::Failed,
+        message: "Original workspace verification failed.".into(),
+        log_path: directory.path().join("update.log"),
+        confirmation: None,
+        refusal: None,
+        in_flight: Vec::new(),
+        recorded_by: Some("0.2.4".into()),
+    };
+    let poll =
+        |expected, job| Message::UpdateUi(update_ui::Action::Polled(expected, Ok(Some(job))));
+    drop(app.update(poll(None, job.clone())));
+    let verification = NoticeKey::UpdateVerification(job.id.clone());
+    assert!(app.notices.has(verification.clone()));
+
     let request = || {
         let (response, receiver) = std::sync::mpsc::sync_channel(1);
         (
             instance::UiUpdateRequest {
-                action: instance::UiUpdateAction::Recheck,
+                action: instance::UiUpdateAction::Recheck(job_id),
                 response,
             },
             receiver,
@@ -738,6 +761,21 @@ fn window_retry_replies_from_the_current_workspace_after_an_incomplete_launch() 
     assert_eq!(answer.try_recv().unwrap(), instance::UI_LAUNCH_READY);
     assert!(app.card_state(cards[0]).is_some());
     assert!(app.startup_gate.reported);
+    assert!(app.notices.has(NoticeKey::StartupRecovery));
+    assert!(!app.resolve_startup_recheck(&uuid::Uuid::new_v4().to_string()));
+    assert!(app.notices.has(NoticeKey::StartupRecovery));
+
+    job.phase = crate::update::UpdatePhase::Complete;
+    job.message = "Update installed; saved windows reopened after retry".into();
+    drop(app.update(poll(Some(job.id.clone()), job)));
+    assert!(!app.notices.has(NoticeKey::StartupRecovery));
+    assert!(!app.notices.has(verification));
+    assert!(app.notices.recent().any(|entry| entry.notice == pane_note));
+    assert!(
+        app.notices
+            .recent()
+            .any(|entry| entry.notice.severity == NoticeSeverity::Success)
+    );
 }
 
 #[test]

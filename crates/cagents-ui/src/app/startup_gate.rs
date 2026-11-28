@@ -53,6 +53,8 @@ pub(super) struct State {
     /// What this window's report said, so a failed update's notice that only
     /// repeats it is not shown twice.
     reported_notice: Option<String>,
+    /// A durable current window proof awaiting the coordinator's completion.
+    rechecked_job: Option<uuid::Uuid>,
     /// Terminals the gate is waiting on without anything settling them.
     pub(super) retries: retries::Retries,
     /// Since when a view this window shows has not been admitted.
@@ -1245,8 +1247,28 @@ impl Cagents {
         self.startup_gate.reported = true;
         instance::finish_window_restore();
         self.startup_gate.reported_notice = Some(notice.message.clone());
-        self.status = Some(notice);
+        self.status = Some(if result.is_err() {
+            notice.with_key(NoticeKey::StartupRecovery)
+        } else {
+            notice
+        });
         report(result)
+    }
+
+    pub(super) fn resolve_startup_recheck(&mut self, job: &str) -> bool {
+        if !self
+            .startup_gate
+            .rechecked_job
+            .is_some_and(|id| uuid::Uuid::parse_str(job) == Ok(id))
+        {
+            return false;
+        }
+        self.startup_gate.rechecked_job = None;
+        if self.notice_stands(NoticeKey::StartupRecovery) {
+            self.startup_gate.reported_notice = None;
+            self.resolve_notice(NoticeKey::StartupRecovery);
+        }
+        true
     }
 
     // An earlier failure belongs to the first launch. Check the panes this
@@ -1277,6 +1299,14 @@ impl Cagents {
             .and(saved)
             .map_err(bounded_report)
             .and_then(|()| self.current_startup_verdict());
+        if result.is_ok()
+            && let instance::UiUpdateAction::Recheck(job) = request.action
+        {
+            self.startup_gate.rechecked_job = Some(job);
+            if let Ok(Some(notes)) = &result {
+                self.status = Some(incomplete_notice(notes));
+            }
+        }
         request.answer_recheck(
             result
                 .as_ref()
