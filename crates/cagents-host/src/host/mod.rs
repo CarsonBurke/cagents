@@ -32,6 +32,7 @@ mod notifications;
 #[cfg(all(test, target_os = "linux"))]
 mod provider_shutdown_tests;
 mod provider_status;
+mod provider_update;
 mod recovery_admission;
 mod service;
 #[cfg(all(test, target_os = "linux"))]
@@ -1034,7 +1035,9 @@ fn initialize_serving_host(
         }
     };
     if let Some(broker) = &notification_broker {
-        host.lock().unwrap_or_else(|p| p.into_inner()).notifications = Some(broker.handle());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.notifications = Some(broker.handle());
+        state.mobile_relay = broker.mobile_relay();
     }
     // Cache sweeps preserve unretired helper journals and live Store leases.
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
@@ -1472,6 +1475,17 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     }
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("starting automation broker", None);
+    let _provider_update_scheduler = if cfg!(test) || recovery_only {
+        None
+    } else {
+        match provider_update::Scheduler::start(Arc::downgrade(&host)) {
+            Ok(scheduler) => Some(scheduler),
+            Err(error) => {
+                tracing::warn!(%error, "scheduled provider updates are unavailable");
+                None
+            }
+        }
+    };
     let mut automation_broker = if recovery_only {
         None
     } else {

@@ -4,6 +4,7 @@
 //! where the daemon has no app bundle to post from, through `osascript`.
 mod batching;
 mod journal;
+pub(super) mod mobile_relay;
 pub(super) mod orphaned;
 #[cfg(target_os = "macos")]
 mod osascript;
@@ -838,6 +839,7 @@ pub(super) fn predecessor_sessions(
 
 pub(super) struct Broker {
     handle: Handle,
+    mobile_relay: Option<mobile_relay::Worker>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -869,14 +871,26 @@ impl Broker {
                     Ok(())
                 });
             })?;
+        let mobile_relay = match (crate::mobile::notify::settings_path(), journal_path()) {
+            (Some(settings), Some(journal)) => crate::mobile::pairing::AuthorizedKeys::of_user()
+                .and_then(|keys| mobile_relay::Worker::start(settings, journal, keys))
+                .map_err(|_| tracing::warn!("Mobile notification worker unavailable"))
+                .ok(),
+            _ => None,
+        };
         Ok(Self {
             handle,
+            mobile_relay,
             thread: Some(thread),
         })
     }
 
     pub fn handle(&self) -> Handle {
         self.handle.clone()
+    }
+
+    pub(super) fn mobile_relay(&self) -> Option<mobile_relay::Handle> {
+        self.mobile_relay.as_ref().map(mobile_relay::Worker::handle)
     }
 }
 

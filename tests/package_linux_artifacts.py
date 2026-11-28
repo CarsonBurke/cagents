@@ -108,6 +108,10 @@ if name in ('cagents', 'cagentsd'):
     variant = 'browserless' if '--no-default-features' in args else 'full'
 if name == 'cagents-ui':
     variant = 'full' if 'integrated-browser' in args else 'browserless'
+if '--timings' in args:
+    timings = Path(args[args.index('--target-dir') + 1]) / 'cargo-timings'
+    timings.mkdir(exist_ok=True)
+    (timings / 'cargo-timing.html').write_text(f'{variant} {name}\n')
 body += '# variant: ' + variant + '\n'
 body += '[ "$*" != "--version" ] || { printf "%s\\n" "' + name + ' ' + os.environ['VERSION'] + '"; exit 0; }\n'
 if name == 'cagents':
@@ -415,6 +419,27 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         self.assertIn("cannot inspect full UI dynamic symbols", result.stderr)
         self.assertEqual(len(self.builds()), 8)
         self.assertFalse(self.dist.exists())
+
+    def test_release_keeps_each_cargo_timing_outside_the_bundle(self):
+        timings = self.directory / "qualification-timings"
+        timings.mkdir()
+        result = self.package_release(CAGENTS_RELEASE_CARGO_TIMINGS_DIR=str(timings))
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.builds()), 8)
+        self.assertTrue(all("--timings" in args for args in self.builds()))
+        self.assertEqual({path.name: path.read_text().strip() for path in timings.iterdir()}, {
+            "full-cagents.html": "full cagents",
+            "full-cagentsd.html": "full cagentsd",
+            "full-cagents-ui.html": "full cagents-ui",
+            "full-cagents-dictate.html": "shared cagents-dictate",
+            "full-ceditor.html": "shared ceditor",
+            "browserless-cagents.html": "browserless cagents",
+            "browserless-cagentsd.html": "browserless cagentsd",
+            "browserless-cagents-ui.html": "browserless cagents-ui",
+        })
+        self.assertEqual(list(self.dist.glob("*.html")), [])
+        self.assertRegex(result.stdout, r"(?m)^full archive and Debian package took [0-9]+s$")
+        self.assertRegex(result.stdout, r"(?m)^browserless archive and Debian package took [0-9]+s$")
 
     def test_release_stops_the_overlapping_compressor_when_the_build_fails(self):
         ready = self.directory / "packaging-ready"

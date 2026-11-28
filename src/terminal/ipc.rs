@@ -388,6 +388,10 @@ use crate::{
 ///
 /// Version 226 adds exact Work card pins and a publication watermark for replies.
 ///
+/// Version 227 appends the mobile relay test request.
+///
+/// Version 228 adds manual provider CLI installation and update requests.
+///
 /// Version 229 appends registration and snapshots of live SSH mobile bridges.
 /// A presence observer receives the existing mobile invalidation for a new topic.
 pub const PROTOCOL_VERSION: u16 = 229;
@@ -978,6 +982,16 @@ pub enum ClientRequest {
     /// figure a window shows moves. The device is read only while some
     /// connection watches.
     WatchDeviceStats,
+    /// Ask the daemon mobile relay worker for a test notification.
+    SendTestMobileNotification,
+    /// Check and, if eligible, update the selected provider CLI on the daemon's computer.
+    ProviderUpdate {
+        provider: crate::agent::Provider,
+    },
+    /// Provision a daemon-managed installation of the selected provider CLI.
+    ProviderManage {
+        provider: crate::agent::Provider,
+    },
     /// Count this SSH mobile bridge until its control connection closes.
     RegisterMobileBridge(MobileBridgeEndpoints),
     /// Read local bridge presence, including the endpoints for an open popover.

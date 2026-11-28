@@ -583,6 +583,134 @@ print(json.dumps([[str(path) for path in pruner.default_roots()],
         self.assertFalse(leftover.exists())
         self.assertTrue(live.exists())
 
+    def incremental(self, target, crate, profile="debug", lock=True):
+        """A crate's incremental directory as rustc leaves it: a finalized
+        session beside its lock file."""
+        session = target / profile / "incremental" / crate / "s-h0abc1def-1x2y3z-0123456789abcdef"
+        session.mkdir(parents=True)
+        (target / profile / ".fingerprint").mkdir(exist_ok=True)
+        if lock:
+            (target / profile / ".cargo-lock").write_text("")
+        (session / "query-cache.bin").write_bytes(b"x" * 8192)
+        (session.parent / "s-h0abc1def-1x2y3z.lock").write_text("")
+        return session.parent
+
+    def test_stale_incremental_state_goes_from_a_build_directory_in_use(self):
+        target = self.target(self.roots / "repo/.worktrees/sentinel/target")
+        stale = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        triple = self.incremental(target / "x86_64-unknown-linux-gnu", "cagents-0bbbbbbbbbbbbbbb")
+        self.settle()
+        fresh = self.incremental(target, "cagents-0ccccccccccccccc")
+        output = self.prune()
+        self.assertTrue(target.exists())
+        self.assertTrue(fresh.exists())
+        self.assertTrue((target / "debug/deps/libcrate.rlib").exists())
+        for crate in (stale, triple):
+            self.assertFalse(crate.exists(), crate)
+            self.assertIn(f"removed {crate}", output)
+        self.assertEqual(len(self.log.read_text().splitlines()), 2)
+        self.assertIn("and 2 crates' stale incremental state", output)
+
+    def test_incremental_state_a_rustc_holds_stays(self):
+        target = self.target(self.roots / "lane/target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        with open(crate / "s-h0abc1def-1x2y3z.lock") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.settle()
+            (target / "debug/deps/fresh.rmeta").write_text("")
+            output = self.prune()
+        self.assertTrue(crate.exists())
+        self.assertIn(f"keep {crate}: a rustc compiles it", output)
+
+    def test_a_dry_run_keeps_stale_incremental_state(self):
+        target = self.target(self.roots / "lane/target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        output = self.prune(apply=False)
+        self.assertTrue(crate.exists())
+        self.assertIn(f"would remove {crate}", output)
+
+    def test_a_main_checkouts_incremental_state_waits_longer(self):
+        checkout = self.roots / "repo"
+        (checkout / ".git").mkdir(parents=True)
+        target = self.target(checkout / "target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        # Idle for twice IDLE, but not for MAIN_CHECKOUT_IDLE_FACTOR times it.
+        self.prune("--max-idle", str(1.5 / 86400))
+        self.assertTrue(crate.exists())
+
+    def test_incremental_state_beyond_the_budget_goes_oldest_first(self):
+        target = self.target(self.roots / "repo/.worktrees/sentinel/target")
+        oldest = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        time.sleep(1.1)
+        older = self.incremental(target, "cagents-0bbbbbbbbbbbbbbb")
+        time.sleep(1.1)
+        newest = self.incremental(target, "cagents-0ccccccccccccccc")
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        # Nothing is idle for an hour; one crate's state fills a byte's budget.
+        arguments = ("--max-idle", str(3600 / 86400), "--incremental-gib", str(1 / 2**30))
+        output = self.prune(*arguments, "--incremental-grace-hours", str(1 / 3600))
+        self.assertTrue(newest.exists())
+        for crate in (oldest, older):
+            self.assertFalse(crate.exists(), crate)
+            self.assertIn(f"removed {crate}", output)
+        self.assertIn("beyond the", output)
+
+    def test_recent_incremental_state_stays_beyond_the_budget(self):
+        target = self.target(self.roots / "lane/target")
+        crates = [self.incremental(target, f"cagents-0{letter * 15}") for letter in "abc"]
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        self.prune("--max-idle", str(3600 / 86400), "--incremental-gib", str(1 / 2**30))
+        for crate in crates:
+            self.assertTrue(crate.exists(), crate)
+
+    def test_incremental_state_stays_while_a_build_holds_its_profile(self):
+        target = self.target(self.roots / "lane/target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa")
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        with open(target / "debug/.cargo-lock") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            output = self.prune()
+        self.assertTrue(crate.exists())
+        self.assertIn(f"keep {crate}: a build holds its profile's lock", output)
+
+    def test_incremental_state_through_a_symlink_or_outside_a_profile_stays(self):
+        target = self.target(self.roots / "lane/target")
+        elsewhere = self.target(self.root / "elsewhere/target")
+        linked = self.incremental(elsewhere, "cagents-0aaaaaaaaaaaaaaa", profile="release")
+        (target / "release").symlink_to(elsewhere / "release")
+        # Cargo 1.100 keeps a package named `incremental` in a profile's build/.
+        package = target / "debug/build/incremental/0123456789abcdef"
+        (package / "fingerprint").mkdir(parents=True)
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        self.prune()
+        self.assertTrue(linked.exists())
+        self.assertTrue(package.exists())
+
+    def test_incremental_state_in_a_profile_without_a_build_lock_stays(self):
+        target = self.target(self.roots / "lane/target")
+        crate = self.incremental(target, "cagents-0aaaaaaaaaaaaaaa", profile="release", lock=False)
+        self.settle()
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        output = self.prune()
+        self.assertTrue(crate.exists())
+        self.assertIn(f"keep {crate}: its profile has no build lock", output)
+
+    def test_an_interrupted_incremental_removal_is_finished(self):
+        target = self.target(self.roots / "lane/target")
+        leftover = self.incremental(target, ".cagents-0aaaaaaaaaaaaaaa.cagents-pruned-999999999")
+        (target / "debug/deps/fresh.rmeta").write_text("")
+        output = self.prune("--max-idle", str(60 / 86400))
+        self.assertFalse(leftover.exists())
+        self.assertIn(f"removed {leftover}", output)
+
     def test_a_checkout_is_never_taken_for_build_output(self):
         # As a target directory configured to be the checkout would leave it.
         checkout = self.target(self.roots / "lane/checkout")

@@ -6170,7 +6170,7 @@ fn copy_and_disclosures_stay_with_their_row_across_separate_history_windows() {
 #[test]
 fn find_reveals_and_restores_only_the_matching_report_continuation() {
     let mut app = crate::app::tests::context_inspector_test_app(false);
-    let (card, target, handle) = history_fixture(&mut app);
+    let (_, target, handle) = history_fixture(&mut app);
     let report = |body: &str| {
         Arc::new(chat::Item {
             id: "report:native-part:1:delivery:131072-140000:0-0".into(),
@@ -15208,6 +15208,27 @@ fn a_fresh_claude_runtime_displays_the_selected_accounts_auto_default() {
         draft_permission_mode(&recipe, Provider::Claude).as_deref(),
         Some("auto")
     );
+}
+
+#[test]
+fn snapshot_installation_shares_unknown_permission_and_carries_a_known_preview() {
+    let (mut runtime, _handle) = view::prepared_runtime_for_test(&[]);
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = None;
+    let published = Arc::new(Snapshot {
+        generation: runtime.snapshot.generation + 1,
+        ready: true,
+        ..Snapshot::default()
+    });
+    runtime.install_snapshot(published.clone(), None);
+    assert!(
+        Arc::ptr_eq(&runtime.snapshot, &published),
+        "an unknown preview has no value to copy into the publication"
+    );
+
+    Arc::make_mut(&mut runtime.snapshot).permission_mode = Some("default".into());
+    runtime.install_snapshot(published.clone(), None);
+    assert_eq!(runtime.snapshot.permission_mode.as_deref(), Some("default"));
+    assert!(published.permission_mode.is_none());
 }
 
 #[test]

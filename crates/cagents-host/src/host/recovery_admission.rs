@@ -97,6 +97,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::WatchWork
         | R::WatchDeviceStats
         | R::WatchConversationPullRequests { .. }
@@ -189,6 +190,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::CompletePendingTerminal { .. }
         | R::RetryPendingTerminalSave { .. }
         | R::PrepareUpgrade { .. }
+        | R::ProviderUpdate { .. }
+        | R::ProviderManage { .. }
         | R::PrepareConfirmedUpgrade { .. }
         | R::ChatCapacitySet { .. }
         | R::Work(crate::work::Request::Remove(_))

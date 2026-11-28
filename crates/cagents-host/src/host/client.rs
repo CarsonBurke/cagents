@@ -1843,6 +1843,24 @@ fn process_admitted_request(
             let providers = super::provider_status::snapshot()?;
             Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
         }
+        ClientRequest::ProviderUpdate { provider } => {
+            drop(_shared);
+            let providers = super::provider_update::request(
+                host,
+                provider,
+                super::provider_update::Operation::Update,
+            )?;
+            Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
+        ClientRequest::ProviderManage { provider } => {
+            drop(_shared);
+            let providers = super::provider_update::request(
+                host,
+                provider,
+                super::provider_update::Operation::Manage,
+            )?;
+            Ok((ServerResponse::ProviderStatus(providers), Vec::new(), false))
+        }
         ClientRequest::Work(request) => {
             // Admission was checked above. A board may wait on scans and
             // GitHub for its bound, which must not hold the fence that
@@ -2167,6 +2185,38 @@ fn process_admitted_request(
                         )
                     }
                 },
+            };
+            Ok((
+                ServerResponse::NotificationTest { outcome },
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::SendTestMobileNotification => {
+            let relay = host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .mobile_relay
+                .clone();
+            let answer = relay
+                .ok_or("The mobile notification worker is unavailable")
+                .and_then(|relay| relay.test());
+            // Only this caller waits for the test. A slow relay cannot hold
+            // admission for shutdown, upgrades or exclusive workspace work.
+            drop(_shared);
+            let outcome = match answer {
+                Ok(answer) => match answer.recv_timeout(crate::notifications::TEST_TIMEOUT) {
+                    Ok(outcome) => outcome,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        crate::notifications::TestOutcome::TimedOut
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        crate::notifications::TestOutcome::Unavailable(
+                            "The mobile notification worker stopped".into(),
+                        )
+                    }
+                },
+                Err(message) => crate::notifications::TestOutcome::Unavailable(message.into()),
             };
             Ok((
                 ServerResponse::NotificationTest { outcome },

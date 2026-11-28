@@ -36,6 +36,7 @@ mod channels;
 mod chat;
 #[cfg(test)]
 mod device_peer_tests;
+mod mobile_notify;
 #[cfg(test)]
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
@@ -116,6 +117,8 @@ use crate::{
 const IO_TIMEOUT: Duration = Duration::from_secs(5);
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(30);
+/// Maintenance can download and verify a full provider binary before replying.
+const PROVIDER_MAINTENANCE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 // Match the window's attachment budget, which gives the daemon time to
 // publish and acknowledge a newly started holder.
 const TERMINAL_SPAWN_REPLY_TIMEOUT: Duration =
@@ -330,6 +333,11 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: devices::DeviceCommand,
     },
+    /// Set up optional phone notifications for agent attention.
+    Mobile {
+        #[command(subcommand)]
+        command: mobile_notify::MobileCommand,
+    },
     /// Read GitHub status through a shared local cache.
     Gh {
         #[command(subcommand)]
@@ -343,7 +351,7 @@ pub enum TopCommand {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// Inspect the provider CLIs this daemon uses.
+    /// Inspect and update the provider CLIs this daemon uses.
     Provider {
         #[command(subcommand)]
         command: ProviderCommand,
@@ -1858,6 +1866,21 @@ impl ControlClient {
         }
     }
 
+    fn send_test_mobile_notification(
+        &mut self,
+    ) -> Result<crate::notifications::TestOutcome, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::SendTestMobileNotification,
+            Instant::now() + crate::notifications::TEST_TIMEOUT + io_timeout(),
+        )? {
+            ServerResponse::NotificationTest { outcome } => Ok(outcome),
+            response => Err(unexpected_response(
+                "a mobile test notification outcome",
+                &response,
+            )),
+        }
+    }
+
     pub fn acknowledge_notification(&mut self, id: uuid::Uuid) -> Result<(), ControlError> {
         self.accepted(ClientRequest::AcknowledgeNotification { id })
     }
@@ -2750,10 +2773,37 @@ impl ControlClient {
     pub fn provider_status(
         &mut self,
     ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
-        match self.request_with_deadline(
-            ClientRequest::ProviderStatus,
-            Instant::now() + Duration::from_secs(20),
-        )? {
+        self.provider_operation(ClientRequest::ProviderStatus, Duration::from_secs(20))
+    }
+
+    /// Check the official release channel and update an eligible installation.
+    pub fn provider_update(
+        &mut self,
+        provider: crate::agent::Provider,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        self.provider_operation(
+            ClientRequest::ProviderUpdate { provider },
+            PROVIDER_MAINTENANCE_TIMEOUT,
+        )
+    }
+
+    /// Provision a managed install without replacing an existing external CLI.
+    pub fn provider_manage(
+        &mut self,
+        provider: crate::agent::Provider,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        self.provider_operation(
+            ClientRequest::ProviderManage { provider },
+            PROVIDER_MAINTENANCE_TIMEOUT,
+        )
+    }
+
+    fn provider_operation(
+        &mut self,
+        request: ClientRequest,
+        timeout: Duration,
+    ) -> Result<Vec<crate::account::provider_install::ProviderStatus>, ControlError> {
+        match self.request_with_deadline(request, Instant::now() + timeout)? {
             ServerResponse::ProviderStatus(providers) => Ok(providers),
             response => Err(unexpected_response("provider status", &response)),
         }
@@ -4157,13 +4207,22 @@ where
         | TopCommand::RestartWindows { .. } => {
             Some("Installation and window restart commands require your own terminal".into())
         }
+        TopCommand::Mobile { .. } => {
+            Some("Mobile notification settings require your own terminal".into())
+        }
         // An agent must never link a device or grant itself access to one.
         TopCommand::Device { command } if command.changes_access() => {
             Some("Device links, grants and updates require your own terminal".into())
         }
         _ => None,
     };
-    if hosted && let Some(message) = user_only_message {
+    let legacy_mobile_caller = matches!(&cli.command, TopCommand::Mobile { .. })
+        && ["CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN"]
+            .iter()
+            .any(|name| std::env::var_os(name).is_some());
+    if (hosted || legacy_mobile_caller)
+        && let Some(message) = user_only_message
+    {
         emit_error(
             cli.global.json,
             &AppError::new(
@@ -4200,7 +4259,8 @@ where
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::StoreSchema
                     | DaemonCommand::DowngradeStore { .. },
-            } | TopCommand::CoordinateInstall { .. }
+            } | TopCommand::Mobile { .. }
+                | TopCommand::CoordinateInstall { .. }
                 | TopCommand::SelectInstall { .. }
                 | TopCommand::SettleEditorInstall { .. }
                 | TopCommand::RestartWindows { .. }
@@ -4321,6 +4381,19 @@ where
                 let code = output.exit_code();
                 emit_success(cli.global.json, output);
                 code
+            }
+            Err(error) => {
+                emit_error(cli.global.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
+    if matches!(&cli.command, TopCommand::Mobile { command } if !command.uses_daemon()) {
+        return match execute(cli.command) {
+            Ok(output) => {
+                emit_success(cli.global.json, output);
+                ExitCode::SUCCESS
             }
             Err(error) => {
                 emit_error(cli.global.json, &error);
@@ -4538,6 +4611,7 @@ where
 
 fn staged_command_requires_daemon(command: &TopCommand) -> bool {
     match command {
+        TopCommand::Mobile { command } => command.uses_daemon(),
         TopCommand::Daemon {
             command: DaemonCommand::Start,
         }
@@ -4839,6 +4913,7 @@ fn execute_with_model_context(
             source.as_deref(),
             caller_reports_startup_failure,
         ),
+        TopCommand::Mobile { command } => mobile_notify::execute(command, !human_output()),
         TopCommand::Daemon { command } => execute_daemon(command),
         TopCommand::Terminal { command } => match project_channel_context {
             Some(context) => execute_terminal_as(command, &context),

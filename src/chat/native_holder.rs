@@ -19,6 +19,18 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(target_os = "linux")]
+pub enum NativeExit {
+    /// Nothing eligible for this observer, including owners without a known peer.
+    Unobservable,
+    /// Recheck the whole ownership proof when this exact live process exits.
+    Waiting(crate::daemon::PinnedProcess),
+    /// Cleanup is unproved and has no process descriptor to watch yet.
+    Pending,
+    /// The exact owner and its process groups have stopped executing.
+    Exited,
+}
+
 /// Kept only in the holder's memory. Discovery files contain process identity,
 /// never the launch recipe or its environment.
 #[derive(Clone, Serialize, Deserialize)]

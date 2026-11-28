@@ -64,6 +64,7 @@ pub(crate) use ready_plan::{begin_new_job as retire_completed_activation, requir
 pub mod recovery;
 #[cfg(target_os = "macos")]
 mod release_stage;
+mod resume_census;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
@@ -356,6 +357,15 @@ impl UpdateError {
 }
 
 impl UpdateJob {
+    /// Whether this recorded failure still concerns a release newer than the
+    /// installed build.
+    #[cfg(feature = "ui")]
+    pub fn is_failed_newer_release(&self, installed: &str) -> bool {
+        self.phase == UpdatePhase::Failed
+            && self.refusal.is_none()
+            && is_newer(&self.version, installed).unwrap_or(false)
+    }
+
     pub fn active_confirmation(&self) -> Option<&UpdateConfirmation> {
         matches!(
             self.phase,
@@ -670,11 +680,14 @@ fn installed_version(text: &str) -> Result<Version, UpdateError> {
 /// No installation or updater files are created by this call.
 pub fn check(cancellation: &CancellationToken) -> Result<UpdateState, UpdateError> {
     #[cfg(all(feature = "ui", feature = "development"))]
-    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
-        && let Some(release) = review_fixture::release(Path::new(&root))?
-    {
-        let installer_only = review_fixture::offers_installer(Path::new(&root));
-        return Ok(offered(release, installer_only));
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE") {
+        let root = Path::new(&root);
+        if let Some(release) = review_fixture::release(root)? {
+            return Ok(offered(release, review_fixture::offers_installer(root)));
+        }
+        if let Some(version) = review_fixture::current_version(root)? {
+            return Ok(UpdateState::Current { version });
+        }
     }
     let installation = match Installation::detect() {
         Ok(installation) => installation,
@@ -750,12 +763,12 @@ enum UpdateRequest {
     InstalledFromTerminal { root: PathBuf },
 }
 
-/// Whether this build asks for newer releases. A development build never
-/// does, apart from offering the native evidence fixture's release.
+/// Whether this build checks for updates. Development only checks when
+/// the native evidence fixture supplies a result.
 pub fn discovers_releases() -> bool {
     #[cfg(all(feature = "ui", feature = "development"))]
     if std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
-        .is_some_and(|root| review_fixture::offers_release(Path::new(&root)))
+        .is_some_and(|root| review_fixture::has_check_result(Path::new(&root)))
     {
         return true;
     }
@@ -1697,7 +1710,7 @@ fn start_job(
     };
     let log = private_create(&job.log_path)?;
     confirmation::initialize(&state, &id)?;
-    write_job(&state, &job)?;
+    write_new_job(&state, &job)?;
     let request_file = private_create(&state.join(format!("{id}.request")))?;
     serde_json::to_writer(&request_file, request)?;
     request_file.sync_all()?;
@@ -1837,6 +1850,8 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
             Err(error) => return Err(error),
         }
     }
+    #[cfg(feature = "ui")]
+    resume_census::enrich(&state, &mut job);
     Ok(Some(job))
 }
 
@@ -2845,7 +2860,12 @@ fn perform_update(
     confirmation::check_cancelled(state, job)?;
     let prepared_slots = guard.prepare_windows(Duration::from_secs(45))?;
     if native_startup_verified {
-        windows::remember_slots(state, job, prepared_slots)?;
+        windows::remember_slots(
+            state,
+            job,
+            prepared_slots,
+            recovery.retained_source(confirmed.replaces_daemon),
+        )?;
     }
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
@@ -4044,14 +4064,33 @@ fn write_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
     write_state_file(state, "status.json", job)
 }
 
+/// With the worker lease held, publish the replacement before retiring the
+/// optional details for the previous job.
+fn write_new_job(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    write_job(state, job)?;
+    if let Err(error) = resume_census::clear(state) {
+        tracing::warn!(%error, "could not clear superseded update resume data");
+    }
+    Ok(())
+}
+
 fn write_state_file(state: &Path, name: &str, value: &impl Serialize) -> Result<(), UpdateError> {
     let temporary = state.join(format!("status-{}.tmp", uuid::Uuid::new_v4()));
+    write_state_file_through(state, name, &temporary, value)
+}
+
+fn write_state_file_through(
+    state: &Path,
+    name: &str,
+    temporary: &Path,
+    value: &impl Serialize,
+) -> Result<(), UpdateError> {
+    let mut file = private_create(temporary)?;
     let result = (|| {
-        let mut file = private_create(&temporary)?;
         serde_json::to_writer(&mut file, value)?;
         file.write_all(b"\n")?;
         file.sync_all()?;
-        fs::rename(&temporary, state.join(name))?;
+        fs::rename(temporary, state.join(name))?;
         File::open(state)?.sync_all()?;
         Ok(())
     })();

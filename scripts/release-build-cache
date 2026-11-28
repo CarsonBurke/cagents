@@ -58,6 +58,28 @@ reclaim_release_runs() (
     done
 )
 
+# Keep one source-only checkout in the locked cache. Git rewrites only the
+# files that differ from the previous build, keeping unchanged path crates
+# fresh for Cargo. Only automatic notes need the caller's history and tags.
+checkout_release_source() (
+    local repository=$1 commit=$2 object_format
+    source_git() {
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+            git -c core.hooksPath=/dev/null -c core.autocrlf=false -c gc.autoDetach=false \
+            --git-dir="$CACHE/source.git" --work-tree="$CACHE/source" "$@"
+    }
+    if [[ ! -f $CACHE/source.git/HEAD ]]; then
+        object_format=$(git -C "$repository" rev-parse --show-object-format)
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git init -q --bare \
+            --object-format="$object_format" "$CACHE/source.git"
+    fi
+    # The cache lock is held, so any Git lock here is from a killed build.
+    find "$CACHE/source.git" -name '*.lock' -type f -delete
+    source_git fetch -q --no-tags --depth=1 "$repository" "$commit"
+    source_git checkout -q -f --detach "$commit"
+    source_git clean -q -ffdx
+)
+
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
     set -euo pipefail
     fail() { printf 'release-build-cache: %s\n' "$*" >&2; exit 1; }

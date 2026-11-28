@@ -396,7 +396,12 @@ pub(super) fn perform(
     confirmation::check_cancelled(state, job)?;
     let prepared_slots = guard.prepare_windows(Duration::from_secs(45))?;
     if native_startup_verified {
-        windows::remember_slots(state, job, prepared_slots)?;
+        windows::remember_slots(
+            state,
+            job,
+            prepared_slots,
+            recovery.retained_source(confirmed.replaces_daemon),
+        )?;
     }
     {
         let inspected = crate::install_guard::preflight_source_panes(
@@ -1147,18 +1152,36 @@ pub(super) fn confirm_daemon_ready(
     pid: Option<u32>,
     timeout: Duration,
 ) -> Result<(), UpdateError> {
+    confirm_daemon_ready_matching(expected, pid, None, timeout).map(|_| ())
+}
+
+pub(super) fn confirm_window_retry_daemon_ready(
+    candidate: &Path,
+    retained: Option<&crate::model::HostSessionProof>,
+    timeout: Duration,
+) -> Result<crate::model::HostSessionProof, UpdateError> {
+    confirm_daemon_ready_matching(candidate, None, retained, timeout)
+}
+
+fn confirm_daemon_ready_matching(
+    expected: &Path,
+    pid: Option<u32>,
+    retained: Option<&crate::model::HostSessionProof>,
+    timeout: Duration,
+) -> Result<crate::model::HostSessionProof, UpdateError> {
     let socket = crate::daemon::RuntimePaths::discover()
         .map_err(|error| invalid(error.to_string()))?
         .socket;
-    confirm_daemon_ready_at(&socket, expected, pid, Instant::now() + timeout)
+    confirm_daemon_ready_at(&socket, expected, pid, retained, Instant::now() + timeout)
 }
 
 fn confirm_daemon_ready_at(
     socket: &Path,
     expected: &Path,
     pid: Option<u32>,
+    retained: Option<&crate::model::HostSessionProof>,
     deadline: Instant,
-) -> Result<(), UpdateError> {
+) -> Result<crate::model::HostSessionProof, UpdateError> {
     use crate::{control::ControlClient, terminal_ipc::StartupState};
     let guidance =
         "Existing work and recovery records were kept. Check cagents daemon status before retrying";
@@ -1202,8 +1225,9 @@ fn confirm_daemon_ready_at(
     let ownership = |proof: &crate::model::HostSessionProof| {
         let unavailable = || invalid("the confirmed terminal service changed or is unavailable");
         peer.verify(proof).map_err(|_| unavailable())?;
-        if peer.executable().map_err(|_| unavailable())? != expected
-            || pid.is_some_and(|pid| pid != peer.pid())
+        if pid.is_some_and(|pid| pid != peer.pid())
+            || (retained != Some(proof)
+                && peer.executable().map_err(|_| unavailable())? != expected)
         {
             return Err(invalid("the confirmed terminal service changed"));
         }
@@ -1220,7 +1244,7 @@ fn confirm_daemon_ready_at(
             .map_err(|error| failed(&error, restoring))?;
         ownership(client.proof()).map_err(|error: UpdateError| communication(&error))?;
         match state {
-            StartupState::Ready => return Ok(()),
+            StartupState::Ready => return Ok(client.proof().clone()),
             StartupState::Retained { detail } => {
                 return Err(invalid(format!(
                     "The update could not restore all panes: {detail}. {guidance}"
@@ -1875,6 +1899,15 @@ else: raise AssertionError(sys.argv)
         peer: StartupPeer,
         timeout: Duration,
     ) -> (Result<(), UpdateError>, usize) {
+        startup_fixture_with_retained(states, peer, timeout, |_| None)
+    }
+
+    fn startup_fixture_with_retained(
+        states: Vec<crate::terminal_ipc::StartupState>,
+        peer: StartupPeer,
+        timeout: Duration,
+        retained: impl FnOnce(&crate::model::HostSessionProof) -> Option<crate::model::HostSessionProof>,
+    ) -> (Result<(), UpdateError>, usize) {
         use crate::{
             model::{HostIncarnation, HostSessionId, HostSessionProof},
             terminal_ipc::{
@@ -1891,6 +1924,7 @@ else: raise AssertionError(sys.argv)
             boot_id: crate::daemon::read_boot_id().unwrap(),
             host_incarnation: HostIncarnation::new("startup-probe"),
         };
+        let retained = retained(&proof);
         let mut lease = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1907,6 +1941,7 @@ else: raise AssertionError(sys.argv)
         if matches!(peer, StartupPeer::OtherProof) {
             proof.host_incarnation = HostIncarnation::new("another-startup");
         }
+        let expected_proof = proof.clone();
         let lease_path = root.path().join("cagentsd.lock");
         let server = thread::spawn(move || {
             let (mut stream, _) = crate::descriptor::accept(&listener).unwrap();
@@ -2002,7 +2037,14 @@ else: raise AssertionError(sys.argv)
         } else {
             std::env::current_exe().unwrap()
         };
-        let result = confirm_daemon_ready_at(&socket, &executable, None, Instant::now() + timeout);
+        let result = confirm_daemon_ready_at(
+            &socket,
+            &executable,
+            None,
+            retained.as_ref(),
+            Instant::now() + timeout,
+        )
+        .map(|verified| assert_eq!(verified, expected_proof));
         // A client whose deadline passed before it connected left the
         // fixture waiting to accept; this connection ends that wait.
         drop(UnixStream::connect(&socket));
@@ -2064,6 +2106,33 @@ else: raise AssertionError(sys.argv)
                 usize::from(matches!(peer, StartupPeer::ChangedLease))
             );
         }
+    }
+
+    #[test]
+    fn window_retry_accepts_only_the_recorded_retained_daemon() {
+        use crate::terminal_ipc::StartupState;
+
+        let (result, requests) = startup_fixture_with_retained(
+            vec![StartupState::Ready],
+            StartupPeer::OtherExecutable,
+            Duration::from_secs(3),
+            |proof| Some(proof.clone()),
+        );
+        result.unwrap();
+        assert_eq!(requests, 1);
+
+        let (result, requests) = startup_fixture_with_retained(
+            vec![StartupState::Ready],
+            StartupPeer::OtherExecutable,
+            Duration::from_secs(3),
+            |proof| {
+                let mut other = proof.clone();
+                other.host_incarnation = "changed".into();
+                Some(other)
+            },
+        );
+        assert!(result.is_err());
+        assert_eq!(requests, 0);
     }
 
     #[test]

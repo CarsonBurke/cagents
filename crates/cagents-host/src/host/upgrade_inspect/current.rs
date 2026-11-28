@@ -13,7 +13,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-const MAX_FRAME: usize = 4 * 1024 * 1024;
 /// How long a saved-history reader may take to apply its saved frame once
 /// inspection shows it. Readiness is the reader's own change announcement;
 /// this only fails a wedged reader, leaving the rest of inspection its time.
@@ -420,7 +419,7 @@ fn unsettled_reader() -> String {
 /// Read one frame of the chat bootstrap subset: a response or an event, as
 /// a source at `protocol` encoded it.
 fn read_chat_envelope(protocol: u16, reader: &mut impl Read) -> Result<ServerEnvelope, String> {
-    let payload = read_payload_with_limit(reader, ipc::MAX_FRAME_BYTES)?;
+    let payload = read_payload(reader)?;
     ipc::decoding_from(protocol, || {
         postcard::from_bytes::<ServerEnvelope>(&payload)
     })
@@ -474,13 +473,13 @@ fn readable(stream: &UnixStream, deadline: Instant) -> Result<bool, String> {
     }
 }
 
-fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
+fn read_payload(reader: &mut impl Read) -> Result<Vec<u8>, String> {
     let mut prefix = [0; 4];
     reader
         .read_exact(&mut prefix)
         .map_err(|_| "Truncated source response")?;
     let length = u32::from_be_bytes(prefix) as usize;
-    if length == 0 || length > limit {
+    if length == 0 || length > ipc::MAX_FRAME_BYTES {
         return Err("Source response exceeds the inspection limit".into());
     }
     let mut payload = vec![0; length];
@@ -491,7 +490,7 @@ fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u
 }
 
 fn read_response(protocol: u16, reader: &mut impl Read) -> Result<ServerEnvelope, String> {
-    let payload = read_payload_with_limit(reader, MAX_FRAME)?;
+    let payload = read_payload(reader)?;
     let (envelope, remaining) = ipc::decoding_from(protocol, || {
         postcard::take_from_bytes::<InspectionEnvelope>(&payload)
     })
@@ -679,10 +678,7 @@ mod tests {
             stream: &mut stream,
             deadline: Instant::now() + Duration::from_secs(2),
         };
-        assert_eq!(
-            read_payload_with_limit(&mut stream, MAX_FRAME).unwrap(),
-            payload
-        );
+        assert_eq!(read_payload(&mut stream).unwrap(), payload);
     }
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
@@ -1122,10 +1118,54 @@ mod tests {
                 "mutation {mutation}"
             );
         }
-        assert!(
-            read_response(100, &mut ((MAX_FRAME as u32 + 1).to_be_bytes()).as_slice()).is_err()
-        );
+        let oversized = (ipc::MAX_FRAME_BYTES as u32 + 1).to_be_bytes();
+        assert!(read_response(100, &mut oversized.as_slice()).is_err());
         assert!(read_response(100, &mut [0, 0].as_slice()).is_err());
+    }
+
+    #[test]
+    fn inventory_reads_a_daemon_frame_over_four_mebibytes() {
+        let protocol = 187; // A qualified source that sends one unpaged List reply.
+        let (_, mut terminal) = populated_inventory();
+        let mut earlier = terminal.upgrade_sources[0].clone();
+        earlier.launch.arguments.push("x".repeat(64 * 1024));
+        terminal.upgrade_sources = (1..=65)
+            .map(|id| {
+                let mut source = earlier.clone();
+                source.id = TerminalId::from_uuid(uuid::Uuid::from_u128(id));
+                source
+            })
+            .collect();
+        let mut frame = Vec::new();
+        ipc::encoding_for(protocol, || {
+            ipc::write_frame(
+                &mut frame,
+                &ServerEnvelope {
+                    version: protocol,
+                    request_id: Some(1),
+                    proof: proof(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Listed {
+                            terminals: vec![terminal.clone()],
+                        },
+                    },
+                },
+            )
+        })
+        .unwrap();
+        assert!(frame.len() - 4 > 4 * 1024 * 1024);
+        let received = read_response(protocol, &mut frame.as_slice()).unwrap();
+        let ServerMessage::Response {
+            response: ServerResponse::Listed { terminals },
+        } = received.message
+        else {
+            panic!("expected terminal inventory");
+        };
+        assert_eq!(terminals.len(), 1);
+        assert!(
+            terminals[0].upgrade_sources == terminal.upgrade_sources,
+            "the full terminal lineage should survive inspection"
+        );
     }
 
     #[test]

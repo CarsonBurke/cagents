@@ -22,6 +22,7 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::BTreeSet,
     fs::{self, File, OpenOptions},
     io::{self, Read, Write},
@@ -110,6 +111,13 @@ impl StoredCensus {
         match &self.original {
             Some(original) => Ok(digest(original.get().as_bytes())),
             None => serde_json::to_vec(&self.value).map(|bytes| digest(&bytes)),
+        }
+    }
+
+    pub(crate) fn same_bytes(&self, other: &Self) -> Result<bool, serde_json::Error> {
+        match (&self.original, &other.original) {
+            (Some(left), Some(right)) => Ok(left.get() == right.get()),
+            _ => Ok(self.hash()? == other.hash()?),
         }
     }
 
@@ -413,6 +421,24 @@ impl Census {
         record
     }
 
+    fn with_historical_pages(&self) -> Cow<'_, Self> {
+        if self.snapshots.len() >= self.chats.len() {
+            return Cow::Borrowed(self);
+        }
+        let mut census = self.clone();
+        census.snapshots.extend(
+            self.chats
+                .iter()
+                .filter(|source| !self.snapshots.iter().any(|saved| &saved.source == *source))
+                .map(|source| super::floor::StoppedSnapshot {
+                    source: source.clone(),
+                    snapshot: crate::chat::Snapshot::default(),
+                    limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
+                }),
+        );
+        Cow::Owned(census)
+    }
+
     /// Recovery later saves this capture's pages beside the stopped-pane
     /// evidence already retained for its source, shortening pages to fit.
     /// Its identity evidence must fit there unshortened.
@@ -551,6 +577,13 @@ pub(crate) struct Authority {
     daemon_path: PathBuf,
     target: PathBuf,
     target_hash: String,
+}
+
+#[cfg(any(all(target_os = "macos", feature = "host"), test))]
+impl Authority {
+    fn same_evidence(&self, other: &Self) -> bool {
+        self == other && self.census.same_bytes(&other.census).unwrap_or(false)
+    }
 }
 
 /// Disk evidence alone never grants the automatic prepare/ACK authority.
@@ -1339,20 +1372,8 @@ impl PendingRecovery {
             self.census.terminals = original.terminals;
             self.census.chats = original.chats;
         }
-        let missing: Vec<_> = self
-            .census
-            .chats
-            .iter()
-            .filter(|source| !self.census.snapshots.iter().any(|saved| &saved.source == *source))
-            .map(|source| super::floor::StoppedSnapshot {
-                source: source.clone(),
-                snapshot: crate::chat::Snapshot::default(),
-                limitation: Some("Paused after an incomplete update. No transcript page was captured for this exact update request. The conversation identity remains available for explicit continuation; no provider was started.".into()),
-            })
-            .collect();
-        if !missing.is_empty() {
-            self.census.snapshots.extend(missing);
-        }
+        // A matching Proposed capture already carries the original bytes.
+        // Derive its historical pages only for recovery.
         self.census.freeze().map_err(|error| error.to_string())?;
         self.producer = Some(CaptureProducer::ExplicitCensus {
             transaction: original.transaction,
@@ -1370,16 +1391,7 @@ impl PendingRecovery {
             return Ok(None);
         };
         let pending = pending.with_original_census(path)?;
-        persist_bound_capture(
-            &pending.checkpoint_path,
-            &CapturedCensus {
-                producer: pending.producer.clone(),
-                source: pending.source.clone(),
-                checkpoint_hash: Some(pending.checkpoint_hash.clone()),
-                census: pending.census.clone(),
-                windows: pending.windows.clone(),
-            },
-        )?;
+        pending.bind_manual_census()?;
         let bytes =
             read_checkpoint(&pending.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         pending.validate(&bytes)?;
@@ -1396,6 +1408,22 @@ impl PendingRecovery {
                 .with_file_name(recovery_name(&self.checkpoint_hash)),
         )?
         .is_some())
+    }
+
+    fn bind_manual_census(&self) -> Result<(), String> {
+        self.census
+            .with_historical_pages()
+            .validate_capture(&self.source)?;
+        persist_bound_capture(
+            &self.checkpoint_path,
+            &CapturedCensus {
+                producer: self.producer.clone(),
+                source: self.source.clone(),
+                checkpoint_hash: Some(self.checkpoint_hash.clone()),
+                census: self.census.clone(),
+                windows: self.windows.clone(),
+            },
+        )
     }
 
     pub(crate) fn authorize_manual(
@@ -1430,19 +1458,7 @@ impl PendingRecovery {
         let bytes =
             read_checkpoint(&self.checkpoint_path)?.ok_or("Recovery checkpoint disappeared")?;
         self.validate(&bytes)?;
-        // The original complete capture is immutable. Installer recovery
-        // fills in missing historical pages before publishing its capture.
-        self.census.validate_capture(&self.source)?;
-        persist_bound_capture(
-            &self.checkpoint_path,
-            &CapturedCensus {
-                producer: self.producer.clone(),
-                source: self.source.clone(),
-                checkpoint_hash: Some(self.checkpoint_hash.clone()),
-                census: self.census.clone(),
-                windows: self.windows.clone(),
-            },
-        )?;
+        self.bind_manual_census()?;
         let target = fs::canonicalize(target).map_err(|e| e.to_string())?;
         let layout = crate::update::locate(&target).map_err(|e| e.to_string())?;
         let cli =
@@ -1820,7 +1836,7 @@ impl ReadyPlanEvidence<'_> {
 
     #[cfg(feature = "host")]
     pub(crate) fn same_authority(&self, authority: &Authority) -> bool {
-        self.authority.as_ref() == authority
+        self.authority.same_evidence(authority)
     }
 
     pub(crate) fn claim_exists(&self) -> Result<bool, String> {
@@ -2447,7 +2463,7 @@ fn read_verified_record_identity(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -2474,7 +2490,10 @@ fn read_verified_record_identity(
         || target_hash.is_some_and(|hash| record.target_hash != hash)
         || record.target.as_deref() != Some(target)
         || executable_hash(target)? != record.target_hash
-        || &*record.census != census
+        || !record
+            .census
+            .same_bytes(census)
+            .map_err(|error| error.to_string())?
         || record.successor.as_ref() != Some(serving)
         || !serving.is_complete()
     {
@@ -2483,7 +2502,7 @@ fn read_verified_record_identity(
     let evidence = PendingRecovery {
         source: source.clone(),
         checkpoint_hash: checkpoint_hash.into(),
-        census: census.clone().into(),
+        census: census.clone(),
         windows: Vec::new(),
         original_census_complete: true,
         producer: None,
@@ -2498,7 +2517,7 @@ fn read_verified_record(
     checkpoint_path: &Path,
     checkpoint_hash: &str,
     source: &HostSessionProof,
-    census: &Census,
+    census: &StoredCensus,
     target: &Path,
     request: Option<&Authority>,
     target_hash: Option<&str>,
@@ -3352,7 +3371,7 @@ pub struct AlreadyRecovered {
     pub(crate) job: String,
     pub(crate) windows: Vec<String>,
     pub source: HostSessionProof,
-    pub census: Census,
+    pub census: StoredCensus,
     pub paused_terminals: Vec<TerminalId>,
     pub paused_chats: Vec<TerminalId>,
     pub witness: SettledWitness,
@@ -3413,7 +3432,7 @@ fn validate_settled_identity(
             .parent()
             .ok_or("Prepared checkpoint has no directory")?,
     )?;
-    record.census.validate_evidence(&record.source)?;
+    let _ = record.recovery_census()?;
     record.validate_census()?;
     let layout = crate::update::locate(target).map_err(|e| e.to_string())?;
     let state = layout.prefix.join(".update");
@@ -3870,7 +3889,7 @@ fn recovered_data(
         job: record.job,
         windows: record.windows,
         source: record.source,
-        census: record.census.value,
+        census: record.census,
         paused_terminals: record.paused_terminals,
         paused_chats: record.paused_chats,
         adopted_chat_descriptors: descriptors,
@@ -4708,6 +4727,18 @@ fn validate_reviewed(
 }
 
 impl RecoveryRecord {
+    /// Derive the view used for recovery and its paused pages while preserving
+    /// the stored census that authorizes the request.
+    pub fn recovery_census(&self) -> Result<Cow<'_, Census>, String> {
+        let census = if matches!(self.origin, Origin::ExplicitRecovery { .. }) {
+            self.census.with_historical_pages()
+        } else {
+            Cow::Borrowed(&*self.census)
+        };
+        census.validate_evidence(&self.source)?;
+        Ok(census)
+    }
+
     fn normalized_issued_chat(&self, descriptor: &Session) -> Session {
         let mut normalized = descriptor.clone();
         let Some(after) = normalized.terminal.as_mut() else {
@@ -4965,7 +4996,7 @@ impl Inherited {
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>, String> {
     if !matches!(authority.origin, Origin::AcknowledgedPrepare) {
         return Ok(None);
@@ -4980,7 +5011,10 @@ fn validate_acknowledged_capture(authority: &Authority) -> Result<Option<String>
         || capture.source != authority.source
         || capture.checkpoint_hash.as_deref() != Some(authority.checkpoint_hash.as_str())
         || capture.windows != authority.windows
-        || capture.census != authority.census
+        || !capture
+            .census
+            .same_bytes(&authority.census)
+            .map_err(|error| error.to_string())?
     {
         return Err(
             "Prepared authority changed its acknowledged inventory or saved windows".into(),

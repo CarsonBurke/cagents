@@ -386,6 +386,11 @@ impl Reservation {
         if state.native_closing.contains_key(&source.id) {
             return Err(retryable_unavailable("Chat is already starting or closing"));
         }
+        if retained_actor::local_startup_conflicts(&state, source) {
+            return Err(retryable_unavailable(
+                "The provider's startup cleanup is still unconfirmed",
+            ));
+        }
         if let Some(record) = state.chats.get(&source.id) {
             // An exact live Codex terminal pair is an attachment, not admission.
             // Authenticate it before allowing the existing fast path to run.
@@ -1709,6 +1714,7 @@ mod tests {
             state.native_actor_startups.insert(
                 source.id,
                 retained_actor::Startup {
+                    local: false,
                     source: source.clone(),
                     requested: source.clone(),
                     context,
@@ -2775,6 +2781,7 @@ printf '{"type":"control_response","response":{"subtype":"success","request_id":
                         state.native_actor_startups.insert(
                             source.id,
                             retained_actor::Startup {
+                                local: false,
                                 source: source.clone(),
                                 requested: source.clone(),
                                 failed_close: None,

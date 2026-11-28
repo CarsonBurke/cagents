@@ -25,7 +25,22 @@ Under those locks it is renamed aside, so a build that starts later finds no
 directory rather than a partly removed one. Still under them, the renamed
 copy is put back if a process opened it meanwhile, such as a build waiting
 for those locks; after them, if anything wrote to it. An interrupted removal
-leaves only the renamed copy, which the next run removes. A directory that
+leaves only the renamed copy, which the next run removes.
+
+A build directory that stays because something wrote to it lately still
+has its incremental compilation state bounded, as an offload slot's lease
+bounds a slot's: rustc keeps a directory per crate, profile, feature set and
+dependency graph and never removes one those changes leave behind, so a
+target directory that a long-lived checkout keeps building, such as the main
+build sentinel's, otherwise grows without bound. A crate's goes once nothing
+has compiled it for the same idle time, or, once nothing has for
+--incremental-grace-hours, when the crates compiled more recently fill
+--incremental-gib. A crate whose session lock a rustc holds stays; the rest
+are renamed aside, put back if a rustc locked or wrote to them meanwhile,
+and removed. Rustc remakes what a later build needs, at the cost of that
+crate's next compile being a full one.
+
+A directory that
 holds a `.git` or `Cargo.toml` is a checkout, never build output. A main checkout's own build, whose workspace has a `.git`
 directory, seeds new worktrees, so it waits four times as long. Never
 touched: the checkouts given with --keep-checkout, the directories given
@@ -337,6 +352,81 @@ def put_back(aside: Path, directory: Path) -> bool:
     return True
 
 
+def rustc_holds(crate: Path) -> bool:
+    """Whether a rustc compiles the crate whose incremental directory this
+    is: it holds an flock(2) on its session's lock file meanwhile."""
+    with os.scandir(crate) as entries:
+        locks = [entry.path for entry in entries
+                 if entry.name.startswith("s-") and entry.name.endswith(".lock")]
+    for lock in locks:
+        try:
+            descriptor = os.open(lock, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        except OSError:
+            continue
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        except OSError:
+            pass
+        finally:
+            os.close(descriptor)
+    return False
+
+
+def incremental_crates(build: Path):
+    """The incremental directories of the crates in a build directory, each
+    with when anything in it was last written and the bytes it holds, and
+    another run's renamed copies, which it did not finish removing, with
+    whether each is one. Rustc keeps a directory per crate, profile, feature
+    set and dependency graph and removes none when those change."""
+    for depth in ("*", "*/*"):
+        for incremental in sorted(build.glob(f"{depth}/incremental")):
+            # Nothing a symlink leads to, and only a profile's: in Cargo
+            # 1.100's layout a package may be named `incremental`.
+            if os.path.realpath(incremental) != str(incremental) or not directory(incremental) \
+                    or not fingerprinted(incremental.parent):
+                continue
+            with contextlib.suppress(OSError), os.scandir(incremental) as entries:
+                crates = [Path(entry.path) for entry in entries
+                          if entry.is_dir(follow_symlinks=False)]
+            for crate in crates:
+                if deadline_passed():
+                    return
+                leftover = PRUNED.match(crate.name)
+                if leftover and alive(int(leftover["pid"])):
+                    continue
+                measured = measure(crate)
+                if measured is not None and (leftover or measured[2]):
+                    yield incremental.parent, crate, measured[0], measured[1], bool(leftover)
+
+
+def measure(root: Path) -> tuple[float, int, bool] | None:
+    """When anything under root was last written or linked, the bytes it
+    holds, counting each file once, as rustc hard-links a session's files
+    into the next, and whether it holds rustc's sessions. None when it
+    cannot be read whole."""
+    newest, total, seen, pending = 0.0, 0, set(), [root]
+    sessions = False
+    try:
+        newest = max(newest, root.lstat().st_mtime)
+        with os.scandir(root) as entries:
+            sessions = any(entry.name.startswith("s-") for entry in entries)
+        while pending:
+            with os.scandir(pending.pop()) as entries:
+                for entry in entries:
+                    info = entry.stat(follow_symlinks=False)
+                    newest = max(newest, info.st_mtime, info.st_ctime)
+                    if stat.S_ISDIR(info.st_mode):
+                        pending.append(Path(entry.path))
+                    elif (info.st_dev, info.st_ino) not in seen:
+                        seen.add((info.st_dev, info.st_ino))
+                        total += info.st_blocks * 512
+    except OSError:
+        return None
+    return newest, total, sessions
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -464,6 +554,12 @@ def main() -> int:
     parser.add_argument("--orphan-hours", type=nonnegative, default=6.0, metavar="HOURS",
                         help="remove mirrored build directories of removed "
                              "workspaces unwritten this long (default 6)")
+    parser.add_argument("--incremental-gib", type=nonnegative, default=20, metavar="GIB",
+                        help="incremental compilation state each build directory in use keeps, "
+                             "its most recently compiled crates' (default %(default)s)")
+    parser.add_argument("--incremental-grace-hours", type=nonnegative, default=1.0, metavar="HOURS",
+                        help="keep incremental state written this recently beyond that budget too, "
+                             "as a build may be reading or writing it (default %(default)s)")
     parser.add_argument("--evidence-hours", type=nonnegative, default=12.0, metavar="HOURS",
                         help="remove native-evidence tasks' builds unwritten and unused "
                              "this long (default 12)")
@@ -555,14 +651,122 @@ def main() -> int:
         write_managed_log(arguments.managed_log)
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
+    budget = arguments.incremental_gib * 2**30
+    grace_cutoff = now - arguments.incremental_grace_hours * 3600
     orphan_cutoff = now - arguments.orphan_hours * 3600
     evidence_cutoff = now - arguments.evidence_hours * 3600
-    removed = kept = 0
+    removed = kept = trimmed = 0
     freed = 0
     failed = complete = False
     def note(message):
         if arguments.verbose:
             print(message, flush=True)
+
+    def record(path, size, reason):
+        if arguments.log or arguments.managed_log:
+            line = f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{path}\t{size}\t{reason}\n"
+            if arguments.managed_log:
+                write_managed_log(arguments.managed_log, os.fsencode(line))
+            else:
+                with contextlib.suppress(OSError), open(arguments.log, "a") as log:
+                    log.write(line)
+
+    def trim_incremental(build, cutoff):
+        """Bounds the incremental state of a build directory that stays: a
+        crate's goes once nothing has written it since cutoff, or, once
+        nothing has for --incremental-grace-hours, when the crates written
+        more recently fill the budget, as an offload slot's lease bounds a
+        slot. Each is renamed aside under its profile's Cargo locks unless a
+        rustc holds it, so a compile that starts later finds none rather
+        than part of one, and put back if a rustc locked or wrote to it
+        meanwhile. Returns how many went and their bytes."""
+        nonlocal failed
+        crates = sorted(incremental_crates(build), key=lambda crate: crate[2], reverse=True)
+        count = size = kept_bytes = 0
+        for profile, crate, newest, bytes_, leftover in crates:
+            if deadline_passed():
+                break
+            if leftover:
+                reason = "interrupted removal"
+            elif newest <= cutoff:
+                reason = "incremental state unwritten since the cutoff"
+            elif kept_bytes >= budget and newest <= grace_cutoff:
+                reason = f"incremental state beyond the {arguments.incremental_gib:g} GiB kept"
+            else:
+                # The crates compiled most recently stay until they fill the
+                # budget, the one that crosses it included.
+                kept_bytes += bytes_
+                continue
+            try:
+                if not leftover and rustc_holds(crate):
+                    note(f"keep {crate}: a rustc compiles it")
+                    kept_bytes += bytes_
+                    continue
+            except OSError:
+                continue
+            if not arguments.apply:
+                print(f"would remove {crate} ({bytes_ / 2**30:.1f} GiB, {reason})", flush=True)
+                count, size = count + 1, size + bytes_
+                continue
+            aside = crate if leftover else \
+                crate.with_name(f".{crate.name}.cagents-pruned-{os.getpid()}")
+            # Cargo's locks on the profile keep its builds out while this
+            # renames: rustc opens a crate's directory by path from before it
+            # locks its session until it finishes. They are held only to look
+            # for a rustc and rename, so a build waiting for them waits no
+            # longer than that. A profile without them, which no build has
+            # used yet, is not trimmed.
+            locks = [lock for lock in (profile / name for name in LOCK_NAMES) if lock.exists()]
+            if not locks and not leftover:
+                note(f"keep {crate}: its profile has no build lock")
+                kept_bytes += bytes_
+                continue
+            with held(locks) as free:
+                if not free:
+                    note(f"keep {crate}: a build holds its profile's lock")
+                    kept_bytes += bytes_
+                    continue
+                try:
+                    if not leftover and rustc_holds(crate):
+                        note(f"keep {crate}: a rustc compiles it")
+                        kept_bytes += bytes_
+                        continue
+                except FileNotFoundError:
+                    # Removed meanwhile, as by `cargo clean`.
+                    continue
+                try:
+                    if aside != crate:
+                        os.rename(crate, aside)
+                except OSError as error:
+                    print(f"failed to remove {crate}: {error}", file=sys.stderr, flush=True)
+                    failed = True
+                    continue
+                # A rustc that locked it as it was renamed keeps it; so does
+                # a look that fails.
+                try:
+                    used = not leftover and rustc_holds(aside)
+                except OSError:
+                    used = True
+                if used:
+                    if put_back(aside, crate):
+                        note(f"keep {crate}: used while it was being removed")
+                    continue
+            # After them, anything that wrote to it since it was measured
+            # keeps it too.
+            if not leftover and survey(aside, newest) is None:
+                if put_back(aside, crate):
+                    note(f"keep {crate}: written while it was being removed")
+                continue
+            try:
+                shutil.rmtree(aside)
+            except OSError as error:
+                print(f"failed to remove {aside}: {error}", file=sys.stderr, flush=True)
+                failed = True
+                continue
+            count, size = count + 1, size + bytes_
+            print(f"removed {crate} ({bytes_ / 2**30:.1f} GiB, {reason})", flush=True)
+            record(crate, bytes_, reason)
+        return count, size
 
     for directory in find(roots, excluded, arguments.max_depth, arguments.mirror):
         if deadline_passed():
@@ -589,6 +793,10 @@ def main() -> int:
         surveyed = survey(directory, cutoff)
         if surveyed is None:
             kept += 1
+            if not leftover:
+                count, size = trim_incremental(directory, cutoff)
+                trimmed += count
+                freed += size
             continue
         size, locks = surveyed
         if not arguments.apply:
@@ -645,14 +853,7 @@ def main() -> int:
         freed += size
         removed += 1
         print(f"removed {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
-        if arguments.log or arguments.managed_log:
-            record = (f"{time.strftime('%Y-%m-%dT%H:%M:%S%z')}\t{directory}\t"
-                      f"{size}\t{reason}\n")
-            if arguments.managed_log:
-                write_managed_log(arguments.managed_log, os.fsencode(record))
-            else:
-                with contextlib.suppress(OSError), open(arguments.log, "a") as log:
-                    log.write(record)
+        record(directory, size, reason)
     else:
         complete = True
     if not complete or deadline_passed():
@@ -662,8 +863,9 @@ def main() -> int:
         with contextlib.suppress(OSError):
             arguments.stamp.touch()
     verb = "removed" if arguments.apply else "would remove"
-    print(f"{verb} {removed} build directories ({freed / 2**30:.1f} GiB); "
-          f"kept {kept} in use or recently written", flush=True)
+    print(f"{verb} {removed} build directories and {trimmed} crates' stale incremental "
+          f"state in the rest ({freed / 2**30:.1f} GiB); kept {kept} in use or recently written",
+          flush=True)
     return int(failed) if complete else INCOMPLETE
 
 

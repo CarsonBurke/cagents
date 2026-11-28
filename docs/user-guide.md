@@ -1329,6 +1329,29 @@ already-running conversation. If a terminal later exports an excluded variable,
 switching it to native chat refuses before stopping the CLI. Recovery retains
 the recorded account selection; choose **System default** to inherit credentials.
 
+### Updating provider CLIs
+
+Run `cagents provider status` to see the executable and version the daemon
+finds for each provider, how it was installed, and any update results. Add
+`--json` for executable paths.
+
+To have cagents maintain Claude Code, run `cagents provider manage claude`.
+This installs a separate copy from Anthropic's signed releases. It requires
+`curl` and `gpgv` on the daemon's PATH. Put the directory printed by the
+command first on your login shell's PATH, then check `cagents provider status`
+for **managed by Cagents**. Claude Code uses your existing account configuration.
+
+The daemon checks at startup and every four hours. Run
+`cagents provider update claude` to check immediately, or set
+`update_providers_automatically = false` in
+[`settings.toml`](configuration.md#settings-file) to turn off scheduled checks.
+Claude Code's channel, update opt-outs, and version limits also apply. Each
+new launch reads the selected version. Older versions stay on disk so that
+running sessions can keep opening their executable and resources.
+
+Use the original installer or package manager for other provider installations,
+including your original Claude Code installation.
+
 ### Switching between terminal and chat
 
 Supported OMP, Claude, Codex and Antigravity terminal sessions offer **Switch

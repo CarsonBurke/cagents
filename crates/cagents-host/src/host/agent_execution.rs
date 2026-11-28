@@ -38,6 +38,8 @@ pub(super) use ownership::{cancel_agent_run, reconcile_agent_run};
 // Client IDs allocated to external sockets begin at one. This subscriber owns
 // only accepted execution sessions and never requests presentation delivery.
 pub(super) const EXECUTION_CLIENT: u64 = 0;
+pub(super) const NEW_WORK_HELD: &str =
+    "The daemon is not starting new work now, as during an update; try again shortly";
 pub(super) type SharedRegistry = Arc<Mutex<Registry>>;
 
 pub(super) fn registry(host: &SharedHost) -> Result<SharedRegistry, String> {
@@ -1984,10 +1986,19 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .preflight_agent_close(&origin, id)?;
+    let close_unpublished_startup = || {
+        if let Some(HostedSession::Chat(session)) = agent.session.as_ref()
+            && super::chat::retained_actor::has_local_startup(host, session.id)
+        {
+            super::chat::close_retained_native(host, session)?;
+        }
+        Ok::<_, String>(())
+    };
     if agent.closed {
         // Older daemons closed the worker without retiring its shared pane.
         // Repeating close repairs only that retained presentation; it does not
         // start or contact a provider, and keeps the completed run history.
+        close_unpublished_startup()?;
         let closed = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
@@ -2005,6 +2016,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     };
     if ended {
         super::chat::codex_reconnect::reconcile_startup(host, &registry, id)?;
+        close_unpublished_startup()?;
     }
     // A daemon stop already proved this agent's process ended and revoked its
     // authority; only its saved conversation remains to retire.
@@ -2030,6 +2042,8 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                 };
                 if let Some(target) = hosted {
                     super::chat::close_captured(host, target).map_err(|error| error.message)?;
+                } else if super::chat::retained_actor::has_local_startup(host, session.id) {
+                    super::chat::close_retained_native(host, session)?;
                 } else if lost_with_earlier_boot(host, &agent, pending.as_ref()) {
                     // A changed kernel boot proves that process is gone, even
                     // with no daemon stop recorded for it. The fence refuses

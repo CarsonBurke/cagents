@@ -48,6 +48,29 @@ pub struct InFlight {
     pub unlisted: u32,
 }
 
+/// Extra details that only the resume offer reads. These never enter the
+/// legacy census, its rollback binding, or the update status report.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResumeData {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_text: Vec<QueuedText>,
+}
+
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueuedText {
+    pub id: String,
+    pub text: String,
+}
+
+impl std::fmt::Debug for QueuedText {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("QueuedText")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
 fn is_zero(count: &u32) -> bool {
     *count == 0
 }
@@ -141,13 +164,11 @@ impl InFlight {
             }
         }
         for message in &snapshot.queued_messages {
-            if message.id.len() > MAX_ID_BYTES {
+            if message.id.len() > MAX_ID_BYTES || work.queued.len() >= MAX_QUEUED {
                 work.unlisted = work.unlisted.saturating_add(1);
-            } else if work.queued.len() < MAX_QUEUED {
-                work.queued.push(message.id.clone());
-            } else {
-                work.unlisted = work.unlisted.saturating_add(1);
+                continue;
             }
+            work.queued.push(message.id.clone());
         }
         work
     }
@@ -191,6 +212,8 @@ impl InFlight {
 pub struct Outcome {
     #[serde(flatten)]
     pub work: InFlight,
+    #[serde(skip)]
+    pub resume: ResumeData,
     /// What the update review called the conversation.
     #[serde(default)]
     pub label: String,
@@ -460,6 +483,9 @@ mod tests {
         assert!(older.work.is_empty());
         assert_eq!(older.fate, Fate::Unknown);
         assert!(!older.lost());
+        let old_queue = serde_json::json!({ "id": id, "queued": ["q"] });
+        let queue: InFlight = serde_json::from_value(old_queue.clone()).unwrap();
+        assert_eq!(serde_json::to_value(queue).unwrap(), old_queue);
         let newer: Outcome = serde_json::from_value(serde_json::json!({
             "id": id,
             "turn": true,
@@ -483,6 +509,7 @@ mod tests {
             serde_json::json!({ "id": id })
         );
         let round_trip = Outcome {
+            resume: ResumeData::default(),
             work: InFlight {
                 id,
                 turn: true,

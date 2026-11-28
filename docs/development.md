@@ -967,13 +967,13 @@ across commits. It records the fourth such failure and names the stray marker
 as a possible cause in the issue. A recorded verdict or a change in the marker
 set starts a new count. Other outside-code stops preserve the count.
 
-After the test lanes finish, the sentinel builds the three executables
-[native evidence](#native-evidence) runs and keeps them under `builds/` for the
-six newest built commits, about 0.6 GiB each. Native evidence copies these
-executables when available. A build that fails is logged to
-`logs/SHA-evidence.log`, and native evidence builds that commit when needed.
-The sentinel builds this evidence and bisects check failures before sending
-test notifications to GitHub.
+After the test lanes finish, the sentinel bisects any check failures and
+reports the test verdict. It then builds the three executables
+[native evidence](#native-evidence) uses and keeps them under `builds/` for the
+six newest built commits, about 0.6 GiB each. This optional build waits up to
+two minutes for admission by default. A build that fails or cannot start is
+logged to `logs/SHA-evidence.log`. Native evidence copies a cached build when
+available and builds the requested commit when needed.
 
 `scripts/main-build-sentinel --repository PATH --require-tests SHA` prints a
 commit's verdict and exits 0 if its tests passed, 1 if they failed, 3 if a
@@ -1445,6 +1445,8 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 - **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority, with none of the build's open files. The build doesn't wait for it. A run that is cut short or killed is started again by the next build; none starts while one is running.
 - **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout, and native-evidence builds unused for an hour; on the schedule they wait six and twelve hours.
 - **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
+
+A build directory something still writes to, such as the main build sentinel's, is never idle as a whole, so the pruner bounds the incremental compilation state inside it as an offload slot's lease does. Rustc keeps a directory per crate, profile, feature set and dependency graph, and never removes one left behind when those change; the sentinel's, whose lanes give most crates new ones at nearly every `main` commit, grew by about 100 GiB a day to over 400 GiB. A crate's state goes once no build has compiled it within the same idle time, or, once none has for an hour (`--incremental-grace-hours`), when the crates compiled more recently fill 20 GiB (`--incremental-gib`). Each crate is checked and moved aside under Cargo's locks on its profile, so a build there waits for that rather than finding part of it gone, and state a rustc holds stays. A later build that needs what went compiles that crate in full. The guard keeps its own build's directory out of the run it starts, so the main build sentinel, which builds nearly all the time, also runs the pruner on its checkout and that checkout's mirrored build directory hourly, after a tick's builds and before the next can start, at idle priority within ten minutes and under a lock of its own, so the host's runs that builds wait for are not held up; its output is in `build-trim.log` in the sentinel's state directory. A profile no build has locked yet is left alone.
 
 The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 

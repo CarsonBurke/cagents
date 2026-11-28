@@ -880,7 +880,7 @@ pub async fn provider_version(
     command.arg("--version");
     match provider {
         Provider::Claude => {
-            command.env("DISABLE_AUTOUPDATER", "1");
+            command.env("DISABLE_UPDATES", "1");
         }
         Provider::Muse => {
             command
@@ -1414,8 +1414,13 @@ async fn read_claude_cli(
 ) -> Result<Probed, String> {
     let mut status = command_with_path(account, program, search_path);
     status.args(["auth", "status", "--json"]);
-    let mut usage = command_with_path(account, program, search_path);
-    usage.args([
+    let usage = claude_usage_command(account, program, search_path);
+    join_claude(run_json(status), claude_usage(usage)).await
+}
+
+fn claude_usage_command(account: &Account, program: &Path, search_path: Option<&OsStr>) -> Command {
+    let mut command = command_with_path(account, program, search_path);
+    command.args([
         "-p",
         "--input-format",
         "stream-json",
@@ -1428,7 +1433,40 @@ async fn read_claude_cli(
         "",
         "--disable-slash-commands",
     ]);
-    join_claude(run_json(status), claude_usage(usage)).await
+    command
+}
+
+/// Refreshes draft model choices from the newly selected Claude executable.
+/// An account reader already in flight gets to finish publishing first.
+#[cfg(feature = "host")]
+pub async fn refresh_claude_catalog(
+    account: &Account,
+    program: &Path,
+    search_path: Option<&OsStr>,
+    cache: &Cache,
+    version: &str,
+) -> Result<(), String> {
+    let result = tokio::time::timeout(TIMEOUT, async {
+        let _lock = loop {
+            if let Some(lock) = cache
+                .try_probe_lock(&account.lock_name())
+                .map_err(|error| error.to_string())?
+            {
+                break lock;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        };
+        let mut session =
+            Session::spawn(claude_usage_command(account, program, search_path)).await?;
+        let catalog = claude_initialize(&mut session).await;
+        let (_, catalog) = after_close(catalog, session.close()).await?;
+        let catalog = catalog.ok_or("Claude Code did not list available models")?;
+        cache
+            .store_managed_claude_catalog(catalog, version)
+            .map_err(|error| error.to_string())
+    })
+    .await;
+    result.map_err(|_| "Claude Code did not list models in time".to_owned())?
 }
 
 async fn invalidate_claude_plan(account: &Account, cache: Option<&Cache>) -> Result<(), String> {
@@ -1632,15 +1670,22 @@ async fn claude_usage(command: Command) -> Result<ClaudeSession, String> {
     after_close(result, session.close()).await
 }
 
-async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String> {
+async fn claude_initialize(
+    session: &mut Session,
+) -> Result<(Observed<Result<Value, String>>, Option<CatalogObservation>), String> {
     const INITIALIZE: &str = "cagents-usage-initialize";
-    const USAGE: &str = "cagents-usage";
     session
         .send(&json!({"type": "control_request", "request_id": INITIALIZE,
             "request": {"subtype": "initialize"}}))
         .await?;
     let initialized = claude_response(session, INITIALIZE).await?;
     let catalog = claude_catalog(&initialized);
+    Ok((initialized, catalog))
+}
+
+async fn claude_exchange(session: &mut Session) -> Result<ClaudeSession, String> {
+    const USAGE: &str = "cagents-usage";
+    let (initialized, catalog) = claude_initialize(session).await?;
     if initialized.value.is_err() {
         return Ok(ClaudeSession {
             catalog,

@@ -108,6 +108,8 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::RetryPendingTerminalSave { .. }
         | R::DeviceOperation { .. }
         | R::DeviceTrust { .. }
+        | R::ProviderUpdate { .. }
+        | R::ProviderManage { .. }
         | R::Shutdown
         | R::ShutdownV1 { .. }
         | R::PrepareUpgrade { .. }
@@ -125,6 +127,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::NotificationPreferencesChanged { .. }
         | R::AcknowledgeNotification { .. }
         | R::SendTestNotification
+        | R::SendTestMobileNotification
         | R::ChatStart { .. }
         | R::ChatStartInPane { .. }
         | R::ChatRecoverAccount { .. }

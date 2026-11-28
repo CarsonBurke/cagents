@@ -1923,6 +1923,9 @@ pub struct AppSettings {
     /// every few hours. A check the user asks for runs either way.
     #[serde(default = "default_check_for_updates")]
     pub check_for_updates: bool,
+    /// Schedule updates for provider CLIs enrolled in this cagents instance.
+    #[serde(default = "default_check_for_updates")]
+    pub update_providers_automatically: bool,
     /// Days without activity after which a Work board card is stale. The
     /// daemon reads it from this file too; see `crate::work::stale_after_days`.
     #[serde(default = "default_work_stale_after_days")]
@@ -2051,6 +2054,7 @@ impl Default for AppSettings {
             relaunch_agents_on_upgrade: default_relaunch_agents_on_upgrade(),
             resume_sessions_after_reboot: false,
             check_for_updates: default_check_for_updates(),
+            update_providers_automatically: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
             preference_defaults_revision: PREFERENCE_DEFAULTS_REVISION,

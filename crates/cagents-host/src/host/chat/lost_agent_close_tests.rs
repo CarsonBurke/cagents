@@ -1077,6 +1077,7 @@ fn a_claimed_allocation_or_paired_terminal_refuses_lost_close() {
                         state.native_actor_startups.insert(
                             source.id,
                             super::retained_actor::Startup {
+                                local: false,
                                 source: requested.clone(),
                                 requested,
                                 context: Arc::new(

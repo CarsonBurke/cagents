@@ -293,6 +293,7 @@ fn restore_with_policy_for_start(
         if state.shutting_down
             || (state.chat_spawning.contains_key(&source.id) && admission.is_none())
             || state.native_closing.contains_key(&source.id)
+            || retained_actor::local_startup_conflicts(&state, source)
         {
             return Err(retryable_unavailable(
                 "Native holder adoption is unavailable while another transition is pending",

@@ -104,7 +104,7 @@ fn next_check_label(failures: u32) -> String {
 /// What the About settings page shows about updates.
 pub(super) struct UpdateSummary {
     pub status: String,
-    /// Whether `status` reports a failed check.
+    /// Whether `status` reports a failed check or update.
     pub failed: bool,
     /// Whether "Check for updates" can run now.
     pub can_check: bool,
@@ -348,7 +348,7 @@ struct Interruptions {
 fn interruptions_available(
     confirmation: &crate::update::UpdateConfirmation,
 ) -> Option<Interruptions> {
-    use crate::update::impact::{Disposition, Policy, SessionCause, SessionKind};
+    use crate::update::impact::{Policy, SessionKind, WaitReason};
 
     if confirmation.stop.is_some() {
         return None;
@@ -361,12 +361,18 @@ fn interruptions_available(
     let mut subagents = 0;
     let mut delivery_waits = false;
     let mut recovery_needed = false;
-    for session in daemon.sessions.iter().filter(|session| {
-        session.kind == SessionKind::NativeChat && session.disposition == Disposition::WaitsForIdle
-    }) {
-        if session.reason == SessionCause::PendingDelivery {
-            delivery_waits = true;
-            continue;
+    for session in daemon
+        .sessions
+        .iter()
+        .filter(|session| session.kind == SessionKind::NativeChat)
+    {
+        match session.wait_reason() {
+            Some(WaitReason::PendingDelivery) => {
+                delivery_waits = true;
+                continue;
+            }
+            Some(WaitReason::FinishingTurn) => {}
+            None => continue,
         }
         recovery_needed |= confirmation
             .preview
@@ -1428,7 +1434,14 @@ impl Cagents {
                     ),
                     false,
                 ),
-                Some(UpdateState::Current { .. }) => ("cagents is up to date".to_owned(), false),
+                Some(UpdateState::Current { version }) => state
+                    .job
+                    .as_ref()
+                    .filter(|job| job.is_failed_newer_release(version))
+                    .map_or_else(
+                        || ("cagents is up to date".to_owned(), false),
+                        |job| (startup_gate::update_failure(&job.message).summary, true),
+                    ),
                 Some(UpdateState::Unsupported { reason }) => (reason.clone(), false),
                 None => ("Not checked yet".to_owned(), false),
             }
@@ -1774,20 +1787,28 @@ impl Cagents {
                             if self.startup_gate.reported_notice()
                                 != Some(failure.notice.message.as_str())
                             {
-                                self.status = Some(failure.notice);
+                                self.status = Some(
+                                    failure
+                                        .notice
+                                        .with_key(NoticeKey::UpdateVerification(job.id.clone())),
+                                );
                             }
-                        } else if job.phase == UpdatePhase::Complete
-                            && self.update_ui.job.as_ref().is_some_and(|shown| {
-                                shown.id == job.id && !shown.phase.is_terminal()
-                            })
-                        {
-                            self.notices.record(
-                                TransientNotice::success(format!(
-                                    "Updated to cagents {}",
-                                    job.version
-                                ))
-                                .with_details(job.message.clone()),
-                            );
+                        } else if job.phase == UpdatePhase::Complete {
+                            self.resolve_notice(NoticeKey::UpdateVerification(job.id.clone()));
+                            let rechecked = self.resolve_startup_recheck(&job.id);
+                            if rechecked
+                                || self.update_ui.job.as_ref().is_some_and(|shown| {
+                                    shown.id == job.id && shown.phase != UpdatePhase::Complete
+                                })
+                            {
+                                self.notices.record(
+                                    TransientNotice::success(format!(
+                                        "Updated to cagents {}",
+                                        job.version
+                                    ))
+                                    .with_details(job.message.clone()),
+                                );
+                            }
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.
@@ -2054,6 +2075,66 @@ pub(in crate::app) mod tests {
         assert_eq!(entry.notice.details.as_deref(), Some(job.message.as_str()));
         assert_eq!(entry.repeats, 1);
         assert!(app.update_ui.error.is_none());
+    }
+
+    #[test]
+    fn about_keeps_the_rollback_failure_until_a_later_release_is_available() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let rollback = "cagents 9.1.1 could not start, so cagents 9.1.0 was put back and your windows reopened with it.";
+        let job = UpdateJob {
+            id: "rolled-back".into(),
+            version: "9.1.1".into(),
+            phase: UpdatePhase::Failed,
+            message: rollback.into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+            recorded_by: None,
+        };
+        drop(app.update_update_ui(Action::Polled(None, Ok(Some(job)))));
+        // A manual check clears the transient header error before it runs.
+        app.update_ui.error = None;
+        drop(
+            app.update_update_ui(Action::Checked(Ok(UpdateState::Current {
+                version: "9.1.0".into(),
+            }))),
+        );
+        let summary = app.summarize_updates(false);
+        assert_eq!(summary.status, rollback.trim_end_matches('.'));
+        assert!(summary.failed);
+        assert!(summary.available.is_none());
+        assert!(summary.can_check);
+
+        let digest = [0u8; 32];
+        let asset = |name| serde_json::json!({"name": name, "size": 1, "sha256": digest});
+        let release = serde_json::from_value(serde_json::json!({
+            "version": "9.1.2",
+            "url": "https://example.invalid/release",
+            "metadata": digest,
+            "archive": asset("cagents.tar.gz"),
+            "checksums": asset("SHA256SUMS"),
+            "installer": asset("install.sh"),
+        }))
+        .unwrap();
+        drop(app.update_update_ui(Action::Checked(Ok(UpdateState::Available { release }))));
+        let summary = app.summarize_updates(false);
+        assert_eq!(summary.status, "cagents 9.1.2 is available");
+        assert!(!summary.failed);
+        assert_eq!(summary.available.unwrap().0, "9.1.2");
+
+        // An external installation can leave the failed job on disk.
+        for installed in ["9.1.1+local.abc", "9.1.10"] {
+            drop(
+                app.update_update_ui(Action::Checked(Ok(UpdateState::Current {
+                    version: installed.into(),
+                }))),
+            );
+            let summary = app.summarize_updates(false);
+            assert_eq!(summary.status, "cagents is up to date", "{installed}");
+            assert!(!summary.failed, "{installed}");
+            assert!(summary.available.is_none(), "{installed}");
+        }
     }
 
     /// A window reopened by an older worker can first read that worker's

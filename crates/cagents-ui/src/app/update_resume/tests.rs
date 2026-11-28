@@ -18,6 +18,7 @@ fn outcome(id: TerminalId, fate: Fate, work: impl FnOnce(&mut InFlight)) -> Outc
     };
     work(&mut recorded);
     Outcome {
+        resume: Default::default(),
         work: recorded,
         label: "Recorded label".into(),
         fate,
