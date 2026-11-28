@@ -27,7 +27,14 @@ integrated-browser = [
     "dep:net_traits",
     "dep:dpi",
     "dep:euclid",
+    "dep:http-body-util",
+    "dep:hyper",
+    "dep:hyper-rustls",
+    "dep:hyper-util",
     "dep:keyboard-types",
+    "dep:mime",
+    "dep:rustls",
+    "dep:rustls-platform-verifier",
     "dep:raw-window-handle",
     "dep:servo",
     "dep:wayland-client",
@@ -58,6 +65,17 @@ cagents-dictate = { path = "../cagents-dictate" }
 cagents-ui-kit = { path = "../cagents-ui-kit" }
 cagents-browser-import = { path = "../browser-import", features = ["desktop-keyring"], optional = true }
 cookie = { version = "0.18", optional = true }
+# A page Servo cannot render is fetched again as a file, with an HTTP client
+# built as Servo builds its own: hyper over rustls with the platform's
+# certificate verifier. These are the packages and features Servo's network
+# stack already links, so the browser lane builds nothing new.
+http-body-util = { version = "0.1", optional = true }
+hyper = { version = "1.8", optional = true }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "tls12"], optional = true }
+hyper-util = { version = "0.1", features = ["client-legacy", "http1", "http2", "tokio"], optional = true }
+mime = { version = "0.3.13", optional = true }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs", "std", "tls12"], optional = true }
+rustls-platform-verifier = { version = "0.6.2", optional = true }
 net_traits = { package = "servo-net-traits", git = "https://github.com/servo/servo.git", rev = "5c14ac9428d8d95c2f6c2f0300fe248d3929f282", optional = true }
 unicode-casefold = "0.2"
 unicode-linebreak = "0.1"

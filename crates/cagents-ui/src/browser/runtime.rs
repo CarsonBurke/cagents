@@ -533,8 +533,11 @@ impl Engine {
             }
             return;
         }
+        let Some(servo) = self.servo.as_ref() else {
+            return;
+        };
         for card in &mut self.cards {
-            card.after_spin();
+            card.after_spin(servo);
         }
     }
 
@@ -956,10 +959,15 @@ impl Card {
 
     /// Follows one shared `spin_event_loop`. Only Servo's new-frame callback
     /// authorizes a paint, so an idle animation cannot present every 16 ms.
-    fn after_spin(&mut self) {
+    fn after_spin(&mut self, servo: &servo::Servo) {
         let Some(session) = &mut self.session else {
             return;
         };
+        if let Some(unrenderable) = session.unrenderable.take() {
+            self.events.semantic(BrowserEvent::Unrenderable(
+                unrenderable.into_document(servo),
+            ));
+        }
         if session.restore_scroll_ready.replace(false) {
             let x = self.restore.scroll_x;
             let y = self.restore.scroll_y;
@@ -1027,6 +1035,9 @@ struct CardSession {
     pending_clipboard: Rc<RefCell<HashMap<DelegateRequestId, servo::StringRequest>>>,
     pending_file_pickers: Rc<RefCell<HashMap<DelegateRequestId, servo::FilePicker>>>,
     navigation: Rc<RefCell<NavigationState>>,
+    /// A page Servo could not render, found by the load probe and reported
+    /// after the spin, where the runtime's cookie store can be read.
+    unrenderable: Rc<super::content::Slot>,
 }
 
 /// The size Servo must be resized to, or `None` when it already renders at it.
@@ -1067,6 +1078,7 @@ impl CardSession {
         let restore_scroll_ready = Rc::new(Cell::new(false));
         let pending_clipboard = Rc::new(RefCell::new(HashMap::new()));
         let pending_file_pickers = Rc::new(RefCell::new(HashMap::new()));
+        let unrenderable = Rc::new(super::content::Slot::default());
         let navigation = Rc::new(RefCell::new(NavigationState::restored(
             &restore.url,
             &restore.history,
@@ -1086,6 +1098,7 @@ impl CardSession {
             ime_control: RefCell::new(None),
             navigation: navigation.clone(),
             faulted: faulted.clone(),
+            unrenderable: unrenderable.clone(),
         });
         let clipboard = Rc::new(BrowserClipboardDelegate {
             events,
@@ -1127,6 +1140,7 @@ impl CardSession {
             pending_clipboard,
             pending_file_pickers,
             navigation,
+            unrenderable,
         })
     }
 
@@ -1237,6 +1251,7 @@ struct BrowserDelegate {
     ime_control: RefCell<Option<(servo::EmbedderControlId, DelegateRequestId)>>,
     navigation: Rc<RefCell<NavigationState>>,
     faulted: Rc<Cell<bool>>,
+    unrenderable: Rc<super::content::Slot>,
 }
 
 impl BrowserDelegate {
@@ -1317,10 +1332,13 @@ impl servo::WebViewDelegate for BrowserDelegate {
         self.guard(|| self.animating.set(animating));
     }
 
-    fn notify_load_status_changed(&self, _webview: servo::WebView, status: servo::LoadStatus) {
+    fn notify_load_status_changed(&self, webview: servo::WebView, status: servo::LoadStatus) {
         self.guard(|| {
             self.events
                 .semantic(BrowserEvent::LoadStateChanged(format!("{status:?}")));
+            if status == servo::LoadStatus::Complete {
+                super::content::probe(&webview, &self.unrenderable);
+            }
             if status == servo::LoadStatus::Complete
                 && self.navigation.borrow_mut().take_restore_scroll()
             {
@@ -2113,6 +2131,7 @@ mod tests {
             }))
             .build();
         let events = EventBus::new();
+        let unrenderable = Rc::new(super::super::content::Slot::default());
         let navigation = Rc::new(RefCell::new(NavigationState::restored(
             &first,
             std::slice::from_ref(&first),
@@ -2128,6 +2147,7 @@ mod tests {
             ime_control: RefCell::new(None),
             navigation: navigation.clone(),
             faulted: Rc::default(),
+            unrenderable: unrenderable.clone(),
         });
         let webview = servo::WebViewBuilder::new(&servo, rendering_context)
             .url(first.clone())
@@ -2204,5 +2224,47 @@ mod tests {
         spin_until("the second typed address", &|history, loaded| {
             *history == (typed.clone(), 2) && loaded && webview.url() == Some(fourth.clone())
         });
+        assert_eq!(
+            *unrenderable.borrow(),
+            None,
+            "a page Servo rendered is not offered as a file"
+        );
+
+        // A PDF loads as Servo's one-line stand-in, which the load probe
+        // finds; a text file Servo shows itself is left alone.
+        std::fs::write(directory.join("paper.pdf"), b"%PDF-1.4\n%%EOF\n").unwrap();
+        std::fs::write(directory.join("notes.txt"), "Notes").unwrap();
+        let paper = Url::from_file_path(directory.join("paper.pdf")).unwrap();
+        let notes = Url::from_file_path(directory.join("notes.txt")).unwrap();
+        let spin_for = |what: &str, done: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(60);
+            while !done() {
+                while events.try_recv().is_ok() {}
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                servo.spin_event_loop();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        navigate_webview(&webview, &navigation, paper.clone());
+        spin_for("the PDF's probe", &|| unrenderable.borrow().is_some());
+        assert_eq!(
+            unrenderable.take(),
+            Some(super::super::content::Unrenderable {
+                url: paper,
+                content_type: "application/pdf".to_owned(),
+            })
+        );
+        navigate_webview(&webview, &navigation, notes.clone());
+        spin_for("the text file", &|| webview.url() == Some(notes.clone()));
+        // The probe answers after the load completes; a page with a real
+        // origin answers too, and must leave the slot empty.
+        let settle = std::time::Instant::now() + Duration::from_secs(2);
+        spin_for("the text file's probe", &|| {
+            std::time::Instant::now() >= settle
+        });
+        assert_eq!(*unrenderable.borrow(), None);
     }
 }

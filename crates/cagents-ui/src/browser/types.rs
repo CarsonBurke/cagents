@@ -323,6 +323,8 @@ pub enum BrowserEvent {
     Delegate(DelegateRequest),
     LifecycleChanged(BrowserLifecycle),
     ClosedByContent,
+    /// The page loaded is one Servo cannot show, such as a PDF.
+    Unrenderable(super::UnrenderableDocument),
     Error(BrowserError),
     Crashed {
         reason: String,
