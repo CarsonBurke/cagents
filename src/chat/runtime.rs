@@ -1138,9 +1138,8 @@ impl LocalHandle {
         &self,
         run: crate::model::RunId,
         command: Command,
-    ) -> Result<(), String> {
+    ) -> Result<(), Rejection> {
         self.submit_command(Some(run), command, false)
-            .map_err(String::from)
     }
 
     /// Resolve only a current refusal, checked by the provider actor itself.

@@ -1,3 +1,4 @@
+mod acp_mode;
 mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
@@ -7960,10 +7961,18 @@ fn an_acp_agent_s_launch_names_its_mode_in_its_own_words() {
             "low"
         ]
     );
-    // `agy --mode` does not take its default by name.
+    // This recipe feeds the native chat adapter, which names the default
+    // over ACP even though the stock terminal command cannot take it.
     assert_eq!(
         launch_options(&spec("default")),
-        ["--model", "gemini-3.8-flash", "--effort", "low"]
+        [
+            "--model",
+            "gemini-3.8-flash",
+            "--mode",
+            "default",
+            "--effort",
+            "low"
+        ]
     );
 }
 
