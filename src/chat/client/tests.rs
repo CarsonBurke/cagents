@@ -7777,3 +7777,75 @@ fn starting_a_chat_connects_to_the_daemon_once() {
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+/// A conversation whose provider the lost daemon ran itself has nothing left
+/// to attach to. Reconnecting stops asking, and says why in the reader's
+/// terms; only the reader's explicit restore starts the provider again, on
+/// the saved conversation and this daemon's proof, with nothing sent.
+#[test]
+fn a_chat_its_lost_daemon_ran_is_reopened_only_when_asked() {
+    let live = host_proof("live");
+    let saved = omp_card(Some(CONVERSATION), Some(host_proof("lost")));
+    let refusal = || {
+        ServerMessage::Error(ipc::ProtocolError::new(
+            ipc::ProtocolErrorCode::TerminalUnavailable,
+            crate::chat::daemon_lost_stopped(crate::agent::Provider::Omp),
+            true,
+        ))
+    };
+    let (outcome, asked, _) = negotiate_with_restore_policy(&live, saved.clone(), refusal(), true);
+    assert!(
+        matches!(&asked, ClientRequest::ResolveUpgradeChat { source } if *source == saved),
+        "{asked:?}"
+    );
+    let failure = outcome.unwrap_err();
+    assert_eq!(failure.recovery, crate::chat::Recovery::DaemonLost);
+    assert!(failure.recovery.is_blocked(), "attaching again cannot help");
+    assert!(
+        failure
+            .message
+            .starts_with(crate::chat::DAEMON_LOST_STOPPED),
+        "{}",
+        failure.message
+    );
+    assert!(!failure.message.contains("holder"), "{}", failure.message);
+
+    let (outcome, _, _) = negotiate_with_restore_policy(&live, saved.clone(), refusal(), false);
+    let mut expected = saved;
+    expected.proof = Some(live);
+    assert!(
+        matches!(
+            &outcome,
+            Ok(ClientRequest::ChatStart { session, source: None, terminate_source: false, .. })
+                if *session == expected
+        ),
+        "{outcome:?}"
+    );
+}
+
+/// An older daemon's holder refusal keeps its ordinary retry: only the
+/// daemon's own sentence for a lost daemon's chat offers a reopen.
+#[test]
+fn only_the_lost_daemon_refusal_offers_a_reopen() {
+    for (message, recovery) in [
+        (
+            crate::chat::daemon_lost_stopped(crate::agent::Provider::Antigravity),
+            crate::chat::Recovery::DaemonLost,
+        ),
+        (
+            crate::chat::NOTHING_RUNS_IT.to_owned(),
+            crate::chat::Recovery::Retry,
+        ),
+        (
+            format!("Cannot attach: {}", crate::chat::DAEMON_LOST_STOPPED),
+            crate::chat::Recovery::Retry,
+        ),
+    ] {
+        let failure = start_failure(ipc::ProtocolError::new(
+            ipc::ProtocolErrorCode::TerminalUnavailable,
+            message,
+            true,
+        ));
+        assert_eq!(failure.recovery, recovery, "{}", failure.message);
+    }
+}

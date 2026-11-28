@@ -887,6 +887,13 @@ pub enum Recovery {
     /// restore does, only meets the same refusal; an explicit start of the
     /// saved conversation reopens it, and the reader has to ask for that.
     UpdateStopped,
+    /// The daemon that ran this conversation's provider ended without
+    /// stopping it, and nothing else kept the provider: no holder, terminal or
+    /// listener outlived that daemon ([`DAEMON_LOST_STOPPED`]). Nothing of it
+    /// is attached and nothing was resent. Attaching again only meets the
+    /// same refusal; the reader's explicit restore of the saved conversation
+    /// reopens it, and the reader has to ask for that.
+    DaemonLost,
 }
 
 impl Recovery {
@@ -895,7 +902,11 @@ impl Recovery {
     pub fn is_blocked(self) -> bool {
         matches!(
             self,
-            Self::Blocked | Self::AfterRestart | Self::UpdateRecovery | Self::UpdateStopped
+            Self::Blocked
+                | Self::AfterRestart
+                | Self::UpdateRecovery
+                | Self::UpdateStopped
+                | Self::DaemonLost
         )
     }
 }
@@ -919,6 +930,27 @@ pub fn update_restart_stopped(reason: &str) -> String {
     let reason = reason.trim_end_matches('.');
     format!("{UPDATE_RESTART_STOPPED}. {reason}. It isn't running, and nothing was resent.")
 }
+
+/// How the daemon's refusal begins for a conversation whose provider the
+/// daemon ran itself, when the daemon ended without stopping it. Nothing kept
+/// that provider attached, so a restore can only attach to nothing; a client
+/// reads this prefix as [`Recovery::DaemonLost`] and offers the reader an
+/// explicit reopen instead.
+pub const DAEMON_LOST_STOPPED: &str =
+    "This conversation stopped when cagents' background service quit unexpectedly";
+
+/// The daemon's full refusal for [`DAEMON_LOST_STOPPED`], naming the provider
+/// the person knows the conversation by.
+pub fn daemon_lost_stopped(provider: crate::agent::Provider) -> String {
+    format!(
+        "{DAEMON_LOST_STOPPED}. {} is no longer connected, and nothing was resent.",
+        provider.label()
+    )
+}
+
+/// The daemon's refusal to reattach a conversation no holder is registered
+/// for, when nothing says why. It already says that nothing was restarted.
+pub const NOTHING_RUNS_IT: &str = "Nothing is running this conversation any more, so it couldn't be reconnected. Nothing was restarted or resent.";
 
 /// How the daemon's refusal under startup recovery's hold on original
 /// ownership begins. The protocol has no code of its own for it, so a client

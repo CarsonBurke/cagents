@@ -353,18 +353,19 @@ fn restore_reserved(
     proof: &HostSessionProof,
 ) -> Result<ServerResponse, SetupError> {
     let directory = registry::directory(Kind::Native).map_err(SetupError::Unavailable)?;
-    let record = registry::recovery_candidate(
-        &registry::socket(&directory, source.id),
-        Kind::Native,
-    ).map_err(SetupError::Unavailable)?
-    .ok_or_else(|| SetupError::Unavailable(
-        // The update's restore stopped this conversation's failed restart:
-        // say so rather than suggest a holder may yet appear.
-        super::super::state::stopped_upgrade_reason(host, source).map_or_else(
-            || "The durable native holder is unavailable; this conversation was not restarted or resent".into(),
-            |reason| chat::update_restart_stopped(&reason),
-        ),
-    ))?;
+    let record =
+        registry::recovery_candidate(&registry::socket(&directory, source.id), Kind::Native)
+            .map_err(SetupError::Unavailable)?
+            .ok_or_else(|| {
+                SetupError::Unavailable(
+                    // The update's restore stopped this conversation's failed restart:
+                    // say so rather than suggest a holder may yet appear.
+                    super::super::state::stopped_upgrade_reason(host, source).map_or_else(
+                        || missing_owner(host, source),
+                        |reason| chat::update_restart_stopped(&reason),
+                    ),
+                )
+            })?;
     if Handle::is_remote_record(&record) {
         return super::retained_actor::restore_for_start(host, client, source, proof, record);
     }
@@ -405,6 +406,17 @@ fn restore_reserved(
         super::super::state::retire_unattached_upgrade_chat(host, source.id);
     }
     result
+}
+
+/// Why nothing reattaches `source` when no holder is registered for it. A
+/// provider the lost daemon ran itself had no holder to find: the window is
+/// told it stopped with that daemon, which it may offer to reopen.
+fn missing_owner(host: &SharedHost, source: &Session) -> String {
+    if super::ended_with_lost_daemon(host, source) {
+        chat::daemon_lost_stopped(source.launch.provider)
+    } else {
+        chat::NOTHING_RUNS_IT.into()
+    }
 }
 
 fn restore_authenticated(
