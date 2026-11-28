@@ -41,10 +41,14 @@ class PruneBuildDirs(unittest.TestCase):
         # Only private directories are ever searched.
         self.env |= {"HOME": str(self.home), "CAGENTS_BUILD_PRUNE_ROOTS": str(self.roots)}
 
-    def prune(self, *arguments, apply=True, status=0):
-        command = [str(PRUNER), "--lock", str(self.root / "lock"), "--log", str(self.log),
+    def prune(self, *arguments, apply=True, status=0, managed_log=False, limit_writes=False):
+        log_option = "--managed-log" if managed_log else "--log"
+        command = [str(PRUNER), "--lock", str(self.root / "lock"), log_option, str(self.log),
                    "--mirror", str(self.roots / "cargo-build"), "--verbose",
                    "--max-idle", str(IDLE / 86400), "--orphan-hours", str(IDLE / 3600)]
+        if limit_writes:
+            # Turn a file size limit into a write error instead of a signal.
+            command = ["sh", "-c", 'trap "" XFSZ; ulimit -f 1; exec "$@"', "sh", *command]
         result = subprocess.run(command + (["--apply"] if apply else []) + list(arguments),
                                 env=self.env, capture_output=True, text=True, timeout=HANG_GUARD)
         self.assertEqual(result.returncode, status, result.stderr)
@@ -89,6 +93,69 @@ class PruneBuildDirs(unittest.TestCase):
         # The worktree that held it stays.
         self.assertTrue((self.roots / "repo/.worktrees/old").is_dir())
         self.assertEqual(len(self.log.read_text().splitlines()), 4)
+
+    def test_managed_removal_log_rotates_and_retains_recent_complete_rows(self):
+        limit = 1 << 20
+        oldest = b"old record\n"
+        latest = b"most recent record\n"
+        middle = b"intervening record\n"
+        repetitions = (limit - len(oldest + latest)) // len(middle)
+        self.log.write_bytes(oldest + middle * repetitions + latest)
+        self.assertLessEqual(self.log.stat().st_size, limit)
+        self.assertLess(limit - self.log.stat().st_size, 50)
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+
+        self.prune(managed_log=True)
+
+        self.assertFalse(path.exists())
+        rows = self.log.read_bytes().splitlines(keepends=True)
+        self.assertLessEqual(self.log.stat().st_size, limit)
+        self.assertEqual(rows[0], middle)
+        self.assertEqual(rows[-2], latest)
+        self.assertIn(os.fsencode(path), rows[-1])
+
+    def test_oversized_legacy_log_is_bounded_even_without_a_removal(self):
+        recent = b"recent record\n"
+        self.log.write_bytes(b"older content\n" * (1 << 17) + recent)
+        previous_size = self.log.stat().st_size
+        with (self.root / "lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.prune(managed_log=True, status=75)
+        self.assertEqual(self.log.stat().st_size, previous_size)
+        self.prune(apply=False, managed_log=True)
+        self.assertEqual(self.log.stat().st_size, previous_size)
+
+        self.prune(managed_log=True)
+
+        self.assertLessEqual(self.log.stat().st_size, 1 << 20)
+        self.assertTrue(self.log.read_bytes().endswith(recent))
+
+    def test_explicit_removal_log_remains_append_only(self):
+        old_row = b"kept old record\n"
+        self.log.write_bytes(old_row * (1 << 17))
+        previous_size = self.log.stat().st_size
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+
+        self.prune()
+
+        with self.log.open("rb") as log:
+            self.assertEqual(log.readline(), old_row)
+            log.seek(previous_size)
+            self.assertIn(os.fsencode(path), log.read())
+
+    def test_managed_log_write_failure_does_not_stop_pruning(self):
+        legacy = b"existing log record\n" * (1 << 16)
+        self.log.write_bytes(legacy)
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+
+        output = self.prune(managed_log=True, limit_writes=True)
+
+        self.assertFalse(path.exists())
+        self.assertEqual(self.log.read_bytes(), legacy)
+        self.assertIn(f"removed {path}", output)
 
     def test_a_recent_write_anywhere_inside_keeps_it(self):
         path = self.target(self.roots / "lane/target")

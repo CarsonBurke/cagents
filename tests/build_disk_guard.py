@@ -240,7 +240,8 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertIn(f"--stamp {self.root}/pruner.scheduled", call)
         self.assertIn(f"--keep {self.root}", call)
         self.assertIn(f"--root {checkout.resolve()} --keep-checkout {checkout.resolve()}", call)
-        self.assertIn(f"--log {self.root}/pruner.tsv", call)
+        for invocation in lines:
+            self.assertIn(f"--managed-log {self.root}/pruner.tsv", invocation)
 
     def test_under_pressure_the_schedule_starts_nothing_more(self):
         guard, calls = self.stand_in_pruner()
