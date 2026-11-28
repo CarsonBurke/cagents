@@ -1325,11 +1325,11 @@ cmd_open_window() {
     session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" env)
     eval "$session_environment"
     original=$(app_window_ids) || die 'could not observe the current native windows'
-    # Probe the actual window lease before launching: a duplicate slot would
-    # activate its existing window and could never produce a new native ID.
+    # Only an exclusive lease names an existing window. Other observers
+    # use shared locks and can inspect this slot alongside us.
     if [ -e "$runtime/cagents-development-ui.lock.$slot" ]; then
         exec 6<"$runtime/cagents-development-ui.lock.$slot"
-        flock -n -x 6 || die "window $slot is already open"
+        flock -n -s 6 || die "window $slot is already open"
         exec 6<&-
     fi
     rm -f -- "$state/window-$slot"
