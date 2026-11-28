@@ -481,6 +481,7 @@ fn launch_account_error(failure: crate::account::registry::LaunchAccountError) -
         if matches!(
             failure,
             crate::account::registry::LaunchAccountError::Removed { .. }
+                | crate::account::registry::LaunchAccountError::Archived { .. }
         ) {
             ProtocolErrorCode::AccountRemoved
         } else {

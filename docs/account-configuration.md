@@ -180,10 +180,11 @@ daemon, save account preferences there, and run sign-in on that device.
 Remote Codex sign-in uses its device-code flow, so browser consent can finish
 on the desktop without forwarding localhost callbacks. Adding, linking and
 removing managed accounts operates on the daemon's device. Linked paths are
-entered as device paths; `~/` expands to the device user's home. The daemon
-refuses removal while that home still belongs to a live hosted terminal,
-sign-in or conversation. Linked homes are forgotten without deleting their
-files. Pending sign-ins survive a window restart and are verified on the
+entered as device paths. `~/` expands to the device user's home. Close panes,
+hosted terminals, conversations, and sign-in sessions using the account before
+forgetting or archiving it. The selected daemon also checks its saved panes
+and retained conversations. Linked homes are forgotten with their files
+and sign-in intact. Pending sign-ins survive a window restart and are verified on the
 device before joining its account list.
 
 New Claude homes receive a one-time copy of `settings.json` and user-scoped
@@ -385,9 +386,41 @@ cagents account remove claude/00000000-0000-4000-8000-000000000001 --yes
 
 The selected daemon authenticates the caller and applies its existing account
 lifecycle admission. Agent tokens and live home owners cannot remove
-accounts. System accounts cannot be removed. This build also refuses managed
-account file deletion and retains the account and its files. A linked account
-is forgotten without deleting its files. The CLI sends only the account ID,
-never a local home path, and requires `--yes` before contacting the daemon.
-If the response is uncertain, inspect the account list before retrying; removal
-does not retry automatically.
+accounts. System accounts cannot be removed. The CLI sends the linked account ID
+to the selected daemon and requires `--yes` before contacting it. If the response
+is uncertain, inspect the account list before retrying.
+
+## Archiving a managed account
+
+Use `account removal-plan` to count saved transcripts on the selected device.
+Then use one of the `account archive` commands from your own system terminal.
+Replace the example IDs with the IDs from `account list`. Use the same
+`--device` on each command when the accounts are on another device.
+
+```sh
+cagents account removal-plan codex/00000000-0000-4000-8000-000000000001
+cagents account archive codex/00000000-0000-4000-8000-000000000001 --yes
+cagents account archive codex/00000000-0000-4000-8000-000000000001 --move-to codex/system --yes
+```
+
+Archive signs out the managed Claude or Codex home through its provider CLI,
+keeps its history on disk, and removes it from account routing. Defaults that
+pointed to the archived account inherit ordinary routing again.
+
+With `--move-to`, the daemon copies the transcripts to an active account of the
+same provider before signing out. Close hosted sessions on that account too.
+The transfer preserves top-level Claude project transcripts and Codex rollout
+paths, including archived Codex rollouts. It copies transcript files only.
+An identical copy can be reused. A compatible shorter copy can
+be extended. A divergent target stops the move while keeping the source history
+and login. If publishing copies fails partway through, the original transcripts
+remain available for a retry.
+
+Once any copies are in place, the daemon hides the source from routing before
+asking the provider to sign out. If sign-out fails or gets interrupted, repeat
+the archive command to finish it. The source home stays on disk throughout.
+
+Resume moved conversations on the target account. An existing saved
+conversation can use its account recovery action to pick that account. To put an
+archived home back on the account list, sign in to that home with the provider's
+CLI on the owning device, then link the home again.

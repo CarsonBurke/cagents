@@ -32,20 +32,38 @@ pub enum Operation {
         provider: Provider,
         key: uuid::Uuid,
     },
+    RemovalPlan {
+        id: AccountId,
+    },
+    Archive {
+        id: AccountId,
+        move_to: Option<AccountId>,
+    },
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RemovalPlan {
+    pub conversations: usize,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Archived {
+    pub revision: u64,
+    pub moved: usize,
 }
 
 #[cfg(feature = "host")]
-pub(crate) fn affected_account(
+mod removal;
+#[cfg(feature = "host")]
+pub use removal::removal_plan;
+
+#[cfg(feature = "host")]
+fn affected_account(
     operation: &Operation,
+    registry: &super::registry::Registry,
+    homes: &super::home::Homes,
 ) -> Result<Option<super::Account>, LifecycleError> {
-    use super::{
-        Account,
-        home::Homes,
-        registry::{LIST_PATIENCE, Store, patiently},
-    };
-    let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
-    let store = Store::installation().ok_or("Remote account registry is unavailable")?;
-    let registry = patiently(LIST_PATIENCE, || store.try_load())?;
+    use super::Account;
     match operation {
         Operation::Register { provider, key } | Operation::Abandon { provider, key } => {
             let pending = registry
@@ -83,10 +101,10 @@ pub(crate) fn affected_account(
         // the system login the way the accounts view does, without making
         // every open terminal on the system home refuse the restoration.
         Operation::Restore { provider, key } => {
-            if registry.contains_managed_home(&homes, *provider, *key) {
+            if registry.contains_managed_home(homes, *provider, *key) {
                 return Ok(None);
             }
-            if !homes.is_unregistered(&registry, *provider, *key) {
+            if !homes.is_unregistered(registry, *provider, *key) {
                 return Err(NO_HOME.into());
             }
             Ok(Some(Account::managed(
@@ -97,11 +115,14 @@ pub(crate) fn affected_account(
         }
         Operation::Create { provider, .. } => Ok(Some(Account::system(*provider))),
         Operation::Remove { id } => registry
-            .accounts(Some(&homes))
+            .accounts(Some(homes))
             .into_iter()
             .find(|account| account.id() == *id)
             .map(Some)
             .ok_or("The device account was removed".into()),
+        Operation::RemovalPlan { .. } | Operation::Archive { .. } => {
+            unreachable!("managed removal has its own account lookup")
+        }
     }
 }
 
@@ -118,7 +139,21 @@ pub fn affected_accounts(operation: &Operation) -> Result<Vec<super::Account>, L
     if provider.is_some_and(|provider| !super::Account::PROVIDERS.contains(provider)) {
         return Err("Omp manages its own logins".into());
     }
-    let mut accounts: Vec<_> = affected_account(operation)?.into_iter().collect();
+    use super::{
+        home::Homes,
+        registry::{LIST_PATIENCE, Store, patiently},
+    };
+    let homes = Homes::installation().ok_or("Remote account storage is unavailable")?;
+    let store = Store::installation().ok_or("Remote account registry is unavailable")?;
+    let registry = patiently(LIST_PATIENCE, || store.try_load())?;
+    if let Operation::Archive { id, move_to } = operation {
+        let source = removal::source(&registry, &homes, id)?;
+        let target = removal::target(&registry, &homes, &source, move_to.as_ref())?;
+        return Ok(std::iter::once(source).chain(target).collect());
+    }
+    let mut accounts: Vec<_> = affected_account(operation, &registry, &homes)?
+        .into_iter()
+        .collect();
     // Register reads the pending home and probes System for duplicate login
     // identity. Reserve both before either probe; an idempotent completed
     // registration has no probe and therefore needs no System reservation.
@@ -256,6 +291,12 @@ pub trait Reservation {
     /// Makes `attempt` again while another process holds the account list,
     /// for as long as the daemon is patient.
     fn patiently<T>(&self, attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T>;
+    /// Saves the routing hold and advances the reservation's registry basis.
+    fn hide_before_sign_out(
+        &self,
+        store: &super::registry::Store,
+        key: uuid::Uuid,
+    ) -> Result<(), LifecycleError>;
     /// Runs `effect` once the reservation is verified, as one patient attempt.
     fn commit<T>(&self, effect: impl FnMut() -> std::io::Result<T>) -> Result<T, LifecycleError>;
 }
@@ -329,6 +370,12 @@ pub fn execute_at(
             provider,
             copy_codex_config,
         } => create(provider, copy_codex_config, reservation, &homes, &store),
+        Operation::Archive { id, move_to } => {
+            removal::archive(reservation, &homes, &store, &id, move_to.as_ref())
+        }
+        Operation::RemovalPlan { .. } => {
+            Err("Account removal previews use the read-only handler".into())
+        }
         operation => change(operation, reservation, homes, store),
     }
 }
@@ -401,7 +448,9 @@ fn change(
         .build()?;
     reservation.verify()?;
     match operation {
-        Operation::Create { .. } => unreachable!("execute_at creates accounts itself"),
+        Operation::Create { .. } | Operation::Archive { .. } | Operation::RemovalPlan { .. } => {
+            unreachable!("execute_at handles this account operation separately")
+        }
         Operation::Link {
             provider,
             key,

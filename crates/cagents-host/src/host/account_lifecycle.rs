@@ -4,6 +4,9 @@
 //! This foundation issues no deletion permit. Managed removal refuses and
 //! pending/failed homes remain intact. Historical namespace enrollment and
 //! complete actor/reader retirement census belong to that separate cut.
+mod removal;
+pub(super) use removal::admit_pane_edit;
+
 use super::state::SharedHost;
 use crate::chat::protocol::SetupError;
 use crate::{
@@ -28,6 +31,7 @@ type Map = BTreeMap<uuid::Uuid, Arc<Reserved>>;
 #[derive(Clone)]
 pub(super) struct Reserved {
     homes: Vec<Home>,
+    removing: bool,
     /// The unregistered home this reservation restores, if that is what it
     /// is for. A restore changes no home and writes the list only under its
     /// locks, so it does not hold up a shutdown, an upgrade or a chat's
@@ -301,6 +305,7 @@ pub(crate) struct Reservation {
     accounts: Vec<Account>,
     create: Option<(crate::agent::Provider, uuid::Uuid)>,
     store: Store,
+    hidden_for_sign_out: Mutex<Option<uuid::Uuid>>,
     /// How long each step asks again for an account-list lock another
     /// process holds. See [`crate::account::registry::patiently`].
     patience: std::time::Duration,
@@ -310,6 +315,7 @@ pub(crate) struct Reservation {
         uuid::Uuid,
         Option<crate::account::registry::Registered>,
         Option<crate::account::registry::Pending>,
+        bool,
         bool,
     )>,
 }
@@ -337,6 +343,7 @@ impl Reservation {
         host: &SharedHost,
         accounts: &[Account],
         restores: Option<(crate::agent::Provider, uuid::Uuid)>,
+        removing: bool,
     ) -> Result<Self, ProtocolError> {
         let store = Store::installation().ok_or_else(|| refusal("Account registry unavailable"))?;
         Self::install_with_store(
@@ -345,6 +352,7 @@ impl Reservation {
             store,
             crate::account::home::Homes::installation().as_ref(),
             restores,
+            removing,
             crate::account::registry::LIST_PATIENCE,
         )
     }
@@ -355,6 +363,7 @@ impl Reservation {
         store: Store,
         installed_homes: Option<&crate::account::home::Homes>,
         restores: Option<(crate::agent::Provider, uuid::Uuid)>,
+        removing: bool,
         patience: std::time::Duration,
     ) -> Result<Self, ProtocolError> {
         let gate = host
@@ -378,6 +387,12 @@ impl Reservation {
             })
             .collect::<Result<Vec<_>, _>>()
             .map_err(refusal)?;
+        if removing
+            && let [source, target] = homes.as_slice()
+            && source.overlaps(target)
+        {
+            return Err(refusal("Choose a target with a separate account home"));
+        }
         // Nothing is held yet: no lease, no control admission.
         let registry = crate::account::registry::patiently(patience, || store.try_load())
             .map_err(|error| super::client::lifecycle_refusal(error.into()))?;
@@ -417,6 +432,7 @@ impl Reservation {
                         .find(|pending| pending.key == key)
                         .cloned(),
                     registry.is_archived(key),
+                    registry.is_signed_out(key),
                 )
             })
             .collect();
@@ -455,7 +471,14 @@ impl Reservation {
                 "An operation is already changing this account home. Wait for it to finish, then retry.",
             ));
         }
-        entries.insert(token, Arc::new(Reserved { homes, restores }));
+        entries.insert(
+            token,
+            Arc::new(Reserved {
+                homes,
+                restores,
+                removing,
+            }),
+        );
         drop(entries);
         drop(writer);
         let reservation = Self {
@@ -466,6 +489,7 @@ impl Reservation {
             create: None,
             registered,
             store,
+            hidden_for_sign_out: Default::default(),
             patience,
         };
         // No effects have happened. Refuse any filesystem/registration change
@@ -496,6 +520,7 @@ impl Reservation {
             store,
             Some(homes),
             None,
+            false,
             crate::account::registry::LIST_PATIENCE,
         )
     }
@@ -603,7 +628,18 @@ impl Reservation {
             crate::account::remote::Operation::Restore { provider, key } => Some((*provider, *key)),
             _ => None,
         };
-        let mut reservation = Self::install_restoring(host, &accounts, restores)?;
+        let removing = matches!(
+            operation,
+            crate::account::remote::Operation::Remove { .. }
+                | crate::account::remote::Operation::Archive { .. }
+        );
+        let mut reservation = Self::install_restoring(host, &accounts, restores, removing)?;
+        if removing {
+            let held = reservation.current().map_err(refusal)?;
+            if let Some((source, target)) = held.homes.split_first() {
+                removal::ensure_unoccupied(host, accounts[0].provider, source, target)?;
+            }
+        }
         if create.is_some()
             && reservation
                 .current()
@@ -957,10 +993,15 @@ impl Reservation {
         for home in &current.homes {
             home.verify()?;
         }
-        for (key, account, pending, archived) in &self.registered {
+        let hidden_for_sign_out = *self
+            .hidden_for_sign_out
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        for (key, account, pending, archived, signed_out) in &self.registered {
             if registry.find(*key) != account.as_ref()
                 || registry.pending().iter().find(|value| value.key == *key) != pending.as_ref()
-                || registry.is_archived(*key) != *archived
+                || registry.is_archived(*key) != (*archived || hidden_for_sign_out == Some(*key))
+                || registry.is_signed_out(*key) != *signed_out
             {
                 return Err(
                     "The affected account registration changed; reload accounts before retrying"
@@ -1004,6 +1045,21 @@ impl crate::account::remote::Reservation for Reservation {
 
     fn patiently<T>(&self, attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
         Reservation::patiently(self, attempt)
+    }
+
+    fn hide_before_sign_out(
+        &self,
+        store: &Store,
+        key: uuid::Uuid,
+    ) -> Result<(), crate::account::remote::LifecycleError> {
+        self.commit(|| {
+            store.try_update_reserved(self, |registry| registry.hide_before_sign_out(key))
+        })?;
+        *self
+            .hidden_for_sign_out
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(key);
+        Ok(())
     }
 
     fn commit<T>(
@@ -2111,6 +2167,7 @@ pub(crate) mod tests {
             store.clone(),
             None,
             None,
+            false,
             std::time::Duration::from_millis(30),
         ) {
             Err(refusal) => refusal,
@@ -2130,6 +2187,7 @@ pub(crate) mod tests {
                     store.clone(),
                     None,
                     None,
+                    false,
                     std::time::Duration::from_secs(30),
                 )
                 .map(drop)

@@ -1,5 +1,4 @@
-//! Transfer only the exact idle conversation's transcript between CLI homes.
-//! Login stores, configuration and unrelated conversations never move.
+//! Copy provider transcripts between CLI homes, preserving their relative paths.
 use crate::{agent::Provider, chat::Session};
 use std::{
     fs,
@@ -30,7 +29,7 @@ pub struct Staged {
 /// alternate account whose copy of the conversation has diverged.
 pub fn stage(source: &Session, replacement: &Session) -> Result<Staged, String> {
     let (source, destination) = locate(source, replacement)?;
-    stage_transcript(source, destination).map_err(|error| {
+    stage_transcript(source, destination, Staging::Active).map_err(|error| {
         format!("The conversation history could not be prepared on the alternate account: {error}")
     })
 }
@@ -169,20 +168,30 @@ fn destination_current(destination: &Path, bytes: &[u8]) -> io::Result<bool> {
     Ok(destination.exists() && matches_existing_transcript(destination, bytes)?)
 }
 
-/// Stages a copy even when the destination already holds the history, so the
-/// commit after the original closes only renames into a directory this
-/// account has already written.
-fn stage_transcript(source: PathBuf, destination: PathBuf) -> io::Result<Staged> {
+enum Staging {
+    /// A live source can append before commit, so prove that the destination is
+    /// writable even when it already has a matching copy.
+    Active,
+    /// Account removal has fenced the source, so identical copies need no space.
+    Idle { clean: bool },
+}
+
+fn stage_transcript(source: PathBuf, destination: PathBuf, staging: Staging) -> io::Result<Staged> {
     let bytes = read_transcript(&source)?;
     let mut staged = Staged {
         source,
         destination,
         temporary: None,
     };
-    destination_current(&staged.destination, &bytes)?;
+    let identical = destination_current(&staged.destination, &bytes)?;
+    if identical && matches!(staging, Staging::Idle { .. }) {
+        return Ok(staged);
+    }
     let parent = transcript_directory(&staged.destination)?;
     crate::secure_file::prepare_private_directory(parent)?;
-    remove_abandoned_copies(parent);
+    if matches!(staging, Staging::Active | Staging::Idle { clean: true }) {
+        remove_abandoned_copies(parent);
+    }
     let temporary = parent.join(format!("{STAGED_PREFIX}{}", uuid::Uuid::new_v4()));
     use std::os::unix::fs::OpenOptionsExt;
     let mut file = fs::OpenOptions::new()
@@ -251,12 +260,17 @@ fn commit_transcript(staged: &mut Staged) -> io::Result<()> {
     fs::File::open(&parent)?.sync_all()
 }
 
+#[cfg(feature = "host")]
+mod inventory;
+#[cfg(feature = "host")]
+pub(crate) use inventory::Inventory;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn stage_at(source: &Path, destination: &Path) -> io::Result<Staged> {
-        stage_transcript(source.to_owned(), destination.to_owned())
+        stage_transcript(source.to_owned(), destination.to_owned(), Staging::Active)
     }
 
     fn copy_transcript(source: &Path, destination: &Path) -> io::Result<()> {

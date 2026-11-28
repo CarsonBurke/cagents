@@ -178,6 +178,9 @@ fn edit_then_guarded<T>(
         _ => false,
     };
     // A replayed operation returns its original result without re-checking later pane ownership.
+    if !replay {
+        super::account_lifecycle::admit_pane_edit(host, &edit)?;
+    }
     if !replay && super::chat::pane_start::requires_edit_check(&edit) {
         super::chat::pane_start::validate_edit(host, &registry, &edit)?;
     }

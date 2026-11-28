@@ -375,7 +375,9 @@ use crate::{
 /// Version 221 adds per-session context usage and idle compaction requests.
 ///
 /// Version 222 appends tracked compaction requests and outcome replies.
-pub const PROTOCOL_VERSION: u16 = 222;
+///
+/// Version 223 adds managed account removal planning, transcript transfer and archival.
+pub const PROTOCOL_VERSION: u16 = 223;
 /// The refusal of a retired channel-work request or workspace edit.
 pub const RETIRED_CHANNEL_WORK: &str =
     "Channel work was removed; the Work board (`cagents work`) tracks pull requests";
