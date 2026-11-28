@@ -320,16 +320,28 @@ draft is rehearsed; see [Signing in GitHub Actions](#signing-in-github-actions).
    - a private user with its own headless desktop installs the published
      release;
    - it opens three windows, one holding nothing, and seeds chats, agents, a
-     channel, terminals with a long-lived child and a chat whose provider has
-     already stopped;
+     channel and terminals with a long-lived child;
+   - it also seeds a chat whose provider has already stopped when the
+     **published source tag** lists `ended-provider` in
+     `scripts/release-rehearsal-capabilities.txt`. That capability requires
+     both the stopped-provider lifecycle fix (#4832) and the checkpoint
+     verification fix (#3860). Before declaring the capability, verify
+     that the source reports the chat as exited or omits it from its live
+     inventory before the update begins, including when the provider
+     outlives the worker. Published 0.2.3 and 0.2.4 run the standard matrix
+     without that seed;
    - the published build's own updater finds the cut in a file feed made
      from the cut bundle, checks its signature against the release keys, and
      updates;
    - it requires every pane, chat, agent and terminal to survive, NEW to
      serve, the windows to reopen on NEW, and no reopened window to show
      "Update failed" or "Update not installed";
-   - then, as after a reboot, it closes the windows, stops NEW's daemon and
-     reopens them, and requires the same again.
+   - then, as after a reboot, it closes the windows, deliberately stops
+     NEW's daemon and reopens the windows. The update must still read
+     `Complete` with NEW serving. A note that saved panes could not
+     reconnect is expected for the seeded terminal and console panes after
+     this stop. The harness verifies that they survived the update before
+     it stops their daemon.
 
    It takes about 12 minutes, plus the published release's download the
    first time. Interrupting it stops the run on the host too. The options

@@ -945,6 +945,19 @@ start_next_version() {
     [[ ! -d $worktree ]] || repository_git worktree remove --force "$worktree"
 }
 
+# An ended provider exercises the source daemon even when the cut runs the
+# staged updater. Read the published tag, which can differ from a local tag,
+# without changing refs or FETCH_HEAD.
+source_supports_ended_provider() {
+    local ref=refs/tags/v$1 tag capabilities
+    tag=$(repository_git ls-remote --refs origin "$ref") || return 1
+    tag=${tag%%$'\t'*}
+    [[ $tag =~ ^([a-f0-9]{40}|[a-f0-9]{64})$ ]] || return 1
+    fetch_cut_objects <<< "$tag" || return 1
+    capabilities=$(repository_git show "$tag^{commit}:scripts/release-rehearsal-capabilities.txt" 2>/dev/null) || return 1
+    grep -qxF ended-provider <<< "$capabilities"
+}
+
 # The version is updated from what is published now to the bytes cut, copied
 # to the build host. By default the published build updates itself as a
 # person does, from a file feed of the signed cut; --staged runs the cut's
@@ -952,7 +965,7 @@ start_next_version() {
 # draft the release workflow left and serve it as it would be published.
 rehearse() {
     local bundle=$BUNDLES/$VERSION sha previous root started mode=in-app files=() incoming status
-    local source=bundle metadata=release-metadata.json generation state reason refusal_harness=-
+    local source=bundle metadata=release-metadata.json generation state reason ended_provider=false
     if [[ $FROM_DRAFT == true ]]; then
         source=draft
         sha=$(repository_git rev-parse --verify --quiet "refs/tags/$TAG^{commit}") \
@@ -987,10 +1000,10 @@ rehearse() {
     [[ $previous =~ $VERSION_PATTERN && $previous != "$VERSION" \
         && $(printf '%s\n%s\n' "$previous" "$VERSION" | sort -V | tail -n1) == "$VERSION" ]] \
         || fail "the newest published release is $previous, not older than $VERSION; there is nothing to rehearse"
-    # Even a staged update asks the published daemon to review its live work.
-    # The cut may predate the separate refusal case, which uses this checkout's harness.
-    if [[ $previous == 0.2.3 ]]; then
-        refusal_harness=$(repository_git rev-parse --verify HEAD) || fail 'cannot locate the refusal harness commit'
+    if source_supports_ended_provider "$previous"; then
+        ended_provider=true
+    else
+        printf 'Source %s has no verified ended-provider support. Running the normal upgrade cases.\n' "$previous"
     fi
     # ssh would drop an empty argument, and the host's shell parses the rest.
     root=${REHEARSAL_ROOT:--}
@@ -1016,7 +1029,7 @@ HOST
     fi
     status=0
     on_host "$sha" "$VERSION" "$previous" "$GITHUB_REPOSITORY" "$root" "$mode" "$REHEARSAL_PARENTS" "$incoming" \
-        "$source" "$metadata" "$refusal_harness" <<'HOST' || status=$?
+        "$source" "$metadata" "$ended_provider" <<'HOST' || status=$?
 # Parsed whole before it runs, so nothing it starts reads the rest of it.
 main() {
 set -euo pipefail
@@ -1029,9 +1042,9 @@ main_run "$@"
 }
 main_run() {
 local repository=$PWD sha=$2 version=$3 previous=$4 github=$5 root=$6 mode=$7 cache=~/.cache/cagents-release-rehearsal
-local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release
-local feed=$cache/feed-$3 path=() refusal_path=() parents parent
-local source=${10} metadata=${11} refusal_harness=${12} digest
+local new=$cache/cut-$3 old=$cache/$4 harness=$PWD/.worktrees/.rehearse-release status=0
+local feed=$cache/feed-$3 path=() parents parent report update marker before kept
+local source=${10} metadata=${11} ended_provider=${12} digest
 # The nearest .git above a path, or nothing.
 git_above() {
     local ancestor=$1
@@ -1046,6 +1059,7 @@ if [[ $root == - ]]; then
     done
     [[ -n $root ]] || { echo "release: each of ${parents[*]} has a .git above it; set CAGENTS_RELEASE_REHEARSAL_ROOT" >&2; exit 1; }
 fi
+report=$root/report.txt
 if [[ $source == draft ]]; then
     # What the updater fetches of the draft, as GitHub serves it: the
     # archive, its installer and checksums, and every generation's metadata.
@@ -1083,16 +1097,12 @@ if [[ ! -f $old/SHA256SUMS ]]; then
 fi
 (cd "$old" && sha256sum --check --strict --ignore-missing --quiet SHA256SUMS) \
     || { rm -rf -- "$old"; echo "release: the download of $previous was damaged; run the rehearsal again" >&2; exit 1; }
-# Make a fresh checkout so nothing already at the path can redirect Git.
-load_harness() {
-    local revision=$1
-    git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
-    git -C "$repository" worktree prune
-    git -C "$repository" cat-file -e "$revision^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
-    git -C "$repository" cat-file -e "$revision^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$revision"
-    git -C "$repository" worktree add -q --detach "$harness" "$revision"
-}
-load_harness "$sha"
+# Make a fresh checkout of the cut so nothing already at the path can redirect Git.
+git -C "$repository" worktree remove --force "$harness" 2>/dev/null || rm -rf -- "$harness"
+git -C "$repository" worktree prune
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin main || :
+git -C "$repository" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$repository" fetch -q --no-tags origin "$sha"
+git -C "$repository" worktree add -q --detach "$harness" "$sha"
 local rehearse=$harness/scripts/rehearse-update
 if [[ $mode == in-app ]]; then
     rm -rf -- "$feed"
@@ -1116,10 +1126,9 @@ fi
 if [[ -f $harness/crates/ceditor/build.rs ]]; then
     path+=(--bundled-ceditor)
 fi
-qualify() {
-local expected=$1
-shift
-local status=0 report=$root/report.txt update marker before kept
+if [[ $ended_provider == true ]]; then
+    path=(--ended-provider "${path[@]}")
+fi
 if [[ -e $root ]]; then
     echo "Replacing the earlier rehearsal in $root."
     # Without its marker, init never finished, so nothing there runs.
@@ -1133,7 +1142,7 @@ before=$(git_above "$(dirname -- "$root")")
 trap : TERM
 "$rehearse" --root "$root" run --old-dir "$old" --old-version "$previous" --old-installer "$old/install.sh" \
     --new-dir "$new" --new-version "$version" --new-installer "$new/install.sh" --answer yes \
-    "$@" >/dev/null 9>&- || status=$?
+    "${path[@]}" >/dev/null 9>&- || status=$?
 # A sandbox can leave a .git mountpoint above the root while the rehearsal
 # runs, which the product then refuses as a checkout: a failure that says
 # nothing about the cut.
@@ -1150,11 +1159,22 @@ try:
 except (OSError, ValueError):
     print("absent")' "$root/home/.local/share/cagents-install/.update/status.json")
 echo "Update status: $update"
-if [[ $update != "$expected" ]]; then
-    echo "release: the update ended $update, not $expected" >&2
+if [[ $update != Complete ]]; then
+    echo "release: the update ended $update, not Complete" >&2
 fi
-if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == "$expected" ]]; then
-    return 0
+if ((status == 0)) && grep -qx 'Outcome: PASS' "$report" && [[ $update == Complete ]]; then
+    # Publishing a draft requires a pass for its exact metadata and source release.
+    mkdir -- "$cache/$9"
+    {
+        [[ -z $digest ]] || printf 'Rehearsed metadata: sha256 %s\nRehearsed from: %s\n' "$digest" "$previous"
+        cat -- "$report"
+    } > "$cache/$9/passed.txt"
+    mv -- "$cache/$9/passed.txt" "$cache/passed-$version.txt"
+    "$rehearse" --root "$root" cleanup >/dev/null \
+        || echo "release: the rehearsal passed, but $root could not be removed" >&2
+    git -C "$repository" worktree remove --force "$harness" || :
+    rm -rf -- "$feed" "$new"
+    echo "Its report is in $cache/passed-$version.txt on $HOSTNAME."
 elif [[ -n $marker ]]; then
     echo "release: $marker appeared above $root during the rehearsal, so its result says nothing" \
         "about $version; rehearse again (its report is in $root on $HOSTNAME)" >&2
@@ -1172,42 +1192,6 @@ else
     echo "release: its report, records and screenshots are in $root on $HOSTNAME" >&2
     exit 1
 fi
-}
-if [[ $refusal_harness == - ]]; then
-    path=(--ended-provider "${path[@]}")
-fi
-qualify Complete "${path[@]}"
-
-local update_report=$root/report.txt
-mkdir -- "$cache/$9"
-if [[ $refusal_harness != - ]]; then
-    # Preserve the successful upgrade report before reusing the short private root.
-    update_report=$cache/$9/update.txt
-    cp -- "$root/report.txt" "$update_report"
-    "$rehearse" --root "$root" cleanup >/dev/null
-    load_harness "$refusal_harness"
-    echo "Checking the expected ended-provider refusal from $previous."
-    if [[ $mode == in-app ]]; then
-        refusal_path=(--feed "$feed")
-    fi
-    qualify 'Failed refused' --ended-provider --expect-refusal ended-provider "${refusal_path[@]}"
-fi
-
-# Publishing a draft requires a pass for its exact metadata and source release.
-{
-    [[ -z $digest ]] || printf 'Rehearsed metadata: sha256 %s\nRehearsed from: %s\n' "$digest" "$previous"
-    cat -- "$update_report"
-    if [[ $refusal_harness != - ]]; then
-        printf '\nExpected ended-provider refusal from %s:\n' "$previous"
-        cat -- "$root/report.txt"
-    fi
-} > "$cache/$9/passed.txt"
-mv -- "$cache/$9/passed.txt" "$cache/passed-$version.txt"
-"$rehearse" --root "$root" cleanup >/dev/null \
-    || echo "release: the rehearsal passed, but $root could not be removed" >&2
-git -C "$repository" worktree remove --force "$harness" || :
-rm -rf -- "$feed" "$new"
-echo "Its report is in $cache/passed-$version.txt on $HOSTNAME."
 }
 setsid -w bash -c "$(declare -f main main_run); main \"\$@\"" bash "$@" </dev/null
 HOST
