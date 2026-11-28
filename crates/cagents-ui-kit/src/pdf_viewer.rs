@@ -486,34 +486,35 @@ impl PdfDocument {
         })
     }
 
-    /// The zoom and page controls, for the host to place in its toolbar
-    /// beside its own.
+    /// The page and zoom controls, for the host to place in its toolbar
+    /// beside its own: each element is a group that stays together, so a
+    /// narrow toolbar can wrap between groups.
     pub fn controls(&self) -> Vec<Element<'_, PdfAction>> {
         let pages = self.sizes.len();
         let current = self.current_page();
         let fitted = self.fitted();
-        let mut controls: Vec<Element<'_, PdfAction>> = Vec::with_capacity(8);
+        let mut paging: Vec<Element<'_, PdfAction>> = Vec::with_capacity(3);
         if pages > 1 {
-            controls.push(
+            paging.push(
                 icon_button(Icon::ChevronUp, "Previous page")
                     .on_press_maybe((current > 0).then_some(PdfAction::PreviousPage))
                     .into(),
             );
-            controls.push(
+            paging.push(
                 icon_button(Icon::ChevronDown, "Next page")
                     .on_press_maybe((current + 1 < pages).then_some(PdfAction::NextPage))
                     .into(),
             );
         }
         if pages > 0 {
-            controls.push(
+            paging.push(
                 design::body(format!("Page {} of {pages}", current + 1))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
             );
         }
-        controls.push(widget::Space::new().width(space::S).into());
-        controls.push(
+        let mut zooming: Vec<Element<'_, PdfAction>> = Vec::with_capacity(5);
+        zooming.push(
             icon_button(Icon::ZoomOut, "Zoom out")
                 .on_press_maybe(
                     (pages > 0 && self.zoom.smaller(fitted).is_some())
@@ -521,7 +522,7 @@ impl PdfDocument {
                 )
                 .into(),
         );
-        controls.push(
+        zooming.push(
             widget::container(
                 design::body(format!(
                     "{}%",
@@ -533,21 +534,21 @@ impl PdfDocument {
             .width(Length::Fixed(ZOOM_LABEL_WIDTH))
             .into(),
         );
-        controls.push(
+        zooming.push(
             icon_button(Icon::ZoomIn, "Zoom in")
                 .on_press_maybe(
                     (pages > 0 && self.zoom.larger(fitted).is_some()).then_some(PdfAction::ZoomIn),
                 )
                 .into(),
         );
-        controls.push(
+        zooming.push(
             icon_button(Icon::ZoomFit, "Fit to width")
                 .selected(self.zoom == Zoom::FitWidth)
                 .on_press(PdfAction::FitWidth)
                 .into(),
         );
         let inverted = matches!(self.tone, PdfTone::Inverted { .. });
-        controls.push(
+        zooming.push(
             icon_button(
                 if inverted {
                     Icon::Brightness
@@ -564,7 +565,16 @@ impl PdfDocument {
             .on_press(PdfAction::ToggleTone)
             .into(),
         );
-        controls
+        [paging, zooming]
+            .into_iter()
+            .filter(|group| !group.is_empty())
+            .map(|group| {
+                widget::row::with_children(group)
+                    .spacing(space::XS)
+                    .align_y(iced::Alignment::Center)
+                    .into()
+            })
+            .collect()
     }
 
     /// The scrolling column of pages.
@@ -722,6 +732,29 @@ impl Geometry {
     }
 }
 
+/// Where in the viewport, as a fraction of its height, the page being read
+/// is taken from.
+///
+/// A third of the way down, as a reader's eye sits, except over the last
+/// screenful: a short last page can never scroll up to that line, so the line
+/// slides down to the viewport's bottom as the scroll reaches its end, and the
+/// last page is reached both by scrolling and by Next.
+fn reading_line(top: f32, viewport: f32, column: f32) -> f32 {
+    const EYE: f32 = 1.0 / 3.0;
+    if viewport <= 0.0 {
+        return EYE;
+    }
+    // The slide starts a screenful before the end, or at the start when the
+    // whole column scrolls less than that, so the first page is read first.
+    let end = column - viewport;
+    let span = viewport.min(end);
+    if span <= 0.0 {
+        return EYE;
+    }
+    let tail = ((top - (end - span)) / span).clamp(0.0, 1.0);
+    EYE + (1.0 - EYE) * tail
+}
+
 /// The column of pages: laid out from their sizes, drawn only where seen.
 struct PageColumn<'a> {
     sizes: &'a [PageSize],
@@ -815,7 +848,7 @@ impl Widget<PdfAction, Theme, Renderer> for PageColumn<'_> {
         let Some((first, last)) = geometry.pages_between(top, bottom) else {
             return;
         };
-        let reading = top + viewport.height / 3.0;
+        let reading = top + viewport.height * reading_line(top, viewport.height, geometry.height());
         let current = geometry.page_at(reading);
         let height = geometry.page_height(current).max(1.0);
         let within = ((reading - geometry.page_top(current)) / height).clamp(0.0, 1.0);
@@ -943,6 +976,38 @@ mod tests {
             };
             pages
         ]
+    }
+
+    #[test]
+    fn the_last_page_is_current_once_scrolled_to_the_end() {
+        // Wide pages in a tall pane: the last page's top never reaches the
+        // upper third of the viewport.
+        let sizes = vec![
+            PageSize {
+                width: 612.0,
+                height: 300.0,
+            };
+            5
+        ];
+        let geometry = Geometry::new(&sizes, Zoom::FitWidth, 600.0);
+        let viewport = 900.0;
+        let end = geometry.height() - viewport;
+        let at = |top: f32| {
+            geometry.page_at(top + viewport * reading_line(top, viewport, geometry.height()))
+        };
+        assert_eq!(at(0.0), 0);
+        assert_eq!(
+            at(end),
+            sizes.len() - 1,
+            "the end of the scroll reads the last page"
+        );
+        // Scrolling on never moves the indicator back.
+        let mut previous = 0;
+        for step in 0..=100 {
+            let page = at(end * step as f32 / 100.0);
+            assert!(page >= previous, "page {page} after {previous}");
+            previous = page;
+        }
     }
 
     #[test]
