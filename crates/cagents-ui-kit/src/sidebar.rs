@@ -4955,7 +4955,9 @@ impl SidebarState {
         let pending = std::mem::take(&mut self.in_progress_fold_pending);
         if pending {
             self.in_progress_collapsed = true;
-            self.release_list_hold();
+            if let Some(hold) = self.list_hold.get_mut() {
+                hold.in_progress = Default::default();
+            }
         }
         pending
     }
@@ -4963,9 +4965,6 @@ impl SidebarState {
     /// Unfolds In progress, so a row in it can be shown, and drops any fold
     /// still waiting on its probe.
     pub fn unfold_in_progress(&mut self) {
-        if self.in_progress_collapsed {
-            self.release_list_hold();
-        }
         self.in_progress_collapsed = false;
         self.in_progress_fold_pending = false;
     }

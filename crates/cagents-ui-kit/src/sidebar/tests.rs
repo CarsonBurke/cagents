@@ -14653,13 +14653,14 @@ fn folding_in_progress_releases_its_rows_and_the_folded_section_does_not_hold_th
 
     assert!(state.toggle_in_progress());
     assert!(state.fold_in_progress());
-    state.hover_list(&model, false, true);
+    assert!(state.list_held(), "the untouched sections keep their holds");
     state.follow_list(&model, false);
     assert!(!state.held_in_progress(row));
 
     model.projects[0].panes[0].attention = AttentionSummary::default();
     assert!(in_progress_rows(&model, &state, false).is_empty());
     assert!(!state.toggle_in_progress(), "unfolds immediately");
+    assert!(state.list_held());
     assert!(!visible_selection_rows(&model, &state, false).contains(&row));
 }
 
