@@ -85,6 +85,7 @@ fn job_artifact(name: &str) -> Option<&str> {
             | "recovery.json"
             | "settled.json"
             | "linux-handoff.json"
+            | "saved-windows.json"
             | "cutover.json"
             | "cutover-start-failed.json"
             | "cutover-restored.json"

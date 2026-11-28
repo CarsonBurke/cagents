@@ -608,6 +608,12 @@ pub enum DaemonCommand {
         #[arg(long)]
         census: Option<PathBuf>,
     },
+    /// Reopen the saved windows from a failed update with the serving installation.
+    ReopenUpdateWindows {
+        /// Update job named in the failure message.
+        #[arg(long)]
+        job: String,
+    },
     /// Update to a release, or finish a staged installation.
     #[command(after_help = "Goes through the app's reviewed update flow.")]
     Upgrade {
@@ -4164,6 +4170,7 @@ where
                 | DaemonCommand::InspectUpdateRecovery { .. }
                 | DaemonCommand::InspectPendingUpdateRecovery { .. }
                 | DaemonCommand::RecoverUpdate { .. }
+                | DaemonCommand::ReopenUpdateWindows { .. }
                 | DaemonCommand::PrepareUpgrade { .. }
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
@@ -4209,6 +4216,7 @@ where
                 command: DaemonCommand::Bridge { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::RecoverUpdate { .. }
+                    | DaemonCommand::ReopenUpdateWindows { .. }
                     | DaemonCommand::InspectPendingUpdateRecovery { .. }
                     | DaemonCommand::InspectUpdateRecovery { .. }
                     | DaemonCommand::CaptureUpdateCensus { .. }
@@ -4595,6 +4603,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
                     | DaemonCommand::InspectUpdateRecovery { .. }
                     | DaemonCommand::InspectPendingUpdateRecovery { .. }
                     | DaemonCommand::RecoverUpdate { .. }
+                | DaemonCommand::ReopenUpdateWindows { .. }
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::StoreSchema
@@ -5586,6 +5595,17 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 command: "daemon.recover_update",
                 data: json!({"verified":true,"report":report}),
                 human: report,
+            })
+        }
+        DaemonCommand::ReopenUpdateWindows { job } => {
+            let notes = crate::update::reopen_update_windows(&job)
+                .map_err(|error| AppError::new("update_recovery", error))?;
+            let message = "Saved windows reopened with the selected version";
+            Ok(CommandOutput {
+                command: "daemon.reopen_update_windows",
+                data: json!({"reopened":true,"notes":notes}),
+                human: notes
+                    .map_or_else(|| message.into(), |notes| format!("{message}\n\n{notes}")),
             })
         }
         DaemonCommand::VerifyUpdateLease => {

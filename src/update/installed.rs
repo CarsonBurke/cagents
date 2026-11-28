@@ -2,7 +2,8 @@
 use super::*;
 
 const DAEMON_BINARY: &str = "cagentsd";
-const BINARIES: [&str; 3] = ["cagents", "cagents-ui", DAEMON_BINARY];
+const UI_BINARY: &str = "cagents-ui";
+const BINARIES: [&str; 3] = ["cagents", UI_BINARY, DAEMON_BINARY];
 pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
 const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
@@ -93,10 +94,27 @@ pub(super) fn complete_selection(
 }
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(super) struct Stamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
+pub(super) struct Stamp(Vec<BinaryStamp>);
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+type BinaryStamp = (u64, u64, u64, i64, i64, i64, i64);
+
 impl Stamp {
+    fn open_ui(&self, root: &Path) -> Result<File, UpdateError> {
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(root.join("bin").join(UI_BINARY))?;
+        let index = BINARIES
+            .iter()
+            .position(|&binary| binary == UI_BINARY)
+            .unwrap();
+        if binary_stamp(&file.metadata()?)? != self.0[index] {
+            return Err(invalid("The staged UI changed since it was verified"));
+        }
+        Ok(file)
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn daemon_inode(&self) -> (u64, u64) {
         let index = BINARIES
             .iter()
@@ -108,28 +126,31 @@ impl Stamp {
 }
 
 pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
-    let mut entries = Vec::new();
-    for binary in BINARIES {
-        let metadata = fs::symlink_metadata(root.join("bin").join(binary))?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::getuid() }
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(invalid(
-                "installed candidate binaries must be owned regular files without shared write permission",
-            ));
-        }
-        entries.push((
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
+    BINARIES
+        .iter()
+        .map(|binary| binary_stamp(&fs::symlink_metadata(root.join("bin").join(binary))?))
+        .collect::<Result<_, _>>()
+        .map(Stamp)
+}
+
+fn binary_stamp(metadata: &fs::Metadata) -> Result<BinaryStamp, UpdateError> {
+    if !metadata.is_file()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(invalid(
+            "installed candidate binaries must be owned regular files without shared write permission",
         ));
     }
-    Ok(Stamp(entries))
+    Ok((
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    ))
 }
 
 pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateError> {
@@ -269,15 +290,26 @@ pub(super) fn perform(
     })?;
     let mut recovery = recovery::Context::default();
     recovery.capture(state, job)?;
+    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    confirmation::check_cancelled(state, job)?;
+    let native_startup_verified = windows::verify_candidate(
+        state,
+        job,
+        guard.has_running_windows()?,
+        &cancellation,
+        || before.open_ui(root),
+    )?;
     set_phase(
         state,
         job,
         UpdatePhase::ClosingWindows,
-        "Saving and closing application windows",
+        "Saving and closing all application windows",
     )?;
-    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    guard.prepare_windows(Duration::from_secs(45))?;
+    let prepared_slots = guard.prepare_windows(Duration::from_secs(45))?;
+    if native_startup_verified {
+        windows::remember_slots(state, job, prepared_slots)?;
+    }
     {
         let inspected = crate::install_guard::preflight_source_panes(
             &guard,
@@ -640,8 +672,13 @@ pub(super) fn perform(
     let reopened = guard
         .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
-    let handoff_kind =
-        verify_reopened_service(&recovery, state, job, result.is_ok().then_some(survivors))?;
+    let handoff_kind = verify_reopened_service(
+        &recovery,
+        state,
+        job,
+        result.is_ok().then_some(survivors),
+        reopened.is_ok(),
+    );
     finish_reopening_windows(state, job, result, handoff_kind, reopened)
 }
 
@@ -1093,6 +1130,21 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
 #[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_substituted_ui_is_refused_before_the_native_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        fs::create_dir(&bin).unwrap();
+        for binary in BINARIES {
+            fs::write(bin.join(binary), b"verified").unwrap();
+        }
+        let verified = stamp(root.path()).unwrap();
+        assert!(verified.open_ui(root.path()).is_ok());
+        fs::rename(bin.join(UI_BINARY), bin.join("original")).unwrap();
+        fs::write(bin.join(UI_BINARY), b"replacement").unwrap();
+        assert!(verified.open_ui(root.path()).is_err());
+    }
 
     #[test]
     fn local_staged_selection_is_bound_to_the_public_source_until_it_commits() {

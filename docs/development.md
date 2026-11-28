@@ -3153,6 +3153,19 @@ Optional problem states each have their own switch:
   `--expect-console-refusal` instead: the scenario requires a refusal before
   startup, no execution receipt, the original daemon serving and all work intact.
 
+Use `--expect-refusal window-startup` with a checksum-verified candidate
+whose UI exits before presenting a frame. Pass the same fault archive in a
+signed file feed to exercise the release worker. On Linux, the release worker
+comes from OLD, so OLD must include the first-frame check and NEW must request
+a daemon replacement. The rehearsal requires the original daemon, windows and
+inventory to survive the refusal and checks the recorded failure message.
+
+If the selected daemon has recovered and a real saved workspace fails to
+reopen, the update reports `cagents daemon reopen-update-windows --job JOB`.
+Run it in a terminal on the graphical desktop. It uses the selected build to
+retry missing slots, verifies the original inventory and settles the update
+once the windows are ready.
+
 A failed Prepared update retains its original census and selected target.
 Use the exact `daemon recover-update --checkpoint ... --yes` command printed by
 that target; an old `current` executable cannot recover Prepared. A retry must

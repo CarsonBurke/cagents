@@ -1143,7 +1143,7 @@ pub(super) fn finish(
                 ));
             }
         }
-        finish_windows(&intent, layout, successor)
+        finish_windows(&intent, layout, successor, state, &job)
     })();
     job.confirmation = None;
     job.refusal = None;
@@ -1186,6 +1186,8 @@ fn finish_windows(
     intent: &Intent,
     layout: &InstallLayout,
     serving: &HostSessionProof,
+    state: &Path,
+    job: &UpdateJob,
 ) -> Result<(), UpdateError> {
     let ui = layout.version_root.join("bin/cagents-ui");
     if !intent.windows.is_empty() {
@@ -1196,9 +1198,12 @@ fn finish_windows(
         // fence. An authenticated Ready owner settles that slot either way.
         let verified = crate::instance::UiUpdateGuard::acquire_for_cutover()
             .and_then(|guard| guard.verify_cutover_windows(&intent.windows, &ui));
-        if verified.is_err() {
-            launched?;
-            verified?;
+        if let Err(error) = verified {
+            return Err(windows::reopen_failure(
+                state,
+                job,
+                launched.err().unwrap_or(error),
+            ));
         }
     }
     intent.verify_serving(layout, serving).map(|_| ())
