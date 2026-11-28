@@ -851,7 +851,19 @@ fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
         },
         Some(&facts("/w/app")),
     );
-    let facts = facts("/w/app");
+    let mut facts = facts("/w/app");
+    let local = Arc::make_mut(facts.project.as_mut().unwrap().local.as_mut().unwrap());
+    let feature = &mut local.worktrees[1];
+    feature.created_at_unix_ms = Some(1_000);
+    feature.head = Some(crate::work::Head {
+        oid: "abc".into(),
+        committed_at_unix_ms: Some(2_000),
+    });
+    feature.dirty = Some(crate::work::Dirty {
+        paths: 1,
+        conflicted: 0,
+        newest_modified_at_unix_ms: Some(3_000),
+    });
     let list = assemble(
         &watched,
         Some(&facts),
@@ -873,6 +885,8 @@ fn edited_worktrees_are_listed_most_recent_first_and_outside_ones_dropped() {
             ("/w/app", Some("main"), false),
         ]
     );
+    assert_eq!(list.worktrees[0].last_activity_unix_ms, Some(3_000));
+    assert_eq!(list.worktrees[1].last_activity_unix_ms, None);
     // The feat branch heads #1, which editing it worked on, so the row shows
     // the worktree; main heads nothing.
     assert!(
