@@ -22,7 +22,10 @@ use crate::{
     upgrade::handoff::{STARTUP_BASE, StartupInventory},
 };
 
-#[cfg(target_os = "macos")]
+#[cfg(any(
+    target_os = "macos",
+    all(test, not(any(feature = "host", feature = "ui")))
+))]
 use super::ipc::client_session::connect_until_with_owner;
 
 use super::{
@@ -1811,24 +1814,7 @@ fn start_and_verify_daemon_at(
         refuse_update_launch(socket)?;
         if let Some((owner, allowance)) = crate::update::selected_listener_startup(socket, None) {
             let deadline = deadline.max(started + STARTUP_BASE + allowance);
-            let stream = connect_until_with_owner(socket, deadline, &owner).map_err(|source| {
-                if source.kind() == io::ErrorKind::TimedOut {
-                    HostedTerminalStartError::HostReadyTimeout {
-                        path: socket.to_owned(),
-                        timeout: deadline.duration_since(started),
-                    }
-                } else {
-                    HostedTerminalStartError::HostSocket {
-                        path: socket.to_owned(),
-                        source,
-                    }
-                }
-            })?;
-            // The selected daemon can consume its recovery evidence before
-            // accepting the connection. Carry the admitted deadline into hello.
-            return verify_startup_stream(socket, stream, |stream| {
-                crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
-            });
+            return join_selected_daemon(socket, &owner, started, deadline);
         }
     }
     let stream = connection?;
@@ -1849,6 +1835,36 @@ fn start_and_verify_daemon_at(
         }
         #[cfg(not(target_os = "macos"))]
         crate::control::ControlClient::from_stream_until(stream, deadline)
+    })
+}
+
+#[cfg(any(
+    target_os = "macos",
+    all(test, not(any(feature = "host", feature = "ui")))
+))]
+fn join_selected_daemon(
+    socket: &Path,
+    owner: &crate::pinned_process::PinnedProcess,
+    started: Instant,
+    deadline: Instant,
+) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
+    let stream = connect_until_with_owner(socket, deadline, owner).map_err(|source| {
+        if source.kind() == io::ErrorKind::TimedOut {
+            HostedTerminalStartError::HostReadyTimeout {
+                path: socket.to_owned(),
+                timeout: deadline.duration_since(started),
+            }
+        } else {
+            HostedTerminalStartError::HostSocket {
+                path: socket.to_owned(),
+                source,
+            }
+        }
+    })?;
+    // The selected daemon can consume its recovery evidence before accepting
+    // the connection. Carry the admitted deadline into hello.
+    verify_startup_stream(socket, stream, |stream| {
+        crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
     })
 }
 
@@ -4367,6 +4383,28 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    #[cfg(not(any(feature = "host", feature = "ui")))]
+    #[test]
+    fn selected_daemon_hello_keeps_the_admitted_deadline() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        let owner = crate::pinned_process::PinnedProcess::open(std::process::id()).unwrap();
+        let _budget = crate::control::ordinary_budget::quick();
+        let restore = crate::control::ordinary_budget::QUICK + Duration::from_millis(200);
+        let server = thread::spawn(move || {
+            let mut stream = accept_connection(&listener);
+            thread::sleep(restore);
+            answer_ready_hello(&mut stream);
+        });
+        let started = Instant::now();
+        let client =
+            join_selected_daemon(&socket, &owner, started, started + Duration::from_secs(5))
+                .unwrap();
+        assert_eq!(client.proof(), &proof("restored"));
+        server.join().unwrap();
     }
 
     #[test]
