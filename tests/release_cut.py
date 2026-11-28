@@ -307,8 +307,9 @@ class ReleaseCut(unittest.TestCase):
         self.git("fetch", "-q", "origin", cwd=host)
         self.bundles = []
         self.write_status()
+        # The stand-in host only sees system tools and the executables its fixture supplies.
         self.env = {key: value for key, value in os.environ.items() if not key.startswith(("CAGENTS_", "GIT_"))} | {
-            "HOME": str(self.home), "FIXTURE": str(self.root), "PATH": f"{self.bin}:{os.environ['PATH']}",
+            "HOME": str(self.home), "FIXTURE": str(self.root), "PATH": f"{self.bin}:/usr/bin:/bin",
             "CAGENTS_RELEASE_BUNDLES": str(self.root / "bundles"), "XDG_STATE_HOME": str(self.home / ".state"),
             "CAGENTS_RELEASE_REHEARSAL_ROOT": str(self.root / "cr")}
 
