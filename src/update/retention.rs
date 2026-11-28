@@ -310,6 +310,11 @@ mod tests {
 
     #[test]
     fn collects_abandoned_release_extractions_and_keeps_other_entries() {
+        use std::{
+            os::fd::AsRawFd,
+            process::{Command, Stdio},
+        };
+
         let directory = crate::test_fixture::tempdir().unwrap();
         let state = directory.path();
         let neighboring = crate::test_fixture::tempdir().unwrap();
@@ -332,7 +337,12 @@ mod tests {
         let legacy = staging();
         let active = staging();
         let active_lease = lease_extraction(&active).unwrap();
-        let extractor = active_lease.try_clone().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "read -r released || :"])
+            .stdin(Stdio::piped());
+        super::super::candidate::inherit(&mut command, active_lease.as_raw_fd());
+        let mut extractor = command.spawn().unwrap();
         drop(active_lease);
         let abandoned = staging();
         drop(lease_extraction(&abandoned).unwrap());
@@ -357,7 +367,8 @@ mod tests {
         assert!(fs::symlink_metadata(link).unwrap().is_symlink());
         assert_eq!(fs::read(kept_file).unwrap(), b"support data");
 
-        drop(extractor);
+        drop(extractor.stdin.take());
+        assert!(extractor.wait().unwrap().success());
         collect(&root, None, SystemTime::now()).unwrap();
         assert!(!active.exists());
     }

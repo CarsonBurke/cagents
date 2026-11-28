@@ -363,6 +363,8 @@ mod tests {
             checksums: asset,
         };
         let lease = retention::lease_extraction(stage.path()).unwrap();
+        let lease_path = retention::extraction_lease_path(stage.path());
+        let identity = fs::read(&lease_path).unwrap();
         let installer = r#"set -eu
 test "$1" = --prefix
 test "${4}" = 0.2.4
@@ -372,7 +374,7 @@ test "$(cat "$CAGENTS_CHECKSUMS")" = exact-checksums
 test "$(readlink "$2/current")" = versions/0.2.3
 test "${6%/*}" = "$2/.update"
 test -z "$(ls -A "$6")"
-printf 'lease inherited' >&@lease_fd@
+: >&@lease_fd@
 mkdir "$6/cagents-0.2.4"
 printf 'staged\n' > "$6/cagents-0.2.4/receipt"
 "#
@@ -391,8 +393,7 @@ printf 'staged\n' > "$6/cagents-0.2.4/receipt"
             &CancellationToken::new(),
         )
         .unwrap();
-        let lease_bytes = fs::read(retention::extraction_lease_path(stage.path())).unwrap();
-        assert!(lease_bytes.ends_with(b"lease inherited"));
+        assert_eq!(fs::read(lease_path).unwrap(), identity);
         assert_eq!(
             fs::read_link(selected).unwrap(),
             Path::new("versions/0.2.3")
