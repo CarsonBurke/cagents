@@ -179,6 +179,10 @@ impl Registry {
         })
     }
 
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
     /// Applies `setting`'s agent concurrency limits here and in every
     /// connection opened from this one afterwards.
     pub(crate) fn use_concurrency(

@@ -458,6 +458,8 @@ pub(crate) struct HostState {
     pub(super) held_followups: BTreeMap<TerminalId, BTreeSet<ClientId>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
+    /// Resident releases fence an allocation without advertising a new owner.
+    pub(super) chat_releases: BTreeSet<TerminalId>,
     /// Subset of transition reservations that retire an exact original source.
     pub(super) chat_close_reservations: BTreeMap<TerminalId, super::chat::capacity::CloseRemoval>,
     pub(super) pane_chat_starts: BTreeMap<CardId, super::chat::pane_start::Claim>,
@@ -479,6 +481,7 @@ pub(crate) struct HostState {
     upgrade: Option<PreparedUpgrade>,
     pub(super) upgrade_chats: BTreeMap<TerminalId, Vec<crate::upgrade::handoff::ChatSource>>,
     pub(super) chat_resolutions: BTreeMap<ClientId, super::chat::upgrade_resolution::Attempt>,
+    pub(super) history_retirement: Option<std::sync::mpsc::SyncSender<()>>,
     pub(super) exited_queue_transfers: super::chat::queue_transfer::Transfers,
     pub(super) exited_queue_archive: Arc<super::chat::queue_transfer::Archive>,
     /// Where this daemon's upgrade handoff keeps durable evidence, including
@@ -555,6 +558,37 @@ impl HostState {
         if let Some(courier) = &self.mailbox {
             courier.wake();
         }
+        if self
+            .chats
+            .get(&id)
+            .is_some_and(super::chat::Record::unsubscribed_history)
+        {
+            self.recheck_history_readers();
+        }
+    }
+
+    pub(super) fn recheck_history_readers(&self) {
+        if let Some(worker) = &self.history_retirement {
+            let _ = worker.try_send(());
+        }
+    }
+
+    /// Clear the exact transition token and wake an orphan it could have
+    /// deferred. A release's own refusal leaves the same reader eligible.
+    pub(super) fn clear_chat_reservation(&mut self, source: &crate::chat::Session) -> bool {
+        if self.chat_spawning.get(&source.id) != Some(source) {
+            return false;
+        }
+        self.chat_spawning.remove(&source.id);
+        if !self.chat_releases.remove(&source.id)
+            && self
+                .chats
+                .get(&source.id)
+                .is_some_and(super::chat::Record::unsubscribed_history)
+        {
+            self.recheck_history_readers();
+        }
+        true
     }
 
     pub(super) fn enable_holder_recovery(&mut self) {
@@ -632,6 +666,7 @@ impl HostState {
             held_followups: BTreeMap::new(),
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
+            chat_releases: BTreeSet::new(),
             chat_close_reservations: BTreeMap::new(),
             pane_chat_starts: BTreeMap::new(),
             historical_chat_retirements: BTreeMap::new(),
@@ -647,6 +682,7 @@ impl HostState {
             upgrade: None,
             upgrade_chats: BTreeMap::new(),
             chat_resolutions: BTreeMap::new(),
+            history_retirement: None,
             exited_queue_transfers: Default::default(),
             exited_queue_archive: Arc::default(),
             upgrade_evidence: None,
@@ -769,6 +805,10 @@ impl HostState {
             .map(super::model::Registry::execution_connection)
     }
 
+    pub(super) fn model_path(&self) -> Option<&std::path::Path> {
+        self.model.as_ref().map(super::model::Registry::path)
+    }
+
     /// How many hosted agents are working, and how many are waiting on the
     /// user, across running terminals and native conversations.
     pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
@@ -819,8 +859,27 @@ impl HostState {
         if let Some(notifications) = &self.notifications {
             notifications.presence(client, Some(presence.clone()));
         }
-        self.notification_watchers.insert(client, presence);
+        if let Some(previous) = self.notification_watchers.insert(client, presence) {
+            self.recheck_dropped_window_history(&previous);
+        }
         activation
+    }
+
+    pub(super) fn window_claims_session(&self, session: TerminalId) -> bool {
+        self.notification_watchers
+            .values()
+            .any(|presence| presence.sessions.contains(&session))
+    }
+
+    fn recheck_dropped_window_history(&self, previous: &crate::notifications::Presence) {
+        if previous.sessions.iter().any(|id| {
+            self.chats
+                .get(id)
+                .is_some_and(super::chat::Record::unsubscribed_history)
+                && !self.window_claims_session(*id)
+        }) {
+            self.recheck_history_readers();
+        }
     }
 
     /// Partition a window publication into new and existing live claims.
@@ -849,13 +908,24 @@ impl HostState {
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
+        let mut dropped_history = false;
         for (&client, current) in &mut self.notification_watchers {
             if current.destination() == presence.destination() {
+                dropped_history |= current.sessions.iter().any(|id| {
+                    !presence.sessions.contains(id)
+                        && self
+                            .chats
+                            .get(id)
+                            .is_some_and(super::chat::Record::unsubscribed_history)
+                });
                 *current = presence.clone();
                 if let Some(notifications) = &self.notifications {
                     notifications.presence(client, Some(presence.clone()));
                 }
             }
+        }
+        if dropped_history {
+            self.recheck_history_readers();
         }
     }
 
@@ -1232,6 +1302,12 @@ impl HostState {
         effects: &crate::workspace_model::delta::EditEffects,
     ) {
         self.mobile_sessions_changed();
+        if !effects.views.is_empty()
+            || !effects.agents.is_empty()
+            || !effects.removed_agents.is_empty()
+        {
+            self.recheck_history_readers();
+        }
         if let Some(work) = &self.work
             && !(effects.projects.is_empty() && effects.removed_projects.is_empty())
         {
@@ -1295,18 +1371,25 @@ impl HostState {
 
     pub(crate) fn unregister_client(&mut self, client_id: ClientId) -> Vec<TerminalHandle> {
         self.mobile_watchers.remove(&client_id);
-        self.chat_resolutions.remove(&client_id);
+        let mut recheck_history = self
+            .chat_resolutions
+            .remove(&client_id)
+            .is_some_and(|attempt| attempt.is_history());
         self.exited_queue_transfers.remove(client_id);
-        if self.notification_watchers.remove(&client_id).is_some()
-            && let Some(notifications) = &self.notifications
-        {
-            notifications.presence(client_id, None);
+        if let Some(presence) = self.notification_watchers.remove(&client_id) {
+            self.recheck_dropped_window_history(&presence);
+            if let Some(notifications) = &self.notifications {
+                notifications.presence(client_id, None);
+            }
         }
         for receipt in self.chat_handoffs.values_mut() {
             receipt.detach(client_id);
         }
         for record in self.chats.values_mut() {
-            record.detach(client_id);
+            recheck_history |= record.detach(client_id);
+        }
+        if recheck_history {
+            self.recheck_history_readers();
         }
         self.held_followups.retain(|_, holders| {
             holders.remove(&client_id);
@@ -2744,6 +2827,9 @@ impl HostState {
 
     fn settle_startup_custody(&mut self, id: &TerminalId) {
         if self.startup_custody.remove(id) {
+            if self.startup_state() == StartupState::Ready {
+                self.recheck_history_readers();
+            }
             crate::daemon::wake();
         }
     }

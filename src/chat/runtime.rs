@@ -3045,6 +3045,9 @@ impl Actor {
             return Err("History initialization attempted a provider write".into());
         }
         self.step(initial)?;
+        // The host may be waiting for this read-only frame to settle even
+        // when nobody is subscribed to its presentation.
+        (self.notify)(Update::Presentation);
         while !self.stop.load(Ordering::Acquire) {
             self.drain_commands(false)?;
             if !self.pending.is_empty() {

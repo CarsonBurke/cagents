@@ -62,6 +62,84 @@ pub(super) fn recover(host: &SharedHost, requested: &Session) -> Result<(), Stri
     install(host, &saved, requested)
 }
 
+pub(super) fn recover_attachment(host: &SharedHost, requested: &Session) -> Result<bool, String> {
+    // A malformed floor ledger must leave ordinary provider-saved history
+    // attachable through its own proof and transcript.
+    let Ok(ledger) = crate::upgrade::floor::load() else {
+        return Ok(false);
+    };
+    let Some(original) = ledger
+        .resume_source(requested)
+        .filter(|original| ledger.history_replacement(original, requested))
+    else {
+        return Ok(false);
+    };
+    install(host, &crate::upgrade::floor::snapshot(original)?, requested)?;
+    Ok(true)
+}
+
+fn projection(
+    saved: &crate::upgrade::floor::StoppedSnapshot,
+    session: &Session,
+) -> Result<(ProcessSpec, Step, chat::runtime::Store), String> {
+    let mut spec = ProcessSpec::from(&session.launch.recipe);
+    spec.transport = TransportSpec::History;
+    let mut events = vec![chat::Event::History {
+        items: saved
+            .snapshot
+            .items
+            .iter()
+            .map(|item| (**item).clone())
+            .collect(),
+        has_earlier: false,
+    }];
+    if let Some(id) = &session.launch.session_id {
+        events.push(chat::Event::Session {
+            id: id.clone(),
+            title: saved.snapshot.title.clone(),
+        });
+    }
+    events.push(chat::Event::ReadOnlyHistory {
+        reason: saved
+            .limitation
+            .clone()
+            .unwrap_or_else(|| crate::upgrade::floor::default_limitation(&saved.source).into()),
+    });
+    events.push(chat::Event::Exited { code: None });
+    let mut initial = Step {
+        events,
+        ..Step::default()
+    };
+    let store = chat::runtime::preflight(&spec, &mut initial)?;
+    Ok((spec, initial, store))
+}
+
+pub(super) fn reload(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<Option<chat::runtime::Store>, String> {
+    // install records the exact captured source first, before any issued
+    // aliases. Several update epochs can name the same allocation.
+    let original = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .upgrade_chats
+        .get(&session.id)
+        .and_then(|sources| sources.first())
+        .map(|entry| entry.source.clone());
+    let Some(original) = original else {
+        return Ok(None);
+    };
+    let ledger = crate::upgrade::floor::load()?;
+    if !ledger.history_replacement(&original, session)
+        || ledger.resume_source(&original) != Some(&original)
+    {
+        return Ok(None);
+    }
+    let saved = crate::upgrade::floor::snapshot(&original)?;
+    projection(&saved, session).map(|(_, _, store)| Some(store))
+}
+
 fn install(
     host: &SharedHost,
     saved: &crate::upgrade::floor::StoppedSnapshot,
@@ -74,49 +152,31 @@ fn install(
         .clone();
     {
         let id = saved.source.id;
-        if host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .chats
-            .contains_key(&id)
-        {
-            return Ok(());
-        }
         let mut session = saved.source.clone();
         session.proof = Some(proof.clone());
         session.reset_owned_codex_listener();
         session.native_continuity = chat::NativeContinuity::ReconnectOnly;
         session.terminal = None;
         session.owned_codex_listener = None;
-        let mut spec = ProcessSpec::from(&session.launch.recipe);
-        spec.transport = TransportSpec::History;
-        let mut events = vec![chat::Event::History {
-            items: saved
-                .snapshot
-                .items
-                .iter()
-                .map(|item| (**item).clone())
-                .collect(),
-            has_earlier: false,
-        }];
-        if let Some(id) = &session.launch.session_id {
-            events.push(chat::Event::Session {
-                id: id.clone(),
-                title: saved.snapshot.title.clone(),
-            });
+        let mut admission = None;
+        {
+            let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+            if state.chats.contains_key(&id) {
+                return Ok(());
+            }
+            if state.shutting_down
+                || state.chat_spawning.contains_key(&id)
+                || state.native_closing.contains_key(&id)
+                || state.native_actor_startups.contains_key(&id)
+                || state.chat_handoffs.contains_key(&id)
+            {
+                return Err("The conversation is changing; its saved history was kept".into());
+            }
+            capacity::Reservation::install(&mut admission, host, &mut state, &session)
+                .map_err(|error| error.message)?;
+            state.inventory_changed();
         }
-        events.push(chat::Event::ReadOnlyHistory {
-            reason: saved
-                .limitation
-                .clone()
-                .unwrap_or_else(|| crate::upgrade::floor::default_limitation(&saved.source).into()),
-        });
-        events.push(chat::Event::Exited { code: None });
-        let mut initial = Step {
-            events,
-            ..Step::default()
-        };
-        let store = chat::runtime::preflight(&spec, &mut initial)?;
+        let (spec, initial, store) = projection(saved, &session)?;
         let environment = spec.environment.clone();
         let weak = Arc::downgrade(host);
         let handle = Handle::start_owned(
@@ -129,24 +189,27 @@ fn install(
             move |update| changed(&weak, id, update),
         )?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state
-            .upgrade_chats
-            .entry(id)
-            .or_default()
-            .push(crate::upgrade::handoff::ChatSource {
-                source: saved.source.clone(),
-                launch: saved.source.launch.clone(),
-            });
-        if requested != &saved.source {
-            state
-                .upgrade_chats
-                .entry(id)
-                .or_default()
-                .push(crate::upgrade::handoff::ChatSource {
-                    source: requested.clone(),
-                    launch: requested.launch.clone(),
-                });
+        if state.shutting_down
+            || state.chats.contains_key(&id)
+            || !admission
+                .as_ref()
+                .is_some_and(|admission| admission.holds(&state, id))
+        {
+            drop(state);
+            handle.close()?;
+            return Err("The conversation changed while its saved history opened".into());
         }
+        let mut sources = vec![crate::upgrade::handoff::ChatSource {
+            source: saved.source.clone(),
+            launch: saved.source.launch.clone(),
+        }];
+        if requested != &saved.source {
+            sources.push(crate::upgrade::handoff::ChatSource {
+                source: requested.clone(),
+                launch: requested.launch.clone(),
+            });
+        }
+        state.upgrade_chats.insert(id, sources);
         state.chats.insert(
             id,
             Record {
@@ -443,6 +506,189 @@ mod tests {
 #[cfg(test)]
 mod flow_tests {
     use super::*;
+    use crate::model::{CardId, CardKind};
+    use crate::workspace_model::{
+        ModelEdit,
+        views::{Change, Pane, Scope},
+    };
+
+    fn provider_history_ignores_unreadable_floor(root: &Path, proof: HostSessionProof) {
+        let cwd = root.join("missing-project");
+        let config = root.join("claude-fixture");
+        let thread = uuid::Uuid::new_v4().to_string();
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let project = config.join("projects").join(project);
+        std::fs::create_dir_all(&project).unwrap();
+        let item = serde_json::json!({
+            "type": "user", "uuid": "kept-message", "parentUuid": null, "sessionId": thread,
+            "message": { "role": "user", "content": "Ordinary provider history" }
+        });
+        std::fs::write(project.join(format!("{thread}.jsonl")), format!("{item}\n")).unwrap();
+        let source = Session {
+            id: TerminalId::new(),
+            launch: chat::Launch {
+                provider: Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "/must-not-execute-provider-recipe".into(),
+                    arguments: vec![],
+                    working_directory: cwd,
+                    environment: BTreeMap::from([(
+                        "CLAUDE_CONFIG_DIR".into(),
+                        config.to_str().unwrap().into(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some(thread),
+                draft_model: None,
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::ReconnectOnly,
+        };
+        let mut state = HostState::new(proof);
+        state.install_model(
+            crate::host::model::Registry::at(&root.join("provider-history.sqlite3")).unwrap(),
+        );
+        state.register_client(1);
+        let host = Arc::new(HostLock::new(state));
+        let id = source.id;
+        let response = crate::host::client::process_request(
+            &host,
+            1,
+            ClientRequest::ChatAttach { session: source },
+        )
+        .unwrap()
+        .0;
+        assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
+        let snapshot =
+            crate::test_timing::wait_for("the provider history reader to settle", || {
+                handle.snapshot(None).filter(|snapshot| snapshot.exited)
+            });
+        assert!(snapshot.items.iter().any(|item| matches!(&item.content,
+            chat::ItemContent::Text { text, .. } if text == "Ordinary provider history"
+        )));
+        handle.close().unwrap();
+    }
+
+    fn verify_history_retirement(host: &SharedHost, original: &Session) {
+        use crate::host::client::process_request;
+        let id = original.id;
+        let request = |client, request| process_request(host, client, request).unwrap().0;
+        let resolve = |client| {
+            let ServerResponse::UpgradeChatResolved { session } = request(
+                client,
+                ClientRequest::ResolveUpgradeChat {
+                    source: original.clone(),
+                },
+            ) else {
+                panic!("resolve did not return the saved history");
+            };
+            session
+        };
+        let resolved = resolve(1);
+        let handle = host.lock().unwrap().chats[&id].handle.clone();
+        crate::test_timing::wait_for("the resolved history reader to settle", || {
+            handle.snapshot(None).filter(|snapshot| snapshot.exited)
+        });
+        let collect = || crate::host::chat::history_retirement::collect(host).unwrap();
+        collect();
+        assert!(
+            host.lock().unwrap().chats.contains_key(&id),
+            "Resolve pins its reader until Attach"
+        );
+        request(
+            1,
+            ClientRequest::ChatAttach {
+                session: resolved.clone(),
+            },
+        );
+        host.lock().unwrap().register_client(2);
+        request(
+            2,
+            ClientRequest::ChatAttach {
+                session: resolved.clone(),
+            },
+        );
+        request(1, ClientRequest::ChatDetach { chat_id: id });
+        collect();
+        assert!(
+            host.lock().unwrap().chats.contains_key(&id),
+            "a hidden subscriber still pins its reader"
+        );
+
+        let repository = original.launch.recipe.working_directory.clone();
+        let scope = Scope::Worktree {
+            repository: repository.clone(),
+            path: repository,
+        };
+        let pane = Pane {
+            id: CardId::new(),
+            title: "Paused history".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 1.0,
+            kind: CardKind::Chat(resolved.clone()),
+            scope: None,
+        };
+        let edit = |edit| request(1, ClientRequest::ApplyWorkspaceEdit { edit });
+        edit(ModelEdit::OpenProject {
+            repository: original.launch.recipe.working_directory.clone(),
+            name: "Project".into(),
+            kind: Default::default(),
+        });
+        let ServerResponse::WorkspaceEdit(seeded) = edit(ModelEdit::SeedView {
+            scope: scope.clone(),
+            panes: vec![pane.clone()],
+            closed: vec![],
+        }) else {
+            panic!("seed did not commit");
+        };
+        host.lock().unwrap().unregister_client(2);
+        collect();
+        assert!(
+            host.lock().unwrap().chats.contains_key(&id),
+            "the saved pane alone pins its reader"
+        );
+
+        crate::host::chat::history_retirement::start(host).unwrap();
+        edit(ModelEdit::ChangeView {
+            scope,
+            expected_revision: seeded.effects.views[0].after.unwrap(),
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Remove { id: pane.id },
+        });
+        let wait_for_release = || {
+            crate::test_timing::wait_for("the unreferenced reader to retire", || {
+                (!host.lock().unwrap().chats.contains_key(&id)).then_some(())
+            });
+            assert!(crate::upgrade::floor::snapshot(original).is_ok());
+        };
+        wait_for_release();
+        assert!(handle.is_completed());
+        assert!(!host.lock().unwrap().upgrade_chats.contains_key(&id));
+
+        // A previously issued current descriptor can still reopen the exact
+        // paused page after automatic release.
+        request(1, ClientRequest::ChatAttach { session: resolved });
+        request(1, ClientRequest::ChatDetach { chat_id: id });
+        wait_for_release();
+
+        // A watcher may resolve and then go away without ever attaching.
+        let release_initial =
+            chat::runtime::hold_history_reader(&original.launch.recipe.working_directory);
+        resolve(1);
+        host.lock().unwrap().unregister_client(1);
+        drop(release_initial);
+        wait_for_release();
+    }
+
     #[test]
     fn recorded_floor_resolves_stopped_and_explicit_resume_requires_a_new_quiet_allocation() {
         const ROOT: &str = "CAGENTS_FLOOR_HISTORY_FLOW_ROOT";
@@ -568,6 +814,7 @@ mod flow_tests {
             &published,
             &crate::upgrade::floor::display_snapshot()
         ));
+        provider_history_ignores_unreadable_floor(&root, new.clone());
         std::fs::remove_file(&invalid).unwrap();
         let path = std::fs::read_dir(invalid.parent().unwrap())
             .unwrap()
@@ -806,5 +1053,19 @@ mod flow_tests {
         for handle in handles {
             handle.close().unwrap();
         }
+        let mut state = HostState::new(proof("retirement", boot.as_str()));
+        state.install_model(
+            crate::host::model::Registry::at(&root.join("retirement.sqlite3")).unwrap(),
+        );
+        state.register_client(1);
+        let host = Arc::new(HostLock::new(state));
+        let unnamed_codex = record
+            .chats
+            .iter()
+            .find(|source| {
+                source.launch.provider == Provider::Codex && source.launch.session_id.is_none()
+            })
+            .unwrap();
+        verify_history_retirement(&host, unnamed_codex);
     }
 }

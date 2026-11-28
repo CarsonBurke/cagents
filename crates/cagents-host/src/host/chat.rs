@@ -13,6 +13,7 @@ mod console_relaunch_tests;
 #[cfg(test)]
 mod failed_upgrade_stop_tests;
 pub(super) mod floor_history;
+pub(super) mod history_retirement;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
@@ -103,14 +104,18 @@ impl Record {
         !self.handle.is_read_only_history() && !self.handle.is_completed()
     }
 
+    pub(super) fn unsubscribed_history(&self) -> bool {
+        self.handle.is_read_only_history() && self.subscribers.is_empty()
+    }
+
     /// Only the last visible subscriber leaving changes the actor's visibility.
-    pub(super) fn detach(&mut self, client: ClientId) {
+    pub(super) fn detach(&mut self, client: ClientId) -> bool {
         self.observations.remove(&client);
-        if self.subscribers.remove(&client) == Some(true)
-            && !self.subscribers.values().any(|visible| *visible)
-        {
+        let removed = self.subscribers.remove(&client);
+        if removed == Some(true) && !self.subscribers.values().any(|visible| *visible) {
             self.handle.set_visible(false);
         }
+        removed.is_some() && self.unsubscribed_history()
     }
 
     /// The conversation as its actor now holds it: the source it started
@@ -704,6 +709,14 @@ fn changed_for_instance(
             titles.offer(super::workspace::titles::Target::Chat(id));
         }
         return;
+    }
+    if matches!(update, Update::Presentation)
+        && state
+            .chats
+            .get(&id)
+            .is_some_and(Record::unsubscribed_history)
+    {
+        state.recheck_history_readers();
     }
     let proof = state.proof_handle();
     let HostState { chats, clients, .. } = &mut *state;
@@ -4124,10 +4137,10 @@ struct AccountSwitchReservation {
 
 impl Drop for AccountSwitchReservation {
     fn drop(&mut self) {
-        let mut state = self.host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
-            state.chat_spawning.remove(&self.source.id);
-        }
+        self.host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clear_chat_reservation(&self.source);
     }
 }
 
@@ -5129,7 +5142,7 @@ fn process_inner(
                 !state.chats.contains_key(&session.id)
                     && !state.chat_handoffs.contains_key(&session.id)
             };
-            if missing {
+            if missing && !floor_history::recover_attachment(host, &session).map_err(unavailable)? {
                 return capacity::restore_saved_history(host, client, session);
             }
             // A live actor remains attachable after account removal. A stopped
@@ -5215,7 +5228,9 @@ fn process_inner(
                 return Ok(ServerResponse::Detached);
             }
             let record = attached_mut(&mut state, client, chat_id)?;
-            record.detach(client);
+            if record.detach(client) {
+                state.recheck_history_readers();
+            }
             let released = state
                 .held_followups
                 .get_mut(&chat_id)
@@ -6753,7 +6768,10 @@ pub(super) fn chat_list_inventory(state: &HostState) -> Vec<Session> {
         state
             .chat_spawning
             .values()
-            .filter(|pending| state.historical_chat_retirements.get(&pending.id) != Some(*pending))
+            .filter(|pending| {
+                state.historical_chat_retirements.get(&pending.id) != Some(*pending)
+                    && !state.chat_releases.contains(&pending.id)
+            })
             .map(|pending| {
                 let mut session = pending.clone();
                 // Inventory describes this daemon's pending attachment. Keep

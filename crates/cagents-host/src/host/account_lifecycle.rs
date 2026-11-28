@@ -315,10 +315,17 @@ pub(crate) struct Reservation {
 }
 impl Drop for Reservation {
     fn drop(&mut self) {
-        self.map
+        let changed = self
+            .map
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .remove(&self.token);
+            .remove(&self.token)
+            .is_some_and(|entry| entry.restores.is_none());
+        if changed && let Some(host) = self.host.upgrade() {
+            host.lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .recheck_history_readers();
+        }
     }
 }
 impl Reservation {

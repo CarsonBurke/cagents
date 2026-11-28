@@ -382,6 +382,7 @@ fn publish_restored_selection(host: &SharedHost, pending: &mut Option<StartupPub
         tracing::error!(%detail, "restored startup owners were kept");
     }
     state.publishing_startup = false;
+    state.recheck_history_readers();
 }
 
 #[cfg(target_os = "macos")]
@@ -1497,6 +1498,9 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     }
     #[cfg(all(test, target_os = "linux"))]
     observe_fixture_startup("startup services started", None);
+    if let Err(error) = chat::history_retirement::start(&host) {
+        tracing::warn!(%error, "Automatic history reader retirement is unavailable");
+    }
     // Restoring a checkpoint above may hold the host for as long as its
     // inventory takes; from here on a hold that long is a deadlock.
     let mut stall_watch = match host.watch(lock::STALL_LIMIT) {
