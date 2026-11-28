@@ -109,6 +109,11 @@ TEST_ENVIRONMENT_IGNORED = re.compile(r"CAGENTS_TEST_|RUST_TEST_|RUSTFLAGS$|RUST
 EXCERPT_CHARACTERS = 12000
 # How many main commits keep their native-evidence executables, about 0.6 GiB each.
 BUILDS_KEPT = 6
+# How often the sentinel's own build directory is trimmed. The guard before
+# each of its builds keeps that build's directory out of the pruner's runs,
+# yet nearly every commit gives its lanes' crates new incremental state.
+BUILD_TRIM_SECONDS = 60 * 60
+PRUNER = Path(__file__).resolve().parent / "prune-build-dirs"
 # Diagnostic files outlive transient failures, with a daily sweep under the watcher lock.
 EVIDENCE_SWEEP_SECONDS = 24 * 60 * 60
 LOG_RETENTION_SECONDS = 30 * EVIDENCE_SWEEP_SECONDS
@@ -176,6 +181,31 @@ def prune_evidence(directory, state):
     expire_files(directory / "verdicts", TEMP_VERDICT_NAME, cutoff, protected)
     state["evidence_swept_at"] = now
     save(directory / "state.json", state)
+
+
+def trim_build(repository, directory, state):
+    """Starts prune-build-dirs on the sentinel's checkout at most hourly, in
+    the background at idle priority: it bounds the incremental state its
+    target directory keeps, under the profile locks its builds take, and
+    removes the directory once nothing has built there for a week."""
+    now = time.time()
+    last = state.get("build_trimmed_at")
+    if last is not None and 0 <= now - last < BUILD_TRIM_SECONDS:
+        return
+    checkout = repository / ".worktrees" / "main-build-sentinel"
+    if not PRUNER.is_file() or not checkout.is_dir():
+        return
+    command = [str(PRUNER), "--apply", "--budget", "1800",
+               "--output", str(directory / "build-trim.log")]
+    if shutil.which("ionice"):
+        command = ["ionice", "-c", "3", *command]
+    with contextlib.suppress(OSError):
+        subprocess.Popen(["nice", "-n", "19", *command], cwd="/", start_new_session=True,
+                         env=dict(os.environ, CAGENTS_BUILD_PRUNE_ROOTS=str(checkout)),
+                         stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL)
+        state["build_trimmed_at"] = now
+        save(directory / "state.json", state)
 
 
 def git(repository, *args):
@@ -815,6 +845,7 @@ def tick_locked(repository, directory, github_repository):
             raise RuntimeError("state belongs to another GitHub repository")
         state["github_repository"] = github_repository
         prune_evidence(directory, state)
+        trim_build(repository, directory, state)
         if time.time() < state.get("retry_after", 0):
             return
         # The timestamp also bounds restart/manual invocations and failed Git fetches.

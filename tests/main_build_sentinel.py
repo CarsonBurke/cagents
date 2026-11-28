@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -195,6 +196,19 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
                                       SENTINEL_TEST_LANES=json.dumps(sentinel.TEST_LANES))
         self.environment.start()
         self.addCleanup(self.environment.stop)
+        # Records each start of the build directory's pruner; none of the
+        # host's own build output is ever searched.
+        self.prunes = self.root / "prunes"
+        pruner = self.bin / "prune-build-dirs"
+        pruner.write_text(f'''#!/usr/bin/python3
+import json, os, sys
+with open({str(self.prunes)!r}, 'a') as out:
+    out.write(json.dumps([sys.argv[1:], os.environ.get('CAGENTS_BUILD_PRUNE_ROOTS')]) + '\\n')
+''')
+        pruner.chmod(0o755)
+        self.pruner = patch.object(sentinel, "PRUNER", pruner)
+        self.pruner.start()
+        self.addCleanup(self.pruner.stop)
         self.now = 2000
 
     def command(self, *args):
@@ -580,6 +594,34 @@ with open(os.environ['SENTINEL_SYSTEMCTL'], 'a') as out:
         start = ["--user", "start", "--no-block", sentinel.PREBUILD_SERVICE]
         # Before the first lane's tests, after them, and on a tick with nothing to do.
         self.assertEqual(calls, [[start, 0], [start, len(self.tested())], [start, len(self.tested())]])
+
+    def started_prunes(self, count):
+        """The pruner's starts, once there are count: it runs detached."""
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            lines = self.prunes.read_text().splitlines() if self.prunes.exists() else []
+            if len(lines) >= count:
+                return [json.loads(line) for line in lines]
+            time.sleep(0.05)
+        self.fail(f"the pruner started fewer than {count} times")
+
+    def test_the_sentinels_build_directory_is_trimmed_hourly_in_the_background(self):
+        # The first tick makes the checkout, which has nothing to trim before.
+        self.tick()
+        self.assertFalse(self.prunes.exists())
+        self.now += 1
+        self.tick()
+        (arguments, roots), = self.started_prunes(1)
+        self.assertEqual(roots, str(self.repo / ".worktrees/main-build-sentinel"))
+        self.assertIn("--apply", arguments)
+        self.now += sentinel.BUILD_TRIM_SECONDS - 1
+        self.tick()
+        self.now += 1
+        self.tick()
+        self.assertEqual(len(self.started_prunes(2)), 2)
+        # The tick within the hour started none.
+        time.sleep(0.5)
+        self.assertEqual(len(self.prunes.read_text().splitlines()), 2)
 
     def test_a_host_without_the_prebuild_service_still_tests(self):
         (self.bin / "systemctl").write_text("#!/bin/sh\nexit 5\n")
