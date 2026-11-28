@@ -1675,6 +1675,39 @@ mod tests {
         assert_eq!(cache.load(now).remove("other-account"), Some(figures));
     }
 
+    #[cfg(feature = "host")]
+    #[test]
+    fn the_managed_catalog_receipt_tracks_the_list_that_won_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = Cache::at(directory.path());
+        cache
+            .store_managed_claude_catalog(catalog(20, "managed").into(), "2.0.0")
+            .unwrap();
+        cache
+            .store_catalog(Provider::Claude, catalog(10, "delayed"))
+            .unwrap();
+        assert!(cache.managed_claude_catalog_is_current("2.0.0"));
+        assert_eq!(
+            cache.catalogs(30)[&Provider::Claude].models[0].id,
+            "managed"
+        );
+
+        cache
+            .store_catalog(Provider::Claude, catalog(30, "replacement"))
+            .unwrap();
+        assert!(!cache.managed_claude_catalog_is_current("2.0.0"));
+        assert!(
+            cache
+                .store_managed_claude_catalog(catalog(25, "delayed-managed").into(), "2.0.0")
+                .is_err()
+        );
+        assert!(!cache.managed_claude_catalog_is_current("2.0.0"));
+        assert_eq!(
+            cache.catalogs(30)[&Provider::Claude].models[0].id,
+            "replacement"
+        );
+    }
+
     #[test]
     fn catalogs_stamped_in_the_future_are_neither_read_nor_kept() {
         let directory = tempfile::tempdir().unwrap();
