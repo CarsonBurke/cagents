@@ -12,6 +12,8 @@ struct Plan<'a> {
     version: u16,
     target: PathBuf,
     selection: installed::Selection,
+    // A source launcher from an earlier version reads this stamp. The target
+    // checks the full candidate digest before it can resume activation.
     stamp: installed::Stamp,
     binaries: String,
     ready: ReadyPlanEvidence<'a>,
@@ -39,9 +41,9 @@ pub(crate) struct HeldSourceReturn {
     reservation_digest: [u8; 32],
 }
 
-/// Captured from the still-serving daemon and its privately owned matched set
-/// before sending its prepare request. A version path alone can be repaired
-/// in place while an updater is gone.
+/// Captured from the still-serving daemon and its core binaries before
+/// sending its prepare request. The source daemon may verify this with an
+/// earlier build when it resumes serving, including during repair.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct SourceImage {
@@ -61,7 +63,7 @@ impl SourceImage {
         selection: &installed::Selection,
     ) -> Result<Self, UpdateError> {
         let executable = layout.version_root.join("bin/cagentsd");
-        let stamp = installed::stamp(&layout.version_root)?;
+        let stamp = installed::core_stamp(&layout.version_root)?;
         let (device, inode) = stamp.daemon_inode();
         if source.executable()? != executable
             || !selection.source_is_unchanged(layout)?
@@ -73,8 +75,8 @@ impl SourceImage {
                 "The serving daemon is not the exact selected build",
             ));
         }
-        let binaries = installed::Candidate::Local(&layout.version_root).digest()?;
-        if stamp != installed::stamp(&layout.version_root)?
+        let binaries = installed::digest(&layout.version_root, installed::CORE_PROGRAMS)?;
+        if stamp != installed::core_stamp(&layout.version_root)?
             || source.executable()? != executable
             || !selection.source_is_unchanged(layout)?
             || crate::process::mapped_executable_identity(source.pid, &executable)?
@@ -103,9 +105,9 @@ impl SourceImage {
         if self.root != layout.version_root
             || self.version != layout.version
             || self.proof != *proof
-            || self.stamp != installed::stamp(&self.root)?
-            || self.binaries != installed::Candidate::Local(&self.root).digest()?
-            || self.stamp != installed::stamp(&self.root)?
+            || self.stamp != installed::core_stamp(&self.root)?
+            || self.binaries != installed::digest(&self.root, installed::CORE_PROGRAMS)?
+            || self.stamp != installed::core_stamp(&self.root)?
         {
             return Err(invalid(
                 "The original selected build no longer matches the approved update",
@@ -809,6 +811,18 @@ impl Reservation<'_> {
         if let Ok(target) = self.plan.target_layout(&source.prefix, job) {
             return Ok(Some(target));
         }
+        self.record_unclaimed_return(source, state, worker, &guard, failure)?;
+        Ok(None)
+    }
+
+    fn record_unclaimed_return(
+        &self,
+        source: &InstallLayout,
+        state: &Path,
+        worker: &File,
+        guard: &crate::instance::UiUpdateGuard,
+        failure: &UpdateError,
+    ) -> Result<(), UpdateError> {
         let handoff = acquire_unserved_runtime()?;
         if self.phase()? != Phase::AwaitingAdmission
             || !self.plan.selection.source_is_unchanged(source)?
@@ -821,12 +835,12 @@ impl Reservation<'_> {
         }
         self.plan
             .ready
-            .verify_unclaimed_source(worker, &guard, &handoff)
+            .verify_unclaimed_source(worker, guard, &handoff)
             .map_err(invalid)?;
         self.verify_original_if_recorded(source)?;
         eprintln!("The staged update could not be verified: {failure}");
         cutover::persist(state, &self.return_path(), &self.return_binding()?, true)?;
-        Ok(None)
+        Ok(())
     }
 
     fn verify_held_return_daemon(&self, source: &InstallLayout) -> Result<bool, UpdateError> {
@@ -1095,7 +1109,7 @@ pub(super) fn record(
             version: 1,
             target: prefix.join("versions").join(&job.version),
             selection: selection.clone(),
-            stamp: stamp.clone(),
+            stamp: stamp.core(),
             binaries: binaries.into(),
             ready,
         },
@@ -1246,7 +1260,7 @@ impl Plan<'_> {
             || layout.version_root != self.target
             || layout.version != job.version
             || self.selection != installed::Selection::capture(&layout)?
-            || self.stamp != installed::stamp(&self.target)?
+            || self.stamp != installed::core_stamp(&self.target)?
         {
             return Err(invalid(
                 "The approved installation changed while the update was interrupted",
@@ -1256,6 +1270,7 @@ impl Plan<'_> {
     }
 
     fn verify_binaries(&self, state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+        let before = installed::stamp(&self.target)?;
         let bytes = read_private(
             &state.join(format!("{}.request", job.id)),
             SMALL_ASSET_LIMIT,
@@ -1285,7 +1300,10 @@ impl Plan<'_> {
                 ));
             }
         };
-        if candidate != self.binaries || installed::stamp(&self.target)? != self.stamp {
+        if candidate != self.binaries
+            || before.core() != self.stamp
+            || installed::stamp(&self.target)? != before
+        {
             return Err(invalid(
                 "The approved build changed while the update was interrupted",
             ));
@@ -1385,7 +1403,26 @@ pub(super) fn recover_worker(
     }
     let daemon = target.version_root.join("bin/cagentsd");
     let publication = crate::install_guard::reserve_darwin_publication()?;
-    plan.verify_binaries(state, job)?;
+    if let Err(error) = plan.verify_binaries(state, job) {
+        // Older source launchers can verify the core files and still dispatch
+        // a target whose helper changed. Settle the same authenticated return
+        // they would have used for an unavailable core binary.
+        if reserved
+            && let Some(reservation) = shared_reservation()?
+                .filter(|reservation| reservation.job == job.id && reservation.state() == state)
+            && reservation.phase()? == Phase::AwaitingAdmission
+        {
+            let source = locate(&installation.prefix.join("current/bin/cagents"))?;
+            reservation.record_unclaimed_return(&source, state, worker, &guard, &error)?;
+            drop(publication);
+            drop(guard);
+            reservation.finish_return(&source)?;
+            return Err(invalid(format!(
+                "The staged update could not be verified. Your work is available in the current version. {error}"
+            )));
+        }
+        return Err(error);
+    }
     if !plan.selection_is_untouched(&target)? {
         return Err(invalid(
             "The installed selector changed before the update could resume",
@@ -1471,8 +1508,8 @@ mod tests {
             root: root.clone(),
             version: "0.2.4".into(),
             proof: proof.clone(),
-            stamp: installed::stamp(&root).unwrap(),
-            binaries: installed::Candidate::Local(&root).digest().unwrap(),
+            stamp: installed::core_stamp(&root).unwrap(),
+            binaries: installed::digest(&root, installed::CORE_PROGRAMS).unwrap(),
             live_process: None,
         };
         let layout = InstallLayout {

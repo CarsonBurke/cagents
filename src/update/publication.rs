@@ -5,7 +5,6 @@ use super::*;
 pub struct LocalPublication {
     switch: crate::install_guard::CurrentExchange,
     candidate: InstallLayout,
-    #[cfg(target_os = "macos")]
     stamp: installed::Stamp,
 }
 
@@ -33,18 +32,15 @@ impl LocalPublication {
             let link = Path::new("versions").join(&candidate.version);
             crate::install_guard::CurrentExchange::prepare(&candidate.prefix, &link, expected)?
         };
-        #[cfg(target_os = "macos")]
         let stamp = installed::stamp(&candidate.version_root)?;
         Ok(Self {
             switch,
             candidate,
-            #[cfg(target_os = "macos")]
             stamp,
         })
     }
 
     pub fn publish(self) -> Result<(), UpdateError> {
-        #[cfg(target_os = "macos")]
         if installed::stamp(&self.candidate.version_root)? != self.stamp {
             return Err(invalid("The replacement build changed after it was parked"));
         }

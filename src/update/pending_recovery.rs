@@ -28,6 +28,7 @@ pub(crate) fn run(
     }
     let cli = fs::canonicalize(crate::process::current_executable()?)?;
     let layout = locate(&cli)?;
+    layout.validated_programs()?;
     let daemon = layout.version_root.join("bin/cagentsd");
     let ui = layout.version_root.join("bin/cagents-ui");
     let state = layout.prefix.join(".update");
@@ -138,7 +139,7 @@ pub(crate) fn run(
         };
     }
     drop(retirement);
-    let before = candidate_stamp(&layout.version_root)?;
+    let before = installed::stamp_with_limit(&layout.version_root, RECOVERY_BINARY_LIMIT)?;
     #[cfg(target_os = "linux")]
     let selection = staged_selection(&layout)?;
     #[cfg(target_os = "linux")]
@@ -201,7 +202,7 @@ pub(crate) fn run(
     let result = (|| {
         // The sealed receipt binds the target path/hash and exact checkpoint.
         // Verify the entire matched set again before routing current to it.
-        if candidate_stamp(&layout.version_root)? != before {
+        if installed::stamp_with_limit(&layout.version_root, RECOVERY_BINARY_LIMIT)? != before {
             return Err(invalid(
                 "The selected candidate changed before recovery; nothing was started",
             ));
@@ -479,33 +480,7 @@ fn report(receipt: &recovery::Receipt) -> String {
     }
 }
 
-#[derive(PartialEq, Eq)]
-struct CandidateStamp(Vec<(u64, u64, u64, i64, i64, i64, i64)>);
-fn candidate_stamp(root: &Path) -> Result<CandidateStamp, UpdateError> {
-    let mut entries = Vec::new();
-    for name in ["cagents", "cagentsd", "cagents-ui"] {
-        let metadata = fs::symlink_metadata(root.join("bin").join(name))?;
-        if !metadata.is_file()
-            || metadata.uid() != crate::daemon::current_uid()
-            || metadata.mode() & 0o022 != 0
-            || metadata.len() > 512 * 1024 * 1024
-        {
-            return Err(invalid(
-                "The selected candidate is not a privately owned matched executable set",
-            ));
-        }
-        entries.push((
-            metadata.dev(),
-            metadata.ino(),
-            metadata.len(),
-            metadata.mtime(),
-            metadata.mtime_nsec(),
-            metadata.ctime(),
-            metadata.ctime_nsec(),
-        ));
-    }
-    Ok(CandidateStamp(entries))
-}
+const RECOVERY_BINARY_LIMIT: u64 = 512 * 1024 * 1024;
 
 fn select_target(layout: &InstallLayout) -> Result<(), UpdateError> {
     let current = layout.prefix.join("current");

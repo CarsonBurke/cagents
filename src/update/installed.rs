@@ -3,7 +3,56 @@ use super::*;
 
 const DAEMON_BINARY: &str = "cagentsd";
 const UI_BINARY: &str = "cagents-ui";
-const BINARIES: [&str; 3] = ["cagents", UI_BINARY, DAEMON_BINARY];
+const DICTATION_BINARY: &str = "cagents-dictate";
+// Earlier handoff readers stamp the first three programs in this order.
+pub(super) const PROGRAMS: &[&str] = &["cagents", UI_BINARY, DAEMON_BINARY, DICTATION_BINARY];
+pub(super) const CORE_PROGRAMS: &[&str] = PROGRAMS.split_at(3).0;
+const DICTATION_NOTICES: &str = "share/doc/cagents/THIRD-PARTY-NOTICES";
+
+fn installed_programs(root: &Path) -> io::Result<&'static [&'static str]> {
+    // v0.2.0 was the first published release with dictation. Earlier local
+    // builds that shipped it paired the helper with these notices (#3759).
+    let shipped_in_release = root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .and_then(|name| Version::parse(name).ok())
+        .is_some_and(|version| (version.major, version.minor, version.patch) >= (0, 2, 0));
+    if shipped_in_release
+        || entry_exists(&root.join(DICTATION_NOTICES))?
+        || entry_exists(&root.join("bin").join(DICTATION_BINARY))?
+    {
+        Ok(PROGRAMS)
+    } else {
+        Ok(CORE_PROGRAMS)
+    }
+}
+
+/// Verify the extra companion before selecting a candidate. Core installation
+/// identity is checked separately so a damaged helper cannot strand its owner.
+pub(super) fn validated_programs(root: &Path) -> Result<&'static [&'static str], UpdateError> {
+    let programs = installed_programs(root)?;
+    if programs.contains(&DICTATION_BINARY) {
+        program_metadata(&root.join("bin"), DICTATION_BINARY)?;
+    }
+    Ok(programs)
+}
+
+#[cfg(test)]
+pub(super) fn write_dictation_fixture(bin: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let helper = bin.join(DICTATION_BINARY);
+    fs::write(&helper, b"dictation fixture").unwrap();
+    fs::set_permissions(&helper, fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+fn entry_exists(path: &Path) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
 pub(super) const LOCAL_STAGE_MARKER: &str = ".cagents-local-candidate-v1";
 const LOCAL_SOURCE_MARKER: &str = ".cagents-local-source-v1";
 
@@ -104,19 +153,26 @@ impl Stamp {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
             .open(root.join("bin").join(UI_BINARY))?;
-        let index = BINARIES
+        let index = PROGRAMS
             .iter()
             .position(|&binary| binary == UI_BINARY)
             .unwrap();
-        if binary_stamp(&file.metadata()?)? != self.0[index] {
+        let metadata = file.metadata()?;
+        validate_program(UI_BINARY, &metadata)?;
+        if binary_stamp(&metadata) != self.0[index] {
             return Err(invalid("The staged UI changed since it was verified"));
         }
         Ok(file)
     }
 
+    #[cfg(target_os = "macos")]
+    pub(super) fn core(&self) -> Self {
+        Self(self.0[..CORE_PROGRAMS.len()].to_vec())
+    }
+
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     pub(super) fn daemon_inode(&self) -> (u64, u64) {
-        let index = BINARIES
+        let index = PROGRAMS
             .iter()
             .position(|&binary| binary == DAEMON_BINARY)
             .unwrap();
@@ -126,23 +182,35 @@ impl Stamp {
 }
 
 pub(super) fn stamp(root: &Path) -> Result<Stamp, UpdateError> {
-    BINARIES
-        .iter()
-        .map(|binary| binary_stamp(&fs::symlink_metadata(root.join("bin").join(binary))?))
-        .collect::<Result<_, _>>()
-        .map(Stamp)
+    stamp_with_limit(root, ARCHIVE_LIMIT)
 }
 
-fn binary_stamp(metadata: &fs::Metadata) -> Result<BinaryStamp, UpdateError> {
-    if !metadata.is_file()
-        || metadata.uid() != crate::daemon::current_uid()
-        || metadata.mode() & 0o022 != 0
-    {
-        return Err(invalid(
-            "installed candidate binaries must be owned regular files without shared write permission",
-        ));
+pub(super) fn stamp_with_limit(root: &Path, max_size: u64) -> Result<Stamp, UpdateError> {
+    stamp_programs(root, installed_programs(root)?, max_size)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(super) fn core_stamp(root: &Path) -> Result<Stamp, UpdateError> {
+    stamp_programs(root, CORE_PROGRAMS, ARCHIVE_LIMIT)
+}
+
+fn stamp_programs(root: &Path, programs: &[&str], max_size: u64) -> Result<Stamp, UpdateError> {
+    let bin = root.join("bin");
+    let mut entries = Vec::with_capacity(programs.len());
+    for &binary in programs {
+        let metadata = program_metadata(&bin, binary)?;
+        if metadata.len() > max_size {
+            return Err(invalid(format!(
+                "Installed bin/{binary} exceeds the update size limit"
+            )));
+        }
+        entries.push(binary_stamp(&metadata));
     }
-    Ok((
+    Ok(Stamp(entries))
+}
+
+fn binary_stamp(metadata: &fs::Metadata) -> BinaryStamp {
+    (
         metadata.dev(),
         metadata.ino(),
         metadata.len(),
@@ -150,7 +218,31 @@ fn binary_stamp(metadata: &fs::Metadata) -> Result<BinaryStamp, UpdateError> {
         metadata.mtime_nsec(),
         metadata.ctime(),
         metadata.ctime_nsec(),
-    ))
+    )
+}
+
+fn program_metadata(bin: &Path, binary: &str) -> Result<fs::Metadata, UpdateError> {
+    let metadata = fs::symlink_metadata(bin.join(binary))
+        .map_err(|error| invalid(format!("Cannot inspect installed bin/{binary}: {error}")))?;
+    validate_program(binary, &metadata)?;
+    Ok(metadata)
+}
+
+fn validate_program(binary: &str, metadata: &fs::Metadata) -> Result<(), UpdateError> {
+    if !metadata.is_file()
+        || metadata.uid() != crate::daemon::current_uid()
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(invalid(format!(
+            "Installed bin/{binary} must be an owned regular file without shared write permission"
+        )));
+    }
+    if binary == DICTATION_BINARY && metadata.mode() & 0o100 == 0 {
+        return Err(invalid(format!(
+            "Installed bin/{binary} must be executable"
+        )));
+    }
+    Ok(())
 }
 
 pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateError> {
@@ -158,18 +250,14 @@ pub(super) fn digest(root: &Path, binaries: &[&str]) -> Result<String, UpdateErr
     use sha2_image::{Digest, Sha256};
     let mut hash = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
-    for binary in binaries {
+    for &binary in binaries {
         let mut file = OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-            .open(root.join("bin").join(binary))?;
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(root.join("bin").join(binary))
+            .map_err(|error| invalid(format!("Cannot open installed bin/{binary}: {error}")))?;
         let metadata = file.metadata()?;
-        if !metadata.is_file()
-            || metadata.uid() != unsafe { libc::getuid() }
-            || metadata.mode() & 0o022 != 0
-        {
-            return Err(invalid("installed binary is not an owned regular file"));
-        }
+        validate_program(binary, &metadata)?;
         let size = metadata.len();
         if size > ARCHIVE_LIMIT {
             return Err(invalid("installed binary exceeds update size limit"));
@@ -214,7 +302,7 @@ impl Candidate<'_> {
 
     pub(super) fn digest(&self) -> Result<String, UpdateError> {
         match self {
-            Self::Local(root) => digest(root, &BINARIES),
+            Self::Local(root) => digest(root, installed_programs(root)?),
             #[cfg(target_os = "macos")]
             Self::Release(release) => release.digest(),
         }
@@ -458,13 +546,7 @@ pub(super) fn perform(
                     "The replacement did not receive the terminal service lease",
                 ));
             }
-            startup_attempted = true;
-            startup_owned = true;
             let receipt = survivors.recovery_receipt();
-            #[cfg(target_os = "linux")]
-            if handoff.is_some() {
-                linux_handoff::arm(state, job, &daemon, &recovery, &guard)?;
-            }
             #[cfg(target_os = "macos")]
             let ready_plan = receipt
                 .filter(|receipt| receipt.is_ready())
@@ -482,6 +564,17 @@ pub(super) fn perform(
                     )
                 })
                 .transpose()?;
+            // The Ready reservation gives the source a return path even if
+            // the target changed after the source stopped.
+            if stamp(root)? != before {
+                return Err(invalid("The installed application changed before startup"));
+            }
+            startup_attempted = true;
+            startup_owned = true;
+            #[cfg(target_os = "linux")]
+            if handoff.is_some() {
+                linux_handoff::arm(state, job, &daemon, &recovery, &guard, Some(&before))?;
+            }
             let activate = |standby: &mut crate::daemon::standby::Parked, job: &mut UpdateJob| {
                 standby.activate(&daemon, handoff.as_ref(), receipt, timeout, || {
                     let _ = report_overdue_startup(state, job);
@@ -520,6 +613,9 @@ pub(super) fn perform(
                 ))
             })?;
             return confirm_daemon_ready(&daemon, Some(standby.pid()), timeout);
+        }
+        if stamp(root)? != before {
+            return Err(invalid("The installed application changed before startup"));
         }
         let mut command = Command::new(
             root.join("bin")
@@ -1136,7 +1232,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let bin = root.path().join("bin");
         fs::create_dir(&bin).unwrap();
-        for binary in BINARIES {
+        for &binary in CORE_PROGRAMS {
             fs::write(bin.join(binary), b"verified").unwrap();
         }
         let verified = stamp(root.path()).unwrap();
@@ -1159,7 +1255,7 @@ mod tests {
         for version in ["source", "candidate", "other"] {
             let bin = prefix.join("versions").join(version).join("bin");
             fs::create_dir_all(&bin).unwrap();
-            for binary in BINARIES {
+            for &binary in CORE_PROGRAMS {
                 fs::write(bin.join(binary), "").unwrap();
             }
         }
@@ -2004,20 +2100,76 @@ exit 1"#,
     }
 
     #[test]
+    fn local_identity_includes_the_dictation_helper_when_shipped() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        for version in [
+            "0.1.3+local.before",
+            "0.1.3+local.with-helper",
+            "0.2.0",
+            "0.2.0+local.build",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path().join(version);
+            let bin = root.join("bin");
+            fs::create_dir_all(&bin).unwrap();
+            for &binary in CORE_PROGRAMS {
+                fs::write(bin.join(binary), b"first build").unwrap();
+            }
+
+            if version == "0.1.3+local.with-helper" {
+                let notices = root.join(DICTATION_NOTICES);
+                fs::create_dir_all(notices.parent().unwrap()).unwrap();
+                fs::write(notices, b"dictation notices").unwrap();
+            }
+            let candidate = Candidate::Local(&root);
+            if version == "0.1.3+local.before" {
+                assert!(stamp(&root).is_ok());
+                assert!(candidate.digest().is_ok());
+            } else {
+                assert!(stamp(&root).is_err());
+                assert!(candidate.digest().is_err());
+            }
+
+            write_dictation_fixture(&bin);
+            let helper = bin.join(DICTATION_BINARY);
+            let before = stamp(&root).unwrap();
+            let identity = candidate.digest().unwrap();
+            let daemon = fs::metadata(bin.join(DAEMON_BINARY)).unwrap();
+            assert_eq!(before.daemon_inode(), (daemon.dev(), daemon.ino()));
+
+            let replacement = bin.join("replacement");
+            fs::write(&replacement, b"another dictation").unwrap();
+            fs::set_permissions(&replacement, fs::Permissions::from_mode(0o755)).unwrap();
+            fs::rename(replacement, &helper).unwrap();
+            assert!(stamp(&root).unwrap() != before);
+            assert_ne!(candidate.digest().unwrap(), identity);
+
+            fs::set_permissions(&helper, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(stamp(&root).is_err());
+            assert!(candidate.digest().is_err());
+            fs::remove_file(&helper).unwrap();
+            symlink("cagents", &helper).unwrap();
+            assert!(stamp(&root).is_err());
+            assert!(candidate.digest().is_err());
+        }
+    }
+
+    #[test]
     fn replacing_one_binary_invalidates_the_confirmed_matched_set() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().join("0.1.3+local.same-name");
         fs::create_dir_all(root.join("bin")).unwrap();
-        for binary in BINARIES {
+        for &binary in CORE_PROGRAMS {
             fs::write(root.join("bin").join(binary), b"first build").unwrap();
         }
         let original_stamp = stamp(&root).unwrap();
-        let original_identity = digest(&root, &BINARIES).unwrap();
+        let original_identity = Candidate::Local(&root).digest().unwrap();
         let replacement = root.join("bin/replacement");
         fs::write(&replacement, b"other build").unwrap();
         fs::rename(replacement, root.join("bin/cagentsd")).unwrap();
         assert!(stamp(&root).unwrap() != original_stamp);
-        assert_ne!(digest(&root, &BINARIES).unwrap(), original_identity);
+        assert_ne!(Candidate::Local(&root).digest().unwrap(), original_identity);
         // A different target behind an unchanged version name cannot borrow
         // the previous confirmation through a symlink either.
         fs::remove_file(root.join("bin/cagentsd")).unwrap();
