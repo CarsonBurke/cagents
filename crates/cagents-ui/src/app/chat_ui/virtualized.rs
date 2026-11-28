@@ -10,7 +10,7 @@ use iced::advanced::{
 use iced::{Event, Point, Rectangle, Size, Vector};
 use std::{
     cell::Cell,
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     ops::Range,
     rc::{Rc, Weak},
 };
@@ -339,14 +339,45 @@ impl<'a> Column<'a> {
         let Some(height) = height else {
             return row.estimate.max(0.0);
         };
-        if height.estimate == row.estimate {
+        let adjusted = height.adjusted(row.estimate);
+        if adjusted == height.height {
             return height.height;
         }
         let revision = match self.address(index) {
             Ok(_) => row.revision,
             Err(shared) => (self.body.as_ref().unwrap().revision)(shared),
         };
-        height.for_row(revision, row.estimate)
+        if revision == height.revision {
+            height.height
+        } else {
+            adjusted
+        }
+    }
+
+    fn refresh_offsets(&self, state: &mut State, range: Range<usize>) {
+        for index in range {
+            let row = self.descriptor(index);
+            let shape = &mut state.shapes[index];
+            let measured = state.heights.get(&row.key);
+            let adjusts = self.address(index).is_err()
+                && measured.is_some_and(|height| height.adjusted(row.estimate) != height.height);
+            let was_adjusted = if adjusts {
+                !state.adjusted_rows.insert(index)
+            } else {
+                state.adjusted_rows.remove(&index)
+            };
+            if adjusts
+                || was_adjusted
+                || shape.revision != row.revision
+                || shape.estimate != row.estimate
+            {
+                shape.revision = row.revision;
+                shape.estimate = row.estimate;
+                state
+                    .offsets
+                    .set(index, self.corrected_height(index, row, measured));
+            }
+        }
     }
 
     fn content(&self, index: usize) -> &Element<'a, Message> {
@@ -386,7 +417,8 @@ impl<'a> Column<'a> {
         {
             return [0..body.start, body.start + body.rows.len()..self.len()];
         }
-        [0..self.len(), 0..0]
+        let end = self.len();
+        [0..end, end..end]
     }
 }
 #[derive(Clone, Copy)]
@@ -397,12 +429,8 @@ struct Height {
     cross: f32,
 }
 impl Height {
-    fn for_row(&self, revision: u64, estimate: f32) -> f32 {
-        if self.revision == revision {
-            self.height
-        } else {
-            (self.height + estimate - self.estimate).max(0.0)
-        }
+    fn adjusted(&self, estimate: f32) -> f32 {
+        (self.height + estimate - self.estimate).max(0.0)
     }
 }
 #[cfg(test)]
@@ -425,9 +453,9 @@ struct State {
     descriptors: u64,
     shapes: Vec<Descriptor>,
     body: Option<(usize, Weak<[Descriptor]>)>,
-    // Only these measured shared rows need their current fingerprint outside
-    // the viewport. All others have either an estimate or an unchanged size.
-    changed_estimates: HashSet<usize>,
+    // Only these measured shared rows need their current revision outside the
+    // viewport. A rounded correction can differ even at the same estimate.
+    adjusted_rows: BTreeSet<usize>,
     observed: Option<Viewport>,
     positions: HashMap<u64, usize>,
     anchors: HashSet<u64>,
@@ -561,25 +589,19 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     .flatten()
                     .all(|index| state.shapes[index].same_indexes(self.descriptor(index))));
         if !width_changed && !reshaped && state.descriptors != self.revision {
-            for index in changed.into_iter().flatten() {
+            let [before, after] = changed;
+            // Prefix sums use floats. Apply corrections in physical row order
+            // to match the flat layout, including chrome around the shared body.
+            let retained = before.end..after.start;
+            self.refresh_offsets(state, before);
+            for &index in state.adjusted_rows.range(retained) {
                 let row = self.descriptor(index);
-                let shape = &mut state.shapes[index];
-                if shape.revision != row.revision || shape.estimate != row.estimate {
-                    shape.revision = row.revision;
-                    shape.estimate = row.estimate;
-                    let measured = state.heights.get(&row.key);
-                    if self.address(index).is_err() {
-                        if measured.is_some_and(|height| height.estimate != row.estimate) {
-                            state.changed_estimates.insert(index);
-                        } else {
-                            state.changed_estimates.remove(&index);
-                        }
-                    }
-                    state
-                        .offsets
-                        .set(index, self.corrected_height(index, row, measured));
-                }
+                let measured = state.heights.get(&row.key);
+                state
+                    .offsets
+                    .set(index, self.corrected_height(index, row, measured));
             }
+            self.refresh_offsets(state, after);
         }
         if width_changed || reshaped {
             #[cfg(test)]
@@ -626,7 +648,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     .entry(measured.cross.to_bits())
                     .or_default() += 1;
             }
-            state.changed_estimates.clear();
+            state.adjusted_rows.clear();
             state.offsets = PrefixSums::new(
                 state
                     .shapes
@@ -635,25 +657,16 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                     .map(|(index, row)| {
                         let measured = state.heights.get(&row.key);
                         if self.address(index).is_err()
-                            && measured.is_some_and(|height| height.estimate != row.estimate)
+                            && measured.is_some_and(|height| {
+                                height.adjusted(row.estimate) != height.height
+                            })
                         {
-                            state.changed_estimates.insert(index);
+                            state.adjusted_rows.insert(index);
                         }
                         self.corrected_height(index, row, measured)
                     })
                     .collect(),
             );
-        } else if state.descriptors != self.revision {
-            // A new view can change copy, Find or theme even without changing
-            // the row geometry descriptors. Match the original height rule
-            // for rows whose current estimate and last measurement differ.
-            for &index in &state.changed_estimates {
-                let row = self.descriptor(index);
-                let measured = state.heights.get(&row.key);
-                state
-                    .offsets
-                    .set(index, self.corrected_height(index, row, measured));
-            }
         }
         if state.descriptors != self.revision {
             state.descriptors = self.revision;
@@ -726,15 +739,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 let height = self.axis.main(node.size());
                 changed |= (height - state.offsets.values[index]).abs() > 0.5;
                 let cross = self.axis.cross(node.size()).max(0.0);
-                if let Some(previous) = state.heights.insert(
-                    key,
-                    Height {
-                        revision,
-                        height,
-                        estimate,
-                        cross,
-                    },
-                ) && let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits())
+                let measured = Height {
+                    revision,
+                    height,
+                    estimate,
+                    cross,
+                };
+                if let Some(previous) = state.heights.insert(key, measured)
+                    && let Some(count) = state.cross_extents.get_mut(&previous.cross.to_bits())
                 {
                     *count -= 1;
                     if *count == 0 {
@@ -743,7 +755,11 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Column<'_> {
                 }
                 *state.cross_extents.entry(cross.to_bits()).or_default() += 1;
                 state.offsets.set(index, height);
-                state.changed_estimates.remove(&index);
+                if self.address(index).is_err() && measured.adjusted(estimate) != height {
+                    state.adjusted_rows.insert(index);
+                } else {
+                    state.adjusted_rows.remove(&index);
+                }
                 node.move_to_mut(self.axis.point(state.offsets.prefix(index)));
                 nodes.push(node);
                 tree.children.push(child);
@@ -1272,7 +1288,13 @@ mod tests {
             height: 720.0,
             bottom: true,
         };
-        let estimate = |index| 64.0 + (index % 7) as f32 * 32.0;
+        let estimate = |index| {
+            if index == 127 {
+                60.3
+            } else {
+                64.0 + (index % 7) as f32 * 32.0
+            }
+        };
         let mut owned_tree = None;
         let mut retained_tree = None;
         let mut rows: Rc<[Descriptor]> = (0..128)
@@ -1286,26 +1308,41 @@ mod tests {
             }
             let revision = move |index| u64::from(pass >= 2 && matches!(index, 122 | 125 | 127));
             let display = move |index, revision| {
-                let height = estimate(index) + if revision == 1 { 96.0 } else { 0.0 };
+                let height = if index == 127 {
+                    // The original rounded correction differs from this
+                    // height at the same estimate after a revision change.
+                    42.6
+                } else {
+                    estimate(index) + if revision == 1 { 96.0 } else { 0.0 }
+                };
                 widget::Space::new().height(height).into()
             };
+            let before = 1_060_356.0_f32 + if pass >= 2 { 132.0 } else { 0.0 };
+            let after = if pass >= 2 { 32.3_f32 } else { 18.1 };
+            let chrome = || {
+                [
+                    Row::space(1_001, u64::from(before.to_bits()), before),
+                    Row::space(1_002, u64::from(after.to_bits()), after),
+                ]
+            };
             let window = Rc::new(Cell::new(Some(viewport)));
+            let [leading, trailing] = chrome();
             let mut owned = column(
-                rows.iter()
-                    .enumerate()
-                    .map(|(index, row)| {
+                std::iter::once(leading)
+                    .chain(rows.iter().enumerate().map(|(index, row)| {
                         let revision = revision(index);
                         Row::new(row.key, revision, row.estimate, None, move || {
                             display(index, revision)
                         })
-                    })
+                    }))
+                    .chain(std::iter::once(trailing))
                     .collect(),
                 window.clone(),
             );
             let mut retained = column_with_body(
-                vec![],
+                Vec::from(chrome()),
                 Some(Body {
-                    start: 0,
+                    start: 1,
                     rows: rows.clone(),
                     revision: Box::new(revision),
                     build: Box::new(display),
@@ -1326,6 +1363,15 @@ mod tests {
                 cached.offsets.values, original.offsets.values,
                 "pass {pass}"
             );
+            assert_eq!(cached.offsets.tree, original.offsets.tree, "pass {pass}");
+            if pass == 2 {
+                let physical = 128;
+                assert_eq!(original.heights[&128].height, 42.6);
+                assert!(!original.realized.contains(&physical));
+                let expected = 42.6_f32 + 60.3_f32 - 60.3_f32;
+                assert_ne!(expected, 42.6);
+                assert_eq!(cached.offsets.values[physical], expected);
+            }
             assert_eq!(cached.mounted, original.mounted, "pass {pass}");
             assert_eq!(retained.size(), owned.size(), "pass {pass}");
             assert!(
@@ -1338,7 +1384,7 @@ mod tests {
             );
             if pass == 1 {
                 viewport.bottom = false;
-                viewport.top = owned.size().height - viewport.height - 160.0;
+                viewport.top = owned.size().height - viewport.height - 3_000.0;
             }
         }
     }
