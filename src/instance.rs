@@ -2493,8 +2493,7 @@ impl UiUpdateGuard {
     ) -> io::Result<Option<String>> {
         require_owned_runtime_directory(&self.runtime)?;
         self.relaunch_selected_windows(slots, executable, |guard, slot| {
-            validate_window_slot(slot)?;
-            if private_lock_is_held(&guard.runtime.join(slot_lock_name(slot)))? {
+            if guard.saved_window_lease(slot)?.is_some() {
                 return Ok(false);
             }
             #[cfg(target_os = "linux")]
@@ -2503,6 +2502,12 @@ impl UiUpdateGuard {
             }
             Ok(true)
         })
+    }
+
+    fn saved_window_lease(&self, slot: &str) -> io::Result<Option<PathBuf>> {
+        validate_window_slot(slot)?;
+        let lease = self.runtime.join(slot_lock_name(slot));
+        Ok(private_lock_is_held(&lease)?.then_some(lease))
     }
 
     #[cfg(target_os = "linux")]
@@ -2520,52 +2525,67 @@ impl UiUpdateGuard {
     }
 
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
+        require_owned_runtime_directory(&self.runtime)?;
         #[cfg(target_os = "macos")]
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
-        let windows = self.verified_windows()?;
+        let mut errors = Vec::new();
         for slot in slots {
             #[cfg(target_os = "linux")]
             let deadline = Instant::now() + crate::control::ui_launch_timeout(true)?;
-            let lease = self.runtime.join(slot_lock_name(slot));
-            let Some(owner) = windows.iter().find(|window| window.lease_path == lease) else {
-                #[cfg(target_os = "linux")]
-                if self.reconnecting_slot(slot, image)? {
-                    continue;
-                }
-                return Err(io::Error::other(
-                    "A saved window has no matching restored owner",
-                ));
-            };
-            if owner.executable != image {
-                return Err(io::Error::other(
-                    "A saved window has no matching restored owner",
-                ));
+            if let Err(error) = self.verify_cutover_window(slot, image, deadline) {
+                errors.push((slot.as_str(), error.to_string()));
             }
-            let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
-            let peer = crate::pinned_process::peer_credentials(&stream)?;
-            if peer.uid != current_uid() || peer.pid != owner.pid {
-                return Err(io::Error::other(
-                    "A saved window changed its restored owner",
-                ));
-            }
-            stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
-            let remaining = deadline
-                .checked_duration_since(Instant::now())
-                .filter(|remaining| !remaining.is_zero())
-                .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
-            writeln!(&mut stream, "update-ready")?;
+        }
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(window_failures(&errors, None)))
+        }
+    }
+
+    fn verify_cutover_window(&self, slot: &str, image: &Path, deadline: Instant) -> io::Result<()> {
+        let owner = match self.saved_window_lease(slot)? {
+            Some(lease) => verified_window_lease_owner(&lease, Path::new("/proc"), slot)?,
+            None => None,
+        };
+        let Some(owner) = owner else {
             #[cfg(target_os = "linux")]
-            crate::control::read_ui_launch_handshake(&mut stream, remaining)?;
-            #[cfg(target_os = "macos")]
-            {
-                stream.set_read_timeout(Some(remaining))?;
-                if read_capped_line(&stream)? != "ready" {
-                    return Err(io::Error::other("A saved window is still reopening"));
-                }
+            if self.reconnecting_slot(slot, image)? {
+                return Ok(());
             }
-            if !owner.still_owns_lease()? {
+            return Err(io::Error::other(
+                "A saved window has no matching restored owner",
+            ));
+        };
+        if owner.executable != image {
+            return Err(io::Error::other(
+                "A saved window has no matching restored owner",
+            ));
+        }
+        let mut stream = connect_cutover_window(&self.runtime, slot, deadline)?;
+        let peer = crate::pinned_process::peer_credentials(&stream)?;
+        if peer.uid != current_uid() || peer.pid != owner.pid {
+            return Err(io::Error::other(
+                "A saved window changed its restored owner",
+            ));
+        }
+        stream.set_write_timeout(Some(ACTIVATION_IO_TIMEOUT))?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|remaining| !remaining.is_zero())
+            .ok_or_else(|| io::Error::other("Saved windows are still reopening"))?;
+        writeln!(&mut stream, "update-ready")?;
+        #[cfg(target_os = "linux")]
+        crate::control::read_ui_launch_handshake(&mut stream, remaining)?;
+        #[cfg(target_os = "macos")]
+        {
+            stream.set_read_timeout(Some(remaining))?;
+            if read_capped_line(&stream)? != "ready" {
                 return Err(io::Error::other("A saved window is still reopening"));
             }
+        }
+        if !owner.still_owns_lease()? {
+            return Err(io::Error::other("A saved window is still reopening"));
         }
         Ok(())
     }
@@ -2593,6 +2613,7 @@ impl UiUpdateGuard {
                 Err(error) => errors.push((slot.clone(), error.to_string())),
             }
         }
+        let name_failed_slots = !errors.is_empty();
         let assessed = planned.len() + errors.len();
         self.prepared.clear();
         self.release_launch_fence()?;
@@ -2630,7 +2651,7 @@ impl UiUpdateGuard {
         if errors.is_empty() {
             Ok(notes)
         } else {
-            let mut error = relaunch_failure(assessed, &errors);
+            let mut error = window_failures(&errors, (!name_failed_slots).then_some(assessed));
             if let Some(notes) = notes {
                 error.push('\n');
                 error.push_str(&notes);
@@ -2720,6 +2741,10 @@ fn split_relaunch_failures(
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
 pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+    window_failures(errors, Some(windows))
+}
+
+fn window_failures(errors: &[(&str, String)], common_to_all: Option<usize>) -> String {
     let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
     for (slot, error) in errors {
         let text = error
@@ -2736,7 +2761,7 @@ pub fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
         }
     }
     if let [(slots, reason)] = groups.as_slice()
-        && slots.len() == windows
+        && Some(slots.len()) == common_to_all
     {
         return reason.clone();
     }
@@ -5202,37 +5227,45 @@ mod tests {
             fs::remove_file(&arguments).unwrap();
             let mut guard = UiUpdateGuard::acquire().unwrap();
             guard.set_recovery_restore_only();
-            let broken_locks = [
-                (
-                    "broken-lease".to_owned(),
-                    guard.runtime.join(slot_lock_name("broken-lease")),
-                ),
-                #[cfg(target_os = "linux")]
-                {
-                    let slot = crate::device::scoped_window_slot("unavailable", PRIMARY_WINDOW);
-                    let lock = device_reconnect_lock_path(&slot).unwrap();
-                    (slot, lock)
-                },
-            ];
-            for (_, lock) in &broken_locks {
-                fs::create_dir(lock).unwrap();
+            let mut slots = vec!["broken-lease".to_owned()];
+            let lease = guard.runtime.join(slot_lock_name(&slots[0]));
+            fs::write(&lease, "saved window evidence").unwrap();
+            fs::set_permissions(&lease, fs::Permissions::from_mode(0o644)).unwrap();
+            let alias = guard.runtime.join("lease-evidence");
+            fs::hard_link(&lease, &alias).unwrap();
+            #[cfg(target_os = "linux")]
+            {
+                let slot = crate::device::scoped_window_slot("unavailable", PRIMARY_WINDOW);
+                fs::create_dir(device_reconnect_lock_path(&slot).unwrap()).unwrap();
+                slots.push(slot);
             }
-            let slots = broken_locks
-                .iter()
-                .map(|(slot, _)| slot.clone())
-                .chain([PRIMARY_WINDOW.into()])
-                .collect::<Vec<_>>();
+            slots.push(PRIMARY_WINDOW.into());
             let failure = guard
                 .relaunch_missing_windows(&slots, &executable)
                 .unwrap_err()
                 .to_string();
-            for (slot, lock) in &broken_locks {
+            for slot in &slots[..slots.len() - 1] {
                 assert!(failure.contains(slot));
-                assert!(lock.is_dir(), "failed ownership evidence must be preserved");
             }
             let recovery_arguments = fs::read_to_string(&arguments).unwrap();
             assert!(recovery_arguments.contains("--window\nprimary\n"));
             assert!(recovery_arguments.contains(RESTORE_EXISTING_ONLY_ARGUMENT));
+
+            let guard = UiUpdateGuard::acquire_for_cutover().unwrap();
+            let failure = guard
+                .verify_cutover_windows(&slots, &executable)
+                .unwrap_err()
+                .to_string();
+            assert!(failure.contains("broken-lease"));
+            assert_eq!(fs::read_to_string(&alias).unwrap(), "saved window evidence");
+            assert_eq!(fs::metadata(&lease).unwrap().mode() & 0o777, 0o644);
+            assert_eq!(fs::metadata(&alias).unwrap().mode() & 0o777, 0o644);
+            assert_eq!(fs::metadata(&lease).unwrap().nlink(), 2);
+            let failure = guard
+                .relaunch_missing_windows(&["broken-lease".into(), "second".into()], &executable)
+                .unwrap_err()
+                .to_string();
+            assert!(failure.contains("broken-lease"));
 
             // A later ordinary launch from this same process has no recovery
             // argv or environment policy to inherit.
