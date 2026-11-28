@@ -435,9 +435,9 @@ eval "$3"
             .unwrap();
         let root = home.path();
         let launcher = OsStr::new("/usr/bin:/bin");
-        let discover =
+        let default_discovery =
             || discover(&shell, root, Some(launcher), None, Duration::from_secs(5)).unwrap();
-        let before: Vec<_> = std::env::split_paths(&discover()).collect();
+        let before: Vec<_> = std::env::split_paths(&default_discovery()).collect();
         assert_eq!(
             before,
             [
@@ -453,7 +453,7 @@ eval "$3"
         std::fs::write(&cli, "#!/bin/sh\n").unwrap();
         std::fs::set_permissions(&cli, std::os::unix::fs::PermissionsExt::from_mode(0o700))
             .unwrap();
-        let after = discover();
+        let after = default_discovery();
         assert_eq!(
             super::super::find_executable("claude", Some(&after)),
             Some(cli)
