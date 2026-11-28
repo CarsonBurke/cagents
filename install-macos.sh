@@ -16,6 +16,8 @@ DEFAULT_REPOSITORY='<OWNER>/<REPO>'
 TARGET=aarch64-apple-darwin
 LABEL=dev.cagents.Cagents.Daemon
 MARKER_TEXT='cagents install root'
+PROGRAMS='cagents cagentsd cagents-ui cagents-dictate'
+APP_LAUNCHER=Contents/MacOS/Cagents
 LOGIN_COMMAND='CDPATH= cd -P "$1/current/bin" && exec "$PWD/cagents" daemon start'
 LOGIN_NAME=cagents-login
 
@@ -178,11 +180,23 @@ verify_extract_dir() {
 }
 
 verify_program_versions() {
-    for program in cagents cagentsd cagents-ui cagents-dictate; do
+    for program in $PROGRAMS; do
         reported=$("$1/bin/$program" --version) || fail "cagents $VERSION could not run $program on this Mac"
         [ "$reported" = "$program $VERSION" ] \
             || fail "the release holds $reported, expected $program $VERSION"
     done
+}
+
+release_executable() {
+    [ -f "$1" ] && [ ! -L "$1" ] && [ -x "$1" ]
+}
+
+same_release_tree() {
+    [ -d "$2" ] && [ ! -L "$2" ] && [ ! -L "$2/bin" ] || return 1
+    for program in $PROGRAMS; do
+        release_executable "$2/bin/$program" || return 1
+    done
+    release_executable "$2/Cagents.app/$APP_LAUNCHER" && diff -rq "$1" "$2" >/dev/null 2>&1
 }
 
 # Removes LINK when it is a symbolic link to TARGET, and only then.
@@ -604,7 +618,8 @@ plutil -lint -s "$AGENT_NEW" && chmod 0644 "$AGENT_NEW" \
 # Cagents.app stays at one path, which the Dock and Login Items remember;
 # it is replaced only when the release changed it.
 APP_CHANGED=0
-if [ ! -d "$APP" ] || ! diff -rq "$NEW/Cagents.app" "$APP" >/dev/null 2>&1; then
+if [ ! -d "$APP" ] || [ -L "$APP" ] || ! release_executable "$APP/$APP_LAUNCHER" \
+    || ! diff -rq "$NEW/Cagents.app" "$APP" >/dev/null 2>&1; then
     APP_CHANGED=1
     ditto "$NEW/Cagents.app" "$STAGE/Cagents.app" \
         && codesign --verify --strict "$STAGE/Cagents.app" 2>/dev/null \
@@ -707,7 +722,7 @@ if [ -e "$TARGET_DIR" ] || [ -L "$TARGET_DIR" ]; then
     # This release again, as a repair or a return to the version kept for
     # rollback: keep the tree when it is the release's, or replace it whole.
     # A process running from the old tree keeps the files it has open.
-    if [ -L "$TARGET_DIR" ] || ! diff -rq "$NEW" "$TARGET_DIR" >/dev/null 2>&1; then
+    if ! same_release_tree "$NEW" "$TARGET_DIR"; then
         TREE=replacing
         mv "$TARGET_DIR" "$STAGE/replaced" || fail 'cannot set aside the version tree it replaces'
         mv "$NEW" "$TARGET_DIR" || fail 'cannot move the release into place'
