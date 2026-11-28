@@ -949,33 +949,18 @@ impl SidebarProject {
             if flags != (row.needs_review, row.review_requested_again) {
                 let mut row = row.clone();
                 (row.needs_review, row.review_requested_again) = flags;
-                worktree.set_pull_request(row);
+                worktree.set_worktree_pull_request(row, worktree.archived_pull_request);
             }
         }
     }
 
+    /// Replace the listing. Worktree associations are reconciled with local Git separately.
     pub fn replace_pull_requests(&mut self, pull_requests: Vec<SidebarPullRequest>) {
         if self.display_pull_requests() != pull_requests.as_slice() {
             self.pull_requests_revision = Revision::next();
         }
         self.pull_requests = pull_requests;
         self.cached_display = None;
-        self.refresh_worktree_pull_requests();
-    }
-
-    pub fn refresh_worktree_pull_requests(&mut self) {
-        for row in &mut self.worktrees {
-            if let Some(pr) = matching_pull_request(row, &self.pull_requests) {
-                row.set_pull_request(pr.clone());
-            } else if row.pull_request().is_some_and(|pr| {
-                !matches!(
-                    pr.state,
-                    Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)
-                )
-            }) {
-                row.clear_pull_request();
-            }
-        }
     }
 
     /// Changes when [`Self::replace_pull_requests`] changes which pull
@@ -1108,6 +1093,7 @@ pub struct SidebarWorktree {
     pub behind: Option<u64>,
     pub created_at_unix_ms: Option<i64>,
     pub pull_request_state: Option<WorktreePullRequestState>,
+    archived_pull_request: bool,
     /// Held by the application rather than read from the checkout, and
     /// reapplied whenever a read replaces the row.
     pub deletion: Option<RowDeletion>,
@@ -1169,6 +1155,7 @@ impl SidebarWorktree {
             created_at_unix_ms: None,
             head_repository: None,
             pull_request_state: None,
+            archived_pull_request: false,
             deletion: None,
             chrome,
         }
@@ -1302,6 +1289,19 @@ impl SidebarWorktree {
     }
 
     pub fn set_pull_request(&mut self, pull_request: SidebarPullRequest) {
+        self.set_worktree_pull_request(pull_request, false);
+    }
+
+    pub fn set_archived_pull_request(&mut self, pull_request: SidebarPullRequest) {
+        self.set_worktree_pull_request(pull_request, true);
+    }
+
+    pub fn archived_pull_request(&self) -> Option<&SidebarPullRequest> {
+        self.pull_request().filter(|_| self.archived_pull_request)
+    }
+
+    fn set_worktree_pull_request(&mut self, pull_request: SidebarPullRequest, archived: bool) {
+        self.archived_pull_request = archived;
         self.chrome.folded_pr_title = Some(fold(&pull_request.title));
         self.pull_request_state = pull_request.state;
         self.chrome.pull_request = Some(pull_request);
@@ -1316,6 +1316,7 @@ impl SidebarWorktree {
         let changed =
             self.pull_request_state.take().is_some() || self.chrome.pull_request.is_some();
         self.chrome.pull_request = None;
+        self.archived_pull_request = false;
         self.chrome.folded_pr_title = None;
         if changed {
             self.refresh_status_chrome();
@@ -1399,23 +1400,14 @@ pub fn worktree_display_name(path: &Path, branch: Option<&str>, detached: bool) 
 /// Branch names are case-sensitive and only attached worktrees can own a PR.
 /// A project's PR list includes other forks. Match source repository as well
 /// as branch, and refuse ambiguous associations instead of using list order.
-fn matching_pull_request<'a>(
+pub fn matching_pull_request<'a>(
     worktree: &SidebarWorktree,
     pull_requests: &'a [SidebarPullRequest],
 ) -> Option<&'a SidebarPullRequest> {
-    if worktree.detached {
-        return None;
-    }
-    let branch = worktree.branch.as_deref()?;
-    let repository = worktree.head_repository.as_ref()?;
     let matching = || {
-        pull_requests.iter().filter(|pr| {
-            pr.head_ref == branch
-                && pr
-                    .head_repository
-                    .as_ref()
-                    .is_some_and(|head| head.same_repository(repository))
-        })
+        pull_requests
+            .iter()
+            .filter(|pr| pr.matches_worktree(worktree))
     };
     let is_open = |pr: &SidebarPullRequest| {
         matches!(
@@ -1579,7 +1571,18 @@ impl SidebarPullRequest {
         row
     }
 
-    fn is_terminal(&self) -> bool {
+    pub fn matches_worktree(&self, worktree: &SidebarWorktree) -> bool {
+        !worktree.detached
+            && worktree.branch.as_deref() == Some(self.head_ref.as_str())
+            && self.head_repository.as_ref().is_some_and(|head| {
+                worktree
+                    .head_repository
+                    .as_ref()
+                    .is_some_and(|repository| head.same_repository(repository))
+            })
+    }
+
+    pub fn is_terminal(&self) -> bool {
         matches!(
             self.state,
             Some(WorktreePullRequestState::Merged | WorktreePullRequestState::Closed)

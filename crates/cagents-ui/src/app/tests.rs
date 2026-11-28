@@ -246,20 +246,21 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
     let make_project = |record: &WorktreeRecord| {
         let mut row = SidebarWorktree::from_repository(record, None);
         row.head_repository = open.head_repository_key();
-        SidebarProject::new(
+        let mut project = SidebarProject::new(
             project_id,
             RepositoryId::new(),
             "repo".into(),
             "/repo".into(),
             vec![row],
             vec![SidebarPullRequest::from_github(project_id, &open, &[])],
-        )
+        );
+        project.github_ready = true;
+        project
     };
     let mut project = make_project(&record);
     apply_attached_worktree_prs(
         &mut project,
         &[(record.clone(), None)],
-        std::slice::from_ref(&open),
         &[ArchivedWorktreePr {
             pull_request: merged,
             worktree: record.id,
@@ -275,7 +276,7 @@ fn attached_pr_overrides_reused_branch_without_hiding_unpushed_open_work() {
         ..record
     };
     let mut project = make_project(&unpushed);
-    apply_attached_worktree_prs(&mut project, &[(unpushed, None)], &[open], &[]);
+    apply_attached_worktree_prs(&mut project, &[(unpushed, None)], &[]);
     assert_eq!(
         project.worktrees[0].pull_request_state,
         Some(sidebar::WorktreePullRequestState::Open)

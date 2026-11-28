@@ -2551,11 +2551,6 @@ impl ArchivedWorktreePr {
                 == Some(self.pull_request.head_ref_name.as_str())
             && self.pull_request.belongs_to_head(head_repository)
     }
-
-    fn is_valid_for(&self, record: &WorktreeRecord, head_repository: &GitHubRepoKey) -> bool {
-        self.matches(record, head_repository)
-            && record.head_oid.as_deref() == Some(self.validated_head.as_str())
-    }
 }
 
 /// Resolve branches missing from the recent PR page within their source
@@ -2744,73 +2739,80 @@ fn pr_head_is_ancestor(worktree: &Path, pr_head: &str, local_head: &str) -> bool
 fn apply_attached_worktree_prs(
     project: &mut SidebarProject,
     worktrees: &[(WorktreeRecord, Option<StatusSnapshot>)],
-    recent: &[crate::github::PullRequest],
     archived: &[ArchivedWorktreePr],
 ) {
     let records = worktrees
         .iter()
         .map(|(record, _)| (record.id, record))
         .collect::<HashMap<_, _>>();
+    let recent = if project.github_ready {
+        project.pull_requests.as_slice()
+    } else {
+        &[]
+    };
     for row in &mut project.worktrees {
         let Some(record) = records.get(&row.id).copied() else {
+            continue;
+        };
+        let Some(head_repository) = row.head_repository.as_ref() else {
+            row.clear_pull_request();
             continue;
         };
         if record.detached || record.bare {
             row.clear_pull_request();
             continue;
         }
-        let Some(head_repository) = row.head_repository.as_ref() else {
-            row.clear_pull_request();
-            continue;
-        };
-        let valid_archived = || {
+
+        let candidates = || {
             archived
                 .iter()
-                .filter(|association| association.is_valid_for(record, head_repository))
-                .map(|association| &association.pull_request)
+                .filter(|association| association.matches(record, head_repository))
         };
-        let mut exact = recent.iter().chain(valid_archived()).filter(|pr| {
-            record
-                .branch
-                .as_deref()
-                .and_then(|branch| branch.strip_prefix("refs/heads/"))
-                == Some(pr.head_ref_name.as_str())
-                && record.head_oid.as_deref() == Some(pr.head_ref_oid.as_str())
-                && pr.belongs_to_head(head_repository)
+        let valid_archived = || {
+            candidates().filter(|association| {
+                record.head_oid.as_deref() == Some(association.validated_head.as_str())
+            })
+        };
+        let mut exact_archived = valid_archived().filter(|association| {
+            record.head_oid.as_deref() == Some(association.pull_request.head_ref_oid.as_str())
         });
-        let first = exact.next();
-        let ambiguous = first.is_some_and(|first| exact.any(|pr| pr.number != first.number));
+        let mut exact_recent = recent.iter().filter(|pr| {
+            pr.head_oid.is_some() && pr.head_oid == record.head_oid && pr.matches_worktree(row)
+        });
+        let first_recent = exact_recent.next();
+        let first_archived = exact_archived.next();
+        let mut exact_numbers = first_recent
+            .into_iter()
+            .chain(exact_recent)
+            .map(|pr| pr.number)
+            .chain(
+                first_archived
+                    .into_iter()
+                    .chain(exact_archived)
+                    .map(|association| association.pull_request.number),
+            );
+        let ambiguous = exact_numbers
+            .next()
+            .is_some_and(|first| exact_numbers.any(|number| number != first));
+
         if ambiguous {
             row.clear_pull_request();
-        } else if let Some(pr) = first {
-            row.set_pull_request(SidebarPullRequest::from_github(
-                project.id,
-                pr,
-                &pr.check_summaries(),
-            ));
-        } else if let Some(branch) = record
-            .branch
-            .as_deref()
-            .and_then(|branch| branch.strip_prefix("refs/heads/"))
-            && let Some(pr) = valid_archived().find(|pr| pr.head_ref_name == branch)
+        } else if let Some(pr) = first_recent {
+            row.set_pull_request(pr.clone());
+        } else if let Some(association) = first_archived.or_else(|| valid_archived().next()) {
+            let pr = &association.pull_request;
+            row.set_archived_pull_request(SidebarPullRequest::from_github(project.id, pr, &[]));
+        } else if row.archived_pull_request().is_some_and(|shown| {
+            candidates().any(|association| association.pull_request.url == shown.url)
+        }) {
+            // A remote result proved this PR against an older HEAD. Keep its
+            // badge until the queued local ancestry check settles the proof.
+        } else if let Some(pr) =
+            sidebar::matching_pull_request(row, recent).filter(|pr| !pr.is_terminal())
         {
-            // The proof still names this checkout's current HEAD, even when
-            // later local commits put it ahead of the historical PR head.
-            row.set_pull_request(SidebarPullRequest::from_github(
-                project.id,
-                pr,
-                &pr.check_summaries(),
-            ));
-        } else if matches!(
-            row.pull_request_state,
-            Some(
-                sidebar::WorktreePullRequestState::Closed
-                    | sidebar::WorktreePullRequestState::Merged
-            )
-        ) {
-            // A branch-only historical match from the recent page may belong
-            // to another incarnation of this branch. Open associations keep
-            // working while a local branch is ahead of its remote head.
+            // A recent open PR can still match a branch with unpushed commits.
+            row.set_pull_request(pr.clone());
+        } else if project.github_ready || row.archived_pull_request().is_some() {
             row.clear_pull_request();
         }
     }
@@ -18998,6 +19000,9 @@ impl Cagents {
                         .projects
                         .iter_mut()
                         .find(|project| project.id == project_id)
+                    && self.refresh_ui.git.remember_initial_archived(
+                        project_id, generation, &archived,
+                    )
                 {
                     let worktrees = worktrees
                         .into_iter()
@@ -19020,10 +19025,7 @@ impl Cagents {
                                 })
                         })
                         .collect::<Vec<_>>();
-                    apply_attached_worktree_prs(project, &worktrees, &recent, &archived);
-                    self.refresh_ui
-                        .git
-                        .remember_archived(project_id, generation, &archived);
+                    apply_attached_worktree_prs(project, &worktrees, &archived);
                     // Separate local HEADs can prove the same PR. Cleanup
                     // continues to receive each historical PR only once.
                     let mut archived_prs = archived
