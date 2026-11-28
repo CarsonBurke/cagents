@@ -105,19 +105,60 @@ fn merged(current: Option<&OsStr>, login: &OsStr) -> Option<OsString> {
     )
 }
 
-/// Use the shell order for shared directories while keeping the caller's
-/// extra directories first. Relative caller entries keep their meaning in
-/// the provider's working directory.
+/// A recorded selection keeps its order and gains any missing absolute
+/// shell directories. An ambient launch follows the freshly discovered
+/// shell order without giving relative entries higher precedence.
 #[cfg(all(feature = "host", target_os = "linux"))]
-pub fn merge_provider_path(caller: impl Iterator<Item = PathBuf>, shell: &OsStr) -> Option<String> {
-    let path = merge_paths(
-        caller,
-        std::env::split_paths(shell)
-            .filter(|directory| directory.is_absolute() && directory.to_str().is_some()),
-    )?
-    .into_string()
-    .ok()?;
+pub fn merge_provider_path(
+    recorded: Option<&str>,
+    launcher: Option<&str>,
+    shell: &OsStr,
+) -> Option<String> {
+    let shell: Vec<_> = std::env::split_paths(shell)
+        .filter(|directory| directory.is_absolute() && directory.to_str().is_some())
+        .collect();
+    let directories = if let Some(recorded) = recorded.filter(|&path| Some(path) != launcher) {
+        std::env::split_paths(recorded).chain(shell).collect()
+    } else {
+        restore_relative_entries(launcher, shell)
+    };
+    let mut seen = HashSet::new();
+    let directories = directories
+        .into_iter()
+        .filter(|directory| seen.insert(directory.clone()));
+    let path = std::env::join_paths(directories).ok()?.into_string().ok()?;
     (!path.is_empty()).then_some(path)
+}
+
+/// Keep each relative entry behind the surviving directories that originally
+/// took precedence over it. A shell can reorder those directories, so use
+/// the furthest position reached in its refreshed order.
+#[cfg(all(feature = "host", target_os = "linux"))]
+fn restore_relative_entries(launcher: Option<&str>, shell: Vec<PathBuf>) -> Vec<PathBuf> {
+    let Some(launcher) = launcher else {
+        return shell;
+    };
+    if !std::env::split_paths(launcher).any(|path| path.is_relative()) {
+        return shell;
+    }
+    let mut after = std::collections::HashMap::new();
+    for (index, path) in shell.iter().enumerate() {
+        after.entry(path.as_path()).or_insert(index + 1);
+    }
+    let mut relative = vec![Vec::new(); shell.len() + 1];
+    let mut position = 0;
+    for path in std::env::split_paths(launcher) {
+        if path.is_relative() {
+            relative[position].push(path);
+        } else if let Some(&next) = after.get(path.as_path()) {
+            position = position.max(next);
+        }
+    }
+    relative
+        .into_iter()
+        .zip(shell.into_iter().map(Some).chain([None]))
+        .flat_map(|(relative, absolute)| relative.into_iter().chain(absolute))
+        .collect()
 }
 
 fn merge_paths(
