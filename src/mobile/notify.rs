@@ -74,7 +74,11 @@ pub fn relay_origin(input: &str) -> Result<Url, &'static str> {
     let allowed = match url.host() {
         Some(Host::Domain(host)) => {
             let host = host.trim_end_matches('.');
-            host.contains('.')
+            host.len() <= 253
+                && host.contains('.')
+                && host
+                    .split('.')
+                    .all(|label| !label.is_empty() && label.len() <= 63)
                 && ![
                     "localhost",
                     "local",
@@ -170,6 +174,9 @@ impl Settings {
         settings.revision = Some(uuid::Uuid::new_v4());
         let encoded = serde_json::to_vec(&settings)
             .map_err(|_| "Could not encode mobile notification settings")?;
+        if encoded.len() as u64 > MAX_SETTINGS {
+            return Err("Mobile notification settings exceed their size limit".into());
+        }
         let write = || -> io::Result<()> {
             use std::os::unix::fs::PermissionsExt;
             let mut file = tempfile::Builder::new()
@@ -212,6 +219,14 @@ mod tests {
             "https://[2002:7f00:1::]",
         ] {
             assert!(relay_origin(invalid).is_err(), "{invalid}");
+        }
+        let long_label = "a".repeat(64);
+        let long_name = format!("{0}.{0}.{0}.{0}.org", "a".repeat(63));
+        for invalid in [
+            format!("https://{long_label}.org"),
+            format!("https://{long_name}"),
+        ] {
+            assert!(relay_origin(&invalid).is_err());
         }
         for valid in [
             "https://ntfy.sh",
