@@ -205,21 +205,28 @@ version_after() {
 # this checkout, where its keys and generation are read. --verify-only, which
 # works offline, takes every release tag in the tagged history.
 EARLIER=()
+declare -A MACOS_READERS=()
 if "$VERIFY_ONLY"; then
     candidates=$(checkout_git tag --merged "$SOURCE_COMMIT" --list 'v[0-9]*') || fail 'cannot list the release tags here'
 else
     command -v gh >/dev/null 2>&1 || fail 'required command not found: gh'
     candidates=$(GH_HOST=github.com GH_PROMPT_DISABLED=1 gh api --hostname github.com --paginate \
-        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '.[][] | select(.draft == false) | .tag_name') \
+        "repos/$REPOSITORY/releases?per_page=100" | jq -rs '
+            .[][] | select(.draft == false) | .tag_name as $tag |
+            ($tag | ltrimstr("v")) as $version |
+            [$tag, any(.assets[]?; .name == "cagents-\($version)-aarch64-apple-darwin.tar.gz")] | @tsv
+        ') \
         || fail 'cannot list the published releases'
 fi
-while IFS= read -r earlier; do
+while IFS=$'\t' read -r earlier apple_silicon; do
     [[ $earlier =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || continue
     version_after "$VERSION" "${earlier#v}" || continue
     checkout_git merge-base --is-ancestor "refs/tags/$earlier" "$SOURCE_COMMIT" 2>/dev/null \
         || fail "the published $earlier is not in $TAG's history here; fetch the release tags"
     checkout_git cat-file -e "$earlier:src/update/release-keys.pub" 2>/dev/null || continue
-    EARLIER+=("$earlier $(generation_at "$earlier")")
+    earlier_generation=$(generation_at "$earlier")
+    EARLIER+=("$earlier $earlier_generation")
+    if [[ $apple_silicon == true ]]; then MACOS_READERS[$earlier_generation]=$earlier; fi
 done < <(sort -uV <<< "$candidates")
 PREVIOUS_GENERATION=1
 if ((${#EARLIER[@]})); then PREVIOUS_GENERATION=${EARLIER[-1]##* }; fi
@@ -574,6 +581,13 @@ if [[ -n $PROMOTE ]]; then
     cp -- "$WORK_DIR/draft/$OWN_METADATA" "$WORK_DIR/from-draft/release-metadata.json"
     cp -- "$WORK_DIR/draft/$OWN_METADATA.sig" "$WORK_DIR/from-draft/release-metadata.json.sig"
     DIST_DIR=$WORK_DIR/from-draft
+fi
+
+# The bridge must serve every platform already using the preceding generation.
+# That generation will keep seeing this release even after later ones ship.
+if ((GENERATION > PREVIOUS_GENERATION)) && ! "$MACOS"; then
+    macos_reader=${MACOS_READERS[$PREVIOUS_GENERATION]:-}
+    [[ -z $macos_reader ]] || fail "$TAG needs the Apple Silicon build to bridge trust generation $PREVIOUS_GENERATION, which shipped it in $macos_reader"
 fi
 
 # A private snapshot keeps uploads and comparisons bound to the bytes validated here.
