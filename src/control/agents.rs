@@ -24,12 +24,7 @@ pub enum AgentCommand {
         agent_id: AgentId,
     },
     /// Start a provider session on one prompt, accepted durably.
-    #[command(
-        after_help = "Without --channel or --worktree, the agent joins the calling session's \
-        view, or the channel its lineage last belonged to when that view is missing or \
-        ambiguous. An agent for another project, or for a caller that never belonged to a \
-        channel, gets a new channel."
-    )]
+    #[command(after_help = spawn_after_help())]
     Spawn {
         #[command(flatten)]
         prompt: PromptArgs,
@@ -67,7 +62,7 @@ pub enum AgentCommand {
         )]
         model: Option<String>,
         #[arg(long, value_name = "MODE")]
-        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never, each optionally followed by /read-only, /workspace-write or /danger-full-access. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo. An agent's child gets no more than the agent's own mode",
+        #[arg(help = "Permission policy. Claude Code: default, manual, auto, acceptEdits, plan, dontAsk or bypassPermissions. Codex: untrusted, on-failure, on-request or never, each optionally followed by /read-only, /workspace-write or /danger-full-access. Antigravity: default, acceptEdits, auto or plan. Muse: manual, auto, dontAsk or bypassPermissions, or its terminal's untrusted, on-request or never. Oh My Pi: always-ask, write or yolo. Omitted, an agent's child inherits the agent's level, as below",
             value_parser = permission_mode)]
         permission_mode: Option<String>,
         /// The provider's effort name, such as low or high; omit for its default.
@@ -589,6 +584,46 @@ impl Handles {
     fn name(self, id: impl std::fmt::Display) -> String {
         super::format::prefix(&id.to_string(), self.0).to_owned()
     }
+}
+
+/// The providers in the order `agent spawn --help` lists their modes.
+const HELP_PROVIDERS: [Provider; 5] = [
+    Provider::Claude,
+    Provider::Codex,
+    Provider::Antigravity,
+    Provider::Muse,
+    Provider::Omp,
+];
+
+/// What `agent spawn --help` says after its options: where the agent is
+/// placed, and the mode an agent's child inherits, from the table the daemon
+/// applies, so the two never disagree.
+fn spawn_after_help() -> String {
+    use crate::agent_execution::permission::{Tier, equivalent};
+    let mut help = String::from(
+        "Without --channel or --worktree, the agent joins the calling session's view, or the \
+        channel its lineage last belonged to when that view is missing or ambiguous. An agent \
+        for another project, or for a caller that never belonged to a channel, gets a new \
+        channel.\n\n\
+        Without --permission-mode, your own spawn uses the provider's configured mode. A \
+        spawn by an agent gives the child the agent's own permission level: the agent's own \
+        mode when the child runs the same provider, and otherwise the child provider's mode \
+        for that level in the list below, or for the nearest stricter level it has. Every \
+        mode counts at one of these levels by what it lets an agent do without asking: \
+        dontAsk counts as Ask, for example, and so does a mode cagents can't confirm. An agent \
+        never starts a child above its own level, even with --permission-mode, but a person \
+        can change the child's mode in cagents at any time.\n",
+    );
+    for tier in Tier::ALL {
+        let modes: Vec<String> = HELP_PROVIDERS
+            .into_iter()
+            .filter_map(|provider| {
+                equivalent(provider, tier).map(|mode| format!("{mode} ({})", provider.label()))
+            })
+            .collect();
+        help.push_str(&format!("\n  {}: {}", tier.label(), modes.join(", ")));
+    }
+    help
 }
 
 /// A `--permission-mode` value one of the providers names; the request's own
@@ -2721,6 +2756,42 @@ mod tests {
                 help.contains(&format!("{named}.")) || help.ends_with(&named),
                 "{help} lacks {named}"
             );
+        }
+    }
+
+    /// Spawn's help lists the mode each provider's child inherits at each
+    /// level, exactly as the daemon gives it.
+    #[test]
+    fn spawn_help_lists_the_inherited_modes() {
+        use crate::agent_execution::permission::{Tier, equivalent};
+        use clap::CommandFactory;
+        let mut command = crate::control::Cli::command();
+        command.build();
+        let help = command
+            .find_subcommand_mut("agent")
+            .and_then(|agent| agent.find_subcommand_mut("spawn"))
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(help.contains(
+            "\n  Nothing asks: bypassPermissions (Claude Code), never/danger-full-access (Codex), bypassPermissions (Muse), yolo (Oh My Pi)"
+        ), "{help}");
+        assert!(help.contains(
+            "\n  Edits apply: acceptEdits (Claude Code), on-request/workspace-write (Codex), acceptEdits (Antigravity)"
+        ), "{help}");
+        for tier in Tier::ALL {
+            let line = help
+                .lines()
+                .find(|line| line.starts_with(&format!("  {}: ", tier.label())))
+                .unwrap_or_else(|| panic!("{help} lacks {tier:?}"));
+            for provider in Provider::ALL {
+                if let Some(mode) = equivalent(provider, tier) {
+                    assert!(
+                        line.contains(&format!("{mode} ({})", provider.label())),
+                        "{line}"
+                    );
+                }
+            }
         }
     }
 

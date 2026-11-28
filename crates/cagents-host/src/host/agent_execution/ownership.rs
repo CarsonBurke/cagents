@@ -1,7 +1,8 @@
 //! Serialize automatic cleanup with interactive ownership changes. Displaying
 //! a conversation is not takeover; issuing work or opening native controls is.
-//! Answering a request that can grant the agent something is not: an owner
-//! whose approvals are limited relies on a person to give that answer.
+//! Answering a request that can grant the agent something is not, nor is
+//! changing its permission mode: an owner whose approvals are limited relies
+//! on a person to give that answer, and only a person can change the mode.
 use super::*;
 use crate::chat::failure::delivery;
 use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
@@ -57,7 +58,8 @@ pub(in crate::host) fn interactive(
     };
     // Answering a request that can grant the agent something, such as a tool
     // approval its limited owner was refused, answers for that owner, who
-    // keeps the agent's controls.
+    // keeps the agent's controls, as does changing the agent's permission
+    // mode, which a person may do for a child its owner started too strict.
     let claims = claims
         && match &request {
             ClientRequest::ChatCommand { command, .. }
@@ -68,7 +70,9 @@ pub(in crate::host) fn interactive(
                     .chats
                     .get(&id)
                     .map(|record| record.handle.clone());
-                !handle.is_some_and(|handle| answers_grant(&handle, agent.spec.provider, command))
+                !handle.is_some_and(|handle| {
+                    sets_permission_for_owner(&handle, agent.spec.provider, command)
+                })
             }
             _ => true,
         };

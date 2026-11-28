@@ -5722,7 +5722,7 @@ impl Runtime {
             let modes = &snapshot.capabilities.permission_modes;
             let chosen = self.chosen_permission_mode();
             let selected = modes.iter().position(|mode| Some(mode.as_str()) == chosen);
-            if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
+            if transitioning {
                 controls.push(footer_cell(design::caption(
                     selected.map_or("Permissions", |index| {
                         permission_mode_label(self.session.launch.provider, &modes[index])
@@ -5735,12 +5735,18 @@ impl Runtime {
                     // the leading group little room; the chevron that says
                     // this is a picker keeps its place either way.
                     crate::ui_controls::trailing(
-                        crate::ui_controls::FadeText::caption(selected.map_or(
-                            "Permissions",
-                            |index| {
+                        crate::ui_controls::FadeText::caption({
+                            let label = selected.map_or("Permissions", |index| {
                                 permission_mode_label(self.session.launch.provider, &modes[index])
-                            },
-                        )),
+                            });
+                            // A Codex turn keeps the mode it started in, so a
+                            // change made during it is marked as waiting.
+                            if self.next_turn_permission_mode().is_some() {
+                                Cow::Owned(format!("{label} · next turn"))
+                            } else {
+                                Cow::Borrowed(label)
+                            }
+                        }),
                         widget::icon(Icon::ChevronDown.handle()).size(design::COMPACT_ICON_SIZE),
                         step::GAP_XS,
                     ),

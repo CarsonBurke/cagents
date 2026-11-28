@@ -4959,7 +4959,21 @@ fn permission_picker_updates_both_codex_policies() {
         "threadSettings": {"approvalPolicy":"on-failure","sandboxPolicy":{"type":"workspaceWrite"}}
     }})).unwrap();
     assert!(custom.events.contains(&Event::PermissionMode(None)));
+    // A running turn, such as one waiting on an approval, doesn't hold the
+    // change back: Codex applies it from the next turn.
     adapter.busy = true;
+    let step = adapter
+        .command(Command::SetPermissionMode {
+            mode: "yolo".into(),
+        })
+        .unwrap();
+    assert_eq!(step.writes[0]["method"], "thread/settings/update");
+    assert_eq!(step.writes[0]["params"]["approvalPolicy"], "never");
+    assert_eq!(
+        step.writes[0]["params"]["sandboxPolicy"]["type"],
+        "dangerFullAccess"
+    );
+    adapter.direct_input = false;
     assert!(
         adapter
             .command(Command::SetPermissionMode {

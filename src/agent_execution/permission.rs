@@ -7,6 +7,11 @@
 //! agent do without asking anyone. A mode this module cannot rank is refused
 //! for an agent caller; a session whose own mode it cannot confirm or rank
 //! counts as [`Tier::Ask`]. A person's own connection has no ceiling.
+//!
+//! A child whose mode its agent omits inherits the agent's level: its own
+//! mode for the same provider, and otherwise the child provider's
+//! [`equivalent`] of the agent's tier. The ceiling bounds agents only: a person
+//! changing a conversation's mode in cagents is not held to it.
 
 use crate::agent::Provider;
 
@@ -270,10 +275,14 @@ impl Mode {
         }
     }
 
-    /// The modes an omitted mode pins for each of the provider's tiers, from
-    /// strictest: the strictest of each tier that still asks a person rather
-    /// than denying, so not `dontAsk`.
-    fn strictest(provider: Provider) -> Vec<Mode> {
+    /// The provider's closest counterpart of each tier it has, from
+    /// strictest: the mode a child of another provider inherits from an agent
+    /// of that tier. Where a tier holds several, it is the one the provider
+    /// itself presents for that level, and otherwise the strictest that asks
+    /// a person rather than denying, so never `dontAsk`. Codex's are the
+    /// approval and sandbox pairs its own picker names, except asking, which
+    /// it has no preset for.
+    fn equivalents(provider: Provider) -> Vec<Mode> {
         use Approval::*;
         use Sandbox::*;
         match provider {
@@ -281,13 +290,14 @@ impl Mode {
                 Self::Claude(Claude::Plan),
                 Self::Claude(Claude::Default),
                 Self::Claude(Claude::AcceptEdits),
+                Self::Claude(Claude::Auto),
                 Self::Claude(Claude::BypassPermissions),
             ],
             Provider::Codex => vec![
-                Self::Codex(Untrusted, ReadOnly),
+                Self::Codex(OnRequest, ReadOnly),
                 Self::Codex(Untrusted, WorkspaceWrite),
                 Self::Codex(OnRequest, WorkspaceWrite),
-                Self::Codex(OnRequest, DangerFullAccess),
+                Self::Codex(Never, DangerFullAccess),
             ],
             Provider::Omp => vec![Self::Omp(Omp::AlwaysAsk), Self::Omp(Omp::Yolo)],
             // Only the modes the agent has, the strictest of each tier.
@@ -308,6 +318,38 @@ impl Mode {
                     .map(|(mode, meaning)| Self::Acp(mode, meaning))
                     .collect()
             }
+        }
+    }
+}
+
+/// The mode of `provider` a child inherits from an agent of exactly `tier`,
+/// as `agent spawn --help` lists them, or `None` where the provider has no
+/// mode of that tier and an agent of it gives the nearest stricter one.
+pub fn equivalent(provider: Provider, tier: Tier) -> Option<String> {
+    Mode::equivalents(provider)
+        .into_iter()
+        .find(|mode| mode.tier() == tier)
+        .map(Mode::name)
+}
+
+impl Tier {
+    /// Every tier, from strictest.
+    pub const ALL: [Self; 5] = [
+        Self::ReadOnly,
+        Self::Ask,
+        Self::AutoEdit,
+        Self::AutoRun,
+        Self::Full,
+    ];
+
+    /// The tier as `agent spawn --help` and the documentation name it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "Read-only",
+            Self::Ask => "Ask",
+            Self::AutoEdit => "Edits apply",
+            Self::AutoRun => "Safe commands run",
+            Self::Full => "Nothing asks",
         }
     }
 }
@@ -447,12 +489,12 @@ impl Ceiling {
 
     /// The mode a child of `provider` launches in when this session asks for
     /// `requested`: the request itself when it is within this ceiling, and
-    /// otherwise a refusal. An omitted mode is pinned: a child of the same
-    /// provider inherits this session's mode, and any other gets the strictest
-    /// mode of its provider within this session's tier, short of one where
-    /// nothing asks. A Codex request without a sandbox takes this session's
-    /// sandbox when it is a Codex session too, and that pinned mode's
-    /// otherwise.
+    /// otherwise a refusal. An omitted mode is inherited: a child of the same
+    /// provider gets this session's mode, and any other its provider's
+    /// equivalent of this session's tier, or of the nearest stricter tier it
+    /// has. A Codex request without a sandbox takes this session's sandbox
+    /// when it is a Codex session too, and otherwise that equivalent's, but
+    /// never more than the workspace's.
     pub fn child(&self, provider: Provider, requested: Option<&str>) -> Result<String, String> {
         let own = self.mode.filter(|_| self.provider == Some(provider));
         let Some(requested) = requested else {
@@ -470,9 +512,12 @@ impl Ceiling {
                 let sandbox = match (sandbox, own) {
                     (Some(sandbox), _) => sandbox,
                     (None, Some(Mode::Codex(_, own))) => own,
-                    (None, _) => match self.pin(provider)? {
+                    // A request that names only how the child asks keeps
+                    // Codex's usual workspace sandbox at most, rather than
+                    // going without one under a lead where nothing asks.
+                    (None, _) => match self.equivalent(provider, Tier::AutoEdit)? {
                         Mode::Codex(_, sandbox) => sandbox,
-                        _ => unreachable!("a Codex pin is a Codex mode"),
+                        _ => unreachable!("a Codex equivalent is a Codex mode"),
                     },
                 };
                 Mode::Codex(approval, sandbox)
@@ -526,23 +571,24 @@ impl Ceiling {
 
     /// The mode a child of `provider` gets when its mode is omitted: this
     /// session's own for the same provider, when the provider takes it as a
-    /// mode, and otherwise its pin. Antigravity's bypass is a switch, not a
-    /// mode a child can be given.
+    /// mode, and otherwise its equivalent. Antigravity's bypass is a switch,
+    /// not a mode a child can be given.
     fn omitted(&self, provider: Provider) -> Result<Mode, String> {
         match self.mode.filter(|own| {
             self.provider == Some(provider) && provider.check_permission_mode(&own.name()).is_ok()
         }) {
             Some(own) => Ok(own),
-            None => self.pin(provider),
+            None => self.equivalent(provider, Tier::Full),
         }
     }
 
-    /// The strictest mode of `provider` within this session's tier. An
-    /// omitted mode never becomes one where nothing asks except by
-    /// inheritance, so the pin stops at [`Tier::AutoEdit`].
-    fn pin(&self, provider: Provider) -> Result<Mode, String> {
-        let tier = self.tier().min(Tier::AutoEdit);
-        let modes = Mode::strictest(provider);
+    /// The mode of `provider` that matches this session's tier, up to `cap`:
+    /// its equivalent of the highest tier it has that allows no more than
+    /// either. A session of unknown mode counts as asking, so its child asks
+    /// too.
+    fn equivalent(&self, provider: Provider, cap: Tier) -> Result<Mode, String> {
+        let tier = self.tier().min(cap);
+        let modes = Mode::equivalents(provider);
         modes
             .iter()
             .rev()
@@ -832,7 +878,7 @@ mod tests {
                 .permission_modes()
                 .iter()
                 .filter_map(|mode| Mode::parse(provider, mode));
-            for mode in Mode::strictest(provider).into_iter().chain(modes) {
+            for mode in Mode::equivalents(provider).into_iter().chain(modes) {
                 ceilings.push(Ceiling {
                     provider: Some(provider),
                     mode: Some(mode),
@@ -939,12 +985,12 @@ mod tests {
         }
     }
 
-    /// Every mode this module names is one its provider takes, so a pinned
-    /// or inherited mode always launches.
+    /// Every mode this module names is one its provider takes, so an
+    /// inherited mode always launches.
     #[test]
     fn every_named_mode_is_one_its_provider_takes() {
         for provider in Provider::ALL {
-            for mode in Mode::strictest(provider) {
+            for mode in Mode::equivalents(provider) {
                 assert_eq!(
                     provider.check_permission_mode(&mode.name()),
                     Ok(()),
@@ -964,8 +1010,9 @@ mod tests {
             );
         }
         assert_eq!(Provider::Codex.permission_sandboxes().len(), 3);
-        // A Muse child of a Claude agent is pinned to its tier, and a Muse
-        // agent's own mode is inherited by its own name.
+        // A Muse child of a Claude agent gets Muse's equivalent of its tier,
+        // or the nearest stricter one, and a Muse agent's own mode is
+        // inherited by its own name.
         assert_eq!(
             Ceiling::confirmed(Provider::Claude, Some("default"))
                 .child(Provider::Muse, None)
@@ -1107,19 +1154,36 @@ mod tests {
     }
 
     #[test]
-    fn another_provider_compares_and_pins_on_the_tier() {
+    fn another_provider_compares_and_inherits_on_the_tier() {
         let claude = |mode| Ceiling::confirmed(Provider::Claude, Some(mode));
-        for (mode, pinned) in [
-            ("plan", "untrusted/read-only"),
+        for (mode, inherited) in [
+            ("plan", "on-request/read-only"),
             ("default", "untrusted/workspace-write"),
             ("acceptEdits", "on-request/workspace-write"),
-            // Only an inherited or explicit mode is one where nothing asks.
-            ("bypassPermissions", "on-request/workspace-write"),
+            // Codex has nothing between accepting edits and nothing asking.
+            ("auto", "on-request/workspace-write"),
+            // A lead where nothing asks starts children where nothing asks,
+            // rather than ones that stop on every command leaving the sandbox.
+            ("bypassPermissions", "never/danger-full-access"),
         ] {
             assert_eq!(
                 claude(mode).child(Provider::Codex, None).as_deref(),
-                Ok(pinned),
+                Ok(inherited),
                 "{mode}"
+            );
+        }
+        // A request naming only how the child asks keeps the workspace
+        // sandbox; only one naming the sandbox goes without.
+        for (approval, mode) in [
+            ("never", "never/workspace-write"),
+            ("on-request", "on-request/workspace-write"),
+            ("untrusted", "untrusted/workspace-write"),
+        ] {
+            assert_eq!(
+                claude("bypassPermissions")
+                    .child(Provider::Codex, Some(approval))
+                    .as_deref(),
+                Ok(mode)
             );
         }
         assert_eq!(
@@ -1146,14 +1210,14 @@ mod tests {
         );
 
         let codex = |mode| Ceiling::confirmed(Provider::Codex, Some(mode));
-        for (mode, pinned) in [
+        for (mode, inherited) in [
             ("readOnly", "plan"),
             ("workspaceWrite", "acceptEdits"),
-            ("yolo", "acceptEdits"),
+            ("yolo", "bypassPermissions"),
         ] {
             assert_eq!(
                 codex(mode).child(Provider::Claude, None).as_deref(),
-                Ok(pinned),
+                Ok(inherited),
                 "{mode}"
             );
         }
@@ -1167,11 +1231,182 @@ mod tests {
                 .child(Provider::Claude, Some("bypassPermissions"))
                 .is_ok()
         );
-        // Oh My Pi has nothing read-only to pin.
+        // Oh My Pi has nothing read-only to give.
         assert_eq!(
             claude("plan").child(Provider::Omp, None),
             Err("This agent runs in plan mode, and Oh My Pi has no mode that strict, so it can't start one.".into())
         );
+    }
+
+    /// The cross-provider table `agent spawn --help` prints: each provider's
+    /// equivalent of each tier, where it has one.
+    #[test]
+    fn each_provider_has_its_equivalent_of_each_tier() {
+        use Tier::*;
+        let table = [
+            (
+                Provider::Claude,
+                [
+                    Some("plan"),
+                    Some("default"),
+                    Some("acceptEdits"),
+                    Some("auto"),
+                    Some("bypassPermissions"),
+                ],
+            ),
+            (
+                Provider::Codex,
+                [
+                    Some("on-request/read-only"),
+                    Some("untrusted/workspace-write"),
+                    Some("on-request/workspace-write"),
+                    None,
+                    Some("never/danger-full-access"),
+                ],
+            ),
+            (
+                Provider::Antigravity,
+                [
+                    Some("plan"),
+                    Some("default"),
+                    Some("acceptEdits"),
+                    Some("auto"),
+                    None,
+                ],
+            ),
+            (
+                Provider::Muse,
+                [
+                    None,
+                    Some("manual"),
+                    None,
+                    Some("auto"),
+                    Some("bypassPermissions"),
+                ],
+            ),
+            (
+                Provider::Omp,
+                [None, Some("always-ask"), None, None, Some("yolo")],
+            ),
+        ];
+        assert_eq!(Tier::ALL, [ReadOnly, Ask, AutoEdit, AutoRun, Full]);
+        for (provider, modes) in table {
+            for (tier, mode) in Tier::ALL.into_iter().zip(modes) {
+                assert_eq!(
+                    equivalent(provider, tier).as_deref(),
+                    mode,
+                    "{provider:?} {tier:?}"
+                );
+            }
+        }
+    }
+
+    /// Every ceiling an agent can have, of every provider and mode, and of
+    /// none.
+    fn every_ceiling() -> Vec<Ceiling> {
+        let mut ceilings = vec![Ceiling::unknown()];
+        for provider in Provider::ALL {
+            ceilings.push(Ceiling {
+                provider: Some(provider),
+                mode: None,
+                reported: Some("an unrankable mode".into()),
+            });
+            let named = provider
+                .permission_modes()
+                .iter()
+                .chain(provider.permission_mode_aliases())
+                .filter_map(|mode| Mode::parse(provider, mode));
+            let codex = [
+                Approval::Untrusted,
+                Approval::OnRequest,
+                Approval::OnFailure,
+                Approval::Never,
+            ]
+            .into_iter()
+            .flat_map(|approval| {
+                [
+                    Sandbox::ReadOnly,
+                    Sandbox::WorkspaceWrite,
+                    Sandbox::DangerFullAccess,
+                ]
+                .map(|sandbox| Mode::Codex(approval, sandbox))
+            })
+            .filter(|_| provider == Provider::Codex);
+            let bypass = (provider == Provider::Antigravity)
+                .then_some(Mode::Acp(Claude::BypassPermissions, BYPASS));
+            for mode in named.chain(codex).chain(bypass) {
+                ceilings.push(Ceiling {
+                    provider: Some(provider),
+                    mode: Some(mode),
+                    reported: None,
+                });
+            }
+        }
+        ceilings
+    }
+
+    /// Inheriting never raises a child above its agent: whatever the agent's
+    /// provider and mode, an omitted mode gives every provider's child one
+    /// within the agent's own, which the agent could also have named.
+    #[test]
+    fn an_inherited_mode_never_exceeds_its_agent() {
+        for ceiling in every_ceiling() {
+            for provider in Provider::ALL {
+                let Ok(inherited) = ceiling.child(provider, None) else {
+                    // Only a provider with nothing that strict refuses.
+                    assert!(
+                        Mode::equivalents(provider)
+                            .iter()
+                            .all(|mode| mode.tier() > ceiling.tier()),
+                        "{ceiling:?} refused {provider:?}"
+                    );
+                    continue;
+                };
+                let mode = Mode::parse(provider, &inherited)
+                    .unwrap_or_else(|| panic!("{ceiling:?} gave {provider:?} {inherited}"));
+                assert!(
+                    mode.tier() <= ceiling.tier(),
+                    "{ceiling:?} gave {provider:?} {inherited}"
+                );
+                if let Some(own) = ceiling.mode.filter(|_| ceiling.provider == Some(provider)) {
+                    assert!(
+                        mode.within(own),
+                        "{ceiling:?} gave {provider:?} {inherited}"
+                    );
+                }
+                assert_eq!(provider.check_permission_mode(&inherited), Ok(()));
+                assert_eq!(
+                    ceiling.child(provider, Some(&inherited)).as_deref(),
+                    Ok(inherited.as_str()),
+                    "{ceiling:?} {provider:?}"
+                );
+            }
+        }
+    }
+
+    /// An agent whose mode is unknown, or one cagents can't rank, gives its
+    /// children modes that ask, never ones that edit or run unasked.
+    #[test]
+    fn an_unknown_agent_gives_children_that_ask() {
+        for ceiling in [
+            Ceiling::unknown(),
+            Ceiling::confirmed(Provider::Claude, None),
+            Ceiling::confirmed(Provider::Codex, Some("custom")),
+        ] {
+            for (provider, inherited) in [
+                (Provider::Claude, "default"),
+                (Provider::Codex, "untrusted/workspace-write"),
+                (Provider::Antigravity, "default"),
+                (Provider::Muse, "manual"),
+                (Provider::Omp, "always-ask"),
+            ] {
+                assert_eq!(
+                    ceiling.child(provider, None).as_deref(),
+                    Ok(inherited),
+                    "{ceiling:?} {provider:?}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1232,7 +1467,8 @@ mod tests {
                 assert!(lead.child(provider, Some(requested)).is_ok());
             }
         }
-        // Its own mode is inherited, and another provider's pinned.
+        // Its own mode is inherited, and so is its tier by another provider:
+        // Codex has nothing that runs safe commands, so it accepts edits.
         assert_eq!(
             lead.child(Provider::Antigravity, None).as_deref(),
             Ok("auto")
@@ -1241,10 +1477,7 @@ mod tests {
             lead.child(Provider::Codex, None).as_deref(),
             Ok("on-request/workspace-write")
         );
-        assert_eq!(
-            lead.child(Provider::Claude, None).as_deref(),
-            Ok("acceptEdits")
-        );
+        assert_eq!(lead.child(Provider::Claude, None).as_deref(), Ok("auto"));
         // Nothing where nothing asks, and accept-edits can't start auto.
         assert_eq!(
             lead.child(Provider::Codex, Some("never/danger-full-access")),
@@ -1296,7 +1529,7 @@ mod tests {
             lead.child(Provider::Claude, Some("default")),
             Err("This agent runs in dontAsk mode, so it can't start a child in default. Without --permission-mode it starts in dontAsk. Only a person can start it in that mode.".into())
         );
-        // Another provider's child is pinned to one that asks a person.
+        // Another provider's child gets the equivalent that asks a person.
         assert_eq!(
             lead.child(Provider::Codex, None).as_deref(),
             Ok("untrusted/workspace-write")
@@ -1502,7 +1735,8 @@ mod tests {
         }
 
         // An Antigravity lead that skips permissions starts any Antigravity
-        // mode, but its bypass is a switch, so an omitted one is pinned.
+        // mode, but its bypass is a switch, so an omitted one is the nearest
+        // mode Antigravity has.
         let bypass = Ceiling::launched(&recipe("agy", &["--dangerously-skip-permissions"]));
         assert!(bypass.may_approve());
         assert_eq!(
@@ -1511,7 +1745,7 @@ mod tests {
         );
         assert_eq!(
             bypass.child(Provider::Antigravity, None).as_deref(),
-            Ok("acceptEdits")
+            Ok("auto")
         );
         assert_eq!(
             bypass

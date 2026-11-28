@@ -625,6 +625,12 @@ which models or efforts a live account can use.
 With `home/.codex/fixture-unconfirmed-model` present, thread start/resume omits
 the model field while turns keep their ordinary activity and completion frames.
 Remove the marker to report the selected model on the next start/resume.
+A new thread runs in the approval policy and sandbox its launch names, as an
+agent spawned with `--permission-mode never/danger-full-access` names them,
+and otherwise in `on-request` with a read-only sandbox. The peer accepts
+`thread/settings/update` during a turn too, as Codex does, and confirms the
+thread's new settings with `thread/settings/updated`, so the permission
+picker's changes show.
 `home/.codex/fixture-turn-pause` optionally holds a number of seconds from 0
 to 300 for the peer's busy turn, instead of its usual six-second pause.
 The footer scene uses 20 seconds so native capture can show confirmed running

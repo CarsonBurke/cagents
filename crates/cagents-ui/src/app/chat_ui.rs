@@ -3752,6 +3752,9 @@ pub(super) struct Runtime {
     composer_actions_query: String,
     /// The permission mode plan mode replaced, which leaving it restores.
     mode_before_plan: Option<String>,
+    /// While a turn runs, the permission mode it started in, which a Codex
+    /// turn keeps whatever mode the person chooses meanwhile.
+    turn_permission_mode: Option<Option<String>>,
     branch_picker: bool,
     changes: changes::State,
     /// Joins the parts of a long message back into one before presentation.
@@ -5518,6 +5521,7 @@ impl Runtime {
             composer_actions: false,
             composer_actions_query: String::new(),
             mode_before_plan: None,
+            turn_permission_mode: None,
             branch_picker: false,
             changes: changes::State::default(),
             logical_prose: logical_prose::State::default(),
@@ -5930,8 +5934,7 @@ impl Runtime {
                 self.plan_toggle().is_some(),
                 ComposerRow::Plan,
                 // The footer's mode control is offered on the same terms.
-                !transitioning
-                    && !(self.session.launch.provider == Provider::Codex && snapshot.busy),
+                !transitioning,
             ),
             (
                 !snapshot.capabilities.interrupt_modes.is_empty(),
@@ -6967,6 +6970,7 @@ impl Runtime {
         // Hidden publications number new children too, so a child keeps the
         // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
+        self.observe_turn_permission_mode(&snapshot);
         if !self.presents() {
             self.release_transcript_presentation();
             self.settle_commands(&snapshot, false);
