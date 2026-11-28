@@ -170,6 +170,21 @@ class Doctor(unittest.TestCase):
 
 
 class CodexWatcher(unittest.TestCase):
+    def test_a_file_at_the_system_directory_still_warns(self):
+        doctor = runpy.run_path(str(ROOT / "scripts/doctor"))
+        with tempfile.TemporaryDirectory(prefix="cagents-codex-doctor-") as temporary:
+            path = Path(temporary) / "codex"
+            path.write_text("existing configuration")
+            report = mock.Mock()
+            with mock.patch("sys.platform", "linux"), mock.patch("shutil.which", return_value="/usr/bin/codex"):
+                doctor["check_codex_watcher"](report, path)
+            report.warn.assert_called_once()
+            name, detail = report.warn.call_args.args
+            self.assertEqual(name, "codex")
+            self.assertIn(f"{path} must be a directory", detail)
+            report.fail.assert_not_called()
+            self.assertEqual(path.read_text(), "existing configuration")
+
     def test_a_missing_system_directory_warns_only_with_codex_on_linux(self):
         doctor = runpy.run_path(str(ROOT / "scripts/doctor"))
         with tempfile.TemporaryDirectory(prefix="cagents-codex-doctor-") as temporary:
