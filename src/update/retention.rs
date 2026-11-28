@@ -6,7 +6,7 @@ use std::{collections::BTreeSet, ffi::OsStr, time::SystemTime};
 const KEEP: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 const COMPLETE: &str = ".complete";
 
-fn canonical_id(id: &str) -> bool {
+pub(super) fn canonical_id(id: &str) -> bool {
     uuid::Uuid::parse_str(id).is_ok_and(|parsed| parsed.to_string() == id)
 }
 
@@ -82,6 +82,7 @@ fn job_artifact(name: &str) -> Option<&str> {
         "log"
             | "request"
             | "census.json"
+            | "resume-census.json"
             | "recovery.json"
             | "settled.json"
             | "linux-handoff.json"
@@ -203,6 +204,7 @@ mod tests {
             "log",
             "request",
             "census.json",
+            "resume-census.json",
             "recovery.json",
             "cutover-inventory.json",
             "ready-parked-support.json",

@@ -407,13 +407,13 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         let chats = client.list_chats()?;
         let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
         let mut in_flight = Vec::new();
-        let mut queue_text_budget = super::in_flight::QUEUED_TEXT_CENSUS_BYTES;
+        let mut resume_census = super::resume_census::Capture::new();
         for chat in &chats {
             let snapshot = client.capture_chat_snapshot(chat.clone())?;
             // Read before the page keeps only what a reader shows.
-            let mut work = self.survivors.observe_in_flight(chat, &snapshot);
+            let work = self.survivors.observe_in_flight(chat, &snapshot);
             if !work.is_empty() {
-                work.fit_queued_text(&mut queue_text_budget);
+                resume_census.observe(&work, &snapshot);
                 in_flight.push(work);
             }
             snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
@@ -452,7 +452,11 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             state,
             &job.id,
         )
-        .map_err(invalid)
+        .map_err(invalid)?;
+        if let Err(error) = resume_census.save(state, &job.id) {
+            tracing::warn!(%error, "could not retain optional update resume data");
+        }
+        Ok(())
     }
     fn begin_preparation(
         &mut self,
@@ -1821,6 +1825,7 @@ impl Survivors {
                     }
                 };
                 Outcome {
+                    resume: Default::default(),
                     label: self
                         .labels
                         .get(&work.id)

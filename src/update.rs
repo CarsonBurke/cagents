@@ -64,6 +64,7 @@ pub(crate) use ready_plan::{begin_new_job as retire_completed_activation, requir
 pub mod recovery;
 #[cfg(target_os = "macos")]
 mod release_stage;
+mod resume_census;
 mod retention;
 #[cfg(all(feature = "ui", feature = "development"))]
 mod review_fixture;
@@ -1837,6 +1838,8 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
             Err(error) => return Err(error),
         }
     }
+    #[cfg(feature = "ui")]
+    resume_census::enrich(&state, &mut job);
     Ok(Some(job))
 }
 
