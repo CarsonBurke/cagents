@@ -247,7 +247,8 @@ fn configure_remote_fixture(fixture: &Fixture, failing_ssh: bool) {
 #[test]
 fn daemon_recovery_hints_keep_the_callers_device() {
     use cagents::{
-        agent_execution::Operation,
+        agent::Provider,
+        agent_execution::{Operation, Reply, resume::Resumed},
         device_service,
         model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
         terminal_ipc::{
@@ -262,6 +263,7 @@ fn daemon_recovery_hints_keep_the_callers_device() {
         return;
     }
     const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+    const PAIRED: &str = "00000000-0000-4000-8000-000000000002";
     let fixture = Fixture::new();
     configure_remote_fixture(&fixture, false);
     let directory = fixture
@@ -343,6 +345,23 @@ fn daemon_recovery_hints_keep_the_callers_device() {
                     ClientRequest::Agent {
                         operation: Operation::Resume(handle),
                         ..
+                    } if handle == PAIRED => ServerMessage::Response {
+                        response: ServerResponse::Agent(Reply::Resumed(Resumed {
+                            stopped: PAIRED.parse().unwrap(),
+                            session: PAIRED.parse().unwrap(),
+                            provider: Provider::Codex,
+                            title: None,
+                            agent: None,
+                            already_running: false,
+                            starting: false,
+                            note: Some(format!(
+                                "The provider is still starting. Run `cagents resume {PAIRED}` again to restore the paired terminal"
+                            )),
+                        })),
+                    },
+                    ClientRequest::Agent {
+                        operation: Operation::Resume(handle),
+                        ..
                     } => {
                         assert_eq!(handle, "abcd");
                         ServerMessage::Error(ProtocolError::new(
@@ -397,8 +416,26 @@ fn daemon_recovery_hints_keep_the_callers_device() {
             "{message}"
         );
         assert!(message.ends_with(&format!("`{target} resume {SESSION}`, or message another session from `{target} sessions --all`")), "{message}");
+
+        let resume = fixture.run(command.clone().args(["resume", PAIRED]));
+        assert_eq!(resume.exit_code, Some(0), "{resume:?}");
+        let value: Value = serde_json::from_slice(&resume.stdout).unwrap();
+        assert_eq!(
+            value["data"]["sessions"][0]["note"],
+            format!(
+                "The provider is still starting. Run `{target} resume {PAIRED}` again to restore the paired terminal"
+            )
+        );
         if device == Some("fixture") {
             command.arguments.remove(0); // The fixture defaults to --json.
+            let repaired = fixture.run(command.clone().args(["resume", PAIRED]));
+            let repaired = String::from_utf8(repaired.stdout).unwrap();
+            assert!(
+                repaired.contains(&format!(
+                    "`{target} resume {PAIRED}` again to restore the paired terminal"
+                )),
+                "{repaired}"
+            );
             let output = fixture.run(command.args(["resume", "abcd", SESSION]));
             assert_eq!(output.exit_code, Some(4), "{output:?}");
             let message = String::from_utf8(output.stdout).unwrap();
