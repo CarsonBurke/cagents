@@ -588,7 +588,7 @@ pub enum Action {
 pub struct RemoteRead {
     pub(super) availability: GitHubAvailability,
     pub(super) archived: Vec<ArchivedWorktreePr>,
-    pub(super) binding: Option<review_request_ui::RepositoryBinding>,
+    pub(super) binding: Option<Box<review_request_ui::RepositoryBinding>>,
 }
 
 #[derive(Debug, Clone)]
@@ -933,7 +933,7 @@ impl Cagents {
                     row.revoke_github();
                 }
                 row.github_status = availability.label().into();
-                self.update_review_binding(project, &availability, binding);
+                self.update_review_binding(project, &availability, binding.map(|binding| *binding));
                 self.github_availability.insert(project, availability);
                 return Task::batch([
                     self.open_pending_pull_requests(project),
@@ -1727,7 +1727,7 @@ impl Cagents {
                 RemoteRead {
                     availability,
                     archived,
-                    binding,
+                    binding: binding.map(Box::new),
                 }
             })
             .await

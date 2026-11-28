@@ -324,11 +324,11 @@ mod tests {
                 result: Ok(git_ui::RemoteRead {
                     availability,
                     archived: Vec::new(),
-                    binding: Some(RepositoryBinding {
+                    binding: Some(Box::new(RepositoryBinding {
                         local: Some(original.clone()),
                         resolved: None,
                         remotes: BTreeMap::from([("origin".into(), original.clone())]),
-                    }),
+                    })),
                 }),
             }));
             assert!(!app.sidebar_model.projects[0].github_ready);
@@ -352,11 +352,11 @@ mod tests {
                     refreshed_at: 2,
                 },
                 archived: Vec::new(),
-                binding: Some(RepositoryBinding {
+                binding: Some(Box::new(RepositoryBinding {
                     local: Some(replacement.clone()),
                     resolved: Some(replacement.clone()),
                     remotes: BTreeMap::from([("origin".into(), replacement.clone())]),
-                }),
+                })),
             }),
         }));
         assert!(
@@ -375,11 +375,11 @@ mod tests {
                     detail: "could not resolve the new remote".into(),
                 },
                 archived: Vec::new(),
-                binding: Some(RepositoryBinding {
+                binding: Some(Box::new(RepositoryBinding {
                     local: Some(original.clone()),
                     resolved: None,
                     remotes: BTreeMap::from([("origin".into(), original)]),
-                }),
+                })),
             }),
         }));
         assert!(!app.watches_review_requests());
