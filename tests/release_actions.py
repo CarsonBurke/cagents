@@ -10,6 +10,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import textwrap
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -21,6 +22,15 @@ echo "$*" >> "$FIXTURE/gh.log"
 case "$1 $2" in
     "release list") cat "$FIXTURE/published" 2>/dev/null ;;
     "api repos/"*/status\?per_page=100) cat "$FIXTURE/status-response" ;;
+    "api --method")
+        [[ $3 == GET ]] || exit 99
+        case $4 in
+            repos/*/actions/workflows/release.yml/runs) cat "$FIXTURE/prepared-runs" ;;
+            repos/*/actions/runs/*/artifacts)
+                run=${4%/artifacts}
+                cat "$FIXTURE/prepared-artifacts-${run##*/}" ;;
+            *) exit 99 ;;
+        esac ;;
     "api --silent")
         [[ $3 == --method && $4 == POST && $5 == repos/*/statuses/* ]] || exit 99
         [[ ! -e $FIXTURE/status-write-fails ]] ;;
@@ -59,6 +69,25 @@ class ReleaseWorkflow(unittest.TestCase):
         self.assertIn("needs: [admit, build]", sign)
         self.assertIn("needs.admit.result == 'success'", sign)
         self.assertIn("COMMIT: ${{ needs.admit.outputs.commit }}", sign)
+
+    def test_prepared_bundles_keep_signing_on_the_existing_tagged_run_path(self):
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        jobs = dict(re.findall(r"^  (\w+):\n((?:^    .*\n|\n)*)", workflow, re.MULTILINE))
+        build, sign, publish = (jobs[name] for name in ("build", "sign", "publish"))
+        alias = "steps.prepared.outputs.artifact_id"
+        self.assertIn("actions: read", build)
+        self.assertIn('run: scripts/release-actions prepared-bundle "$COMMIT"', build)
+        self.assertIn("COMMIT: ${{ needs.admit.outputs.commit }}", build)
+        self.assertIn("artifact-ids: ${{ " + alias + " }}", build)
+        self.assertIn("run-id: ${{ steps.prepared.outputs.run_id }}", build)
+        self.assertIn("github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'"
+                      " && format('qualified-linux-{0}', github.run_attempt) || 'bundle'", build)
+        self.assertIn(f"if: {alias} == ''", build.split("- name: Build, package and smoke-test", 1)[1])
+        check = build.index('scripts/release-metadata check --dir "$dist" --version "$VERSION" --source-commit "$COMMIT"')
+        self.assertLess(check, build.index('scripts/release-metadata write --dir "$dist"'))
+        self.assertIn("name: bundle", sign)
+        self.assertIn("name: bundle", publish)
+        self.assertNotIn("RELEASE_SIGNING_KEY", build)
 
 
 class ReleaseActions(unittest.TestCase):
@@ -277,6 +306,120 @@ class ReleaseActions(unittest.TestCase):
         (self.root / "status-write-fails").touch()
         result = self.run_actions("record-tests", sha, stdin=json.dumps(good))
         self.assertIn("cannot record the fw16 test status", result.stderr)
+
+    def prepared_run(self, sha, run_id, attempt=1):
+        return {
+            "id": run_id, "run_attempt": attempt, "path": ".github/workflows/release.yml",
+            "head_branch": "main", "head_sha": sha, "event": "workflow_dispatch",
+            "status": "completed", "conclusion": "success", "repository": {"id": 94},
+            "head_repository": {"id": 94},
+        }
+
+    def prepared_artifact(self, sha, run_id, artifact_id, attempt=1):
+        return {
+            "id": artifact_id, "name": f"qualified-linux-{attempt}", "expired": False,
+            "workflow_run": {"id": run_id, "head_sha": sha, "head_branch": "main",
+                             "repository_id": 94, "head_repository_id": 94},
+        }
+
+    def write_prepared_runs(self, *runs):
+        (self.root / "prepared-runs").write_text(json.dumps({"workflow_runs": runs}))
+
+    def write_prepared_artifacts(self, run_id, *artifacts):
+        (self.root / f"prepared-artifacts-{run_id}").write_text(json.dumps({"artifacts": artifacts}))
+
+    def find_bundle(self, sha):
+        return self.run_actions("prepared-bundle", sha, env={"GITHUB_REPOSITORY_ID": "94"})
+
+    def test_prepared_bundle_uses_the_exact_successful_attempt_by_immutable_id(self):
+        sha = self.git("rev-parse", "HEAD")
+        self.write_prepared_runs(self.prepared_run(sha, 27, attempt=2))
+        self.write_prepared_artifacts(27, self.prepared_artifact(sha, 27, 101),
+                                      self.prepared_artifact(sha, 27, 102, attempt=2))
+        result = self.find_bundle(sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run_id": "27", "artifact_id": "102"})
+        log = (self.root / "gh.log").read_text()
+        self.assertIn(f"release.yml/runs -f branch=main -f event=workflow_dispatch -f status=success -f head_sha={sha}", log)
+        self.assertIn("/runs/27/artifacts -f name=qualified-linux-2", log)
+
+    def test_prepared_bundle_ignores_runs_without_exact_source_and_success(self):
+        sha = self.git("rev-parse", "HEAD")
+        run = self.prepared_run(sha, 27)
+        for field, invalid in {
+            "head_sha": "0" * 40, "head_branch": "feature", "event": "push", "status": "in_progress",
+            "conclusion": "failure", "path": ".github/workflows/other.yml", "repository": {"id": 95},
+            "head_repository": {"id": 95},
+        }.items():
+            with self.subTest(field=field):
+                self.write_prepared_runs(run | {field: invalid})
+                result = self.find_bundle(sha)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.outputs(), {})
+        self.assertNotIn("/artifacts", (self.root / "gh.log").read_text())
+
+    def test_prepared_bundle_skips_expired_wrong_attempt_and_wrong_origin_artifacts(self):
+        sha = self.git("rev-parse", "HEAD")
+        self.write_prepared_runs(self.prepared_run(sha, 27, attempt=2), self.prepared_run(sha, 26))
+        artifact = self.prepared_artifact(sha, 27, 103, attempt=2)
+        wrong_source = artifact | {"workflow_run": artifact["workflow_run"] | {"head_sha": "0" * 40}}
+        self.write_prepared_artifacts(27, self.prepared_artifact(sha, 27, 102),
+                                      artifact | {"expired": True}, wrong_source)
+        self.write_prepared_artifacts(26, self.prepared_artifact(sha, 26, 101))
+        result = self.find_bundle(sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {"run_id": "26", "artifact_id": "101"})
+
+    def test_prepared_bundle_without_a_live_artifact_triggers_the_build(self):
+        sha = self.git("rev-parse", "HEAD")
+        self.write_prepared_runs(self.prepared_run(sha, 27))
+        self.write_prepared_artifacts(27)
+        result = self.find_bundle(sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.outputs(), {})
+        self.assertIn("Building and smoke-testing the tag", result.stdout)
+
+    def test_prepared_bundle_distinguishes_an_api_failure_from_a_cache_miss(self):
+        sha = self.git("rev-parse", "HEAD")
+        self.write_prepared_runs(self.prepared_run(sha, 27))
+        result = self.find_bundle(sha)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(self.outputs(), {})
+        self.assertIn("cannot list prepared release artifacts for run 27", result.stderr)
+
+    def test_workflow_refreshes_prepared_notes_only_after_verifying_the_download(self):
+        shutil.copy2(ROOT / "scripts/release-metadata", self.repo / "scripts/release-metadata")
+        self.git("commit", "-qm", "fix(release): improve the release gate", "--allow-empty")
+        sha = self.git("rev-parse", "HEAD")
+        dist = self.root / "prepared-dist"
+        dist.mkdir()
+        archive = dist / "cagents-0.2.4-x86_64-unknown-linux-gnu.tar.gz"
+        for path in (archive, dist / "install.sh", dist / "SHA256SUMS"):
+            path.write_bytes(b"qualified artifact\n")
+        notes = self.root / "old-notes.md"
+        notes.write_text("Notes from preparation\n")
+        metadata = dist / "release-metadata.json"
+        subprocess.run(["scripts/release-metadata", "write", "--dir", str(dist), "--version", "0.2.4",
+                        "--source-commit", sha, "--protocol", "218", "--notes", str(notes)],
+                       cwd=self.repo, check=True, capture_output=True)
+        original = json.loads(metadata.read_bytes())
+        workflow = (ROOT / ".github/workflows/release.yml").read_text()
+        step = workflow.split("- name: Verify the prepared files and refresh their release notes\n", 1)[1]
+        script = textwrap.dedent(step.split("        run: |\n", 1)[1].split("      - name:", 1)[0])
+        command = ["bash", "-eo", "pipefail", "-c", script]
+        env = {**os.environ, "RUNNER_TEMP": str(self.root), "GITHUB_WORKSPACE": str(self.repo),
+               "VERSION": "0.2.4", "COMMIT": sha}
+
+        result = subprocess.run(command, cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        refreshed = json.loads(metadata.read_bytes())
+        self.assertEqual(refreshed, original | {"notes": "### Fixed\n- Improve the release gate\n"})
+
+        archive.write_bytes(b"different bytes\n")
+        result = subprocess.run(command, cwd=self.repo, env=env, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("does not match the release files", result.stderr)
+        self.assertEqual(json.loads(metadata.read_bytes()), refreshed)
 
     def test_sign_signs_the_checked_metadata_with_the_actions_key(self):
         dist = self.root / "dist"
