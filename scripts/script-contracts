@@ -182,6 +182,8 @@ JOBS = (
                       ("bash", "scripts/build-release-linux"))),
         Suite("release signatures", "tests/publish_release_signatures.py",
               sources=("scripts/publish-release", "scripts/release-metadata")),
+        Suite("release archive layouts", "tests/release_editor_archive.py",
+              sources=("scripts/publish-release",)),
         Suite("release artifact smoke", "tests/release_artifact_smoke.py",
               sources=("scripts/build-release-linux", "scripts/release-build-cache", "scripts/cargo-gate-command.py",
                        "tests/fixture_custody.py", "scripts/prepare-release-smoke-rootfs", "scripts/smoke-release-artifacts",
@@ -252,7 +254,6 @@ UNSCHEDULED = (
     "tests/package_linux_artifacts.py",
     "tests/publish_release_git_environment.py",
     "tests/redraw_latency.py",
-    "tests/release_editor_archive.py",
     "tests/release_package_dependencies.py",
     "tests/terminal_escape_fixture.py",
 )

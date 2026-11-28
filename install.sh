@@ -753,6 +753,7 @@ METAINFO_TARGET=$PREFIX/current/$METAINFO_MEMBER
 AUTOSTART_TARGET=$PREFIX/current/$AUTOSTART_MEMBER
 EDITOR_BIN_LINK=$HOME/.local/bin/ceditor
 EDITOR_LAUNCHER=$PREFIX/.ceditor-launcher
+EDITOR_LAUNCHER_VERSION=2
 EDITOR_DESKTOP_MEMBER=share/applications/io.github.cagents.ceditor.desktop
 EDITOR_ICON_MEMBER=share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg
 EDITOR_DESKTOP_LINK=$DATA_HOME/${EDITOR_DESKTOP_MEMBER#share/}
@@ -835,7 +836,6 @@ remove_editor_link_temp() {
 }
 
 settle_editor_launchers() {
-    if [ -n "$EDITOR_LAUNCHER_TEMP" ]; then rm -f "$EDITOR_LAUNCHER_TEMP" || :; fi
     remove_editor_link_temp
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$ROLLBACK_OK" -eq 1 ]; then
         remove_created_link "$EDITOR_BIN_LINK_CREATED" "$EDITOR_BIN_LINK" "$EDITOR_LAUNCHER"
@@ -849,10 +849,24 @@ settle_editor_launchers() {
         fi
         if [ "$EDITOR_LAUNCHER_CREATED" -eq 1 ] \
             && { [ ! -L "$EDITOR_BIN_LINK" ] || [ "$(readlink "$EDITOR_BIN_LINK" 2>/dev/null || :)" != "$EDITOR_LAUNCHER" ]; } \
-            && is_managed_editor_launcher "$EDITOR_LAUNCHER"; then
+            && [ ! -L "$EDITOR_LAUNCHER" ] && [ "$EDITOR_LAUNCHER" -ef "$EDITOR_LAUNCHER_TEMP" ]; then
             rm -f "$EDITOR_LAUNCHER" || :
         fi
     fi
+    [ -n "$EDITOR_LAUNCHER_TEMP" ] || return 0
+
+    editor_launcher_backup=$EDITOR_LAUNCHER_TEMP.previous
+    if [ -f "$editor_launcher_backup" ]; then
+        if [ "$TRANSACTION_COMMITTED" -eq 1 ] || [ "$ROLLBACK_OK" -eq 0 ] \
+            || [ "$EDITOR_LAUNCHER" -ef "$editor_launcher_backup" ]; then
+            rm -f "$editor_launcher_backup" || :
+        elif ! { [ ! -L "$EDITOR_LAUNCHER" ] && [ "$EDITOR_LAUNCHER" -ef "$EDITOR_LAUNCHER_TEMP" ] \
+            && mv -fT "$editor_launcher_backup" "$EDITOR_LAUNCHER"; }; then
+            printf '%s: could not restore %s; the original file is at %s\n' \
+                "$PROGRAM" "$EDITOR_LAUNCHER" "$editor_launcher_backup" >&2
+        fi
+    fi
+    rm -f "$EDITOR_LAUNCHER_TEMP" "$EDITOR_LAUNCHER_TEMP.next" || :
 }
 
 # These commands belong to the verified candidate, including after current
@@ -1550,19 +1564,117 @@ prune_installed_versions() (
     exit 0
 )
 
+prepare_link_parent() {
+    link_directory=${1%/*}
+    mkdir -p "$link_directory" || fail "cannot create link directory $link_directory"
+    [ -d "$link_directory" ] || fail "link parent is not a directory: $link_directory"
+}
+
+# The ownership marker stays compatible with earlier uninstallers. The
+# optional third line versions the launcher implementation independently.
+editor_launcher_version() (
+    is_managed_editor_launcher "$1" || exit 1
+    version=$(sed -n '3s/^# cagents ceditor launcher revision //p; 3q' "$1") || exit 1
+    case $version in ''|0*|*[!0-9]*) version=1 ;; esac
+    [ "${#version}" -le 9 ] || exit 1
+    printf '%s\n' "$version"
+)
+
+prepare_editor_launchers() {
+    if [ -e "$EDITOR_LAUNCHER" ] || [ -L "$EDITOR_LAUNCHER" ]; then
+        is_managed_editor_launcher "$EDITOR_LAUNCHER" && [ -x "$EDITOR_LAUNCHER" ] \
+            || fail "refusing to replace existing file $EDITOR_LAUNCHER"
+    fi
+    prepare_link_parent "$EDITOR_BIN_LINK"
+    prepare_link_parent "$EDITOR_DESKTOP_LINK"
+    prepare_link_parent "$EDITOR_ICON_LINK"
+}
+
+publish_editor_launchers() {
+    editor_launcher_installed=$(editor_launcher_version "$EDITOR_LAUNCHER" || printf '0')
+    if [ "$editor_launcher_installed" -lt "$EDITOR_LAUNCHER_VERSION" ]; then
+        EDITOR_LAUNCHER_TEMP=$(mktemp "$PREFIX/.ceditor-launcher.XXXXXX")
+        # Keep this indirection across current switches, including a rollback
+        # to a release from before the editor was bundled.
+        {
+            printf '#!/bin/sh\n# cagents managed ceditor launcher v1\n# cagents ceditor launcher revision %s\n' "$EDITOR_LAUNCHER_VERSION"
+            cat <<'EOF'
+launcher=$(readlink -f -- "$0") || exit 1
+editor=${launcher%/*}/current/bin/ceditor
+source_build=$HOME/.local/lib/ceditor/current
+if { [ -f "$source_build/.prefer-source" ] || [ ! -x "$editor" ]; } \
+    && [ -x "$source_build/bin/ceditor" ] \
+    && [ "$(cat "$source_build/bin/.ceditor-companions" 2>/dev/null)" = 'ceditor companions v1' ]; then
+    exec "$source_build/bin/ceditor" "$@"
+fi
+if [ -x "$editor" ]; then exec "$editor" "$@"; fi
+printf '%s\n' 'ceditor is unavailable in the selected cagents release' >&2
+exit 1
+EOF
+        } > "$EDITOR_LAUNCHER_TEMP"
+        chmod 0755 "$EDITOR_LAUNCHER_TEMP"
+        if [ "$editor_launcher_installed" -eq 0 ]; then
+            EDITOR_LAUNCHER_CREATED=1
+            ln -T "$EDITOR_LAUNCHER_TEMP" "$EDITOR_LAUNCHER" \
+                || fail "cannot publish $EDITOR_LAUNCHER"
+        else
+            ln -T "$EDITOR_LAUNCHER" "$EDITOR_LAUNCHER_TEMP.previous" \
+                && [ "$(editor_launcher_version "$EDITOR_LAUNCHER_TEMP.previous")" = "$editor_launcher_installed" ] \
+                && ln -T "$EDITOR_LAUNCHER_TEMP" "$EDITOR_LAUNCHER_TEMP.next" \
+                && [ ! -L "$EDITOR_LAUNCHER" ] && [ "$EDITOR_LAUNCHER" -ef "$EDITOR_LAUNCHER_TEMP.previous" ] \
+                && mv -fT "$EDITOR_LAUNCHER_TEMP.next" "$EDITOR_LAUNCHER" \
+                || fail "cannot replace $EDITOR_LAUNCHER"
+        fi
+    fi
+
+    if [ -L "$EDITOR_BIN_LINK" ] && [ "$(readlink "$EDITOR_BIN_LINK")" = "$LEGACY_EDITOR_LINK" ] \
+        && [ ! -f "$HOME/.local/lib/ceditor/current/.prefer-source" ]; then
+        EDITOR_BIN_LINK_MIGRATED=1
+        replace_editor_bin_link "$LEGACY_EDITOR_LINK" "$EDITOR_LAUNCHER" \
+            || fail "cannot migrate $EDITOR_BIN_LINK"
+        remove_editor_link_temp
+    elif [ ! -e "$EDITOR_BIN_LINK" ] && [ ! -L "$EDITOR_BIN_LINK" ]; then
+        EDITOR_BIN_LINK_CREATED=1
+        ln -sT "$EDITOR_LAUNCHER" "$EDITOR_BIN_LINK" || fail "cannot create $EDITOR_BIN_LINK"
+    fi
+
+    # Existing source installs own copies of these files. Keep them so their
+    # menu entry and icon still work if the selected bundle has no editor.
+    editor_desktop_target=$PREFIX/current/$EDITOR_DESKTOP_MEMBER
+    if [ ! -e "$EDITOR_DESKTOP_LINK" ] && [ ! -L "$EDITOR_DESKTOP_LINK" ]; then
+        EDITOR_DESKTOP_LINK_CREATED=1
+        ln -sT "$editor_desktop_target" "$EDITOR_DESKTOP_LINK" || fail "cannot create $EDITOR_DESKTOP_LINK"
+    else
+        refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$editor_desktop_target" \
+            || fail "cannot refresh $EDITOR_DESKTOP_LINK"
+    fi
+    if [ ! -e "$EDITOR_ICON_LINK" ] && [ ! -L "$EDITOR_ICON_LINK" ]; then
+        EDITOR_ICON_LINK_CREATED=1
+        ln -sT "$PREFIX/current/$EDITOR_ICON_MEMBER" "$EDITOR_ICON_LINK" || fail "cannot create $EDITOR_ICON_LINK"
+    fi
+}
+
 if [ -n "$SELECT_VERSION" ]; then
-    # Nothing from this release is installed: its coordinator only switches
-    # current, under the held launch fence and staging ownership checks, to a
-    # complete version that is already installed in this prefix.
+    # The coordinator switches current under the held launch fence and staging
+    # ownership checks, to a complete version already installed in this prefix.
     [ ! -L "$PREFIX" ] || fail "refusing to install through symlink $PREFIX"
     [ -L "$PREFIX/current" ] || fail "no installed version to select from at $PREFIX"
+    if [ -x "$PREFIX/versions/$SELECT_VERSION/bin/ceditor" ]; then
+        prepare_editor_launchers
+        publish_editor_launchers
+    fi
     SELECTED_FROM=$(readlink "$PREFIX/current") || fail "cannot inspect $PREFIX/current"
     "$COORDINATOR" select-install --prefix "$PREFIX" \
         --version-root "$PREFIX/versions/$SELECT_VERSION" \
         --expect-current "$SELECTED_FROM" >/dev/null \
         || fail "version $SELECT_VERSION was not selected"
+    TRANSACTION_COMMITTED=1
     refresh_desktop_link "$DESKTOP_LINK" "$DESKTOP_TARGET" || :
-    refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$PREFIX/current/$EDITOR_DESKTOP_MEMBER" || :
+    if [ -x "$PREFIX/current/bin/ceditor" ]; then
+        refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$PREFIX/current/$EDITOR_DESKTOP_MEMBER" || :
+    else
+        remove_editor_launchers || :
+    fi
     refresh_launcher_caches
     printf 'Serving installed cagents %s; running windows and daemon were preserved. Windows offer an update only while it differs from the version they run.\n' "$SELECT_VERSION"
     exit 0
@@ -1710,12 +1822,6 @@ check_link_destination() {
         is_managed_copy "$link" "$link_member" "$@" \
             || fail "refusing to replace existing file $link"
     fi
-}
-
-prepare_link_parent() {
-    link_directory=${1%/*}
-    mkdir -p "$link_directory" || fail "cannot create link directory $link_directory"
-    [ -d "$link_directory" ] || fail "link parent is not a directory: $link_directory"
 }
 
 desktop_exec_escape() {
@@ -1971,67 +2077,6 @@ ensure_link() {
     ln -sT "$link_target" "$link_path" || fail "cannot create link $link_path"
 }
 
-prepare_editor_launchers() {
-    if [ -e "$EDITOR_LAUNCHER" ] || [ -L "$EDITOR_LAUNCHER" ]; then
-        is_managed_editor_launcher "$EDITOR_LAUNCHER" && [ -x "$EDITOR_LAUNCHER" ] \
-            || fail "refusing to replace existing file $EDITOR_LAUNCHER"
-    fi
-    prepare_link_parent "$EDITOR_BIN_LINK"
-    prepare_link_parent "$EDITOR_DESKTOP_LINK"
-    prepare_link_parent "$EDITOR_ICON_LINK"
-}
-
-publish_editor_launchers() {
-    if ! is_managed_editor_launcher "$EDITOR_LAUNCHER"; then
-        EDITOR_LAUNCHER_TEMP=$(mktemp "$PREFIX/.ceditor-launcher.XXXXXX")
-        # Keep this indirection across current switches, including a rollback
-        # to a release from before the editor was bundled.
-        cat > "$EDITOR_LAUNCHER_TEMP" <<'EOF'
-#!/bin/sh
-# cagents managed ceditor launcher v1
-launcher=$(readlink -f -- "$0") || exit 1
-editor=${launcher%/*}/current/bin/ceditor
-if [ -x "$editor" ]; then exec "$editor" "$@"; fi
-legacy_bin=$HOME/.local/lib/ceditor/current/bin
-if [ -x "$legacy_bin/ceditor" ] \
-    && [ "$(cat "$legacy_bin/.ceditor-companions" 2>/dev/null)" = 'ceditor companions v1' ]; then
-    exec "$legacy_bin/ceditor" "$@"
-fi
-printf '%s\n' 'ceditor is unavailable in the selected cagents release' >&2
-exit 1
-EOF
-        chmod 0755 "$EDITOR_LAUNCHER_TEMP"
-        ln -T "$EDITOR_LAUNCHER_TEMP" "$EDITOR_LAUNCHER" \
-            || fail "cannot publish $EDITOR_LAUNCHER"
-        EDITOR_LAUNCHER_CREATED=1
-    fi
-
-    if [ -L "$EDITOR_BIN_LINK" ] && [ "$(readlink "$EDITOR_BIN_LINK")" = "$LEGACY_EDITOR_LINK" ]; then
-        EDITOR_BIN_LINK_MIGRATED=1
-        replace_editor_bin_link "$LEGACY_EDITOR_LINK" "$EDITOR_LAUNCHER" \
-            || fail "cannot migrate $EDITOR_BIN_LINK"
-        remove_editor_link_temp
-    elif [ ! -e "$EDITOR_BIN_LINK" ] && [ ! -L "$EDITOR_BIN_LINK" ]; then
-        EDITOR_BIN_LINK_CREATED=1
-        ln -sT "$EDITOR_LAUNCHER" "$EDITOR_BIN_LINK" || fail "cannot create $EDITOR_BIN_LINK"
-    fi
-
-    # Existing source installs own copies of these files. Keep them so their
-    # menu entry and icon still work if the selected bundle has no editor.
-    editor_desktop_target=$PREFIX/current/$EDITOR_DESKTOP_MEMBER
-    if [ ! -e "$EDITOR_DESKTOP_LINK" ] && [ ! -L "$EDITOR_DESKTOP_LINK" ]; then
-        EDITOR_DESKTOP_LINK_CREATED=1
-        ln -sT "$editor_desktop_target" "$EDITOR_DESKTOP_LINK" || fail "cannot create $EDITOR_DESKTOP_LINK"
-    else
-        refresh_desktop_link "$EDITOR_DESKTOP_LINK" "$editor_desktop_target" \
-            || fail "cannot refresh $EDITOR_DESKTOP_LINK"
-    fi
-    if [ ! -e "$EDITOR_ICON_LINK" ] && [ ! -L "$EDITOR_ICON_LINK" ]; then
-        EDITOR_ICON_LINK_CREATED=1
-        ln -sT "$PREFIX/current/$EDITOR_ICON_MEMBER" "$EDITOR_ICON_LINK" || fail "cannot create $EDITOR_ICON_LINK"
-    fi
-}
-
 [ ! -x "$NEW_VERSION_DIR/bin/ceditor" ] || prepare_editor_launchers
 
 # A reviewed worker supplies its pre-shutdown census. A standalone installer
@@ -2227,6 +2272,17 @@ if [ "$DAEMON_START_FAILED" -eq 0 ]; then
         fail 'the installation did not prove that the terminal service and its sessions are ready'
     fi
     if [ "$DAEMON_DEFERRED" -eq 0 ]; then DAEMON_STARTED=1; fi
+fi
+# A same-protocol update can put the previous tree back after the installer
+# exits if its worker cannot reopen any windows. The first bundled editor needs
+# its launchers settled even when the worker came from a pre-Ceditor release.
+if [ "$STAGE_ONLY" -eq 0 ] && [ "$RESTART_DAEMON" -eq 0 ] \
+    && [ -n "${CAGENTS_INSTALL_CENSUS_PATH:-}" ] && [ -z "${CAGENTS_INSTALL_RESULT_FD:-}" ] \
+    && [ "$OLD_DAEMON_WAS_RUNNING" -eq 1 ] \
+    && [ "$HAD_CURRENT" -eq 1 ] && [ ! -x "$PREVIOUS_VERSION_DIR/bin/ceditor" ] \
+    && [ -x "$NEW_VERSION_DIR/bin/ceditor" ]; then
+    installer_tool "$NEW_VERSION_DIR/bin/cagents" settle-editor-install "$PREVIOUS_VERSION_DIR" >/dev/null \
+        || fail 'cannot prepare Ceditor launcher rollback'
 fi
 TRANSACTION_COMMITTED=1
 if [ "$NEW_VERSION_RETAINED" -eq 1 ]; then

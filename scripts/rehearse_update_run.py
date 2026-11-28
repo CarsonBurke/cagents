@@ -1156,6 +1156,46 @@ class Rehearsal:
         observation = json.loads(text)
         return observation if observation['window']['id'] == window['id'] else None
 
+    def verify_bundled_ceditor(self, version):
+        """Launch through the installed command and check the window and matched service."""
+        root, prefix, selected = private_candidate(self.root, version)
+        if (prefix/'current').resolve(strict=True) != selected:
+            raise RuntimeError(f'Ceditor rehearsal requires {version} to be the selected installation')
+        bin_dir = selected/'bin'
+        public = root/'home/.local/bin'
+        cli = (public/'cagents').resolve(strict=True)
+        if cli != bin_dir/'cagents':
+            raise RuntimeError('the public Cagents command does not select the matched CLI')
+        for name in ('cagents', 'ceditor'):
+            _, reported = self.call('env', public/name, '--version', timeout=20)
+            if reported.splitlines() != [f'{name} {version}']:
+                raise RuntimeError(f'the public {name} command does not report {version}')
+        owner = daemon_owner(root)
+        if owner is None:
+            raise RuntimeError('no serving daemon before launching bundled Ceditor')
+
+        self.call('ceditor', 'start-installed', timeout=90)
+        window = self.mapped().get('ceditor')
+        observation = self.observe_window(window) if window else None
+        if not observation or observation.get('painted') is not True:
+            raise RuntimeError('the bundled Ceditor window was not observed on the desktop')
+        editor = Path(f'/proc/{window["pid"]}/exe').readlink()
+        if editor != bin_dir/'ceditor':
+            raise RuntimeError(f'the public Ceditor launcher opened {editor}, outside the selected build')
+        _, serving = self.cli('--no-start', 'daemon', 'status')
+        data = serving.get('data', {})
+        daemon = Path(f'/proc/{owner[0]}/exe').readlink()
+        if (daemon_owner(root) != owner or daemon != bin_dir/'cagentsd'
+                or data.get('running') is not True or data.get('daemon_version') != version):
+            raise RuntimeError(f'bundled Ceditor did not leave the matched {version} daemon serving')
+
+        self.call('shot', 'after-ceditor', timeout=45)
+        evidence = {'version': version, 'cli_executable': str(cli), 'ceditor_executable': str(editor),
+                    'daemon_executable': str(daemon), 'daemon_identity': owner, 'window': observation}
+        output = root/'records/after/bundled-ceditor.json'
+        output.write_text(json.dumps(evidence, indent=2, sort_keys=True)+'\n')
+        self.notes.append(f'bundled Ceditor {version} opened with its matched CLI and serving daemon: {output}')
+
     HEADER = {'row': 21, 'step': 24, 'span': 420, 'right': 120}
 
     def header_offers_update(self, version):
@@ -2340,6 +2380,8 @@ class Rehearsal:
                 self.reopen_existing_only(args.new_version)
             if args.new_terminal_after_restore and not self.errors:
                 self.new_terminal_after_restore(args.new_version,args.expect_terminal_restart_failure)
+            if args.bundled_ceditor and not self.errors:
+                self.verify_bundled_ceditor(args.new_version)
         except Exception as exc:
             failure = str(exc)
             self.errors.append(failure)
@@ -2361,7 +2403,8 @@ class Rehearsal:
             if code:
                 self.errors.append('cleanup failed; inspect private processes and native lock')
             report = [f'Rehearsal: {self.root}',f'OLD: {args.old_version}',f'NEW: {args.new_version}',
-                      f'Ceditor: {args.ceditor or "disabled"}',f'Total duration: {time.monotonic()-start:.3f}s',
+                      f'Ceditor: {"bundled" if args.bundled_ceditor else args.ceditor or "disabled"}',
+                      f'Total duration: {time.monotonic()-start:.3f}s',
                       f'Outcome: {"FAIL" if self.errors else "PASS"}', '', 'Regressions / evidence gaps:',
                       *self.errors, '', 'Notes:', *self.notes, '', 'Steps (seconds, exit):']
             for step in self.steps:
@@ -2455,7 +2498,10 @@ def main():
     for prefix in ('old','new'):
         for field in ('dir','version','installer'):
             run.add_argument('--'+prefix+'-'+field,required=True)
-    run.add_argument('--ceditor',metavar='BIN_DIR')
+    editor = run.add_mutually_exclusive_group()
+    editor.add_argument('--ceditor',metavar='BIN_DIR')
+    editor.add_argument('--bundled-ceditor',action='store_true',
+                        help='after a successful update, launch the installed ceditor and verify the mapped editor and running daemon belong to NEW')
     run.add_argument('--feed',metavar='DIR',help="update in the app, as a person does, instead of through NEW's staged CLI: OLD's own `daemon upgrade --version NEW` finds NEW in this file feed (scripts/release feed), and OLD's update worker runs the update. The feed must serve the archive in --new-dir")
     run.add_argument('--empty-window',action='store_true',help="also open a window holding nothing, after seeding: reopened, it reports ready at once, so its first read of the update's status races OLD's worker still verifying NEW")
     run.add_argument('--restart-after-update',action='store_true',help="with --feed, after the update close every window, stop NEW's daemon and reopen the windows, as after a reboot: they must still show no failure, and a Complete update must stay Complete")
@@ -2517,6 +2563,8 @@ def main():
         parser.error('--stall-suppress-flush, --stall-under-lock and --stall-resume-after require --stall-window-after-flush')
     if args.command == 'run' and args.restart_after_update and (not args.feed or args.expect_refusal or args.fail_new_daemon or args.ceditor):
         parser.error('--restart-after-update requires a successful in-app update (--feed) without --ceditor, whose own service would outlive the restart')
+    if args.command == 'run' and args.bundled_ceditor and (args.expect_refusal or args.fail_new_daemon or args.expect_terminal_restart_failure):
+        parser.error('--bundled-ceditor requires a successful update and serving NEW daemon')
     if args.command == 'run' and args.plain_restart and (args.expect_refusal or args.fail_new_daemon):
         parser.error('--plain-restart requires a successful recovery scenario')
     if args.command == 'run' and args.expect_console_refusal and (not args.fail_new_daemon or args.no_console):

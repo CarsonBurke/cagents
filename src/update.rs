@@ -39,6 +39,8 @@ mod publication;
 #[cfg(all(any(target_os = "linux", target_os = "macos"), feature = "host"))]
 #[doc(hidden)]
 pub use publication::LocalPublication;
+
+pub(crate) use installed::settle_editor_install;
 mod pending_recovery;
 pub mod progress;
 #[cfg(target_os = "macos")]

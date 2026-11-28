@@ -38,13 +38,16 @@ finish_package() {
 
 # Cargo builds stay serial and their executable paths can be overwritten by
 # the next feature set. Each stage fixes the bytes its package worker reads.
-# Overlap one archive worker at a time with the next product's build.
+# Overlap full packaging with the browserless build.
 scripts/package-linux.sh --variant full --stage "$staging/full"
 package_variant full
 scripts/package-linux.sh --variant browserless --stage "$staging/browserless" \
     --reuse-dictate "$staging/full/cagents-dictate"
 finish_package
-package_variant browserless
-scripts/package-ceditor-linux.sh --stage "$staging/ceditor" --reuse-companions "$staging/browserless"
-finish_package
+scripts/package-linux.sh --variant browserless --package-stage "$staging/browserless"
+# The standalone archive shares the full editor and the browserless companions.
+mkdir -- "$staging/ceditor"
+ln -- "$staging/full/ceditor" "$staging/browserless/cagents" "$staging/browserless/cagentsd" "$staging/ceditor/"
+standalone_started=$SECONDS
 scripts/package-ceditor-linux.sh --package-stage "$staging/ceditor"
+printf 'Standalone ceditor packaging took %s seconds\n' "$((SECONDS - standalone_started))"

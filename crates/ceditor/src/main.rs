@@ -2,6 +2,8 @@
 // between worktrees, without invalidating third-party dependencies.
 const _: Option<&str> = option_env!("CAGENTS_CHECKOUT_ROOT");
 
+cagents::stamp_version!();
+
 mod app;
 mod preferences;
 
@@ -26,7 +28,7 @@ const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 /// Native file editor and Git diff viewer with optional shared review alerts.
 #[derive(Parser)]
 #[command(
-    version,
+    version = cagents::version(),
     about,
     after_help = "Open existing files or folders. With no paths, restore saved tabs or browse the current directory.\nCtrl+T creates an untitled note; Ctrl+O opens a file; Ctrl+Shift+O opens a folder; Ctrl+S saves (or save-as for untitled notes); Ctrl+W closes a tab.\nCtrl+F finds in the open file; Ctrl+P opens the quick-open palette; Ctrl+Space requests language-server completions.\nSettings and language-server configuration are independent of cagents."
 )]
@@ -66,7 +68,7 @@ fn main() -> std::process::ExitCode {
     // Diagnostics precede ordinary UI startup: a panic in a render or
     // worker thread used to take the window with it and leave nothing behind
     // in ceditor's data directory.
-    cagents::instance::install_panic_hook_with_version(PRODUCT, env!("CARGO_PKG_VERSION"));
+    cagents::instance::install_panic_hook(PRODUCT);
     cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
     let result = run(arguments);
     if result.is_err() {
@@ -95,6 +97,12 @@ fn settings_path() -> Result<PathBuf, Box<dyn std::error::Error>> {
 }
 
 fn run(arguments: Arguments) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::process::CommandExt;
+    if let Some(executable) = cagents::control::staged_editor_executable()? {
+        let mut command = std::process::Command::new(executable);
+        command.args(std::env::args_os().skip(1));
+        return Err(command.exec().into());
+    }
     let settings_path = settings_path()?;
     cagents::worktree_cleanup::prepare_standalone_editor_protection();
     let flags = app::Flags {

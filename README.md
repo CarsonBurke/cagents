@@ -40,7 +40,8 @@ restart the UI while your agents keep working.
 - **Keyboard navigation.** Move through a horizontal strip of chats, terminals,
   editors, and browsers. Resize panes without leaving the keyboard.
 - **Built-in editor.** Edit files and working-tree diffs with syntax highlighting,
-  autosave, and optional language servers. The editor also ships as `ceditor`.
+  autosave, and optional language servers. The full Linux release includes the
+  standalone `ceditor` app and updates it alongside Cagents.
 - **Browser panes.** Open pages in the optional Servo browser. Browserless
   builds open links in your system browser.
 - **Remote workspaces.** Connect to another machine's daemon over SSH for

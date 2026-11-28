@@ -856,6 +856,64 @@ class ReopenedWindows(unittest.TestCase):
                                   ('launch', 'second'), ('wait', ['main','second'])])
 
 
+class BundledCeditor(unittest.TestCase):
+    def test_public_launcher_must_open_the_matched_editor_and_leave_its_daemon_serving(self):
+        spec = importlib.util.spec_from_file_location('bundled_ceditor_rehearsal',
+                                                     REPOSITORY/'scripts/rehearse_update_run.py')
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        with tempfile.TemporaryDirectory(prefix='ru-ceditor-') as temporary:
+            root = Path(temporary).resolve()
+            (root/'.rehearse-update').write_text(f'{root}\n')
+            prefix = root/'home/.local/share/cagents-install'
+            bin_dir = prefix/'versions/new/bin'
+            bin_dir.mkdir(parents=True)
+            (prefix/'.cagents-install-root').write_text('cagents install root\n')
+            (prefix/'current').symlink_to('versions/new')
+            public = root/'home/.local/bin'
+            public.mkdir()
+            (public/'cagents').symlink_to(prefix/'current/bin/cagents')
+            (bin_dir/'cagents').touch()
+            (root/'records/after').mkdir(parents=True)
+            window = {'id': 3, 'pid': 30}
+            observation = {'window': window, 'painted': True}
+
+            for failure in ('', 'stale editor version', 'stale editor process', 'unpainted window',
+                            'replaced daemon', 'wrong daemon image', 'wrong daemon version'):
+                with self.subTest(failure=failure or 'matched release'):
+                    rehearsal = scenario.Rehearsal(root, str(SCRIPT))
+                    status = {'data': {'running': True,
+                                       'daemon_version': 'old' if failure == 'wrong daemon version' else 'new'}}
+                    cli = 'cagents new\n'
+                    editor = 'ceditor old\n' if failure == 'stale editor version' else 'ceditor new\n'
+                    old_bin = prefix/'versions/old/bin'
+                    images = [
+                        (old_bin if failure == 'stale editor process' else bin_dir)/'ceditor',
+                        (old_bin if failure == 'wrong daemon image' else bin_dir)/'cagentsd',
+                    ]
+                    owners = [(40, 2), (41, 3) if failure == 'replaced daemon' else (40, 2)]
+                    observed = {**observation, 'painted': failure != 'unpainted window'}
+                    with patch.object(rehearsal, 'call', side_effect=[(0, cli), (0, editor), (0, ''), (0, '')]) as call, \
+                            patch.object(rehearsal, 'mapped', return_value={'ceditor': window}), \
+                            patch.object(rehearsal, 'observe_window', return_value=observed), \
+                            patch.object(rehearsal, 'cli', return_value=(0, status)), \
+                            patch.object(scenario, 'daemon_owner', side_effect=owners), \
+                            patch.object(Path, 'readlink', side_effect=images):
+                        if failure:
+                            with self.assertRaises(RuntimeError):
+                                rehearsal.verify_bundled_ceditor('new')
+                        else:
+                            rehearsal.verify_bundled_ceditor('new')
+                            self.assertEqual([entry.args for entry in call.call_args_list], [
+                                ('env', public/'cagents', '--version'), ('env', public/'ceditor', '--version'),
+                                ('ceditor', 'start-installed'), ('shot', 'after-ceditor'),
+                            ])
+            evidence = json.loads((root/'records/after/bundled-ceditor.json').read_text())
+            self.assertEqual(evidence['ceditor_executable'], str(bin_dir/'ceditor'))
+            self.assertEqual(evidence['daemon_executable'], str(bin_dir/'cagentsd'))
+            self.assertEqual(evidence['window'], observation)
+
+
 class ScaleSeed(unittest.TestCase):
     def module(self):
         spec = importlib.util.spec_from_file_location('rehearsal_scale', REPOSITORY/'scripts/rehearse_update_run.py')
@@ -3061,7 +3119,8 @@ class FailedInitialization(unittest.TestCase):
                     root.mkdir()
                     raise RuntimeError("partly failed init")
                 return 1, "not initialized"
-            args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None))()
+            args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None,
+                                         bundled_ceditor=False))()
             printed = io.StringIO()
             with patch.object(rehearsal, "call", side_effect=call), redirect_stdout(printed):
                 self.assertEqual(rehearsal.run(args), 1)

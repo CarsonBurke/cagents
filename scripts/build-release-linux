@@ -252,7 +252,12 @@ run_release_phase bwrap --unshare-user --uid "$CALLER_UID" --gid "$CALLER_GID" \
 printf '%s: artifacts built and checked in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 stage_started=$SECONDS
 VERSION=$version
-run_release_phase "$ROOT_DIR/scripts/smoke-release-artifacts" --dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS"
+smoke_args=(--dist "$WORK/dist" --version "$VERSION" --rootfs "$SMOKE_ROOTFS")
+# Ceditor's version stamp was introduced with the bundled editor layout.
+if ! git -C "$ROOT_DIR" cat-file -e "$SOURCE_COMMIT:crates/ceditor/build.rs" 2>/dev/null; then
+    smoke_args+=(--legacy-editor-layout)
+fi
+run_release_phase "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
 printf '%s: artifact smoke completed in %ss\n' "$PROGRAM" "$((SECONDS - stage_started))"
 # The signed metadata names every asset with its size and digest, so an
 # installed cagents trusts the release through one signature.

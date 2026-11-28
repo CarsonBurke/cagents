@@ -23,17 +23,18 @@ build sentinel on fw16 runs them on each commit it checks, in the ordinary test
 profile ([Watching main after merges](development.md#watching-main-after-merges)).
 `mise run release -- build` requires the tagged commit's passing verdict. The
 builder packages the shipped binaries with `release` and checks them and the
-desktop metadata. Both cagents packages ship the dictation helper `cagents-dictate`,
-linked against the sherpa-onnx libraries `scripts/sherpa-onnx-libs` verifies,
-with its third-party notices; the builder and the publisher refuse a package
-from a source with the helper that lacks either.
+desktop metadata. The full archive and Debian package ship Ceditor beside
+the matched Cagents binaries. Both cagents packages ship the dictation helper
+`cagents-dictate` and its third-party notices. The helper links against the
+sherpa-onnx libraries that `scripts/sherpa-onnx-libs` verifies. The builder and
+the publisher require the helper and its notices for sources that include it.
 
-The build stages one copy of the dictation helper for both cagents variants.
-The standalone editor ships the same CLI and daemon as the browserless
-package. Each cagents variant builds its own CLI, daemon and UI for its
-product identity. Cargo runs one build at a time while a single-CPU worker
-packages the previous variant. The package size reports count the shared
-helper's build time under the full variant.
+The full package and standalone archive share one Ceditor build. The
+standalone archive uses private copies of the staged browserless CLI and
+daemon. Each Cagents variant builds its own CLI, daemon and UI for its product
+identity, and both use one staged dictation helper. The size reports count the
+shared helper's build time under the full variant. Cargo builds one variant at
+a time while a single-CPU worker packages the previous one.
 
 Before exposing the bundle, the builder installs and removes each Debian
 package and extracts each portable archive in a disposable Ubuntu 24.04 runtime
@@ -43,6 +44,8 @@ binaries were built without debug assertions or the development feature, the
 setting their whole production identity follows) and safe shutdown, live-daemon removal guards, and
 preservation of unrelated files and saved app data. The compiler environment
 remains Ubuntu 22.04; runtime smoke does not replace the glibc baseline checks.
+The smoke also checks Ceditor's version and verifies that the full archive,
+Debian package, and editor-only archive carry identical Ceditor executables.
 Before compiling, the builder validates the runtime cache or provisions it with
 network access using `scripts/prepare-release-smoke-rootfs`. Every artifact
 execution uses a separate networkless namespace with private user state. The
@@ -52,11 +55,12 @@ and `CAGENTS_RELEASE_SMOKE_CACHE` overrides it. Each cache keeps one pinned base
 archive and one provisioned runtime image. The next preparation reclaims scratch
 directories left by interrupted preparations while it holds the cache lock.
 
-Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally,
-then build:
+Install `bubblewrap`, `curl`, `git`, and the standard archive tools locally.
+The build and verification tools use the selected source revision to determine
+which artifact layout to expect. For example, to rebuild an older tag:
 
 ```sh
-mise run release:build -- --ref v0.1.2 --output /var/tmp/cagents-v0.1.2
+mise run release:build -- --ref v0.2.3 --output /var/tmp/cagents-v0.2.3
 ```
 
 `release:build` runs `scripts/build-release-linux`; its `--help` gives the cache
@@ -380,7 +384,7 @@ through `scripts/cargo-gate` beside other builds, and requires the commit's
 passing test verdict from main's sentinel. It brings the verified bundle back
 to the same place, ready for signing.
 
-`mise run release:verify -- --version 0.2.0 --dist DIR` runs the same checks
+`mise run release:verify -- --version VERSION --dist DIR` runs the same checks
 without publishing. Both modes repeat the offline artifact smoke against a
 private snapshot of the bundle. To verify a bundle built elsewhere, prepare the
 runtime image first, or supply an existing Ubuntu 24.04 amd64 runtime image
@@ -389,6 +393,11 @@ hanging commands, or a failed daemon handshake stop verification. No package is
 installed on the host.
 
 ### Rehearsing
+
+When the target release bundles Ceditor, `release rehearse` opens the installed
+editor after the upgrade. It checks that the window comes from the selected
+release and that the matching daemon stays running. This includes rehearsals of
+an Actions draft.
 
 `mise run release -- feed 0.2.0 --feed DIR` adds the signed bundle to a file
 feed with GitHub's layout: `DIR/download/v0.2.0/` holds every asset and,

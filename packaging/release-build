@@ -139,6 +139,12 @@ if [[ -f crates/cagents-dictate/Cargo.toml ]]; then
     dictate_version=$(jq -er '.packages[] | select(.name == "cagents-dictate") | .version' <<< "$metadata")
     [[ $dictate_version == "$VERSION" ]] || fail 'cagents and cagents-dictate versions must match'
 fi
+# Older source refs ship Ceditor only in its standalone archive. The version
+# stamp was introduced with the bundled editor layout.
+bundled_editor=0
+if [[ -f crates/ceditor/build.rs ]]; then
+    bundled_editor=1
+fi
 # Explicit commits and branches are useful for pre-release verification, while
 # a selected version tag may never disagree with the exported manifests.
 case $SOURCE_REF in
@@ -160,7 +166,9 @@ else
     # the standalone packagers.
     ./scripts/package-linux.sh --variant full
     ./scripts/package-linux.sh --variant browserless
+    standalone_started=$SECONDS
     ./scripts/package-ceditor-linux.sh
+    printf 'Standalone ceditor packaging took %s seconds\n' "$((SECONDS - standalone_started))"
 fi
 
 metric() {
@@ -203,6 +211,15 @@ check_glibc() {
     [[ $(printf '%s\n' GLIBC_2.35 "$required" | sort -V | sed -n '$p') == GLIBC_2.35 ]] \
         || fail "$binary requires $required, above glibc 2.35"
 }
+editor_desktop=io.github.cagents.ceditor
+check_editor_desktop() {
+    local share=$1 command=$2 entry=$1/applications/$editor_desktop.desktop
+    desktop-file-validate "$entry"
+    grep -Fqx "Exec=$command %F" "$entry"
+    grep -Fqx "Icon=$editor_desktop" "$entry"
+    grep -Fqx "StartupWMClass=$editor_desktop" "$entry"
+    [[ -s $share/icons/hicolor/scalable/apps/$editor_desktop.svg ]]
+}
 for product in cagents cagents-browserless; do
     case $product in
         cagents) desktop=dev.cagents.Cagents ;;
@@ -217,6 +234,7 @@ for product in cagents cagents-browserless; do
     [[ -x $root/bin/$product && -s $root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
     binaries=(cagents cagents-ui cagentsd)
     if ((dictate)); then binaries+=(cagents-dictate); fi
+    if ((bundled_editor)) && [[ $product == cagents ]]; then binaries+=(ceditor); fi
     for binary in "${binaries[@]}"; do
         [[ -x $root/bin/$binary ]]
         check_glibc "$root/bin/$binary"
@@ -227,6 +245,11 @@ for product in cagents cagents-browserless; do
         "$root/bin/cagents-dictate" models >/dev/null || fail "$product's dictation helper does not run"
         grep -Fq 'sherpa-onnx' "$root/share/doc/cagents/THIRD-PARTY-NOTICES" \
             || fail "$product does not carry the helper's third-party notices"
+    fi
+    if ((bundled_editor)) && [[ $product == cagents ]]; then
+        check_editor_desktop "$root/share" ceditor
+        [[ $("$root/bin/ceditor" --version) == "ceditor $VERSION" ]] \
+            || fail 'cagents ships an editor from another build'
     fi
     [[ $("$root/bin/$product" --version) == "cagents $VERSION" ]]
     appstreamcli validate --no-net "$root/share/metainfo/$desktop.metainfo.xml"
@@ -242,6 +265,11 @@ for product in cagents cagents-browserless; do
     grep -Fqx "StartupWMClass=$desktop" "$debian_root/usr/share/applications/$desktop.desktop"
     appstreamcli validate --no-net "$debian_root/usr/share/metainfo/$desktop.metainfo.xml"
     [[ $("$debian_root/usr/bin/$product" --version) == "cagents $VERSION" ]]
+    if ((bundled_editor)) && [[ $product == cagents ]]; then
+        check_editor_desktop "$debian_root/usr/share" /usr/bin/ceditor
+        [[ $("$debian_root/usr/bin/ceditor" --version) == "ceditor $VERSION" ]] \
+            || fail 'the cagents package ships no matching editor'
+    fi
     if ((dictate)); then
         [[ $("$debian_root/usr/libexec/$product/cagents-dictate" --version) == "cagents-dictate $VERSION" ]] \
             || fail "the $product package ships no matching dictation helper"
@@ -252,12 +280,8 @@ done
 
 tar -xzf "/dist/ceditor-$VERSION-$CAGENTS_RELEASE_TARGET.tar.gz" -C "$staging"
 editor_root="$staging/ceditor-$VERSION"
-desktop=io.github.cagents.ceditor
-desktop-file-validate "$editor_root/share/applications/$desktop.desktop"
-grep -Fqx 'Exec=ceditor %F' "$editor_root/share/applications/$desktop.desktop"
-grep -Fqx "Icon=$desktop" "$editor_root/share/applications/$desktop.desktop"
-grep -Fqx "StartupWMClass=$desktop" "$editor_root/share/applications/$desktop.desktop"
-[[ -x $editor_root/bin/ceditor && -s $editor_root/share/icons/hicolor/scalable/apps/$desktop.svg ]]
+check_editor_desktop "$editor_root/share" ceditor
+[[ -x $editor_root/bin/ceditor ]]
 for binary in ceditor cagents cagentsd; do
     check_glibc "$editor_root/lib/ceditor/releases/$VERSION/bin/$binary"
     [[ $("$editor_root/lib/ceditor/releases/$VERSION/bin/$binary" --version) == "$binary $VERSION" ]]

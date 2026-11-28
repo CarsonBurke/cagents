@@ -194,9 +194,9 @@ How Debian upgrades treat a running daemon is described in
 
 ## Portable archive
 
-The archive is self-contained as a directory layout, not as a static
-executable. Keep its `bin` directory intact: `cagents`, `cagents-ui`,
-`cagentsd`, and the dictation helper `cagents-dictate` must stay together.
+The archive uses a self-contained directory layout. Keep its `bin` directory
+intact so `cagents`, `cagents-ui`, `cagentsd`, `ceditor`, and the dictation helper
+`cagents-dictate` can find companions from the same release.
 `share/doc/cagents/THIRD-PARTY-NOTICES` lists the open-source libraries the
 helper includes and their licenses.
 
@@ -215,10 +215,9 @@ tar -xzf "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 `install.sh` never uses `sudo` and refuses to run as root. It installs an
 immutable version below `${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/`
 (or `--prefix PATH`), switches the `current` symlink atomically, creates desktop
-metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only
-`$HOME/.local/bin/cagents` on `PATH`. The application menu entry uses the
-installed binary and icon by absolute path, so launching from the desktop does
-not depend on `PATH`; using `cagents` from a terminal does.
+metadata under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes `cagents` and
+`ceditor` in `$HOME/.local/bin`. New application menu entries use absolute paths
+so they work on desktops that omit this directory from `PATH`.
 
 Those links point into `current`, so an update reaches them. If a desktop
 tool has replaced one with a plain copy, and the copy is byte-for-byte the
@@ -234,6 +233,22 @@ the daemon starts at boot, adding `--resume-sessions` to have it reopen stopped
 chats and agents then too (see [Starting at boot](daemon.md#starting-at-boot)).
 See [Daemon and upgrades](daemon.md) for how the daemon, sessions, and upgrades
 interact.
+
+The first full release with Ceditor migrates the default-prefix launcher created
+by older versions of `scripts/install-ceditor`. It preserves the editor's
+settings, saved state, and private builds. The launcher follows `current` and
+can still open the previous source build if you return to a release that
+predates the bundled editor. Close and reopen an existing Ceditor window to
+use an updated build. During a protocol-changing staged update, Ceditor opens
+the build that matches the running daemon when available. If the previous
+release has no bundled editor, you can edit files and finish the staged update
+to connect review alerts.
+
+To keep a source build, run `scripts/install-ceditor` from your checkout at the
+default prefix. Later signed Cagents updates honor that choice for both the
+command and the menu entry. To switch back, remove
+`$HOME/.local/lib/ceditor/current/.prefer-source` and rerun the signed Cagents
+installer.
 
 ## Updating
 

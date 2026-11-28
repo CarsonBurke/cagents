@@ -6,7 +6,7 @@ prefix=${HOME:?HOME must be set}/.local
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --prefix) [ "$#" -ge 2 ] || { printf '%s\n' '--prefix requires a path' >&2; exit 2; }; shift; prefix=$1 ;;
-        --help) printf '%s\n' 'Usage: scripts/install-ceditor [--prefix PATH]' '' 'Build and install the standalone editor with private matched alert companions (default: ~/.local).' 'Requires Python 3 to read Cargo executable artifacts.' 'Switches the private set atomically; does not replace public cagents executables.'; exit 0 ;;
+        --help) printf '%s\n' 'Usage: scripts/install-ceditor [--prefix PATH]' '' 'Build and install the standalone editor with private matched alert companions (default: ~/.local).' 'Requires Python 3 to read Cargo executable artifacts.' 'Switches the private set atomically.' 'At the default prefix, keeps the source build selected across signed Cagents updates.'; exit 0 ;;
         *) printf '%s\n' "Unknown option: $1" >&2; exit 2 ;;
     esac
     shift
@@ -45,6 +45,8 @@ for binary in ceditor cagents cagentsd; do
 done
 printf '%s\n' 'ceditor companions v1' > "$staged/bin/.ceditor-companions"
 chmod 644 "$staged/bin/.ceditor-companions"
+# Commit the explicit source choice with the matched private executables.
+: > "$staged/.prefer-source"
 ln -s "releases/$(basename "$staged")" "$link"
 mv -fT -- "$link" "$private/current"
 committed=1

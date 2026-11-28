@@ -5,6 +5,7 @@ PROGRAM=smoke-release-artifacts
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 DIST_DIR=
 VERSION=
+BUNDLED_EDITOR=1
 BASE_ROOT=${CAGENTS_RELEASE_SMOKE_CACHE:-"${XDG_CACHE_HOME:-$HOME/.cache}/cagents-release-smoke/ubuntu-24.04-amd64"}/rootfs
 fail() { printf '%s: %s\n' "$PROGRAM" "$*" >&2; exit 1; }
 while (($#)); do
@@ -17,9 +18,11 @@ while (($#)); do
                 --rootfs) BASE_ROOT=$2 ;;
             esac
             shift 2 ;;
+        --legacy-editor-layout) BUNDLED_EDITOR=0; shift ;;
         --help)
-            printf '%s\n' 'Usage: scripts/smoke-release-artifacts --dist DIR --version VERSION [--rootfs DIR]' \
+            printf '%s\n' 'Usage: scripts/smoke-release-artifacts --dist DIR --version VERSION [--rootfs DIR] [--legacy-editor-layout]' \
                 'Install, exercise and remove every shipped artifact in offline disposable Ubuntu root filesystems.' \
+                '--legacy-editor-layout selects releases that shipped the editor-only archive before bundling Ceditor.' \
                 'Prepare the default runtime image with scripts/prepare-release-smoke-rootfs. No network or host installation is used by smoke runs.'
             exit 0 ;;
         *) fail "unknown argument: $1" ;;
@@ -53,12 +56,15 @@ trap cleanup EXIT
 trap 'exit 1' HUP INT TERM
 cp -- "$ROOT_DIR/packaging/smoke-release-artifact" "$WORK/smoke"
 
+full_deb="cagents_${VERSION}_amd64.deb"
+full_archive="cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+editor_archive="ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
 artifacts=(
-    "cagents_${VERSION}_amd64.deb"
+    "$full_deb"
     "cagents-browserless_${VERSION}_amd64.deb"
-    "cagents-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+    "$full_archive"
     "cagents-browserless-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
-    "ceditor-${VERSION}-x86_64-unknown-linux-gnu.tar.gz"
+    "$editor_archive"
 )
 for artifact in "${artifacts[@]}"; do
     [[ -f $DIST_DIR/$artifact && ! -L $DIST_DIR/$artifact ]] || fail "missing regular artifact: $artifact"
@@ -76,6 +82,7 @@ smoke() {
         --tmpfs /root --tmpfs /home \
         --ro-bind "$DIST_DIR/$artifact" /artifact --ro-bind "$WORK/smoke" /smoke \
         --setenv PATH /usr/sbin:/usr/bin:/sbin:/bin --setenv LANG C.UTF-8 \
+        --setenv CAGENTS_SMOKE_BUNDLED_EDITOR "$BUNDLED_EDITOR" \
         --setenv RUST_LOG warn,cagents_ui=info,cagentsd=info \
         --setenv XDG_CONFIG_HOME /root/config --setenv XDG_DATA_HOME /root/data \
         --setenv XDG_CACHE_HOME /root/cache --setenv XDG_STATE_HOME /root/state \
@@ -88,18 +95,38 @@ for index in "${!artifacts[@]}"; do
     pids+=("$!")
 done
 failed=0
+editor_digest=
+editor_digest_artifact=
 for index in "${!artifacts[@]}"; do
     status=0
     wait "${pids[index]}" || status=$?
     pids[index]=
     if ((status == 0)); then
         cat -- "$WORK/$index/log"
-        printf 'Artifact smoke passed: %s\n' "${artifacts[index]}"
+        artifact=${artifacts[index]}
+        if ((BUNDLED_EDITOR)) && [[ $artifact == "$full_deb" || $artifact == "$full_archive" || $artifact == "$editor_archive" ]]; then
+            report=$WORK/$index/scratch/ceditor.sha256
+            if [[ ! -f $report || -L $report || $(stat -c %s "$report") != 65 ]] ||
+                ! IFS= read -r digest < "$report" || [[ ! $digest =~ ^[a-f0-9]{64}$ ]]; then
+                printf '%s: %s produced no valid editor digest\n' "$PROGRAM" "$artifact" >&2
+                status=1
+            elif [[ -z $editor_digest ]]; then
+                editor_digest=$digest
+                editor_digest_artifact=$artifact
+            elif [[ $digest != "$editor_digest" ]]; then
+                printf '%s: %s ships different editor bytes from %s\n' \
+                    "$PROGRAM" "$artifact" "$editor_digest_artifact" >&2
+                status=1
+            fi
+        fi
+        if ((status == 0)); then
+            printf 'Artifact smoke passed: %s\n' "${artifacts[index]}"
+        fi
     else
         cat -- "$WORK/$index/log" >&2
         printf '%s: %s failed (exit %s)\n' "$PROGRAM" "${artifacts[index]}" "$status" >&2
-        failed=1
     fi
+    if ((status != 0)); then failed=1; fi
     rm -rf -- "$WORK/$index"
 done
 ((failed == 0)) || exit 1

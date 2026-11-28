@@ -896,6 +896,247 @@ pub(super) fn restore_current(
         let _ = fs::remove_file(&temporary);
     }
     replaced?;
+    if candidate.join("bin/ceditor").is_file()
+        && !prefix.join(previous).join("bin/ceditor").is_file()
+        && let Some(dirs) = directories::BaseDirs::new()
+    {
+        restore_editor_launchers(prefix, dirs.home_dir(), dirs.data_dir());
+    }
+    Ok(())
+}
+
+/// The installer commits its launcher changes before the worker can test the
+/// reopened windows. Returning to a release without Ceditor must also retire
+/// the editor links that would otherwise point into that release.
+fn restore_editor_launchers(prefix: &Path, home: &Path, data: &Path) {
+    fn owned_link_to(link: &Path, target: &Path) -> bool {
+        fs::symlink_metadata(link)
+            .is_ok_and(|meta| meta.is_symlink() && meta.uid() == unsafe { libc::geteuid() })
+            && fs::read_link(link).ok().as_deref() == Some(target)
+    }
+
+    fn remove_link(link: &Path, target: &Path) {
+        if owned_link_to(link, target)
+            && let Err(error) = fs::remove_file(link)
+        {
+            eprintln!(
+                "Could not remove the obsolete Ceditor link at {}: {error}",
+                link.display()
+            );
+        }
+    }
+
+    fn restore_source_link(link: &Path, launcher: &Path, source: &Path) -> io::Result<()> {
+        let relative = Path::new("../lib/ceditor/current/bin/ceditor");
+        let parent = link
+            .parent()
+            .ok_or_else(|| io::Error::other("the editor command has no parent directory"))?;
+        if parent.join(relative).canonicalize()? != source.canonicalize()? {
+            return Err(io::Error::other(
+                "the source link points to a different installation",
+            ));
+        }
+        let temporary = parent.join(format!(".ceditor-rollback-{}", uuid::Uuid::new_v4()));
+        std::os::unix::fs::symlink(relative, &temporary)?;
+        let replaced = if owned_link_to(link, launcher) {
+            fs::rename(&temporary, link)
+        } else {
+            Ok(())
+        };
+        let _ = fs::remove_file(&temporary);
+        replaced
+    }
+
+    for member in [
+        "applications/io.github.cagents.ceditor.desktop",
+        "icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg",
+    ] {
+        remove_link(
+            &data.join(member),
+            &prefix.join("current/share").join(member),
+        );
+    }
+
+    let launcher = prefix.join(".ceditor-launcher");
+    let public = home.join(".local/bin/ceditor");
+    let source = home.join(".local/lib/ceditor/current/bin/ceditor");
+    if !editor_marker(&launcher).is_some_and(|content| {
+        content.lines().nth(1) == Some("# cagents managed ceditor launcher v1")
+    }) {
+        return;
+    }
+    if owned_link_to(&public, &launcher)
+        && fs::metadata(&source).is_ok_and(|meta| {
+            meta.is_file()
+                && meta.mode() & 0o111 != 0
+                && meta.mode() & 0o022 == 0
+                && crate::install_guard::trusted_executable_owner(meta.uid())
+        })
+        && editor_marker(&source.with_file_name(".ceditor-companions"))
+            .is_some_and(|content| content == "ceditor companions v1\n")
+    {
+        if let Err(error) = restore_source_link(&public, &launcher, &source) {
+            eprintln!(
+                "Could not restore the original Ceditor link at {}: {error}",
+                public.display()
+            );
+            return;
+        }
+    } else {
+        remove_link(&public, &launcher);
+    }
+    if fs::read_link(&public).ok().as_deref() != Some(launcher.as_path())
+        && let Err(error) = fs::remove_file(&launcher)
+    {
+        eprintln!(
+            "Could not remove the obsolete Ceditor launcher at {}: {error}",
+            launcher.display()
+        );
+    }
+}
+
+fn editor_marker(path: &Path) -> Option<String> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file()
+        || !crate::install_guard::trusted_executable_owner(metadata.uid())
+        || metadata.mode() & 0o022 != 0
+    {
+        return None;
+    }
+    let mut content = String::new();
+    file.take(256).read_to_string(&mut content).ok()?;
+    Some(content)
+}
+
+/// Older workers may restore the old version after this installer returns.
+/// Have a detached command wait once for that worker's lease to be released.
+/// The waiting process carries no launch fence, installer assets or daemon lease.
+pub(crate) fn settle_editor_install(
+    previous: &Path,
+    completed_job: Option<&str>,
+) -> Result<(), UpdateError> {
+    let executable = crate::process::current_executable()?;
+    let candidate = locate(&executable)?;
+    let previous = locate(&previous.join("bin/cagents"))?;
+    if previous.prefix != candidate.prefix
+        || previous.version_root == candidate.version_root
+        || previous.version_root.join("bin/ceditor").is_file()
+        || !candidate.version_root.join("bin/ceditor").is_file()
+    {
+        return Err(invalid(
+            "The editor installation changed while settling the update",
+        ));
+    }
+    let state = state_dir(&candidate.prefix)?;
+    let lock = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(state.join("lock"))?;
+    validate_lock(&lock)?;
+    if let Some(job) = completed_job {
+        let _worker = crate::instance::owned_file_lock(lock, libc::LOCK_SH | libc::LOCK_NB)?;
+        return settle_editor_rollback(&state, &candidate, &previous, job);
+    }
+
+    crate::instance::validate_install_guard()?;
+    selected_candidate(&candidate.prefix, &candidate.version_root)?;
+    let job = editor_update_job(&state)?;
+    if job.phase != UpdatePhase::Installing
+        || job.version != candidate.version
+        || uuid::Uuid::parse_str(&job.id)
+            .ok()
+            .is_none_or(|id| id.to_string() != job.id)
+        || std::env::var_os(recovery::CENSUS_ENV).as_deref()
+            != Some(recovery::census_path(&state, &job.id).as_os_str())
+    {
+        return Err(invalid(
+            "The editor installation does not match the running update job",
+        ));
+    }
+    let log = OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(state.join(format!("{}.log", job.id)))?;
+    let metadata = log.metadata()?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || metadata.nlink() != 1
+    {
+        return Err(invalid("unsafe updater log"));
+    }
+    let mut child = after_update_lock(&lock)
+        .arg(executable)
+        .arg("settle-editor-install")
+        .arg(previous.version_root)
+        .args(["--job", &job.id])
+        .stderr(Stdio::from(log))
+        .spawn()?;
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(())
+}
+
+fn after_update_lock(lock: &File) -> Command {
+    let fd = lock.as_raw_fd();
+    let mut command = Command::new("flock");
+    command
+        .args(["--shared", "--no-fork"])
+        .arg(format!("/proc/self/fd/{fd}"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    crate::install_guard::sanitize_child_environment(&mut command);
+    // SAFETY: both operations are scalar syscalls in the child before exec,
+    // and only the exact updater lock file is unsealed below.
+    unsafe {
+        command.pre_exec(|| {
+            crate::daemon::seal_inherited_descriptors()?;
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    candidate::inherit(&mut command, fd);
+    command
+}
+
+fn editor_update_job(state: &Path) -> Result<UpdateJob, UpdateError> {
+    Ok(serde_json::from_slice(&read_private(
+        &state.join("status.json"),
+        JOB_STATE_LIMIT,
+    )?)?)
+}
+
+fn settle_editor_rollback(
+    state: &Path,
+    candidate: &InstallLayout,
+    previous: &InstallLayout,
+    job_id: &str,
+) -> Result<(), UpdateError> {
+    let job = editor_update_job(state)?;
+    if job.id != job_id
+        || job.version != candidate.version
+        || !matches!(job.phase, UpdatePhase::Installing | UpdatePhase::Failed)
+    {
+        return Ok(());
+    }
+    // A window or daemon starting after rollback can briefly hold this fence.
+    // Wait for it, then recheck current while excluding installation changes.
+    let (launch_fence, _) = crate::instance::update_recovery_fences()?;
+    let _guard = crate::instance::owned_lock(&launch_fence, libc::LOCK_EX)?;
+    if selected_candidate(&candidate.prefix, &previous.version_root).is_ok()
+        && let Some(dirs) = directories::BaseDirs::new()
+    {
+        restore_editor_launchers(&candidate.prefix, dirs.home_dir(), dirs.data_dir());
+    }
     Ok(())
 }
 
@@ -1305,6 +1546,111 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
+    fn older_worker_launcher_cleanup_follows_its_locked_job() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        const FIXTURE: &str = "CAGENTS_EDITOR_ROLLBACK_FIXTURE";
+        const JOB: &str = "fb882c28-3ef7-41d3-b00a-11f74c35fbf6";
+        if let Some(root) = std::env::var_os(FIXTURE) {
+            let prefix = PathBuf::from(root);
+            let state = state_dir(&prefix).unwrap();
+            assert!(matches!(acquire_lock(&state), Err(UpdateError::Busy)));
+            let layout = |version: &str| InstallLayout {
+                prefix: prefix.clone(),
+                version_root: prefix.join("versions").join(version),
+                version: version.into(),
+            };
+            let candidate = layout("new");
+            let previous = layout("old");
+            settle_editor_rollback(&state, &candidate, &previous, JOB).unwrap();
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path();
+        let home = prefix.join("home");
+        let data = prefix.join("data");
+        let runtime = prefix.join("runtime");
+        fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
+        let public = home.join(".local/bin/ceditor");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        let launcher = prefix.join(".ceditor-launcher");
+        let managed_launcher = "#!/bin/sh\n# cagents managed ceditor launcher v1\n# cagents ceditor launcher revision 2\n";
+        fs::write(&launcher, managed_launcher).unwrap();
+        symlink(&launcher, &public).unwrap();
+        for version in ["old", "new"] {
+            fs::create_dir_all(prefix.join("versions").join(version)).unwrap();
+        }
+        let state = state_dir(prefix).unwrap();
+        let updater = acquire_lock(&state).unwrap();
+        let mut job = UpdateJob {
+            id: JOB.into(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: state.join("update.log"),
+            recorded_by: None,
+            confirmation: None,
+            refusal: None,
+            in_flight: Vec::new(),
+        };
+        write_job(&state, &job).unwrap();
+        symlink("versions/new", prefix.join("current")).unwrap();
+        let lock = File::open(state.join("lock")).unwrap();
+        let selector = thread::current().name().unwrap().to_owned();
+        let run = || {
+            after_update_lock(&lock)
+                .arg(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture"])
+                .env(FIXTURE, prefix)
+                .env("HOME", &home)
+                .env("XDG_DATA_HOME", &data)
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .unwrap()
+        };
+        let child = run();
+        assert!(public.is_symlink());
+        job.phase = UpdatePhase::Complete;
+        write_job(&state, &job).unwrap();
+        drop(updater);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(public.is_symlink());
+
+        let updater = acquire_lock(&state).unwrap();
+        let child = run();
+        symlink("versions/old", prefix.join(".rollback")).unwrap();
+        fs::rename(prefix.join(".rollback"), prefix.join("current")).unwrap();
+        job.phase = UpdatePhase::Failed;
+        write_job(&state, &job).unwrap();
+        drop(updater);
+        let output = child.wait_with_output().unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(!public.is_symlink());
+        assert!(!launcher.exists());
+
+        let source = home.join(".local/lib/ceditor/current/bin/ceditor");
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, "source editor").unwrap();
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            source.with_file_name(".ceditor-companions"),
+            "ceditor companions v1\n",
+        )
+        .unwrap();
+        fs::write(&launcher, managed_launcher).unwrap();
+        symlink(&launcher, &public).unwrap();
+        restore_editor_launchers(prefix, &home, &data);
+        assert_eq!(
+            fs::read_link(public).unwrap(),
+            Path::new("../lib/ceditor/current/bin/ceditor")
+        );
+        assert!(!launcher.exists());
+    }
+
+    #[test]
     #[cfg_attr(
         not(target_os = "linux"),
         ignore = "self-update is Linux-only: it relies on memfd seals and /proc"
@@ -1324,6 +1670,7 @@ mod tests {
                 .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
                 .env(ROOT, root.path())
                 .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("XDG_DATA_HOME", root.path().join("data"))
                 .env("HOME", root.path().join("home"))
                 .output()
                 .unwrap();
@@ -1346,6 +1693,26 @@ mod tests {
             fs::create_dir_all(version.join("bin")).unwrap();
         }
         symlink("versions/candidate", root.join("current")).unwrap();
+        fs::write(candidate.join("bin/ceditor"), "bundled editor").unwrap();
+        let launcher = root.join(".ceditor-launcher");
+        fs::write(
+            &launcher,
+            "#!/bin/sh\n# cagents managed ceditor launcher v1\n# cagents ceditor launcher revision 2\n",
+        )
+        .unwrap();
+        let public = root.join("home/.local/bin/ceditor");
+        fs::create_dir_all(public.parent().unwrap()).unwrap();
+        symlink(&launcher, &public).unwrap();
+        let desktop = root.join("data/applications/io.github.cagents.ceditor.desktop");
+        fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        symlink(
+            root.join("current/share/applications/io.github.cagents.ceditor.desktop"),
+            &desktop,
+        )
+        .unwrap();
+        let icon = root.join("data/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg");
+        fs::create_dir_all(icon.parent().unwrap()).unwrap();
+        fs::write(&icon, "independent editor icon").unwrap();
         let cli = candidate.join("bin/cagents");
         fs::write(
             &cli,
@@ -1405,6 +1772,8 @@ else: raise AssertionError(sys.argv)
             .is_err()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), candidate);
+        assert_eq!(public.read_link().unwrap(), launcher);
+        assert!(desktop.is_symlink());
         // A command that never spawned cannot have converted the store; old
         // recovery must not depend on invoking that unavailable candidate.
         assert!(
@@ -1412,6 +1781,10 @@ else: raise AssertionError(sys.argv)
                 .unwrap()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert!(!public.is_symlink());
+        assert!(!desktop.is_symlink());
+        assert!(!launcher.exists());
+        assert_eq!(fs::read_to_string(icon).unwrap(), "independent editor icon");
         assert!(!root.join("converted").exists());
         fs::remove_file(root.join("current")).unwrap();
         symlink("versions/candidate", root.join("current")).unwrap();

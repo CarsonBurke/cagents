@@ -105,6 +105,29 @@ class InstallLocalHead(unittest.TestCase):
         self.assert_built(result)
         self.assertIn(f"Building main at {self.short()}.\n", result.stdout)
 
+    def test_bundled_editor_can_raise_the_destination_glibc_requirement(self):
+        package = self.checkout / "scripts/package-linux.sh"
+        package.write_text(
+            '#!/bin/sh\nset -eu\n'
+            'payload=cagents-$VERSION/bin\n'
+            'cd "$CAGENTS_DIST_DIR"\n'
+            'mkdir -p "$payload"\n'
+            'touch "$payload/cagents" "$payload/cagentsd" "$payload/cagents-ui" "$payload/ceditor"\n'
+            'tar -czf "cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz" "$payload"\n'
+        )
+        self.git(self.checkout, "commit", "--quiet", "-am", "include bundled editor fixture")
+        tools = self.directory / "tools"
+        (tools / "getconf").write_text('#!/bin/sh\nprintf "%s\\n" "glibc 2.35"\n')
+        (tools / "readelf").write_text(
+            '#!/bin/sh\ncase "$3" in */ceditor) echo GLIBC_2.39 ;; *) echo GLIBC_2.35 ;; esac\n'
+        )
+        for tool in ("getconf", "readelf"):
+            (tools / tool).chmod(0o755)
+
+        result = self.run_script("--this-commit", "--stage-only")
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn("the build requires glibc 2.39; this host has 2.35", result.stderr)
+
     def test_a_staged_build_is_reused_through_its_own_cli(self):
         prefix = self.home / "data/cagents-install"
         version = f"1.2.3+local.{self.short()}"

@@ -140,6 +140,8 @@ pub enum HostedTerminalStartError {
     CurrentExecutable(#[source] io::Error),
     #[error("the sibling cagentsd binary does not exist at {0}")]
     HostBinaryMissing(PathBuf),
+    #[error(transparent)]
+    EditorInstallation(io::Error),
     #[error("could not launch cagentsd at {path}: {source}")]
     LaunchHost {
         path: PathBuf,
@@ -1573,7 +1575,18 @@ fn ensure_daemon_ready_at(
     let started = Instant::now();
     match crate::descriptor::connect_settled(socket) {
         Ok(stream) => {
-            return verify_existing_startup_stream(socket, stream, started);
+            let result = verify_existing_startup_stream(socket, stream, started);
+            if application == crate::notifications::Application::Ceditor
+                && matches!(
+                    result,
+                    Err(HostedTerminalStartError::HostIncompatible { .. })
+                )
+            {
+                let executable = crate::process::current_executable()
+                    .map_err(HostedTerminalStartError::CurrentExecutable)?;
+                validate_editor_daemon_installation(&executable)?;
+            }
+            return result;
         }
         Err(error)
             if !matches!(
@@ -1595,6 +1608,9 @@ fn ensure_daemon_ready_at(
         .map_err(HostedTerminalStartError::HostStartup)?;
     let current_exe = crate::process::current_executable()
         .map_err(HostedTerminalStartError::CurrentExecutable)?;
+    if application == crate::notifications::Application::Ceditor {
+        validate_editor_daemon_installation(&current_exe)?;
+    }
     let daemon_binary = crate::companion::Product::Daemon
         .beside(&current_exe)
         .map_err(|_| HostedTerminalStartError::HostBinaryMissing(current_exe))?;
@@ -1660,6 +1676,26 @@ fn verify_existing_startup_stream(
                     .unwrap_or(STARTUP_BASE)
         })
     })
+}
+
+fn validate_editor_daemon_installation(executable: &Path) -> Result<(), HostedTerminalStartError> {
+    let editor_result = (|| {
+        crate::instance::validate_editor_daemon_version(executable)?;
+        if crate::install_guard::staged_owner_bin(
+            executable,
+            false,
+            #[cfg(target_os = "macos")]
+            None,
+        )?
+        .is_some()
+        {
+            return Err(io::Error::other(
+                "Finish the staged Cagents update to connect Ceditor review alerts.",
+            ));
+        }
+        Ok(())
+    })();
+    editor_result.map_err(HostedTerminalStartError::EditorInstallation)
 }
 
 /// The daemon binds its listener before restoring retained sessions and

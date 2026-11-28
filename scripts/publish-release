@@ -114,6 +114,11 @@ fi
 if checkout_git cat-file -e "$SOURCE_COMMIT:crates/cagents-host/Cargo.toml" 2>/dev/null; then
     manifests+=(crates/cagents-host/Cargo.toml)
 fi
+# Ceditor's version stamp was introduced with the bundled editor layout.
+BUNDLED_EDITOR=0
+if checkout_git cat-file -e "$SOURCE_COMMIT:crates/ceditor/build.rs" 2>/dev/null; then
+    BUNDLED_EDITOR=1
+fi
 for manifest in "${manifests[@]}"; do
     tagged_version=$(checkout_git show "$SOURCE_COMMIT:$manifest" | manifest_version)
     [[ $tagged_version == "$VERSION" ]] || fail "$manifest at $TAG does not declare version $VERSION"
@@ -370,7 +375,7 @@ check_metadata() {
 }
 
 # Validate the complete member set and types without extracting or running code.
-# Only the browserless command alias may be a link; all binaries must be executable.
+# Only the browserless alias and standalone editor's links may be links.
 check_archive() {
     local directory=$1 archive=$2 product=$3 desktop=$4
     local root=$product-$VERSION file parent expected actual mode owner size date time name rest
@@ -400,6 +405,11 @@ check_archive() {
         if [[ $product == cagents ]]; then
             files+=(bin/cagents-uninstall)
             executables+=(bin/cagents-uninstall)
+            if ((BUNDLED_EDITOR)); then
+                files+=(bin/ceditor share/applications/io.github.cagents.ceditor.desktop
+                    share/icons/hicolor/scalable/apps/io.github.cagents.ceditor.svg)
+                executables+=(bin/ceditor)
+            fi
         else
             files+=(bin/cagents-browserless)
         fi
@@ -422,8 +432,8 @@ check_archive() {
     while read -r mode owner size date time name rest; do
         case $name in
             */) [[ $mode == d* && -z $rest ]] || fail "invalid directory member in $archive" ;;
-            "$root/bin/ceditor")
-                [[ $product == ceditor && $mode == l* && $rest == '-> ../lib/ceditor/current/bin/ceditor' ]] \
+            "ceditor-$VERSION/bin/ceditor")
+                [[ $mode == l* && $rest == '-> ../lib/ceditor/current/bin/ceditor' ]] \
                     || fail "invalid editor public link in $archive"
                 ;;
             "$root/lib/ceditor/current")
@@ -582,6 +592,7 @@ if "$MACOS"; then check_macos_archive "$DIST_DIR"; fi
 if [[ -z $PROMOTE ]]; then
     smoke_args=(--dist "$DIST_DIR" --version "$VERSION")
     if [[ -n $SMOKE_ROOTFS ]]; then smoke_args+=(--rootfs "$SMOKE_ROOTFS"); fi
+    if ((! BUNDLED_EDITOR)); then smoke_args+=(--legacy-editor-layout); fi
     "$ROOT_DIR/scripts/smoke-release-artifacts" "${smoke_args[@]}"
 fi
 
@@ -720,8 +731,13 @@ sha256sum --check --strict --ignore-missing SHA256SUMS
 CAGENTS_ARCHIVE="\$PWD/$FULL_ARCHIVE" CAGENTS_CHECKSUMS="\$PWD/SHA256SUMS" sh ./install.sh --version $VERSION --restart-daemon
 \`\`\`
 
+EOF
+    if ((BUNDLED_EDITOR)); then
+        printf '%s\n\n' 'This release installs and updates `ceditor` alongside cagents.'
+    fi
+    cat <<EOF
 Debian packages are upgraded with the system package manager. The standalone
-ceditor archive unpacks into \`~/.local\`:
+editor archive unpacks into \`~/.local\`:
 \`tar -xzf $EDITOR_ARCHIVE --strip-components=1 -C ~/.local\`.
 
 EOF

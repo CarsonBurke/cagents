@@ -1082,6 +1082,11 @@ if [[ $mode == in-app ]]; then
     # Then a reboot: the windows must still read the update as good.
     path=(--feed "$feed" --empty-window --restart-after-update)
 fi
+# This build script was introduced with the bundled editor and its
+# rehearsal check. Older cuts use their own harness without this option.
+if [[ -f $harness/crates/ceditor/build.rs ]]; then
+    path+=(--bundled-ceditor)
+fi
 if [[ -e $root ]]; then
     echo "Replacing the earlier rehearsal in $root."
     # Without its marker, init never finished, so nothing there runs.
