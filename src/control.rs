@@ -98,7 +98,10 @@ use crate::{
             ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
             ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
             TerminalDescriptor, TerminalSnapshot, TerminalVisibility,
-            client_session::{HandshakeError, validate_handshake},
+            client_session::{
+                DeadlineReader, DeadlineWriter, HandshakeError, ReplyError, connect_until,
+                validate_handshake,
+            },
             daemon_socket_path, read_frame, write_frame,
         },
     },
@@ -1141,64 +1144,8 @@ impl std::fmt::Debug for ControlClient {
     }
 }
 
-/// Linux AF_UNIX backlog pressure returns EAGAIN without connecting. Retry
-/// fresh nonblocking sockets within the same establishment deadline, rather
-/// than treating writability/SO_ERROR as evidence that EAGAIN completed.
-/// Darwin answers that pressure with a refusal, which callers take to mean no
-/// daemon runs; see [`crate::descriptor::retry_refusal`].
 pub fn connect_control_socket(path: &Path, timeout: Duration) -> io::Result<UnixStream> {
-    let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-    address.sun_family = libc::AF_UNIX as _;
-    let bytes = path.as_os_str().as_encoded_bytes();
-    if bytes.is_empty() || bytes.len() >= address.sun_path.len() || bytes.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "invalid daemon Unix socket path",
-        ));
-    }
-    for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
-        *target = *byte as _;
-    }
-    let deadline = Instant::now() + timeout;
-    let refusing_since = Instant::now();
-    let mut delay = Duration::from_millis(1);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon socket connection deadline elapsed",
-            ));
-        }
-        let stream = UnixStream::from(crate::descriptor::unix_socket(libc::SOCK_STREAM, true)?);
-        let fd = stream.as_raw_fd();
-        // SAFETY: address is initialized with its valid length and the
-        // descriptor belongs exclusively to this connection attempt.
-        let result = unsafe {
-            libc::connect(
-                fd,
-                (&address as *const libc::sockaddr_un).cast(),
-                (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1) as _,
-            )
-        };
-        if result == 0 {
-            stream.set_nonblocking(false)?;
-            return Ok(stream);
-        }
-        let error = io::Error::last_os_error();
-        if !matches!(
-            error.kind(),
-            io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
-        {
-            return Err(error);
-        }
-        // EAGAIN has not queued a connection. Close this attempt before
-        // retrying, preserving bounded descriptor use and the selected endpoint.
-        drop(stream);
-        thread::sleep(delay.min(deadline.saturating_duration_since(Instant::now())));
-        delay = (delay * 2).min(Duration::from_millis(20));
-    }
+    connect_until(path, Instant::now() + timeout, || false)
 }
 
 /// How long a window waits for the device to answer one device operation.
@@ -1226,9 +1173,10 @@ impl ControlClient {
         let health_request = crate::daemon_health::begin();
         let deadline = Instant::now() + Self::handshake_timeout();
         let result = (|| {
-            let stream = connect_control_socket(
+            let stream = connect_until(
                 socket_path,
-                io_timeout().min(deadline.saturating_duration_since(Instant::now())),
+                deadline.min(Instant::now() + io_timeout()),
+                || false,
             )
             .map_err(ControlError::Connect)?;
             connected(&stream).map_err(ControlError::Configure)?;
@@ -1268,7 +1216,19 @@ impl ControlClient {
         deadline: Instant,
     ) -> Result<Self, ControlError> {
         let deadline = deadline.max(Instant::now() + Self::handshake_timeout());
-        Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
+        Self::from_stream_with_startup_budget(stream, deadline)
+    }
+
+    /// Complete hello within the remaining startup budget, including the write.
+    pub(crate) fn from_stream_with_startup_budget(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
+        Self::from_stream_inner(
+            stream,
+            deadline,
+            deadline.min(Instant::now() + io_timeout()),
+        )
     }
 
     /// Consult the restoration deadline only if the ordinary hello budget runs out.
@@ -3300,10 +3260,7 @@ impl ControlClient {
             };
             write_frame_for(
                 self.protocol,
-                &mut DeadlineWriter {
-                    stream: &mut self.stream,
-                    deadline: write_deadline,
-                },
+                &mut DeadlineWriter::new(&mut self.stream, write_deadline),
                 &envelope,
             )?;
         } else {
@@ -3314,10 +3271,7 @@ impl ControlClient {
             let envelope = match deadline {
                 Some(deadline) => read_frame_from(
                     self.protocol,
-                    &mut DeadlineReader {
-                        stream: &mut self.stream,
-                        deadline,
-                    },
+                    &mut DeadlineReader::new(&mut self.stream, deadline),
                 )
                 .map_err(|error| reply_error(error, Some(reply_timeout)))?
                 .ok_or(ControlError::ConnectionClosed)?,
@@ -3509,27 +3463,6 @@ fn read_frame_from<T: serde::de::DeserializeOwned>(
     crate::terminal_ipc::decoding_from(protocol, || read_frame(reader))
 }
 
-/// Bound the complete response, including unsolicited notifications and every
-/// partial frame read. A socket timeout alone restarts on each successful read.
-struct DeadlineReader<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl Read for DeadlineReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon response deadline expired",
-            ));
-        }
-        self.stream.set_read_timeout(Some(remaining))?;
-        self.stream.read(buffer)
-    }
-}
-
 /// Extend a timed-out hello read inside the frame reader, which still holds
 /// any prefix or payload bytes already received on this connection.
 struct HandshakeReplyReader<'a, F> {
@@ -3554,30 +3487,6 @@ impl<F: FnOnce() -> Instant> Read for HandshakeReplyReader<'_, F> {
             }
         }
         result
-    }
-}
-
-/// Bound every partial write of a request against the same overall deadline.
-struct DeadlineWriter<'a> {
-    stream: &'a mut UnixStream,
-    deadline: Instant,
-}
-
-impl Write for DeadlineWriter<'_> {
-    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
-        let remaining = self.deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "daemon request deadline expired",
-            ));
-        }
-        self.stream.set_write_timeout(Some(remaining))?;
-        self.stream.write(buffer)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
     }
 }
 
@@ -3609,18 +3518,12 @@ impl HandshakeClient {
         // remote handshakes allow longer reads. Explicit callers retain their
         // own complete operation deadline for both directions.
         write_frame(
-            &mut DeadlineWriter {
-                stream: &mut self.stream,
-                deadline: write_deadline,
-            },
+            &mut DeadlineWriter::new(&mut self.stream, write_deadline),
             &request,
         )?;
         let started = Instant::now();
         let mut reader = HandshakeReplyReader {
-            reader: DeadlineReader {
-                stream: &mut self.stream,
-                deadline,
-            },
+            reader: DeadlineReader::new(&mut self.stream, deadline),
             extend,
         };
         let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
@@ -3634,14 +3537,19 @@ impl HandshakeClient {
         validate_handshake(&envelope, self.protocol, request_id)
             .cloned()
             .map_err(|error| match error {
-                HandshakeError::UnsupportedVersion { actual } => {
+                HandshakeError::InvalidReply(ReplyError::UnsupportedVersion { actual }) => {
                     ControlError::UnsupportedVersion { actual }
                 }
-                HandshakeError::RequestIdMismatch { expected, actual } => {
-                    ControlError::RequestIdMismatch { expected, actual }
+                HandshakeError::InvalidReply(ReplyError::RequestIdMismatch {
+                    expected,
+                    actual,
+                }) => ControlError::RequestIdMismatch { expected, actual },
+                HandshakeError::InvalidReply(ReplyError::IncompleteProof) => {
+                    ControlError::IncompleteProof
                 }
-                HandshakeError::IncompleteProof => ControlError::IncompleteProof,
-                HandshakeError::ProofMismatch => ControlError::ProofMismatch,
+                HandshakeError::InvalidReply(ReplyError::ProofMismatch) => {
+                    ControlError::ProofMismatch
+                }
                 HandshakeError::Remote(error) => ControlError::Remote {
                     code: error.code,
                     message: error.message.clone(),
@@ -12695,10 +12603,7 @@ mod tests {
         client_stream.set_nonblocking(false).unwrap();
         let started = Instant::now();
         let error = write_frame(
-            &mut DeadlineWriter {
-                stream: &mut client_stream,
-                deadline: started + Duration::from_millis(20),
-            },
+            &mut DeadlineWriter::new(&mut client_stream, started + Duration::from_millis(20)),
             &ClientRequest::Agent {
                 authority: crate::agent_execution::Authority::default(),
                 operation: crate::agent_execution::Operation::PeekInbox(
@@ -12729,10 +12634,10 @@ mod tests {
             }
         });
         let started = Instant::now();
-        let error = read_frame::<ServerEnvelope>(&mut DeadlineReader {
-            stream: &mut client_stream,
-            deadline: started + Duration::from_millis(100),
-        })
+        let error = read_frame::<ServerEnvelope>(&mut DeadlineReader::new(
+            &mut client_stream,
+            started + Duration::from_millis(100),
+        ))
         .unwrap_err();
         assert!(matches!(error, FrameError::Io(error)
             if matches!(error.kind(), io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock)));

@@ -7,6 +7,9 @@ use crate::{
     terminal_ipc::{
         self as ipc, ClientEnvelope, ClientRequest, FrameCodec, PROTOCOL_VERSION, ServerEnvelope,
         ServerMessage, ServerResponse,
+        client_session::{
+            DeadlineReader, DeadlineWriter, ReplyError, connect_until, validate_reply,
+        },
     },
 };
 use arc_swap::ArcSwap;
@@ -32,6 +35,8 @@ mod append;
 /// shows that it is not responding.
 const UNANSWERED_GRACE: Duration = Duration::from_secs(15);
 const CHAT_ATTACH_TIMEOUT: Duration = Duration::from_secs(70);
+const CHAT_IO_TIMEOUT: Duration = Duration::from_secs(5);
+const CHAT_LOOKUP_TIMEOUT: Duration = Duration::from_secs(20);
 
 pub fn restore_intent(intent: Intent, policy: crate::instance::WindowRestorePolicy) -> Intent {
     if intent == Intent::Restore && policy == crate::instance::WindowRestorePolicy::ExistingOnly {
@@ -204,7 +209,7 @@ fn trace_worker_stack(role: &'static str) {
 fn connect_daemon(path: &std::path::Path) -> io::Result<UnixStream> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
-    let result = crate::descriptor::connect_settled(path);
+    let result = connect_until(path, Instant::now() + CHAT_IO_TIMEOUT, || false);
     #[cfg(feature = "ui")]
     crate::daemon_health::connection_io(path, &result, health_request);
     result
@@ -222,18 +227,13 @@ fn frame_timed_out(error: &ipc::FrameError) -> bool {
     )
 }
 
-fn frame_read_error(error: ipc::FrameError, timeout: Option<Duration>) -> String {
+fn frame_read_error(error: ipc::FrameError, timeout: Duration) -> String {
     if !frame_timed_out(&error) {
         return format!("Cannot decode matched daemon protocol: {error}");
     }
-    timeout.map_or_else(
-        || "Timed out waiting for the daemon response".into(),
-        |timeout| {
-            format!(
-                "the daemon did not answer within {}",
-                crate::control::reply_budget(timeout)
-            )
-        },
+    format!(
+        "the daemon did not answer within {}",
+        crate::control::reply_budget(timeout)
     )
 }
 
@@ -1492,12 +1492,20 @@ fn receive(
     codec: &mut FrameCodec,
     request_id: u64,
     proof: Option<&HostSessionProof>,
+    timeout: Duration,
 ) -> Result<ServerResponse, String> {
-    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
-        HandshakeError::Protocol(error) => error.message,
-        HandshakeError::ProofChanged(_) => "Daemon proof changed".into(),
-        HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => message,
-    })
+    receive_handshake(stream, codec, request_id, proof, timeout)
+        .map_err(HandshakeError::into_message)
+}
+
+impl HandshakeError {
+    fn into_message(self) -> String {
+        match self {
+            Self::Protocol(error) => error.message,
+            Self::ProofChanged(_) => "Daemon proof changed".into(),
+            Self::Unanswered(message) | Self::Transport(message) => message,
+        }
+    }
 }
 fn receive_start(
     stream: &mut UnixStream,
@@ -1505,13 +1513,15 @@ fn receive_start(
     request_id: u64,
     proof: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, StartFailure> {
-    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
-        HandshakeError::Protocol(error) => start_failure(error),
-        HandshakeError::ProofChanged(error) => StartFailure::retry(
-            error.map_or_else(|| "Daemon proof changed".into(), |error| error.message),
-        ),
-        HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => {
-            StartFailure::retry(message)
+    receive_handshake(stream, codec, request_id, proof, CHAT_ATTACH_TIMEOUT).map_err(|error| {
+        match error {
+            HandshakeError::Protocol(error) => start_failure(error),
+            HandshakeError::ProofChanged(error) => StartFailure::retry(
+                error.map_or_else(|| "Daemon proof changed".into(), |error| error.message),
+            ),
+            HandshakeError::Unanswered(message) | HandshakeError::Transport(message) => {
+                StartFailure::retry(message)
+            }
         }
     })
 }
@@ -1522,7 +1532,7 @@ fn receive_connect(
     request_id: u64,
     expected: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, StartFailure> {
-    receive_handshake(stream, codec, request_id, expected)
+    receive_handshake(stream, codec, request_id, expected, CHAT_ATTACH_TIMEOUT)
         .map_err(|error| connect_failure(error, expected.is_some()))
 }
 /// Why a native chat connection could not be opened, for a start whose
@@ -1575,11 +1585,11 @@ fn connect_handshake(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
     expected: Option<&HostSessionProof>,
+    timeout: Duration,
 ) -> Result<HostSessionProof, HandshakeError> {
-    set_chat_timeouts(stream)?;
     codec
         .write(
-            stream,
+            &mut DeadlineWriter::new(stream, Instant::now() + CHAT_IO_TIMEOUT),
             &ClientEnvelope {
                 version: PROTOCOL_VERSION,
                 request_id: 1,
@@ -1591,11 +1601,8 @@ fn connect_handshake(
             },
         )
         .map_err(|e| e.to_string())?;
-    match receive_handshake(stream, codec, 1, expected)? {
-        ServerResponse::Connected { proof, .. } if proof.is_complete() => Ok(proof),
-        ServerResponse::Connected { .. } => {
-            Err("Daemon returned an incomplete native chat ownership proof".into())
-        }
+    match receive_handshake(stream, codec, 1, expected, timeout)? {
+        ServerResponse::Connected { proof, .. } => Ok(proof),
         _ => Err("Daemon did not complete native chat handshake".into()),
     }
 }
@@ -1607,26 +1614,27 @@ fn chat_handshake(
     codec: &mut FrameCodec,
     expected: Option<&HostSessionProof>,
 ) -> Result<(UnixStream, HostSessionProof), HandshakeError> {
-    match stream {
+    let (stream, proof) = match stream {
         ChatStream::Bare(mut stream) => {
-            connect_handshake(&mut stream, codec, expected).map(|proof| (stream, proof))
+            let proof = connect_handshake(&mut stream, codec, expected, CHAT_ATTACH_TIMEOUT)?;
+            (stream, proof)
         }
         ChatStream::Proven { stream, proof } => {
-            set_chat_timeouts(&stream)?;
             if let Some(expected) = expected {
                 ipc::validate_proof(Some(expected), &proof)
                     .map_err(|error| HandshakeError::ProofChanged(Some(error)))?;
             }
-            Ok((stream, proof))
+            (stream, proof)
         }
-    }
+    };
+    set_chat_timeouts(&stream)?;
+    Ok((stream, proof))
 }
+
 fn set_chat_timeouts(stream: &UnixStream) -> Result<(), String> {
-    stream
-        .set_read_timeout(Some(CHAT_ATTACH_TIMEOUT))
+    crate::descriptor::set_read_timeout_or_hangup(stream, Some(CHAT_ATTACH_TIMEOUT))
         .map_err(|e| e.to_string())?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
+    crate::descriptor::set_write_timeout_or_hangup(stream, Some(CHAT_IO_TIMEOUT))
         .map_err(|e| e.to_string())
 }
 
@@ -1635,20 +1643,26 @@ fn receive_handshake(
     codec: &mut FrameCodec,
     request_id: u64,
     proof: Option<&HostSessionProof>,
+    timeout: Duration,
 ) -> Result<ServerResponse, HandshakeError> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
-    let frame = codec.read(stream);
+    let frame = codec.read(&mut DeadlineReader::new(stream, Instant::now() + timeout));
     #[cfg(feature = "ui")]
     match &frame {
-        Err(error) => crate::daemon_health::frame(stream, Some(error), health_request),
+        Err(error) => crate::daemon_health::frame_with_budget(
+            stream,
+            Some(error),
+            health_request,
+            Some(timeout),
+        ),
         Ok(None) => crate::daemon_health::disconnected(stream, health_request),
         _ => {}
     }
     let envelope: ServerEnvelope = frame
         .map_err(|error| {
             let unanswered = frame_timed_out(&error);
-            let message = frame_read_error(error, stream.read_timeout().ok().flatten());
+            let message = frame_read_error(error, timeout);
             if unanswered {
                 HandshakeError::Unanswered(message)
             } else {
@@ -1656,16 +1670,21 @@ fn receive_handshake(
             }
         })?
         .ok_or("Daemon disconnected")?;
-    if envelope.version != PROTOCOL_VERSION {
-        #[cfg(feature = "ui")]
-        crate::daemon_health::incompatible_stream(stream, envelope.version, health_request);
-        return Err("Daemon version mismatch; use matched cagents executables".into());
-    }
-    if !envelope.proof.is_complete() {
-        return Err(HandshakeError::ProofChanged(None));
-    }
-    if envelope.request_id != Some(request_id) {
-        return Err("Unexpected daemon response ordering".into());
+    match validate_reply(&envelope, PROTOCOL_VERSION, request_id) {
+        Ok(()) => {}
+        Err(ReplyError::UnsupportedVersion { actual }) => {
+            #[cfg(feature = "ui")]
+            crate::daemon_health::incompatible_stream(stream, actual, health_request);
+            #[cfg(not(feature = "ui"))]
+            let _ = actual;
+            return Err("Daemon version mismatch; use matched cagents executables".into());
+        }
+        Err(ReplyError::RequestIdMismatch { .. }) => {
+            return Err("Unexpected daemon response ordering".into());
+        }
+        Err(ReplyError::IncompleteProof | ReplyError::ProofMismatch) => {
+            return Err(HandshakeError::ProofChanged(None));
+        }
     }
     if proof.is_some_and(|proof| proof != &envelope.proof) {
         return Err(HandshakeError::ProofChanged(match envelope.message {
@@ -1675,11 +1694,6 @@ fn receive_handshake(
     }
     match envelope.message {
         ServerMessage::Response { response } => {
-            if let ServerResponse::Connected { proof, .. } = &response
-                && *proof != envelope.proof
-            {
-                return Err(HandshakeError::ProofChanged(None));
-            }
             #[cfg(feature = "ui")]
             crate::daemon_health::frame(stream, None, health_request);
             Ok(response)
@@ -2466,34 +2480,12 @@ impl ClientHandle {
     ) -> Result<super::BindingPreview, String> {
         let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
         let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .map_err(|error| error.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|error| error.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        connect_handshake(&mut stream, &mut codec, Some(&source), CHAT_LOOKUP_TIMEOUT)
+            .map_err(HandshakeError::into_message)?;
         codec
             .write(
-                &mut stream,
-                &ClientEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: 1,
-                    proof: None,
-                    request: ClientRequest::Connect {
-                        expected_host: Some(source.clone()),
-                        resume: Vec::new(),
-                    },
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 1, Some(&source))? {
-            ServerResponse::Connected { proof, .. } if proof == source => {}
-            _ => return Err("The source daemon did not confirm its identity".into()),
-        }
-        codec
-            .write(
-                &mut stream,
+                &mut DeadlineWriter::new(&mut stream, Instant::now() + CHAT_IO_TIMEOUT),
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: 2,
@@ -2505,7 +2497,13 @@ impl ClientHandle {
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 2, Some(&source))? {
+        match receive(
+            &mut stream,
+            &mut codec,
+            2,
+            Some(&source),
+            CHAT_LOOKUP_TIMEOUT,
+        )? {
             ServerResponse::ChatPreviewed { preview } => Ok(preview),
             _ => Err("The daemon did not return a verified conversation preview".into()),
         }
@@ -2519,34 +2517,12 @@ impl ClientHandle {
     ) -> Result<Vec<super::BindingCandidate>, String> {
         let socket = ipc::daemon_socket_path().map_err(|error| error.to_string())?;
         let mut stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
-        stream
-            .set_read_timeout(Some(Duration::from_secs(20)))
-            .map_err(|error| error.to_string())?;
-        stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .map_err(|error| error.to_string())?;
         let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        connect_handshake(&mut stream, &mut codec, Some(&source), CHAT_LOOKUP_TIMEOUT)
+            .map_err(HandshakeError::into_message)?;
         codec
             .write(
-                &mut stream,
-                &ClientEnvelope {
-                    version: PROTOCOL_VERSION,
-                    request_id: 1,
-                    proof: None,
-                    request: ClientRequest::Connect {
-                        expected_host: Some(source.clone()),
-                        resume: Vec::new(),
-                    },
-                },
-            )
-            .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 1, Some(&source))? {
-            ServerResponse::Connected { proof, .. } if proof == source => {}
-            _ => return Err("The source daemon did not confirm its identity".into()),
-        }
-        codec
-            .write(
-                &mut stream,
+                &mut DeadlineWriter::new(&mut stream, Instant::now() + CHAT_IO_TIMEOUT),
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: 2,
@@ -2558,7 +2534,13 @@ impl ClientHandle {
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(&mut stream, &mut codec, 2, Some(&source))? {
+        match receive(
+            &mut stream,
+            &mut codec,
+            2,
+            Some(&source),
+            CHAT_LOOKUP_TIMEOUT,
+        )? {
             ServerResponse::ChatCandidates { candidates } => Ok(candidates),
             _ => Err("The daemon did not return a verified conversation list".into()),
         }
@@ -2951,7 +2933,13 @@ impl ClientHandle {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-            let prepared = match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+            let prepared = match receive(
+                &mut stream,
+                &mut codec,
+                request_id,
+                Some(&proof),
+                CHAT_ATTACH_TIMEOUT,
+            )? {
                 ServerResponse::ChatResumePrepared { session: prepared }
                     if super::is_retained_resume_successor(&session, &prepared) =>
                 {
@@ -3029,7 +3017,7 @@ impl ClientHandle {
         let mut pane_wait = Duration::from_millis(50);
         codec
             .write(
-                &mut stream,
+                &mut DeadlineWriter::new(&mut stream, Instant::now() + CHAT_IO_TIMEOUT),
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id: attach_request,
@@ -3049,18 +3037,24 @@ impl ClientHandle {
         let mut early_model = None;
         let mut ended_queues = VecDeque::new();
         let mut seen_queue_executions = [None; 2];
+        let mut attach_deadline = Instant::now() + CHAT_ATTACH_TIMEOUT;
         let (session, mut initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
-            let frame = codec.read(&mut stream);
+            let frame = codec.read(&mut DeadlineReader::new(&mut stream, attach_deadline));
             #[cfg(feature = "ui")]
             match &frame {
-                Err(error) => crate::daemon_health::frame(&stream, Some(error), health_request),
+                Err(error) => crate::daemon_health::frame_with_budget(
+                    &stream,
+                    Some(error),
+                    health_request,
+                    Some(CHAT_ATTACH_TIMEOUT),
+                ),
                 Ok(None) => crate::daemon_health::disconnected(&stream, health_request),
                 _ => {}
             }
             let envelope: ServerEnvelope = frame
-                .map_err(|error| frame_read_error(error, stream.read_timeout().ok().flatten()))?
+                .map_err(|error| frame_read_error(error, CHAT_ATTACH_TIMEOUT))?
                 .ok_or("Daemon disconnected")?;
             if envelope.version != PROTOCOL_VERSION {
                 #[cfg(feature = "ui")]
@@ -3151,7 +3145,10 @@ impl ClientHandle {
                         pane_wait = (pane_wait * 2).min(Duration::from_millis(200));
                         codec
                             .write(
-                                &mut stream,
+                                &mut DeadlineWriter::new(
+                                    &mut stream,
+                                    Instant::now() + CHAT_IO_TIMEOUT,
+                                ),
                                 &ClientEnvelope {
                                     version: PROTOCOL_VERSION,
                                     request_id: attach_request,
@@ -3160,6 +3157,7 @@ impl ClientHandle {
                                 },
                             )
                             .map_err(|error| error.to_string())?;
+                        attach_deadline = Instant::now() + CHAT_ATTACH_TIMEOUT;
                         continue;
                     }
                     let mut failure = start_failure(error);
@@ -3198,6 +3196,8 @@ impl ClientHandle {
             })
             .transpose()?;
         crate::descriptor::set_read_timeout_or_hangup(&stream, None).map_err(|e| e.to_string())?;
+        crate::descriptor::set_write_timeout_or_hangup(&stream, Some(CHAT_IO_TIMEOUT))
+            .map_err(|e| e.to_string())?;
         let mut reader_stream = stream.try_clone().map_err(|e| e.to_string())?;
         let cancel = stream.try_clone().map_err(|error| error.to_string())?;
         let body_requested = Arc::new(AtomicBool::new(true));

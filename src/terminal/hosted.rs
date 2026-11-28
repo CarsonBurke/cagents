@@ -17,7 +17,10 @@ use arc_swap::{ArcSwap, ArcSwapOption};
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
 use thiserror::Error;
 
-use crate::model::{HostSessionProof, TerminalId, TerminalSession};
+use crate::{
+    model::{HostSessionProof, TerminalId, TerminalSession},
+    upgrade::handoff::{STARTUP_BASE, StartupInventory},
+};
 
 use super::{
     KeyInput, MouseInput, PasteOrigin, RenderSnapshot, TerminalEvent, TerminalSendError,
@@ -26,8 +29,12 @@ use super::{
         ClientEnvelope, ClientRequest, FrameCodec, FrameError, MAX_FRAME_BYTES, MAX_INPUT_BYTES,
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ResumeCursor, SUPPRESS_GRID_REPLAY,
         ServerEnvelope, ServerMessage, ServerResponse, TerminalScroll, TerminalSnapshot,
-        TerminalSpawnOptions, TerminalVisibility, WireTerminalSize, daemon_socket_path,
-        write_frame,
+        TerminalSpawnOptions, TerminalVisibility, WireTerminalSize,
+        client_session::{
+            DeadlineReader, DeadlineWriter, HandshakeError, ReplyError, connect_until,
+            validate_handshake,
+        },
+        daemon_socket_path, write_frame,
     },
 };
 
@@ -1572,34 +1579,19 @@ fn ensure_daemon_ready_at(
     socket: &Path,
     application: crate::notifications::Application,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
-    let started = Instant::now();
-    match crate::descriptor::connect_settled(socket) {
-        Ok(stream) => {
-            let result = verify_existing_startup_stream(socket, stream, started);
+    match connect_existing_daemon(socket, Instant::now()) {
+        Ok(Some(client)) => return Ok(client),
+        Ok(None) => {}
+        Err(error) => {
             if application == crate::notifications::Application::Ceditor
-                && matches!(
-                    result,
-                    Err(HostedTerminalStartError::HostIncompatible { .. })
-                )
+                && matches!(error, HostedTerminalStartError::HostIncompatible { .. })
             {
                 let executable = crate::process::current_executable()
                     .map_err(HostedTerminalStartError::CurrentExecutable)?;
                 validate_editor_daemon_installation(&executable)?;
             }
-            return result;
+            return Err(error);
         }
-        Err(error)
-            if !matches!(
-                error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
-            ) =>
-        {
-            return Err(HostedTerminalStartError::HostSocket {
-                path: socket.to_owned(),
-                source: error,
-            });
-        }
-        Err(_) => {}
     }
 
     refuse_update_launch(socket)?;
@@ -1658,24 +1650,63 @@ fn refuse_state_served_elsewhere(socket: &Path) -> Result<(), HostedTerminalStar
     }
 }
 
-/// A bound listener may still be restoring, or may belong to an older build.
-/// Prove its protocol and allow its full restore budget from connect start.
-fn verify_existing_startup_stream(
+/// A bound listener may still be restoring. A full backlog and a slow hello
+/// both draw from the same restoration allowance counted from connect start.
+fn connect_existing_daemon(
     socket: &Path,
-    stream: UnixStream,
     started: Instant,
-) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
-    use crate::upgrade::handoff::{STARTUP_BASE, StartupInventory};
-
-    let inventory = StartupInventory::capture();
-    verify_startup_stream(socket, stream, |stream| {
-        crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
-            started
-                + inventory
-                    .and_then(StartupInventory::timeout)
-                    .unwrap_or(STARTUP_BASE)
+) -> Result<Option<crate::control::ControlClient>, HostedTerminalStartError> {
+    // A restore may consume the checkpoint before the dial or hello completes.
+    let mut inventory = StartupInventory::capture().ok();
+    let mut dial = connect_until(socket, started + DAEMON_READY_TIMEOUT, || false);
+    let mut extended_deadline = None;
+    if dial
+        .as_ref()
+        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+    {
+        refuse_update_launch(socket)?;
+        let deadline = startup_restore_deadline(started, inventory.take());
+        dial = connect_until(socket, deadline, || false);
+        if dial
+            .as_ref()
+            .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
+        {
+            refuse_update_launch(socket)?;
+        }
+        extended_deadline = Some(deadline);
+    }
+    match dial {
+        Ok(stream) => verify_startup_stream(socket, stream, |stream| match extended_deadline {
+            Some(deadline) => {
+                crate::control::ControlClient::from_stream_with_startup_budget(stream, deadline)
+            }
+            None => {
+                crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
+                    startup_restore_deadline(started, inventory)
+                })
+            }
         })
-    })
+        .map(Some),
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            Ok(None)
+        }
+        Err(source) => Err(HostedTerminalStartError::HostSocket {
+            path: socket.to_owned(),
+            source,
+        }),
+    }
+}
+
+fn startup_restore_deadline(started: Instant, inventory: Option<StartupInventory>) -> Instant {
+    started
+        + inventory
+            .and_then(|inventory| inventory.timeout().ok())
+            .unwrap_or(STARTUP_BASE)
 }
 
 fn validate_editor_daemon_installation(executable: &Path) -> Result<(), HostedTerminalStartError> {
@@ -1711,15 +1742,7 @@ fn start_and_verify_daemon_at(
     launch: impl FnMut(bool) -> io::Result<Child>,
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     let deadline = Instant::now() + timeout;
-    start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
-    // Another launcher can win the daemon lease while we wait for readiness;
-    // it must satisfy the same protocol contract as an existing daemon.
-    let stream = crate::descriptor::connect_settled(socket).map_err(|source| {
-        HostedTerminalStartError::HostSocket {
-            path: socket.to_owned(),
-            source,
-        }
-    })?;
+    let stream = start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     verify_startup_stream(socket, stream, |stream| {
         crate::control::ControlClient::from_stream_until(stream, deadline)
     })
@@ -1798,7 +1821,7 @@ fn start_daemon_at(
     daemon_binary: &Path,
     mut scoped: bool,
     mut launch: impl FnMut(bool) -> io::Result<Child>,
-) -> Result<(), HostedTerminalStartError> {
+) -> Result<UnixStream, HostedTerminalStartError> {
     let launch_error = |source| HostedTerminalStartError::LaunchHost {
         path: daemon_binary.to_owned(),
         source,
@@ -1819,8 +1842,8 @@ fn start_daemon_at(
             Err(error) => break Err(HostedTerminalStartError::HostStartup(error.to_string())),
         };
         match daemon_startup_ready(socket, timeout, started.elapsed(), status) {
-            Ok(true) => break Ok(()),
-            Ok(false) => thread::sleep(
+            Ok(Some(stream)) => break Ok(stream),
+            Ok(None) => thread::sleep(
                 DAEMON_READY_POLL_INTERVAL.min(timeout.saturating_sub(started.elapsed())),
             ),
             // A user manager may disappear or reject transient units after
@@ -1917,13 +1940,21 @@ fn daemon_startup_ready(
     timeout: Duration,
     elapsed: Duration,
     child_status: Option<ExitStatus>,
-) -> Result<bool, HostedTerminalStartError> {
-    match crate::descriptor::connect_settled(socket) {
-        Ok(_) => return Ok(true),
+) -> Result<Option<UnixStream>, HostedTerminalStartError> {
+    let started = Instant::now();
+    let remaining = timeout.saturating_sub(elapsed);
+    match connect_until(
+        socket,
+        started + remaining.min(DAEMON_READY_TIMEOUT),
+        || false,
+    ) {
+        Ok(stream) => return Ok(Some(stream)),
         Err(error)
             if matches!(
                 error.kind(),
-                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::TimedOut
             ) => {}
         Err(source) => {
             return Err(HostedTerminalStartError::HostSocket {
@@ -1947,13 +1978,13 @@ fn daemon_startup_ready(
             });
         }
     }
-    if elapsed >= timeout {
+    if started.elapsed() >= remaining {
         return Err(HostedTerminalStartError::HostReadyTimeout {
             path: socket.to_owned(),
             timeout,
         });
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2274,24 +2305,16 @@ fn serve_connection(
     if stop.is_requested() {
         return ConnectionEnd::Stop;
     }
-    let mut stream = match crate::descriptor::connect(socket) {
+    let handshake_deadline = connected_at + DAEMON_READY_TIMEOUT;
+    let mut stream = match connect_until(socket, handshake_deadline, || stop.is_requested()) {
         Ok(stream) => stream,
+        Err(_) if stop.is_requested() => return ConnectionEnd::Stop,
         Err(_) => return ConnectionEnd::Retry,
     };
     let _connection = match stop.register_connection(&stream) {
         Ok(registration) => registration,
         Err(_) => return ConnectionEnd::Retry,
     };
-    if stream
-        .set_read_timeout(Some(HANDSHAKE_POLL_INTERVAL))
-        .is_err()
-        || stream
-            .set_write_timeout(Some(Duration::from_secs(5)))
-            .is_err()
-    {
-        return ConnectionEnd::Retry;
-    }
-
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
     let connect_id = 1;
@@ -2314,11 +2337,15 @@ fn serve_connection(
             },
         },
     };
-    if write_frame(&mut stream, &connect).is_err() {
+    if write_frame(
+        &mut DeadlineWriter::new(&mut stream, handshake_deadline),
+        &connect,
+    )
+    .is_err()
+    {
         return ConnectionEnd::Retry;
     }
 
-    let handshake_deadline = Instant::now() + DAEMON_READY_TIMEOUT;
     // Keep partially received frames across the short polling timeout. A
     // timeout can interrupt either the length prefix or its payload.
     let mut handshake_codec = FrameCodec::new(MAX_FRAME_BYTES);
@@ -2330,7 +2357,10 @@ fn serve_connection(
         if Instant::now() >= handshake_deadline {
             return ConnectionEnd::Retry;
         }
-        let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+        let envelope = match handshake_codec.read::<ServerEnvelope>(
+            &mut DeadlineReader::new(&mut stream, handshake_deadline)
+                .with_poll_interval(HANDSHAKE_POLL_INTERVAL),
+        ) {
             Ok(Some(envelope)) => envelope,
             Ok(None) => return ConnectionEnd::Retry,
             Err(FrameError::Io(error)) if is_timeout(&error) => {
@@ -2358,43 +2388,49 @@ fn serve_connection(
                 return ConnectionEnd::Retry;
             }
         };
-        if envelope.version != PROTOCOL_VERSION {
-            #[cfg(feature = "ui")]
-            crate::daemon_health::incompatible(socket, envelope.version, health_request);
-            crate::diagnostics::record(crate::diagnostics::Event::ProtocolMismatch);
-            tracing::warn!(
-                actual = envelope.version,
-                expected = PROTOCOL_VERSION,
-                "the daemon speaks an unsupported protocol version"
-            );
-            return ConnectionEnd::Retry;
+        // A capacity refusal can arrive before the daemon reads Connect.
+        if envelope.version == PROTOCOL_VERSION
+            && envelope.request_id.is_none()
+            && let ServerMessage::Error(error) = envelope.message
+        {
+            return reject_handshake(events, published, stop, error);
         }
-        // The daemon can refuse or sever a connection before it ever reads the
-        // connect frame — client capacity, for one — and that unsolicited error
-        // carries the only accurate reason this handle will ever see.
-        let unsolicited = envelope.request_id.is_none();
-        if envelope.request_id != Some(connect_id) {
-            if unsolicited && let ServerMessage::Error(error) = envelope.message {
-                return reject_handshake(events, published, stop, error);
+        let error = match validate_handshake(&envelope, PROTOCOL_VERSION, connect_id) {
+            Ok(proof) if published.pin_proof(proof) => None,
+            Ok(_)
+            | Err(HandshakeError::InvalidReply(
+                ReplyError::IncompleteProof | ReplyError::ProofMismatch,
+            )) => Some(ProtocolError::new(
+                ProtocolErrorCode::ProofMismatch,
+                "the daemon returned a different or incomplete session proof",
+                false,
+            )),
+            Err(HandshakeError::Remote(error)) => Some(error.clone()),
+            Err(HandshakeError::InvalidReply(ReplyError::UnsupportedVersion { actual })) => {
+                #[cfg(feature = "ui")]
+                crate::daemon_health::incompatible(socket, actual, health_request);
+                crate::diagnostics::record(crate::diagnostics::Event::ProtocolMismatch);
+                tracing::warn!(
+                    actual,
+                    expected = PROTOCOL_VERSION,
+                    "the daemon speaks an unsupported protocol version"
+                );
+                return ConnectionEnd::Retry;
             }
-            return ConnectionEnd::Retry;
+            Err(
+                HandshakeError::InvalidReply(ReplyError::RequestIdMismatch { .. })
+                | HandshakeError::UnexpectedMessage(_),
+            ) => {
+                return ConnectionEnd::Retry;
+            }
+        };
+        if let Some(error) = error {
+            return reject_handshake(events, published, stop, error);
         }
         match envelope.message {
             ServerMessage::Response {
                 response: ServerResponse::Connected { proof, resumed },
             } => {
-                if envelope.proof != proof || !published.pin_proof(&proof) {
-                    return reject_handshake(
-                        events,
-                        published,
-                        stop,
-                        ProtocolError::new(
-                            ProtocolErrorCode::ProofMismatch,
-                            "the daemon returned a different or incomplete session proof",
-                            false,
-                        ),
-                    );
-                }
                 if matches!(intent, ConnectionIntent::AuthorizedSpawn { .. }) && !resumed.is_empty()
                 {
                     return reject_handshake(
@@ -2434,10 +2470,7 @@ fn serve_connection(
                 crate::daemon_health::frame(&stream, None, health_request);
                 break (proof, attached);
             }
-            ServerMessage::Error(error) => {
-                return reject_handshake(events, published, stop, error);
-            }
-            _ => return ConnectionEnd::Retry,
+            _ => unreachable!("validated Connect reply"),
         }
     };
 
@@ -2450,7 +2483,7 @@ fn serve_connection(
             let request_id = next_request_id;
             next_request_id += 1;
             if write_frame(
-                &mut stream,
+                &mut DeadlineWriter::new(&mut stream, handshake_deadline),
                 &ClientEnvelope {
                     version: PROTOCOL_VERSION,
                     request_id,
@@ -2469,7 +2502,10 @@ fn serve_connection(
                 if Instant::now() >= handshake_deadline {
                     return Err(ConnectionEnd::Retry);
                 }
-                let envelope = match handshake_codec.read::<ServerEnvelope>(&mut stream) {
+                let envelope = match handshake_codec.read::<ServerEnvelope>(
+                    &mut DeadlineReader::new(&mut stream, handshake_deadline)
+                        .with_poll_interval(HANDSHAKE_POLL_INTERVAL),
+                ) {
                     Ok(Some(envelope)) => envelope,
                     Ok(None) => return Err(ConnectionEnd::Retry),
                     Err(FrameError::Io(error)) if is_timeout(&error) => continue,
@@ -2591,6 +2627,10 @@ fn serve_connection(
         }
     }
 
+    if crate::descriptor::set_write_timeout_or_hangup(&stream, Some(DAEMON_READY_TIMEOUT)).is_err()
+    {
+        return ConnectionEnd::Retry;
+    }
     let mut connection = match ConnectionIo::new(stream, terminal_id) {
         Ok(connection) => connection,
         Err(_) => return ConnectionEnd::Retry,
@@ -3598,9 +3638,77 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let timeout = Duration::from_secs(35);
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
+        assert!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None)
+                .unwrap()
+                .is_none()
+        );
         let _listener = crate::descriptor::bind(&socket).unwrap();
-        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None).unwrap());
+        assert!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(6), None)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn startup_backlog_pressure_uses_the_remaining_readiness_budget() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        // SAFETY: the fixture owns this listening descriptor.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let _pending = UnixStream::connect(&socket).unwrap();
+        let (finished, wait) = crossbeam_channel::bounded::<()>(0);
+        let server = thread::spawn(move || {
+            // Release an accidentally blocking connect if the deadline regresses.
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+            drop(listener);
+        });
+
+        let timeout = Duration::from_secs(30);
+        let started = Instant::now();
+        let result =
+            daemon_startup_ready(&socket, timeout, timeout - Duration::from_millis(50), None);
+        let elapsed = started.elapsed();
+        drop(finished);
+        server.join().unwrap();
+        assert!(matches!(
+            result,
+            Err(HostedTerminalStartError::HostReadyTimeout { .. })
+        ));
+        assert!(elapsed < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn existing_daemon_can_dial_during_the_restore_allowance() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let listener = crate::descriptor::bind(&socket).unwrap();
+        // SAFETY: the fixture owns this listening descriptor.
+        assert_eq!(
+            unsafe { libc::listen(listener.as_raw_fd(), crate::descriptor::ONE_PENDING_BACKLOG) },
+            0
+        );
+        let _pending = UnixStream::connect(&socket).unwrap();
+        let server = thread::spawn(move || {
+            drop(accept_connection(&listener));
+            answer_ready_hello(&mut accept_connection(&listener));
+        });
+
+        // Even with the ordinary dial budget spent, the restoring daemon can
+        // drain its queue and prove readiness within the startup allowance.
+        let started = Instant::now() - DAEMON_READY_TIMEOUT;
+        let client = connect_existing_daemon(&socket, started).unwrap().unwrap();
+        assert_eq!(client.proof(), &proof("restored"));
+        server.join().unwrap();
     }
 
     fn hold_startup_lease(socket: &Path) -> crate::daemon::HostLease {
@@ -3643,6 +3751,10 @@ mod tests {
                 HostedTerminalStartError::UpdateInProgress(_)
             ));
             assert!(crate::instance::is_update_in_progress(&error));
+            assert!(matches!(
+                connect_existing_daemon(&socket, Instant::now() - DAEMON_READY_TIMEOUT),
+                Err(HostedTerminalStartError::UpdateInProgress(_))
+            ));
             // This is an already-dispatched launch: a failed child plus the
             // update worker's lease must not look like a restoring daemon.
             let result = start_daemon_at(
@@ -3701,15 +3813,37 @@ mod tests {
             drop(update);
             let _admission = crate::instance::AdmissionFence::acquire().unwrap();
             assert!(
-                !daemon_startup_ready(
+                daemon_startup_ready(
                     &socket,
                     Duration::from_secs(125),
                     Duration::from_secs(60),
                     Some(ExitStatus::from_raw(1 << 8)),
                 )
-                .unwrap(),
+                .unwrap()
+                .is_none(),
                 "a declared concurrent admission still owns its restoration allowance"
             );
+
+            let listener = crate::descriptor::bind(&socket).unwrap();
+            let (finished, wait) = crossbeam_channel::bounded::<()>(0);
+            let server = thread::spawn(move || {
+                let mut stream = accept_connection(&listener);
+                let _: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                let _ = wait.recv_timeout(Duration::from_secs(6));
+            });
+            let now = Instant::now();
+            let started = now - (crate::upgrade::handoff::STARTUP_BASE - Duration::from_secs(1));
+            let result = connect_existing_daemon(&socket, started);
+            let elapsed = now.elapsed();
+            drop(finished);
+            server.join().unwrap();
+            assert!(matches!(
+                result,
+                Err(HostedTerminalStartError::HostProtocol(
+                    crate::control::ControlError::ReplyTimeout { .. }
+                ))
+            ));
+            assert!(elapsed < Duration::from_secs(3));
             return;
         }
         let root = tempfile::tempdir().unwrap();
@@ -4055,7 +4189,12 @@ mod tests {
             // ordinary hello times out, only the captured restore allowance
             // can still extend the deadline.
             let started = Instant::now() - crate::upgrade::handoff::STARTUP_BASE;
-            verify_existing_startup_stream(&socket, UnixStream::connect(&socket).unwrap(), started)
+            verify_startup_stream(&socket, UnixStream::connect(&socket).unwrap(), |stream| {
+                let inventory = StartupInventory::capture().ok();
+                crate::control::ControlClient::from_stream_with_startup_deadline(stream, || {
+                    startup_restore_deadline(started, inventory)
+                })
+            })
         } else {
             ensure_daemon_ready_at(&socket, crate::notifications::Application::Cagents)
         };
@@ -4083,33 +4222,30 @@ mod tests {
             let listener = crate::descriptor::bind(&socket).unwrap();
             thread::spawn(move || {
                 thread::sleep(restore);
-                // Readiness probes connect and close; answer the handshake.
-                loop {
-                    let mut stream = accept_connection(&listener);
-                    let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
-                        continue;
-                    };
-                    let proof = proof("restored");
-                    write_frame(
-                        &mut stream,
-                        &ServerEnvelope {
-                            version: PROTOCOL_VERSION,
-                            request_id: Some(request.request_id),
-                            proof: proof.clone(),
-                            message: ServerMessage::Response {
-                                response: ServerResponse::Connected {
-                                    proof,
-                                    resumed: Vec::new(),
-                                },
-                            },
-                        },
-                    )
-                    .unwrap();
-                    return;
-                }
+                answer_ready_hello(&mut accept_connection(&listener));
             });
             Command::new("true").spawn()
         }
+    }
+
+    fn answer_ready_hello(stream: &mut UnixStream) {
+        let request: ClientEnvelope = read_frame(stream).unwrap().unwrap();
+        let proof = proof("restored");
+        write_frame(
+            stream,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request.request_id),
+                proof: proof.clone(),
+                message: ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof,
+                        resumed: Vec::new(),
+                    },
+                },
+            },
+        )
+        .unwrap();
     }
 
     #[test]
@@ -4383,10 +4519,22 @@ mod tests {
         let loser = Some(ExitStatus::from_raw(1 << 8));
         // Two providers may each consume thirty seconds. The winner owns the
         // inventory throughout; even incomplete lease metadata is not failure.
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(30), loser).unwrap());
-        assert!(!daemon_startup_ready(&socket, timeout, Duration::from_secs(60), loser).unwrap());
+        assert!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(30), loser)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(60), loser)
+                .unwrap()
+                .is_none()
+        );
         let _listener = crate::descriptor::bind(&socket).unwrap();
-        assert!(daemon_startup_ready(&socket, timeout, Duration::from_secs(61), loser).unwrap());
+        assert!(
+            daemon_startup_ready(&socket, timeout, Duration::from_secs(61), loser)
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
@@ -5120,7 +5268,7 @@ mod tests {
         ));
     }
 
-    fn assert_handshake_stops(message: ServerMessage) {
+    fn assert_handshake_stops(message: ServerMessage, correlated: bool) {
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("daemon.sock");
         let listener = crate::descriptor::bind(&socket).unwrap();
@@ -5143,11 +5291,15 @@ mod tests {
             connect.request,
             ClientRequest::Connect { expected_host: Some(expected), .. } if expected == pinned
         ));
+        let expected_error = match &message {
+            ServerMessage::Error(error) => Some(error.message.clone()),
+            _ => None,
+        };
         write_frame(
             &mut stream,
             &ServerEnvelope {
                 version: PROTOCOL_VERSION,
-                request_id: Some(connect.request_id),
+                request_id: correlated.then_some(connect.request_id),
                 proof: proof("new"),
                 message,
             },
@@ -5159,8 +5311,8 @@ mod tests {
             events.recv_timeout(Duration::from_secs(2)).unwrap(),
             TerminalEvent::Error {
                 operation: "connect to cagents daemon",
-                ..
-            }
+                message,
+            } if expected_error.is_none_or(|expected| expected == message)
         ));
         wake_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         // A second receive proves the worker exited, rather than backing off.
@@ -5181,30 +5333,51 @@ mod tests {
 
     #[test]
     fn stale_handshake_stops_even_when_an_older_daemon_marks_it_retryable() {
-        assert_handshake_stops(ServerMessage::Error(ProtocolError::new(
-            ProtocolErrorCode::ProofMismatch,
-            "the request targets a different cagents daemon incarnation",
+        assert_handshake_stops(
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::ProofMismatch,
+                "the request targets a different cagents daemon incarnation",
+                true,
+            )),
             true,
-        )));
+        );
+    }
+
+    #[test]
+    fn unsolicited_capacity_refusal_reports_the_daemons_reason() {
+        assert_handshake_stops(
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::QueueFull,
+                "the daemon is at client capacity",
+                false,
+            )),
+            false,
+        );
     }
 
     #[test]
     fn non_retryable_handshake_failure_stops_the_client() {
-        assert_handshake_stops(ServerMessage::Error(ProtocolError::new(
-            ProtocolErrorCode::PermissionDenied,
-            "terminal access denied",
-            false,
-        )));
+        assert_handshake_stops(
+            ServerMessage::Error(ProtocolError::new(
+                ProtocolErrorCode::PermissionDenied,
+                "terminal access denied",
+                false,
+            )),
+            true,
+        );
     }
 
     #[test]
     fn connected_response_cannot_repin_a_stale_terminal() {
-        assert_handshake_stops(ServerMessage::Response {
-            response: ServerResponse::Connected {
-                proof: proof("new"),
-                resumed: Vec::new(),
+        assert_handshake_stops(
+            ServerMessage::Response {
+                response: ServerResponse::Connected {
+                    proof: proof("new"),
+                    resumed: Vec::new(),
+                },
             },
-        });
+            true,
+        );
     }
 
     #[test]
