@@ -1240,7 +1240,10 @@ pub(super) fn restore_pass(
             // release whose home is kept, so record it where it survives the
             // list's loss. A home whose marker cannot be written is retried
             // by the next daemon.
-            if let Err(error) = homes.mark_released(provider, key) {
+            if let Err(error) = store.try_backfill_released_home(&homes, provider, key) {
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    continue;
+                }
                 sweep.examined.insert((provider, key));
                 tracing::warn!(
                     provider = provider.executable(),

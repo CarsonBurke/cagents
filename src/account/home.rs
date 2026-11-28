@@ -183,15 +183,27 @@ impl Homes {
         use std::os::unix::fs::OpenOptionsExt;
 
         crate::secure_file::prepare_private_directory(&self.provider_directory(provider))?;
-        fs::OpenOptions::new()
+        let marker = self.released_marker(provider, key);
+        match fs::OpenOptions::new()
             .write(true)
-            .create(true)
-            // Not blocking keeps a FIFO by this name from stalling the daemon
-            // while it holds the account list.
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            // Never open an existing entry, even if it is a FIFO with a reader.
+            .create_new(true)
             .mode(0o600)
-            .open(self.released_marker(provider, key))?;
-        Ok(())
+            .open(&marker)
+        {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                if fs::symlink_metadata(&marker)?.is_file() {
+                    Ok(())
+                } else {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "expected a regular released-home marker",
+                    ))
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// Whether a regular marker beside the home records that its sign-in

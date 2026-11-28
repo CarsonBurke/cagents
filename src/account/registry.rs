@@ -1505,6 +1505,27 @@ impl Store {
         read(&self.path())
     }
 
+    /// Copy an earlier release record to a marker if the current account
+    /// list still records it and the managed home is still kept.
+    #[cfg(any(feature = "host", test))]
+    pub fn try_backfill_released_home(
+        &self,
+        homes: &Homes,
+        provider: Provider,
+        key: Uuid,
+    ) -> io::Result<()> {
+        let _lock = self.try_lock()?;
+        let registry = read(&self.path())?;
+        if !registry.is_newer()
+            && registry.is_released(key)
+            && registry.find(key).is_none()
+            && homes.is_unregistered(&registry, provider, key)
+        {
+            homes.mark_released(provider, key)?;
+        }
+        Ok(())
+    }
+
     /// Applies `change` to the registry as it stands on disk and writes the
     /// result, all under the lock; returns the registry written and what
     /// `change` returned.
@@ -2766,6 +2787,58 @@ mod tests {
     }
 
     #[test]
+    fn a_release_marker_is_backfilled_only_from_the_locked_current_list() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path().join("config"));
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, _) = homes.create(provider, None).unwrap();
+        let (previous, ()) = store
+            .update(|registry| registry.release(key, &homes))
+            .unwrap();
+        assert!(previous.is_released(key));
+        assert!(!homes.is_released(provider, key));
+
+        let lock = store.lock().unwrap();
+        let held = store
+            .try_backfill_released_home(&homes, provider, key)
+            .unwrap_err();
+        assert_eq!(held.kind(), io::ErrorKind::WouldBlock);
+        assert!(!homes.is_released(provider, key));
+        drop(lock);
+
+        // The sweep may have read an older list before another writer
+        // replaced it. Only the list under the lock can authorize the marker.
+        store.update(|registry| registry.released.clear()).unwrap();
+        store
+            .try_backfill_released_home(&homes, provider, key)
+            .unwrap();
+        assert!(!homes.is_released(provider, key));
+
+        store
+            .update(|registry| {
+                registry.release(key, &homes);
+                registry.begin(provider, key, 1);
+            })
+            .unwrap();
+        store
+            .try_backfill_released_home(&homes, provider, key)
+            .unwrap();
+        assert!(!homes.is_released(provider, key));
+
+        let (current, ()) = store
+            .update(|registry| registry.release(key, &homes))
+            .unwrap();
+        store
+            .try_backfill_released_home(&homes, provider, key)
+            .unwrap();
+        assert!(homes.is_released(provider, key));
+        assert_eq!(store.load().unwrap().revision(), current.revision());
+        fs::remove_file(store.path()).unwrap();
+        assert!(homes.unregistered(&store.load().unwrap()).is_empty());
+    }
+
+    #[test]
     fn marking_a_home_released_is_idempotent_and_ignores_a_symlink() {
         use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -2787,6 +2860,30 @@ mod tests {
         assert!(!homes.is_released(provider, linked));
         assert!(homes.mark_released(provider, linked).is_err());
         assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+    }
+
+    #[test]
+    fn marking_a_home_released_refuses_a_fifo_even_with_a_reader() {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::fs::{FileTypeExt, OpenOptionsExt};
+
+        let directory = tempfile::tempdir().unwrap();
+        let homes = Homes::at(directory.path().join("accounts"));
+        let provider = Provider::Claude;
+        let (key, home) = homes.create(provider, None).unwrap();
+        let marker = home.with_file_name(format!(".released-{}", key.hyphenated()));
+        let name = CString::new(marker.as_os_str().as_bytes()).unwrap();
+        // SAFETY: `name` is an owned, NUL-terminated path in the fixture.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let _reader = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&marker)
+            .unwrap();
+        assert!(homes.mark_released(provider, key).is_err());
+        assert!(!homes.is_released(provider, key));
+        assert!(fs::symlink_metadata(marker).unwrap().file_type().is_fifo());
     }
 
     #[test]
