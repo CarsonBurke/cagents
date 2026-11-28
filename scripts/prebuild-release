@@ -37,12 +37,14 @@ import fcntl
 import json
 import os
 from pathlib import Path
-import tomllib
+import re
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
+import tomllib
 
 PROGRAM = "prebuild-release"
 SERVICE = "cagents-prebuild.service"
@@ -88,6 +90,11 @@ GRACE_SECONDS = 60
 # A failed build is tried once more this long after, in case what failed was
 # the host rather than the commit; a second failure, or failing tests, is final.
 RETRY_FAILED_SECONDS = 3600
+FAILURE_LOG_SECONDS = 30 * 24 * 3600
+FAILURE_LOG_BYTES = 128 * 2**20
+FAILURE_LOG_COUNT = 32
+FAILURE_TAIL_CHARACTERS = 4000
+FAILURE_LOG_NAME = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})\.log")
 
 
 def pause(seconds):
@@ -243,12 +250,52 @@ class Store:
 
     def fail(self, sha, status, log=None):
         attempts = (self.failure(sha) or {}).get("attempts", 0) + 1
-        tail = log.read_text(errors="replace")[-4000:] if log and log.exists() else ""
+        tail = ""
+        if log is not None:
+            with contextlib.suppress(FileNotFoundError), log.open("rb") as output:
+                # Four bytes per UTF-8 character suffice even for a log much
+                # larger than the space available to keep it.
+                limit = 4 * FAILURE_TAIL_CHARACTERS
+                end = output.seek(0, os.SEEK_END)
+                output.seek(max(0, end - limit))
+                tail = output.read(limit).decode("utf-8", errors="replace")[-FAILURE_TAIL_CHARACTERS:]
         write_json(self.failures / f"{sha}.json", {"sha": sha, "status": status, "failed_at": time.time(),
                                                    "attempts": attempts, "log_tail": tail})
         if log and log.exists():
             shutil.move(log, self.failures / f"{sha}.log")
+            self.prune_failure_logs()
         say(f"{sha} failed: {status}")
+
+    def prune_failure_logs(self):
+        """Bound completed build logs under the service's store lock."""
+        with contextlib.suppress(OSError):
+            directory = os.open(self.failures, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            try:
+                root = os.fstat(directory)
+                if root.st_uid != os.geteuid() or root.st_mode & 0o022:
+                    return
+                logs = []
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if not FAILURE_LOG_NAME.fullmatch(entry.name):
+                            continue
+                        with contextlib.suppress(OSError):
+                            info = entry.stat(follow_symlinks=False)
+                            if (stat.S_ISREG(info.st_mode) and info.st_uid == root.st_uid
+                                    and info.st_nlink == 1):
+                                logs.append((info.st_mtime_ns, entry.name, info.st_size))
+                cutoff = time.time_ns() - FAILURE_LOG_SECONDS * 10**9
+                remaining_bytes = FAILURE_LOG_BYTES
+                remaining_logs = FAILURE_LOG_COUNT
+                for mtime, name, size in sorted(logs, reverse=True):
+                    if mtime >= cutoff and remaining_logs and size <= remaining_bytes:
+                        remaining_bytes -= size
+                        remaining_logs -= 1
+                    else:
+                        with contextlib.suppress(OSError):
+                            os.unlink(name, dir_fd=directory)
+            finally:
+                os.close(directory)
 
     def requested(self):
         """Requested commits, the earliest first."""
@@ -657,6 +704,7 @@ def run(repository, store, sentinel, cache, keep):
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return 0
+        store.prune_failure_logs()
         store.evict(keep, repository, sentinel)
         while True:
             sha, priority = choose(repository, store, sentinel)
@@ -845,7 +893,12 @@ def wait(repository, store, sentinel, sha, timeout):
             break
         failure = store.failure(sha)
         if failure is not None:
-            say(f"{sha} failed: {failure['status']}; see {store.failures / f'{sha}.log'}")
+            say(f"{sha} failed: {failure['status']}")
+            log = store.failures / f"{sha}.log"
+            with contextlib.suppress(OSError):
+                if stat.S_ISREG(log.lstat().st_mode):
+                    say(f"See the build log at {log}")
+            say(f"See the failure record at {store.failures / f'{sha}.json'}")
             return 1
         if deadline is not None and time.monotonic() >= deadline:
             say(f"{sha} is still not bundled")
