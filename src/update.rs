@@ -20,7 +20,7 @@ pub use cutover::{
 #[cfg(all(target_os = "macos", feature = "host"))]
 pub(crate) use cutover::{Original as ReadyCutoverOriginal, record as record_ready_cutover};
 #[cfg(target_os = "macos")]
-pub(crate) use cutover::{selected_listener_startup_allowance, selected_startup_allowance};
+pub(crate) use cutover::{selected_listener_startup, selected_startup_allowance};
 mod feed;
 mod floor;
 mod floor_display;

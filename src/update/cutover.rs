@@ -1103,32 +1103,28 @@ pub(crate) fn selected_startup_allowance(executable: &Path) -> Duration {
 /// Budget the selected runtime's daemon for callers with any matched protocol.
 /// A connected caller also confirms the peer owns this listener. A caller
 /// waiting for space in its backlog can still verify the runtime lease.
-pub(crate) fn selected_listener_startup_allowance(
+pub(crate) fn selected_listener_startup(
     socket: &Path,
     peer: Option<crate::daemon::PeerCredentials>,
-) -> Duration {
-    let allowance = || {
-        let paths = crate::daemon::RuntimePaths::discover().ok()?;
-        if paths.socket != socket
-            || peer.is_some_and(|peer| peer.uid != crate::daemon::current_uid())
-        {
-            return None;
-        }
-        let process = crate::daemon::lease_handoff::observe_owner(&paths).ok()?;
-        if peer.is_some_and(|peer| process.pid() != peer.pid) {
-            return None;
-        }
-        let executable = process.executable().ok()?;
-        let restart = pending_restart(&executable).ok()??;
-        if crate::process::mapped_executable_identity(process.pid(), &executable).ok()?
-            != restart.intent.target_image
-            || process.exited().ok()?
-        {
-            return None;
-        }
-        restart.startup_allowance().ok()
-    };
-    allowance().unwrap_or_default()
+) -> Option<(crate::pinned_process::PinnedProcess, Duration)> {
+    let paths = crate::daemon::RuntimePaths::discover().ok()?;
+    if paths.socket != socket || peer.is_some_and(|peer| peer.uid != crate::daemon::current_uid()) {
+        return None;
+    }
+    let process = crate::daemon::lease_handoff::observe_owner(&paths).ok()?;
+    if peer.is_some_and(|peer| process.pid() != peer.pid) {
+        return None;
+    }
+    let executable = process.executable().ok()?;
+    let restart = pending_restart(&executable).ok()??;
+    if crate::process::mapped_executable_identity(process.pid(), &executable).ok()?
+        != restart.intent.target_image
+        || process.exited().ok()?
+    {
+        return None;
+    }
+    let allowance = restart.startup_allowance().ok()?;
+    (!allowance.is_zero()).then_some((process, allowance))
 }
 
 /// An unrelated job must not replace the unfinished status between the

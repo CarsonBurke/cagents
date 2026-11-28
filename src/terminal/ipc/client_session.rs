@@ -23,6 +23,42 @@ pub(crate) fn connect_until(
     deadline: Instant,
     cancelled: impl Fn() -> bool,
 ) -> io::Result<UnixStream> {
+    connect_with_deadline(path, deadline, cancelled, false)
+}
+
+/// An authenticated owner may bind before accepting any clients. Darwin can
+/// refuse a full backlog throughout that recovery, so wait within the same
+/// deadline while the exact process remains alive.
+#[cfg(any(
+    target_os = "macos",
+    all(test, not(any(feature = "host", feature = "ui")))
+))]
+pub(crate) fn connect_until_with_owner(
+    path: &Path,
+    deadline: Instant,
+    owner: &crate::pinned_process::PinnedProcess,
+) -> io::Result<UnixStream> {
+    let stream = connect_with_deadline(
+        path,
+        deadline,
+        || !matches!(owner.exited(), Ok(false)),
+        true,
+    )?;
+    let peer = crate::daemon::peer_credentials(&stream)?;
+    if peer.uid != crate::daemon::current_uid() || peer.pid != owner.pid() || owner.exited()? {
+        return Err(io::Error::other(
+            "the selected daemon's listener changed during startup",
+        ));
+    }
+    Ok(stream)
+}
+
+fn connect_with_deadline(
+    path: &Path,
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+    owner_is_known: bool,
+) -> io::Result<UnixStream> {
     let mut address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     address.sun_family = libc::AF_UNIX as _;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -61,10 +97,12 @@ pub(crate) fn connect_until(
             return Ok(stream);
         }
         let error = io::Error::last_os_error();
+        let refused_by_owner = owner_is_known && error.kind() == io::ErrorKind::ConnectionRefused;
         if !matches!(
             error.kind(),
             io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-        ) && !crate::descriptor::retry_refusal(&error, refusing_since)
+        ) && !refused_by_owner
+            && !crate::descriptor::retry_refusal(&error, refusing_since)
         {
             return Err(error);
         }
@@ -250,6 +288,25 @@ mod tests {
         })
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    }
+
+    #[test]
+    fn a_refused_selected_listener_waits_within_its_exact_owner_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        drop(crate::descriptor::bind(&socket).unwrap());
+        let owner = crate::pinned_process::PinnedProcess::open(std::process::id()).unwrap();
+
+        let ordinary =
+            connect_until(&socket, Instant::now() + Duration::from_secs(2), || false).unwrap_err();
+        assert_eq!(ordinary.kind(), io::ErrorKind::ConnectionRefused);
+        let until = Instant::now() + Duration::from_millis(250);
+        let busy = connect_until_with_owner(&socket, until, &owner).unwrap_err();
+        assert_eq!(busy.kind(), io::ErrorKind::TimedOut);
+
+        std::fs::remove_file(&socket).unwrap();
+        let _listener = crate::descriptor::bind(&socket).unwrap();
+        connect_until_with_owner(&socket, Instant::now() + Duration::from_secs(1), &owner).unwrap();
     }
 
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {

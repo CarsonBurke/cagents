@@ -22,6 +22,9 @@ use crate::{
     upgrade::handoff::{STARTUP_BASE, StartupInventory},
 };
 
+#[cfg(target_os = "macos")]
+use super::ipc::client_session::connect_until_with_owner;
+
 use super::{
     KeyInput, MouseInput, PasteOrigin, RenderSnapshot, TerminalEvent, TerminalSendError,
     TerminalSize, TerminalWake,
@@ -1664,15 +1667,36 @@ fn connect_existing_daemon(
     let mut inventory = StartupInventory::capture().ok();
     let mut dial = connect_until(socket, started + DAEMON_READY_TIMEOUT, || false);
     let mut extended_deadline = None;
-    if dial
+    let extend = dial
         .as_ref()
-        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
-    {
+        .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut);
+    #[cfg(target_os = "macos")]
+    let selected = if dial.as_ref().is_err_and(|error| {
+        matches!(
+            error.kind(),
+            io::ErrorKind::ConnectionRefused | io::ErrorKind::TimedOut
+        )
+    }) {
+        crate::update::selected_listener_startup(socket, None)
+    } else {
+        None
+    };
+    #[cfg(target_os = "macos")]
+    let extend = extend || selected.is_some();
+    if extend {
         refuse_update_launch(socket)?;
         let deadline = startup_restore_deadline(started, inventory.take());
+        #[cfg(not(target_os = "macos"))]
+        let result = connect_until(socket, deadline, || false);
         #[cfg(target_os = "macos")]
-        let deadline = deadline + crate::update::selected_listener_startup_allowance(socket, None);
-        dial = connect_until(socket, deadline, || false);
+        let (deadline, result) = match selected {
+            Some((owner, allowance)) => {
+                let deadline = deadline + allowance;
+                (deadline, connect_until_with_owner(socket, deadline, &owner))
+            }
+            None => (deadline, connect_until(socket, deadline, || false)),
+        };
+        dial = result;
         if dial
             .as_ref()
             .is_err_and(|error| error.kind() == io::ErrorKind::TimedOut)
@@ -1727,9 +1751,8 @@ fn startup_allowance_for_stream<'a>(
 ) -> impl FnOnce() -> Duration + use<'a> {
     let peer = crate::daemon::peer_credentials(stream).ok();
     move || {
-        peer.map_or(Duration::ZERO, |peer| {
-            crate::update::selected_listener_startup_allowance(socket, Some(peer))
-        })
+        peer.and_then(|peer| crate::update::selected_listener_startup(socket, Some(peer)))
+            .map_or(Duration::ZERO, |(_, allowance)| allowance)
     }
 }
 
@@ -1779,7 +1802,33 @@ fn start_and_verify_daemon_at(
 ) -> Result<crate::control::ControlClient, HostedTerminalStartError> {
     let started = Instant::now();
     let deadline = started + timeout;
-    let stream = start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
+    let connection = start_daemon_at(socket, timeout, daemon_binary, scoped, launch);
+    #[cfg(target_os = "macos")]
+    let connection = connection.or_else(|error| {
+        let HostedTerminalStartError::HostReadyTimeout { .. } = error else {
+            return Err(error);
+        };
+        refuse_update_launch(socket)?;
+        let Some((owner, allowance)) = crate::update::selected_listener_startup(socket, None)
+        else {
+            return Err(error);
+        };
+        let deadline = deadline.max(started + STARTUP_BASE + allowance);
+        connect_until_with_owner(socket, deadline, &owner).map_err(|source| {
+            if source.kind() == io::ErrorKind::TimedOut {
+                HostedTerminalStartError::HostReadyTimeout {
+                    path: socket.to_owned(),
+                    timeout: deadline.duration_since(started),
+                }
+            } else {
+                HostedTerminalStartError::HostSocket {
+                    path: socket.to_owned(),
+                    source,
+                }
+            }
+        })
+    });
+    let stream = connection?;
     #[cfg(target_os = "macos")]
     let allowance = startup_allowance_for_stream(socket, &stream);
     verify_startup_stream(socket, stream, |stream| {
