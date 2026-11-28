@@ -42,7 +42,7 @@ if [[ $artifact == *.AppImage ]]; then
         -f $XDG_DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg &&
         -f $XDG_CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop ]] || fail 'missing AppImage desktop integration'
     "$public_command" --no-start --json daemon status > /tmp/appimage-status
-    jq -e --arg version "$version" '.ok and .data.running and .data.instance == "production" and .data.daemon_version == $version' /tmp/appimage-status >/dev/null
+    jq -e --arg version "$version" '.ok and .data.running and .data.startup == "ready" and .data.instance == "production" and .data.daemon_version == $version' /tmp/appimage-status >/dev/null
     daemon_pid=$(jq -er '.pid | select(type == "number" and . > 1)' "$XDG_RUNTIME_DIR/cagents/cagentsd.lock")
     [[ $(readlink "/proc/$daemon_pid/exe") == "$binaries/cagentsd" ]] || fail 'wrong AppImage daemon executable'
     for process in /proc/[0-9]*/exe; do

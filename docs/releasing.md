@@ -56,11 +56,11 @@ archive and one provisioned runtime image. The next preparation reclaims scratch
 directories left by interrupted preparations while it holds the cache lock.
 
 The versioned Linux AppImage embeds the full portable archive, installer
-and static [type-2 runtime source](https://github.com/AppImage/type2-runtime/tree/caf24f9f712084686bfc24a70b75e50df0aefb9c).
+and a static type-2 runtime executable.
 The build extracts the runtime from the checksum-pinned appimagetool 1.9.1
-distribution and includes its license notice. To relink the runtime with a
-different libfuse, follow the linked source tree's `BUILD.md`. The running
-image's `--appimage-offset` prints the size of the original runtime prefix.
+distribution and includes its license notice. To relink with a different
+libfuse, follow `BUILD.md` in the [pinned runtime source tree](https://github.com/AppImage/type2-runtime/tree/caf24f9f712084686bfc24a70b75e50df0aefb9c).
+The image's `--appimage-offset` prints the size of the original runtime prefix.
 Copy the bytes after that offset and append them to the rebuilt runtime to use
 the same filesystem payload.
 
