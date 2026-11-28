@@ -31,7 +31,7 @@ pub(super) fn transcript<'a>(
         subagent,
         anchors,
         follow_end,
-        items,
+        Rc::new(Aliases::new(items)),
         None,
         Memory::default(),
         false,
@@ -332,6 +332,7 @@ impl Memory {
     }
 }
 
+#[cfg(test)]
 pub(super) fn transcript_observed<'a>(
     content: impl Into<Element<'a, Message>>,
     target: Target,
@@ -339,6 +340,36 @@ pub(super) fn transcript_observed<'a>(
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
     items: Vec<(Id, &'a str)>,
+    observations: Observations,
+    memory: Memory,
+    restoration_pending: bool,
+    preparing: HashSet<&'a str>,
+    find_intent: Option<find_navigation::Intent>,
+    history: History<'a>,
+) -> Element<'a, Message> {
+    transcript_observed_with_aliases(
+        content,
+        target,
+        subagent,
+        anchors,
+        follow_end,
+        Rc::new(Aliases::new(items)),
+        observations,
+        memory,
+        restoration_pending,
+        preparing,
+        find_intent,
+        history,
+    )
+}
+
+pub(super) fn transcript_observed_with_aliases<'a>(
+    content: impl Into<Element<'a, Message>>,
+    target: Target,
+    subagent: Option<&'a str>,
+    anchors: Vec<(usize, &'a str)>,
+    follow_end: bool,
+    items: Rc<Aliases>,
     observations: Observations,
     memory: Memory,
     restoration_pending: bool,
@@ -396,7 +427,7 @@ fn transcript_impl<'a>(
     subagent: Option<&'a str>,
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
-    items: Vec<(Id, &'a str)>,
+    items: Rc<Aliases>,
     observations: Option<Observations>,
     memory: Memory,
     restoration_pending: bool,
@@ -449,7 +480,7 @@ pub(super) fn tool_output<'a>(content: impl Into<Element<'a, Message>>) -> Eleme
         subagent: None,
         anchors: Vec::new(),
         follow_end: true,
-        items: Vec::new(),
+        items: Rc::default(),
         observations: None,
         memory: Memory::default(),
         restoration_pending: false,
@@ -637,6 +668,10 @@ impl Operation<Option<LogicalLocation>> for LocateLogical {
             return;
         }
         if !self.scope.active {
+            return;
+        }
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.wanted = Some(self.item.clone());
             return;
         }
         if let Some((bounds, stage)) =
@@ -891,6 +926,10 @@ pub(super) fn find_anchor(
         fn custom(&mut self, _: Option<&Id>, _: Rectangle, state: &mut dyn std::any::Any) {
             if let Some(marker) = state.downcast_ref::<FindCorrection>() {
                 self.scope.authorize(marker.target, self.target);
+            } else if self.scope.active
+                && let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>()
+            {
+                policy.wanted = Some(self.anchor.clone());
             }
         }
         fn container(&mut self, id: Option<&Id>, bounds: Rectangle) {
@@ -947,39 +986,41 @@ pub(super) fn find_anchor(
 /// process-local, so a fast hasher serves, as in [`crate::fingerprint`].
 type Names<'a> = HashSet<&'a str, foldhash::fast::RandomState>;
 
-/// The transcript's items by the ids that report their bounds. Every pass of
-/// a layout asks for every row's bounds, so this is built once per layout.
-struct Aliases<'a> {
-    items: &'a [(Id, &'a str)],
+/// The stable mapping from native widget IDs to transcript items. The
+/// native layout can measure a folded strip once for several source items.
+#[derive(Default)]
+pub(super) struct Aliases {
+    items: Vec<(Id, Arc<str>)>,
     /// The first entry of `items` each id names.
-    first: std::collections::HashMap<&'a Id, usize, foldhash::fast::RandomState>,
+    first: HashMap<Id, usize, foldhash::fast::RandomState>,
     /// The next entry with the same id, or `usize::MAX`.
     next: Vec<usize>,
     /// The first entry naming each entry's item: an item several ids name,
     /// such as a step in an exchange's strip, is one row of the anchor.
     slot: Vec<usize>,
 }
-impl<'a> Aliases<'a> {
-    fn new(items: &'a [(Id, &'a str)]) -> Self {
-        let mut first = std::collections::HashMap::with_capacity_and_hasher(
-            items.len(),
-            foldhash::fast::RandomState::default(),
-        );
+impl Aliases {
+    pub(super) fn new<'a>(items: impl IntoIterator<Item = (Id, &'a str)>) -> Self {
+        let mut names = HashMap::<&str, (usize, Arc<str>), foldhash::fast::RandomState>::default();
+        let mut slot = Vec::new();
+        let items: Vec<_> = items
+            .into_iter()
+            .enumerate()
+            .map(|(index, (id, item))| {
+                let (first, item) = names
+                    .entry(item)
+                    .or_insert_with(|| (index, Arc::from(item)));
+                slot.push(*first);
+                (id, item.clone())
+            })
+            .collect();
+        let mut first = HashMap::with_capacity_and_hasher(items.len(), Default::default());
         let mut next = vec![usize::MAX; items.len()];
         for (index, (id, _)) in items.iter().enumerate().rev() {
-            if let Some(later) = first.insert(id, index) {
+            if let Some(later) = first.insert(id.clone(), index) {
                 next[index] = later;
             }
         }
-        let mut slots = std::collections::HashMap::with_capacity_and_hasher(
-            items.len(),
-            foldhash::fast::RandomState::default(),
-        );
-        let slot = items
-            .iter()
-            .enumerate()
-            .map(|(index, (_, item))| *slots.entry(*item).or_insert(index))
-            .collect();
         Self {
             items,
             first,
@@ -990,8 +1031,8 @@ impl<'a> Aliases<'a> {
 }
 
 /// Row bounds for anchoring, and which of them only a placeholder reported.
-struct ItemBounds<'b, 'a> {
-    aliases: &'b Aliases<'a>,
+struct ItemBounds<'a> {
+    aliases: &'a Aliases,
     /// Each item's bounds by its slot in [`Aliases`], and whether only a
     /// placeholder reported them: an unmounted row's estimate, or the whole
     /// virtual row for each item it aliases.
@@ -1003,14 +1044,15 @@ struct ItemBounds<'b, 'a> {
     /// [`virtualized::PlaceholderPolicy`] and its traversal of mounted rows.
     in_placeholders: bool,
 }
-impl Operation for ItemBounds<'_, '_> {
+impl Operation for ItemBounds<'_> {
     fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
         self.in_placeholders = false;
         visit(self);
         self.in_placeholders = false;
     }
     fn custom(&mut self, _: Option<&Id>, bounds: Rectangle, state: &mut dyn std::any::Any) {
-        if state.is::<virtualized::PlaceholderPolicy>() {
+        if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+            policy.visit = true;
             self.in_placeholders = true;
             return;
         }
@@ -1045,7 +1087,7 @@ struct Anchored<'a> {
     subagent: Option<&'a str>,
     anchors: Vec<(usize, &'a str)>,
     follow_end: bool,
-    items: Vec<(Id, &'a str)>,
+    items: Rc<Aliases>,
     observations: Option<Observations>,
     memory: Memory,
     restoration_pending: bool,
@@ -1369,7 +1411,7 @@ impl Anchor {
     fn kept(
         &self,
         subagent: Option<&str>,
-        items: &[(Id, &str)],
+        items: &[(Id, impl AsRef<str>)],
         pivot: Pivot,
     ) -> Option<view::Kept> {
         if self.held {
@@ -1383,7 +1425,7 @@ impl Anchor {
             .iter()
             .take(pivot.items)
             .enumerate()
-            .map(|(index, (_, id))| (*id, index))
+            .map(|(index, (_, id))| (id.as_ref(), index))
             .collect();
         let mut older_end = None::<f32>;
         let mut newer_start = None::<f32>;
@@ -1822,14 +1864,21 @@ impl Anchored<'_> {
     fn pivot_id(&self) -> Option<&str> {
         let pivot = self.history.pivot?;
         self.items
+            .items
             .get(..pivot.items)?
             .get(pivot.index)
-            .map(|(_, id)| *id)
+            .map(|(_, id)| id.as_ref())
     }
 
     /// What of the window a page keeps, see [`Anchor::kept`].
-    fn kept(&self, anchor: &Anchor) -> Option<view::Kept> {
-        anchor.kept(self.subagent, &self.items, self.history.pivot?)
+    fn with_page_geometry(&self, scroll: Scroll, anchor: &Anchor) -> Scroll {
+        let scroll = scroll.with_unloaded(self.history.unloaded);
+        let kept = self
+            .history
+            .pivot
+            .filter(|_| scroll.within_prefetch_reach())
+            .and_then(|pivot| anchor.kept(self.subagent, &self.items.items, pivot));
+        scroll.with_kept(kept)
     }
 }
 
@@ -1937,7 +1986,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
         let content_part = layout_part("anchored content");
         let mut node = self.content.as_widget_mut().layout(child, renderer, limits);
         drop(content_part);
-        let aliases = Aliases::new(&self.items);
+        let aliases = &self.items;
         const PASSES: usize = 4;
         let mut settle = false;
         for pass in 0..PASSES {
@@ -1967,7 +2016,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 })
                 .collect();
             let mut measured = ItemBounds {
-                aliases: &aliases,
+                aliases,
                 found: vec![None; aliases.items.len()],
                 wanted,
                 virtual_rows: vec![],
@@ -1982,7 +2031,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
             let mut placeholders = Names::default();
             for (slot, found) in measured.found.iter().enumerate() {
                 if let Some((bounds, placeholder)) = found {
-                    let item = aliases.items[slot].1;
+                    let item = aliases.items[slot].1.as_ref();
                     rows.push((item, *bounds));
                     if *placeholder {
                         placeholders.insert(item);
@@ -2389,13 +2438,14 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     let top = (saved_top + top - before.0.unwrap_or(top))
                         .clamp(0.0, saved_geometry.travel());
                     context.top = Some(top);
-                    let scroll = Scroll::new(
-                        top,
-                        saved_geometry.content.height,
-                        saved_geometry.viewport.height,
-                    )
-                    .with_unloaded(self.history.unloaded)
-                    .with_kept(self.kept(&anchor));
+                    let scroll = self.with_page_geometry(
+                        Scroll::new(
+                            top,
+                            saved_geometry.content.height,
+                            saved_geometry.viewport.height,
+                        ),
+                        &anchor,
+                    );
                     let wheel = match event {
                         Event::Mouse(mouse::Event::WheelScrolled { delta }) => Some(match *delta {
                             mouse::ScrollDelta::Lines { x, y } => {
@@ -2494,9 +2544,6 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                     || previous.top != top
                     || previous.geometry != geometry
             });
-            let scroll = Scroll::new(top, geometry.content.height, geometry.viewport.height)
-                .with_unloaded(self.history.unloaded)
-                .with_kept(self.kept(&anchor));
             // Only navigation toward an edge can request its page. Content
             // scrollables own their gestures, including retries at their ends.
             let wheel = match event {
@@ -2520,6 +2567,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 .captured
                 .as_ref()
                 .is_some_and(|captured| captured.get());
+            // Hover and other input without scroll intent or a geometry
+            // change neither request a page nor report a new observation.
+            if !changed && !moved && wheel.is_none() && anchor.pending_input.is_none() {
+                return;
+            }
+            let scroll = self.with_page_geometry(
+                Scroll::new(top, geometry.content.height, geometry.viewport.height),
+                &anchor,
+            );
             let direction = navigation_input(
                 before.0,
                 top,

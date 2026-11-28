@@ -7215,6 +7215,16 @@ fn inspector_toggle_clearance_keeps_transcript_rows_out_of_its_footprint() {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
         }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                policy.wanted = Some(scroll::item_id("0-prompt"));
+            }
+        }
         fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
             if id == Some(&scroll::item_id("0-prompt")) {
                 self.row = Some(bounds);
@@ -7283,6 +7293,16 @@ fn a_railed_chat_reserves_no_toggle_clearance() {
     impl Operation for Bounds {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                policy.wanted = Some(scroll::item_id("0-prompt"));
+            }
         }
         fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
             if id == Some(&scroll::item_id("0-prompt")) {
@@ -7699,6 +7719,16 @@ fn reading_column_is_stable_across_transcript_states() {
     impl Operation for Probe {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                policy.wanted = Some(scroll::item_id("0-answer"));
+            }
         }
         fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
             if id == Some(&self.composer) {
@@ -10316,6 +10346,16 @@ fn an_exchange_is_found_through_its_first_row_mounted_or_not() {
     impl Operation for Anchors {
         fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
             visit(self);
+        }
+        fn custom(
+            &mut self,
+            _: Option<&widget::Id>,
+            _: iced::Rectangle,
+            state: &mut dyn std::any::Any,
+        ) {
+            if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                policy.wanted = Some(self.0.clone());
+            }
         }
         fn container(&mut self, id: Option<&widget::Id>, bounds: iced::Rectangle) {
             if id == Some(&self.0) {
