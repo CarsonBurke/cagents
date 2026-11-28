@@ -42,7 +42,11 @@ class MacosInstaller(unittest.TestCase):
         self.executable(tools / "uname", 'case "$1" in -s) echo Darwin ;; -m) echo arm64 ;; *) exit 1 ;; esac')
         self.executable(tools / "ditto", 'exec /usr/bin/cp -a -- "$@"')
         self.executable(tools / "mv", 'if [ "$1" = -fh ]; then shift; set -- -fT "$@"; fi\nexec /usr/bin/mv "$@"')
-        self.executable(tools / "stat", '[ "$1" = -f ] && [ "$2" = %u ] || exit 1\nexec /usr/bin/stat -c %u -- "$3"')
+        self.executable(tools / "stat", '''[ "$1" = -f ] || exit 1
+case "$2" in
+    %u|%d:%i) exec /usr/bin/stat -c "$2" -- "$3" ;;
+    *) exit 1 ;;
+esac''')
 
         for program in ("cagents", "cagentsd", "cagents-ui", "cagents-dictate"):
             self.executable(self.stage / "bin" / program, f'''case "$*" in
@@ -109,6 +113,19 @@ esac''')
     def test_uninstall_removes_an_empty_prefix(self):
         self.run_installer("--uninstall", "--publish-removal")
         self.assertFalse(self.prefix.exists())
+
+    def test_uninstall_can_reinstall_with_a_file_added_during_prefix_removal(self):
+        self.environment["FIXTURE_PREFIX"] = str(self.prefix)
+        self.executable(self.root / "tools/rmdir", r'''
+if [ "$1" = "$FIXTURE_PREFIX" ]; then
+    printf 'late user file\n' > "$1/late.txt"
+fi
+exec /usr/bin/rmdir "$@"
+''')
+        self.run_installer("--uninstall", "--publish-removal")
+        self.assertFalse(self.tree.exists())
+        self.reinstall()
+        self.assertEqual((self.prefix / "late.txt").read_text(), "late user file\n")
 
 
 if __name__ == "__main__":

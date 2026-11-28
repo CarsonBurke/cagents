@@ -279,6 +279,7 @@ if [ "$UNINSTALL" -eq 1 ]; then
     [ -z "$PUBLISH_TREE" ] && [ -z "$PUBLISHER" ] || fail 'invalid removal request'
     if [ -e "$PREFIX" ] || [ -L "$PREFIX" ]; then
         [ -d "$PREFIX" ] && [ ! -L "$PREFIX" ] || fail "$PREFIX is not an installation directory; nothing was removed"
+        prefix_identity=$(stat -f '%d:%i' "$PREFIX") || fail "cannot identify $PREFIX; nothing was removed"
         owned_prefix || fail "$PREFIX was not made by this installer; nothing was removed"
         current_cli=$PREFIX/current/bin/cagents
         [ -x "$current_cli" ] || fail "$PREFIX has no installed cagents to coordinate removal; repair the installation first"
@@ -336,9 +337,21 @@ if [ "$UNINSTALL" -eq 1 ]; then
     remaining=$(find "$PREFIX" -mindepth 1 -maxdepth 1 ! -name "${MARKER##*/}" -print) \
         || fail "could not inspect $PREFIX; kept its installation marker"
     if [ -z "$remaining" ]; then
+        [ "$(stat -f '%d:%i' "$PREFIX")" = "$prefix_identity" ] \
+            || fail "$PREFIX changed during removal; kept its installation marker"
         rm -f "$MARKER"
-        rmdir "$PREFIX" 2>/dev/null || note "kept $PREFIX, which holds files this installer did not make"
-    else
+        if ! rmdir "$PREFIX" 2>/dev/null; then
+            # A file may have arrived since the scan. Restore the marker in the
+            # same directory only, without overwriting an existing entry.
+            (
+                CDPATH= cd -P "$PREFIX" || exit 1
+                [ "$(stat -f '%d:%i' .)" = "$prefix_identity" ] || exit 1
+                set -C
+                printf '%s\n' "$MARKER_TEXT" > "${MARKER##*/}"
+            ) || fail "could not restore the installation marker at $PREFIX"
+        fi
+    fi
+    if owned_prefix; then
         note "kept $PREFIX and its installation marker because it holds files this installer did not make"
     fi
     if [ "$PURGE" -eq 1 ]; then
