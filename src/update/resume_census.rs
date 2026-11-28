@@ -131,7 +131,7 @@ pub(super) fn clear(state: &Path) -> Result<(), UpdateError> {
 
 /// Only the UI's view of a terminal job needs access to the private data.
 /// An absent, unsafe or outdated file leaves that job usable as before.
-#[cfg(any(feature = "ui", all(test, not(feature = "host"))))]
+#[cfg(any(feature = "ui", test))]
 pub(super) fn enrich(state: &Path, job: &mut super::UpdateJob) {
     if !job.phase.is_terminal()
         || !job
@@ -165,7 +165,7 @@ pub(super) fn enrich(state: &Path, job: &mut super::UpdateJob) {
     }
 }
 
-#[cfg(all(test, not(any(feature = "host", feature = "ui"))))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::Provider;
