@@ -1,3 +1,5 @@
+#[path = "support/acp_settings.rs"]
+mod acp_settings;
 #[path = "support/cli.rs"]
 mod cli;
 #[path = "support/hosted_agent_cleanup.rs"]
@@ -64,6 +66,16 @@ impl Fixture {
     }
 
     fn with_provider(script: &str) -> Self {
+        Self::with_programs(|root| Self::install_program(root, "claude", script))
+    }
+
+    fn install_program(root: &Path, name: &str, script: &str) {
+        let program = root.join("bin").join(name);
+        fs::write(&program, script).unwrap();
+        fs::set_permissions(program, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    fn with_programs(install: impl FnOnce(&Path)) -> Self {
         let root = tempfile::tempdir().unwrap();
         fs::write(root.path().join(".cagents-fixture-root"), "").unwrap();
         fs::create_dir_all(root.path().join("bin/lib")).unwrap();
@@ -110,9 +122,7 @@ impl Fixture {
                 .unwrap();
             assert!(output.status.success(), "private Git setup: {output:?}");
         }
-        let provider = root.path().join("bin/claude");
-        fs::write(&provider, script).unwrap();
-        fs::set_permissions(provider, fs::Permissions::from_mode(0o700)).unwrap();
+        install(root.path());
         let daemon = Self::spawn_daemon(root.path());
         let fixture = Self {
             root,
@@ -300,6 +310,309 @@ impl Drop for Fixture {
                 panic!("private fixture cleanup failed: {error}");
             }
         }
+    }
+}
+
+#[test]
+fn acp_spawn_passes_provider_settings_through_the_cli() {
+    use cagents::{
+        agent::Provider,
+        agent_execution::{Authority, Destination, Operation, Reply, directory},
+        descriptor,
+        terminal::ipc::{ProtocolError, ProtocolErrorCode},
+    };
+
+    let root = tempfile::tempdir_in(std::env::temp_dir().canonicalize().unwrap()).unwrap();
+    for directory in ["home", "run", "data", "config", "cache", "tmp", "project"] {
+        fs::create_dir(root.path().join(directory)).unwrap();
+    }
+    let runtime = root.path().join("run");
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let runtime = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir(&runtime).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = runtime.join(cagents::terminal_ipc::SOCKET_FILE_NAME);
+    let listener =
+        descriptor::with_socket_address(&socket, |address| descriptor::bind(address)).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let project = root.path().join("project");
+    let authority = Authority::from_environment();
+    let proof = HostSessionProof {
+        host_session_id: "acp-cli-contract".into(),
+        host_incarnation: "acp-cli-incarnation".into(),
+        boot_id: "acp-cli-boot".into(),
+    };
+
+    for (provider, model, reasoning, mode) in [
+        (Provider::Antigravity, "gemini-4-neon", "high", "plan"),
+        (Provider::Muse, "muse-spark-1.2", "xhigh", "manual"),
+    ] {
+        let prompt = "Read the private checkout.";
+        let deadline = Instant::now() + Duration::from_secs(10);
+        thread::scope(|scope| {
+            let verify = scope.spawn(|| {
+                let mut stream = loop {
+                    match descriptor::accept(&listener) {
+                        Ok((stream, _)) => break stream,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            assert!(Instant::now() < deadline, "CLI never connected");
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept private CLI: {error}"),
+                    }
+                };
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                stream
+                    .set_write_timeout(Some(Duration::from_secs(3)))
+                    .unwrap();
+                let mut exchange = |message| {
+                    let request: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert_eq!(request.version, PROTOCOL_VERSION);
+                    let expected_proof =
+                        (!matches!(request.request, ClientRequest::Connect { .. }))
+                            .then_some(&proof);
+                    assert_eq!(request.proof.as_ref(), expected_proof);
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+                    request.request
+                };
+                let response = |response| ServerMessage::Response { response };
+                assert!(matches!(
+                    exchange(response(ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![]
+                    })),
+                    ClientRequest::Connect { .. }
+                ));
+                let context = directory::Context {
+                    sessions: directory::Sessions {
+                        caller: None,
+                        scope: directory::Scope::Project(project.clone()),
+                        sessions: vec![],
+                    },
+                    lineage_channel: None,
+                };
+                let ClientRequest::Agent {
+                    authority: actual,
+                    operation:
+                        Operation::Context {
+                            scope: directory::Scope::Containing(path),
+                            standing: false,
+                        },
+                } = exchange(response(ServerResponse::Agent(Reply::Context(context))))
+                else {
+                    panic!("expected a project context request");
+                };
+                assert!(actual == authority);
+                assert_eq!(path, project);
+
+                let refusal = ProtocolError::new(
+                    ProtocolErrorCode::PermissionDenied,
+                    "private CLI fixture observed the submission",
+                    false,
+                );
+                let ClientRequest::Agent {
+                    authority: actual,
+                    operation: Operation::Submit(submit),
+                } = exchange(ServerMessage::Error(refusal))
+                else {
+                    panic!("expected a spawn submission");
+                };
+                assert!(actual == authority);
+                assert_eq!(submit.prompt, prompt);
+                let Destination::New(spec) = submit.destination else {
+                    panic!("expected a new agent")
+                };
+                assert_eq!(spec.target.repository, project);
+                assert_eq!(spec.target.directory, project);
+                assert_eq!(spec.provider, provider);
+                assert_eq!(spec.model.as_deref(), Some(model));
+                assert_eq!(spec.reasoning_effort.as_deref(), Some(reasoning));
+                assert_eq!(spec.permission_mode.as_deref(), Some(mode));
+            });
+            let spec = private_cli_capture::private_cli(root.path()).args([
+                "--no-start",
+                "agent",
+                "spawn",
+                "--provider",
+                provider.executable(),
+                "--directory",
+                project.to_str().unwrap(),
+                "--model",
+                model,
+                "--reasoning-effort",
+                reasoning,
+                "--permission-mode",
+                mode,
+                prompt,
+            ]);
+            let output = private_cli_capture::capture(spec, deadline).unwrap();
+            verify.join().unwrap();
+            assert_eq!(output.status.code(), Some(1), "{output:?}");
+            let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+            assert!(
+                error["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("private CLI fixture observed the submission"),
+                "{error}"
+            );
+        });
+    }
+}
+
+#[test]
+#[cfg_attr(
+    not(target_os = "macos"),
+    ignore = "requires an external User session to drive the shipped CLI and daemon together"
+)]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "the retained fixture adopts escaped descendants as a subreaper, which Darwin lacks (#4045)"
+)]
+fn acp_spawn_applies_settings_before_prompt_and_preserves_plan_for_followup() {
+    use cagents::agent_execution::Authority;
+
+    assert_eq!(
+        Authority::from_environment(),
+        Authority::default(),
+        "run the full CLI and daemon qualification from an external User session"
+    );
+    #[cfg(target_os = "linux")]
+    {
+        use cagents::daemon;
+        let (_caller, observer) = UnixStream::pair().unwrap();
+        let peer = daemon::peer_credentials(&observer).unwrap();
+        assert!(
+            !daemon::peer_requires_session_authority(&observer, peer),
+            "run the full CLI and daemon qualification from an external User session"
+        );
+    }
+    if retained_fixture::run_isolated() {
+        return;
+    }
+    let fixture = Fixture::with_programs(|root| {
+        for (directory, name, source) in [
+            (
+                "libexec/acp",
+                "fake-acp-agent.py",
+                include_str!("../../../tests/fixtures/fake-acp-agent.py"),
+            ),
+            (
+                "scripts",
+                "fixture_home.py",
+                include_str!("../../../scripts/fixture_home.py"),
+            ),
+        ] {
+            let path = root.join(directory);
+            fs::create_dir_all(&path).unwrap();
+            fs::write(path.join(name), source).unwrap();
+        }
+        fs::create_dir(root.join("home/.gemini")).unwrap();
+        let provider = include_str!("../../../tests/fixtures/fixture-acp.sh");
+        Fixture::install_program(root, "agy", provider);
+        Fixture::install_program(root, "muse-upstream", provider);
+        Fixture::install_program(root, "muse", "#!/bin/sh\nexec muse-upstream \"$@\"\n");
+        let login = Fixture::command(root, &root.join("bin/muse-upstream"))
+            .env("FAKE_ACP_LOGIN_SECONDS", "0")
+            .arg("login")
+            .output()
+            .unwrap();
+        assert!(login.status.success(), "Muse fixture login: {login:?}");
+    });
+
+    let project = fixture.root.path().join("project");
+    let project = project.to_str().unwrap();
+    fixture.cli(&["project", "open", project]);
+    let consult =
+        "Review this checkout and outline possible improvements without editing anything.";
+    let followup = "Describe the tradeoffs without making changes.";
+    let agy = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "agy",
+        "--repository",
+        project,
+        "--model",
+        "gemini-4-neon",
+        "--reasoning-effort",
+        "high",
+        "--permission-mode",
+        "plan",
+        "--wait",
+        "--timeout",
+        "15",
+        consult,
+    ]);
+    assert_eq!(agy["run"]["state"], "Succeeded", "{agy}");
+    let agy_id = agy["agent"]["id"].as_str().unwrap();
+    let sent = fixture.cli(&[
+        "agent",
+        "send",
+        agy_id,
+        "--wait",
+        "--timeout",
+        "15",
+        followup,
+    ]);
+    assert_eq!(sent["run"]["state"], "Succeeded", "{sent}");
+
+    let muse_prompt = "Summarize this checkout.";
+    let muse = fixture.cli(&[
+        "agent",
+        "spawn",
+        "--provider",
+        "muse",
+        "--repository",
+        project,
+        "--permission-mode",
+        "manual",
+        "--wait",
+        "--timeout",
+        "15",
+        muse_prompt,
+    ]);
+    assert_eq!(muse["run"]["state"], "Succeeded", "{muse}");
+
+    for (provider, settings, prompts) in [
+        (
+            "agy",
+            &[
+                ("model", "gemini-4-neon"),
+                ("thought_level", "high"),
+                ("mode", "plan"),
+            ][..],
+            &[consult, followup][..],
+        ),
+        (
+            "muse",
+            &[("mode", "promptUnmatched")][..],
+            &[muse_prompt][..],
+        ),
+    ] {
+        let log = fixture
+            .root
+            .path()
+            .join("acp")
+            .join(provider)
+            .join("frames.log");
+        let frames: Vec<Value> = fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        acp_settings::assert_turns(&frames, settings, prompts);
     }
 }
 
