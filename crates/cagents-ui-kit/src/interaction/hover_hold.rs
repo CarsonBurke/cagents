@@ -61,6 +61,10 @@ impl<T> Hold<T> {
         self.0.as_ref()
     }
 
+    pub fn get_mut(&mut self) -> Option<&mut T> {
+        self.0.as_mut()
+    }
+
     pub fn is_held(&self) -> bool {
         self.0.is_some()
     }
@@ -93,6 +97,16 @@ impl<K: PartialEq> Held<K> {
         &self.0
     }
 
+    /// Holds the `keys` not yet held, after those that are, so what arrived
+    /// while held keeps the place it arrived at.
+    pub fn extend(&mut self, keys: impl IntoIterator<Item = K>) {
+        for key in keys {
+            if !self.contains(&key) {
+                self.0.push(key);
+            }
+        }
+    }
+
     /// The items to show while held: each held key that `find` still
     /// resolves, in its held place, then the `live` items whose keys are not
     /// held, in their live order. A held key `find` no longer resolves, such
@@ -110,57 +124,52 @@ impl<K: PartialEq> Held<K> {
 }
 
 /// The width a row of items shared, such as a window's tabs, when the pointer
-/// came over it, and which items shared it.
+/// came over it, the room the row had, and which items shared the width.
 ///
 /// While held, closing an item or retitling one keeps the others' width, so
 /// the next item's close control comes to rest under the pointer, as in a
 /// browser. A row showing an item it did not hold, as after a tab was added
 /// or the row switched to another set of tabs, is not held: it has to make
 /// room, and its owner takes a new hold at the new width (see
-/// [`Self::holds`]).
+/// [`Self::holds`]). Nor is a row that has less room than it had, which
+/// would scroll, or squeeze, at the held width.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldWidth<K> {
     width: f32,
+    room: f32,
     keys: Held<K>,
 }
 
 impl<K: PartialEq> HeldWidth<K> {
-    /// A hold on `width`, shared by the items `keys`.
-    pub fn new(width: f32, keys: impl IntoIterator<Item = K>) -> Self {
+    /// A hold on `width`, in a row `room` wide, shared by the items `keys`.
+    pub fn new(width: f32, room: f32, keys: impl IntoIterator<Item = K>) -> Self {
         Self {
             width,
+            room,
             keys: Held::new(keys),
         }
     }
 
-    /// Whether this hold still answers for a row showing `shown`: every
-    /// item it shows was in the row when the hold was taken.
-    pub fn holds<'k>(&self, shown: impl IntoIterator<Item = &'k K>) -> bool
+    /// Whether this hold still answers for a row `room` wide showing
+    /// `shown`: every item it shows was in the row when the hold was taken,
+    /// and the row has no less room than it had.
+    pub fn holds<'k>(&self, room: f32, shown: impl IntoIterator<Item = &'k K>) -> bool
     where
         K: 'k,
     {
-        shown.into_iter().all(|key| self.keys.contains(key))
+        room >= self.room - 0.5 && shown.into_iter().all(|key| self.keys.contains(key))
     }
 
-    /// The width to draw the row showing `shown` at, where `live` is the
-    /// width they would take now and `fits(width)` says whether they fit the
-    /// row at that width without scrolling.
-    ///
-    /// The held width, while it [holds](Self::holds), unless the row has
-    /// since narrowed so that it no longer fits where the live width would.
-    pub fn width<'k>(
-        &self,
-        live: f32,
-        shown: impl IntoIterator<Item = &'k K>,
-        fits: impl Fn(f32) -> bool,
-    ) -> f32
+    /// The width to draw the row at: the held width while it
+    /// [holds](Self::holds), else `live`, what the items would take now.
+    pub fn width<'k>(&self, live: f32, room: f32, shown: impl IntoIterator<Item = &'k K>) -> f32
     where
         K: 'k,
     {
-        if !self.holds(shown) || (!fits(self.width) && fits(live)) {
-            live
-        } else {
+        if self.holds(room, shown) {
             self.width
+        } else {
+            live
         }
     }
 }
@@ -192,6 +201,15 @@ struct Region<'a, Message> {
     on_hover: Box<dyn Fn(bool) -> Message + 'a>,
 }
 
+/// What a [`Region`] last reported, until its owner answers it.
+///
+/// Several pointer events can arrive before the owner hears the first
+/// report and the region is drawn afresh with its answer. Comparing each
+/// with the report already sent, rather than with the stale `held`, sends
+/// each change once, and a leave right after an enter is not lost.
+#[derive(Debug, Default)]
+struct Reported(Option<bool>);
+
 /// Whether `event` moves the pointer, or takes it out of the window, so a
 /// region can tell whether the pointer is over it.
 fn moves_pointer(event: &Event) -> bool {
@@ -206,10 +224,20 @@ fn moves_pointer(event: &Event) -> bool {
 }
 
 impl<Message> Widget<Message, Theme, Renderer> for Region<'_, Message> {
+    fn tag(&self) -> tree::Tag {
+        tree::Tag::of::<Reported>()
+    }
+    fn state(&self) -> tree::State {
+        tree::State::new(Reported::default())
+    }
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
     }
     fn diff(&mut self, tree: &mut Tree) {
+        // Drawn afresh, the region carries its owner's answer in `held`.
+        if tree.tag == tree::Tag::of::<Reported>() {
+            tree.state.downcast_mut::<Reported>().0 = None;
+        }
         tree.diff_children(std::slice::from_mut(&mut self.content));
     }
     fn size(&self) -> Size<Length> {
@@ -261,7 +289,9 @@ impl<Message> Widget<Message, Theme, Renderer> for Region<'_, Message> {
             // not take the pointer off the region.
             let over = !matches!(event, Event::Mouse(mouse::Event::CursorLeft))
                 && cursor.land().is_over(layout.bounds());
-            if over != self.held {
+            let reported = &mut tree.state.downcast_mut::<Reported>().0;
+            if over != reported.unwrap_or(self.held) {
+                *reported = Some(over);
                 shell.publish((self.on_hover)(over));
             }
         }
@@ -904,22 +934,22 @@ mod tests {
     }
 
     #[test]
-    fn a_held_width_survives_closes_but_not_newcomers_or_a_narrowed_row() {
-        let held = HeldWidth::new(120.0, [1, 2, 3, 4]);
-        let fits = |width: f32| width <= 150.0;
+    fn a_held_width_survives_closes_but_not_newcomers_or_lost_room() {
+        let held = HeldWidth::new(120.0, 600.0, [1, 2, 3, 4]);
         // A close or a retitle: the live width changed, the held one stays.
-        assert_eq!(held.width(200.0, &[1, 2, 4], fits), 120.0);
-        assert_eq!(held.width(90.0, &[1, 2, 3, 4], fits), 120.0);
+        assert_eq!(held.width(200.0, 600.0, &[1, 2, 4]), 120.0);
+        assert_eq!(held.width(90.0, 600.0, &[1, 2, 3, 4]), 120.0);
+        // A wider window keeps the hold; the tabs still fit.
+        assert_eq!(held.width(200.0, 800.0, &[1, 2, 4]), 120.0);
         // An addition, or another set of tabs, is the owner's own change:
         // the row makes room.
-        assert!(!held.holds(&[1, 2, 3, 4, 5]));
-        assert_eq!(held.width(100.0, &[1, 2, 3, 4, 5], fits), 100.0);
-        assert_eq!(held.width(100.0, &[7, 8], fits), 100.0);
-        // A row that narrowed until the held width overflows where the live
-        // one would fit gives way.
-        assert_eq!(held.width(100.0, &[1, 2, 3], |width| width <= 110.0), 100.0);
-        // While neither fits, as in a scrolling strip, the hold stands.
-        assert_eq!(held.width(100.0, &[1, 2, 3], |_| false), 120.0);
+        assert!(!held.holds(600.0, &[1, 2, 3, 4, 5]));
+        assert_eq!(held.width(100.0, 600.0, &[1, 2, 3, 4, 5]), 100.0);
+        assert_eq!(held.width(100.0, 600.0, &[7, 8]), 100.0);
+        // A row that lost room gives way, and stays given way however
+        // many tabs close after.
+        assert_eq!(held.width(100.0, 500.0, &[1, 2, 3]), 100.0);
+        assert_eq!(held.width(150.0, 500.0, &[1]), 150.0);
     }
 
     /// Runs `events` through `element`, laid out in a 200x100 window, with
@@ -998,6 +1028,23 @@ mod tests {
             ),
             [false],
             "leaving the window releases the hold"
+        );
+        // Events that arrive before the owner answers report each change
+        // once, and a leave right after an enter is not lost.
+        let mut element = region(false);
+        let mut tree = Tree::new(element.as_widget());
+        assert_eq!(
+            run(
+                &mut element,
+                &mut tree,
+                &[
+                    moved(50.0, 20.0),
+                    moved(60.0, 20.0),
+                    moved(150.0, 20.0),
+                    moved(160.0, 20.0)
+                ]
+            ),
+            [true, false]
         );
     }
 

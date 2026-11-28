@@ -5154,14 +5154,15 @@ impl Application for Editor {
         } else {
             Task::none()
         };
-        let tabs_changed = previous_tabs != (self.active, self.tabs.len());
         let refresh =
             self.can_refresh_visible() && (previous_tabs.0 != self.active || !was_refresh_visible);
         Task::batch([
             task,
             self.notification_focus(),
             self.open_requested_review(),
-            if tabs_changed {
+            // Only a change of tab is revealed: a tab closed beside the
+            // active one leaves the strip where the pointer had it.
+            if previous_tabs.0 != self.active {
                 self.reveal_active_tab()
             } else {
                 Task::none()

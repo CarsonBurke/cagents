@@ -317,11 +317,12 @@ mod tests {
         assert!(!app.tabs_held());
         drop(app.update_chrome(Action::TabsHover(true)));
         assert!(app.tabs_held());
-        let (_, width) = app.tab_strip_geometry();
+        let (available, width) = app.tab_strip_geometry();
         assert_eq!(
             app.chrome_ui.tabs_hold.get(),
             Some(&crate::interaction::hover_hold::HeldWidth::new(
                 width,
+                available,
                 app.workspace.shown()
             ))
         );
@@ -346,6 +347,22 @@ mod tests {
             // particular is under it.
             assert_eq!(app.chrome_ui.hovered_tab, held.then_some(order[2]));
         }
+    }
+
+    #[test]
+    fn a_narrowed_strip_gives_up_its_hold_for_good() {
+        let mut app = tab_fixture(5, 1600.0);
+        drop(app.update_chrome(Action::TabsHover(true)));
+        app.workspace.resize_viewport(900.0);
+        drop(app.sync_chrome());
+        assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
+        // Closing tabs until the old width would fit again does not bring
+        // it back under the pointer.
+        while app.workspace.shown().count() > 1 {
+            close_last_tab(&mut app);
+            assert_eq!(app.tab_strip_geometry(), app.live_tab_strip_geometry());
+        }
+        assert!(!app.tabs_held());
     }
 
     #[test]
@@ -2821,7 +2838,12 @@ impl Cagents {
     pub(super) fn update_chrome(&mut self, action: Action) -> Task<Message> {
         // Ending a hover is never refused: a dialog that opens while a tab is
         // hovered would otherwise leave it drawn hovered once it closes.
-        if self.modal_is_open() && !matches!(action, Action::Close | Action::UnhoverTab(_)) {
+        if self.modal_is_open()
+            && !matches!(
+                action,
+                Action::Close | Action::UnhoverTab(_) | Action::TabsHover(_)
+            )
+        {
             return Task::none();
         }
         if let Action::ShowNoticesFor(card) = &action
@@ -3098,11 +3120,12 @@ impl Cagents {
                 } else if !self.tabs_held() {
                     // Taken on arrival, and afresh once the strip shows a
                     // tab the hold did not, at the width it made room at.
-                    let (_, width) = self.live_tab_strip_geometry();
+                    let (available, width) = self.live_tab_strip_geometry();
                     self.chrome_ui
                         .tabs_hold
                         .take(crate::interaction::hover_hold::HeldWidth::new(
                             width,
+                            available,
                             self.workspace.shown(),
                         ));
                 }
@@ -3830,11 +3853,12 @@ impl Cagents {
     /// Whether the pointer holds the tab strip as it is now: every tab it
     /// shows was there when the hold was taken.
     fn tabs_held(&self) -> bool {
+        let Some(hold) = self.chrome_ui.tabs_hold.get() else {
+            return false;
+        };
+        let (available, _) = self.live_tab_strip_geometry();
         let shown: Vec<_> = self.workspace.shown().collect();
-        self.chrome_ui
-            .tabs_hold
-            .get()
-            .is_some_and(|hold| hold.holds(&shown))
+        hold.holds(available, &shown)
     }
 
     /// The strip's room and the width its tabs share: what they would take
@@ -3909,8 +3933,10 @@ impl Cagents {
             + 2.0 * crate::tab_strip::EDGE_INSET;
         let max_offset = (content - available).max(0.0);
         if max_offset <= 0.0 {
-            // Everything fits; any offset at all would be wrong.
-            return if self.chrome_ui.tabs_offset > 0.0 {
+            // Everything fits; any offset at all would be wrong, except that
+            // a strip under the pointer keeps its room until the pointer
+            // leaves, and then settles by itself.
+            return if self.chrome_ui.tabs_offset > 0.0 && !self.tabs_held() {
                 workspace_widget::scroll_to(widget::Id::new("workspace.tabs"), 0.0)
                     .map(cosmic::Action::App)
             } else {

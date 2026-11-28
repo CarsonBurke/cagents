@@ -3368,7 +3368,14 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::Repository(action) => !repository_action_allowed_while_modal(action),
         Message::TerminalFind(action) => !matches!(action, terminal_ui::Action::ConfirmPaste(..) | terminal_ui::Action::Focus(..) | terminal_ui::Action::DismissContext(..) | terminal_ui::Action::Refresh(..)),
         Message::ChatUi(action) => !action.allowed_while_modal(),
-        Message::ChromeUi(action) => !matches!(action, chrome_ui::Action::Close),
+        // The pointer's coming and going is reported whatever is open, so a
+        // hover or a hold it ended does not outlast the dialog.
+        Message::ChromeUi(action) => !matches!(
+            action,
+            chrome_ui::Action::Close
+                | chrome_ui::Action::UnhoverTab(_)
+                | chrome_ui::Action::TabsHover(_)
+        ),
         Message::ChannelUi(action) => !action.answers_own_dialog(),
         Message::SidebarSelection(_) => false,
         Message::AccountUi(action) => action.blocked_while_modal(),
@@ -3381,7 +3388,9 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
-        Message::Sidebar(action) => !answers_discard_confirmation(action),
+        Message::Sidebar(action) => {
+            !answers_discard_confirmation(action) && !matches!(action, SidebarAction::ListHover(_))
+        }
         #[cfg(feature = "integrated-browser")]
         Message::BrowserBack(_)
         | Message::BrowserForward(_)
@@ -13851,6 +13860,10 @@ impl Cagents {
             .pin_panel_worktree(self.inspector_panel_pin());
         // The Attention list draws the focused pane's row as current.
         self.sidebar_state.follow_card(self.workspace.focused());
+        // Work that started under a resting pointer keeps the slot it
+        // joined In progress at.
+        let compact = self.projects_sidebar_mode() == SidebarMode::Compact;
+        self.sidebar_state.follow_list(&self.sidebar_model, compact);
         let focus = self.sidebar_focus();
         let changed = self
             .sidebar_state

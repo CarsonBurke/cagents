@@ -57,24 +57,17 @@ pub fn horizontal_with_scroll<'a, Message: 'a>(
 
 type OnScroll<'a, Message> = Box<dyn Fn(scrollable::Viewport) -> Message + 'a>;
 
-/// Whether `count` tabs `width` wide fit a strip `available` wide without
-/// scrolling.
-pub fn fits(count: usize, width: f32, available: f32) -> bool {
-    count as f32 * (width + SPACING) + 2.0 * EDGE_INSET <= available
-}
-
-/// The width the tabs `shown`, which share one width, are drawn at: `live`,
-/// what they would take now, unless the pointer holds the strip at a width
-/// it had (see [`crate::interaction::hover_hold::HeldWidth`]).
+/// The width the tabs `shown`, which share one width, are drawn at in a
+/// strip `available` wide: `live`, what they would take now, unless the
+/// pointer holds the strip at a width it had (see
+/// [`crate::interaction::hover_hold::HeldWidth`]).
 pub fn tab_width(
     hold: Option<&crate::interaction::hover_hold::HeldWidth<crate::model::CardId>>,
     live: f32,
     shown: &[crate::model::CardId],
     available: f32,
 ) -> f32 {
-    hold.map_or(live, |hold| {
-        hold.width(live, shown, |width| fits(shown.len(), width, available))
-    })
+    hold.map_or(live, |hold| hold.width(live, available, shown))
 }
 
 /// How a strip whose owner holds its tabs' width hears the pointer come and

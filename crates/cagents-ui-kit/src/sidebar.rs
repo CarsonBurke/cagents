@@ -3814,9 +3814,28 @@ impl SidebarState {
     pub fn hover_list(&mut self, model: &SidebarModel, compact: bool, over: bool) {
         if !over {
             self.list_hold.release();
-        } else if !self.list_hold.is_held() {
+        } else if !self.list_hold.is_held() && !model.projects.is_empty() {
+            // A list still loading holds nothing worth keeping; the pointer's
+            // next move over the loaded list takes the hold.
             let hold = ListHold::capture(model, self, compact);
             self.list_hold.take(hold);
+        }
+    }
+
+    /// Grows the hold with the In progress rows that arrived since it was
+    /// taken, in the order they arrived, so each keeps its slot as later
+    /// ones come and go. The application runs this at the tail of every
+    /// update.
+    pub fn follow_list(&mut self, model: &SidebarModel, compact: bool) {
+        if !self.list_hold.is_held() {
+            return;
+        }
+        let rows: Vec<_> = in_progress_rows(model, self, compact)
+            .into_iter()
+            .map(InProgressRow::row)
+            .collect();
+        if let Some(hold) = self.list_hold.get_mut() {
+            hold.in_progress.extend(rows);
         }
     }
 
@@ -4110,18 +4129,30 @@ impl SidebarState {
     /// user, or was dealt with there and is kept until hidden.
     fn lists_card(&self, card: &SidebarCard) -> bool {
         let row = SelectionRow::Card(card.id);
-        match self.list_hold.get() {
-            Some(hold) => hold.listed.contains(&row),
-            None => card.attention.needs_attention() || self.retained_in_attention(row),
-        }
+        self.held_in_list(
+            row,
+            card.attention.needs_attention() || self.retained_in_attention(row),
+        )
     }
 
     /// Whether the Attention list's main section lists `channel`.
     fn lists_channel(&self, channel: &SidebarChannel) -> bool {
         let row = SelectionRow::Channel(channel.id);
+        self.held_in_list(
+            row,
+            channel.needs_attention() || self.retained_in_attention(row),
+        )
+    }
+
+    /// Whether the Attention list's main section lists `row`, which `live`
+    /// says it would now. While the pointer holds the list, a row it listed
+    /// stays, and one held in In progress keeps its slot there, whatever its
+    /// agent has done since. Anything else that needs the user joins at
+    /// once: a new approval or question must not wait for the pointer.
+    fn held_in_list(&self, row: SelectionRow, live: bool) -> bool {
         match self.list_hold.get() {
-            Some(hold) => hold.listed.contains(&row),
-            None => channel.needs_attention() || self.retained_in_attention(row),
+            Some(hold) => hold.listed.contains(&row) || (live && !hold.in_progress.contains(&row)),
+            None => live,
         }
     }
 
@@ -7131,7 +7162,13 @@ fn project_list<'a>(
         !modal_open && !compact,
         sticky_viewport.clone(),
     );
-    if lists_kept_attention_rows(&projects) {
+    // Under the pointer, the control neither comes nor goes: it would move
+    // the In progress rows below it.
+    if state
+        .list_hold
+        .get()
+        .map_or(lists_kept_attention_rows(&projects), |hold| hold.hide_read)
+    {
         column =
             widget::column::with_children(vec![column, hide_read_attention(compact, modal_open)])
                 .spacing(space::XS)
@@ -14180,13 +14217,6 @@ fn navigation_search_ranks(
 /// rows the Attention list keeps in place. Drawing and keyboard order both
 /// ask this, so the two cannot disagree about which rows exist.
 fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) -> bool {
-    if let Some(hold) = state.list_hold.get()
-        && !compact_rail_searching(state)
-    {
-        // Held under the pointer: what the rail drew stays, and only where
-        // the user went joins it.
-        return channel.selected || hold.rail.contains(&SelectionRow::Channel(channel.id));
-    }
     // The Attention list holds only channels worth a glance.
     state.filter == SidebarFilter::Attention
         || compact_rail_searching(state)
@@ -14195,6 +14225,17 @@ fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) ->
         || channel.activity.is_some()
         || channel.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Channel(channel.id))
+        || held_on_rail(state, SelectionRow::Channel(channel.id))
+}
+
+/// Whether the rail keeps `row` because the pointer holds it: a row it drew
+/// stays drawn until the pointer leaves, though what put it there is over.
+fn held_on_rail(state: &SidebarState, row: SelectionRow) -> bool {
+    !compact_rail_searching(state)
+        && state
+            .list_hold
+            .get()
+            .is_some_and(|hold| hold.rail.contains(&row))
 }
 
 /// [`compact_rail_shows_channel`], for a worktree. A worktree with open panes
@@ -14204,25 +14245,17 @@ fn compact_rail_shows_worktree(
     project: ProjectId,
     worktree: &SidebarWorktree,
 ) -> bool {
-    let selected = state.drawn_selection()
-        == Some(SidebarSelection::Worktree {
-            project_id: project,
-            worktree_id: worktree.id,
-        });
-    if let Some(hold) = state.list_hold.get()
-        && !compact_rail_searching(state)
-    {
-        return selected
-            || hold
-                .rail
-                .contains(&SelectionRow::Worktree(project, worktree.id));
-    }
     compact_rail_searching(state)
-        || selected
+        || state.drawn_selection()
+            == Some(SidebarSelection::Worktree {
+                project_id: project,
+                worktree_id: worktree.id,
+            })
         || state.has_agent_update(project, worktree.id)
         || state.worktree_has_panes(project, worktree.id)
         || state.agent_activity(project, worktree.id).is_some()
         || worktree.deletion.is_some()
+        || held_on_rail(state, SelectionRow::Worktree(project, worktree.id))
 }
 
 /// The rail searches only while its popover holds the query.
@@ -14549,6 +14582,8 @@ struct ListHold {
     in_progress: crate::interaction::hover_hold::Held<SelectionRow>,
     /// The channel and worktree rows the compact rail drew.
     rail: BTreeSet<SelectionRow>,
+    /// Whether the list closed with its "Hide read" control.
+    hide_read: bool,
 }
 
 impl ListHold {
@@ -14560,6 +14595,7 @@ impl ListHold {
                     .into_iter()
                     .map(InProgressRow::row),
             ),
+            hide_read: !state.retained_attention.is_empty(),
             ..Self::default()
         };
         for project in &model.projects {
@@ -14728,31 +14764,29 @@ fn in_progress_rows<'a>(
         return rows;
     };
     // Held rows keep their slots whatever their agents have done since;
-    // only a row that went, or is going, gives its slot up.
-    let find = |row: &SelectionRow| {
-        model.projects.iter().find_map(|project| {
-            let item = match *row {
-                SelectionRow::Channel(id) => project
-                    .channels
-                    .iter()
-                    .find(|channel| {
-                        channel.id == id && channel.deletion != Some(RowDeletion::Deleting)
-                    })
-                    .map(InProgressItem::Channel),
-                SelectionRow::Card(id) => project
-                    .panes
-                    .iter()
-                    .find(|card| card.id == id)
-                    .map(InProgressItem::Card),
-                _ => None,
-            }?;
-            Some(InProgressRow { project, item })
-        })
-    };
+    // only a row that went, or is going, gives its slot up. One pass finds
+    // them all, however many rows are held.
+    let mut held = BTreeMap::new();
+    for project in &model.projects {
+        for channel in &project.channels {
+            let row = SelectionRow::Channel(channel.id);
+            if channel.deletion != Some(RowDeletion::Deleting) && hold.in_progress.contains(&row) {
+                let item = InProgressItem::Channel(channel);
+                held.insert(row, InProgressRow { project, item });
+            }
+        }
+        for card in &project.panes {
+            let row = SelectionRow::Card(card.id);
+            if hold.in_progress.contains(&row) {
+                let item = InProgressItem::Card(card);
+                held.insert(row, InProgressRow { project, item });
+            }
+        }
+    }
     let live: Vec<_> = rows.into_iter().map(|row| (row.row(), row)).collect();
     hold.in_progress
         .arrange(
-            |row| find(row).map(|found| (*row, found)),
+            |row| held.remove(row).map(|found| (*row, found)),
             live,
             |(row, _)| row,
         )

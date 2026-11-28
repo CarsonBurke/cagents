@@ -14418,7 +14418,12 @@ fn attention_rows_hold_still_under_the_pointer() {
     let feature = model.projects[0].worktrees[1].clone();
     let working = CardId::from_uuid(Uuid::from_u128(81));
     let waiting = CardId::from_uuid(Uuid::from_u128(82));
-    let durable = pane_workspace(&[(working, &feature.path), (waiting, &main.path)]);
+    let asking = CardId::from_uuid(Uuid::from_u128(83));
+    let durable = pane_workspace(&[
+        (working, &feature.path),
+        (waiting, &main.path),
+        (asking, &main.path),
+    ]);
     let activity = |state| Activity {
         provider: Provider::Codex,
         state,
@@ -14464,6 +14469,10 @@ fn attention_rows_hold_still_under_the_pointer() {
     // A second report while held keeps the hold the pointer arrived to.
     state.hover_list(&model, false, true);
     assert_eq!(visible_selection_rows(&model, &state, false), before);
+    // A question does not wait for the pointer to leave.
+    state.set_agent_activity(asking, project, main.id, activity(ActivityState::Question));
+    refresh_attention(&mut state, &mut model, &durable);
+    assert!(visible_selection_rows(&model, &state, false).contains(&SelectionRow::Card(asking)));
     state.hover_list(&model, false, false);
     assert!(!state.list_held());
     // Settled: the waiting card now works, under In progress, last.
@@ -14489,8 +14498,13 @@ fn work_starting_under_the_pointer_joins_in_progress_after_held_rows() {
     let feature = model.projects[0].worktrees[1].clone();
     let first = CardId::from_uuid(Uuid::from_u128(91));
     let second = CardId::from_uuid(Uuid::from_u128(92));
-    // Settled, the second pane, in the feature checkout, sorts first.
-    let durable = pane_workspace(&[(first, &main.path), (second, &feature.path)]);
+    let third = CardId::from_uuid(Uuid::from_u128(93));
+    // Settled, the third pane, in the feature checkout, sorts first.
+    let durable = pane_workspace(&[
+        (first, &main.path),
+        (second, &main.path),
+        (third, &feature.path),
+    ]);
     let activity = |state| Activity {
         provider: Provider::Codex,
         state,
@@ -14507,23 +14521,36 @@ fn work_starting_under_the_pointer_joins_in_progress_after_held_rows() {
     };
     assert_eq!(rows(&model, &state), [SelectionRow::Card(first)]);
     state.hover_list(&model, false, true);
-    state.set_agent_activity(
-        second,
-        project,
-        feature.id,
-        activity(ActivityState::Working),
-    );
-    refresh_attention(&mut state, &mut model, &durable);
+    let start = |state: &mut SidebarState, model: &mut SidebarModel, card, worktree| {
+        state.set_agent_activity(card, project, worktree, activity(ActivityState::Working));
+        refresh_attention(state, model, &durable);
+        state.follow_list(model, false);
+    };
+    start(&mut state, &mut model, second, main.id);
     assert_eq!(
         rows(&model, &state),
         [SelectionRow::Card(first), SelectionRow::Card(second)],
         "the newcomer follows the held row"
     );
+    // A later newcomer that sorts first does not move the earlier one.
+    start(&mut state, &mut model, third, feature.id);
+    assert_eq!(
+        rows(&model, &state),
+        [
+            SelectionRow::Card(first),
+            SelectionRow::Card(second),
+            SelectionRow::Card(third)
+        ],
+    );
     state.hover_list(&model, false, false);
     assert_eq!(
         rows(&model, &state),
-        [SelectionRow::Card(second), SelectionRow::Card(first)],
-        "and takes its own place once the pointer leaves"
+        [
+            SelectionRow::Card(third),
+            SelectionRow::Card(first),
+            SelectionRow::Card(second)
+        ],
+        "and they take their own places once the pointer leaves"
     );
 }
 
@@ -14552,10 +14579,8 @@ fn compact_rail_rows_hold_still_under_the_pointer() {
     assert!(shows(&model, &state), "a row whose work ended stays drawn");
     state.release_list_hold();
     assert!(!shows(&model, &state), "and goes once released");
-    // Work starting under the pointer waits for it to leave.
+    // Work starting under the pointer shows at once.
     state.hover_list(&model, true, true);
     model.projects[0].channels[0].activity = Some(crate::agent::ActivityState::Working);
-    assert!(!shows(&model, &state));
-    state.hover_list(&model, true, false);
     assert!(shows(&model, &state));
 }
