@@ -245,6 +245,10 @@ run = 'exec scripts/gradle-remote -- :shared:jvmTest :androidApp:testDebugUnitTe
 description = "Build the Android app's debug APK on the build host (mobile/androidApp/build/outputs/apk/debug)"
 run = 'exec scripts/gradle-remote --fetch androidApp/build/outputs/apk/debug -- :androidApp:assembleDebug'
 
+[tasks."mobile:release"]
+description = "Package the Android APK on the build host from a Git ref with user-provisioned signing material"
+run = 'exec scripts/package-android build'
+
 [tasks."mobile:install"]
 description = "Build the minified preview APK on the build host and install it on the connected phone, over the debug build (set ANDROID_SERIAL to choose one)"
 run = """
