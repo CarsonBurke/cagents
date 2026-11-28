@@ -471,13 +471,14 @@ TimeoutStartSec=infinity
 WantedBy=default.target
 ",
         condition = text.replace('%', "%%"),
-        program = systemd_quoted(text),
+        program = systemd_executable(text),
         at_boot = crate::instance::DAEMON_AT_BOOT_ENV,
     ))
 }
 
-/// `text`, a path, as one systemd command-line word.
-fn systemd_quoted(text: &str) -> String {
+/// `text`, a path, as the executable word in a systemd command line.
+/// Specifiers expand in that word, while dollar signs stay literal.
+fn systemd_executable(text: &str) -> String {
     if text
         .chars()
         .all(|c| c.is_ascii_alphanumeric() || "/._-+".contains(c))
@@ -487,8 +488,7 @@ fn systemd_quoted(text: &str) -> String {
     let escaped = text
         .replace('\\', "\\\\")
         .replace('"', "\\\"")
-        .replace('%', "%%")
-        .replace('$', "$$");
+        .replace('%', "%%");
     format!("\"{escaped}\"")
 }
 
@@ -503,7 +503,6 @@ fn program_of(unit: &str) -> Option<PathBuf> {
         .and_then(|quoted| quoted.strip_suffix('"'))
         .map(|quoted| {
             quoted
-                .replace("$$", "$")
                 .replace("%%", "%")
                 .replace("\\\"", "\"")
                 .replace("\\\\", "\\")
@@ -700,16 +699,16 @@ mod tests {
 
     #[test]
     fn a_path_systemd_would_split_or_expand_is_quoted_and_read_back() {
-        let program = Path::new("/home/some one/100%/$HOME/cagents");
+        let program = Path::new("/home/some one/100%/$HOME/$$/cagents");
         let unit = render(program).unwrap();
         assert!(
-            unit.contains(r#"ExecStart="/home/some one/100%%/$$HOME/cagents" daemon start"#),
+            unit.contains(r#"ExecStart="/home/some one/100%%/$HOME/$$/cagents" daemon start"#),
             "{unit}"
         );
         // Conditions expand specifiers but not variables, and take the rest
         // of the line as the path.
         assert!(
-            unit.contains("ConditionFileIsExecutable=/home/some one/100%%/$HOME/cagents\n"),
+            unit.contains("ConditionFileIsExecutable=/home/some one/100%%/$HOME/$$/cagents\n"),
             "{unit}"
         );
         assert_eq!(program_of(&unit).as_deref(), Some(program));
