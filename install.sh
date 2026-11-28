@@ -652,7 +652,8 @@ private_hint() {
         || printf '; for a private repository, sign in with gh auth login --hostname github.com'
 }
 
-CURL_OPTIONS="--proto =https --tlsv1.2 --fail --location --silent --show-error"
+# curl only skips its default configuration when --disable is first.
+CURL_OPTIONS="--disable --proto =https --tlsv1.2 --fail --location --silent --show-error"
 AUTHENTICATED_GH=0
 if [ -z "$VERSION" ] || [ -z "$LOCAL_ARCHIVE" ] || [ -z "$LOCAL_CHECKSUMS" ]; then
     validate_repository
