@@ -5,6 +5,8 @@ pub mod ipc;
 #[cfg(feature = "host")]
 mod reactor;
 mod search;
+#[cfg(feature = "host")]
+mod service_init;
 mod snapshot;
 pub use search::SearchMatch;
 #[cfg(feature = "ui")]
