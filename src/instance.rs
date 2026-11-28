@@ -775,7 +775,6 @@ pub fn report_ui_recovery_progress(saved_chats: usize) -> io::Result<()> {
 }
 
 static UI_WINDOW_OPENED: AtomicBool = AtomicBool::new(false);
-#[cfg(any(feature = "host", feature = "ui", target_os = "linux"))]
 const CUTOVER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(all(target_os = "macos", feature = "ui"))]
 static UI_RESTORATION_READY: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -2036,7 +2035,6 @@ impl UiUpdateGuard {
 
     /// Let a window that is already taking its slot reach the fence naturally.
     /// The detached flock waiter owns no update lease if this budget expires.
-    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn acquire_for_cutover() -> io::Result<Self> {
         match Self::acquire() {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
@@ -2513,7 +2511,6 @@ impl UiUpdateGuard {
         )
     }
 
-    #[cfg(any(feature = "host", target_os = "linux"))]
     pub(crate) fn verify_cutover_windows(&self, slots: &[String], image: &Path) -> io::Result<()> {
         #[cfg(target_os = "macos")]
         let deadline = Instant::now() + CUTOVER_READY_TIMEOUT + ACTIVATION_IO_TIMEOUT;
@@ -2625,7 +2622,6 @@ impl UiUpdateGuard {
 }
 
 /// A naturally opened window can take its lease before binding activation.
-#[cfg(any(feature = "host", target_os = "linux"))]
 fn connect_cutover_window(runtime: &Path, slot: &str, deadline: Instant) -> io::Result<UnixStream> {
     use std::os::fd::AsFd;
 

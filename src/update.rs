@@ -75,6 +75,14 @@ mod review;
 pub mod source_inspection;
 pub use review::render_review;
 mod signature;
+mod windows;
+pub(crate) use windows::reopen as reopen_update_windows;
+#[cfg(feature = "ui")]
+#[doc(hidden)]
+pub use windows::{
+    PROBE_ARGUMENT as UI_FIRST_FRAME_PROBE, PROBE_RECEIPT as UI_FIRST_FRAME_RECEIPT,
+    validate_probe_environment,
+};
 #[cfg(feature = "ui")]
 pub mod startup;
 use std::{
@@ -2811,15 +2819,26 @@ fn perform_update(
     }
     let mut recovery = recovery::Context::default();
     recovery.capture(state, job)?;
+    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    confirmation::check_cancelled(state, job)?;
+    let native_startup_verified = windows::verify_candidate(
+        state,
+        job,
+        guard.has_running_windows()?,
+        &cancellation,
+        || candidate::archive_binary(&release, &archive, "cagents-ui", &cancellation),
+    )?;
     set_phase(
         state,
         job,
         UpdatePhase::ClosingWindows,
         "Saving and closing all application windows",
     )?;
-    let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     confirmation::check_cancelled(state, job)?;
-    guard.prepare_windows(Duration::from_secs(45))?;
+    let prepared_slots = guard.prepare_windows(Duration::from_secs(45))?;
+    if native_startup_verified {
+        windows::remember_slots(state, job, prepared_slots)?;
+    }
     // The build these windows run, to return to if the new one cannot open.
     let previous = installation.prefix.join("current").canonicalize()?;
     // The daemon serving these windows; one still serving after the install
@@ -2979,10 +2998,12 @@ fn perform_update(
         state,
         job,
         install_result.is_ok().then_some(survivors),
-    )?;
+        reopen_result.is_ok(),
+    );
     let (new, old) = (&release.version, &installation.version);
     match restored {
         Some(Ok(Ok(()))) => {
+            handoff_kind.or_else(|error| report_recovery_failure(state, job, error))?;
             // The phase in progress no longer describes anything.
             job.message.clear();
             return report_recovery_failure(
@@ -2994,6 +3015,7 @@ fn perform_update(
             );
         }
         Some(Ok(Err(error))) => {
+            handoff_kind.or_else(|error| report_recovery_failure(state, job, error))?;
             eprintln!("cagents {old} could not reopen the windows: {error}");
             job.message.clear();
             return report_recovery_failure(
@@ -3014,24 +3036,28 @@ fn finish_reopening_windows(
     state: &Path,
     job: &mut UpdateJob,
     install_result: Result<(), UpdateError>,
-    handoff: Handoff,
+    handoff: Result<Handoff, UpdateError>,
     reopened: Result<Option<String>, UpdateError>,
 ) -> Result<Completion, UpdateError> {
     let pane_notes = match reopened {
         Ok(notes) => notes,
         Err(error) => {
-            if install_result.is_ok() {
+            let error = if install_result.is_ok() {
                 job.message.clear();
-            }
-            return report_recovery_failure(
-                state,
-                job,
-                invalid(format!(
-                    "Some saved windows did not reopen: {error}. Run `cagents ui` to reopen the saved workspace."
+                windows::reopen_failure(state, job, error)
+            } else {
+                windows::unrecorded_reopen_failure(error)
+            };
+            let error = match handoff {
+                Ok(_) => error,
+                Err(service) => invalid(format!(
+                    "{error} Daemon inventory verification also failed: {service}"
                 )),
-            );
+            };
+            return report_recovery_failure(state, job, error);
         }
     };
+    let handoff = handoff.or_else(|error| report_recovery_failure(state, job, error))?;
     install_result.map(|()| Completion {
         handoff,
         pane_notes,
@@ -3089,8 +3115,9 @@ fn restore_previous_build(
 fn verify_reopened_service(
     recovery: &recovery::Context,
     state: &Path,
-    job: &mut UpdateJob,
+    job: &UpdateJob,
     successor: Option<&mut floor::Survivors>,
+    windows_ready: bool,
 ) -> Result<Handoff, UpdateError> {
     let census = recovery
         .census
@@ -3102,29 +3129,28 @@ fn verify_reopened_service(
     let receipt = if let Some(absence) = absence {
         absence
     } else {
-        census.verify_with_target_retiring(
-            &state
-                .parent()
-                .ok_or_else(|| invalid("Update state has no installation root"))?
-                .join("versions")
-                .join(&job.version),
-            state,
-            &job.id,
-        )?
+        let target = state
+            .parent()
+            .ok_or_else(|| invalid("Update state has no installation root"))?
+            .join("versions")
+            .join(&job.version);
+        if windows_ready {
+            census.verify_with_target_retiring(&target, state, &job.id)?
+        } else {
+            census.verify_with_target(&target, state, &job.id)?
+        }
     };
     receipt.save(&recovery::outcome_path(state, &job.id))?;
     if matches!(receipt.outcome, recovery::Outcome::NoSource) {
         Ok(Handoff::NoDaemon)
     } else if receipt.usable() {
         if let Some(successor) = successor {
-            if let Err(error) = successor.confirm_successor(&receipt) {
-                return report_recovery_failure(state, job, error);
-            }
+            successor.confirm_successor(&receipt)?;
             successor.record_verified_pauses(&receipt.outcome, |id| census.has_recorded_chat(*id));
         }
         Ok(Handoff::Served)
     } else {
-        report_recovery_failure(state, job, receipt.failure())
+        Err(receipt.failure())
     }
 }
 
@@ -3790,21 +3816,7 @@ fn archive_daemon_digest(
     archive: &File,
     cancellation: &CancellationToken,
 ) -> Result<String, UpdateError> {
-    let archive_fd = archive.as_raw_fd();
-    let mut extract = Command::new("tar");
-    extract
-        .args(["-xOz", "--file"])
-        .arg(format!("/proc/self/fd/{archive_fd}"))
-        .arg("--")
-        .arg(format!("cagents-{}/bin/cagentsd", release.version));
-    candidate::inherit(&mut extract, archive_fd);
-    let mut daemon = bounded_command(
-        &mut extract,
-        "candidate daemon extraction",
-        512 * 1024 * 1024,
-        Duration::from_secs(120),
-        cancellation,
-    )?;
+    let mut daemon = candidate::archive_binary(release, archive, "cagentsd", cancellation)?;
     let mut hash = Sha256::new();
     let mut buffer = [0; 64 * 1024];
     loop {
@@ -4012,7 +4024,6 @@ fn read_private(path: &Path, limit: u64) -> Result<Vec<u8>, UpdateError> {
     }
     Ok(bytes)
 }
-#[cfg(any(target_os = "linux", feature = "host"))]
 fn read_job(state: &Path) -> Result<Option<UpdateJob>, UpdateError> {
     match read_private(&state.join("status.json"), JOB_STATE_LIMIT) {
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
@@ -6845,17 +6856,15 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 assert!(reopen.status().unwrap().success());
                 assert!(HostLease::is_held(&paths).unwrap());
             }
-            let final_result = settled
-                .and_then(|_| verify_reopened_service(&context, root.path(), &mut job, None))
-                .and_then(|handoff| {
-                    finish_reopening_windows(
-                        root.path(),
-                        &mut job,
-                        installer_result,
-                        handoff,
-                        Ok(None),
-                    )
-                });
+            let handoff = settled
+                .and_then(|_| verify_reopened_service(&context, root.path(), &job, None, true));
+            let final_result = finish_reopening_windows(
+                root.path(),
+                &mut job,
+                installer_result,
+                handoff,
+                Ok(None),
+            );
             finish_worker(root.path(), &mut job, final_result, &mut survivors).unwrap();
             let persisted: UpdateJob =
                 serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap())
@@ -7059,7 +7068,7 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
                 root.path(),
                 &mut job,
                 installer_result,
-                Handoff::Served,
+                Ok(Handoff::Served),
                 Ok(None),
             );
             finish_worker(root.path(), &mut job, final_result, &mut survivors).unwrap_err();

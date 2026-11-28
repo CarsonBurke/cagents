@@ -91,6 +91,10 @@ pub(crate) fn main_with_before_start(
         };
     }
 
+    if arguments == [cagents::update::UI_FIRST_FRAME_PROBE] {
+        return report(probe_first_frame());
+    }
+
     // Argv is settled before the handshake below is armed. A mistyped flag is
     // a shell mistake, not a startup failure: routing it through
     // `report_startup_failure` answered the launcher with an error and, on a
@@ -133,7 +137,7 @@ pub(crate) fn main_with_before_start(
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents_ui::browser::ProcessShutdown;
     let caller_reports_startup_failure = options.caller_reports_startup_failure;
-    let result = run(options);
+    let result = run(options, false);
     // Whatever ended startup explains itself from here; the wait is over.
     cagents::instance::dismiss_startup_wait_notice();
     match &result {
@@ -555,7 +559,26 @@ fn prepare_device(caller_reports_startup_failure: bool) -> std::io::Result<()> {
     })
 }
 
-fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
+fn probe_first_frame() -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+
+    cagents::update::validate_probe_environment()?;
+    // The shell calls this after successful presentation. Window creation and
+    // RedrawRequested can both happen before the renderer has produced a frame.
+    iced::runtime::frame::observe(|_| {
+        let mut output = std::io::stdout().lock();
+        let written = output
+            .write_all(cagents::update::UI_FIRST_FRAME_RECEIPT.as_bytes())
+            .and_then(|()| output.flush());
+        // All stores are disposable, and this process has no hosted work.
+        std::process::exit(i32::from(written.is_err()));
+    });
+    let options = parse(&[])?.expect("default window options");
+    run(options, true)?;
+    Err("UI exited before presenting its first frame".into())
+}
+
+fn run(options: Options<'_>, first_frame_probe: bool) -> Result<(), Box<dyn std::error::Error>> {
     let Options {
         new_window,
         slot,
@@ -586,7 +609,8 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         let _ = DEVICE_WINDOW.set((device.name.clone(), slot.to_owned()));
     }
     prepare_device(caller_reports_startup_failure)?;
-    if !cagents::device::is_remote()
+    if !first_frame_probe
+        && !cagents::device::is_remote()
         && let Some(executable) = cagents::control::staged_ui_executable(
             #[cfg(target_os = "macos")]
             &mut || show_startup_wait_notice(StartupWaitKind::Update),
@@ -623,7 +647,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         )?;
         let (activation_tx, activation_rx) = async_channel::unbounded();
         let listener = cagents::instance::UiActivationListener::bind(activation_tx)?;
-        if !fixture {
+        if !fixture && !first_frame_probe {
             if restore_policy == cagents::instance::WindowRestorePolicy::ExistingOnly {
                 // A recovery relaunch observes the daemon the coordinator
                 // verified; it cannot autostart another one on a lost socket.
@@ -633,7 +657,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 cagents::terminal::ensure_daemon_ready()?;
             }
         }
-        let restored = cagents_ui::app::Cagents::load_startup()?;
+        let restored = cagents_ui::app::Cagents::load_startup(first_frame_probe)?;
         Ok((lease, (listener, activation_rx), restored))
     })();
     let (_application_lease, activation, restored) = startup?;
@@ -646,8 +670,13 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     type Shell = Cosmic<cagents_ui::app::Cagents>;
     cagents::performance::ui_trace::install();
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
+    let app_id = if first_frame_probe {
+        "dev.cagents.Cagents.StartupProbe"
+    } else {
+        cagents::instance::APPLICATION_ID
+    };
     let settings = iced::Settings {
-        id: Some(cagents::instance::APPLICATION_ID.to_owned()),
+        id: Some(app_id.to_owned()),
         default_font: cosmic::font::default(),
         default_text_size: iced::Pixels(14.0),
         antialiasing: true,
@@ -676,7 +705,7 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
                 // entry; a macOS window belongs to its application bundle.
                 #[cfg(target_os = "linux")]
                 platform_specific: iced::window::PlatformSpecific {
-                    application_id: cagents::instance::APPLICATION_ID.to_owned(),
+                    application_id: app_id.to_owned(),
                     ..Default::default()
                 },
                 #[cfg(target_os = "macos")]
@@ -692,15 +721,24 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
             core.set_main_window_id(Some(window));
             let startup = restored.borrow_mut().take().expect("UI initialized once");
             let (shell, initialize) = Shell::init((core, (activation_rx.clone(), startup)));
-            let opened = open
-                .map(cagents_ui::app::Message::StartupWindowOpened)
-                .map(cosmic::Action::App);
+            let opened = if first_frame_probe {
+                open.discard()
+            } else {
+                open.map(cagents_ui::app::Message::StartupWindowOpened)
+                    .map(cosmic::Action::App)
+            };
             (shell, iced::Task::batch([opened, initialize]))
         },
         Shell::update,
         Shell::view,
     )
-    .subscription(Shell::subscription)
+    .subscription(move |shell| {
+        if first_frame_probe {
+            iced::Subscription::none()
+        } else {
+            Shell::subscription(shell)
+        }
+    })
     .title(Shell::title)
     .style(Shell::style)
     .theme(Shell::theme)

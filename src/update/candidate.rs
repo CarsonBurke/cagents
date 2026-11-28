@@ -15,6 +15,31 @@ enum Executable {
     },
 }
 
+/// The installer consumes the same sealed archive. Extract a single executable
+/// without consulting the installed selector or reopening the download path.
+pub(super) fn archive_binary(
+    release: &Release,
+    archive: &File,
+    binary: &str,
+    cancellation: &CancellationToken,
+) -> Result<File, UpdateError> {
+    let archive_fd = archive.as_raw_fd();
+    let mut extract = Command::new("tar");
+    extract
+        .args(["-xOz", "--file"])
+        .arg(format!("/proc/self/fd/{archive_fd}"))
+        .arg("--")
+        .arg(format!("cagents-{}/bin/{binary}", release.version));
+    inherit(&mut extract, archive_fd);
+    bounded_command(
+        &mut extract,
+        "candidate executable extraction",
+        512 * 1024 * 1024,
+        Duration::from_secs(120),
+        cancellation,
+    )
+}
+
 impl Staged {
     pub fn preview(&self, policy: impact::Policy) -> Result<impact::Preview, UpdateError> {
         match observe_impact(&self.identity, policy) {
@@ -50,23 +75,8 @@ impl Staged {
         digest: &[u8; 32],
         cancellation: &CancellationToken,
     ) -> Result<Self, UpdateError> {
-        let archive_fd = archive.as_raw_fd();
-        let mut extract = Command::new("tar");
-        extract
-            .args(["-xOz", "--file"])
-            .arg(format!("/proc/self/fd/{archive_fd}"))
-            .arg("--")
-            .arg(format!("cagents-{}/bin/cagents", release.version));
-        inherit(&mut extract, archive_fd);
-        let executable = bounded_command(
-            &mut extract,
-            "candidate extraction",
-            512 * 1024 * 1024,
-            Duration::from_secs(120),
-            cancellation,
-        )?;
         Self::from_file(
-            executable,
+            archive_binary(release, archive, "cagents", cancellation)?,
             release.version.clone(),
             digest.iter().map(|byte| format!("{byte:02x}")).collect(),
             cancellation,

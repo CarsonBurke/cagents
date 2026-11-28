@@ -2841,6 +2841,7 @@ pub(crate) struct Bootstrap {
 /// Loaded before iced starts: session restoration and file locks never wait on
 /// the native event loop. Only successfully restored launches can report ready.
 pub struct Startup {
+    first_frame_probe: bool,
     bootstrap: Bootstrap,
     window_view: Option<WindowView>,
 }
@@ -6616,15 +6617,16 @@ impl Cagents {
         })
     }
 
-    pub fn load_startup() -> Result<Startup, String> {
+    pub fn load_startup(first_frame_probe: bool) -> Result<Startup, String> {
         #[cfg(feature = "latency-harness")]
         if crate::latency_fixture::Fixture::from_env().is_some() {
             return Ok(Startup {
+                first_frame_probe,
                 bootstrap: Self::fixture_bootstrap(),
                 window_view: None,
             });
         }
-        let strict = instance::ui_launch_handshake_requested();
+        let strict = first_frame_probe || instance::ui_launch_handshake_requested();
         let mut bootstrap = Self::bootstrap(strict)?;
         let view = bootstrap
             .session
@@ -6650,6 +6652,7 @@ impl Cagents {
             }
         };
         Ok(Startup {
+            first_frame_probe,
             bootstrap,
             window_view,
         })
@@ -17145,18 +17148,20 @@ impl Application for Cagents {
         // the whole of its life, so the observer starts with the window rather
         // than with the first card that happens to need a daemon.
         let (hosted_terminals_tx, hosted_terminals_rx) = async_channel::unbounded();
-        terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
         // The daemon owns the shared sidebar model for the same reason it owns
         // the terminal inventory: it outlives every window. Both threads start
         // with the window, so a channel created elsewhere appears without the
         // window having to do anything first.
         let (workspace_model_updates, workspace_model_rx) = async_channel::unbounded();
         let (workspace_model_tx, workspace_model_requests) = async_channel::unbounded();
-        workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
-        workspace_model_sync::publish_workspace_model(
-            workspace_model_updates,
-            workspace_model_requests,
-        );
+        if !startup.first_frame_probe {
+            terminal_adoption::observe_hosted_inventory(hosted_terminals_tx);
+            workspace_model_sync::observe_workspace_model(workspace_model_updates.clone());
+            workspace_model_sync::publish_workspace_model(
+                workspace_model_updates,
+                workspace_model_requests,
+            );
+        }
         let activation_rx = activation_rx.unwrap_or_else(|| async_channel::unbounded().1);
         let window_scale_factor = core.scale_factor().max(0.01);
         let settings_draft = SettingsDraft::from_settings(&settings);
@@ -17460,6 +17465,12 @@ impl Application for Cagents {
         let _ = app
             .workspace
             .resize_viewport((app.content_width() - sidebar_width).max(0.0));
+        // The disposable window exercises normal construction and rendering.
+        // Login-shell discovery, providers and workspace attachments start
+        // only in the real workspace.
+        if startup.first_frame_probe {
+            return (app, Task::none());
+        }
         #[cfg(feature = "latency-harness")]
         if app.latency_fixture.is_some() {
             app.cards = app

@@ -2944,7 +2944,7 @@ mod tests {
             state,
             &mut update,
             Ok(()),
-            Handoff::Served,
+            Ok(Handoff::Served),
             Ok(Some(notes.into())),
         );
         finish_worker(

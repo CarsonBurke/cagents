@@ -367,7 +367,7 @@ fn finish_under_lease(
         return Ok(());
     };
     let result = match approved.accepted_from(retained) {
-        Ok(Some(accepted)) => finish_windows(layout, state, approved, &accepted, guard),
+        Ok(Some(accepted)) => finish_windows(layout, state, &job, approved, &accepted, guard),
         Ok(None) => return Ok(()),
         Err(error) => Err(error),
     };
@@ -387,6 +387,7 @@ fn finish_under_lease(
 fn finish_windows(
     layout: &InstallLayout,
     state: &Path,
+    job: &UpdateJob,
     handoff: &Handoff,
     accepted: &Acceptance,
     mut guard: UiUpdateGuard,
@@ -461,7 +462,9 @@ fn finish_windows(
     let pane_notes = match (launched, verified) {
         (Ok(notes), Ok(())) => notes,
         (Err(_), Ok(())) => None,
-        (Err(error), Err(_)) | (Ok(_), Err(error)) => return Err(error.into()),
+        (Err(error), Err(_)) | (Ok(_), Err(error)) => {
+            return Err(windows::reopen_failure(state, job, error));
+        }
     };
 
     recovery::retire_current_service(source::BusyPatience::for_one_run())?;

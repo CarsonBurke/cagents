@@ -794,28 +794,32 @@ def expected_refusal(root, kind, old_version):
                      for side in ('before','after')]
     errors = refusal_preserved_processes(root/'records')
     status = json.loads((root/'home/.local/share/cagents-install/.update/status.json').read_text())
-    phase = 'Failed' if kind=='interrupt' else 'Cancelled'
+    phase = 'Cancelled' if kind=='cancel' else 'Failed'
     if status.get('phase') != phase:
         errors.append(f'expected {phase}, saw {status.get("phase")}')
     target = after.get('target',{})
     if status.get('version') != target.get('version'):
         errors.append('refusal did not belong to the requested target')
-    if kind=='interrupt' and 'did not stop in time; nothing was changed' not in status.get('message',''):
+    message = status.get('message','')
+    if kind=='interrupt' and 'did not stop in time; nothing was changed' not in message:
         errors.append('update did not report the interruption settlement bound')
+    if kind=='window-startup' and 'could not present its first window frame' not in message:
+        errors.append('update did not report the candidate first-frame failure')
     current = root/'home/.local/share/cagents-install/current'
     staged = root/'staged-candidate.json'
     if staged.exists():
-        # The installer's --stage-only already selected the candidate as current
-        # and recorded the running owner; a refusal must leave both as staged.
+        # Some installers record a deferred owner on the selected stage.
+        # Others leave the previous build selected until the worker commits.
         binding = json.loads(staged.read_text())
         if str(current.resolve()) != binding['current']:
             errors.append('refusal changed the installed current version')
-        try:
-            owner = json.loads((current.resolve()/'.deferred-owner.json').read_text())
-        except (OSError, ValueError):
-            owner = {}
-        if owner.get('owner_version') != old_version:
-            errors.append('refusal lost the deferred owner of the running service')
+        elif current.resolve().name != old_version:
+            try:
+                owner = json.loads((current.resolve()/'.deferred-owner.json').read_text())
+            except (OSError, ValueError):
+                owner = {}
+            if owner.get('owner_version') != old_version:
+                errors.append('refusal lost the deferred owner of the running service')
     elif current.resolve().name != old_version:
         errors.append('refusal changed the installed current version')
     executable = str(root/'home/.local/share/cagents-install/versions'/old_version/'bin/cagentsd')
@@ -835,9 +839,9 @@ def expected_refusal(root, kind, old_version):
     started, finished = target.get('started',0), target.get('finished',0)
     events = [row for row in after.get('fixture_events',[]) if row.get('time',0)>=started]
     interrupts = [row for row in events if row.get('event')=='request' and row.get('method')=='turn/interrupt']
-    if kind=='cancel':
+    if kind in ('cancel','window-startup'):
         if interrupts:
-            errors.append('review cancellation sent an interrupt request')
+            errors.append(f'{kind} refusal sent an interrupt request')
     else:
         parents = [row for row in interrupts if row.get('parent') is True and row.get('errors')==[]]
         if not parents or not 25 <= finished-min(row['time'] for row in parents) <= 40:
@@ -2468,7 +2472,7 @@ def main():
     run.add_argument('--new-terminal-after-restore',action='store_true',help='after verified existing-only reopening deliberately stop the private daemon, then open and use a new terminal through the same native UI')
     run.add_argument('--expect-terminal-restart-failure',action='store_true',help='before example only: require the native new-terminal action to fail with no daemon after the deliberate stop')
     run.add_argument('--reopen-timeout',type=float,default=45)
-    run.add_argument('--expect-refusal',choices=('interrupt','cancel'),help='require the exact refusal and unchanged old service, install, windows and inventory')
+    run.add_argument('--expect-refusal',choices=('interrupt','cancel','window-startup'),help='require the exact refusal and unchanged old service, install, windows and inventory')
     run.add_argument('--require-prepared',action='store_true',help='require this fresh job to reach source-bound Prepared before recovery')
     run.add_argument('--plain-restart',action='store_true',help='after verified recovery, crash only the private daemon and start it normally; verify the original census again')
     run.add_argument('--codex-pause',type=float,default=6,help='offline Codex turn pause in seconds (maximum 300)')

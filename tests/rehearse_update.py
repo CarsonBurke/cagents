@@ -1059,6 +1059,16 @@ class ChatViews(unittest.TestCase):
             write(after,{**status,'phase':'Cancelled'})
             self.assertTrue(scenario.expected_refusal(root,'cancel','old'))
 
+            window_failure = {**status,'message':'cagents new could not present its first window frame'}
+            write(cancelled, window_failure)
+            self.assertEqual(scenario.expected_refusal(root,'window-startup','old'),[])
+            write(after, window_failure)
+            self.assertIn('window-startup refusal sent an interrupt request',
+                          scenario.expected_refusal(root,'window-startup','old'))
+            write(cancelled, status)
+            self.assertIn('update did not report the candidate first-frame failure',
+                          scenario.expected_refusal(root,'window-startup','old'))
+
             # The current installer's --stage-only selects the candidate before the
             # update; a refusal must keep that staged current and its deferred owner.
             (prefix/'versions/new').mkdir()
