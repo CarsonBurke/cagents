@@ -39,7 +39,8 @@ if (nav && sentinel && "IntersectionObserver" in window) {
 }
 
 // Show the reader's own keyboard shortcuts. Without JavaScript, or on any
-// other platform, the page shows Linux's.
+// other platform, the page shows Linux's. iPadOS also reports "MacIntel"
+// and gets the Mac keys, which suit an iPad with a keyboard.
 const platform = navigator.userAgentData?.platform || navigator.platform || "";
 if (/^mac/i.test(platform)) {
   for (const keys of document.querySelectorAll(".keys[data-platform]")) {

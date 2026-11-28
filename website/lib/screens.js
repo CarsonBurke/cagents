@@ -59,16 +59,16 @@ export function pictureHtml(screen, { eager = false } = {}) {
   const img = `<img src="/${screen.files[primary]}.webp" width="${screen.width}" height="${screen.height}" alt="${escapeHtml(screen.alt)}" decoding="async" ${loading} />`;
   const caption = screen.caption ? `<figcaption>${escapeHtml(screen.caption)}</figcaption>` : "";
   const icon = `<svg class="shot-expand-icon" viewBox="-4 -4 24 24" aria-hidden="true"><path d="M6 2H2v4m8-4h4v4M2 10v4h4m8-4v4h-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" /></svg>`;
-  return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture>${sources.join("")}${img}</picture>${icon}</a>${caption}`;
+  return `<a class="shot-expand" href="/${screen.files[primary]}.webp"><span class="visually-hidden">Expand screenshot. </span><picture data-themes="${screen.themes.join(" ")}">${sources.join("")}${img}</picture>${icon}</a>${caption}`;
 }
 
 // The themes every screenshot on the page was captured in. A reader sees the
 // app in one theme throughout: until each capture has a light variant, light
 // mode shows the dark captures too, rather than mixing dark and light app
 // windows on one page.
+// Dark comes first, as the fallback, whatever order screens.json lists.
 export function sharedThemes(names, screens) {
-  const [first, ...rest] = names.map((name) => screens[name].themes);
-  const themes = first.filter((theme) => rest.every((other) => other.includes(theme)));
+  const themes = ["dark", "light"].filter((theme) => names.every((name) => screens[name].themes.includes(theme)));
   if (!themes.length) throw new Error(`the page's screenshots share no theme: ${names.join(", ")}`);
   return themes;
 }

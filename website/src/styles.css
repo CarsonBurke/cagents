@@ -54,6 +54,7 @@
   --stage: linear-gradient(180deg, #1a1b1f, #111215);
   --stage-line: #24262b;
   --band: var(--bg-deep);
+  --glow: 9%;
   --shadow: 0 1px 0 rgb(255 255 255 / 0.04) inset, 0 24px 60px -20px rgb(0 0 0 / 0.7);
   --radius: 12px;
   --page: min(1240px, 100% - 2 * var(--gutter));
@@ -86,11 +87,12 @@
     --stage: linear-gradient(180deg, #26272b, #18191c);
     --stage-line: transparent;
     --band: #1c1d20;
+    --glow: 0%;
     --shadow: 0 1px 2px rgb(23 27 36 / 0.08), 0 24px 50px -24px rgb(23 27 36 / 0.4);
   }
 
   /* Once the light captures exist, light mode shows them on light surfaces. */
-  :root:has(.shot source[media="(prefers-color-scheme: light)"]) {
+  :root:has(.shot picture[data-themes~="light"]) {
     --app: #d7d7d7;
     --app-line: rgb(0 0 0 / 0.12);
     --app-focus: #1f6f62;
@@ -331,7 +333,8 @@ kbd + kbd {
 }
 
 @media (max-width: 640px) {
-  .nav-text {
+  .nav-text,
+  .nav-github-label {
     display: none;
   }
 
@@ -340,14 +343,6 @@ kbd + kbd {
     min-width: 2.5rem;
   }
 
-  .nav-github-label {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip-path: inset(50%);
-    white-space: nowrap;
-  }
 }
 
 /* Buttons and links */
@@ -453,7 +448,7 @@ kbd + kbd {
   width: 100%;
 }
 
-#agents .stage {
+.feature:nth-child(even) .stage {
   padding: clamp(1rem, 3vw, 2.25rem);
 }
 
@@ -461,6 +456,7 @@ kbd + kbd {
 
 .shot-expand {
   display: block;
+  border-radius: calc(var(--radius) - 1px);
   cursor: zoom-in;
 }
 
@@ -551,6 +547,7 @@ html:has(.screenshot-viewer[open]) {
 .viewer-image {
   overflow: auto;
   background: var(--app);
+  --focus: var(--app-focus);
 }
 
 .viewer-image:focus-visible {
@@ -721,15 +718,31 @@ main > .section:last-child {
 }
 
 /* The accounts capture is one tall pane; keep it at its natural reading size. */
-#accounts .shot {
+.feature:first-child .shot {
   max-width: 24rem;
 }
 
 /* The tall accounts capture sits beside its copy as soon as both fit. */
-@media (min-width: 45rem) {
-  #accounts {
+@media (min-width: 45rem) and (max-width: 959.98px) {
+  .feature:first-child {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: clamp(2rem, 4vw, 3rem);
+  }
+}
+
+/* Its stage hugs the capture, and the copy starts level with the stage. */
+@media (min-width: 45rem) {
+  .feature:first-child {
+    align-items: start;
+  }
+
+  .feature:first-child .feature-copy {
+    padding-top: clamp(1rem, 4vw, 3rem);
+  }
+
+  .feature:first-child .stage {
+    justify-self: end;
+    width: min(100%, calc(24rem + 2 * clamp(1.25rem, 4vw, 3rem) + 2px));
   }
 }
 
@@ -769,6 +782,19 @@ main > .section:last-child {
 
 .cards .shot {
   margin-bottom: 1rem;
+}
+
+.cards .shot-expand-icon {
+  right: 0.375rem;
+  bottom: 0.375rem;
+  width: 1.625rem;
+  height: 1.625rem;
+}
+
+@media (prefers-color-scheme: light) {
+  .cards .pane {
+    box-shadow: 0 0 0 1px rgb(23 27 36 / 0.1), 0 2px 4px rgb(23 27 36 / 0.1), 0 20px 40px -18px rgb(23 27 36 / 0.45);
+  }
 }
 
 .cards p {
@@ -882,7 +908,7 @@ pre {
   padding: clamp(4.5rem, 9vw, 7rem) var(--gutter);
   border-top: 1px solid var(--line);
   background:
-    radial-gradient(60% 100% at 50% 0%, color-mix(in srgb, var(--coral) 9%, transparent), transparent),
+    radial-gradient(60% 100% at 50% 0%, color-mix(in srgb, var(--coral) var(--glow), transparent), transparent),
     var(--bg-deep);
   text-align: center;
 }

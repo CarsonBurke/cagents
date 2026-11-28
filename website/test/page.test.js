@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import test from "node:test";
-import { loadScreens, renderPage } from "../lib/screens.js";
+import { loadScreens, renderPage, sharedThemes } from "../lib/screens.js";
 
 const root = new URL("../", import.meta.url);
 const repository = new URL("../", root);
@@ -77,14 +77,18 @@ test("install actions lead to the installation guide, never to a command", () =>
   for (const platform of ["#install-with-the-verified-installer", "#install-on-apple-silicon-macos"]) {
     assert.ok(page.includes(`href="${guide}${platform}"`), `no platform link to ${platform}`);
   }
-  assert.doesNotMatch(page, /curl\s|install\.sh|\bsh -c\b/, "the page shows no install command");
+  assert.doesNotMatch(
+    page,
+    /curl\s|install\.sh|\bsh -c\b|\b(?:brew|apt|apt-get|dnf|pacman|yay|flatpak|snap) install\b|\bdpkg -i\b|\brpm -i/,
+    "the page shows no install command",
+  );
   assert.ok(page.includes('href="https://github.com/CarsonBurke/cagents/releases/latest"'));
   const text = page.replace(/<svg[\s\S]*?<\/svg>/g, "").replace(/<[^>]*>/g, " ");
   assert.doesNotMatch(text, /\bv?\d+\.\d+\.\d+\b/, "the page names no release version");
 });
 
 test("every screenshot on the page offers the same themes", () => {
-  const pictures = [...page.matchAll(/<picture>([\s\S]*?)<\/picture>/g)].map(([, content]) =>
+  const pictures = [...page.matchAll(/<picture[^>]*>([\s\S]*?)<\/picture>/g)].map(([, content]) =>
     [...content.matchAll(/media="([^"]+)"/g)].map(([, media]) => media).join(","),
   );
   assert.equal(pictures.length, Object.keys(screens).length);
@@ -117,4 +121,52 @@ test("the README's screenshots are in the repository", () => {
   ].map(([, path]) => path);
   assert.ok(paths.length >= 5, "the README shows the hero and its tour");
   for (const path of paths) assert.ok(existsSync(new URL(path, repository)), `${path} is missing`);
+});
+
+// Made-up captures with the given themes, without reading any files.
+const fakeScreens = (themesByName) =>
+  Object.fromEntries(
+    Object.entries(themesByName).map(([name, themes]) => [
+      name,
+      {
+        alt: `${name} capture`,
+        themes,
+        files: Object.fromEntries(themes.map((theme) => [theme, `src/screens/${name}-${theme}`])),
+        width: 10,
+        height: 10,
+      },
+    ]),
+  );
+const fakePage = (names) => names.map((name) => `<figure class="shot"><!--screenshot:${name}--></figure>`).join("");
+
+test("captures that all have a light variant show it in light mode", () => {
+  const screens = fakeScreens({ one: ["light", "dark"], two: ["dark", "light"] });
+  const html = renderPage(fakePage(["one", "two"]), { screens });
+  const pictures = [...html.matchAll(/<picture data-themes="([^"]+)">([\s\S]*?)<\/picture>/g)];
+  assert.equal(pictures.length, 2);
+  for (const [, themes, content] of pictures) {
+    assert.equal(themes, "dark light");
+    assert.match(content, /media="\(prefers-color-scheme: light\)"[^>]*srcset="\/src\/screens\/\w+-light\.webp"/);
+    assert.match(content, /<img src="\/src\/screens\/\w+-dark\.webp"/, "dark stays the fallback");
+  }
+});
+
+test("one dark-only capture keeps every capture dark", () => {
+  const screens = fakeScreens({ one: ["dark", "light"], two: ["dark"] });
+  const html = renderPage(fakePage(["one", "two"]), { screens });
+  assert.doesNotMatch(html, /prefers-color-scheme|-light\./);
+  assert.equal([...html.matchAll(/<picture data-themes="dark">/g)].length, 2);
+});
+
+test("captures that share no theme are an error", () => {
+  const screens = fakeScreens({ one: ["dark"], two: ["light"] });
+  assert.throws(() => renderPage(fakePage(["one", "two"]), { screens }), /share no theme/);
+  assert.deepEqual(sharedThemes(["two"], screens), ["light"]);
+});
+
+test("the stylesheet's light-capture switch matches the markup", () => {
+  const css = readFileSync(new URL("src/styles.css", root), "utf8");
+  assert.ok(css.includes('picture[data-themes~="light"]'), "styles.css no longer keys light surfaces on data-themes");
+  const html = renderPage(fakePage(["one"]), { screens: fakeScreens({ one: ["dark", "light"] }) });
+  assert.ok(html.includes('<picture data-themes="dark light">'));
 });
