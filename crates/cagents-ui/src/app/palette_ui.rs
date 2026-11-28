@@ -2239,16 +2239,10 @@ mod tests {
         app.settings.palette_recents = [8, 6, 3]
             .map(|index| entry_key(&entries[index].2).unwrap())
             .into();
-        let identities = |entries: Vec<(String, Message)>| {
+        let identities = |entries: Vec<(String, String, Message)>| {
             entries
                 .into_iter()
-                .map(|(label, message)| (label, EntryIdentity::capture(&message)))
-                .collect::<Vec<_>>()
-        };
-        let unhinted = |entries: Vec<(String, _, Message)>| {
-            entries
-                .into_iter()
-                .map(|(label, _, message)| (label, message))
+                .map(|(label, hint, message)| (label, hint, EntryIdentity::capture(&message)))
                 .collect::<Vec<_>>()
         };
         for move_pane in [None, Some(card)] {
@@ -2285,11 +2279,13 @@ mod tests {
                     )
                 });
                 assert_eq!(
-                    identities(unhinted(app.filter_palette_entries(entries.clone()))),
+                    identities(app.filter_palette_entries(entries.clone())),
                     identities(
                         expected
                             .into_iter()
-                            .map(|(label, _, message)| (label, message))
+                            .map(|(label, hint, message)| {
+                                (label, app.palette_detail(&hint).to_owned(), message)
+                            })
                             .collect()
                     ),
                     "query {raw_query:?}, moving {moving}"

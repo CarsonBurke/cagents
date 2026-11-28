@@ -1109,7 +1109,7 @@ pub enum ShortcutKey {
 }
 
 pub fn parse_shortcut(raw: &str) -> Result<ShortcutBinding, &'static str> {
-    let (chord, key) = lex_chord(raw)?;
+    let (chord, key) = lex_chord(raw, true)?;
     let key = match key {
         Some(ShownKey::Bound(key)) => Some(key),
         Some(_) => return Err(UNBINDABLE_KEY),
@@ -1138,7 +1138,7 @@ const UNBINDABLE_KEY: &str = "keyboard shortcut key must be a letter, digit, pun
 /// whether a binding could take it: `Shift+Enter` is a find field's chord,
 /// though no action may be bound to it.
 fn parse_chord(raw: &str) -> Result<ShownChord, &'static str> {
-    let (chord, key) = lex_chord(raw)?;
+    let (chord, key) = lex_chord(raw, false)?;
     Ok(ShownChord {
         key: key.ok_or("keyboard shortcut must contain a key")?,
         ..chord
@@ -1146,8 +1146,9 @@ fn parse_chord(raw: &str) -> Result<ShownChord, &'static str> {
 }
 
 /// [`parse_chord`]'s modifiers, with its key where it names one; the chord
-/// returned holds a placeholder key.
-fn lex_chord(raw: &str) -> Result<(ShownChord, Option<ShownKey>), &'static str> {
+/// returned holds a placeholder key. With `bindable`, a key no binding takes
+/// is refused where it is read, ahead of any later error in the chord.
+fn lex_chord(raw: &str, bindable: bool) -> Result<(ShownChord, Option<ShownKey>), &'static str> {
     let mut control = false;
     let mut alt = false;
     let mut shift = false;
@@ -1181,7 +1182,11 @@ fn lex_chord(raw: &str) -> Result<(ShownChord, Option<ShownKey>), &'static str> 
         if key.is_some() {
             return Err("keyboard shortcut must contain exactly one key");
         }
-        key = Some(parse_key(token).ok_or(UNBINDABLE_KEY)?);
+        key = match parse_key(token) {
+            Some(ShownKey::Bound(key)) => Some(ShownKey::Bound(key)),
+            Some(key) if !bindable => Some(key),
+            _ => return Err(UNBINDABLE_KEY),
+        };
     }
     let chord = ShownChord {
         control,
@@ -2512,9 +2517,10 @@ fn free_defaults(chords: Vec<String>, bound: &[ShortcutBinding]) -> Vec<String> 
 /// An action the table lacks was on its default too, and the user chose the
 /// table's chords around it, so it takes part as if it held its old default:
 /// it moves where its new chords are free and keeps the old ones where they
-/// are not, rather than ending up unbound. One the build that wrote the table
-/// may not have had never had a default there; it is left to
-/// `preserve_existing_shortcut`.
+/// are not, rather than ending up unbound. It is not implied onto a chord the
+/// table gives another action, and one whose old chords the table gives away
+/// entirely, like one the build that wrote the table may not have had, is
+/// left to `preserve_existing_shortcut`.
 fn adopt_shortcut_defaults(
     shortcuts: &mut toml::Table,
     revision: u32,
@@ -2531,19 +2537,31 @@ fn adopt_shortcut_defaults(
             && left.iter().all(|chord| right.contains(chord))
             && right.iter().all(|chord| left.contains(chord))
     };
+    let listed = bound_chords(shortcuts, &[]);
     let mut implied = Vec::new();
     for action in SHORTCUT_ACTIONS {
         if !shortcuts.contains_key(action)
             && every_table_had(action, revision)
             && let Some(retired) = retired_default(action, revision)
         {
-            shortcuts.insert(action.into(), retired.to_vec().into());
-            implied.push(action);
+            // A chord the table gives another action was the user's choice
+            // over this default, so it is not implied back.
+            let free = free_defaults(
+                retired.iter().map(|chord| (*chord).to_owned()).collect(),
+                &listed,
+            );
+            if !free.is_empty() {
+                shortcuts.insert(action.into(), free.into());
+                implied.push(action);
+            }
         }
     }
     let mut moving: Vec<&str> = SHORTCUT_ACTIONS
         .into_iter()
         .filter(|action| {
+            if implied.contains(action) {
+                return true;
+            }
             let Some(chords) = shortcuts.get(*action).and_then(parsed_chords) else {
                 return false;
             };
@@ -5761,6 +5779,17 @@ next_column = ["Alt+W", "Alt+Right"]
         assert_eq!(shortcuts.chat_account, ["Ctrl+Shift+A"]);
         assert_eq!(shortcuts.toggle_inspector, ["Ctrl+Shift+I"]);
         assert_eq!(shortcuts.cycle_pane_width, ["Alt+Shift+R"]);
+
+        // A listed action holds the old chord too: the user's choice stands,
+        // and the omitted action takes no chord rather than share it.
+        let loaded = load_sparse(&[
+            ("new_terminal", &["Alt+I"]),
+            ("open_settings", &["Ctrl+Shift+I"]),
+        ]);
+        let shortcuts = &loaded.keyboard_shortcuts;
+        assert_eq!(shortcuts.new_terminal, ["Alt+I"]);
+        assert_eq!(shortcuts.open_settings, ["Ctrl+Shift+I"]);
+        assert!(shortcuts.toggle_inspector.is_empty());
     }
 
     #[test]

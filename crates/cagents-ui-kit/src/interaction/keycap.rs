@@ -230,15 +230,16 @@ impl<Message> Widget<Message, Theme, Renderer> for Cap<'_, Message> {
             &layout::Limits::new(Size::ZERO, limits.max()),
         );
         let inner = key.size();
-        let size = Size::new(
-            (inner.width + 2.0 * CAP_PADDING).max(MIN_CAP_WIDTH),
-            inner.height,
+        let size = limits.resolve(
+            Length::Shrink,
+            Length::Shrink,
+            Size::new(
+                (inner.width + 2.0 * CAP_PADDING).max(MIN_CAP_WIDTH),
+                inner.height,
+            ),
         );
-        let key = key.move_to(Point::new((size.width - inner.width) / 2.0, 0.0));
-        layout::Node::with_children(
-            limits.resolve(Length::Shrink, Length::Shrink, size),
-            vec![key],
-        )
+        let key = key.move_to(Point::new(((size.width - inner.width) / 2.0).max(0.0), 0.0));
+        layout::Node::with_children(size, vec![key])
     }
 
     fn operate(
@@ -248,11 +249,18 @@ impl<Message> Widget<Message, Theme, Renderer> for Cap<'_, Message> {
         renderer: &Renderer,
         operation: &mut dyn Operation,
     ) {
-        if let Some(key) = layout.children().next() {
-            self.key
-                .as_widget_mut()
-                .operate(&mut tree.children[0], key, renderer, operation);
-        }
+        let Some(key) = layout.children().next() else {
+            return;
+        };
+        operation.container(None, layout.bounds());
+        operation.traverse(&mut |operation| {
+            self.key.as_widget_mut().operate(
+                &mut tree.children[0],
+                key.with_virtual_offset(layout.virtual_offset()),
+                renderer,
+                operation,
+            );
+        });
     }
 
     fn draw(

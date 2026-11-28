@@ -633,8 +633,12 @@ impl<Message> Widget<Message, Theme, Renderer> for Table<'_, Message> {
                 .zip(&mut tree.children)
                 .zip(layout.children())
             {
-                cell.as_widget_mut()
-                    .operate(tree, cell_layout, renderer, operation);
+                cell.as_widget_mut().operate(
+                    tree,
+                    cell_layout.with_virtual_offset(layout.virtual_offset()),
+                    renderer,
+                    operation,
+                );
             }
         });
     }
