@@ -333,7 +333,7 @@ fn device_access(operation: &DeviceOperation) -> Access<'static> {
 pub(super) fn restoring_terminals() -> ProtocolError {
     ProtocolError::new(
         ProtocolErrorCode::TerminalUnavailable,
-        "The application update is still restoring its terminals",
+        crate::terminal_ipc::UPDATE_RESTORING_TERMINALS,
         true,
     )
 }

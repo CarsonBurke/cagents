@@ -1222,75 +1222,22 @@ impl ControlClient {
         socket_path: &Path,
         connected: impl FnOnce(&UnixStream) -> io::Result<()>,
     ) -> Result<Self, ControlError> {
-        #[cfg(feature = "ui")]
-        let health_request = crate::daemon_health::begin();
-        let deadline = Instant::now() + Self::handshake_timeout();
-        let result = (|| {
-            let stream = connect_control_socket(
-                socket_path,
-                io_timeout().min(deadline.saturating_duration_since(Instant::now())),
-            )
-            .map_err(ControlError::Connect)?;
-            connected(&stream).map_err(ControlError::Configure)?;
-            Self::from_stream_inner(
-                stream,
-                deadline,
-                deadline.min(Instant::now() + io_timeout()),
-            )
-        })();
-        #[cfg(feature = "ui")]
-        crate::daemon_health::connection(socket_path, &result, health_request);
-        result
+        DaemonConnect::default()
+            .connect_socket(socket_path, connected)
+            .map(|handshake| Self::from_handshake(handshake, PROTOCOL_VERSION))
     }
 
     pub fn from_stream(stream: UnixStream) -> Result<Self, ControlError> {
-        let deadline = Instant::now() + Self::handshake_timeout();
-        Self::from_stream_inner(
-            stream,
-            deadline,
-            deadline.min(Instant::now() + io_timeout()),
-        )
-    }
-
-    fn handshake_timeout() -> Duration {
-        if crate::device::is_remote() {
-            REMOTE_HANDSHAKE_TIMEOUT
-        } else {
-            io_timeout()
-        }
-    }
-
-    /// Handshake with a daemon that may still be restoring behind its bound
-    /// listener. The reply may arrive as late as `deadline`, and never gets
-    /// less time than an ordinary handshake.
-    pub(crate) fn from_stream_until(
-        stream: UnixStream,
-        deadline: Instant,
-    ) -> Result<Self, ControlError> {
-        let deadline = deadline.max(Instant::now() + Self::handshake_timeout());
-        Self::from_stream_inner(stream, deadline, Instant::now() + io_timeout())
-    }
-
-    /// Consult the restoration deadline only if the ordinary hello budget runs out.
-    pub(crate) fn from_stream_with_startup_deadline(
-        stream: UnixStream,
-        startup_deadline: impl FnOnce() -> Instant,
-    ) -> Result<Self, ControlError> {
-        let now = Instant::now();
-        Self::from_stream_at(
-            stream,
-            now + Self::handshake_timeout(),
-            now + io_timeout(),
-            PROTOCOL_VERSION,
-            Some(startup_deadline),
-        )
+        DaemonConnect::default()
+            .connect(stream)
+            .map(|handshake| Self::from_handshake(handshake, PROTOCOL_VERSION))
     }
 
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,
     ) -> Result<Self, ControlError> {
-        Self::from_stream_inner(stream, deadline, deadline)
+        Self::from_stream_at(stream, deadline, PROTOCOL_VERSION)
     }
 
     /// Handshake with an update source at its own protocol number. Only the
@@ -1304,63 +1251,31 @@ impl ControlClient {
         if !crate::update::source::is_qualified_source(protocol) {
             return Err(ControlError::UnsupportedVersion { actual: protocol });
         }
-        Self::from_stream_at(
-            stream,
-            deadline,
-            deadline,
-            protocol,
-            None::<fn() -> Instant>,
-        )
-    }
-
-    fn from_stream_inner(
-        stream: UnixStream,
-        deadline: Instant,
-        write_deadline: Instant,
-    ) -> Result<Self, ControlError> {
-        Self::from_stream_at(
-            stream,
-            deadline,
-            write_deadline,
-            PROTOCOL_VERSION,
-            None::<fn() -> Instant>,
-        )
+        Self::from_stream_at(stream, deadline, protocol)
     }
 
     fn from_stream_at(
         stream: UnixStream,
         deadline: Instant,
-        write_deadline: Instant,
         protocol: u16,
-        extend: Option<impl FnOnce() -> Instant>,
     ) -> Result<Self, ControlError> {
-        crate::descriptor::keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&stream))
-            .map_err(ControlError::Configure)?;
-        stream
-            .set_read_timeout(Some(Self::handshake_timeout()))
-            .map_err(ControlError::Configure)?;
-        stream
-            .set_write_timeout(Some(io_timeout()))
-            .map_err(ControlError::Configure)?;
-        let mut client = HandshakeClient {
+        let handshake = DaemonConnect::default().connect_at(
             stream,
-            next_request_id: 1,
+            deadline,
+            deadline,
             protocol,
-        };
-        let proof = client.handshake(deadline, write_deadline, extend)?;
-        client
-            .stream
-            .set_read_timeout(Some(io_timeout()))
-            .map_err(ControlError::Configure)?;
-        client
-            .stream
-            .set_write_timeout(Some(io_timeout()))
-            .map_err(ControlError::Configure)?;
-        Ok(Self {
-            stream: client.stream,
-            proof,
+            None::<fn() -> Instant>,
+        )?;
+        Ok(Self::from_handshake(handshake, protocol))
+    }
+
+    /// Adopt a Connect exchange that requested no terminal replay.
+    pub(crate) fn from_handshake(handshake: DaemonHandshake, protocol: u16) -> Self {
+        Self {
+            stream: handshake.stream,
+            proof: handshake.proof,
             protocol,
-            next_request_id: client.next_request_id,
+            next_request_id: 2,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
@@ -1372,7 +1287,7 @@ impl ControlClient {
             attached_chats: BTreeSet::new(),
             terminal_streams: BTreeSet::new(),
             device_peer: None,
-        })
+        }
     }
 
     pub fn proof(&self) -> &HostSessionProof {
@@ -3581,28 +3496,119 @@ impl Write for DeadlineWriter<'_> {
     }
 }
 
-struct HandshakeClient {
-    stream: UnixStream,
-    next_request_id: u64,
-    protocol: u16,
+/// The result of one Connect exchange. Replay queued after Connected remains
+/// unread on the stream and belongs to the transport that requested it.
+#[derive(Debug)]
+pub(crate) struct DaemonHandshake {
+    pub(crate) stream: UnixStream,
+    pub(crate) proof: HostSessionProof,
+    pub(crate) resumed: Vec<TerminalDescriptor>,
 }
 
-impl HandshakeClient {
-    fn handshake(
-        &mut self,
+#[derive(Default)]
+pub(crate) struct DaemonConnect {
+    pub(crate) expected_host: Option<HostSessionProof>,
+    pub(crate) resume: Vec<crate::terminal::ipc::ResumeCursor>,
+}
+
+impl DaemonConnect {
+    fn timeout() -> Duration {
+        if crate::device::is_remote() {
+            REMOTE_HANDSHAKE_TIMEOUT
+        } else {
+            io_timeout()
+        }
+    }
+
+    pub(crate) fn connect_socket(
+        &self,
+        socket_path: &Path,
+        connected: impl FnOnce(&UnixStream) -> io::Result<()>,
+    ) -> Result<DaemonHandshake, ControlError> {
+        #[cfg(feature = "ui")]
+        let health_request = crate::daemon_health::begin();
+        let deadline = Instant::now() + Self::timeout();
+        let result = (|| {
+            let stream = connect_control_socket(
+                socket_path,
+                io_timeout().min(deadline.saturating_duration_since(Instant::now())),
+            )
+            .map_err(ControlError::Connect)?;
+            connected(&stream).map_err(ControlError::Configure)?;
+            self.connect_at(
+                stream,
+                deadline,
+                deadline.min(Instant::now() + io_timeout()),
+                PROTOCOL_VERSION,
+                None::<fn() -> Instant>,
+            )
+        })();
+        #[cfg(feature = "ui")]
+        crate::daemon_health::connection(socket_path, &result, health_request);
+        result
+    }
+
+    pub(crate) fn connect(&self, stream: UnixStream) -> Result<DaemonHandshake, ControlError> {
+        let deadline = Instant::now() + Self::timeout();
+        self.connect_at(
+            stream,
+            deadline,
+            deadline.min(Instant::now() + io_timeout()),
+            PROTOCOL_VERSION,
+            None::<fn() -> Instant>,
+        )
+    }
+
+    /// A just-launched daemon gets its startup allowance and at least the
+    /// ordinary Connect reply budget.
+    pub(crate) fn connect_until(
+        &self,
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<DaemonHandshake, ControlError> {
+        self.connect_at(
+            stream,
+            deadline.max(Instant::now() + Self::timeout()),
+            Instant::now() + io_timeout(),
+            PROTOCOL_VERSION,
+            None::<fn() -> Instant>,
+        )
+    }
+
+    /// Consult the restoration allowance only if the ordinary reply times out.
+    pub(crate) fn connect_with_startup_deadline(
+        &self,
+        stream: UnixStream,
+        startup_deadline: impl FnOnce() -> Instant,
+    ) -> Result<DaemonHandshake, ControlError> {
+        let now = Instant::now();
+        self.connect_at(
+            stream,
+            now + Self::timeout(),
+            now + io_timeout(),
+            PROTOCOL_VERSION,
+            Some(startup_deadline),
+        )
+    }
+
+    fn connect_at(
+        &self,
+        mut stream: UnixStream,
         deadline: Instant,
         write_deadline: Instant,
+        protocol: u16,
         extend: Option<impl FnOnce() -> Instant>,
-    ) -> Result<HostSessionProof, ControlError> {
-        let request_id = self.next_request_id;
-        self.next_request_id += 1;
+    ) -> Result<DaemonHandshake, ControlError> {
+        crate::descriptor::keep_options_after_shutdown(std::os::fd::AsFd::as_fd(&stream))
+            .map_err(ControlError::Configure)?;
+        let request_id = 1;
         let request = ClientEnvelope {
-            version: self.protocol,
+            version: protocol,
             request_id,
             proof: None,
             request: ClientRequest::Connect {
-                expected_host: None,
-                resume: Vec::new(),
+                expected_host: self.expected_host.clone(),
+                resume: self.resume.clone(),
             },
         };
         // Defaults keep the original five-second write budget, including when
@@ -3610,7 +3616,7 @@ impl HandshakeClient {
         // own complete operation deadline for both directions.
         write_frame(
             &mut DeadlineWriter {
-                stream: &mut self.stream,
+                stream: &mut stream,
                 deadline: write_deadline,
             },
             &request,
@@ -3618,12 +3624,12 @@ impl HandshakeClient {
         let started = Instant::now();
         let mut reader = HandshakeReplyReader {
             reader: DeadlineReader {
-                stream: &mut self.stream,
+                stream: &mut stream,
                 deadline,
             },
             extend,
         };
-        let envelope: ServerEnvelope = read_frame_from(self.protocol, &mut reader)
+        let envelope: ServerEnvelope = read_frame_from(protocol, &mut reader)
             .map_err(|error| {
                 reply_error(
                     error,
@@ -3631,27 +3637,49 @@ impl HandshakeClient {
                 )
             })?
             .ok_or(ControlError::ConnectionClosed)?;
-        validate_handshake(&envelope, self.protocol, request_id)
-            .cloned()
-            .map_err(|error| match error {
-                HandshakeError::UnsupportedVersion { actual } => {
-                    ControlError::UnsupportedVersion { actual }
-                }
-                HandshakeError::RequestIdMismatch { expected, actual } => {
-                    ControlError::RequestIdMismatch { expected, actual }
-                }
-                HandshakeError::IncompleteProof => ControlError::IncompleteProof,
-                HandshakeError::ProofMismatch => ControlError::ProofMismatch,
-                HandshakeError::Remote(error) => ControlError::Remote {
-                    code: error.code,
-                    message: error.message.clone(),
-                    retryable: error.retryable,
-                },
-                HandshakeError::UnexpectedMessage(message) => ControlError::UnexpectedMessage {
-                    expected: "the connect response",
-                    actual: message_name(message),
-                },
-            })
+        validate_handshake(&envelope, protocol, request_id).map_err(|error| match error {
+            HandshakeError::UnsupportedVersion { actual } => {
+                ControlError::UnsupportedVersion { actual }
+            }
+            HandshakeError::RequestIdMismatch { expected, actual } => {
+                ControlError::RequestIdMismatch { expected, actual }
+            }
+            HandshakeError::IncompleteProof => ControlError::IncompleteProof,
+            HandshakeError::ProofMismatch => ControlError::ProofMismatch,
+            HandshakeError::Remote(error) => ControlError::Remote {
+                code: error.code,
+                message: error.message.clone(),
+                retryable: error.retryable,
+            },
+            HandshakeError::UnexpectedMessage(message) => ControlError::UnexpectedMessage {
+                expected: "the connect response",
+                actual: message_name(message),
+            },
+        })?;
+        let ServerMessage::Response {
+            response: ServerResponse::Connected { proof, resumed },
+        } = envelope.message
+        else {
+            unreachable!("validated Connect response")
+        };
+        if self
+            .expected_host
+            .as_ref()
+            .is_some_and(|expected| expected != &proof)
+        {
+            return Err(ControlError::ProofMismatch);
+        }
+        stream
+            .set_read_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        stream
+            .set_write_timeout(Some(io_timeout()))
+            .map_err(ControlError::Configure)?;
+        Ok(DaemonHandshake {
+            stream,
+            proof,
+            resumed,
+        })
     }
 }
 /// How long a reply was awaited, as a person reads it: whole seconds, or a
@@ -9142,11 +9170,12 @@ mod tests {
         )
         .unwrap();
 
-        let client = ControlClient::from_stream_with_startup_deadline(client, || {
-            panic!("a warm hello must not read the upgrade checkpoint")
-        })
-        .unwrap();
-        assert_eq!(client.proof(), &pinned);
+        let client = DaemonConnect::default()
+            .connect_with_startup_deadline(client, || {
+                panic!("a warm hello must not read the upgrade checkpoint")
+            })
+            .unwrap();
+        assert_eq!(client.proof, pinned);
         let request: ClientEnvelope = read_frame(&mut server).unwrap().unwrap();
         assert!(matches!(request.request, ClientRequest::Connect { .. }));
     }
