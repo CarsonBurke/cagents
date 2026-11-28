@@ -96,9 +96,7 @@ fn apple_silicon_uses_the_verified_release_route_or_the_installer() {
         }
     );
     assert_eq!(
-        plan_mac(&remote, &Daemon::Compatible(OURS.version.into()))
-            .unwrap()
-            .action,
+        plan_mac(&remote, &Daemon::Compatible(())).unwrap().action,
         Action::Nothing
     );
     assert!(plan_mac(&remote, &Daemon::Speaks(PROTOCOL_VERSION + 1)).is_err());
@@ -233,10 +231,7 @@ fn a_build_already_on_the_device_is_not_sent_again() {
 #[test]
 fn a_compatible_device_is_left_alone() {
     let remote = installed("0.2.4+local.old");
-    assert_eq!(
-        action(&remote, &Daemon::Compatible(OURS.version.into())),
-        Action::Nothing
-    );
+    assert_eq!(action(&remote, &Daemon::Compatible(())), Action::Nothing);
     let mut stopped = remote;
     stopped.protocol = Some(PROTOCOL_VERSION);
     assert_eq!(action(&stopped, &Daemon::Stopped), Action::Nothing);
@@ -596,6 +591,87 @@ fn glibc_requirements_come_from_an_executables_version_needs() {
     assert!(glibc_versions(script.path()).unwrap().is_empty());
     assert_eq!(parse_version("2.41"), Some(vec![2, 41]));
     assert!(vec![2, 9] < vec![2, 41]);
+}
+
+#[test]
+fn compatible_preflight_needs_only_the_handshake_even_when_build_info_fails() {
+    use crate::{
+        model::{BootId, HostIncarnation, HostSessionId, HostSessionProof},
+        terminal_ipc::{
+            ClientEnvelope, ClientRequest, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+            ServerMessage, ServerResponse, read_frame, write_frame,
+        },
+    };
+    use std::{os::unix::net::UnixListener, thread, time::Duration};
+
+    let root = tempfile::tempdir().unwrap();
+    let socket = root.path().join("daemon.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let peer = thread::spawn(move || {
+        for verify in [false, true] {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let hello: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+            assert!(matches!(hello.request, ClientRequest::Connect { .. }));
+            let proof = HostSessionProof {
+                host_session_id: HostSessionId::new("session"),
+                boot_id: BootId::new("boot"),
+                host_incarnation: HostIncarnation::new("incarnation"),
+            };
+            write_frame(
+                &mut stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+
+            let next: Option<ClientEnvelope> = read_frame(&mut stream).unwrap();
+            if verify {
+                let request = next.expect("post-handoff BuildInfo");
+                assert!(matches!(request.request, ClientRequest::BuildInfo));
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof,
+                        message: ServerMessage::Error(ProtocolError::new(
+                            ProtocolErrorCode::Internal,
+                            "fixture build is unavailable",
+                            false,
+                        )),
+                    },
+                )
+                .unwrap();
+            } else {
+                assert!(next.is_none(), "preflight must close after the handshake");
+            }
+        }
+    });
+
+    let state = daemon_state(Ok(Some(socket.clone())));
+    let build = daemon_build(Ok(Some(socket)));
+    peer.join().unwrap();
+    // The configured CLI lags the running daemon. Losing the compatible
+    // state here would turn a no-op into a provisioning attempt.
+    let remote = installed("0.2.4+local.old");
+    assert_eq!(state, Daemon::Compatible(()));
+    assert_eq!(action(&remote, &state), Action::Nothing);
+    assert!(
+        matches!(build, Daemon::Unknown(ref error) if error.contains("fixture build is unavailable")),
+        "{build:?}"
+    );
 }
 
 #[test]

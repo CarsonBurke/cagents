@@ -18,7 +18,10 @@ use std::{
 use sha2::{Digest, Sha256};
 
 use super::{Device, control_path, quote, remote_executable, ssh};
-use crate::terminal_ipc::PROTOCOL_VERSION;
+use crate::{
+    control::{ControlClient, ControlError},
+    terminal_ipc::PROTOCOL_VERSION,
+};
 
 /// The installer of this very build, which knows its own archive layout.
 const INSTALLER: &str = include_str!("../../install.sh");
@@ -75,8 +78,8 @@ pub enum Step<'a> {
 
 /// The device's daemon, as seen through its bridge without starting it.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Daemon {
-    Compatible(String),
+enum Daemon<Build = ()> {
+    Compatible(Build),
     Speaks(u16),
     Stopped,
     /// It could not be reached for another reason; the device's own update
@@ -107,7 +110,7 @@ pub fn check(device: &Device) -> io::Result<(Check, Option<String>)> {
     let local = Local::current()?;
     let session = Session::open(device)?;
     let remote = Remote::probe(&session, device, &local.version)?;
-    let daemon = daemon_state();
+    let daemon = daemon_state(super::existing_socket_path());
     if let Some(protocol) = newer(&remote, &daemon) {
         return Ok((Check::Newer { protocol }, None));
     }
@@ -140,7 +143,7 @@ pub fn update(
     progress(Step::Inspecting);
     let session = Session::open(device)?;
     let remote = Remote::probe(&session, device, &local.version)?;
-    let daemon = daemon_state();
+    let daemon = daemon_state(super::existing_socket_path());
     let plan = plan(device, &local, &remote, &daemon)?;
     let mac_release = verify_mac_release(device, &local.version, &plan.action)?;
     if let Some(note) = &plan.note {
@@ -195,9 +198,12 @@ pub fn update(
     session.upgrade(device, &cli, release, options)?;
     progress(Step::Verifying);
     let version = release.map_or(local.version.as_str(), |(version, _)| version);
-    verify_update(device, version, daemon_state(), || {
-        Remote::probe(&session, device, version)
-    })?;
+    verify_update(
+        device,
+        version,
+        daemon_build(super::existing_socket_path()),
+        || Remote::probe(&session, device, version),
+    )?;
     Ok(Outcome::Updated {
         sent,
         version: version.to_owned(),
@@ -207,7 +213,7 @@ pub fn update(
 fn verify_update(
     device: &Device,
     version: &str,
-    daemon: Daemon,
+    daemon: Daemon<String>,
     probe: impl FnOnce() -> io::Result<Remote>,
 ) -> io::Result<()> {
     let name = &device.name;
@@ -789,18 +795,29 @@ fn newer(remote: &Remote, daemon: &Daemon) -> Option<u16> {
     .filter(|actual| *actual > PROTOCOL_VERSION)
 }
 
-fn daemon_state() -> Daemon {
-    let socket = match super::existing_socket_path() {
+fn daemon_state(socket: io::Result<Option<PathBuf>>) -> Daemon {
+    inspect_daemon(socket, |_| Ok(()))
+}
+
+fn daemon_build(socket: io::Result<Option<PathBuf>>) -> Daemon<String> {
+    inspect_daemon(socket, |mut client| client.daemon_version())
+}
+
+fn inspect_daemon<T>(
+    socket: io::Result<Option<PathBuf>>,
+    connected: impl FnOnce(ControlClient) -> Result<T, ControlError>,
+) -> Daemon<T> {
+    let socket = match socket {
         Ok(Some(socket)) => socket,
         Ok(None) => return Daemon::Unknown("no device is selected".into()),
         Err(error) => return Daemon::Unknown(error.to_string()),
     };
-    match crate::control::ControlClient::connect(&socket) {
-        Ok(mut client) => match client.daemon_version() {
-            Ok(version) => Daemon::Compatible(version),
+    match ControlClient::connect(&socket) {
+        Ok(client) => match connected(client) {
+            Ok(value) => Daemon::Compatible(value),
             Err(error) => Daemon::Unknown(error.to_string()),
         },
-        Err(crate::control::ControlError::UnsupportedVersion { actual }) => Daemon::Speaks(actual),
+        Err(ControlError::UnsupportedVersion { actual }) => Daemon::Speaks(actual),
         Err(_) if super::existing_daemon_missing() => Daemon::Stopped,
         Err(error) => Daemon::Unknown(error.to_string()),
     }
