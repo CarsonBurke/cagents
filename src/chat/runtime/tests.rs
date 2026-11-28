@@ -1143,6 +1143,7 @@ fn steps_left_running_by_an_ended_provider_read_as_stopped() {
         .items
         .push(Arc::new(tool("child", ToolStatus::Running)));
     subagent(&mut state, "builder").status = ToolStatus::Failed;
+    stop_snapshot_subagents(&mut state);
     stop_snapshot_steps(&mut state);
     apply_event(&mut state, &mut indices, Event::Exited { code: None });
     let statuses: Vec<_> = state
@@ -4591,6 +4592,145 @@ impl Adapter for WebSocketFixture {
         });
         Ok(step)
     }
+}
+
+#[test]
+fn shared_websocket_disconnect_preserves_unfinished_steps_and_edits() {
+    use super::super::FileChangeReply;
+    use std::os::unix::fs::MetadataExt;
+    use tungstenite::Message;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("codex.sock");
+    let listener = crate::descriptor::bind(&path).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        followed: false,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::UnixWebSocket {
+            socket: path,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        },
+        program: "/nonexistent/shared-codex".into(),
+        arguments: Vec::new(),
+        working_directory: directory.path().into(),
+        environment: BTreeMap::new(),
+    };
+    let (disconnect, disconnect_requested) = crossbeam_channel::bounded(1);
+    let (finish, finish_requested) = crossbeam_channel::bounded(1);
+    let server = thread::spawn(move || {
+        let (stream, _) = crate::descriptor::accept(&listener).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut socket = tungstenite::accept(stream).unwrap();
+        assert!(matches!(socket.read().unwrap(), Message::Text(_)));
+        socket
+            .send(Message::Text(
+                json!({"text": "Editing", "busy": true}).to_string().into(),
+            ))
+            .unwrap();
+        disconnect_requested
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        drop(socket);
+        // A shared server and its work can survive the loss of one client.
+        finish_requested
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+        drop(listener);
+    });
+
+    let mut adapter = Box::new(WebSocketFixture);
+    let mut initial = adapter.initialize().unwrap();
+    initial.events.extend([
+        Event::Item(Item {
+            id: "edit".into(),
+            role: Role::Assistant,
+            started_at: None,
+            at: None,
+            content: ItemContent::Changes {
+                changes: vec![crate::chat::FileChange {
+                    lines: crate::chat::LineOrigin::File,
+                    path: "a.rs".into(),
+                    kind: crate::chat::ChangeKind::Updated,
+                    diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                }],
+                status: ToolStatus::Running,
+            },
+        }),
+        Event::Subagent {
+            id: "child".into(),
+            kind: "agent".into(),
+            description: "Review the edit".into(),
+            status: Some(ToolStatus::Running),
+            background: Some(true),
+            model: None,
+            waiting: None,
+            detail: None,
+        },
+        Event::SubagentItem {
+            id: "child".into(),
+            item: Item {
+                id: "child-review".into(),
+                role: Role::Assistant,
+                started_at: None,
+                at: None,
+                content: ItemContent::Tool {
+                    name: "Review".into(),
+                    input: String::new(),
+                    output: String::new(),
+                    status: ToolStatus::Running,
+                },
+            },
+        },
+    ]);
+    let store = preflight(&spec, &mut initial).unwrap();
+    let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+    let before = until(&handle, |snapshot| snapshot.busy);
+    let file = &before.file_changes.files[0];
+    assert_eq!((file.pending, file.failed), (1, 0));
+    assert!(!handle.background_subagents().is_empty());
+    assert_eq!(
+        before.subagents[0].items[0].content.status(),
+        Some(ToolStatus::Running)
+    );
+
+    disconnect.send(()).unwrap();
+    let after = until(&handle, |snapshot| snapshot.exited && handle.is_completed());
+    handle.close().unwrap();
+    finish.send(()).unwrap();
+    server.join().unwrap();
+
+    assert!(
+        after.error.is_some(),
+        "a lost transport still reports an error"
+    );
+    assert!(!after.busy);
+    assert_eq!(after.items, before.items);
+    assert_eq!(after.subagents[0].items, before.subagents[0].items);
+    assert!(handle.background_subagents().is_empty());
+    assert_eq!(after.file_changes, before.file_changes);
+    let Some(FileChangeReply::Patches(patches)) = handle
+        .file_query(&Command::LoadFileChangePatches {
+            request_id: 1,
+            key: file.key.clone(),
+            cursor: None,
+            revision: file.revision,
+        })
+        .unwrap()
+    else {
+        panic!("expected retained patch");
+    };
+    assert!(patches.error.is_none());
+    assert_eq!(patches.patches[0].status, ToolStatus::Running);
 }
 
 #[test]
