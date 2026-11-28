@@ -2190,6 +2190,37 @@ impl ControlClient {
         closed
     }
 
+    pub fn begin_chat_close(
+        &mut self,
+        receipt: uuid::Uuid,
+        session: crate::chat::Session,
+    ) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::BeginChatClose { receipt, session })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response("acceptance of a chat close", &response)),
+        }
+    }
+
+    pub fn read_chat_close(
+        &mut self,
+        receipt: uuid::Uuid,
+    ) -> Result<crate::terminal_ipc::ChatCloseOutcome, ControlError> {
+        match self.request_strict(ClientRequest::ReadChatClose { receipt })? {
+            ServerResponse::ChatCloseOutcome(outcome) => Ok(outcome),
+            response => Err(unexpected_response("a chat close outcome", &response)),
+        }
+    }
+
+    pub fn acknowledge_chat_close(&mut self, receipt: uuid::Uuid) -> Result<(), ControlError> {
+        match self.request_strict(ClientRequest::AcknowledgeChatClose { receipt })? {
+            ServerResponse::Accepted => Ok(()),
+            response => Err(unexpected_response(
+                "acknowledgement of a chat close outcome",
+                &response,
+            )),
+        }
+    }
+
     /// Proves teardown without reopening provider history or creating an actor.
     pub fn close_retained_chat(
         &mut self,
@@ -3701,6 +3732,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatLostProcesses { .. } => "chat_lost_processes",
         ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
+        ServerResponse::ChatCloseOutcome(_) => "chat_close_outcome",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
         ServerResponse::ChatPreviewed { .. } => "chat_previewed",
         ServerResponse::ChatCandidates { .. } => "chat_candidates",

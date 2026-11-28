@@ -6957,9 +6957,8 @@ impl Cagents {
                         self.await_shared_chat_admission(card.id, session);
                         continue;
                     }
-                    // A conversation the last window was still stopping
-                    // when it closed, or failed to, attaches once the launch
-                    // has asked again (see `resume_stopping_chats`).
+                    // A conversation with an outstanding close attaches
+                    // once its receipt has been read (see `resume_stopping_chats`).
                     if self.awaits_stop(card.id, &session) {
                         continue;
                     }
@@ -15846,11 +15845,9 @@ impl Cagents {
             Message::LanguageServersReaped
         });
         let close = self.close_main_window();
-        // A chat closed just before leaves while its conversation stops. The
-        // process stays to hear the daemon's answer only as long as it would
-        // wait for its window anyway: the close is saved, so an answer it
-        // does not hear is asked for again, and reported, at the next launch.
-        let chats_closed = !self.chat_ui.closing_in_background();
+        // Keep the UI process only for outstanding handoff acknowledgements.
+        // The daemon owns provider teardown and the next window reads its receipt.
+        let chats_closed = !self.chat_ui.close_handoffs_pending();
         #[cfg(target_os = "macos")]
         macos_window::exit_began();
         self.exit = Some(ApplicationExit {
@@ -19537,8 +19534,8 @@ impl Cagents {
                 // nothing left to explain.
                 instance::dismiss_startup_wait_notice();
                 instance::mark_ui_window_opened();
-                // Chats the last window closed without hearing whether they
-                // stopped are asked about again, and its refusals reported.
+                // Read the daemon's receipts for closes left by the previous
+                // window and restore any notices it had already received.
                 let report = Task::batch([self.begin_startup_gate(), self.resume_stopping_chats()]);
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
@@ -21043,7 +21040,7 @@ impl Cagents {
             Message::ExitChatClosesTimedOut => {
                 if self.exit.is_some_and(|exit| !exit.chats_closed) {
                     tracing::warn!(
-                        "exiting before the daemon confirmed every closed chat stopped; the next launch asks again"
+                        "exiting before the daemon acknowledged every chat close handoff"
                     );
                 }
                 self.advance_exit(|exit| exit.chats_closed = true)

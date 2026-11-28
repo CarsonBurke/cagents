@@ -1130,7 +1130,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
         .map_or_else(claim_state, |ready| ready.claim_saved_state(&paths.lock));
     #[cfg(not(target_os = "macos"))]
     let state = claim_state();
-    let _state = match state {
+    let saved_state_claim = match state {
         Ok(claim) => Some(claim),
         Err(error) => match crate::instance::state_claim::state_in_use(&error) {
             Some(refusal) => return Err(HostError::StateInUse(refusal.clone())),
@@ -1161,7 +1161,20 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     } else {
         None
     };
-    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(HostState::new(proof)));
+    // A close outcome belongs to the saved window even across a daemon
+    // restart. Only the daemon that holds the saved-state claim may write it.
+    let receipt_root = saved_state_claim
+        .as_ref()
+        .and_then(|_| crate::instance::project_dirs())
+        .map_or_else(
+            || paths.directory.clone(),
+            |dirs| dirs.data_dir().to_path_buf(),
+        );
+    let mut state = HostState::new(proof);
+    state.background_chat_closes = Some(Arc::new(chat::background_close::Journal::new(
+        receipt_root.join("chat-close-receipts"),
+    )));
+    let host: SharedHost = Arc::new(crate::host::state::HostLock::new(state));
     #[cfg(target_os = "macos")]
     let mut local_publication = standby
         .as_mut()

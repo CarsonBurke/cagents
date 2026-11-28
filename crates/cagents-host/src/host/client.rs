@@ -195,6 +195,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatRead { .. }
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
+            | ClientRequest::ReadChatClose { .. }
             | ClientRequest::ChatReadExitedQueuePage { .. }
             | ClientRequest::ChatReadExitedQueue { .. }
             | ClientRequest::ReadWorkspaceModel
@@ -1554,6 +1555,13 @@ fn process_wire_request(
         // input behind it on its connection nor keeps the gate shared.
         None if matches!(request, ClientRequest::Snapshot { .. }) => (None, None),
         None if terminal_io_request(&request) => (None, Some(gate.terminal_io())),
+        // A pane close acknowledges quickly or refuses before it is admitted.
+        // Its request must never sit behind a writer and gain custody after a
+        // restarted window has read the receipt as missing.
+        None if matches!(request, ClientRequest::BeginChatClose { .. }) => (
+            None,
+            Some(gate.try_shared().ok_or_else(control_gate::busy)?),
+        ),
         None => (None, Some(gate.shared())),
     };
     admission(&request, || {
@@ -1614,7 +1622,7 @@ fn process_wire_request(
             .map_err(WireFailure::from);
     }
     let (response, extras, shutdown) =
-        process_admitted_request(host, client_id, request, _shared, false)?;
+        process_admitted_request(host, client_id, request, _shared, false, stream)?;
     Ok((response.into(), extras, shutdown))
 }
 
@@ -1668,6 +1676,7 @@ fn process_admitted_request(
     request: ClientRequest,
     _shared: Option<Shared<'_>>,
     inventory_close: bool,
+    stream: Option<&UnixStream>,
 ) -> Result<RequestOutcome, ProtocolError> {
     // Adapt the additive request to the established close paths. Its original
     // source is checked under the same lock that selects the resident handle;
@@ -2258,6 +2267,31 @@ fn process_admitted_request(
                 Vec::new(),
                 false,
             ))
+        }
+        ClientRequest::BeginChatClose { receipt, session } => {
+            let journal = super::chat::background_close::journal(host)?;
+            let admission = _shared
+                .as_ref()
+                .expect("chat close has shared admission")
+                .retain(control_gate(host));
+            journal.begin(host, receipt, session, admission, || {
+                stream.is_some_and(|stream| request_abandoned(stream, true))
+            })?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ReadChatClose { receipt } => {
+            drop(_shared);
+            let journal = super::chat::background_close::journal(host)?;
+            Ok((
+                ServerResponse::ChatCloseOutcome(journal.read(receipt)?),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::AcknowledgeChatClose { receipt } => {
+            let journal = super::chat::background_close::journal(host)?;
+            journal.acknowledge(receipt)?;
+            Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::ChatCloseRetained { session } => {
             super::chat::close_retained_from_pane(host, &session).map_err(|message| {

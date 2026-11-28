@@ -134,6 +134,9 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatRead { .. }
         | R::ChatClose { .. }
         | R::ChatCloseRetained { .. }
+        | R::BeginChatClose { .. }
+        | R::ReadChatClose { .. }
+        | R::AcknowledgeChatClose { .. }
         | R::ChatLostProcesses { .. }
         | R::ChatCapacityInspect
         | R::ChatCapacitySet { .. }

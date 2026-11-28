@@ -8952,6 +8952,7 @@ mod tests {
             session: chat.clone(),
             card: CardId::new(),
             title: "Plan the release".into(),
+            close_receipt: Some(uuid::Uuid::new_v4()),
             refused: None,
             dismissed: false,
             stopped: false,

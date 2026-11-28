@@ -463,6 +463,7 @@ pub(crate) struct HostState {
     /// The attached windows holding follow-ups the person wrote for each
     /// conversation's next turn, which the courier lets go first.
     pub(super) held_followups: BTreeMap<TerminalId, BTreeSet<ClientId>>,
+    pub(super) background_chat_closes: Option<Arc<super::chat::background_close::Journal>>,
     pub(super) chat_handoffs: BTreeMap<TerminalId, super::chat::TerminalHandoff>,
     pub(super) chat_spawning: BTreeMap<TerminalId, crate::chat::Session>,
     /// Resident releases fence an allocation without advertising a new owner.
@@ -674,6 +675,7 @@ impl HostState {
             chat_deliveries: None,
             chats: BTreeMap::new(),
             held_followups: BTreeMap::new(),
+            background_chat_closes: None,
             chat_handoffs: BTreeMap::new(),
             chat_spawning: BTreeMap::new(),
             chat_releases: BTreeSet::new(),

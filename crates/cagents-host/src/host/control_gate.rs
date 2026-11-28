@@ -104,6 +104,18 @@ pub(super) struct ControlGate {
 #[must_use = "admission ends when the guard is dropped"]
 pub(super) struct Shared<'gate>(&'gate ControlGate);
 
+/// Shared admission transferred to work that outlives its submitting request.
+#[must_use = "admission ends when the guard is dropped"]
+pub(super) struct OwnedShared(std::sync::Arc<ControlGate>);
+
+impl Shared<'_> {
+    pub(super) fn retain(&self, gate: std::sync::Arc<ControlGate>) -> OwnedShared {
+        assert!(std::ptr::eq(self.0, gate.as_ref()));
+        gate.counts().shared += 1;
+        OwnedShared(gate)
+    }
+}
+
 /// Why a client's request left the exclusive queue without admission.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum WaitFailure {
@@ -264,15 +276,27 @@ impl ControlGate {
     }
 }
 
-impl Drop for Shared<'_> {
-    fn drop(&mut self) {
-        let mut counts = self.0.counts();
+impl ControlGate {
+    fn release_shared(&self) {
+        let mut counts = self.counts();
         counts.shared -= 1;
         let empty = counts.shared == 0 && counts.exclusive_waiters();
         drop(counts);
         if empty {
-            self.0.changed.notify_all();
+            self.changed.notify_all();
         }
+    }
+}
+
+impl Drop for Shared<'_> {
+    fn drop(&mut self) {
+        self.0.release_shared();
+    }
+}
+
+impl Drop for OwnedShared {
+    fn drop(&mut self) {
+        self.0.release_shared();
     }
 }
 
